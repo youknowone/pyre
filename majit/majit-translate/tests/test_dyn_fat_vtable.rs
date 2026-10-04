@@ -2,6 +2,7 @@
 //! the vtable word of `DictStrategyRef.imp`, not from the data pointer.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
@@ -16,24 +17,35 @@ const OBJECT_LLBC: &str = concat!(
     "/../../build/llbc/pyre-object.ullbc"
 );
 
-#[test]
-fn w_dict_lookup_reads_getitem_from_the_vtable_word() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let graph = lower_function(&llbc, "w_dict_lookup").expect("lower w_dict_lookup");
-    let mut getitem_reads = 0usize;
+/// `None` means the artefact is absent. A checkout that has not extracted
+/// LLBC skips these tests instead of panicking on the missing file.
+fn object_llbc() -> Option<&'static Llbc> {
+    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
+    LLBC.get_or_init(|| {
+        if !std::path::Path::new(OBJECT_LLBC).is_file() {
+            eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
+            return None;
+        }
+        Some(Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"))
+    })
+    .as_ref()
+}
+
+fn assert_vtable_reads(graph: &FunctionGraph, method_name: &str) {
+    let mut reads = 0usize;
     for block in &graph.blocks {
         for op in &block.operations {
             let OpKind::FieldRead { base, field, .. } = &op.kind else {
                 continue;
             };
-            if field.name != "method_getitem" {
+            if field.name != method_name {
                 continue;
             }
-            getitem_reads += 1;
+            reads += 1;
             let mut seen = HashSet::new();
             assert!(
-                reaches_imp_fat_len(&graph, block.id, base, &mut seen),
-                "method_getitem base does not reach FatLen of imp\n{}",
+                reaches_imp_fat_len(graph, block.id, base, &mut seen),
+                "{method_name} base does not reach FatLen of imp\n{}",
                 graph.dump()
             );
             assert_eq!(
@@ -43,11 +55,7 @@ fn w_dict_lookup_reads_getitem_from_the_vtable_word() {
             );
         }
     }
-    assert!(
-        getitem_reads > 0,
-        "w_dict_lookup lowered no method_getitem read\n{}",
-        graph.dump()
-    );
+    assert!(reads > 0, "lowered no {method_name} read\n{}", graph.dump());
     let still_calls_strategy = graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| {
             let OpKind::Call { target, .. } = &op.kind else {
@@ -61,6 +69,15 @@ fn w_dict_lookup_reads_getitem_from_the_vtable_word() {
         "w_dict_get_strategy stayed a call, so its vtable word was dropped\n{}",
         graph.dump()
     );
+}
+
+#[test]
+fn w_dict_lookup_reads_getitem_from_the_vtable_word() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph = lower_function(llbc, "w_dict_lookup").expect("lower w_dict_lookup");
+    assert_vtable_reads(&graph, "method_getitem");
 }
 
 fn call_names_get_strategy(target: &CallTarget) -> bool {
@@ -129,50 +146,12 @@ fn reaches_imp_fat_len(
 
 #[test]
 fn w_dict_getitem_str_hashed_assembles_with_vtable_word() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let graph = lower_function(&llbc, "w_dict_getitem_str_hashed")
-        .expect("lower w_dict_getitem_str_hashed");
-    let mut reads = 0usize;
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let OpKind::FieldRead { base, field, .. } = &op.kind else {
-                continue;
-            };
-            if field.name != "method_getitem_str_hashed" {
-                continue;
-            }
-            reads += 1;
-            let mut seen = HashSet::new();
-            assert!(
-                reaches_imp_fat_len(&graph, block.id, base, &mut seen),
-                "method_getitem_str_hashed base does not reach FatLen of imp\n{}",
-                graph.dump()
-            );
-            assert_eq!(
-                FunctionGraph::concretetype_of(base),
-                ConcreteType::Signed,
-                "vtable word must be an int so getfield_raw_r loads it"
-            );
-        }
-    }
-    assert!(
-        reads > 0,
-        "w_dict_getitem_str_hashed lowered no method_getitem_str_hashed read\n{}",
-        graph.dump()
-    );
-    let still_calls_strategy = graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            let OpKind::Call { target, .. } = &op.kind else {
-                return false;
-            };
-            call_names_get_strategy(target)
-        })
-    });
-    assert!(
-        !still_calls_strategy,
-        "w_dict_get_strategy stayed a call, so its vtable word was dropped\n{}",
-        graph.dump()
-    );
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph =
+        lower_function(llbc, "w_dict_getitem_str_hashed").expect("lower w_dict_getitem_str_hashed");
+    assert_vtable_reads(&graph, "method_getitem_str_hashed");
     // `join_blocks` renames the indirect call's `hash_` onto the link arg.
     // That arg has to stay defined after the fat-dyn splice, or liveness
     // panics while assembling this graph.

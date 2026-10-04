@@ -268,6 +268,10 @@ fn inline_call_site(
             graph.set_control_flow_metadata(new_block_id, exitswitch, exits);
         }
     }
+    // `Inliner.rewire_exceptblock_no_guard`: an edge into the copied
+    // exceptblock targets the host `graph.exceptblock` and keeps only
+    // etype and evalue. The guarded rewire stays unreachable.
+    rewire_copied_exceptblock(graph, &block_map, callee.exceptblock);
 
     // Connect caller's before-block to callee entry
     // Map call arguments to callee's Input ops.
@@ -406,6 +410,38 @@ fn caller_passon_vars(
         }
     }
     out
+}
+
+/// Retarget edges that enter the copied exceptblock.
+///
+/// `Inliner.rewire_exceptblock_no_guard` walks those entry links, truncates
+/// each to etype and evalue, and points them at the host exceptblock. The
+/// copied exceptblock's own outgoing edges stay; once nothing targets it,
+/// it is unreachable.
+fn rewire_copied_exceptblock(
+    graph: &mut FunctionGraph,
+    block_map: &HashMap<BlockId, BlockId>,
+    callee_except: BlockId,
+) {
+    let Some(&copied_except) = block_map.get(&callee_except) else {
+        return;
+    };
+    let host_except = graph.exceptblock;
+    if copied_except == host_except {
+        return;
+    }
+    for &copied_id in block_map.values() {
+        if copied_id == copied_except {
+            continue;
+        }
+        for exit in &mut graph.blocks[copied_id.0].exits {
+            if exit.target != copied_except {
+                continue;
+            }
+            exit.args.truncate(2);
+            exit.target = host_except;
+        }
+    }
 }
 
 /// Splice one direct call. Returns whether `op_index` was a `Call`.
@@ -1989,6 +2025,74 @@ mod tests {
             .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::Call { .. }));
         assert!(!has_call, "Call op should be replaced by inlined body");
+    }
+
+    #[test]
+    fn splice_rewires_exception_exit_to_the_host_exceptblock() {
+        use crate::model::{Link, LinkArg};
+
+        let mut callee = FunctionGraph::new("raising");
+        let etype = callee.alloc_value_var();
+        let evalue = callee.alloc_value_var();
+        let extra = callee.alloc_value_var();
+        callee.set_control_flow_metadata(
+            callee.startblock,
+            None,
+            vec![Link::new_mixed(
+                vec![
+                    LinkArg::Value(etype),
+                    LinkArg::Value(evalue),
+                    LinkArg::Value(extra),
+                ],
+                callee.exceptblock,
+                None,
+            )],
+        );
+
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let result = caller.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["raising"]),
+                args: crate::model::call_args(Vec::<crate::flowspace::model::Variable>::new()),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        );
+        caller.set_return(entry, result);
+        assert!(splice_direct_call(&mut caller, entry, 0, callee));
+
+        let host = caller.exceptblock;
+        let raising: Vec<_> = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.exits.iter())
+            .filter(|exit| exit.target == host)
+            .collect();
+        assert!(
+            raising.iter().any(|exit| exit.args.len() == 2),
+            "exception edge must reach the host exceptblock with etype and evalue\n{}",
+            caller.dump()
+        );
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.exits.iter())
+                .all(|exit| exit.args.len() <= 2 || exit.target != host),
+            "host exception edge keeps only etype and evalue\n{}",
+            caller.dump()
+        );
+        assert!(
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| block.exits.iter())
+                .all(|exit| exit.args.len() != 3),
+            "the callee's third exception arg must not survive the splice\n{}",
+            caller.dump()
+        );
     }
 
     #[test]

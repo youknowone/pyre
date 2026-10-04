@@ -3996,8 +3996,10 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
 /// Lower a same-crate callee whose return is a fat `&dyn` / `Box<dyn>`,
 /// so the caller can splice the body instead of taking the one-word
 /// jitcode return. `None` leaves the call residual: the body is missing,
-/// too large, `dont_look_inside`, or this `def_id` is already being
-/// spliced (a cycle).
+/// `dont_look_inside`, or this `def_id` is already being spliced (a
+/// cycle). The body is spliced at any size. A cutoff would keep the
+/// one-word return, and the caller's `method_*` read would load the slot
+/// from the data pointer.
 fn lower_fat_dyn_callee(
     llbc: &Llbc,
     def_id: u64,
@@ -4015,7 +4017,7 @@ fn lower_fat_dyn_callee(
         return None;
     }
     let nblocks = decl.unstructured()?.body.len();
-    if nblocks == 0 || nblocks > crate::front::dyn_fat::MAX_SPLICED_BLOCKS {
+    if nblocks == 0 {
         return None;
     }
     lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
