@@ -44,6 +44,15 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
     (marker.opname == "live").then_some(marker.pc)
 }
 
+/// The `-live-` directly before `op_pc`: the liveness a plain guard reads
+/// (`get_list_of_active_boxes`, `pc = self.pc - SIZE_LIVE_OP`).
+fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
+    let pc = op_pc.checked_sub(SIZE_LIVE_OP)?;
+    let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
+    (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
+}
+
 /// Select the resume marker for an after-residual-call guard.  The bytecode's
 /// immediate trailing `-live-` is the RPython authority; metadata twins are
 /// compatibility fallbacks for incomplete/fixture bodies.
@@ -300,7 +309,10 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
                 op_pc,
                 false,
                 parent_frames.clone(),
-                GuardCaptureScope::default(),
+                GuardCaptureScope {
+                    orgpc_live_resume: true,
+                    ..GuardCaptureScope::default()
+                },
                 GuardStampTarget::GuardFromEnd(from_end),
             )?;
         }
@@ -2038,7 +2050,7 @@ enum CallerOperandSlots {
 }
 
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
-/// caller whose operand stack ends at `stack_end`. The two CALL forms name
+/// caller whose operand stack ends at `stack_end`. The CALL forms name
 /// their synthetic `null_or_self` sentinel and callable proof; every other
 /// shape names only how many operands it consumes, and the deepest of those
 /// plays the role the callable plays for CALL. `None` keeps the conservative
@@ -2095,13 +2107,16 @@ fn caller_operand_slots<Sym: WalkSym>(
     // (`eval.rs`) pops the names first and then the identical argument block,
     // so the two shapes differ only in where the stack ends above the
     // arguments, and both name the same synthetic sentinel and callable proof.
+    // CALL_FUNCTION_EX is `[callable, null_or_self, callargs, kwargs_or_null]`
+    // (`call_function_ex`): one argument slot with the mapping above it.
     let call_shape = match instruction {
-        pyre_interpreter::Instruction::Call { argc } => Some((argc, 1usize)),
-        pyre_interpreter::Instruction::CallKw { argc } => Some((argc, 2usize)),
+        pyre_interpreter::Instruction::Call { argc } => Some((argc.get(op_arg) as usize, 1usize)),
+        pyre_interpreter::Instruction::CallKw { argc } => Some((argc.get(op_arg) as usize, 2usize)),
+        pyre_interpreter::Instruction::CallFunctionEx => Some((1, 2)),
         _ => None,
     };
     if let Some((argc, slots_above_args)) = call_shape {
-        let null_or_self = stack_end.checked_sub(argc.get(op_arg) as usize + slots_above_args)?;
+        let null_or_self = stack_end.checked_sub(argc + slots_above_args)?;
         return Some(CallerOperandSlots::Call {
             null_or_self,
             callable: null_or_self.checked_sub(1)?,
@@ -3518,9 +3533,15 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         // while reading the values out of the sub-walk registers at another.
         // The single-frame path can substitute the anchor because it re-reads
         // the owning frame's vable shadow at the carried coordinate; the callee
-        // sub-walk owns no shadow to re-read.
-        false => callee_pjc
-            .resume_marker_for_jitcode_pc(callee_op_pc)
+        // sub-walk owns no shadow to re-read.  `orgpc_live_resume` names a
+        // different coordinate: the `-live-` directly before `callee_op_pc`,
+        // which is this op's own liveness window, so nothing has run between it
+        // and the registers read below.
+        false => scope
+            .orgpc_live_resume
+            .then(|| preceding_live_marker(&callee_pjc, callee_op_pc))
+            .flatten()
+            .or_else(|| callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc))
             .map(|m| m as i32)
             .unwrap_or(callee_op_pc as i32),
     };

@@ -1365,6 +1365,28 @@ fn route_deepest_carrier_exc_edge<Sym: WalkSym>(
     Ok(catch_target)
 }
 
+/// How a reconstructed frame is entered on an exception edge instead of at its
+/// resume pc.
+pub(crate) enum FrameHandlerEntry {
+    /// `finishframe_exception` ChangeFrame: a deeper frame raised, and this
+    /// frame's `catch_exception` target is entered with that exception.
+    Caught {
+        exc: OpRef,
+        exc_concrete: ConcreteValue,
+        catch_target: usize,
+    },
+    /// The exception-guard bridge's own exception, raised by the residual call
+    /// this frame resumes after: `_prepare_exception_resumption` +
+    /// `prepare_resume_from_failure` (`pyjitpl.py`) restore it and record
+    /// `handle_possible_exception`'s GUARD_EXCEPTION, then
+    /// `finishframe_exception` either enters this frame's handler or pops the
+    /// frame when `catch_target` is `None`.
+    Restored {
+        exc_concrete: pyre_object::PyObjectRef,
+        catch_target: Option<usize>,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -1387,10 +1409,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     portal_ec_box: OpRef,
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
-    // `finishframe_exception` ChangeFrame: enter this reconstructed frame at
-    // its `catch_exception` target with the bubbled exception already seeded.
-    // `None` is the ordinary resume-at-CALL / `make_result_of_lastop` path.
-    handler_entry: Option<(OpRef, ConcreteValue, usize)>,
+    // Enter this reconstructed frame on an exception edge.  `None` is the
+    // ordinary resume-at-CALL / `make_result_of_lastop` path.
+    handler_entry: Option<FrameHandlerEntry>,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
@@ -1853,33 +1874,140 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // `last_exc_value` and reconstruct the handler operand stack the same
         // way the walk-level SubRaise catch and the root `CarrierRaiseSeed`
         // path do, then start at `catch_target` instead of the CALL resume pc.
-        let mut walk_entry = if let Some((exc, exc_concrete, catch_target)) = handler_entry {
-            sub_wc.set_last_exc_value(exc, exc_concrete);
-            sub_wc.fbw_mode.class_of_last_exc_is_const = true;
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
-            if let Err(error) =
-                record_bridge_handler_entry_traceback(&mut sub_wc, exc, exc_concrete, entry)
-            {
-                drop(bank_guard);
-                return Some(Err(error));
-            }
-            vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
-            catch_target
-        } else if let Some(catch_target) = routed_catch {
-            match route_deepest_carrier_exc_edge(
-                &mut sub_wc,
-                entry,
+        let mut walk_entry = match handler_entry {
+            Some(FrameHandlerEntry::Caught {
+                exc,
+                exc_concrete,
                 catch_target,
-                root_sym.last_exc_value(),
-            ) {
-                Ok(target) => target,
-                Err(error) => {
+            }) => {
+                sub_wc.set_last_exc_value(exc, exc_concrete);
+                sub_wc.fbw_mode.class_of_last_exc_is_const = true;
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                if let Err(error) =
+                    record_bridge_handler_entry_traceback(&mut sub_wc, exc, exc_concrete, entry)
+                {
                     drop(bank_guard);
                     return Some(Err(error));
                 }
+                vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
+                catch_target
             }
-        } else {
-            entry
+            Some(FrameHandlerEntry::Restored {
+                exc_concrete,
+                catch_target,
+            }) => {
+                // The root frame's exception-edge arm, recorded on this frame:
+                // SAVE_EXC_CLASS / SAVE_EXCEPTION / RESTORE_EXCEPTION, then
+                // GUARD_EXCEPTION against the class read at pointer width
+                // (`_store_exception` keeps the typeptr at offset 0).  The
+                // guard's resume data is this frame at `entry` with every
+                // shallower carrier frame paused above it, carried verbatim
+                // because `entry` is already the post-call coordinate.
+                let class_op = sub_wc.trace_ctx.save_exc_class();
+                let value_op = sub_wc.trace_ctx.save_exception();
+                sub_wc.trace_ctx.restore_exception(class_op, value_op);
+                sub_wc.trace_ctx.set_opref_concrete(
+                    value_op,
+                    majit_ir::Value::Ref(majit_ir::GcRef(exc_concrete as usize)),
+                );
+                let exc_class = unsafe { *(exc_concrete as *const usize) as i64 };
+                let exc_class_const = sub_wc.trace_ctx.const_int(exc_class);
+                sub_wc
+                    .trace_ctx
+                    .record_guard(OpCode::GuardException, &[exc_class_const], 0);
+                if let Err(error) = walker_capture_snapshot_for_last_guard_impl(
+                    &mut sub_wc,
+                    entry,
+                    false,
+                    GuardCaptureScope {
+                        carried_resume_jit_pc: Some(entry),
+                        ..Default::default()
+                    },
+                ) {
+                    drop(bank_guard);
+                    return Some(Err(error));
+                }
+                // `execute_ll_raised`: the handler reads the SAVE_EXCEPTION
+                // box, and GUARD_EXCEPTION made its class a constant.
+                let mut exc_box = ConcreteValue::Ref(exc_concrete);
+                sub_wc.set_last_exc_value(value_op, exc_box);
+                sub_wc.fbw_mode.class_of_last_exc_is_const = true;
+                // Consumed here, so the root walk's
+                // `seed_standing_exception_for_walk` takes the null arm
+                // instead of routing the same exception a second time.
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                match catch_target {
+                    Some(catch_target) => {
+                        if let Err(error) = record_bridge_handler_entry_traceback(
+                            &mut sub_wc,
+                            value_op,
+                            exc_box,
+                            entry,
+                        ) {
+                            drop(bank_guard);
+                            return Some(Err(error));
+                        }
+                        vstack_enter_exception_handler(&mut sub_wc, catch_target, value_op);
+                        catch_target
+                    }
+                    None => {
+                        // No `catch_exception` here: the frame is popped with
+                        // its own traceback node, as the walk's sub-frame
+                        // raise arm does, and the exception goes to the
+                        // shallower carrier frames.
+                        if !recording_raise_keeps_existing_traceback(&mut sub_wc, entry) {
+                            let node = match record_prepend_application_traceback(
+                                &mut sub_wc,
+                                value_op,
+                                exc_box,
+                                entry,
+                            ) {
+                                Ok(node) => node,
+                                Err(error) => {
+                                    drop(bank_guard);
+                                    return Some(Err(error));
+                                }
+                            };
+                            let emit_runtime = node.is_none();
+                            record_inline_application_traceback(
+                                &mut sub_wc,
+                                value_op,
+                                &mut exc_box,
+                                entry,
+                                true,
+                                emit_runtime,
+                                node,
+                            );
+                        }
+                        drop(bank_guard);
+                        return Some(Ok((
+                            DispatchOutcome::SubRaise {
+                                exc: value_op,
+                                exc_concrete: exc_box,
+                            },
+                            entry,
+                        )));
+                    }
+                }
+            }
+            None => {
+                if let Some(catch_target) = routed_catch {
+                    match route_deepest_carrier_exc_edge(
+                        &mut sub_wc,
+                        entry,
+                        catch_target,
+                        root_sym.last_exc_value(),
+                    ) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            drop(bank_guard);
+                            return Some(Err(error));
+                        }
+                    }
+                } else {
+                    entry
+                }
+            }
         };
         // `finishframe_exception` already moved this callee. Start at that
         // pc when it is an instruction in this body; the root walk must not
@@ -1889,7 +2017,21 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         {
             walk_entry = pc;
         }
+        if super::p2_diag_enabled() {
+            let first = crate::jitcode_runtime::decode_op_at(callee_code, walk_entry);
+            let next = first
+                .as_ref()
+                .and_then(|op| crate::jitcode_runtime::decode_op_at(callee_code, op.next_pc));
+            eprintln!(
+                "[p2-walk-entry] entry={entry} walk_entry={walk_entry} first={:?} next={:?}",
+                first.as_ref().map(|op| (op.pc, op.opname, op.next_pc)),
+                next.as_ref().map(|op| (op.pc, op.opname, op.next_pc)),
+            );
+        }
         let outcome = walk(callee_code, walk_entry, &mut sub_wc);
+        if super::p2_diag_enabled() {
+            eprintln!("[p2-walk-outcome] walk_entry={walk_entry} outcome={outcome:?}");
+        }
         // `opimpl_jit_merge_point` when `portal_call_depth` is non-zero:
         // finish this callee (`leave_portal_frame=False`), record
         // `do_recursive_call(assembler_call=True)` on its portal reds, then
@@ -1902,6 +2044,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             portal_frame_box,
             portal_ec_box,
         );
+        if super::p2_diag_enabled() {
+            eprintln!("[p2-consume-loop-header] outcome={outcome:?}");
+        }
         drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
@@ -1982,6 +2127,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
+    handler_entry: Option<FrameHandlerEntry>,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
         ctx,
@@ -2004,7 +2150,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         portal_ec_box,
         None,
         paused_parent_recipes,
-        None,
+        handler_entry,
     )
 }
 
@@ -2102,6 +2248,10 @@ pub(crate) fn drive_bridge_middle_frame_from_handler<Sym: WalkSym>(
         portal_ec_box,
         None,
         paused_parent_recipes,
-        Some((exc, exc_concrete, catch_target)),
+        Some(FrameHandlerEntry::Caught {
+            exc,
+            exc_concrete,
+            catch_target,
+        }),
     )
 }

@@ -8643,7 +8643,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
             vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
+            vstack_last_ref: regs_r[7],
             vstack_reorder_saved: None,
             ..Default::default()
         }),
@@ -8689,6 +8689,12 @@ fn ref_copy_writes_src_value_into_dst_register() {
         wc.registers_r.get(2).expect("ref register in range"),
         src_val_pre,
         "src register must remain unchanged",
+    );
+    assert_eq!(
+        wc.frame_state.borrow().vstack_last_ref,
+        regs_r[7],
+        "a link renaming is not the opcode's result, so ref_copy must leave \
+             the operand-stack TOS candidate alone",
     );
 }
 

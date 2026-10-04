@@ -221,11 +221,20 @@ mod tests {
     #[test]
     fn select_on_a_closed_fd_fails() {
         let _table = fd_table();
-        let mut raw = [0; 2];
-        assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
-        unsafe { libc::close(raw[0]) };
-        let err = select(&[raw[0]], &[], &[], 0.0, false).expect_err("closed fd");
-        unsafe { libc::close(raw[1]) };
-        assert_eq!(err.errno, libc::EBADF);
+        // `pipe` reuses the lowest free descriptor, so a sibling test can
+        // occupy this number between `close` and `select`. Repeat until the
+        // number is still closed.
+        for _ in 0..32 {
+            let mut raw = [0; 2];
+            assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
+            unsafe { libc::close(raw[0]) };
+            let err = select(&[raw[0]], &[], &[], 0.0, false);
+            unsafe { libc::close(raw[1]) };
+            if let Err(err) = err {
+                assert_eq!(err.errno, libc::EBADF);
+                return;
+            }
+        }
+        panic!("closed fd stayed readable");
     }
 }

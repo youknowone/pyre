@@ -4909,6 +4909,61 @@ mod tests {
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
     }
 
+    /// shortpreamble.py `HeapOp.add_op_to_short` builds its replay op on
+    /// `sb.produce_arg(sop.getarg(0))`, so a heap short box whose receiver is
+    /// another short box reads that dependency's replay op.  Binding the
+    /// receiver to the body box instead makes `use_box` append the body op,
+    /// whose own args the short preamble never produces.
+    #[test]
+    fn test_imported_heap_short_box_receiver_is_the_dependency_replay_op() {
+        use crate::optimizeopt::shortpreamble::{PreambleOpKind, ProducedShortOp};
+
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let p0 = OpRef::input_arg_typed(0, Type::Ref);
+        let p0_box = bound_arg(p0);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&p0_box));
+        let outer_pos = OpRef::ref_op(100);
+        let inner_pos = OpRef::ref_op(101);
+        let outer_box = ctx.materialize_operand_at(outer_pos);
+        let inner_box = ctx.materialize_operand_at(inner_pos);
+        let heap_entry = |op: Op, res: &Operand| ProducedShortOp {
+            kind: PreambleOpKind::Heap,
+            res: res.clone(),
+            source_op: OpRc::new(op.clone()),
+            preamble_op: OpRc::new(op),
+            invented_name: false,
+            same_as_source: None,
+            label_arg_idx: None,
+        };
+        let mut outer = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], object_descr(1));
+        outer.pos().set(outer_pos);
+        let mut inner = Op::with_descr(OpCode::GetfieldGcR, &[outer_box.clone()], object_descr(2));
+        inner.pos().set(inner_pos);
+        let short_boxes = vec![
+            (outer_pos, heap_entry(outer, &outer_box)),
+            (inner_pos, heap_entry(inner, &inner_box)),
+        ];
+        let mut result_map = indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
+        for &(source, _) in &short_boxes {
+            result_map.insert(source, ctx.alloc_op_position_typed(Type::Ref));
+        }
+
+        assert!(
+            ctx.initialize_imported_short_preamble_builder_from_short_boxes(
+                &[p0],
+                &[p0],
+                &short_boxes,
+                &result_map,
+                &indexmap::IndexMap::new(),
+            )
+        );
+        let builder = ctx.imported_short_preamble_builder.as_ref().unwrap();
+        let outer_replay = builder.produced_short_op(&outer_box).unwrap().preamble_op;
+        let inner_replay = builder.produced_short_op(&inner_box).unwrap().preamble_op;
+        let receiver = inner_replay.arg(0).bound_op().unwrap();
+        assert!(OpRc::ptr_eq(&receiver, &outer_replay));
+    }
+
     /// After consuming an imported short field, a cache invalidation followed
     /// by another getfield must emit the actual load (not reuse the stale
     /// preamble value).  This prevents null-pointer crashes when the

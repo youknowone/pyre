@@ -11658,14 +11658,17 @@ pub(crate) unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bo
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub(crate) unsafe fn metaclass_python_getattribute(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+    if w_obj.is_null()
+        || !pyre_object::with_roots!(w_obj => pyre_object::typeobject::is_type(w_obj))
+    {
         return None;
     }
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    let typed = pyre_object::with_roots!(w_obj => crate::typedef::r#type(w_obj))?;
+    let mut metatype = typed.as_ptr();
+    let mut slot = pyre_object::with_roots!(metatype => getattribute_if_not_from_object(metatype))?;
+    if pyre_object::with_roots!(metatype, slot => is_type_getattribute_descr(slot)) {
         return None;
     }
     Some((metatype, slot))
@@ -21398,11 +21401,35 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
         None => None,
     };
-    let executed = (*crate::eval::frame_anchor_live(frame_depth)).execute_generator_frame(
-        w_inputvalue,
-        operr,
-        throw_args,
-    );
+    // `next`/`send` carry no operation error. Resume through the registered
+    // one-word helper so the walk does not abort on `execute_generator_frame`
+    // and does not hold a pointer to this frame's resume struct.
+    let executed = if operr.is_none() && throw_args.is_none() {
+        let input = match w_inputvalue {
+            Some(value) => value,
+            None => pyre_object::PY_NULL,
+        };
+        let value = crate::call::eval_resumed_frame_raw(
+            &mut *crate::eval::frame_anchor_live(frame_depth),
+            input,
+        );
+        if value.is_null() {
+            Err(crate::call::take_call_error()
+                .unwrap_or_else(|| crate::PyError::runtime_error("generator resume failed")))
+        } else {
+            Ok(value)
+        }
+    } else {
+        let mut resume = crate::call::FrameResumeArgs {
+            w_inputvalue,
+            operr,
+            throw_args,
+        };
+        crate::call::get_eval_fn()(
+            &mut *crate::eval::frame_anchor_live(frame_depth),
+            Some(&mut resume),
+        )
+    };
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell
@@ -23864,7 +23891,9 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            // `is_w` reaches `abstract_int_is_w`, which allocates for a
+            // long. This pair is not that arm.
+            pyre_object::is_w_exact_builtin(a, b)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }

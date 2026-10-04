@@ -2999,6 +2999,8 @@ fn compare_tuples(
                 }
             }
             if equal.is_none() {
+                // The `_oo` arm runs `eq_w`, which can collect. `with_roots!`
+                // reloads the two tuples before the element walk reads them.
                 equal = pyre_object::with_roots!(a, b => specialised_tuple_same_class_eq(a, b))?;
             }
             equal
@@ -6748,11 +6750,13 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
             // stay pin-free, so a traced `int == int` does not record that
             // residual. The other arm can collect before it returns
             // `NotImplemented`, and the fallthrough reads `a` and `b`.
-            let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                compare_slot(a, b, op)?
-            } else {
-                pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
-            };
+            if builtin_pair_needs_no_caller_roots(a, b) {
+                // These layouts return a bool, so `a` and `b` are not read
+                // again after a call that the rest of `compare_slot` can
+                // collect through.
+                return compare_slot(a, b, op);
+            }
+            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }

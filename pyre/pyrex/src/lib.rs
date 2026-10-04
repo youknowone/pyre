@@ -849,6 +849,14 @@ fn real_main(binary_name: &str) {
                 .downcast_ref::<majit_metainterp::optimize::SpeculativeError>()
                 .is_some();
         if !is_silent_control_flow {
+            // The suite runner keeps a signal death's last stderr line, and
+            // the default hook's trailer is that line. Put the location on
+            // its own line first so a CI log can name the panic.
+            let loc = info
+                .location()
+                .map(|location| location.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!("panicked at {loc}: {info}");
             default_hook(info);
         }
     }));

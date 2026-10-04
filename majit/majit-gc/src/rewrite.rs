@@ -550,8 +550,14 @@ pub struct JitFrameDescrs {
     pub jf_frame_baseitemofs: usize,
     /// descrs.arraydescr.lendescr.offset, measured from JitFrame start.
     pub jf_frame_lengthofs: usize,
-    /// SIGN_SIZE: size of one jf_frame slot.
+    /// SIGN_SIZE: width of a Signed header field (`jf_frame_info`,
+    /// `jfi_frame_size`, the `jf_frame` length).
     pub sign_size: usize,
+    /// unpack_arraydescr_size(descrs.arraydescr): width of one `jf_frame`
+    /// item.  Upstream's `JITFRAME.jf_frame` is `Array(Signed)`, so this is
+    /// `sign_size` on the native backends.  The wasm backend keeps every
+    /// value in an i64 slot, so its items are 8 bytes wide on wasm32 too.
+    pub jf_frame_itemsize: usize,
 }
 
 impl JitFrameDescrs {
@@ -564,8 +570,10 @@ impl JitFrameDescrs {
     ///   refarraydescr    = ArrayDescr(.., ad.itemsize, ..)
     ///   floatarraydescr  = ArrayDescr(..,
     ///         ad.itemsize * 2 if WORD == 4 else ad.itemsize, ..)
-    /// so on 32-bit builds a FLOAT slot spans two Signed words.
+    /// so a FLOAT spans two items when an item is 4 bytes wide.  `ad` is the
+    /// `jf_frame` arraydescr, so its itemsize is `jf_frame_itemsize`.
     fn frame_itemsize(&self, ty: Type) -> i64 {
+        let itemsize = self.jf_frame_itemsize as i64;
         match ty {
             // Value slots are i64 on every backend. wasm32's Signed is 4,
             // but `publish_ca_initial_locs` and the entry loader address
@@ -574,10 +582,10 @@ impl JitFrameDescrs {
             // compare against a zero-extended field load fails.
             Type::Int | Type::Ref => 8,
             Type::Float => {
-                if self.sign_size == 4 {
-                    (self.sign_size * 2) as i64
+                if itemsize == 4 {
+                    itemsize * 2
                 } else {
-                    self.sign_size as i64
+                    itemsize
                 }
             }
             Type::Void => panic!("CALL_ASSEMBLER arg must have a concrete type"),
@@ -3172,6 +3180,22 @@ impl GcRewriterImpl {
         st.emit(store);
     }
 
+    /// [`Self::gen_initialize_tid`] storing only the type-id half of
+    /// `HDR.tid`, so flags the slow-path allocator set survive.
+    fn gen_initialize_tid_keep_flags(&self, obj: Operand, tid: u32, st: &mut RewriteState<'_>) {
+        let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
+            return;
+        };
+        let tid_fd = tid_fd_ref
+            .as_field_descr()
+            .expect("gc_ll_descr.fielddescr_tid must be a FieldDescr");
+        let ofs = st.const_int(-(crate::header::GcHeader::SIZE as i64) + tid_fd.offset() as i64);
+        let tid_val = st.const_int(tid as i64);
+        let size = st.const_int((crate::header::TYPE_ID_BITS / 8) as i64);
+        let store = mk_op(OpCode::GcStore, &[obj, ofs, tid_val, size]);
+        st.emit(store);
+    }
+
     /// rewrite.py:479-484 gen_initialize_vtable parity.
     ///
     /// RPython: emit_setfield(obj, ConstInt(vtable), descr=fielddescr_vtable)
@@ -3290,8 +3314,15 @@ impl GcRewriterImpl {
             st.remember_wb(&frame);
         }
 
-        // rewrite.py — gen_initialize_tid(frame, descrs.arraydescr.tid)
-        self.gen_initialize_tid(frame.clone(), descrs.jitframe_tid, st);
+        // rewrite.py — gen_initialize_tid(frame, descrs.arraydescr.tid),
+        // narrowed to the type-id half of `HDR.tid`. A frame of
+        // `large_object` bytes or more comes back from the slow path as a
+        // young raw-malloced object, and pyre records that generation's
+        // membership as the `YOUNG_RAWMALLOC` header flag where incminimark
+        // keeps the `young_rawmalloced_objects` dict; a whole-word store would
+        // clear it and the minor collection would free a live frame. The fast
+        // path has already zeroed the header word.
+        self.gen_initialize_tid_keep_flags(frame.clone(), descrs.jitframe_tid, st);
 
         // rewrite.py — emit_setfield(frame, c_null, descr=jf_*)
         // with (_, size, _) = unpack_fielddescr(descr). jitframe.py:63-81
@@ -5147,6 +5178,7 @@ mod tests {
             jf_frame_baseitemofs: 64,
             jf_frame_lengthofs: 56,
             sign_size: 8,
+            jf_frame_itemsize: 8,
         });
         rw.call_assembler_callee_locs = Some(Box::new(|token| {
             (token == 9).then_some(CallAssemblerCalleeLocs {
@@ -5181,6 +5213,16 @@ mod tests {
             .expect("rewritten CALL_ASSEMBLER");
         assert!(frame_idx < call_idx);
         assert_eq!(result[call_idx].num_args(), 1);
+        // A frame at or above `large_object` is a young raw-malloced object
+        // whose `YOUNG_RAWMALLOC` flag lives in the upper half of `HDR.tid`,
+        // so the frame's tid stamp covers the type-id half only.
+        let tid_store = &result[frame_idx + 1];
+        assert_eq!(tid_store.opcode, OpCode::GcStore);
+        assert_eq!(tid_store.arg(2).to_opref().inline_const_bits(), Some(7));
+        assert_eq!(
+            tid_store.arg(3).to_opref().inline_const_bits(),
+            Some((crate::header::TYPE_ID_BITS / 8) as i64)
+        );
         let null_before: Vec<i64> = result[..frame_idx]
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
@@ -5203,6 +5245,81 @@ mod tests {
         assert_eq!(
             malloc_count, 2,
             "second New must be a fresh CallMallocNursery, got {result:?}"
+        );
+    }
+
+    /// `getarraydescr_for_frame` answers the `jf_frame` item width, not the
+    /// Signed width.  On wasm32 a Signed is 4 bytes but the callee reads
+    /// every input as an i64 slot, so a 4-byte store left the upper half of
+    /// a recycled nursery slot in the callee's frame argument.
+    #[test]
+    fn test_call_assembler_stores_args_at_frame_item_width() {
+        #[derive(Debug)]
+        struct TestLoopToken(u64);
+        impl majit_ir::Descr for TestLoopToken {
+            fn as_loop_token_descr(&self) -> Option<&dyn majit_ir::LoopTokenDescr> {
+                Some(self)
+            }
+        }
+        impl majit_ir::LoopTokenDescr for TestLoopToken {
+            fn loop_token_number(&self) -> u64 {
+                self.0
+            }
+        }
+
+        let mut rw = make_rewriter();
+        rw.jitframe_info = Some(JitFrameDescrs {
+            jitframe_tid: 7,
+            jitframe_fixed_size: 28,
+            jf_frame_info_ofs: 0,
+            jf_descr_ofs: 4,
+            jf_force_descr_ofs: 8,
+            jf_savedata_ofs: 12,
+            jf_guard_exc_ofs: 16,
+            jf_forward_ofs: 20,
+            jf_frame_ofs: 28,
+            jf_frame_baseitemofs: 32,
+            jf_frame_lengthofs: 28,
+            sign_size: 4,
+            jf_frame_itemsize: 8,
+        });
+        rw.call_assembler_callee_locs = Some(Box::new(|token| {
+            (token == 9).then_some(CallAssemblerCalleeLocs {
+                _ll_initial_locs: vec![8, 16, 24],
+                frame_depth: 4,
+                frame_info_ptr: 0x1000,
+                index_of_virtualizable: -1,
+            })
+        }));
+        let call = Op::with_descr(
+            OpCode::CallAssemblerR,
+            &[
+                ro(OpRef::ref_op(0)),
+                ro(OpRef::int_op(1)),
+                ro(OpRef::float_op(2)),
+            ],
+            std::sync::Arc::new(TestLoopToken(9)),
+        );
+
+        let result = rw.rewrite_ops(&[call]);
+
+        let frame_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::CallMallocNurseryVarsizeFrame)
+            .expect("handle_call_assembler allocates the callee frame");
+        let arg_stores: Vec<(i64, i64)> = result[frame_idx..]
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .filter_map(|o| {
+                let ofs = o.arg(1).to_opref().inline_const_bits()?;
+                let size = o.arg(3).to_opref().inline_const_bits()?;
+                (ofs >= 40).then_some((ofs, size))
+            })
+            .collect();
+        assert_eq!(
+            arg_stores,
+            vec![(40, 8), (48, 8), (56, 8)],
+            "each CALL_ASSEMBLER argument fills a whole jf_frame item, got {result:?}"
         );
     }
 

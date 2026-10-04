@@ -5822,6 +5822,27 @@ fn write_ref_reg<Sym: WalkSym>(
     Ok(())
 }
 
+/// Write a Ref register for a link renaming (`flatten.py insert_renamings`:
+/// `ref_copy` / `ref_pop`) without stamping operand TOS.
+///
+/// A renaming moves a value that is already live into the target block's
+/// register; it is not the result of the Python opcode it happens to be
+/// flattened into.  The opcode's own push stamped `vstack_last_ref` at its
+/// `setarrayitem_vable_r` or residual result, and a following renaming of an
+/// unrelated local (a loop-carried constant, say) must not replace it.
+fn write_renaming_ref_reg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let saved = ctx.frame_state.borrow().vstack_last_ref;
+    write_ref_reg(ctx, pc, dst, value, concrete)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
+    Ok(())
+}
+
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
@@ -7859,6 +7880,16 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// the COND_CALL and leaves the guard holding the recorder's placeholder
     /// resume position.
     pub guard_stamp: GuardStampTarget,
+
+    /// Resume an inlined callee's plain guard at its own opcode: liveness is
+    /// read at the `-live-` directly before the op (`get_list_of_active_boxes`,
+    /// `pc = self.pc - SIZE_LIVE_OP`) instead of at the Python opcode's
+    /// resume marker.  `_nonstandard_virtualizable`'s promote guard needs it:
+    /// the `setarrayitem_vable` that pushes a call's result sits after the
+    /// call in the same Python opcode, so the opcode's marker would resume by
+    /// running the finished call again, from registers the call consumed.
+    /// Falls back to the opcode marker when no `-live-` precedes the op.
+    pub orgpc_live_resume: bool,
 }
 
 /// Which already-recorded guard op a capture stamps its resume position on.
@@ -14662,7 +14693,7 @@ fn handle<Sym: WalkSym>(
                 (val, concrete)
             };
             let dst = code[op.pc + 1] as usize;
-            write_ref_reg(ctx, op.pc, dst, val, concrete)?;
+            write_renaming_ref_reg(ctx, op.pc, dst, val, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "int_push/i" => {
@@ -14744,7 +14775,7 @@ fn handle<Sym: WalkSym>(
             // the guard.
             let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
-            write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
+            write_renaming_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {
@@ -15447,6 +15478,15 @@ fn handle<Sym: WalkSym>(
             // Nested inlines inherit `carrier_resume` and are consumed by
             // `try_walker_inline_resolved_user_call`. A missing token there
             // residualizes the original CALL.
+            //
+            // That else-branch runs only after a `loop_header` stamped
+            // `seen_loop_header_for_jdindex` (`pyjitpl.py`: a nested portal
+            // with no loop_header returns). The per-opcode dispatch merge
+            // point of a reconstructed frame has no preceding `loop_header`;
+            // compiling a loop there at a mid-CALL `next_instr` re-runs the
+            // CALL from a `-live-` that dropped its operands. A frame resumed
+            // mid-call continues at the return point (`blackhole.py`
+            // `_resume_mainloop`).
             let carrier_resume = ctx.fbw_mode.carrier_resume;
             let callee_code = (!ctx.is_top_level
                 && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
@@ -15459,31 +15499,49 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
-                let callee_key = crate::driver::make_green_key_typed(
-                    callee_code as *const (),
-                    next_instr,
-                    is_being_profiled,
-                );
-                let (driver, _) = crate::driver::driver_pair();
-                let greenboxes = [
-                    Value::Int(next_instr as i64),
-                    Value::Int(is_being_profiled as i64),
-                    Value::Ref(majit_ir::GcRef(callee_code)),
-                ];
-                let red_types = [Type::Ref, Type::Ref];
-                let token = driver.get_or_make_portal_assembler_token_arc(
-                    &callee_key,
-                    &greenboxes,
-                    &red_types,
-                );
-                if token.is_some() || carrier_resume {
-                    return Ok(surface_carrier_or_inline_subloop(
-                        token,
+                if crate::jitcode_dispatch::p2_diag_enabled() {
+                    let name = unsafe {
+                        let w = callee_code as pyre_object::PyObjectRef;
+                        let raw = pyre_interpreter::w_code_get_ptr(w)
+                            as *const pyre_interpreter::CodeObject;
+                        if raw.is_null() {
+                            "<null>".to_string()
+                        } else {
+                            (*raw).obj_name.as_str().to_string()
+                        }
+                    };
+                    eprintln!(
+                        "[p2-merge] name={name} next_instr={next_instr} seen_loop_header={} carrier_resume={carrier_resume} is_top_level={} op_pc={}",
+                        ctx.trace_ctx.seen_loop_header_for_jdindex, ctx.is_top_level, op.pc,
+                    );
+                }
+                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 {
+                    let callee_key = crate::driver::make_green_key_typed(
+                        callee_code as *const (),
                         next_instr,
-                        carrier_resume,
-                        op.pc,
-                        op.next_pc,
-                    ));
+                        is_being_profiled,
+                    );
+                    let (driver, _) = crate::driver::driver_pair();
+                    let greenboxes = [
+                        Value::Int(next_instr as i64),
+                        Value::Int(is_being_profiled as i64),
+                        Value::Ref(majit_ir::GcRef(callee_code)),
+                    ];
+                    let red_types = [Type::Ref, Type::Ref];
+                    let token = driver.get_or_make_portal_assembler_token_arc(
+                        &callee_key,
+                        &greenboxes,
+                        &red_types,
+                    );
+                    if token.is_some() || carrier_resume {
+                        return Ok(surface_carrier_or_inline_subloop(
+                            token,
+                            next_instr,
+                            carrier_resume,
+                            op.pc,
+                            op.next_pc,
+                        ));
+                    }
                 }
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
@@ -15500,6 +15558,8 @@ fn handle<Sym: WalkSym>(
                     // assembler`, metainterp.rs).
                     // Same carrier rule as the arm above: a resume with no
                     // token still leaves the loop body via `direct_call_may_force`.
+                    // Same loop_header gate: a mid-CALL dispatch merge point
+                    // is not that else-branch.
                     let carrier_resume = ctx.fbw_mode.carrier_resume;
                     let callee_code = ctx
                         .session
@@ -15508,31 +15568,33 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
-                        let callee_key = crate::driver::make_green_key_typed(
-                            callee_code as *const (),
-                            next_instr,
-                            is_being_profiled,
-                        );
-                        let (driver, _) = crate::driver::driver_pair();
-                        let greenboxes = [
-                            Value::Int(next_instr as i64),
-                            Value::Int(is_being_profiled as i64),
-                            Value::Ref(majit_ir::GcRef(callee_code)),
-                        ];
-                        let red_types = [Type::Ref, Type::Ref];
-                        let token = driver.get_or_make_portal_assembler_token_arc(
-                            &callee_key,
-                            &greenboxes,
-                            &red_types,
-                        );
-                        if token.is_some() || carrier_resume {
-                            return Ok(surface_carrier_or_inline_subloop(
-                                token,
+                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 {
+                            let callee_key = crate::driver::make_green_key_typed(
+                                callee_code as *const (),
                                 next_instr,
-                                carrier_resume,
-                                op.pc,
-                                op.next_pc,
-                            ));
+                                is_being_profiled,
+                            );
+                            let (driver, _) = crate::driver::driver_pair();
+                            let greenboxes = [
+                                Value::Int(next_instr as i64),
+                                Value::Int(is_being_profiled as i64),
+                                Value::Ref(majit_ir::GcRef(callee_code)),
+                            ];
+                            let red_types = [Type::Ref, Type::Ref];
+                            let token = driver.get_or_make_portal_assembler_token_arc(
+                                &callee_key,
+                                &greenboxes,
+                                &red_types,
+                            );
+                            if token.is_some() || carrier_resume {
+                                return Ok(surface_carrier_or_inline_subloop(
+                                    token,
+                                    next_instr,
+                                    carrier_resume,
+                                    op.pc,
+                                    op.next_pc,
+                                ));
+                            }
                         }
                     }
                     top_level_live_code(ctx)

@@ -483,6 +483,35 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     }
 }
 
+/// Resume a suspended frame through the same one-word residual ABI.
+///
+/// `w_inputvalue` null means no sent value (`Option::None`). A sent `None`
+/// is `w_none`, not null. `operr` / `throw_args` stay with the caller: this
+/// residual is only the `next`/`send` path, whose resume payload is one
+/// object. A pointer to the caller's `FrameResumeArgs` would be the stack
+/// address observed while tracing, and the compiled loop would keep calling
+/// it after that frame is gone.
+#[majit_macros::dont_look_inside]
+pub fn eval_resumed_frame_raw(frame: &mut PyFrame, w_inputvalue: PyObjectRef) -> PyObjectRef {
+    let mut resume = FrameResumeArgs {
+        w_inputvalue: if w_inputvalue.is_null() {
+            None
+        } else {
+            Some(w_inputvalue)
+        },
+        operr: None,
+        throw_args: None,
+    };
+    clear_call_error();
+    match get_eval_fn()(frame, Some(&mut resume)) {
+        Ok(value) => value,
+        Err(error) => {
+            set_call_error(error);
+            PY_NULL
+        }
+    }
+}
+
 // ── JIT parameter injection ──────────────────────────────────────
 //
 // `pypy/interpreter/executioncontext.py settrace` invokes

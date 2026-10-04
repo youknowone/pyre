@@ -141,6 +141,148 @@ fn defaults_repr_class_addr(repr: DefaultsRepr) -> i64 {
     ty as i64
 }
 
+/// Read element `tuple_index` of a pair tuple whose class is already guarded
+/// to `repr`.  For `Cls_oo` the `valueN` field is the element; for `Cls_ii`
+/// the element is `wrapint` of the field (`specialisedtupleobject.py`
+/// `wraps`), a fresh box the interpreter's `w_tuple_getitem` makes as well.
+/// The second value is the concrete a boxed int was stamped with, which the
+/// caller's argument concrete has to follow.
+fn emit_pair_tuple_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    tuple_op: OpRef,
+    repr: DefaultsRepr,
+    tuple_index: usize,
+    value: pyre_object::PyObjectRef,
+) -> Result<(OpRef, Option<ConcreteValue>), DispatchError> {
+    if repr == DefaultsRepr::PairObject {
+        let descr = if tuple_index == 0 {
+            crate::descr::specialised_tuple_oo_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_oo_value1_descr()
+        };
+        let elem = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, tuple_op, descr);
+        return Ok((elem, None));
+    }
+    debug_assert!(repr == DefaultsRepr::PairInt);
+    let descr = if tuple_index == 0 {
+        crate::descr::specialised_tuple_ii_value0_descr()
+    } else {
+        crate::descr::specialised_tuple_ii_value1_descr()
+    };
+    let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, tuple_op, descr);
+    let elem = unsafe { pyre_object::w_int_get_value(value) };
+    let boxed = walker_box_int(ctx, op_pc, raw, elem)?;
+    // `wrapint` emits a heap `NewWithVtable`, so the stamped concrete has to
+    // be a heap pointer too — the walk-time `w_tuple_getitem` box may be a
+    // tagged immediate.  The caller re-homes the argument's concrete onto
+    // whatever `box_int_concrete` picked, or its seeding loop would re-stamp
+    // the op with the other one.
+    let concrete = box_int_concrete(elem, value as i64);
+    ctx.trace_ctx.set_opref_concrete(boxed, concrete);
+    let rehomed = match concrete {
+        majit_ir::Value::Ref(gcref) => Some(ConcreteValue::Ref(
+            gcref.as_usize() as pyre_object::PyObjectRef
+        )),
+        _ => None,
+    };
+    Ok((boxed, rehomed))
+}
+
+/// Pin every ref already stored in `concretes`, run `body`, then copy the
+/// collector's forwarded slots back. `body` may allocate (`wrapint` does),
+/// and it reads the forwarded pointers: the copy it was called with can
+/// already have moved inside `pin_roots`.
+fn with_arg_refs_pinned<T>(
+    concretes: &mut [ConcreteValue],
+    body: impl FnOnce(&mut [ConcreteValue]) -> T,
+) -> T {
+    let mut live = Vec::new();
+    let mut slots = Vec::new();
+    for (i, concrete) in concretes.iter().copied().enumerate() {
+        if let ConcreteValue::Ref(obj) = concrete
+            && !obj.is_null()
+        {
+            slots.push((i, live.len()));
+            live.push(obj);
+        }
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&live);
+    let refresh = |concretes: &mut [ConcreteValue]| {
+        for &(i, slot) in &slots {
+            if let ConcreteValue::Ref(obj) = &mut concretes[i] {
+                *obj = pyre_object::gc_roots::shadow_stack_get(base + slot);
+            }
+        }
+    };
+    refresh(concretes);
+    let result = body(concretes);
+    refresh(concretes);
+    result
+}
+
+fn refresh_rooted_refs(concretes: &mut [ConcreteValue], slots: &[Option<usize>]) {
+    for (concrete, slot) in concretes.iter_mut().zip(slots) {
+        if let (ConcreteValue::Ref(obj), Some(slot)) = (concrete, *slot) {
+            *obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+    }
+}
+
+fn refresh_varkw_concretes(extras: &mut [VarkwExtra], slots: &[Option<usize>]) {
+    for (extra, slot) in extras.iter_mut().zip(slots) {
+        if let (ConcreteValue::Ref(obj), Some(slot)) = (&mut extra.concrete, *slot) {
+            *obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+    }
+}
+
+/// Publish `obj` on `roots` and point `slots[index]` at that word. A later
+/// pin can move every earlier word, so both slices are re-read afterwards.
+fn adopt_rooted_ref(
+    roots: &pyre_object::gc_roots::RootScope,
+    concretes: &mut [ConcreteValue],
+    slots: &mut [Option<usize>],
+    varkw: &mut [VarkwExtra],
+    varkw_slots: &[Option<usize>],
+    index: usize,
+    obj: pyre_object::PyObjectRef,
+) {
+    let _ = roots.pin_root(obj);
+    let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if let Some(entry) = slots.get_mut(index) {
+        *entry = Some(slot);
+    }
+    // A missing parameter is `Null`. Refresh only rewrites an existing
+    // `Ref`, so the hole has to become one before the slots are re-read.
+    if let Some(concrete) = concretes.get_mut(index) {
+        *concrete = ConcreteValue::Ref(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
+    refresh_rooted_refs(concretes, slots);
+    refresh_varkw_concretes(varkw, varkw_slots);
+}
+
+/// The [`DefaultsRepr`] a tuple of this exact `ob_type` stores its elements
+/// in, or `None` for a layout the walker has no element read for.
+fn defaults_repr_of(ob_type: *const pyre_object::pyobject::PyType) -> Option<DefaultsRepr> {
+    if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
+        Some(DefaultsRepr::ItemsBlock)
+    } else if std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
+    ) {
+        Some(DefaultsRepr::PairInt)
+    } else if std::ptr::eq(
+        ob_type,
+        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+    ) {
+        Some(DefaultsRepr::PairObject)
+    } else {
+        None
+    }
+}
+
 /// `function.py:188-193,217-231` — which `defs_w` element fills each parameter
 /// the call left unbound.  `defs_w` covers the LAST `len(defs_w)` parameters,
 /// so parameter `p` takes `defs_w[p - (nparams - ndefaults)]`; a `missing`
@@ -165,32 +307,29 @@ unsafe fn positional_defaults_for_inline(
     // The layout is what `ob_type` names.  The type test here only decides
     // which read to emit; keeping that decision valid for a later tuple is the
     // emitting half's job, through the shape guards it records.
-    let ob_type = unsafe { (*tuple).ob_type };
-    let repr = if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
-        DefaultsRepr::ItemsBlock
-    } else if std::ptr::eq(
-        ob_type,
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
-    ) {
-        DefaultsRepr::PairInt
-    } else if std::ptr::eq(
-        ob_type,
-        &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
-    ) {
-        DefaultsRepr::PairObject
-    } else {
-        return None;
-    };
+    let repr = defaults_repr_of(unsafe { (*tuple).ob_type })?;
     let ndefaults = unsafe { pyre_object::w_tuple_len(tuple) };
     let first_defaulted = nparams.checked_sub(ndefaults)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let tuple_slot = roots.base();
+    let _ = roots.pin_root(tuple);
+    // The tuple pin occupies `tuple_slot`; boxed elements follow it.
+    let values_base = tuple_slot + 1;
     let mut values = Vec::with_capacity(missing.len());
     for &param_index in missing {
         let tuple_index = param_index.checked_sub(first_defaulted)?;
+        // `Cls_ii` / `Cls_ff` box a fresh int or float. Re-read the tuple and
+        // pin each box before the next `w_tuple_getitem`.
+        let tuple = roots.get(tuple_slot);
         let value = unsafe { pyre_object::w_tuple_getitem(tuple, tuple_index as i64) }?;
+        let _ = roots.pin_root(value);
         values.push((param_index, tuple_index, value));
     }
+    for (offset, entry) in values.iter_mut().enumerate() {
+        entry.2 = roots.get(values_base + offset);
+    }
     Some(PositionalDefaultsInline {
-        tuple,
+        tuple: roots.get(tuple_slot),
         repr,
         len: ndefaults,
         values,
@@ -2308,6 +2447,33 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
+/// Whether a loop-carried operand parked below the call keeps the fold
+/// worthwhile.
+///
+/// A numeric accumulator (`a` in `a += r(d)`) does: the fold's resume rebuilds
+/// it from the caller's own register writeback, and folding the call is what
+/// turns a residual recursion back into an assembler-to-assembler jump.
+///
+/// A live iterator does not, for a recursive callee.  Folding a self-call that
+/// sits under a `FOR_ITER` iterator costs the caller a compiled loop and a
+/// bridge — measured on
+/// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
+/// `loops_compiled 3 -> 2`, `bridges_compiled 3 -> 2` and 0.18s -> 0.22s.  The
+/// residual path keeps that loop, so leave the iterator-bearing shape to it.
+fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    slot: OpRef,
+) -> bool {
+    match ctx.trace_ctx.box_value(slot) {
+        Some(majit_ir::Value::Int(_)) | Some(majit_ir::Value::Float(_)) => true,
+        Some(majit_ir::Value::Ref(r)) => {
+            let obj = r.as_usize();
+            obj != 0 && unsafe { pyre_object::is_int(obj as pyre_object::PyObjectRef) }
+        }
+        _ => false,
+    }
+}
+
 /// Whether the call at `op_pc` in the walk's own code sits inside a protected
 /// region its `GUARD_NO_EXCEPTION` deopt would have to resume into.
 ///
@@ -2349,13 +2515,14 @@ fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> b
 ///
 /// This screen is the fold's own precondition, not upstream's.  The whole call
 /// collapses into one `CALL_ASSEMBLER` plus
-/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`, so a callee that leaves its frame
-/// by any route other than returning — a `raise` crossing the boundary, a
-/// protected region, an `abort_permanent` marker — has nowhere to put the
-/// unwind in the caller's trace.  Those are the same body facts the inline
-/// route screens on before it walks a callee body, and they answer in the same
-/// direction `look_inside_graph` (`codewriter/policy.py`) answers a "no" with:
-/// the call stays a residual.
+/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`.  A `raise` that crosses the
+/// boundary needs nothing more: the callee's compiled trace propagates it and
+/// `GUARD_NO_EXCEPTION` resumes the caller into its unwind, as
+/// `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) does for every
+/// callee it reaches.  What the fold cannot represent is a protected region
+/// inside the callee or an `abort_permanent` marker; those stay a residual,
+/// the direction `look_inside_graph` (`codewriter/policy.py`) answers a "no"
+/// with.
 ///
 /// Not asked of the walk's own code: `call_site_inside_protected_region` already
 /// read that body's table at this very call site.
@@ -2363,7 +2530,7 @@ fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
     let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return false;
     };
-    !facts.contains_raise && !facts.has_exception_table && !facts.has_abort_permanent
+    !facts.has_exception_table && !facts.has_abort_permanent
 }
 
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
@@ -2552,6 +2719,50 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         if !admit_mutual && !foreign_callee_admits_call_assembler(w_code) {
             if p2_diag_enabled() {
                 eprintln!("[p2-ca] decline pc={} reason=not-self-nor-mutual", op.pc);
+            }
+            return Ok(None);
+        }
+    }
+    // The operand stack below the call's own operands (`r_args = [callable,
+    // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
+    // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
+    // the iterator disqualifies the fold — see
+    // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
+    // operand instead kept a recursion called from a `while` body on the
+    // residual path permanently: `r(8)` a million times over measured 1.23s
+    // against 0.07s for the same run with the numeric shape admitted, because
+    // every recursive call re-entered through the func-entry residency door.
+    // The loopless `fib` shape keeps only within-iteration temps (a prior call
+    // result), no InputArg, and was foldable either way.
+    //
+    // The screen is about a recursion re-entering through the loop it sits
+    // in.  A foreign, non-recursive callee called from a `for` body is the
+    // shape `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) folds for
+    // any callee with its own loop token; declining it left the whole callee
+    // as a residual call per iteration.
+    let recursive_callee = w_code as usize == caller_code as usize
+        || ctx
+            .session
+            .borrow()
+            .framestack
+            .iter()
+            .any(|f| f.w_code == w_code as usize);
+    if recursive_callee && ctx.vstack_valid {
+        let kept_below = ctx
+            .frame_state
+            .borrow()
+            .vstack_boxes
+            .len()
+            .saturating_sub(r_args.len());
+        if ctx.frame_state.borrow().vstack_boxes[..kept_below]
+            .iter()
+            .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
+        {
+            if p2_diag_enabled() {
+                eprintln!(
+                    "[p2-ca] decline pc={} reason=loop-carried-inputarg-below",
+                    op.pc
+                );
             }
             return Ok(None);
         }
@@ -2752,6 +2963,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if ec.is_none() {
         return Ok(None);
     }
+
+    // `function.py` `_immutable_fields_ = ['code?', ...]`. The assembler
+    // token and this frame's pycode come from the function's code. A
+    // `GuardValue` on the function object does not watch that field, so
+    // `f.__code__ = ...` would keep entering the old body. The `?` marker
+    // invalidates the trace instead.
+    walker_pin_function_code(ctx, op.pc, callable)?;
 
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
@@ -3528,12 +3746,15 @@ const NULL_OR_SELF_ARG_INDEX: usize = 1;
 /// is the implicit leading argument inserted by `call_kw` for method-form
 /// calls (`Arguments.prepend` / `funcrun_obj` upstream).
 ///
+/// A keyword that names no parameter is returned separately for a `**kwargs`
+/// callee, which collects it into its mapping (`_match_signature`).
+///
 /// Returns `None` (declining to the residual call, no behavior change) for any
-/// shape the plain positional seeding cannot serve: a non-constant / non-tuple
-/// `kwnames`, a callee with `*args` / `**kwargs` / keyword-only parameters, an
-/// argument count that does not exactly fill the positional parameters (a
-/// default would be needed), a keyword naming an unknown parameter, or a
-/// keyword colliding with a positionally-filled parameter ("multiple values").
+/// shape the seeding cannot serve: a non-constant / non-tuple `kwnames`, a
+/// callee with `*args` / keyword-only parameters, more positional arguments
+/// than the callee takes, a keyword naming an unknown parameter of a callee
+/// without `**kwargs`, or a keyword colliding with a positionally-filled
+/// parameter ("multiple values").
 ///
 /// # Safety
 /// `w_code` must be the live code object pointer for the resolved callable.
@@ -3557,10 +3778,24 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
         && unsafe { (*raw).kwonlyarg_count } == 0
 }
 
+/// Whether the only local of `w_code` outside `registers_r[0..co_argcount]`
+/// is the `**kwargs` mapping.
+fn fbw_callee_scope_is_varkw_only(w_code: *const ()) -> bool {
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return false;
+    }
+    let flags = unsafe { (*raw).flags };
+    !flags.contains(pyre_interpreter::CodeFlags::VARARGS)
+        && flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
+        && unsafe { (*raw).kwonlyarg_count } == 0
+}
+
 /// The scope slot `_match_signature` writes the vararg tuple into
-/// (`_match_signature`): `co_argcount + co_kwonlyargcount`.  `**kwargs`
-/// still leaves the shape residual — see [`fbw_callee_kwonly_count`] for why
-/// that local is the one the seeding cannot build.
+/// (`_match_signature`): `co_argcount + co_kwonlyargcount`.
 fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -3570,22 +3805,37 @@ fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
         return None;
     }
     let flags = unsafe { (*raw).flags };
-    if flags.contains(pyre_interpreter::CodeFlags::VARARGS)
-        && !flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
-    {
+    if flags.contains(pyre_interpreter::CodeFlags::VARARGS) {
         Some(unsafe { (*raw).arg_count as usize + (*raw).kwonlyarg_count as usize })
     } else {
         None
     }
 }
 
+/// The scope slot `_match_signature` writes the `**kwargs` mapping into
+/// (`_match_signature`): `co_argcount + co_kwonlyargcount + has_vararg`.
+fn fbw_callee_varkw_slot(w_code: *const ()) -> Option<usize> {
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let flags = unsafe { (*raw).flags };
+    if flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS) {
+        Some(unsafe {
+            (*raw).arg_count as usize
+                + (*raw).kwonlyarg_count as usize
+                + usize::from(flags.contains(pyre_interpreter::CodeFlags::VARARGS))
+        })
+    } else {
+        None
+    }
+}
+
 /// How many keyword-only locals the seeding has to fill, or `None` when the
-/// callee's scope owns one it cannot build at all.
-///
-/// `**kwargs` is that one.  `_match_signature` writes a FRESH mapping into it
-/// on every call (`_match_signature`), and unlike the vararg's empty tuple a
-/// `dict` is mutable, so there is no shared object to bind and no allocation
-/// the walk can stand in for.  That shape stays residual.
+/// callee's code object is not readable.
 fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -3594,10 +3844,16 @@ fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
     if raw.is_null() {
         return None;
     }
-    if unsafe { (*raw).flags }.contains(pyre_interpreter::CodeFlags::VARKEYWORDS) {
-        return None;
-    }
     Some(unsafe { (*raw).kwonlyarg_count } as usize)
+}
+
+/// One keyword `_match_signature` (`argument.py`) collects into the callee's
+/// `**kwargs` mapping because it names no parameter, in call order.
+struct VarkwExtra {
+    /// The `kwnames` entry, a `str` constant of the calling code.
+    name: pyre_object::PyObjectRef,
+    value: OpRef,
+    concrete: ConcreteValue,
 }
 
 unsafe fn fbw_reorder_call_kw_args(
@@ -3606,7 +3862,7 @@ unsafe fn fbw_reorder_call_kw_args(
     w_code: *const (),
     nparams: usize,
     receiver: Option<(OpRef, ConcreteValue)>,
-) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>, Vec<VarkwExtra>)> {
     if r_args.len() < 3 || arg_concretes.len() < 3 {
         return None;
     }
@@ -3623,14 +3879,24 @@ unsafe fn fbw_reorder_call_kw_args(
         return None;
     }
     let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
+    // A `**kwargs` callee takes every keyword that names no parameter into its
+    // mapping (`_match_signature`), so only the positional arguments have to
+    // fit its parameters.
+    let has_varkw = fbw_callee_varkw_slot(w_code).is_some();
     // No positional parameter may be filled more than once, and the call may
-    // not pass more than the callee takes — `*args` / `**kwargs` /
-    // keyword-only slots are ruled out separately by
-    // `fbw_callee_scope_is_positional_only`.  A parameter left unbound is
-    // allowed through as a hole; the caller fills it from `defs_w` or declines
-    // when it has no default.
+    // not pass more than the callee takes — `*args` / keyword-only slots are
+    // ruled out separately by `fbw_callee_scope_is_positional_only`.  A
+    // parameter left unbound is allowed through as a hole; the caller fills it
+    // from `defs_w` or declines when it has no default.
     let receiver_count = usize::from(receiver.is_some());
-    if nparams == 0 || nkw > nargs || nargs + receiver_count > nparams {
+    if nkw > nargs {
+        return None;
+    }
+    if has_varkw {
+        if nargs - nkw + receiver_count > nparams {
+            return None;
+        }
+    } else if nparams == 0 || nargs + receiver_count > nparams {
         return None;
     }
     let raw = unsafe {
@@ -3640,7 +3906,7 @@ unsafe fn fbw_reorder_call_kw_args(
     if raw.is_null() {
         return None;
     }
-    if !fbw_callee_scope_is_positional_only(w_code) {
+    if !fbw_callee_scope_is_positional_only(w_code) && !fbw_callee_scope_is_varkw_only(w_code) {
         return None;
     }
     let varnames = unsafe { &(*raw).varnames };
@@ -3648,6 +3914,7 @@ unsafe fn fbw_reorder_call_kw_args(
         return None;
     }
     let n_pos = nargs - nkw;
+    let mut extras = Vec::new();
     let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
     let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
     if let Some((receiver_arg, receiver_concrete)) = receiver {
@@ -3667,18 +3934,32 @@ unsafe fn fbw_reorder_call_kw_args(
         let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
             .as_str()
             .ok()?;
+        let posonly = unsafe { (*raw).posonlyarg_count } as usize;
+        // A keyword naming no parameter — or, under PEP 570, naming a
+        // positional-only one — goes to the `**kwargs` mapping when the callee
+        // has one (`_match_signature`); without it the call is a TypeError the
+        // interpreter reports.
         let pi = varnames[..nparams]
             .iter()
-            .position(|v| v.as_str() == name)?;
+            .position(|v| v.as_str() == name)
+            .filter(|&pi| pi >= posonly);
+        let Some(pi) = pi else {
+            if !has_varkw {
+                return None;
+            }
+            extras.push(VarkwExtra {
+                name: name_obj,
+                value: args[n_pos + j],
+                concrete: arg_conc[n_pos + j],
+            });
+            continue;
+        };
         // A keyword may only bind a parameter past the positional fill, and each
         // parameter at most once (else Python raises "multiple values for
         // argument").  A name in the positional-only range is not bindable by
         // keyword at all — `def f(x, /)` called as `f(x=1)` is a TypeError, so
         // binding slot 0 here would inline a call the interpreter rejects.
-        if pi < receiver_count + n_pos
-            || pi < unsafe { (*raw).posonlyarg_count } as usize
-            || slot_args[pi].is_some()
-        {
+        if pi < receiver_count + n_pos || slot_args[pi].is_some() {
             return None;
         }
         slot_args[pi] = Some(args[n_pos + j]);
@@ -3690,7 +3971,7 @@ unsafe fn fbw_reorder_call_kw_args(
         out_args.push(slot_args[k].unwrap_or(OpRef::NONE));
         out_conc.push(slot_conc[k].unwrap_or(ConcreteValue::Null));
     }
-    Some((out_args, out_conc))
+    Some((out_args, out_conc, extras))
 }
 
 /// Permute a builtin CALL_KW into the gateway Signature's parameter
@@ -3890,86 +4171,361 @@ fn fbw_unpack_specialised_tuple_pair<Sym: WalkSym>(
     None
 }
 
-/// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
-/// kwargs_or_null)` star tuple into the positional argument boxes the inline
-/// path seeds from, or `None` to leave the call a residual.
+/// A `f(*args)` star tuple whose elements the resolved half reads off the
+/// tuple, once every non-emitting eligibility check has passed.
 ///
-/// The elements are read out of the heap cache rather than off the tuple, so
-/// this folds exactly when the star tuple is virtual at the call — the
-/// `args = (...)` / `f(*args)` pair the walker just recorded, whose
-/// `wrappeditems` block and per-index stores are still cached
-/// (`try_walker_specialize_newtuple_object`), or whose `value0` / `value1`
-/// fields are cached on a specialised pair
-/// (`fbw_unpack_specialised_tuple_pair`).  A tuple that arrived from
-/// anywhere else has no cached block and declines, as does any `**kwargs`
-/// merge (the helper's `kwargs_or_null` is then a real mapping) and any arity
-/// that is not the callee's exact parameter count.
+/// `Arguments._combine_starargs_wrapped` takes the positional arguments from
+/// `space.fixedview(w_stararg)`, which for an exact tuple is `w_obj.tolist()`:
+/// the `wrappeditems` elements of a `W_TupleObject`, or the `wraps[i]` of a
+/// specialised pair.  The emit re-proves the layout with a class guard and,
+/// for the array-backed tuple, pins its length to the callee's arity.
+struct StarArgsInline {
+    starargs_op: OpRef,
+    repr: DefaultsRepr,
+    /// The elements at resolve time, in parameter order.
+    values: Vec<pyre_object::PyObjectRef>,
+}
+
+/// The `**` mapping of a `CALL_FUNCTION_EX`, bound to the callee's parameters
+/// by name once every non-emitting eligibility check has passed.
+///
+/// `Arguments._combine_starstarargs_wrapped` takes the keywords of an exact
+/// dict through `view_as_kwargs`, and `_match_keywords` binds each one to the
+/// parameter of that name.  The emit re-proves the dict's layout and strategy,
+/// pins its length to the number of keywords bound here, and reads each bound
+/// parameter with a lookup that must hit: with the length pinned, those hits
+/// leave no keyword for `_match_keywords` to reject.
+struct StarKwargsInline {
+    dict_op: OpRef,
+    /// `(parameter index, interned parameter name, value at resolve time)`.
+    bound: Vec<(usize, pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
+}
+
+/// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
+/// kwargs_or_null)` call into the argument boxes the inline path seeds from,
+/// or `None` to leave the call a residual.
+///
+/// When the star tuple is virtual at the call — the `args = (...)` /
+/// `f(*args)` pair the walker just recorded, whose `wrappeditems` block and
+/// per-index stores are still cached (`try_walker_specialize_newtuple_object`),
+/// or whose `value0` / `value1` fields are cached on a specialised pair
+/// (`fbw_unpack_specialised_tuple_pair`) — the elements come out of the heap
+/// cache and the tuple keeps no consumer. Any other exact tuple is read the
+/// way `space.fixedview` reads it; those reads are recorded by the resolved
+/// half, so the argument boxes returned here are the tuple itself as a
+/// placeholder and the [`StarArgsInline`] names what replaces them.
+///
+/// Without a `**` mapping the star tuple has to fill every parameter. With
+/// one, it fills a prefix and the mapping binds the rest by name
+/// ([`fbw_bind_star_kwargs`]); a parameter neither fills is left as a hole for
+/// the caller to fill from `defs_w`.
 fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     arg_concretes: &[ConcreteValue],
+    w_code: *const (),
     nparams: usize,
-) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+) -> Option<(
+    Vec<OpRef>,
+    Vec<ConcreteValue>,
+    Option<StarArgsInline>,
+    Option<StarKwargsInline>,
+)> {
     if r_args.len() < 4 || arg_concretes.len() < 4 || nparams == 0 {
         return None;
     }
     // `kwargs_or_null` is the checked `PY_NULL` sentinel for a call with no
-    // `**` merge; anything else is a real mapping this fold does not bind.
-    match arg_concretes[3] {
-        ConcreteValue::Null => {}
-        ConcreteValue::Ref(kwargs) if kwargs.is_null() || kwargs == pyre_object::PY_NULL => {}
+    // `**` merge; anything else is the mapping `DICT_MERGE` built.
+    let kwargs = match arg_concretes[3] {
+        ConcreteValue::Null => None,
+        ConcreteValue::Ref(kwargs) if kwargs.is_null() || kwargs == pyre_object::PY_NULL => None,
+        ConcreteValue::Ref(kwargs) => Some(kwargs),
         _ => return None,
-    }
+    };
+    let arity_fits = |npos: usize| {
+        if kwargs.is_some() {
+            npos <= nparams
+        } else {
+            npos == nparams
+        }
+    };
     // `wrappeditems` resolves to a structural field index (offset / size /
     // type), so an object whose slot 0 happens to match — a list's backing
     // store, say — would hit the same cache entry and be unpacked as if its
     // slots were tuple element refs.  `f(*some_list)` is ordinary Python, so
     // pin the concrete to a real tuple the way the `kwnames` path does before
     // reading the field.
+    // `fixedview` (`objspace.py`) reads storage only when `_uses_tuple_iter`
+    // holds. A tuple subclass that overrides `__iter__` does not, so only an
+    // exact tuple (the specialised arity-2 variants included) is unpacked
+    // here. Anything else stays a residual and runs its iterator.
     let ConcreteValue::Ref(starargs_obj) = arg_concretes[2] else {
         return None;
     };
-    if starargs_obj.is_null() || unsafe { !pyre_object::is_tuple(starargs_obj) } {
+    if starargs_obj.is_null() || unsafe { !pyre_object::is_exact_tuple(starargs_obj) } {
         return None;
     }
     let starargs = r_args[2];
     // `fixedview` on a specialised pair is `tolist` / `getitem`, not
-    // `wrappeditems`. Only an arity-2 callee matches that layout.
-    if nparams == 2
+    // `wrappeditems`. Only an arity-2 callee with no `**` mapping matches
+    // that layout: the two fields already fill every parameter. A mapping
+    // still has to run `fbw_bind_star_kwargs`, which reports a duplicate or
+    // unexpected key.
+    if kwargs.is_none()
+        && nparams == 2
         && let Some(unpacked) =
             fbw_unpack_specialised_tuple_pair(ctx, op_pc, starargs_obj, starargs)
     {
-        return Some(unpacked);
+        return Some((unpacked.0, unpacked.1, None, None));
     }
     let items_descr = crate::descr::tuple_wrappeditems_descr();
-    let block = ctx
+    // Lives across the uncached `w_tuple_getitem` loop and the `**` bind
+    // below it. `Cls_ii` / `Cls_ff` box on each read, and the bind can
+    // allocate while those boxes are still only in a `Vec`.
+    let extract_roots = pyre_object::gc_roots::push_roots();
+    // The tuple is pinned before the mapping. `pin_root` normalizes the
+    // shadow stack, and later reads reload this slot.
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = extract_roots.pin_root(starargs_obj);
+    let kwargs_slot = if let Some(obj) = kwargs {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = extract_roots.pin_root(obj);
+        Some(slot)
+    } else {
+        None
+    };
+    let mut extracted_base: Option<usize> = None;
+    let (mut args, mut concretes, mut star) = if let Some(block) = ctx
         .trace_ctx
-        .heapcache_getfield_cached(starargs, items_descr.index())?;
-    // The cached length pins the arity: the callee takes exactly `nparams`
-    // positional parameters, and a mismatch is a runtime TypeError the inline
-    // path does not model.
-    let len_op = ctx.trace_ctx.heap_cache().arraylen(block)?;
-    match len_op.inline_const_to_value() {
-        Some(majit_ir::Value::Int(n)) if n as usize == nparams => {}
-        _ => return None,
+        .heapcache_getfield_cached(starargs, items_descr.index())
+    {
+        // The cached length pins the arity: a count the callee cannot take
+        // is a runtime TypeError the inline path does not model.
+        let len_op = ctx.trace_ctx.heap_cache().arraylen(block)?;
+        let npos = match len_op.inline_const_to_value() {
+            Some(majit_ir::Value::Int(n)) if n >= 0 && arity_fits(n as usize) => n as usize,
+            _ => return None,
+        };
+        let array_descr_index = crate::state::pyobject_gcarray_descr().index();
+        let mut args = Vec::with_capacity(nparams);
+        let mut concretes = Vec::with_capacity(nparams);
+        for index in 0..npos {
+            let elem = ctx.trace_ctx.heapcache_getarrayitem(
+                block,
+                OpRef::ConstInt(index as i64),
+                array_descr_index,
+            )?;
+            // Take each concrete from the element box itself, not from the
+            // tuple, so the seeded shadow is the one the symbolic argument
+            // carries.
+            let concrete = walker_concrete_ref_object(ctx, elem)?;
+            args.push(elem);
+            concretes.push(ConcreteValue::Ref(concrete));
+        }
+        (args, concretes, None)
+    } else {
+        // `_uses_tuple_iter` holds for the exact tuple classes alone, and
+        // those are the layouts `defaults_repr_of` has an element read for.
+        let starargs_live = extract_roots.get(tuple_slot);
+        let repr = defaults_repr_of(unsafe { (*starargs_live).ob_type })?;
+        let npos = unsafe { pyre_object::w_tuple_len(starargs_live) };
+        if !arity_fits(npos) {
+            return None;
+        }
+        let values_base = pyre_object::gc_roots::shadow_stack_len();
+        extracted_base = Some(values_base);
+        let mut values = Vec::with_capacity(npos);
+        for index in 0..npos {
+            let tuple = extract_roots.get(tuple_slot);
+            let item = unsafe { pyre_object::w_tuple_getitem(tuple, index as i64) }?;
+            let item = extract_roots.pin_root(item);
+            values.push(item);
+        }
+        let concretes = values.iter().map(|&v| ConcreteValue::Ref(v)).collect();
+        (
+            vec![starargs; npos],
+            concretes,
+            Some(StarArgsInline {
+                starargs_op: starargs,
+                repr,
+                values,
+            }),
+        )
+    };
+    // Cached elements are already boxes. Pin them before the bind: interning
+    // a parameter name can collect, and these are not on `extract_roots` yet.
+    let cached_pin = if extracted_base.is_none() {
+        let live: Vec<pyre_object::PyObjectRef> = concretes
+            .iter()
+            .filter_map(|concrete| match concrete {
+                ConcreteValue::Ref(obj) if !obj.is_null() => Some(*obj),
+                _ => None,
+            })
+            .collect();
+        let base = extract_roots.pin_roots(&live);
+        Some((base, live.len()))
+    } else {
+        None
+    };
+    let Some(kwargs) = kwargs else {
+        if let Some(base) = extracted_base {
+            rehome_extracted_star(&extract_roots, base, &mut concretes, star.as_mut());
+        }
+        rehome_cached_star(&extract_roots, cached_pin, &mut concretes);
+        return Some((args, concretes, star, None));
+    };
+    let kwargs_live = kwargs_slot
+        .map(|slot| extract_roots.get(slot))
+        .unwrap_or(kwargs);
+    let mut star_kwargs =
+        unsafe { fbw_bind_star_kwargs(r_args[3], kwargs_live, w_code, args.len(), nparams) }?;
+    let bound_live: Vec<pyre_object::PyObjectRef> =
+        star_kwargs.bound.iter().map(|entry| entry.2).collect();
+    let bound_base = extract_roots.pin_roots(&bound_live);
+    for (offset, entry) in star_kwargs.bound.iter_mut().enumerate() {
+        entry.2 = extract_roots.get(bound_base + offset);
     }
-    let array_descr_index = crate::state::pyobject_gcarray_descr().index();
-    let mut args = Vec::with_capacity(nparams);
-    let mut concretes = Vec::with_capacity(nparams);
-    for index in 0..nparams {
-        let elem = ctx.trace_ctx.heapcache_getarrayitem(
-            block,
-            OpRef::ConstInt(index as i64),
-            array_descr_index,
-        )?;
-        // Take each concrete from the element box itself, not from the tuple,
-        // so the seeded shadow is the one the symbolic argument carries.
-        let concrete = walker_concrete_ref_object(ctx, elem)?;
-        args.push(elem);
-        concretes.push(ConcreteValue::Ref(concrete));
+    if let Some(base) = extracted_base {
+        rehome_extracted_star(&extract_roots, base, &mut concretes, star.as_mut());
     }
-    Some((args, concretes))
+    rehome_cached_star(&extract_roots, cached_pin, &mut concretes);
+    args.resize(nparams, OpRef::NONE);
+    concretes.resize(nparams, ConcreteValue::Null);
+    for &(index, _, value) in &star_kwargs.bound {
+        // Placeholder until the resolved half records the lookup.
+        args[index] = star_kwargs.dict_op;
+        concretes[index] = ConcreteValue::Ref(value);
+    }
+    Some((args, concretes, star, Some(star_kwargs)))
+}
+
+fn rehome_cached_star(
+    roots: &pyre_object::gc_roots::RootScope,
+    pin: Option<(usize, usize)>,
+    concretes: &mut [ConcreteValue],
+) {
+    let Some((base, len)) = pin else {
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    let mut offset = 0;
+    for concrete in concretes.iter_mut() {
+        if let ConcreteValue::Ref(obj) = concrete
+            && !obj.is_null()
+        {
+            *obj = roots.get(base + offset);
+            offset += 1;
+        }
+    }
+}
+
+fn rehome_extracted_star(
+    roots: &pyre_object::gc_roots::RootScope,
+    base: usize,
+    concretes: &mut [ConcreteValue],
+    star: Option<&mut StarArgsInline>,
+) {
+    let Some(star) = star else {
+        return;
+    };
+    for (offset, value) in star.values.iter_mut().enumerate() {
+        *value = roots.get(base + offset);
+        if let Some(ConcreteValue::Ref(obj)) = concretes.get_mut(offset) {
+            *obj = *value;
+        }
+    }
+}
+
+/// Bind the keywords of the `**` mapping `kwargs` to the parameters of
+/// `w_code` past the `npos` the star tuple filled, the way `_match_keywords`
+/// (`argument.py`) binds the `view_as_kwargs` keys.
+///
+/// Only an exact dict under the unicode strategy is taken, and only by a
+/// callee whose locals are its positional parameters alone.  Every key has to
+/// name a parameter it may bind — past the positional fill and past the
+/// positional-only range — or the call is a TypeError the interpreter
+/// reports, so the inline declines.
+///
+/// # Safety
+/// `kwargs` must be a live object.
+unsafe fn fbw_bind_star_kwargs(
+    dict_op: OpRef,
+    kwargs: pyre_object::PyObjectRef,
+    w_code: *const (),
+    npos: usize,
+    nparams: usize,
+) -> Option<StarKwargsInline> {
+    let exact_dict = unsafe {
+        (*kwargs).ob_type == &pyre_object::pyobject::DICT_TYPE as *const _
+            && (*kwargs).w_class == pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE)
+    };
+    if !exact_dict
+        || !std::ptr::eq(
+            unsafe { (*(kwargs as *const pyre_object::W_DictObject)).dstrategy },
+            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+        )
+    {
+        return None;
+    }
+    if !fbw_callee_scope_is_positional_only(w_code) {
+        return None;
+    }
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let varnames = unsafe { &(*raw).varnames };
+    if varnames.len() < nparams {
+        return None;
+    }
+    let posonly = unsafe { (*raw).posonlyarg_count } as usize;
+    // Copy the names out before any interning. `get_interned_wtf8` can
+    // collect, and `varnames` is a borrow of the code object.
+    let names: Vec<(usize, String)> = varnames[..nparams]
+        .iter()
+        .enumerate()
+        .skip(npos.max(posonly))
+        .map(|(index, name)| (index, name.as_str().to_string()))
+        .collect();
+    let roots = pyre_object::gc_roots::push_roots();
+    let kwargs_slot = roots.base();
+    let _ = roots.pin_root(kwargs);
+    let mut bound = Vec::new();
+    let mut value_slots = Vec::new();
+    for (index, name) in names {
+        // The name is baked into the lookup, so it has to be the canonical
+        // object a collection cannot move.  Parameter names are interned when
+        // the code object is built; one that is not declines rather than
+        // interning a value at trace time.
+        let name_obj = pyre_object::get_interned_wtf8(Wtf8::new(name.as_str()))?;
+        if majit_gc::can_move(majit_ir::GcRef(name_obj as usize)) {
+            return None;
+        }
+        let kwargs = roots.get(kwargs_slot);
+        if let Some(value) = unsafe {
+            pyre_object::dictmultiobject::w_dict_lookup_or_null_unicode_strategy(kwargs, name_obj)
+        } {
+            value_slots.push(pyre_object::gc_roots::shadow_stack_len());
+            let _ = roots.pin_root(value);
+            bound.push((index, name_obj, value));
+        }
+    }
+    for (entry, slot) in bound.iter_mut().zip(&value_slots) {
+        entry.2 = roots.get(*slot);
+    }
+    // A key no parameter took is either unknown or names a parameter the
+    // positional fill already bound.
+    let kwargs = roots.get(kwargs_slot);
+    if bound.len() != unsafe { pyre_object::dictmultiobject::w_dict_len(kwargs) } {
+        return None;
+    }
+    Some(StarKwargsInline { dict_op, bound })
 }
 
 /// Body-shape verdicts for a callee's per-fn JitCode, decided once and kept on
@@ -4344,6 +4900,9 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             op.pc,
         );
     }
+    let mut star_args = None;
+    let mut star_kwargs = None;
+    let mut varkw_extra = Vec::new();
     let (callee_args, callee_arg_concretes) = if is_call_kw {
         // A keyword call folds its `kwnames`->parameter permutation at trace
         // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
@@ -4362,12 +4921,13 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         } else {
             None
         };
-        let Some(reordered) = (unsafe {
+        let Some((args, concretes, extras)) = (unsafe {
             fbw_reorder_call_kw_args(r_args, &arg_concretes, w_code, nparams, receiver)
         }) else {
             return Ok(None);
         };
-        reordered
+        varkw_extra = extras;
+        (args, concretes)
     } else if is_call_function_ex {
         // `f(*args)` unpacks the star tuple into positional arguments, which is
         // a trace-time reorder whenever the tuple is the one this trace just
@@ -4381,12 +4941,14 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        let Some(unpacked) =
-            fbw_unpack_call_function_ex_args(ctx, op.pc, r_args, &arg_concretes, nparams)
+        let Some((args, concretes, star, kwargs)) =
+            fbw_unpack_call_function_ex_args(ctx, op.pc, r_args, &arg_concretes, w_code, nparams)
         else {
             return Ok(None);
         };
-        unpacked
+        star_args = star;
+        star_kwargs = kwargs;
+        (args, concretes)
     } else {
         let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
         let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
@@ -4408,7 +4970,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         callee_arg_concretes.extend_from_slice(&arg_concretes[2..]);
         (callee_args, callee_arg_concretes)
     };
-    try_walker_inline_resolved_user_call(
+    try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -4442,6 +5004,14 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         true,
         false,
         None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        star_args,
+        varkw_extra,
+        star_kwargs,
     )
 }
 
@@ -6679,6 +7249,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
+        Vec::new(),
+        None,
     )
 }
 
@@ -6738,22 +7311,95 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // guard inside the BODY runs those same checks on the way out
     // (`crate::operator_continuation`).
     operator_tail: Option<crate::operator_continuation::OperatorTail>,
+    // A `f(*args)` star tuple the positional parameters are read from; its
+    // placeholders in `callee_args` are replaced after the eligibility checks.
+    star_args: Option<StarArgsInline>,
+    // The keywords a `**kwargs` callee collects into its mapping.
+    mut varkw_extra: Vec<VarkwExtra>,
+    // A `f(**mapping)` dict the named parameters are read from; its
+    // placeholders in `callee_args` are replaced after the eligibility checks.
+    star_kwargs: Option<StarKwargsInline>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // Argument boxes and surplus keyword values stay reachable across every
+    // allocation this inline records (`wrapint`, the kwargs dict, a default
+    // box). The shadow slots, not the `Vec` copies, are what a collection
+    // forwards.
+    let _arg_roots = pyre_object::gc_roots::push_roots();
+    let mut arg_root_slots = Vec::with_capacity(callee_arg_concretes.len());
+    {
+        let mut live = Vec::new();
+        for concrete in callee_arg_concretes.iter().copied() {
+            if let ConcreteValue::Ref(obj) = concrete
+                && !obj.is_null()
+            {
+                arg_root_slots.push(Some(live.len()));
+                live.push(obj);
+            } else {
+                arg_root_slots.push(None);
+            }
+        }
+        let base = _arg_roots.pin_roots(&live);
+        for slot in &mut arg_root_slots {
+            if let Some(offset) = *slot {
+                *slot = Some(base + offset);
+            }
+        }
+        refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+    }
+    let mut varkw_root_slots = Vec::with_capacity(varkw_extra.len());
+    {
+        let mut live = Vec::new();
+        for extra in &varkw_extra {
+            if let ConcreteValue::Ref(obj) = extra.concrete
+                && !obj.is_null()
+            {
+                varkw_root_slots.push(Some(live.len()));
+                live.push(obj);
+            } else {
+                varkw_root_slots.push(None);
+            }
+        }
+        if !live.is_empty() {
+            let base = _arg_roots.pin_roots(&live);
+            for slot in &mut varkw_root_slots {
+                if let Some(offset) = *slot {
+                    *slot = Some(base + offset);
+                }
+            }
+            refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+            refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
+        }
+    }
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
     // `funcrun` path still traces through `_match_signature`, which writes a
-    // surplus tuple for `*args` and fills each keyword-only local from
-    // `w_kw_defs` (`_match_signature`); seed both
-    // of those extra locals here, leaving only `**kwargs` residual.
+    // surplus tuple for `*args`, fills each keyword-only local from
+    // `w_kw_defs`, and binds a fresh mapping of the unmatched keywords to
+    // `**kwargs` (`_match_signature`); seed all three of those extra locals
+    // here.
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
-    // `**kwargs` is the one local left: `None` here is that decline.
+    let varkw_slot = fbw_callee_varkw_slot(w_code);
     let Some(kwonly_count) = fbw_callee_kwonly_count(w_code) else {
         return resolved_inline_decline(op.pc, line!());
     };
-    if !positional_only && vararg_slot.is_none() && kwonly_count == 0 {
+    if !positional_only && vararg_slot.is_none() && kwonly_count == 0 && varkw_slot.is_none() {
         return resolved_inline_decline(op.pc, line!());
+    }
+    // Each collected keyword is stored under its `kwnames` constant, which the
+    // emit bakes, so it has to be an object a collection cannot move; its
+    // value is read off the live register at the emit.
+    if !varkw_extra.is_empty() && varkw_slot.is_none() {
+        return resolved_inline_decline(op.pc, line!());
+    }
+    for extra in &varkw_extra {
+        let ConcreteValue::Ref(value) = extra.concrete else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+        if value.is_null() || majit_gc::can_move(majit_ir::GcRef(extra.name as usize)) {
+            return resolved_inline_decline(op.pc, line!());
+        }
     }
     // Not every caller pins the callee function itself.  A specializer that
     // resolves an app-level method behind a builtin — `str(e)` reaching an
@@ -6780,6 +7426,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // fine; that is why the `code?` marker below covers this arm instead.
     let guards_the_callee_function =
         !callable_guard_op.is_constant() && pinned_object_is_the_callee;
+    // The `__call__` arm pins the instance it dispatched on by class and type
+    // version, and that pin selects the resolved `__call__` the way
+    // `space.lookup` does.  The other user of this guard, the `str(e)`
+    // specializer, pins a different operand than its receiver.
+    let receiver_pinned_by_class =
+        exception_receiver_guard.is_some_and(|(receiver, ..)| receiver == callable_guard_op);
     // `Function.funccall_valuestack` fills every parameter the call left
     // unbound from `defs_w` before entering the frame
     // (`function.py:188-193,217-231`); `Arguments.parse` reaches the same frame
@@ -6821,8 +7473,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         callee_args.resize(nparams, OpRef::NONE);
         callee_arg_concretes.resize(nparams, ConcreteValue::Null);
+        arg_root_slots.resize(nparams, None);
         for &(param_index, _, value) in &defaults.values {
-            callee_arg_concretes[param_index] = ConcreteValue::Ref(value);
+            adopt_rooted_ref(
+                &_arg_roots,
+                &mut callee_arg_concretes,
+                &mut arg_root_slots,
+                &mut varkw_extra,
+                &varkw_root_slots,
+                param_index,
+                value,
+            );
         }
         Some(defaults)
     };
@@ -6911,6 +7572,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // in the recorded op / gcref table.  Movability does not decide it.
         callee_args.truncate(nparams);
         callee_arg_concretes.truncate(nparams);
+        // The surplus elements' root slots must leave with them. A later
+        // refresh zips this slice with the concretes, and the vararg index
+        // is about to be reused for the tuple.
+        arg_root_slots.truncate(nparams);
         Some((surplus_ops, concrete))
     } else {
         None
@@ -6920,16 +7585,45 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // the tuple's own slot moves out past the keyword-only block.
     if let Some(resolved) = kwonly_defaults.as_ref() {
         for kwonly in &resolved.values {
+            let index = callee_args.len();
             callee_args.push(OpRef::NONE);
-            callee_arg_concretes.push(ConcreteValue::Ref(kwonly.value));
+            callee_arg_concretes.push(ConcreteValue::Null);
+            arg_root_slots.push(None);
+            adopt_rooted_ref(
+                &_arg_roots,
+                &mut callee_arg_concretes,
+                &mut arg_root_slots,
+                &mut varkw_extra,
+                &varkw_root_slots,
+                index,
+                kwonly.value,
+            );
         }
     }
     if let Some((_, concrete)) = vararg_surplus.as_ref() {
+        let index = callee_args.len();
         callee_args.push(OpRef::NONE);
-        callee_arg_concretes.push(ConcreteValue::Ref(*concrete));
+        callee_arg_concretes.push(ConcreteValue::Null);
+        arg_root_slots.push(None);
+        adopt_rooted_ref(
+            &_arg_roots,
+            &mut callee_arg_concretes,
+            &mut arg_root_slots,
+            &mut varkw_extra,
+            &varkw_root_slots,
+            index,
+            *concrete,
+        );
+    }
+    // The `**kwargs` mapping is built at the emit, which fills both halves.
+    if varkw_slot.is_some() {
+        callee_args.push(OpRef::NONE);
+        callee_arg_concretes.push(ConcreteValue::Null);
+        arg_root_slots.push(None);
     }
     let vararg_index = nparams + kwonly_count;
-    let seeded_locals = vararg_index + usize::from(vararg_slot.is_some());
+    let varkw_index = vararg_index + usize::from(vararg_slot.is_some());
+    let seeded_locals = varkw_index + usize::from(varkw_slot.is_some());
     // Does any incoming binding land a value the callee's register banks can
     // hold unboxed?  Only the `is`-against-None scan below consults this; see
     // its hazard-2 arm for why an int-specialized tested local is unsafe to
@@ -7551,8 +8245,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // fails that guard on every call.  A non-closure operand keeps
                 // the constant screen: dropping it inlined `self.cb(...)`
                 // wherever the callable really varied.
+                // A class-pinned `__call__` receiver selects one function for
+                // every instance the same way, with no identity guard on the
+                // operand.
                 let seeded_callee_resume = (try_multiframe || strict_seed)
                     && (callable_guard_op.is_constant()
+                        || receiver_pinned_by_class
                         || (has_closure && guards_the_callee_function));
                 // The handler exemption below was measured on a CALL entry
                 // (`blackhole_inlined_callee_local_after_escape_declined`).
@@ -7894,13 +8592,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callable_guard_op = function_op;
         callable_guard_value = bound.function;
     }
-
-    // `PyCode.frame_stores_global`: the common globals identity lives on the
-    // code object and needs no frame field.  A shared code object rebound to a
-    // different namespace creates `FrameDebugData.w_globals` in PyPy.  This
-    // custom inline-frame encoder does not yet put that rare debugdata object
-    // into resume data, so keep the call residual instead of compiling a
-    // frame whose `get_w_globals()` would silently read the first namespace.
+    // Nursery-born `Function.__globals__` / `W_Code` must survive the
+    // allocations below (a specialised pair's `wrapint`, the kwargs dict)
+    // until they land in `WalkFrameState`, which `InlineFrameStateGuard`
+    // walks. `PyCode.frame_stores_global` has no frame field in this
+    // encoder, so that rare shape stays residual.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
     if unsafe {
         pyre_interpreter::w_code_frame_stores_global(
@@ -7910,15 +8606,149 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } {
         return resolved_inline_decline(op.pc, line!());
     }
-
-    // Nursery-born `Function.__globals__` / `W_Code` must survive the guards
-    // below until they land in `WalkFrameState`, which
-    // `InlineFrameStateGuard` walks.
     let _inline_const_roots = pyre_object::gc_roots::push_roots();
     let inline_globals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
     let inline_code_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+    refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+    refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
+    if let Some(star) = star_args {
+        // `space.fixedview(w_stararg)` -> `w_obj.tolist()`: the class guard
+        // re-proves the layout the resolve picked the reads for, and an exact
+        // tuple class is also what `_uses_tuple_iter` needs to take this path.
+        walker_guard_class(
+            ctx,
+            op.pc,
+            star.starargs_op,
+            defaults_repr_class_addr(star.repr),
+        )?;
+        if star.repr == DefaultsRepr::ItemsBlock {
+            let items = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                star.starargs_op,
+                crate::descr::tuple_wrappeditems_descr(),
+            );
+            // `_match_signature` raises on any other count; the pair classes
+            // fix theirs at two, so only the array-backed tuple needs this.
+            let len_op = crate::state::opimpl_arraylen_gc(
+                ctx.trace_ctx,
+                items,
+                crate::state::pyobject_gcarray_descr(),
+            );
+            let expected = ctx.trace_ctx.const_int(star.values.len() as i64);
+            let same_len = ctx.trace_ctx.record_op(OpCode::IntEq, &[len_op, expected]);
+            ctx.trace_ctx
+                .set_opref_concrete(same_len, majit_ir::Value::Int(1));
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[same_len])?;
+            for index in 0..star.values.len() {
+                let index_op = ctx.trace_ctx.const_int(index as i64);
+                callee_args[index] = crate::state::trace_items_block_getitem_value_pure(
+                    ctx.trace_ctx,
+                    items,
+                    index_op,
+                );
+            }
+        } else {
+            for index in 0..star.values.len() {
+                let (elem, concrete) =
+                    with_arg_refs_pinned(&mut callee_arg_concretes, |concretes| {
+                        let ConcreteValue::Ref(value) = concretes[index] else {
+                            unreachable!("unpacked star element is a ref");
+                        };
+                        emit_pair_tuple_item(ctx, op.pc, star.starargs_op, star.repr, index, value)
+                    })?;
+                callee_args[index] = elem;
+                if let Some(ConcreteValue::Ref(obj)) = concrete {
+                    adopt_rooted_ref(
+                        &_arg_roots,
+                        &mut callee_arg_concretes,
+                        &mut arg_root_slots,
+                        &mut varkw_extra,
+                        &varkw_root_slots,
+                        index,
+                        obj,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(kw) = star_kwargs {
+        // `view_as_kwargs` reads the keys and values of an exact dict under
+        // the unicode strategy; the class and strategy guards re-prove the
+        // layout the resolve bound the names against.
+        walker_guard_class(
+            ctx,
+            op.pc,
+            kw.dict_op,
+            &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+        )?;
+        walker_guard_exact_w_class(
+            ctx,
+            op.pc,
+            kw.dict_op,
+            pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
+        )?;
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            kw.dict_op,
+            crate::descr::dict_strategy_word_descr(),
+        );
+        let strategy_const = ctx
+            .trace_ctx
+            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
+        walker_emit_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[strategy, strategy_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, strategy_const);
+        // `_match_keywords` rejects a keyword no parameter takes; with every
+        // bound name required to hit below, pinning the count leaves none.
+        let effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        let len_op = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallI,
+            crate::helpers::jit_dict_len as *const (),
+            &[kw.dict_op],
+            &[Type::Ref],
+            Type::Int,
+            effect.clone(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(len_op, majit_ir::Value::Int(kw.bound.len() as i64));
+        let expected = ctx.trace_ctx.const_int(kw.bound.len() as i64);
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[len_op, expected])?;
+        for &(index, name, _) in &kw.bound {
+            let value = match arg_root_slots.get(index).copied().flatten() {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+                None => match callee_arg_concretes.get(index).copied() {
+                    Some(ConcreteValue::Ref(obj)) if !obj.is_null() => obj,
+                    _ => continue,
+                },
+            };
+            let name_op = ctx.trace_ctx.const_ref(name as i64);
+            let value_op = ctx.trace_ctx.call_ref_typed_with_effect(
+                crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const (),
+                &[kw.dict_op, name_op],
+                &[Type::Ref, Type::Ref],
+                effect.clone(),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                value_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+            );
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[value_op])?;
+            callee_args[index] = value_op;
+            callee_arg_concretes[index] = ConcreteValue::Ref(value);
+        }
+    }
 
     // Path-1 (#68): the inlined callee's promoted `pycode` static field and
     // its code-derived globals semantic constant.  The latter is no longer a
@@ -8011,11 +8841,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // bridge count saturated at 29 -- 17.3x CPython against 3.0x for the same
     // loop on one instance.  `self` reaches the callee as the red operand
     // `r_args[0]` (the concrete is only the walk's shadow), so the class and
-    // version guard is the whole requirement.  The other user of this guard,
-    // the `str(e)` specializer, pins a different operand than its receiver, so
-    // it keeps the identity guard.
-    let receiver_pinned_by_class =
-        exception_receiver_guard.is_some_and(|(receiver, ..)| receiver == callable_guard_op);
+    // version guard is the whole requirement (`receiver_pinned_by_class`).
     if !guards_the_callee_function {
         // Those sites resolve the callee through their own guarded path (a
         // type version tag, a receiver class guard); all this has to pin is
@@ -8248,24 +9074,31 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 );
                 if guards_the_callee_function {
                     // `funccall_valuestack` / `_flat_pycall_defaults`:
-                    // `natural_arity > nargs >= natural_arity - len(defs_w)`,
-                    // then `start = ndefs - defs_to_load` and
-                    // `defs_w[start:ndefs]`.  `arraylen_gc(wrappeditems)` is
-                    // `len(self.defs_w)` (`W_TupleObject` carries no length
-                    // field).  Pinning the exact length would deopt every
-                    // later iteration of a mid-loop `__defaults__` swap
-                    // whose new tuple is still long enough.
+                    // parameter `p` reads `defs_w[len - (nparams - p)]`.
+                    // A star-mapping call can leave an early parameter
+                    // unbound and fill a later one, so the live tuple has
+                    // to reach the earliest hole, not merely contain as
+                    // many elements as there are holes.  `arraylen_gc` is
+                    // `len(self.defs_w)`.  Pinning the exact length would
+                    // deopt every later iteration of a mid-loop
+                    // `__defaults__` swap whose new tuple is still long
+                    // enough.
                     let len_op = crate::state::opimpl_arraylen_gc(
                         ctx.trace_ctx,
                         items,
                         crate::state::pyobject_gcarray_descr(),
                     );
-                    let defs_to_load = defaults.values.len() as i64;
-                    let min_len = ctx.trace_ctx.const_int(defs_to_load);
+                    let required_len = defaults
+                        .values
+                        .iter()
+                        .map(|&(_, tuple_index, _)| (defaults.len - tuple_index) as i64)
+                        .max()
+                        .unwrap_or(0);
+                    let min_len = ctx.trace_ctx.const_int(required_len);
                     let enough = ctx.trace_ctx.record_op(OpCode::IntGe, &[len_op, min_len]);
                     ctx.trace_ctx.set_opref_concrete(
                         enough,
-                        majit_ir::Value::Int(i64::from((defaults.len as i64) >= defs_to_load)),
+                        majit_ir::Value::Int(i64::from((defaults.len as i64) >= required_len)),
                     );
                     walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[enough])?;
                     for (param_index, tuple_index, _) in defaults.values {
@@ -8295,40 +9128,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     }
                 }
             }
-            DefaultsRepr::PairObject => {
+            DefaultsRepr::PairObject | DefaultsRepr::PairInt => {
                 for (param_index, tuple_index, _) in defaults.values {
-                    let descr = if tuple_index == 0 {
-                        crate::descr::specialised_tuple_oo_value0_descr()
-                    } else {
-                        crate::descr::specialised_tuple_oo_value1_descr()
-                    };
-                    callee_args[param_index] =
-                        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, defaults_op, descr);
-                }
-            }
-            DefaultsRepr::PairInt => {
-                for (param_index, tuple_index, value) in defaults.values {
-                    let descr = if tuple_index == 0 {
-                        crate::descr::specialised_tuple_ii_value0_descr()
-                    } else {
-                        crate::descr::specialised_tuple_ii_value1_descr()
-                    };
-                    let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, defaults_op, descr);
-                    let elem = unsafe { pyre_object::w_int_get_value(value) };
-                    let boxed = walker_box_int(ctx, op.pc, raw, elem)?;
-                    // `wrapint` emits a heap `NewWithVtable`, so the stamped
-                    // concrete has to be a heap pointer too — the walk-time
-                    // `w_tuple_getitem` box above may be a tagged immediate.
-                    // Re-home the argument's concrete onto whatever
-                    // `box_int_concrete` picked, or the seeding loop below
-                    // would re-stamp the op with the other one.
-                    let concrete = box_int_concrete(elem, value as i64);
-                    if let majit_ir::Value::Ref(gcref) = concrete {
-                        callee_arg_concretes[param_index] =
-                            ConcreteValue::Ref(gcref.as_usize() as pyre_object::PyObjectRef);
+                    let (elem, concrete) =
+                        with_arg_refs_pinned(&mut callee_arg_concretes, |concretes| {
+                            let ConcreteValue::Ref(value) = concretes[param_index] else {
+                                unreachable!("defaulted parameter is a ref");
+                            };
+                            emit_pair_tuple_item(
+                                ctx,
+                                op.pc,
+                                defaults_op,
+                                defaults.repr,
+                                tuple_index,
+                                value,
+                            )
+                        })?;
+                    callee_args[param_index] = elem;
+                    if let Some(ConcreteValue::Ref(obj)) = concrete {
+                        adopt_rooted_ref(
+                            &_arg_roots,
+                            &mut callee_arg_concretes,
+                            &mut arg_root_slots,
+                            &mut varkw_extra,
+                            &varkw_root_slots,
+                            param_index,
+                            obj,
+                        );
                     }
-                    ctx.trace_ctx.set_opref_concrete(boxed, concrete);
-                    callee_args[param_index] = boxed;
                 }
             }
         }
@@ -8435,6 +9262,101 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             op
         };
         callee_args[vararg_index] = tuple_op;
+    }
+
+    // `w_kwds = space.newdict(kwargs=True)` and one `space.setitem(w_kwds,
+    // ...)` per keyword that named no parameter (`_match_signature`),
+    // replacing the placeholder pushed above.
+    if varkw_slot.is_some() {
+        // `newdict` / `setitem` allocate. The vararg tuple and the keyword
+        // values are already live objects; pin them before that, then read
+        // the slots the collector rewrites. A raw copy in
+        // `callee_arg_concretes` would otherwise keep the pre-move address.
+        refresh_rooted_refs(&mut callee_arg_concretes, &arg_root_slots);
+        refresh_varkw_concretes(&mut varkw_extra, &varkw_root_slots);
+        let mut live = Vec::new();
+        let mut concrete_slots = Vec::new();
+        for (i, concrete) in callee_arg_concretes.iter().copied().enumerate() {
+            if let ConcreteValue::Ref(obj) = concrete
+                && !obj.is_null()
+            {
+                concrete_slots.push((i, live.len()));
+                live.push(obj);
+            }
+        }
+        let mut extra_slots = Vec::with_capacity(varkw_extra.len());
+        for extra in &varkw_extra {
+            let name_slot = live.len();
+            live.push(extra.name);
+            let value_slot = match extra.concrete {
+                ConcreteValue::Ref(obj) if !obj.is_null() => {
+                    let slot = live.len();
+                    live.push(obj);
+                    Some(slot)
+                }
+                _ => None,
+            };
+            extra_slots.push((name_slot, value_slot));
+        }
+        let pre_kw_roots = pyre_object::gc_roots::push_roots();
+        let pre_kw_base = pre_kw_roots.pin_roots(&live);
+        let effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        let mut concrete_dict = crate::helpers::jit_kwargs_dict_new();
+        let mut dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
+            crate::helpers::jit_kwargs_dict_new as *const (),
+            &[],
+            &[],
+            effect.clone(),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            dict_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize)),
+        );
+        for (extra, (name_slot, value_slot)) in varkw_extra.iter().zip(extra_slots) {
+            let name = pyre_object::gc_roots::shadow_stack_get(pre_kw_base + name_slot);
+            let value = match value_slot {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot) as i64,
+                None => match ctx.trace_ctx.concrete_of_opref(extra.value) {
+                    Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as i64,
+                    _ => unreachable!("checked by the resolve above"),
+                },
+            };
+            concrete_dict =
+                crate::helpers::jit_kwargs_dict_setitem(concrete_dict, name as i64, value);
+            let name_op = ctx.trace_ctx.const_ref(name as i64);
+            dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
+                crate::helpers::jit_kwargs_dict_setitem as *const (),
+                &[dict_op, name_op, extra.value],
+                &[Type::Ref, Type::Ref, Type::Ref],
+                effect.clone(),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                dict_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize)),
+            );
+        }
+        callee_args[varkw_index] = dict_op;
+        for (i, slot) in concrete_slots {
+            if let ConcreteValue::Ref(obj) = &mut callee_arg_concretes[i] {
+                *obj = pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot);
+            }
+        }
+        // `pre_kw_roots` only covers the dict build. Frame setup still
+        // allocates (closure cells), so the finished mapping joins the
+        // argument roots that live until the frame is built.
+        drop(pre_kw_roots);
+        adopt_rooted_ref(
+            &_arg_roots,
+            &mut callee_arg_concretes,
+            &mut arg_root_slots,
+            &mut varkw_extra,
+            &varkw_root_slots,
+            varkw_index,
+            concrete_dict as pyre_object::PyObjectRef,
+        );
     }
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
@@ -8763,14 +9685,33 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // installs the whole box list, so seed every local the symbolic
         // frame above got from `param_boxes` — a `*args` callee's packed
         // vararg tuple is one of them, and a frame short of it publishes
-        // that name as unbound to any residual the sub-walk runs.  Root
-        // each freshly boxed argument immediately: `ConcreteValue::to_pyobj`
-        // can allocate, and a later argument must not collect an earlier
-        // one before the frame constructor takes ownership of the slice.
+        // that name as unbound to any residual the sub-walk runs.
+        // Root every argument the frame constructor will own before any of
+        // them is boxed. `to_pyobj` allocates for an int or a float, and that
+        // collection moves a kwargs dict or a vararg tuple that is still only
+        // a raw pointer later in `callee_arg_concretes`.
         let arg_roots = pyre_object::gc_roots::push_roots();
-        let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
-        for concrete in callee_arg_concretes.iter().take(seeded_locals).copied() {
-            let _ = pyre_object::gc_roots::pin_root(concrete.to_pyobj());
+        let mut raw_args = Vec::with_capacity(seeded_locals);
+        let mut box_later = Vec::new();
+        for (i, concrete) in callee_arg_concretes
+            .iter()
+            .take(seeded_locals)
+            .copied()
+            .enumerate()
+        {
+            match concrete {
+                ConcreteValue::Ref(obj) => raw_args.push(obj),
+                ConcreteValue::Null => raw_args.push(pyre_object::PY_NULL),
+                ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => {
+                    raw_args.push(pyre_object::PY_NULL);
+                    box_later.push(i);
+                }
+            }
+        }
+        let arg_root_base = arg_roots.pin_roots(&raw_args);
+        for i in box_later {
+            let boxed = callee_arg_concretes[i].to_pyobj();
+            pyre_object::gc_roots::shadow_stack_set(arg_root_base + i, boxed);
         }
         let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
@@ -12004,6 +12945,9 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
+        Vec::new(),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12185,6 +13129,9 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
+        Vec::new(),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12310,6 +13257,9 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Some(attr_ctx),
         None,
+        None,
+        Vec::new(),
+        None,
     )?;
     let Some((outcome, next_pc)) = got else {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12374,6 +13324,9 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         false,
         None,
         Some(attr_ctx),
+        None,
+        None,
+        Vec::new(),
         None,
     )?;
     if called.is_none() {
@@ -12728,6 +13681,9 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
+        Vec::new(),
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -12976,6 +13932,9 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Len),
+        None,
+        Vec::new(),
+        None,
     )?;
     // A refused result — `__len__` answering a non-int or a negative — declines
     // from inside the call above after the body has been walked.  Cut that
@@ -13162,6 +14121,9 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Truth),
+        None,
+        Vec::new(),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -13301,6 +14263,9 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         false,
         None,
         None,
+        None,
+        None,
+        Vec::new(),
         None,
     );
     let inline_resume_pc = match inline {
@@ -13483,6 +14448,9 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         Some(foriter_green_key),
         None,
         None,
+        None,
+        Vec::new(),
+        None,
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
@@ -13603,6 +14571,12 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
         "last_instr",
         resume.yield_py_pc as i64,
     );
+    // `popvalue_maybe_none` (`pyframe.py`) writes None into the slot it pops.
+    // The depth store above is that pop's index write; the yielded object is
+    // still in the slot, and the next `pushvalue_none` requires the slot to
+    // be null. The compiled loop has to store that too: the GC scans the
+    // array independently of `valuestackdepth`.
+    publish_generator_slot_null(ctx, resume.frame, resume.frame_box, top);
     Ok(Some(store.value))
 }
 
@@ -13885,6 +14859,40 @@ fn publish_generator_suspension<Sym: WalkSym>(
     let value_op = ctx.trace_ctx.const_int(value);
     ctx.trace_ctx
         .record_op_with_descr(OpCode::SetfieldGc, &[frame_box, value_op], descr);
+}
+
+/// `popvalue_maybe_none` (`pyframe.py`) stores None over the popped slot.
+///
+/// The generator frame is not the trace's standard virtualizable, so the
+/// marker's `setarrayitem_vable_r` did not write this array. Null the live
+/// slot and record the same store (`GetfieldGc` of `locals_cells_stack_w`,
+/// then `SetarrayitemGc` of `PY_NULL`).
+fn publish_generator_slot_null<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame: usize,
+    frame_box: OpRef,
+    index: usize,
+) {
+    unsafe {
+        (*(frame as *mut pyre_interpreter::PyFrame)).set_locals_w(index, std::ptr::null_mut());
+    }
+    let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
+    let locals_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], locals_descr);
+    let array_ptr =
+        unsafe { (*(frame as *mut pyre_interpreter::PyFrame)).locals_cells_stack_w as usize };
+    ctx.trace_ctx.set_opref_concrete(
+        locals_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(array_ptr)),
+    );
+    let idx = ctx.trace_ctx.const_int(index as i64);
+    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetarrayitemGc,
+        &[locals_array, idx, null_ref],
+        crate::state::pyobject_gcarray_descr(),
+    );
 }
 
 /// Why a `FOR_ITER` over a suspended generator was not resumed into the trace.
@@ -14630,7 +15638,16 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `last_instr + 1`.  Arm the durable undo first so a declined walk
     // puts the frame back whole.
     fbw_arm_durable_frame_undo(gen_frame as usize);
-    unsafe { (*gen_frame).pushvalue_none() };
+    unsafe {
+        // `pushvalue_none` (`pyframe.py`) counts a slot that `popvalue` already
+        // set to None. A traced yield publishes the depth and leaves the
+        // yielded int in that slot; clear it before the count.
+        let depth = (*gen_frame).valuestackdepth;
+        if !(*(*gen_frame).locals_cells_stack_w).as_slice()[depth].is_null() {
+            (*gen_frame).set_locals_w(depth, std::ptr::null_mut());
+        }
+        (*gen_frame).pushvalue_none();
+    };
 
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
@@ -14652,6 +15669,11 @@ fn walk_generator_resume<Sym: WalkSym>(
         frame_box,
         majit_ir::Value::Ref(majit_ir::GcRef(gen_frame as usize)),
     );
+    // The slot `pushvalue_none` just counted may still hold the object the
+    // previous traced yield left behind. Recording already nulled it; the
+    // compiled resume has to as well, before anything reads the frame back.
+    let resumed_depth = unsafe { (*gen_frame).valuestackdepth.saturating_sub(1) };
+    publish_generator_slot_null(ctx, gen_frame as usize, frame_box, resumed_depth);
     ctx.fbw_mode.generator_resume = Some(GeneratorResumeSubwalk {
         frame: gen_frame as usize,
         frame_box,
@@ -18502,6 +19524,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         })? {
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            // `pyjitpl.py finishframe` clears `last_exc_value` before popframe
+            // on a non-exceptional return. This emit replaces that inline
+            // call, so the following `opimpl_catch_exception` sees a clear
+            // slot the way the residual success arm does.
+            ctx.clear_last_exc_value();
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // Inside a transparent helper subwalk this frame already walks the
