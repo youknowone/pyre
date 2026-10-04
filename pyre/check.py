@@ -399,7 +399,7 @@ FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 # than pypy is not a failure. A wider runner-to-runner spread is a measurement
 # or fixture defect to investigate, not slack for this global policy to absorb.
 PERF_GATE_FLOOR_RATIO = 1.0
-PERF_GATE_FLOOR_DIVISOR = 6
+PERF_GATE_FLOOR_DIVISOR = 5
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
