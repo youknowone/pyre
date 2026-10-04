@@ -8062,7 +8062,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             "getgrouplist() requires username, gid",
                         ));
                     }
-                    let w_user = args[0];
+                    let mut w_user = args[0];
                     let mut w_gid = args[1];
                     let user = unsafe {
                         if pyre_object::is_str(w_user) {
@@ -8083,27 +8083,30 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     type GroupId = libc::c_int;
                     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     type GroupId = libc::gid_t;
-                    let gid = crate::baseobjspace::c_uid_t_w(w_gid)? as GroupId;
+                    let gid = pyre_object::with_roots!(w_user =>
+                        crate::baseobjspace::c_uid_t_w(w_gid))?
+                        as GroupId;
                     let mut ngroups: libc::c_int = 64;
                     let mut groups = vec![0 as GroupId; 64];
-                    let mut ret = unsafe {
+                    // `rposix.c_getgroupslist` releases the GIL and saves errno.
+                    let mut ret = pyre_object::with_roots!(w_user, w_gid => unsafe {
                         majit_rlib::rposix::c_getgroupslist(
                             cuser.as_ptr(),
                             gid,
                             groups.as_mut_ptr(),
                             &mut ngroups,
                         )
-                    };
+                    });
                     if ret < 0 && ngroups > 64 {
                         groups.resize(ngroups as usize, 0);
-                        ret = unsafe {
+                        ret = pyre_object::with_roots!(w_user, w_gid => unsafe {
                             majit_rlib::rposix::c_getgroupslist(
                                 cuser.as_ptr(),
                                 gid,
                                 groups.as_mut_ptr(),
                                 &mut ngroups,
                             )
-                        };
+                        });
                     }
                     if ret < 0 {
                         return Err(io_err(
@@ -8120,9 +8123,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         .collect::<Vec<_>>();
                     let mut items = pyre_object::gc_roots::RootedItems::new();
                     for g in groups {
-                        items.push(pyre_object::w_int_new(g));
+                        items.push(pyre_object::with_roots!(w_user, w_gid =>
+                            pyre_object::w_int_new(g)));
                     }
-                    Ok(pyre_object::w_list_new(items.take()))
+                    Ok(pyre_object::with_roots!(w_user, w_gid =>
+                        pyre_object::w_list_new(items.take())))
                 },
                 2,
             ),
@@ -12615,7 +12620,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             "initgroups() requires username, gid",
                         ));
                     }
-                    let w_user = args[0];
+                    let mut w_user = args[0];
                     let mut w_gid = args[1];
                     let user = unsafe {
                         if pyre_object::is_str(w_user) {
@@ -12632,12 +12637,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     })?;
                     // interp_posix.py `@unwrap_spec(username='text', gid=c_gid_t)`.
                     // Darwin's `initgroups` takes `int`; other unix hosts take `gid_t`.
+                    let gid = pyre_object::with_roots!(w_user =>
+                        crate::baseobjspace::c_uid_t_w(w_gid))?;
                     #[cfg(any(target_os = "macos", target_os = "ios"))]
-                    let gid = crate::baseobjspace::c_uid_t_w(w_gid)? as libc::c_int;
+                    let gid = gid as libc::c_int;
                     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-                    let gid = crate::baseobjspace::c_uid_t_w(w_gid)? as libc::gid_t;
+                    let gid = gid as libc::gid_t;
                     // `rposix.c_initgroups` releases the GIL and saves errno.
-                    let ret = unsafe { majit_rlib::rposix::c_initgroups(cuser.as_ptr(), gid) };
+                    let ret = pyre_object::with_roots!(w_user, w_gid => unsafe {
+                        majit_rlib::rposix::c_initgroups(cuser.as_ptr(), gid)
+                    });
                     if ret < 0 {
                         return Err(io_err(
                             std::io::Error::from_raw_os_error(
