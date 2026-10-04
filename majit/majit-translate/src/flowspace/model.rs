@@ -1834,6 +1834,18 @@ impl HostEnv {
             "longlongmask",
             HostObject::new_builtin_callable("rarithmetic.longlongmask"),
         );
+        rarithmetic.module_set(
+            "ulonglongmask",
+            HostObject::new_builtin_callable("rarithmetic.ulonglongmask"),
+        );
+        rarithmetic.module_set(
+            "longlonglongmask",
+            HostObject::new_builtin_callable("rarithmetic.longlonglongmask"),
+        );
+        rarithmetic.module_set(
+            "ulonglonglongmask",
+            HostObject::new_builtin_callable("rarithmetic.ulonglonglongmask"),
+        );
         // Upstream `r_uint` is the class object created via
         // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py),
         // dispatched via `ForTypeEntry(extregistry.ExtRegistryEntry)`

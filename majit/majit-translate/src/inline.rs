@@ -1007,6 +1007,8 @@ pub(crate) fn remap_op_kind(
             reds_i,
             reds_r,
             reds_f,
+            green_classes,
+            red_classes,
         } => OpKind::JitMergePoint {
             jitdriver_index: *jitdriver_index,
             greens_i: greens_i.iter().map(&remap_var).collect(),
@@ -1015,6 +1017,8 @@ pub(crate) fn remap_op_kind(
             reds_i: reds_i.iter().map(&remap_var).collect(),
             reds_r: reds_r.iter().map(&remap_var).collect(),
             reds_f: reds_f.iter().map(&remap_var).collect(),
+            green_classes: green_classes.clone(),
+            red_classes: red_classes.clone(),
         },
         OpKind::LoopHeader { jitdriver_index } => OpKind::LoopHeader {
             jitdriver_index: *jitdriver_index,
@@ -1072,12 +1076,14 @@ pub(crate) fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
+            arg_classes,
         } => OpKind::InlineCall {
             jitcode: jitcode.clone(),
             args_i: args_i.iter().map(&remap_var).collect(),
             args_r: args_r.iter().map(&remap_var).collect(),
             args_f: args_f.iter().map(&remap_var).collect(),
             result_kind: *result_kind,
+            arg_classes: arg_classes.clone(),
         },
         OpKind::RecursiveCall {
             jd_index,
@@ -1088,6 +1094,8 @@ pub(crate) fn remap_op_kind(
             reds_r,
             reds_f,
             result_kind,
+            green_classes,
+            red_classes,
         } => OpKind::RecursiveCall {
             jd_index: *jd_index,
             greens_i: greens_i.iter().map(&remap_var).collect(),
@@ -1097,6 +1105,8 @@ pub(crate) fn remap_op_kind(
             reds_r: reds_r.iter().map(&remap_var).collect(),
             reds_f: reds_f.iter().map(&remap_var).collect(),
             result_kind: *result_kind,
+            green_classes: green_classes.clone(),
+            red_classes: red_classes.clone(),
         },
         OpKind::ConditionalCall {
             condition,

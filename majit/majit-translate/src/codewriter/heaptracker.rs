@@ -428,13 +428,20 @@ mod tests {
 
     #[test]
     fn field_list_has_vtable_when_first_struct_chain_reaches_typeptr() {
+        // `attrs_have_vtable` looks up `canonical_struct_name(owner)`. A
+        // sibling lib test that loaded interpreter LLBC may have registered
+        // `PyObject` in `STRUCT_ORIGIN_REGISTRY`, so the leaf spelling is
+        // not a stable key.
+        let header_type = majit_ir::descr::canonical_struct_name("PyObject");
+        let wrapper_type = majit_ir::descr::canonical_struct_name("Boxed");
+        let pair_type = majit_ir::descr::canonical_struct_name("Pair");
         let mut attrs = std::collections::HashMap::new();
         attrs.insert(
-            "PyObject".to_string(),
+            header_type,
             vec![("ob_type".to_string(), crate::model::ValueType::Ref(None))],
         );
         attrs.insert(
-            "Boxed".to_string(),
+            wrapper_type,
             vec![
                 (
                     "ob_header".to_string(),
@@ -444,7 +451,7 @@ mod tests {
             ],
         );
         attrs.insert(
-            "Pair".to_string(),
+            pair_type,
             vec![
                 ("a".to_string(), crate::model::ValueType::Int),
                 ("b".to_string(), crate::model::ValueType::Int),
@@ -469,20 +476,28 @@ mod tests {
 
     #[test]
     fn callcontrol_has_vtable_walks_inlined_header() {
+        let header_type = majit_ir::descr::canonical_struct_name("PyObject");
+        let wrapper_type = majit_ir::descr::canonical_struct_name("Boxed");
         let mut cc = CallControl::new();
-        cc.set_known_struct_names(["PyObject".to_string(), "Boxed".to_string()].into());
+        cc.set_known_struct_names(
+            [
+                header_type.clone(),
+                wrapper_type.clone(),
+                "PyObject".to_string(),
+                "Boxed".to_string(),
+            ]
+            .into(),
+        );
         let mut fields = crate::front::StructFieldRegistry::default();
-        fields.fields.insert(
-            "PyObject".to_string(),
-            vec![("ob_type".to_string(), "usize".to_string())],
-        );
-        fields.fields.insert(
-            "Boxed".to_string(),
-            vec![
-                ("ob_header".to_string(), "PyObject".to_string()),
-                ("payload".to_string(), "i64".to_string()),
-            ],
-        );
+        let header = vec![("ob_type".to_string(), "usize".to_string())];
+        let wrapper = vec![
+            ("ob_header".to_string(), "PyObject".to_string()),
+            ("payload".to_string(), "i64".to_string()),
+        ];
+        fields.fields.insert(header_type, header.clone());
+        fields.fields.insert("PyObject".to_string(), header);
+        fields.fields.insert(wrapper_type, wrapper.clone());
+        fields.fields.insert("Boxed".to_string(), wrapper);
         cc.set_struct_fields(fields);
         assert!(callcontrol_has_vtable(&cc, "Boxed"));
         assert!(!callcontrol_has_vtable(&cc, "PyObject"));

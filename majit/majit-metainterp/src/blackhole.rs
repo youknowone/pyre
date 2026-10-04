@@ -5072,6 +5072,8 @@ mod tests {
                         rank: None,
                     }],
                     host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
                 },
             );
             cc.register_function_fnaddr(

@@ -2431,6 +2431,8 @@ pub(crate) struct OptionOkOrElseTrySite {
     pub payload_ty: ValueType,
     pub error_ty: ValueType,
     pub niche: bool,
+    /// `Option<NonZero*>`: the word itself, `None` is integer 0.
+    pub scalar_niche: bool,
 }
 
 /// Per-site disposition for [`rewire_one_call_site`].
@@ -2533,7 +2535,20 @@ enum ResidualPayload {
 /// first type argument (the `Break` payload). `Result::Err`'s error is
 /// its last. `Try::branch` on `Result<T, E>` puts
 /// `Result<Infallible, E>` in `Break`, so that shell is peeled to `E`.
+#[cfg(test)]
 pub(crate) fn foreign_residual_type(owner: &str, carrier_path: &str) -> Option<String> {
+    foreign_residual_type_peeling(owner, carrier_path, &[])
+}
+
+/// [`foreign_residual_type`], then peel [`crate::ErrorCarrierSpec::carrier_wrappers`]
+/// off the error argument. `tyref_is_result_of_carrier` already peels those
+/// wrappers when recognising a scoped `Result`; a `from_residual` payload
+/// that names the same wrapped carrier is a reraise, not `From::from`.
+pub(crate) fn foreign_residual_type_peeling(
+    owner: &str,
+    carrier_path: &str,
+    carrier_wrappers: &[&str],
+) -> Option<String> {
     if carrier_path.is_empty() {
         return None;
     }
@@ -2551,11 +2566,35 @@ pub(crate) fn foreign_residual_type(owner: &str, carrier_path: &str) -> Option<S
     } else {
         args.last()?
     };
-    let err = peel_infallible_result(err);
+    let err = peel_declared_wrappers(&peel_infallible_result(err), carrier_wrappers);
     if same_type_spelling(&err, carrier_path) {
         return None;
     }
     Some(err)
+}
+
+/// Peel each declared wrapper's first type argument, outermost first.
+/// `Box<InterpError>` with `wrappers = ["alloc::boxed::Box"]` is `InterpError`.
+fn peel_declared_wrappers(ty: &str, wrappers: &[&str]) -> String {
+    let mut current = ty.to_string();
+    for _ in 0..wrappers.len() {
+        let (head, args) = split_head_args(&current);
+        if args.is_empty() {
+            break;
+        }
+        if !wrappers
+            .iter()
+            .any(|wrapper| same_type_spelling(head, wrapper))
+        {
+            break;
+        }
+        let inner = split_top_level(args);
+        if inner.len() != 1 {
+            break;
+        }
+        current = inner.into_iter().next().expect("len == 1");
+    }
+    current
 }
 
 /// `Result<Infallible, E>` is the `Try::branch` residual, not `E`.
@@ -2648,8 +2687,9 @@ fn from_residual_carrier(
     graph: &FunctionGraph,
     arg: &Variable,
     carrier_path: &str,
+    carrier_wrappers: &[&str],
 ) -> Result<Variable, String> {
-    match residual_payload(graph, arg, carrier_path)? {
+    match residual_payload(graph, arg, carrier_path, carrier_wrappers)? {
         ResidualPayload::Direct(var) | ResidualPayload::Converted(var) => Ok(var),
         ResidualPayload::Foreign { error_ty, .. } => Err(format!(
             "from_residual would raise {error_ty} without From::from"
@@ -2789,6 +2829,7 @@ fn residual_payload(
     graph: &FunctionGraph,
     arg: &Variable,
     carrier_path: &str,
+    carrier_wrappers: &[&str],
 ) -> Result<ResidualPayload, String> {
     let mut current = arg.clone();
     let mut seen = Vec::new();
@@ -2807,11 +2848,9 @@ fn residual_payload(
                         owner_is_result_variant(owner, "Err") || owner.ends_with("::Break")
                     }) =>
             {
-                if let Some(error_ty) = field
-                    .owner_root
-                    .as_deref()
-                    .and_then(|owner| foreign_residual_type(owner, carrier_path))
-                {
+                if let Some(error_ty) = field.owner_root.as_deref().and_then(|owner| {
+                    foreign_residual_type_peeling(owner, carrier_path, carrier_wrappers)
+                }) {
                     let shell = field
                         .owner_root
                         .as_deref()
@@ -2868,7 +2907,9 @@ pub(crate) fn foreign_from_residual_sites(
             let Some(argument) = args.first().and_then(LinkArg::as_variable).cloned() else {
                 continue;
             };
-            let Ok(payload) = residual_payload(graph, &argument, spec.carrier_path) else {
+            let Ok(payload) =
+                residual_payload(graph, &argument, spec.carrier_path, spec.carrier_wrappers)
+            else {
                 continue;
             };
             let ResidualPayload::Foreign { error_ty, shell } = payload else {
@@ -3040,7 +3081,7 @@ fn raise_returned_from_residual(
             "{name}: from_residual result is read by an operation"
         ));
     }
-    let carrier = from_residual_carrier(graph, &residual, spec.carrier_path)
+    let carrier = from_residual_carrier(graph, &residual, spec.carrier_path, spec.carrier_wrappers)
         .map_err(|err| format!("{name}: {err}"))?;
     graph.blocks[block].operations.remove(op_idx);
     let block_id = crate::model::BlockId(block);
@@ -3304,7 +3345,7 @@ fn rewire_one_option_ok_or_else_try_site(
 
     let opt_in_some = map_source(&some_sources, &some_inputs, &opt)
         .expect("some_sources explicitly includes the Option value");
-    let payload = if site.niche {
+    let payload = if site.niche || site.scalar_niche {
         opt_in_some
     } else {
         let payload = graph.alloc_value_var();
@@ -3323,6 +3364,8 @@ fn rewire_one_option_ok_or_else_try_site(
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     ty: site.payload_ty.clone(),
@@ -3356,8 +3399,18 @@ fn rewire_one_option_ok_or_else_try_site(
 
     graph.blocks[a].operations.truncate(call_idx);
     let disc = graph.alloc_value_var();
-    if site.niche {
-        let null = graph.push_null_mut_ptr(a_id);
+    if site.niche || site.scalar_niche {
+        let rhs = if site.scalar_niche {
+            graph
+                .push_op_var(
+                    a_id,
+                    crate::front::mir::nonzero_option_zero(&site.option_owner),
+                    true,
+                )
+                .expect("scalar None produces a value")
+        } else {
+            graph.push_null_mut_ptr(a_id)
+        };
         graph
             .block_mut(a_id)
             .operations
@@ -3366,7 +3419,7 @@ fn rewire_one_option_ok_or_else_try_site(
                 kind: OpKind::BinOp {
                     op: "ne".to_string(),
                     lhs: opt.clone().into_variable(),
-                    rhs: null,
+                    rhs,
                     result_ty: ValueType::Int,
                 },
             });
@@ -3386,6 +3439,8 @@ fn rewire_one_option_ok_or_else_try_site(
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     ty: ValueType::Int,
@@ -6706,6 +6761,8 @@ pub(crate) fn build_shell(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: crate::model::LinkArg::Value(payload),
@@ -9584,6 +9641,8 @@ mod static_result_shell_tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     value: LinkArg::Value(value),
@@ -10211,6 +10270,8 @@ mod static_result_shell_tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     value: LinkArg::Value(value),
@@ -10285,6 +10346,8 @@ mod static_result_shell_tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(consumed),
@@ -11444,6 +11507,7 @@ mod option_ok_or_else_try_tests {
             payload_ty: ValueType::Int,
             error_ty: ValueType::Ref(None),
             niche: false,
+            scalar_niche: false,
         };
         (graph, site)
     }
@@ -12151,6 +12215,40 @@ mod from_residual_conversion_tests {
     }
 
     #[test]
+    fn boxed_carrier_residual_is_not_foreign() {
+        const BOXED: &str = "guest::types::error::InterpError";
+        let wrappers: &[&str] = &["alloc::boxed::Box"];
+        assert_eq!(
+            foreign_residual_type_peeling("Result<i64,Box<InterpError>>::Err", BOXED, wrappers),
+            None
+        );
+        assert_eq!(
+            foreign_residual_type_peeling(
+                "Result<i64,alloc::boxed::Box<guest::types::error::InterpError>>::Err",
+                BOXED,
+                wrappers,
+            ),
+            None
+        );
+        assert_eq!(
+            foreign_residual_type("Result<i64,Box<InterpError>>::Err", BOXED),
+            Some("Box<InterpError>".to_string())
+        );
+        let boxed_spec = crate::ErrorCarrierSpec {
+            carrier_path: BOXED,
+            carrier_class: "",
+            carrier_wrappers: wrappers,
+            to_exc_object: None,
+            from_exc_object: None,
+        };
+        let (graph, _) = from_residual_tail("Result<i64,Box<InterpError>>::Err");
+        assert!(
+            foreign_from_residual_sites(&graph, boxed_spec).is_empty(),
+            "a boxed carrier is a reraise, not From::from"
+        );
+    }
+
+    #[test]
     fn unsuffixed_break_is_raised_directly() {
         let (mut graph, residual) =
             from_residual_tail("core::ops::control_flow::ControlFlow::Break");
@@ -12229,7 +12327,7 @@ mod from_residual_conversion_tests {
             )
             .expect("from_residual");
         graph.set_return(graph.startblock, Some(residual));
-        let err = match residual_payload(&graph, &left, CARRIER) {
+        let err = match residual_payload(&graph, &left, CARRIER, &[]) {
             Err(err) => err,
             Ok(_) => panic!("a copy cycle is not a carrier"),
         };

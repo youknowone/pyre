@@ -68,6 +68,8 @@ pub(crate) struct ExpectSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// `Option<NonZero<_>>`: `None` is the integer 0 and `Some` is the word.
+    pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
 }
@@ -192,7 +194,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
     // aggregate `__pos_0`; the payload IS the base pointer (identity).
     let opt_in_then = map_source(&then_sources, &then_inputs, &opt)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    let payload = if site.niche {
+    let payload = if site.niche || site.scalar_niche {
         opt_in_then
     } else {
         let payload = graph.alloc_value_var();
@@ -208,6 +210,8 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 ty: site.payload_ty.clone(),
@@ -241,7 +245,22 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
     }
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
-    if site.niche {
+    if site.scalar_niche {
+        let zero = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: crate::front::mir::nonzero_option_zero(&site.option_owner),
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone().into_variable(),
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+    } else if site.niche {
         // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
         // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
         // `ptr_ne` with an `Int` result matching the aggregate read.  The null
@@ -270,6 +289,8 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 ty: ValueType::Int,
@@ -323,6 +344,7 @@ mod tests {
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
                 niche: false,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );
@@ -405,6 +427,7 @@ mod tests {
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Ref(None),
                 niche: true,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );
@@ -454,6 +477,7 @@ mod tests {
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
                 niche: false,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );

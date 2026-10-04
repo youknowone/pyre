@@ -1064,6 +1064,17 @@ impl<'a> GraphFlattener<'a> {
             {
                 continue;
             }
+            // `flatten.py` copies only within one kind: the link arg and the
+            // target inputarg share a concretetype, so `getcolor` agrees.
+            if let RegOrConst::Reg(src_r) = &src
+                && src_r.kind != dst.kind
+            {
+                panic!(
+                    "insert_renamings: {src_r:?} -> {dst:?} across kinds \
+                     (graph {}, src {v:?}, dst {dst_var:?}, target {:?})",
+                    self.graph.name, link.target
+                );
+            }
             lst.push((src, dst));
         }
         // `flatten.py lst.sort(key=lambda(v, w): w.index)`.

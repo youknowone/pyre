@@ -1353,6 +1353,8 @@ mod tests {
                 reds_i: vec![],
                 reds_r: vec![frame.clone()],
                 reds_f: vec![],
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             false,
         );
@@ -1410,6 +1412,8 @@ mod tests {
                 reds_i: vec![],
                 reds_r: vec![frame.clone()],
                 reds_f: vec![],
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             false,
         );
@@ -1454,6 +1458,8 @@ mod tests {
                 reds_i: vec![],
                 reds_r: vec![frame.clone()],
                 reds_f: vec![],
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             false,
         );
@@ -1499,6 +1505,8 @@ mod tests {
                 reds_i: vec![],
                 reds_r: vec![frame.clone()],
                 reds_f: vec![],
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             false,
         );
@@ -1559,6 +1567,8 @@ mod tests {
                 reds_i: vec![],
                 reds_r: vec![frame.clone()],
                 reds_f: vec![],
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             false,
         );

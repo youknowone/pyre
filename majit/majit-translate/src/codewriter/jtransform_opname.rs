@@ -611,13 +611,28 @@ fn transduce_op(
             let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
             if name == "cast_primitive" {
-                let word_int = |ty: Option<LowLevelType>| {
+                let word_int = |ty: Option<&LowLevelType>| {
                     matches!(ty, Some(LowLevelType::Signed | LowLevelType::Unsigned))
                 };
+                let wide_int = |ty: Option<&LowLevelType>| {
+                    matches!(
+                        ty,
+                        Some(
+                            LowLevelType::SignedLongLong
+                                | LowLevelType::UnsignedLongLong
+                                | LowLevelType::SignedLongLongLong
+                                | LowLevelType::UnsignedLongLongLong
+                        )
+                    )
+                };
+                let src = operand.concretetype();
+                let dst = result.concretetype();
                 assert!(
-                    word_int(operand.concretetype()) && word_int(result.concretetype()),
-                    "jtransform_opname::lower_graph: cast_primitive is only ported for the \
-                     same-width Signed/Unsigned ll_int2hex shape"
+                    (word_int(src.as_ref()) && word_int(dst.as_ref()))
+                        || wide_int(src.as_ref())
+                        || wide_int(dst.as_ref()),
+                    "jtransform_opname::lower_graph: cast_primitive is only ported for word-sized \
+                     Signed/Unsigned or a longlong widen"
                 );
             }
             let result_ty = value_type_of(&result);
@@ -627,6 +642,68 @@ fn transduce_op(
                     op: "same_as".to_string(),
                     operand,
                     result_ty,
+                },
+                result,
+            );
+        }
+        // 32-bit longlong lives in the float bank. `jtransform.py`
+        // `rewrite_op_cast_int_to_longlong` and the ulonglong siblings
+        // call `llong_from_*` / `ullong_from_*` instead of aliasing the
+        // float result onto the int operand.
+        name @ ("cast_int_to_longlong"
+        | "cast_int_to_ulonglong"
+        | "cast_uint_to_longlong"
+        | "cast_uint_to_ulonglong") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let helper = match name {
+                "cast_int_to_longlong" => "llong_from_int",
+                "cast_uint_to_longlong" => "llong_from_uint",
+                "cast_int_to_ulonglong" => "ullong_from_int",
+                "cast_uint_to_ulonglong" => "ullong_from_uint",
+                _ => unreachable!(),
+            };
+            // 32-bit longlong is the float bank (`f64` bits). 64-bit stays
+            // an int. The registered helper uses the same split. This
+            // lowering runs in the host prepass, so the width is the
+            // cargo target's, not `size_of::<usize>()`.
+            let longlong_is_float = crate::layout::target_word_size() < 8;
+            let result_kind = if longlong_is_float { 'f' } else { 'i' };
+            let result_ll = if longlong_is_float {
+                majit_ir::value::Type::Float
+            } else {
+                majit_ir::value::Type::Int
+            };
+            let oopspec = match helper {
+                "llong_from_int" | "ullong_from_int" => majit_ir::descr::OopSpecIndex::LlongFromInt,
+                _ => majit_ir::descr::OopSpecIndex::LlongFromUint,
+            };
+            let target = crate::model::CallTarget::function_path([helper]);
+            let fnaddr = crate::codewriter::call::symbolic_fnaddr_for_target(&target);
+            let funcptr = out
+                .push_op_var(block, OpKind::ConstInt(fnaddr), true)
+                .expect("funcptr const produces a result");
+            crate::model::FunctionGraph::set_concretetype_of_inline(
+                &funcptr,
+                crate::model::ConcreteType::Signed,
+            );
+            out.push_op_with_result_var(
+                block,
+                OpKind::CallResidual {
+                    funcptr: crate::model::CallFuncPtr::Value(funcptr),
+                    descriptor: crate::codewriter::call::CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Int],
+                        result_ll,
+                        majit_ir::descr::EffectInfo::new(
+                            majit_ir::descr::ExtraEffect::ElidableCannotRaise,
+                            oopspec,
+                        ),
+                    ),
+                    args_i: vec![operand],
+                    args_r: Vec::new(),
+                    args_f: Vec::new(),
+                    result_kind,
+                    indirect_targets: None,
                 },
                 result,
             );
