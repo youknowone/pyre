@@ -426,6 +426,70 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
     }
 }
 
+/// An `Option<char>` joined with a `char` literal default, then compared.
+/// Both links into the join carry a `char`, so both are int-kind.
+#[inline(never)]
+pub fn char_unwrap_or_join(align: Option<char>) -> i64 {
+    let a = align.unwrap_or('>');
+    if a == '^' { 1 } else { 0 }
+}
+
+/// The shape `bitflags!` expands to: a `repr(transparent)` public flag type
+/// around a `repr(transparent)` inner type around the integer, each with a
+/// `const fn` constructor and a `const fn` accessor, and the flag an
+/// associated const built through the constructor.  The inner type's methods
+/// are spelled apart from the outer ones so every local body keeps a unique
+/// name path.
+#[repr(transparent)]
+pub struct InnerCodeFlags(u16);
+
+impl InnerCodeFlags {
+    #[inline]
+    pub const fn inner_from_bits_retain(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    #[inline]
+    pub const fn inner_bits(&self) -> u16 {
+        self.0
+    }
+}
+
+#[repr(transparent)]
+pub struct CodeFlags(InnerCodeFlags);
+
+impl CodeFlags {
+    pub const FLAT: Self = Self::from_bits_retain(0x100);
+
+    #[inline]
+    pub const fn from_bits_retain(bits: u16) -> Self {
+        Self(InnerCodeFlags::inner_from_bits_retain(bits))
+    }
+
+    #[inline]
+    pub const fn bits(&self) -> u16 {
+        self.0.inner_bits()
+    }
+}
+
+/// A flag const read through `.bits()` inside an integer expression.
+#[inline(never)]
+pub fn code_flags_bits_or(nargs: usize) -> usize {
+    nargs | CodeFlags::FLAT.bits() as usize
+}
+
+/// A `char` element read at a constant index and switched on. `char` is a
+/// 4-byte unsigned item, so the index arm lowers it to an int-banked
+/// `ArrayRead` and the match switches on that int.
+#[inline(never)]
+pub fn char_slot_index(v: &Vec<char>) -> i64 {
+    if v.len() >= 2 && matches!(v[1], '<' | '>' | '=' | '^') {
+        1
+    } else {
+        0
+    }
+}
+
 // 10. Register bank of a borrowed primitive, by container.
 //
 // Three shapes one peel decision has to answer together.  The payload's own
@@ -516,7 +580,6 @@ pub fn replace_reborrow_then_read(mut slot: i64, new: i64) -> i64 {
     std::mem::replace(&mut *r, new);
     *r
 }
-
 
 /// Two machine words, inline. `mem::replace` / `swap` / `take` of the whole
 /// value is one read and one store of each field, not a residual copy.
@@ -666,4 +729,165 @@ pub struct HeldCell(pub HeldUnion);
 #[inline(never)]
 pub fn store_held_cell(slot: &mut HeldCell, value: i64) {
     slot.0 = HeldUnion::Int(value);
+}
+
+/// Reads two items of a borrowed slice.
+#[inline(never)]
+pub fn sum_two_items(items: &[i64]) -> i64 {
+    items[0] + items[1]
+}
+
+/// An array literal borrowed as a slice argument. The borrow reaches the
+/// call through a copied reference, and the array is the slice's storage.
+#[inline(never)]
+pub fn sum_of_array_literal(x: i64) -> i64 {
+    let borrowed = &[x, x + 1];
+    let moved = borrowed;
+    sum_two_items(moved)
+}
+
+/// Reverses a slice of raw pointer items, then reads its first item.
+#[inline(never)]
+pub fn reverse_then_first_ref(items: &mut [*mut u8]) -> *mut u8 {
+    items.reverse();
+    items[0]
+}
+
+/// A range subslice of a pointer array local, passed on as a slice.
+#[inline(never)]
+pub fn first_of_array_prefix(a: *mut u8, b: *mut u8, n: usize) -> *mut u8 {
+    let buf = [a, b];
+    first_ref(&buf[..n])
+}
+
+#[inline(never)]
+pub fn first_ref(items: &[*mut u8]) -> *mut u8 {
+    items[0]
+}
+
+/// Appends a slice of integer items to a `Vec`.
+#[inline(never)]
+pub fn extend_vec_from_slice(v: &mut Vec<usize>, items: &[usize]) {
+    v.extend_from_slice(items);
+}
+
+/// Reads an item of a slice carried in a tuple, or null past its end.
+#[inline(never)]
+pub fn item_of_tupled_slice(t: (&[*mut u8], usize)) -> *mut u8 {
+    let items = t.0;
+    if t.1 < items.len() {
+        items[t.1]
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+/// Builds the tuple [`item_of_tupled_slice`] reads.
+#[inline(never)]
+pub fn tuple_a_slice(items: &[*mut u8], i: usize) -> *mut u8 {
+    item_of_tupled_slice((items, i))
+}
+
+/// A closure that captures a slice by reference and returns it.
+#[inline(never)]
+pub fn slice_through_a_closure(items: &[*mut u8]) -> *mut u8 {
+    let get = || -> &[*mut u8] { items };
+    first_ref(get())
+}
+
+/// A closure indexing a slice it captures by reference.
+#[inline(never)]
+pub fn index_through_a_closure(items: &[*mut u8], i: usize) -> *mut u8 {
+    let get = |j: usize| items[j];
+    get(i)
+}
+
+/// The item an `Option<&T>` names, or null.
+#[inline(never)]
+pub fn item_or_null(item: Option<&*mut u8>) -> *mut u8 {
+    match item {
+        Some(p) => *p,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `Option<&T>` of a pointer item passed on as a value.
+#[inline(never)]
+pub fn get_item_or_null(items: &[*mut u8], i: usize) -> *mut u8 {
+    item_or_null(items.get(i))
+}
+
+/// Copies a slice of pointer items into another. The lengths are equal;
+/// that check is an assertion.
+#[inline(never)]
+pub fn copy_slice_from_slice(dst: &mut [*mut u8], src: &[*mut u8]) {
+    dst.copy_from_slice(src);
+}
+
+/// `vec![item; count]` of one-word integer items.
+#[inline(never)]
+pub fn repeat_vec_i64(item: i64, count: usize) -> Vec<i64> {
+    vec![item; count]
+}
+
+/// `vec![item; count]` of pointer items.
+#[inline(never)]
+pub fn repeat_vec_ptr(item: *mut u8, count: usize) -> Vec<*mut u8> {
+    vec![item; count]
+}
+
+/// The data pointer of a shared slice of pointer items.
+#[inline(never)]
+pub fn ptr_of_slice(items: &[*mut u8]) -> *const *mut u8 {
+    items.as_ptr()
+}
+
+/// The data pointer of a mutable slice of pointer items.
+#[inline(never)]
+pub fn mut_ptr_of_slice(items: &mut [*mut u8]) -> *mut *mut u8 {
+    items.as_mut_ptr()
+}
+
+/// A root-bracket guard closed by an explicit `drop` before the function ends.
+pub mod gc_roots {
+    pub struct RootScope {
+        pub base: usize,
+    }
+
+    impl Drop for RootScope {
+        fn drop(&mut self) {}
+    }
+
+    #[inline(never)]
+    pub fn push_roots() -> RootScope {
+        RootScope { base: 0 }
+    }
+}
+
+/// Closes the bracket with `drop(roots)` rather than a scope-end drop.
+#[inline(never)]
+pub fn mem_drop_root_scope() -> usize {
+    let roots = gc_roots::push_roots();
+    let base = roots.base;
+    drop(roots);
+    base
+}
+
+/// `drop` of an integer, which has no destructor.
+#[inline(never)]
+pub fn mem_drop_i64(x: i64) {
+    drop(x);
+}
+
+/// `drop` of a `usize`, which has no destructor.
+#[inline(never)]
+pub fn mem_drop_usize(x: usize) {
+    drop(x);
+}
+
+/// `s.get(1..).unwrap_or(&[])` is the checked spelling of a tail slice.
+/// The length of that tail is the length word of the resulting pair.
+#[inline(never)]
+pub fn tail_len(s: &[i64]) -> usize {
+    s.get(1..).unwrap_or(&[]).len()
 }

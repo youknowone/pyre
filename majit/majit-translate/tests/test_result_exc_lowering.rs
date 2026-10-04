@@ -3,7 +3,7 @@
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function_with_static_addrs;
-use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
+use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
 use std::sync::OnceLock;
 
@@ -933,7 +933,6 @@ fn finditem_str_named_and_attr_cached_lower() {
         "we_are_jitted ConstBool(true) clears the interpreter shortcut: {leaves:?}"
     );
 }
-
 #[test]
 fn a_payload_less_err_shell_of_an_inlined_callee_is_left_materialised() {
     // `from_utf8`'s `Err(Utf8Error)` is built field by field and consumed in
@@ -1018,7 +1017,6 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
         "`.map(Some)` leaves no residual Result::map"
     );
 }
-
 fn return_producer<'a>(
     graph: &'a majit_translate::model::FunctionGraph,
     var: &majit_translate::flowspace::model::Variable,
@@ -1030,32 +1028,69 @@ fn return_producer<'a>(
             return None;
         }
         seen.push(current.clone());
-        let kind = graph.blocks.iter().find_map(|block| {
+        if let Some(kind) = graph.blocks.iter().find_map(|block| {
             block
                 .operations
                 .iter()
                 .find_map(|op| (op.result.as_ref() == Some(&current)).then_some(&op.kind))
-        })?;
-        match kind {
-            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
-                current = operand.clone();
+        }) {
+            match kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                    let Some(src) = args.first().and_then(LinkArg::as_variable) else {
+                        return Some(kind);
+                    };
+                    current = src.clone();
+                }
+                other => return Some(other),
             }
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                args,
-                ..
-            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
-                let Some(src) = args
-                    .first()
-                    .and_then(majit_translate::model::LinkArg::as_variable)
-                else {
-                    return Some(kind);
-                };
-                current = src.clone();
-            }
-            other => return Some(other),
+            continue;
         }
+        // A frame-exit cleanup block rebinds the returned word onto its
+        // inputarg. One predecessor passing one value is that word.
+        let Some(src) = single_inputarg_source(graph, &current) else {
+            return None;
+        };
+        current = src;
     }
+}
+
+/// The value a single predecessor passes into `var` when `var` is an inputarg
+/// of exactly one block. A merge, a missing link arg, or a second binding is
+/// not one producer.
+fn single_inputarg_source(
+    graph: &majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<majit_translate::flowspace::model::Variable> {
+    let mut source = None;
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        let Some(pos) = block.inputargs.iter().position(|input| input == var) else {
+            continue;
+        };
+        if source.is_some() {
+            return None;
+        }
+        let mut incoming = Vec::new();
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target.0 == bi {
+                    incoming.push(link);
+                }
+            }
+        }
+        let [link] = incoming.as_slice() else {
+            return None;
+        };
+        let src = link.args.get(pos)?.as_variable()?.clone();
+        source = Some(src);
+    }
+    source
 }
 
 /// `space.index_w` returns the `Some` payload of `Option<Result<i64, PyError>>`.
@@ -1095,8 +1130,8 @@ fn space_index_w_returns_ok_i64() {
         }
     }
     assert_eq!(
-        ok_returns, 2,
-        "both as_index_value successes return the Ok i64"
+        ok_returns, 1,
+        "joined as_index_value successes return Ok's i64"
     );
 }
 

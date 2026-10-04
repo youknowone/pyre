@@ -4342,15 +4342,11 @@ impl Repr for InstanceRepr {
         // struct carries an `_runtime_type_info` opaque consumable by
         // `fill_vtable_root` via `getRuntimeTypeInfo`. Immutable /
         // special_memory_pressure hints stay unported (R2-D).
-        // `VirtualizableInstanceRepr._setup_repr_llfields`: `vable_token`
-        // precedes the instance attrs (`llfields + myllfields`).
-        if self
-            .virtualizable
-            .borrow()
-            .as_ref()
-            .is_some_and(|vable| vable.top_of_virtualizable_hierarchy)
-        {
-            myllfields.insert(0, ("vable_token".into(), lltype::GCREF.clone()));
+        // `VirtualizableInstanceRepr._setup_repr_llfields`: extra llfields
+        // (the virtualizable token as `llmemory.GCREF`) precede the instance
+        // attrs (`llfields + myllfields`).
+        if let Some(vable) = self.virtualizable.borrow().as_ref() {
+            myllfields.splice(0..0, vable.setup_repr_llfields());
         }
         // `_parse_field_list` reads `self.fields`. Store them before
         // `MkStruct` so the `virtualizable_accessor` hint can name the

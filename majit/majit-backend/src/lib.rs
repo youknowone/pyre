@@ -3053,6 +3053,41 @@ pub fn value_from_unspecialized_word(word: i64, kind: Type) -> Value {
     }
 }
 
+/// Header stores of `llmodel.py bh_new_with_vtable`, plus the host class word.
+///
+/// The type word is written at `vtable_offset` when that offset is `Some`
+/// and `vtable` is nonzero — `llmodel.py` `write_int_at_mem(res,
+/// self.vtable_offset, WORD, sizedescr.get_vtable())`. The class word is
+/// written at `w_class_offset` when that offset is `Some` and
+/// [`majit_ir::descr::resolve_w_class_obj`] returns a nonzero pointer.
+/// That resolver returns `None` for a null vtable and for `JitVirtualRef`.
+///
+/// # Safety
+///
+/// `ptr` is null, or it points at a writable allocation covering each
+/// `Some` offset plus one machine word.
+pub unsafe fn write_new_with_vtable_header(
+    ptr: *mut u8,
+    vtable: usize,
+    vtable_offset: Option<usize>,
+    w_class_offset: Option<usize>,
+) {
+    if ptr.is_null() || vtable == 0 {
+        return;
+    }
+    unsafe {
+        if let Some(vt_off) = vtable_offset {
+            *(ptr.add(vt_off) as *mut usize) = vtable;
+        }
+        if let Some(wc_off) = w_class_offset
+            && let Some(w_class) = majit_ir::descr::resolve_w_class_obj(vtable)
+            && w_class != 0
+        {
+            *(ptr.add(wc_off) as *mut usize) = w_class as usize;
+        }
+    }
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
@@ -4110,6 +4145,24 @@ pub trait Backend: Send {
             ((array_ptr as usize).wrapping_add(offset) as *const usize).read_unaligned() as i64
         }
     }
+
+    /// `llmodel.py` `self.vtable_offset`. `None` until the frontend
+    /// configures it (`gcremovetypeptr` leaves the type word unwritten).
+    fn vtable_offset(&self) -> Option<usize> {
+        None
+    }
+
+    /// Byte offset of the class word beside the type word.
+    /// `None` until [`Self::set_w_class_offset`]. `bh_new_with_vtable`
+    /// writes [`majit_ir::descr::resolve_w_class_obj`] there when this
+    /// is `Some` and the vtable resolves to a class object.
+    fn w_class_offset(&self) -> Option<usize> {
+        None
+    }
+
+    /// Record [`Self::w_class_offset`]. The default stores nothing;
+    /// a backend that writes the class word overrides both.
+    fn set_w_class_offset(&mut self, _offset: Option<usize>) {}
 
     // ── model.py:230-236 allocation ──
     /// model.py / llmodel.py bh_new(sizedescr)

@@ -295,10 +295,13 @@ mod tests {
         let symbolic_c = symbolic(3);
         let symbolic_d = symbolic(4);
         let real = 0x1234_5678i64;
+        // High half set, sign bit clear, but not `SYMBOLIC_FNADDR_BASE`.
+        // A host funcptr keeps bits 48..63 clear, so this word is declined
+        // the same way as a symbolic hash and is recorded at a real start.
         let wrong_tag = 0x7ADE_0000_0000_0001u64 as i64;
         assert!(crate::call::is_symbolic_fnaddr(symbolic_a));
         assert!(!crate::call::is_symbolic_fnaddr(real));
-        assert!(!crate::call::is_symbolic_fnaddr(wrong_tag));
+        assert!(crate::call::is_symbolic_fnaddr(wrong_tag));
 
         let mut code = Vec::new();
         let mut starts = Vec::new();
@@ -389,7 +392,10 @@ mod tests {
             let end = table.offsets[index + 1] as usize;
             (table.values[start..end].to_vec(), table.visited[index])
         };
-        assert_eq!(row(0), (vec![symbolic_a, symbolic_b, symbolic_c], 4));
+        assert_eq!(
+            row(0),
+            (vec![symbolic_a, symbolic_b, symbolic_c, wrong_tag], 4)
+        );
         assert_eq!(row(1), (vec![symbolic_b, symbolic_c], 2));
         assert_eq!(row(2), (vec![symbolic_b, symbolic_c], 2));
         assert_eq!(row(3), (vec![symbolic_c], 1));
@@ -409,7 +415,7 @@ mod tests {
         );
         assert_eq!(
             decoded.reachable_symbolic_residuals_at(0),
-            Some((&[symbolic_a, symbolic_b, symbolic_c][..], 4))
+            Some((&[symbolic_a, symbolic_b, symbolic_c, wrong_tag][..], 4))
         );
     }
 }

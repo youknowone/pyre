@@ -184,6 +184,7 @@ mod tests {
             descrs: Vec::new(),
             ei_descr_mints: Vec::new(),
             all_liveness: Vec::new(),
+            callinfo_rows: Vec::new(),
             total_blocks: 0,
             total_ops: 0,
             total_vable_rewrites: 0,

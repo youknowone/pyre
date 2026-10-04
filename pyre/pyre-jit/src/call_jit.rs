@@ -1878,6 +1878,11 @@ pub fn install_jit_call_bridge() {
             majit_ir::value::default_str_eq,
             majit_ir::value::default_unicode_hash,
         );
+        // Residual trampolines rebuild `&str` / `&Wtf8` from one `Ref` word,
+        // a pointer to an rstr `STR`. The reader is this frontend's layout.
+        majit_ir::helper_fnaddr::set_rstr_payload_reader(
+            pyre_object::unicodeobject::rstr_payload_word,
+        );
         // Same frontend-owns-its-object-model split for the `w_class`
         // header identity `OptVirtualize` folds `new_with_vtable` reads
         // to: `SimpleSizeDescr` carries pyre's `ob_type` in its `vtable`

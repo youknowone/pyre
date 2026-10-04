@@ -1,11 +1,12 @@
-# pyre-check: max-pypy-ratio=19.6
-# Ubuntu run 33279264115: 5.6-9.8x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
-# The ratio is deliberately loose: pypy folds this loop to near nothing
-# (0.01s at any N tried), so the denominator is collapsed and the number
-# measures pypy's constant folding rather than pyre's throughput. What this
-# fixture gates is the differential OUTPUT — pyre must agree with cpython and
-# pypy that the rebound method wins after the loop compiled.
+# pyre-check: max-pypy-ratio=9.2
+# Run 37176956131, startup-subtracted vs pypy: macos dynasm 2.6x,
+# ubuntu dynasm 3.4x, macos cranelift 3.5x, windows dynasm 3.6x,
+# ubuntu cranelift 4.6x. The ceiling is twice that slowest reading.
+# PERF_GATE_FLOOR_DIVISOR is 4, so the floor is 2.3x, under the fastest 2.6x.
+# The ratio still moves with how far pypy constant-folds the loop, so the
+# ceiling stays twice the slowest native reading rather than a tight fit.
+# What this fixture gates is the differential OUTPUT — pyre must agree with
+# cpython and pypy that the rebound method wins after the loop compiled.
 # `typeobject.py:177 _immutable_fields_ = ['_version_tag?']` — the LOAD_METHOD
 # fold bakes the resolved method into the compiled loop under a
 # QUASIIMMUT_FIELD on the receiver type's `_version_tag`, with no per-iteration

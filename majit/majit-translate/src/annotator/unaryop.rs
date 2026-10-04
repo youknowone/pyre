@@ -99,6 +99,7 @@ pub(crate) fn init(
     init_somebool_overrides(reg);
     init_sometuple_overrides(reg);
     init_somelist_overrides(reg);
+    init_somerustvec_overrides(reg);
     init_somedict_overrides(reg);
     init_somestring_overrides(reg);
     init_someunicodestring_overrides(reg);
@@ -1375,6 +1376,24 @@ pub fn contains_SomeList(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
         .generalize(&s_element)
         .expect("contains.SomeList: generalize failed");
     SomeValue::Bool(SomeBool::new())
+}
+
+/// `len(v)` on a Rust `Vec`: a non-negative integer.
+fn init_somerustvec_overrides(
+    reg: &mut std::collections::HashMap<
+        OpKind,
+        std::collections::HashMap<SomeValueTag, Specialization>,
+    >,
+) {
+    register(
+        reg,
+        OpKind::Len,
+        SomeValueTag::RustVec,
+        Specialization {
+            apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
 }
 
 fn init_somelist_overrides(
@@ -2815,6 +2834,15 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "getlength" => "stringbuilder_method_getlength",
             _ => return None,
         },
+        // The Rust `Vec` methods `RustVecRepr::rtype_method` lowers.
+        SomeValue::RustVec(_) => match name {
+            "append" => "rustvec_method_append",
+            "reverse" => "rustvec_method_reverse",
+            "free" => "rustvec_method_free",
+            "items" => "rustvec_method_items",
+            "extend_from_slice" => "rustvec_method_extend_from_slice",
+            _ => return None,
+        },
         // rstring.py — the `UnicodeBuilder` surface the rtyper
         // lowers so far (`UnicodeBuilderRepr::rtype_method`): getlength.
         SomeValue::UnicodeBuilder(_) => match name {
@@ -3628,6 +3656,32 @@ pub(crate) fn call_builtin_method(
                 unreachable!();
             };
             someiterator_next(ann, s_self)
+        }
+        // The item annotation is fixed by the Rust item type, so the
+        // methods neither mutate nor generalize it; all three are void.
+        "rustvec_method_append"
+        | "rustvec_method_reverse"
+        | "rustvec_method_free"
+        | "rustvec_method_extend_from_slice" => {
+            let SomeValue::RustVec(_) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let params: &[&str] = match method.analyser_name.as_str() {
+                "rustvec_method_append" => &["s_item"],
+                // The `(items, length)` words of the source slice.
+                "rustvec_method_extend_from_slice" => &["s_items", "s_length"],
+                _ => &[],
+            };
+            bind_builtin_method_args(args_s, kwds, params, None, &method.analyser_name)?;
+            return Ok(None);
+        }
+        // `ll_items`: the item pointer, a raw address word (`usize`).
+        "rustvec_method_items" => {
+            let SomeValue::RustVec(_) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            return Ok(Some(SomeValue::Integer(SomeInteger::new(true, true))));
         }
         "stringbuilder_method_append" => {
             let SomeValue::StringBuilder(s_self) = &*method.s_self else {
@@ -6361,6 +6415,42 @@ mod tests {
                 .is_none(),
             "append is a void analyser → None"
         );
+    }
+
+    #[test]
+    fn rust_vec_ops_annotate_from_the_item_kind() {
+        use crate::flowspace::model::{Constant, Hlvalue};
+        use majit_ir::rvec::VecItemKind;
+        let ann = mk_ann();
+        for kind in VecItemKind::ALL {
+            let letter = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                kind.kind_char().to_string(),
+            )));
+            let hl = HLOperation::new(OpKind::NewRustVec, vec![letter]);
+            let Some(SomeValue::RustVec(s_vec)) = hl.consider(&ann).unwrap() else {
+                panic!("newrustvec must type as SomeRustVec");
+            };
+            assert_eq!(s_vec.item_kind(), Some(kind));
+            let s_self = SomeValue::RustVec(s_vec);
+            for (name, analyser) in [
+                ("append", "rustvec_method_append"),
+                ("reverse", "rustvec_method_reverse"),
+                ("free", "rustvec_method_free"),
+                ("items", "rustvec_method_items"),
+                ("extend_from_slice", "rustvec_method_extend_from_slice"),
+            ] {
+                let SomeValue::BuiltinMethod(bound) = s_self.find_method(name).unwrap() else {
+                    panic!("Vec.{name} must be recognized");
+                };
+                assert_eq!(bound.analyser_name, analyser);
+            }
+            assert!(s_self.find_method("extend").is_none());
+        }
+        let bad = HLOperation::new(
+            OpKind::NewRustVec,
+            vec![Hlvalue::Constant(Constant::new(ConstValue::byte_str("x")))],
+        );
+        assert!(bad.consider(&ann).is_err());
     }
 
     #[test]

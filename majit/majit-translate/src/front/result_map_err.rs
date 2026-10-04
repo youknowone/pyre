@@ -13,7 +13,7 @@ use crate::flowspace::model::Variable;
 use crate::front::bool_then::{
     close_goto_mixed, emit_sum_variant, map_source, reproduce_exit_args,
 };
-use crate::front::option_closure_select::emit_call_once;
+use crate::front::option_closure_select::emit_callable;
 use crate::front::option_map_or::emit_narrow;
 use crate::model::{
     CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -36,17 +36,87 @@ pub(crate) struct ResultMapErrSite {
     pub mapped_err_ty: ValueType,
     pub mapped_err_class_root: Option<String>,
     pub args_tuple_suffix: String,
+    /// Set when the mapper is a function item (`map_err(named_fn)`), not a
+    /// closure. The Err arm is then a direct call, the same shape as
+    /// `Option::map(opt, named_fn)`.
+    pub fn_item_segments: Option<Vec<String>>,
     /// True only when every captured field recursively needs no destructor.
     /// Other closure environments stay on the fail-closed path until MIR Drop
     /// lowering can preserve their conditional destruction on the Ok arm.
     pub closure_env_is_trivially_dropless: bool,
 }
 
+fn is_map_err_call(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } if args.len() == 2 && name == "map_err" => true,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.len() == 2 && segments.last().map(String::as_str) == Some("map_err") => true,
+        _ => false,
+    }
+}
+
+/// `(result, call is the block's last op)`.
+fn map_err_call_results(graph: &FunctionGraph) -> Vec<(Variable, bool)> {
+    let mut results = Vec::new();
+    for block in &graph.blocks {
+        let n = block.operations.len();
+        for (index, op) in block.operations.iter().enumerate() {
+            if is_map_err_call(&op.kind)
+                && let Some(result) = op.result.clone()
+            {
+                results.push((result, index + 1 == n));
+            }
+        }
+    }
+    results
+}
+
 pub(crate) fn rewire_result_map_err_sites(
     graph: &mut FunctionGraph,
     sites: &[ResultMapErrSite],
 ) -> usize {
-    sites
+    let calls = map_err_call_results(graph);
+    // Simplify rewrites the call's result variable after the site was
+    // recorded. When every recorded variable is gone, bind sites to the
+    // surviving calls. Prefer calls that are still the block's last op:
+    // an inlined helper can leave a second `map_err` mid-block.
+    let stale = sites
+        .iter()
+        .all(|site| !calls.iter().any(|(result, _)| result == &site.result_var));
+    let tail: Vec<&Variable> = calls
+        .iter()
+        .filter(|(_, is_tail)| *is_tail)
+        .map(|(result, _)| result)
+        .collect();
+    let all: Vec<&Variable> = calls.iter().map(|(result, _)| result).collect();
+    let binders: Option<&[&Variable]> = if stale && sites.len() == tail.len() {
+        Some(tail.as_slice())
+    } else if stale && sites.len() == all.len() {
+        Some(all.as_slice())
+    } else {
+        None
+    };
+    let rebound: Vec<ResultMapErrSite> = if let Some(binders) = binders {
+        sites
+            .iter()
+            .zip(binders)
+            .map(|(site, result)| {
+                let mut site = site.clone();
+                site.result_var = (*result).clone();
+                site
+            })
+            .collect()
+    } else {
+        sites.to_vec()
+    };
+    rebound
         .iter()
         .filter(|site| rewire_one(graph, site).is_ok())
         .count()
@@ -85,6 +155,13 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
             args,
             ..
         } if name == "map_err" && args.len() == 2 => (args[0].clone(), args[1].clone()),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.len() == 2 && segments.last().map(String::as_str) == Some("map_err") => {
+            (args[0].clone(), args[1].clone())
+        }
         other => return Err(format!("{name}: recorded map_err site changed: {other:?}")),
     };
     // When the mapped Result is consumed by `?`, result_exc runs first and
@@ -146,7 +223,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         ok_sources.push(receiver.clone().into_variable());
     }
     let mut err_sources = ok_sources.clone();
-    if !err_sources.contains(&env) {
+    if site.fn_item_segments.is_none() && !err_sources.contains(&env) {
         err_sources.push(env.clone().into_variable());
     }
     // Validate the complete exception destination before adding any blocks.
@@ -233,21 +310,29 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         site.err_ty.clone(),
     );
     let err_payload = emit_narrow(graph, err_block, err_payload, &site.err_class_root);
-    let env_err = map_source(&err_sources, &err_inputs, &env)
-        .ok_or_else(|| format!("{name}: closure env not threaded into Err arm"))?;
-    let mapped = emit_call_once(
+    let env_err = if site.fn_item_segments.is_some() {
+        None
+    } else {
+        Some(
+            map_source(&err_sources, &err_inputs, &env)
+                .ok_or_else(|| format!("{name}: closure env not threaded into Err arm"))?,
+        )
+    };
+    let mapped = emit_callable(
         graph,
         err_block,
         env_err,
+        &site.call_once_owner,
+        site.fn_item_segments.as_deref(),
+        None,
         Some((
             err_payload,
             site.err_ty.clone(),
             site.err_class_root.clone(),
         )),
-        &site.call_once_owner,
         site.mapped_err_ty.clone(),
         &site.args_tuple_suffix,
-    );
+    )?;
     let mapped = emit_narrow(graph, err_block, mapped, &site.mapped_err_class_root);
     if exception_lowered {
         // result_exc has already made the map_err call a can-raise site. Keep
@@ -323,6 +408,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             ty: ValueType::Int,
             pure: true,
@@ -477,6 +563,7 @@ fn read_payload(
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             ty,
             pure: true,
@@ -571,6 +658,7 @@ mod tests {
             mapped_err_ty: ValueType::Ref(Some("Error".into())),
             mapped_err_class_root: Some("Error".into()),
             args_tuple_suffix: "<str>".into(),
+            fn_item_segments: None,
             closure_env_is_trivially_dropless: false,
         }
     }

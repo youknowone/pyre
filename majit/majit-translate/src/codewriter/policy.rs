@@ -586,6 +586,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone

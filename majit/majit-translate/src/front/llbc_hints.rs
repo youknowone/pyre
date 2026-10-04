@@ -163,14 +163,14 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                 continue;
             }
             for (prefix, hints) in CONST_PREFIX_HINTS {
-                if let Some(fn_name) = leaf.strip_prefix(prefix) {
-                    // `elidable_promote` emits a synthetic `_orig_<name>_unlikely_name`
-                    // helper carrying `_elidable_function_`.  This generated fn is not
-                    // a user function, so skip it and only harvest hints for the
-                    // user-written functions.
-                    if should_skip_generated_elidable_helper(fn_name) {
-                        continue;
-                    }
+                if leaf.starts_with(prefix) {
+                    // `elidable_promote` renames the decorated body to
+                    // `_orig_<name>_unlikely_name` and that body carries
+                    // `_elidable_function_`: `jit.py elidable_promote` calls
+                    // `elidable(func)` on the original, and the promoting
+                    // wrapper `f` carries no marker.  The body is harvested
+                    // like any other elidable function, so its call sites
+                    // stay residual `CALL_PURE`s.
                     let key = marker_path_to_fn_path(&path, prefix, &function_paths);
                     for hint in *hints {
                         push_hint(&mut out, key.clone(), hint);

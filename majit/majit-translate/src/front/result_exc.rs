@@ -423,6 +423,8 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
 /// disposed of (a `return f(...)` of another scoped callee builds no
 /// shell of its own) — a body whose every return is such a forward
 /// legitimately has nothing left to rewrite here.
+/// A returned payload-less `Ok` carries a Void payload and lowers to a
+/// Void `ConstNone`. A returned payload-less `Err` declines.
 ///
 /// Fail-loud on any shape outside the known construction pattern —
 /// a scoped callee with an unrecognised return shape must break the
@@ -517,9 +519,9 @@ fn lower_result_exc_returns_inner(
         let Some((ctor_idx, ctor_var, is_err)) = ctor else {
             continue;
         };
-        // Payload FieldWrite (__pos_0).  An `Ok` of a zero-sized payload
-        // has none: the field gets no slot and so no write, and its value
-        // is the Void unit (`widen_unit_return_to_void` then drops it).
+        // Payload FieldWrite (__pos_0).  Required except for the `Ok`
+        // shell of a `Result<(), E>` callee, whose Void payload has no
+        // field and so no write.
         let mut fieldwrite_idx: Option<(usize, Variable)> = None;
         let mut discriminant_write_idx: Option<usize> = None;
         for (i, op) in graph.blocks[bi]
@@ -581,31 +583,29 @@ fn lower_result_exc_returns_inner(
         }
         let (fw_idx, payload) = match fieldwrite_idx {
             Some((i, payload)) => (Some(i), payload),
+            None if !shell_reaches_returnblock(graph, bi, &ctor_var) => {
+                // A zero-sized payload writes no `__pos_0`. A consumed
+                // intermediate is left materialised; only a returned shell
+                // is a shape this rewrite must lower.
+                crate::decline::record_reason(
+                    RESULT_EXC_CALLEE_GATE,
+                    "site-skipped-consumed-intermediate",
+                    &format!(
+                        "{}: block {bi} payload-less {} shell left materialised",
+                        graph.name,
+                        if is_err { "Err" } else { "Ok" },
+                    ),
+                    &graph.name,
+                );
+                continue;
+            }
             None if !is_err => (
                 None,
                 graph.alloc_value_var_with_type(crate::model::ConcreteType::Void),
             ),
             // A payload-less `Err` has no exception value to raise, so it is
-            // never a return shell this rewrite lowers.  A zero-sized error
-            // (such as `i64::try_from(&rbigint)`'s) that the graph itself
-            // `match`es, or the `Err` arm of a tagged pair such as
-            // `Result<&str, Utf8Error>`, is an ordinary ADT value — the same
-            // consumed intermediate the payload-carrying case below leaves
-            // materialised.  Only a shell that reaches `returnblock` is a
-            // return this rewrite must lower.
+            // never a return shell this rewrite lowers.
             None => {
-                if !shell_reaches_returnblock(graph, bi, &ctor_var) {
-                    crate::decline::record_reason(
-                        RESULT_EXC_CALLEE_GATE,
-                        "site-skipped-consumed-intermediate",
-                        &format!(
-                            "{}: block {bi} payload-less Err shell left materialised",
-                            graph.name
-                        ),
-                        &graph.name,
-                    );
-                    continue;
-                }
                 return Err(format!(
                     "{}: block {bi} Result Err ctor without a __pos_0 payload write",
                     graph.name
@@ -703,8 +703,8 @@ fn lower_result_exc_returns_inner(
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
         // call otherwise. RootScope closes (`drop_in_place` or the named
-        // `root_scope_close` residual) are re-emitted at the raise site rather
-        // than left in a tail the rewrite bypasses.
+        // `root_scope_close` residual) and FrameAnchor closes are re-emitted
+        // at the raise site rather than left in a tail the rewrite bypasses.
         let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),
@@ -901,6 +901,16 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
     if scalar_result_kind(ok_ty).is_none() {
         return Ok(());
     }
+    // `from_residual` only raises. When its result joins `Option::Some`
+    // payloads of this Result, leave those shells for the split below
+    // and raise on the residual arm instead of mixing an `i64` stamp
+    // into the return phi.
+    detach_joined_from_residual(graph, result_owner)?;
+    // `eliminate_empty_blocks` (`simplify.py`) forwards each predecessor
+    // straight at `returnblock`, so one shell phi arrives as one return
+    // per predecessor. The normal edge is still one `T`
+    // (`exceptiontransform.py` `transform_completely`).
+    coalesce_shell_returns(graph, result_owner, ok_ty);
     let returnblock = graph.returnblock;
     let mut shells = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
@@ -932,10 +942,128 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
     Ok(())
 }
 
+#[derive(Debug)]
 enum ReturnClass {
     Payload,
     Shell,
     Other,
+}
+
+/// One normal edge for every return of this `Result` shell.
+///
+/// Predecessors that each return the shell become one block whose
+/// argument is that shell. The split below then reads one discriminant.
+fn coalesce_shell_returns(graph: &mut FunctionGraph, result_owner: &str, ok_ty: &ValueType) {
+    let returnblock = graph.returnblock;
+    let mut shells = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (ei, link) in block.exits.iter().enumerate() {
+            if link.target != returnblock || link.args.len() != 1 {
+                continue;
+            }
+            let Some(var) = link.args[0].as_variable() else {
+                continue;
+            };
+            if matches!(
+                classify_return_var(graph, var, result_owner, ok_ty),
+                ReturnClass::Shell
+            ) {
+                shells.push((bi, ei));
+            }
+        }
+    }
+    if shells.len() <= 1 {
+        return;
+    }
+    let (join, inputs) = graph.create_block_with_arg_vars(1);
+    for (bi, ei) in shells {
+        graph.blocks[bi].exits[ei].target = join;
+    }
+    graph.set_return(join, Some(inputs[0].clone()));
+}
+
+fn detach_joined_from_residual(
+    graph: &mut FunctionGraph,
+    result_owner: &str,
+) -> Result<(), String> {
+    let returnblock = graph.returnblock;
+    let mut phis: Vec<(usize, usize)> = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if link.target != returnblock || link.args.len() != 1 {
+                continue;
+            }
+            let Some(var) = link.args[0].as_variable() else {
+                continue;
+            };
+            if let Some(slot) = inputarg_slot(graph, var) {
+                if !phis.contains(&slot) {
+                    phis.push(slot);
+                }
+            }
+        }
+    }
+    for (block, slot) in phis {
+        let mut residual_edges: Vec<(usize, usize, Variable)> = Vec::new();
+        let mut shells = 0usize;
+        let mut foreign = false;
+        for (pbi, pred) in graph.blocks.iter().enumerate() {
+            for (ei, link) in pred.exits.iter().enumerate() {
+                if link.target.0 != block {
+                    continue;
+                }
+                let Some(src) = link.args.get(slot).and_then(LinkArg::as_variable) else {
+                    foreign = true;
+                    continue;
+                };
+                if let Some(err) = from_residual_argument(graph, src) {
+                    residual_edges.push((pbi, ei, err));
+                } else if producer_is_some_shell(graph, src, result_owner) {
+                    shells += 1;
+                } else {
+                    foreign = true;
+                }
+            }
+        }
+        if foreign || shells == 0 || residual_edges.is_empty() {
+            continue;
+        }
+        for (pbi, ei, err) in residual_edges {
+            let (raise_bb, inputs) = graph.create_block_with_arg_vars(1);
+            graph.blocks[pbi].exits[ei].target = raise_bb;
+            graph.blocks[pbi].exits[ei].args = vec![LinkArg::Value(err)];
+            crate::front::exc_from_raise::set_raise_from_instance(
+                graph,
+                raise_bb,
+                inputs[0].clone(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn from_residual_argument(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
+    let kind = producing_op(graph, var)?;
+    match kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } if name == "from_residual" => args.first().and_then(LinkArg::as_variable).cloned(),
+        _ => None,
+    }
+}
+
+fn producer_is_some_shell(graph: &FunctionGraph, var: &Variable, result_owner: &str) -> bool {
+    let Some(OpKind::FieldRead { field, ty, .. }) = producing_op(graph, var) else {
+        return false;
+    };
+    field.name == "__pos_0"
+        && matches!(ty, ValueType::Ref(_))
+        && field
+            .owner_root
+            .as_deref()
+            .is_some_and(|owner| option_some_payload_is_result(owner, result_owner))
 }
 
 fn scalar_result_kind(ty: &ValueType) -> Option<char> {
@@ -1007,7 +1135,7 @@ enum ReturnEqn {
     Phi(Vec<usize>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReturnMeet {
     Bot,
     Shell,
@@ -1415,6 +1543,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone
@@ -2361,7 +2490,10 @@ fn from_residual_forwards_to_return(graph: &FunctionGraph, r: &Variable) -> bool
     let Some(kind) = producing_op(graph, r) else {
         return false;
     };
-    is_from_residual_call(kind) && forwards_to_returnblock(graph, block, r).is_ok()
+    // Frame-exit cleanups between the call and `returnblock` belong to this
+    // tail. The strict empty-block walk misses them, and the caller rule
+    // then remints the call to the `Ok` payload.
+    is_from_residual_call(kind) && root_scope_closes_to_returnblock(graph, block, r).is_ok()
 }
 
 /// `return Result::from_residual(residual)` raises. `FromResidual::from_residual`
@@ -2373,6 +2505,10 @@ fn from_residual_forwards_to_return(graph: &FunctionGraph, r: &Variable) -> bool
 /// type is raised only after [`apply_foreign_from_residuals`] has inserted
 /// that `From` impl. `lower_result_exc_returns` already raises `return Err`
 /// the same way (`exceptiontransform.py` `create_exception_handling`).
+///
+/// Frame-exit cleanups on that tail (root-bracket closes,
+/// `ll_slice_buffer_free`) are replayed in the producer before the raise.
+/// `set_raise_values` drops the forwarding blocks that held them.
 fn raise_returned_from_residual(
     graph: &mut FunctionGraph,
     r: &Variable,
@@ -2387,9 +2523,11 @@ fn raise_returned_from_residual(
     if !block_reachable_from_start(graph, block) {
         return Ok(());
     }
-    if forwards_to_returnblock(graph, block, r).is_err() {
+    // Same walker as the deferral above. A non-cleanup hop is some other
+    // consumer, left for the caller rule.
+    let Ok(closes) = root_scope_closes_to_returnblock(graph, block, r) else {
         return Ok(());
-    }
+    };
     let op_idx = graph.blocks[block]
         .operations
         .iter()
@@ -2420,6 +2558,9 @@ fn raise_returned_from_residual(
         .map_err(|err| format!("{name}: {err}"))?;
     graph.blocks[block].operations.remove(op_idx);
     let block_id = crate::model::BlockId(block);
+    for close in closes {
+        graph.push_op_var(block_id, close, false);
+    }
     // `return from_residual(e)` → `raise e`. The codewriter converts
     // the raised carrier (`codewriter::error_carrier_edges`).
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, carrier);
@@ -2688,6 +2829,7 @@ fn rewire_one_option_ok_or_else_try_site(
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     ty: site.payload_ty.clone(),
                     pure: true,
@@ -2750,6 +2892,7 @@ fn rewire_one_option_ok_or_else_try_site(
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     ty: ValueType::Int,
                     pure: true,
@@ -2848,8 +2991,22 @@ fn rewire_one_call_site(
     // with a single forwarding exit.
     let a = producer_block_index(graph, r)
         .ok_or_else(|| format!("{name}: scoped call result var has no producer block"))?;
-    // Tail forward: the callee's Result flows straight to returnblock.
-    if forwards_to_returnblock(graph, a, r).is_ok() {
+    // Tail forward: the callee's Result flows straight to returnblock, or
+    // through blocks that only close brackets.  Those closes also run when
+    // the callee raises, so the call gains an exception edge that re-emits
+    // them before the raise.
+    let call_ends_block = graph.blocks[a]
+        .operations
+        .last()
+        .is_some_and(|op| op.result.as_ref() == Some(r));
+    let tail_closes = if forwards_to_returnblock(graph, a, r).is_ok() {
+        Some(Vec::new())
+    } else if call_ends_block {
+        root_scope_closes_to_returnblock(graph, a, r).ok()
+    } else {
+        None
+    };
+    if let Some(tail_closes) = tail_closes {
         if !enclosing_scoped {
             return Err(format!(
                 "{name}: tail-forwards a scoped callee's Result out of a \
@@ -2893,6 +3050,15 @@ fn rewire_one_call_site(
         // keep the normal-edge value off the shell).
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
+        if !tail_closes.is_empty() {
+            let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
+            let normal = graph.blocks[a].exits[0].clone();
+            graph.set_control_flow_metadata(
+                BlockId(a),
+                Some(ExitSwitch::LastException),
+                vec![normal, exc_link],
+            );
+        }
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
@@ -3044,6 +3210,9 @@ fn rewire_one_call_site(
     // (`__pos_0` read + `from_residual` + return).  A custom handler
     // arm must not be silently disconnected.
     verify_break_arm_is_reraise(graph, &break_link, &cf_c, &name)?;
+    // The bracket closes the break arm's tail runs before returning,
+    // remapped into A's namespace; the exception edge re-emits them.
+    let break_closes_a = break_arm_closes(graph, a, b, c, &break_link, &name)?;
 
     // Map each continue-arm link arg back to A-scope variables: the
     // A→B→C chain is pure positional forwarding.
@@ -3125,19 +3294,7 @@ fn rewire_one_call_site(
     // (`flowspace/model.py` `Link.last_exception` pair; `flatten.rs`
     // turns the `[last_exception, last_exc_value]` propagation shape
     // into the rethrow tail).
-    let va = graph.alloc_value_var();
-    let vb = graph.alloc_value_var();
-    let exceptblock = graph.exceptblock;
-    // `exception_exitcase()` marks the link catch-all
-    // (`Link::catches_all_exceptions`), the propagation shape
-    // `flatten.rs` rethrows without a `goto_if_exception_mismatch`.
-    let mut exc_link = Link::new_mixed(
-        vec![LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())],
-        exceptblock,
-        Some(crate::model::exception_exitcase()),
-    );
-    exc_link.last_exception = Some(LinkArg::Value(va));
-    exc_link.last_exc_value = Some(LinkArg::Value(vb));
+    let exc_link = raise_link_through_closes(graph, break_closes_a, &name)?;
     let block_a = &mut graph.blocks[a];
     block_a.exitswitch = Some(ExitSwitch::LastException);
     block_a.exits = vec![
@@ -3147,6 +3304,135 @@ fn rewire_one_call_site(
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
     Ok(SiteOutcome::Diamond)
+}
+
+/// The bracket closes the `?` break arm runs between its `from_residual`
+/// and `returnblock`, remapped into the call block `a`'s namespace through
+/// the `a → b → c → break arm` links.  Empty when the arm's forward carries
+/// anything besides bracket closes; that arm keeps the direct raise.
+fn break_arm_closes(
+    graph: &FunctionGraph,
+    a: usize,
+    b: usize,
+    c: usize,
+    break_link: &Link,
+    name: &str,
+) -> Result<Vec<OpKind>, String> {
+    let e_block = break_link.target.0;
+    let Some(residual_result) =
+        graph.blocks[e_block]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name: m, .. },
+                    ..
+                } if m == "from_residual" => op.result.clone(),
+                _ => None,
+            })
+    else {
+        return Err(format!(
+            "{name}: break arm {e_block} has no from_residual result to rebuild bracket closes"
+        ));
+    };
+    let closes = root_scope_closes_to_returnblock(graph, e_block, &residual_result)?;
+    if closes.is_empty() {
+        return Ok(closes);
+    }
+    // The break arm's inputargs come from A through the positional B and C
+    // forwards.
+    let [a_to_b] = graph.blocks[a].exits.as_slice() else {
+        return Err(format!("{name}: call block {a} must have a single exit"));
+    };
+    let [b_to_c] = graph.blocks[b].exits.as_slice() else {
+        return Err(format!("{name}: branch block {b} must have a single exit"));
+    };
+    let hops = [(e_block, break_link), (c, b_to_c), (b, a_to_b)];
+    // A close whose argument is not forwarded from A cannot be rebuilt on
+    // the raise edge; the enclosing rewrite declines.
+    closes
+        .iter()
+        .map(|close| remap_root_scope_close_through_links(graph, close, &hops, name))
+        .collect()
+}
+
+/// The exception link of a call whose raise must first run `closes`, the
+/// bracket closes (in the call block's namespace) its normal return runs.
+/// Without closes the link goes straight to `exceptblock`; with them it goes
+/// to a block that re-emits them in order and then raises the caught value.
+fn raise_link_through_closes(
+    graph: &mut FunctionGraph,
+    closes: Vec<OpKind>,
+    name: &str,
+) -> Result<Link, String> {
+    let va = graph.alloc_value_var();
+    let vb = graph.alloc_value_var();
+    // `exception_exitcase()` marks the link catch-all
+    // (`Link::catches_all_exceptions`), the propagation shape
+    // `flatten.rs` rethrows without a `goto_if_exception_mismatch`.
+    let mut exc_link = if closes.is_empty() {
+        Link::new_mixed(
+            vec![LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())],
+            graph.exceptblock,
+            Some(crate::model::exception_exitcase()),
+        )
+    } else {
+        let mut close_vars: Vec<Variable> = Vec::new();
+        for close in &closes {
+            let OpKind::Call { args, .. } = close else {
+                return Err(format!("{name}: a bracket close is not a call"));
+            };
+            for arg in args {
+                let arg = arg.clone().into_variable();
+                if !close_vars.contains(&arg) {
+                    close_vars.push(arg);
+                }
+            }
+        }
+        // R: `[close args..., etype, evalue]`; re-emit the closes, then
+        // raise the caught value.
+        let n = close_vars.len();
+        let (r_id, r_inputs) = graph.create_block_with_arg_vars(n + 2);
+        for close in closes {
+            let OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } = close
+            else {
+                unreachable!("checked above");
+            };
+            let args: Vec<Variable> = args
+                .iter()
+                .map(|arg| {
+                    let pos = close_vars
+                        .iter()
+                        .position(|v| *v == arg.clone().into_variable())
+                        .expect("collected above");
+                    r_inputs[pos].clone()
+                })
+                .collect();
+            graph.push_op_var(
+                r_id,
+                OpKind::Call {
+                    target,
+                    args: crate::model::call_args(args),
+                    result_ty,
+                },
+                true,
+            );
+        }
+        crate::front::exc_from_raise::set_raise_from_instance(graph, r_id, r_inputs[n + 1].clone());
+        let args = close_vars
+            .into_iter()
+            .chain([va.clone(), vb.clone()])
+            .map(LinkArg::Value)
+            .collect();
+        Link::new_mixed(args, r_id, Some(crate::model::exception_exitcase()))
+    };
+    exc_link.last_exception = Some(LinkArg::Value(va));
+    exc_link.last_exc_value = Some(LinkArg::Value(vb));
+    Ok(exc_link)
 }
 
 /// Custom-match fallback: the call's `Result` is consumed by a
@@ -3193,16 +3479,31 @@ fn catch_and_rewrap(
     }
     let is_r = |arg: &LinkArg| matches!(arg, LinkArg::Value(v) if v == r);
     let has_r = orig.args.iter().any(&is_r);
+    // `Ok(())`: the call returns nothing, so the normal arm receives no
+    // payload. Handing the arm the call's result variable would name a
+    // register the void call never writes; the arm's payload is a Void
+    // `None` instead, and its `Ok` shell has no `__pos_0` field to store.
+    let unit_ok = matches!(payload_ty, ValueType::Void);
 
     // Normal arm N: receive every Value arg, rebuild `Ok(r)`.
     let value_args: Vec<LinkArg> = orig
         .args
         .iter()
-        .filter(|a| matches!(a, LinkArg::Value(_)))
+        .filter(|a| matches!(a, LinkArg::Value(_)) && !(unit_ok && is_r(a)))
         .cloned()
         .collect();
     let (n_id, n_inputs) = graph.create_block_with_arg_vars(value_args.len());
-    let (n_shell, ok_payload): (Option<Variable>, Option<Variable>) = if has_r {
+    let (n_shell, ok_payload): (Option<Variable>, Option<Variable>) = if has_r && unit_ok {
+        let unit = graph.alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        graph.blocks[n_id.0]
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(unit.clone()),
+                kind: OpKind::ConstNone,
+            });
+        let shell = push_shell_ctor(graph, n_id, "Ok", suffix);
+        (Some(shell), Some(unit))
+    } else if has_r {
         let r_value_idx = value_args
             .iter()
             .position(&is_r)
@@ -3226,6 +3527,9 @@ fn catch_and_rewrap(
         .iter()
         .map(|arg| match arg {
             LinkArg::Const(c) => LinkArg::Const(c.clone()),
+            LinkArg::Value(_) if unit_ok && is_r(arg) => {
+                LinkArg::Value(n_shell.clone().expect("shell built when r flows"))
+            }
             LinkArg::Value(_) => {
                 let v = n_inputs[vi].clone();
                 vi += 1;
@@ -3331,9 +3635,9 @@ fn catch_and_rewrap(
         vec![Link::new_mixed(value_args, n_id, None), exc_link],
     );
     // The shells exist only so the hand-written `match` can unwrap them.
-    // When that match is a pure `__pos_0` unwrap, feed the payload straight
-    // into the arms (`getindex_w`'s `try/except OperationError`). A shape
-    // that still inspects the shell keeps the rebuild.
+    // Feed the payload straight into the arms (`getindex_w`'s
+    // `try/except OperationError`, and `Err(e) if e.kind == …`). A shape
+    // that still inspects the shell itself keeps the rebuild.
     if let (Some(ok_shell), Some(err_shell), Some(ok_payload), Some(err_payload)) =
         (n_shell, e_shell, ok_payload, err_payload)
     {
@@ -3468,8 +3772,10 @@ fn collapse_rebuilt_shell_match(
         &disc,
         1,
     )?;
-    let ok_build = shell_build_ops(graph, normal, ok_shell)?;
-    let err_build = shell_build_ops(graph, handler, err_shell)?;
+    let ok_payload_is_void = ok_payload.concretetype()
+        == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void);
+    let ok_build = shell_build_ops(graph, normal, ok_shell, ok_payload_is_void)?;
+    let err_build = shell_build_ops(graph, handler, err_shell, false)?;
     // Every check has run. The edits below do not fail.
     delete_ops(graph, normal, ok_build);
     delete_ops(graph, handler, err_build);
@@ -3651,6 +3957,12 @@ struct ShellPos0Walk {
 /// Blocks reachable from `start` whose shell alias is only a `__pos_0`
 /// read or a forwarded link arg. Each read entry is `(block, inputarg
 /// position)` of a read the collapse can delete.
+///
+/// The `__pos_0` result is the payload (`PyError`, `Option`, …), not
+/// another shell. A guard such as `e.kind == AttributeError` reads that
+/// payload; following it and demanding another `__pos_0` used to keep
+/// the `Result` shell, and the arm then took the address of the inline
+/// `PyError` inside the GC shell.
 fn shell_pos0_reads(
     graph: &FunctionGraph,
     start: usize,
@@ -3730,24 +4042,17 @@ fn shell_pos0_reads(
         }
         for link in &graph.blocks[block].exits {
             for (i, arg) in link.args.iter().enumerate() {
+                // Only the shell alias. The payload (`read_result`) is the
+                // unwrapped value and may be matched, passed on, or returned.
                 let shell_alias = matches!(arg, LinkArg::Value(v) if v == &var);
-                let payload_alias = read_result
-                    .as_ref()
-                    .is_some_and(|result| matches!(arg, LinkArg::Value(v) if v == result));
-                if !shell_alias && !payload_alias {
+                if !shell_alias {
                     continue;
                 }
                 let target = link.target.0;
                 if target == graph.returnblock.0 || target == graph.exceptblock.0 {
-                    // The unwrapped payload may leave the function. The
-                    // shell alias must not: that returns the Result / the
-                    // PyError as a normal value.
-                    if shell_alias {
-                        return Err(format!(
-                            "block {block} forwards the Result shell to the function exit"
-                        ));
-                    }
-                    continue;
+                    return Err(format!(
+                        "block {block} forwards the Result shell to the function exit"
+                    ));
                 }
                 let Some(next) = graph.blocks[target].inputargs.get(i).cloned() else {
                     return Err(format!("block {target} lacks inputarg {i}"));
@@ -3808,10 +4113,12 @@ fn project_arm_args(
 }
 
 /// Op indices of the `Ok`/`Err` ctor and its `__pos_0` write. No edit.
+/// A Void payload has no field, so its shell is the ctor alone.
 pub(crate) fn shell_build_ops(
     graph: &FunctionGraph,
     block: usize,
     shell: &Variable,
+    payload_is_void: bool,
 ) -> Result<Vec<usize>, String> {
     let mut remove = Vec::new();
     let mut saw_ctor = false;
@@ -3829,7 +4136,7 @@ pub(crate) fn shell_build_ops(
             remove.push(i);
         }
     }
-    if !saw_ctor || !saw_write {
+    if !saw_ctor || saw_write == payload_is_void {
         return Err(format!("block {block} is not an Ok/Err shell build"));
     }
     remove.sort_unstable();
@@ -3998,29 +4305,15 @@ fn try_fuse_drain_match(
 
     // (2) A→B single exit; B holds `d = r.__discriminant[Result<..,PyError>]`,
     // `exitswitch == Value(d)`, pure besides the read, single predecessor.
-    let (b, r_b) =
-        follow_single_exit(graph, a, r).map_err(|e| format!("{name}: drain fuse: {e}"))?;
+    // A `with_roots!(x => next(x))` restore (`RootScope::get` + pointer
+    // casts) may sit between the call and the discriminant switch; skip
+    // those forwarding blocks. `unpackiterable_portal` has no such hop
+    // because `next(shadow_stack_get(...))` is already the last op.
+    let (b, r_b, a_to_b_chain) = follow_to_result_discriminant(graph, a, r.clone(), &name)?;
     assert_single_pred(graph, b, &name)?;
-    let (disc_idx, disc_var) = graph.blocks[b]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == r_b
-                    && field.name == "__discriminant"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(owner_is_result_of_pyerror) =>
-            {
-                op.result.clone().map(|d| (i, d))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| {
-            format!("{name}: drain fuse: block {b} lacks the Result __discriminant read")
-        })?;
+    let (disc_idx, disc_var) = result_discriminant_read(graph, b, &r_b).ok_or_else(|| {
+        format!("{name}: drain fuse: block {b} lacks the Result __discriminant read")
+    })?;
     match &graph.blocks[b].exitswitch {
         Some(ExitSwitch::Value(v)) if *v == disc_var => {}
         other => {
@@ -4087,54 +4380,45 @@ fn try_fuse_drain_match(
             _ => None,
         })
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
-    let (predicate_idx, predicate_result) = err_ops
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::Call {
-                target:
-                    CallTarget::Method {
-                        name: method,
-                        receiver_root,
-                        ..
-                    },
-                args,
-                ..
-            } if method == "matches_stop_iteration"
-                && receiver_root.as_deref() == Some("PyError")
-                && args.as_slice() == std::slice::from_ref(&err_payload) =>
-            {
-                op.result.clone().map(|matched| (i, matched))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| {
-            format!("{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration")
-        })?;
+    // The drain loop keeps the payload read and `matches_stop_iteration` in
+    // one block. `iter_next` wraps the predicate in `with_roots!`, so the
+    // call sits a few restore/pin hops downstream; the payload is forwarded.
+    let (pred_block, predicate_idx, predicate_result) =
+        follow_to_stopiteration_predicate(graph, err_target, &err_payload, &name)?;
+    if pred_block == err_target {
+        if err_ops.len() != 2 || errpay_idx >= predicate_idx {
+            return Err(format!(
+                "{name}: drain fuse: Err arm is not exactly payload-read then StopIteration predicate"
+            ));
+        }
+        assert_block_pure_besides(
+            graph,
+            err_target,
+            &[errpay_idx, predicate_idx],
+            "Err arm",
+            &name,
+        )?;
+    } else {
+        let mut err_recognized = vec![errpay_idx];
+        err_recognized.extend(restore_op_indices(graph, err_target));
+        assert_block_pure_besides(graph, err_target, &err_recognized, "Err arm", &name)?;
+        let mut pred_recognized = vec![predicate_idx];
+        pred_recognized.extend(restore_op_indices(graph, pred_block));
+        assert_block_pure_besides(graph, pred_block, &pred_recognized, "Err predicate", &name)?;
+    }
     // The guard is the handler's own predicate on the caught carrier
     // (`except OperationError as e: if e.match(space, w_StopIteration)`);
     // `H` re-issues it on the caught value.
-    let predicate_target = match &err_ops[predicate_idx].kind {
+    let predicate_target = match &graph.blocks[pred_block].operations[predicate_idx].kind {
         OpKind::Call { target, .. } => target.clone(),
         _ => unreachable!("predicate matched as a call"),
     };
-    if err_ops.len() != 2 || errpay_idx >= predicate_idx {
-        return Err(format!(
-            "{name}: drain fuse: Err arm is not exactly payload-read then StopIteration predicate"
-        ));
-    }
-    assert_block_pure_besides(
-        graph,
-        err_target,
-        &[errpay_idx, predicate_idx],
-        "Err arm",
-        &name,
-    )?;
 
-    // (6) Err arm → bool-switch block: `m2 = bool(predicate)`, `exitswitch ==
-    // Value(m2)`, pure besides, single predecessor.
-    let (bswitch, predicate_bs) = follow_single_exit(graph, err_target, &predicate_result)
-        .map_err(|e| format!("{name}: drain fuse: Err arm exit: {e}"))?;
+    // (6) predicate → bool-switch block: `m2 = bool(predicate)`, `exitswitch ==
+    // Value(m2)`, pure besides, single predecessor. Restore hops after
+    // `with_roots!` are skipped the same way as after `next()`.
+    let (bswitch, predicate_bs) =
+        follow_to_bool_switch(graph, pred_block, &predicate_result, &name)?;
     assert_single_pred(graph, bswitch, &name)?;
     let (bool_idx, bool_temp) = graph.blocks[bswitch]
         .operations
@@ -4197,19 +4481,58 @@ fn try_fuse_drain_match(
     // reraise block and require the block to write it back into a fresh `Err`.
     let e_bswitch = forward_alias(graph, &err_payload, &err_to_bswitch)
         .ok_or_else(|| format!("{name}: drain fuse: bool-switch drops the Err payload"))?;
+    // The guard binds `e` once. `Err(e) => Err(e)` on the false edge
+    // re-reads `Result::Err.__pos_0` instead of threading that binding
+    // (`except OperationError as e: raise` is the same carrier).
     let e_reraise = forward_alias(graph, &e_bswitch, &reraise_link)
+        .or_else(|| {
+            let shell = forward_alias(graph, &r_err, &err_to_bswitch)
+                .and_then(|shell| forward_alias(graph, &shell, &reraise_link));
+            graph.blocks[reraise_target]
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::FieldRead { base, field, .. }
+                        if field.name == "__pos_0"
+                            && field
+                                .owner_root
+                                .as_deref()
+                                .is_some_and(|owner| owner_is_result_variant(owner, "Err"))
+                            && shell.as_ref().is_none_or(|shell| base == shell) =>
+                    {
+                        op.result.clone()
+                    }
+                    _ => None,
+                })
+        })
         .ok_or_else(|| format!("{name}: drain fuse: reraise link drops the Err payload"))?;
     // The bracket closes the reraise tail runs, remapped into A's namespace.
     // Block `R` replaces the tail, so `R` re-emits them before its raise.
     let reraise_closes =
         verify_drain_reraise_returns_err_payload(graph, reraise_target, &e_reraise, &name)?;
-    let a_to_b = graph.blocks[a].exits[0].clone();
-    let close_hops = [
-        (reraise_target, &reraise_link),
-        (bswitch, &err_to_bswitch),
-        (err_target, &err_link),
-        (b, &a_to_b),
-    ];
+    // `with_roots!` inserts restore hops between `next()`, the predicate,
+    // and the bool switch. Walk the unique-predecessor chain from the
+    // reraise block back to the call instead of assuming those four edges.
+    let mut close_chain: Vec<(usize, Link)> = Vec::new();
+    let mut cursor = reraise_target;
+    while cursor != a {
+        let Some((src, link)) = single_incoming_link(graph, cursor) else {
+            return Err(format!(
+                "{name}: drain fuse: reraise block {cursor} has no single predecessor on the way back to the call"
+            ));
+        };
+        close_chain.push((cursor, link));
+        cursor = src;
+        if close_chain.len() > graph.blocks.len() {
+            return Err(format!(
+                "{name}: drain fuse: reraise predecessor walk did not reach the call"
+            ));
+        }
+    }
+    let close_hops: Vec<(usize, &Link)> = close_chain
+        .iter()
+        .map(|(block, link)| (*block, link))
+        .collect();
     let reraise_closes_a: Vec<OpKind> = reraise_closes
         .iter()
         .map(|close| {
@@ -4233,10 +4556,10 @@ fn try_fuse_drain_match(
             LinkArg::Value(v) if *v == disc_var => {
                 normal_args.push(LinkArg::Const(Constant::new(ConstValue::Int(0))));
             }
-            LinkArg::Value(v) => {
-                let v_a = back_substitute(graph, &[(a, b)], v, &name)?;
-                normal_args.push(LinkArg::Value(v_a));
-            }
+            LinkArg::Value(v) => match origin_link_arg(graph, &a_to_b_chain, v, &name)? {
+                LinkArg::Value(v_a) => normal_args.push(LinkArg::Value(v_a)),
+                LinkArg::Const(c) => normal_args.push(LinkArg::Const(c)),
+            },
         }
     }
     if payload_positions.len() > 1 {
@@ -4286,13 +4609,24 @@ fn try_fuse_drain_match(
         // The collapse only rewrites the __pos_0 read; a carrier that also
         // escapes on an exit or drives the exitswitch would keep pointing at the
         // now-raw-element inputarg post-fusion.
-        let escapes = graph.blocks[ok_target].exits.iter().any(|l| {
-            l.args
-                .iter()
-                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == ok_carrier))
-        }) || matches!(&graph.blocks[ok_target].exitswitch,
+        let switch_uses_carrier = matches!(&graph.blocks[ok_target].exitswitch,
             Some(ExitSwitch::Value(v)) if *v == ok_carrier);
-        if escapes {
+        // A forwarded carrier that no successor reads is the match
+        // scrutinee's dead SSA edge. Collapse rewrites the read; the dead
+        // slot never treats that word as a Result.
+        let escapes_live = switch_uses_carrier
+            || graph.blocks[ok_target].exits.iter().any(|link| {
+                link.args.iter().enumerate().any(|(slot, arg)| {
+                    matches!(arg, LinkArg::Value(v) if *v == ok_carrier)
+                        && crate::front::iter_next::collect_transitive_dead_slots(
+                            graph,
+                            link.target.0,
+                            slot,
+                        )
+                        .is_err()
+                })
+            });
+        if escapes_live {
             return Err(format!(
                 "{name}: drain fuse: Ok arm forwards the Result carrier past the __pos_0 read"
             ));
@@ -4311,95 +4645,107 @@ fn try_fuse_drain_match(
     enum BreakArg {
         Const(LinkArg),
         Forward(Variable),
+        /// The slot is the `Result` shell, read back as `Err.__pos_0`.
+        /// On the exception edge that word is the caught `PyError` (`vb`).
+        Exc,
     }
     let resolve_break = |x: &LinkArg| -> Result<BreakArg, String> {
         // Constants ride through unchanged.
-        let LinkArg::Value(x) = x else {
+        let LinkArg::Value(start) = x else {
             let LinkArg::Const(c) = x else { unreachable!() };
             return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
         };
-        // Hop bswitch → Err-arm.  The exitswitch bool temp is the only
-        // bswitch-defined value; the break arm never carries it, but guard
-        // it just in case (matched arm ⟹ predicate true).
-        if *x == bool_temp {
-            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
-                ConstValue::Bool(true),
-            ))));
-        }
-        let pos = graph.blocks[bswitch]
-            .inputargs
-            .iter()
-            .position(|v| v == x)
-            .ok_or_else(|| {
-                format!("{name}: drain fuse: break value defined in bool-switch block")
-            })?;
-        let LinkArg::Value(y) = err_to_bswitch
-            .args
-            .get(pos)
-            .ok_or_else(|| format!("{name}: drain fuse: Err→bool-switch link lacks arg {pos}"))?
-        else {
-            // A const threaded through the bswitch inputarg.
-            let Some(LinkArg::Const(c)) = err_to_bswitch.args.get(pos) else {
-                unreachable!()
+        // The bool switch's true edge is the StopIteration arm, so a
+        // predicate temp carried onto it is true. Walk every restore hop
+        // back to the call; a direct Err-arm → bool-switch edge is not
+        // what `with_roots!` lowers.
+        let mut current = start.clone();
+        let mut cursor = bswitch;
+        let mut steps = 0usize;
+        'walk: loop {
+            if current == bool_temp || current == predicate_result {
+                return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
+                    ConstValue::Bool(true),
+                ))));
+            }
+            if current == disc_var {
+                return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
+                    ConstValue::Int(1),
+                ))));
+            }
+            if current == err_payload {
+                return Err(format!(
+                    "{name}: drain fuse: break edge carries a detached Err-arm temp (dead `Err(e)` re-bind)"
+                ));
+            }
+            if current == r_b || current == *r {
+                // StopIteration arm: `e = shell.__pos_0` then
+                // `_report_stopiteration_sometimes(iter, e)`. The shell is
+                // not on the exception edge; `e` is the caught carrier.
+                return Ok(BreakArg::Exc);
+            }
+            loop {
+                if graph.blocks[cursor].inputargs.iter().any(|v| v == &current) {
+                    break;
+                }
+                let Some((src, origin)) =
+                    restore_def_source(graph, cursor, &current, &a_to_b_chain)
+                else {
+                    return Err(format!(
+                        "{name}: drain fuse: break value defined in block {cursor}"
+                    ));
+                };
+                if origin {
+                    if src == *r {
+                        return Err(format!(
+                            "{name}: drain fuse: break edge needs the Result value from A scope"
+                        ));
+                    }
+                    return Ok(BreakArg::Forward(src));
+                }
+                current = src;
+                continue 'walk;
+            }
+            if cursor == a {
+                if current == *r {
+                    return Err(format!(
+                        "{name}: drain fuse: break edge needs the Result value from A scope"
+                    ));
+                }
+                return Ok(BreakArg::Forward(current));
+            }
+            let Some((pred, link)) = single_incoming_link(graph, cursor) else {
+                return Err(format!(
+                    "{name}: drain fuse: break block {cursor} has no single predecessor"
+                ));
             };
-            return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
-        };
-        let y = y.clone();
-        // Hop Err-arm → B.  Err-arm-defined values (the two guard ops)
-        // decline, except the predicate bool (matched arm ⟹ true).
-        if y == predicate_result {
-            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
-                ConstValue::Bool(true),
-            ))));
-        }
-        if y == err_payload {
-            return Err(format!(
-                "{name}: drain fuse: break edge carries a detached Err-arm temp (dead `Err(e)` re-bind)"
-            ));
-        }
-        let pos = graph.blocks[err_target]
-            .inputargs
-            .iter()
-            .position(|v| *v == y)
-            .ok_or_else(|| format!("{name}: drain fuse: break value defined in Err-arm block"))?;
-        let LinkArg::Value(z) = err_link
-            .args
-            .get(pos)
-            .ok_or_else(|| format!("{name}: drain fuse: B→Err link lacks arg {pos}"))?
-        else {
-            let Some(LinkArg::Const(c)) = err_link.args.get(pos) else {
-                unreachable!()
+            let Some(pos) = graph.blocks[cursor]
+                .inputargs
+                .iter()
+                .position(|v| v == &current)
+            else {
+                return Err(format!(
+                    "{name}: drain fuse: break value defined in block {cursor}"
+                ));
             };
-            return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
-        };
-        let z = z.clone();
-        // Hop B → A.  The Result value declines (invalid on the exception
-        // edge); the discriminant temp is Const(1) on the Err arm; a B
-        // inputarg forwards from the single A→B edge to an A-scope value.
-        if z == r_b {
-            return Err(format!(
-                "{name}: drain fuse: break edge needs the Result value (dead `Err(e)` re-bind reads it)"
-            ));
-        }
-        if z == disc_var {
-            return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
-                ConstValue::Int(1),
-            ))));
-        }
-        let pos = graph.blocks[b]
-            .inputargs
-            .iter()
-            .position(|v| *v == z)
-            .ok_or_else(|| {
-                format!("{name}: drain fuse: break value defined in discriminant block")
-            })?;
-        match graph.blocks[a].exits[0].args.get(pos) {
-            Some(LinkArg::Const(c)) => Ok(BreakArg::Const(LinkArg::Const(c.clone()))),
-            Some(LinkArg::Value(av)) if *av == *r => Err(format!(
-                "{name}: drain fuse: break edge needs the Result value from A scope"
-            )),
-            Some(LinkArg::Value(av)) => Ok(BreakArg::Forward(av.clone())),
-            None => Err(format!("{name}: drain fuse: A→B link lacks arg {pos}")),
+            match link.args.get(pos) {
+                Some(LinkArg::Const(c)) => {
+                    return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
+                }
+                Some(LinkArg::Value(v)) => current = v.clone(),
+                None => {
+                    return Err(format!(
+                        "{name}: drain fuse: break link into block {cursor} lacks arg {pos}"
+                    ));
+                }
+            }
+            cursor = pred;
+            steps += 1;
+            if steps > graph.blocks.len() {
+                return Err(format!(
+                    "{name}: drain fuse: break predecessor walk did not reach the call"
+                ));
+            }
         }
     };
     // Classify each break-target slot (MUST-ADD#1).  A transitively-dead
@@ -4446,14 +4792,43 @@ fn try_fuse_drain_match(
     // const slot cannot be threaded as a Variable through `set_branch`'s
     // arity-checked link, so decline it.
     let mut forwarded: Vec<Variable> = Vec::new();
-    let mut break_vars_src: Vec<Variable> = Vec::with_capacity(live_slots.len());
+    enum SlotSrc {
+        Forward(Variable),
+        Exc(Variable, Variable),
+    }
+    let mut slot_srcs: Vec<SlotSrc> = Vec::with_capacity(live_slots.len());
     for &slot in &live_slots {
         match resolve_break(&break_link.args[slot])? {
             BreakArg::Forward(av) => {
                 if !forwarded.contains(&av) {
                     forwarded.push(av.clone());
                 }
-                break_vars_src.push(av);
+                slot_srcs.push(SlotSrc::Forward(av));
+            }
+            BreakArg::Exc => {
+                let carrier = graph.blocks[break_target].inputargs[slot].clone();
+                let read = graph.blocks[break_target].operations.iter().find(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { base, field, .. }
+                            if *base == carrier
+                                && field.name == "__pos_0"
+                                && field.owner_root.as_deref().is_some_and(|owner| {
+                                    owner_is_result_variant(owner, "Err")
+                                })
+                    )
+                });
+                let Some(read) = read else {
+                    return Err(format!(
+                        "{name}: drain fuse: break edge needs the Result value (dead `Err(e)` re-bind reads it)"
+                    ));
+                };
+                let Some(payload) = read.result.clone() else {
+                    return Err(format!(
+                        "{name}: drain fuse: break edge Err payload read has no result"
+                    ));
+                };
+                slot_srcs.push(SlotSrc::Exc(carrier, payload));
             }
             BreakArg::Const(c) => {
                 return Err(format!(
@@ -4479,6 +4854,43 @@ fn try_fuse_drain_match(
     }
 
     // All validation + arg-building passed; mutate.
+    // The StopIteration arm read `e` out of the Result shell. The slot now
+    // receives the caught carrier, so uses of that read name the slot.
+    let exc_rewrites: Vec<(Variable, Variable)> = slot_srcs
+        .iter()
+        .filter_map(|src| match src {
+            SlotSrc::Exc(carrier, payload) => Some((carrier.clone(), payload.clone())),
+            SlotSrc::Forward(_) => None,
+        })
+        .collect();
+    for (carrier, payload) in exc_rewrites {
+        let rename = |v: &Variable| -> Variable {
+            if *v == payload {
+                carrier.clone()
+            } else {
+                v.clone()
+            }
+        };
+        let block = &mut graph.blocks[break_target];
+        block.operations.retain(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::FieldRead { base, field, .. }
+                    if *base == carrier && field.name == "__pos_0"
+            )
+        });
+        for op in &mut block.operations {
+            op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
+        }
+        let (sw, exits) = crate::model::remap_control_flow_metadata_var(
+            &block.exitswitch,
+            &block.exits,
+            rename,
+            |b| b,
+        );
+        block.exitswitch = sw;
+        block.exits = exits;
+    }
     // Block H's inputargs: [forwarded loop vars..., va(etype,unused), vb(evalue)].
     let (h_id, h_inputs) = graph.create_block_with_arg_vars(forwarded.len() + 2);
     // H's `etype` inputarg (slot `forwarded.len()`) is the int-kinded caught
@@ -4563,7 +4975,13 @@ fn try_fuse_drain_match(
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
     // were pruned, so no const rides the surviving edge).
-    let break_vars: Vec<Variable> = break_vars_src.iter().map(h_of).collect();
+    let break_vars: Vec<Variable> = slot_srcs
+        .iter()
+        .map(|src| match src {
+            SlotSrc::Forward(av) => h_of(av),
+            SlotSrc::Exc(_, _) => h_vb.clone(),
+        })
+        .collect();
 
     // Drop every dead slot in the transitive chain from its block's inputargs
     // and from every predecessor link feeding that block (descending indices so
@@ -4652,6 +5070,39 @@ fn try_fuse_drain_match(
     Ok(())
 }
 
+/// The bare `Result::{variant}` shell; [`build_shell`] stores the payload.
+/// `Ok(())` has a Void payload and no `__pos_0` field, so it is this shell
+/// alone.
+fn push_shell_ctor(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    variant: &str,
+    suffix: &str,
+) -> Variable {
+    // `suffix` (`<Tuple,PyError>` or empty) keys the shell's ClassDef per
+    // instantiation, matching the front aggregate path; both the `Ok` and
+    // `Err` shells of one callee carry it so the variants share one base.
+    let owner = format!("core::result::Result{suffix}::{variant}");
+    graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor_with_owner(
+                    vec![
+                        "core".to_string(),
+                        "result".to_string(),
+                        format!("Result{suffix}"),
+                    ],
+                    variant,
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner)),
+            },
+            true,
+        )
+        .expect("Result ctor must produce a value")
+}
+
 /// Emit `shell = Result::<variant>(); shell.__pos_0 = payload` into
 /// `block`, mirroring the front lowering's Aggregate shape
 /// (`front/mir.rs` `Rvalue::Aggregate`: niladic transparent ctor + one
@@ -4665,28 +5116,8 @@ pub(crate) fn build_shell(
     suffix: &str,
 ) -> Variable {
     use crate::model::FieldDescriptor;
-    // `suffix` (`<Tuple,PyError>` or empty) keys the shell's ClassDef per
-    // instantiation, matching the front aggregate path; both the `Ok` and
-    // `Err` shells of one callee carry it so the variants share one base.
     let owner = format!("core::result::Result{suffix}::{variant}");
-    let shell = graph
-        .push_op_var(
-            block,
-            OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor_with_owner(
-                    vec![
-                        "core".to_string(),
-                        "result".to_string(),
-                        format!("Result{suffix}"),
-                    ],
-                    variant,
-                ),
-                args: Vec::new(),
-                result_ty: ValueType::Ref(Some(owner.clone())),
-            },
-            true,
-        )
-        .expect("Result ctor must produce a value");
+    let shell = push_shell_ctor(graph, block, variant, suffix);
     graph.blocks[block.0]
         .operations
         .push(crate::model::SpaceOperation {
@@ -4701,6 +5132,7 @@ pub(crate) fn build_shell(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: crate::model::LinkArg::Value(payload),
                 ty: payload_ty,
@@ -4721,7 +5153,7 @@ fn remap_root_scope_close_through_links(
         result_ty,
     } = close
     else {
-        return Err(format!("{name}: expected a RootScope close call"));
+        return Err(format!("{name}: expected a shadow-stack bracket close"));
     };
     let mut remapped = Vec::with_capacity(args.len());
     for arg in args {
@@ -4793,7 +5225,7 @@ fn forwards_to_returnblock_inner(
             let carries_work = if past_bracket_closes {
                 !b.operations
                     .iter()
-                    .all(|op| crate::front::mir::is_root_scope_drop_glue_call(&op.kind))
+                    .all(|op| crate::front::mir::is_shadow_stack_bracket_close(&op.kind))
             } else {
                 !b.operations.is_empty()
             };
@@ -4869,6 +5301,13 @@ fn is_root_bracket_close(kind: &OpKind) -> bool {
         if segments.last().is_some_and(|s| s == super::mir::ROOT_SCOPE_CLOSE))
 }
 
+/// A frame-exit cleanup a raise path runs after its materialisation: a
+/// root-bracket close or a raw array's `ll_slice_buffer_free`.  Neither reads
+/// the exception, so both commute with the ops around them.
+fn is_frame_exit_cleanup(kind: &OpKind) -> bool {
+    is_root_bracket_close(kind) || super::mir::is_slice_buffer_free_call(kind)
+}
+
 /// A bounded rendering of an op kind, for diagnostics that name the
 /// operation that disqualified a rewrite.
 ///
@@ -4942,6 +5381,310 @@ pub(crate) fn back_substitute(
 
 /// `block`'s single exit must carry `var`; returns the target block
 /// index and the inputarg `var` binds to there.
+/// Walk A→…→D through single-exit restore/cast hops until the Result
+/// discriminant switch. Each hop must forward `var` and stay private to
+/// this edge (`assert_single_pred`).
+fn follow_to_result_discriminant(
+    graph: &FunctionGraph,
+    mut block: usize,
+    mut var: Variable,
+    name: &str,
+) -> Result<(usize, Variable, Vec<(usize, usize)>), String> {
+    let mut chain = Vec::new();
+    for _ in 0..graph.blocks.len() {
+        let (next, bound) = follow_single_exit(graph, block, &var)
+            .map_err(|e| format!("{name}: drain fuse: {e}"))?;
+        assert_single_pred(graph, next, name)?;
+        chain.push((block, next));
+        if result_discriminant_read(graph, next, &bound).is_some() {
+            return Ok((next, bound, chain));
+        }
+        if !block_is_result_forwarding_restore(graph, next, &bound) {
+            return Err(format!(
+                "{name}: drain fuse: block {next} lacks the Result __discriminant read"
+            ));
+        }
+        block = next;
+        var = bound;
+    }
+    Err(format!(
+        "{name}: drain fuse: no Result __discriminant switch reachable from block {block}"
+    ))
+}
+
+/// Operand of a one-arg restore, or the value a `RootScope::get` reloaded.
+///
+/// `get` is the read-back of `with_roots!`. The mir bracket plan answers it
+/// with the pinned local; a `get` that survived is the same local when the
+/// bracket pins one value.
+fn restore_def_source(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+    chain: &[(usize, usize)],
+) -> Option<(Variable, bool)> {
+    let op = graph.blocks[block]
+        .operations
+        .iter()
+        .find(|op| op.result.as_ref() == Some(var))?;
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    let leaf = segments.last().map(String::as_str);
+    if leaf == Some("__cast_instance_intrinsic") {
+        return args
+            .first()
+            .and_then(|arg| arg.as_variable())
+            .cloned()
+            .map(|src| (src, false));
+    }
+    if leaf == Some("get") && segments.iter().any(|seg| seg == "RootScope") {
+        // `with_roots!(iter => next(iter))` reads the iterator back after
+        // the call. That read is the operand of `next`, which is already
+        // in the call block's scope.
+        let origin = chain.first().map(|(pred, _)| *pred)?;
+        let call = graph.blocks[origin].operations.last()?;
+        let OpKind::Call { args, .. } = &call.kind else {
+            return None;
+        };
+        return args
+            .iter()
+            .find_map(|arg| arg.as_variable())
+            .cloned()
+            .map(|iter| (iter, true));
+    }
+    (args.len() == 1)
+        .then(|| args[0].as_variable().cloned())
+        .flatten()
+        .map(|src| (src, false))
+}
+
+/// `back_substitute`, but a `Const` on a restore hop is the origin.
+fn origin_link_arg(
+    graph: &FunctionGraph,
+    chain: &[(usize, usize)],
+    var: &Variable,
+    name: &str,
+) -> Result<LinkArg, String> {
+    let mut current = var.clone();
+    for &(pred, succ) in chain.iter().rev() {
+        // A restore hop's cast / `RootScope::get` result is not an inputarg.
+        // Follow that one operand back to the value the link actually carries.
+        loop {
+            if graph.blocks[succ].inputargs.iter().any(|v| *v == current) {
+                break;
+            }
+            let Some((src, origin)) = restore_def_source(graph, succ, &current, chain) else {
+                return Err(format!(
+                    "{name}: continue-arm value is defined inside diamond block {succ}"
+                ));
+            };
+            if origin {
+                return Ok(LinkArg::Value(src));
+            }
+            current = src;
+        }
+        let Some(pos) = graph.blocks[succ]
+            .inputargs
+            .iter()
+            .position(|v| *v == current)
+        else {
+            return Err(format!(
+                "{name}: continue-arm value is defined inside diamond block {succ}"
+            ));
+        };
+        let [link] = graph.blocks[pred].exits.as_slice() else {
+            return Err(format!(
+                "{name}: diamond forwarding block {pred} has multiple exits"
+            ));
+        };
+        match link.args.get(pos) {
+            Some(LinkArg::Value(v)) => current = v.clone(),
+            Some(LinkArg::Const(c)) => return Ok(LinkArg::Const(c.clone())),
+            other => {
+                return Err(format!(
+                    "{name}: diamond forwarding arg at position {pos} is {other:?}, expected a Value"
+                ));
+            }
+        }
+    }
+    Ok(LinkArg::Value(current))
+}
+
+fn follow_to_stopiteration_predicate(
+    graph: &FunctionGraph,
+    start: usize,
+    payload: &Variable,
+    name: &str,
+) -> Result<(usize, usize, Variable), String> {
+    if let Some(found) = stopiteration_predicate_in(graph, start, payload) {
+        return Ok(found);
+    }
+    let mut block = start;
+    let mut var = payload.clone();
+    for _ in 0..graph.blocks.len() {
+        let (next, bound) = follow_single_exit(graph, block, &var)
+            .map_err(|e| format!("{name}: drain fuse: Err payload exit: {e}"))?;
+        assert_single_pred(graph, next, name)?;
+        if let Some(found) = stopiteration_predicate_in(graph, next, &bound) {
+            return Ok(found);
+        }
+        if !block_is_forwarding_restore(graph, next) {
+            return Err(format!(
+                "{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration"
+            ));
+        }
+        block = next;
+        var = bound;
+    }
+    Err(format!(
+        "{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration"
+    ))
+}
+
+fn stopiteration_predicate_in(
+    graph: &FunctionGraph,
+    block: usize,
+    payload: &Variable,
+) -> Option<(usize, usize, Variable)> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name: method,
+                        receiver_root,
+                        ..
+                    },
+                args,
+                ..
+            } if method == "matches_stop_iteration"
+                && receiver_root.as_deref() == Some("PyError")
+                && args.len() == 1
+                && args[0].as_variable() == Some(payload) =>
+            {
+                op.result.clone().map(|matched| (block, i, matched))
+            }
+            _ => None,
+        })
+}
+
+fn follow_to_bool_switch(
+    graph: &FunctionGraph,
+    start: usize,
+    predicate: &Variable,
+    name: &str,
+) -> Result<(usize, Variable), String> {
+    let mut block = start;
+    let mut var = predicate.clone();
+    for _ in 0..graph.blocks.len() {
+        let (next, bound) = follow_single_exit(graph, block, &var)
+            .map_err(|e| format!("{name}: drain fuse: Err arm exit: {e}"))?;
+        assert_single_pred(graph, next, name)?;
+        if graph.blocks[next].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: o, operand, .. } if o == "bool" && *operand == bound
+            )
+        }) {
+            return Ok((next, bound));
+        }
+        if !block_is_forwarding_restore(graph, next) {
+            return Err(format!(
+                "{name}: drain fuse: bool-switch block {next} lacks bool(predicate)"
+            ));
+        }
+        block = next;
+        var = bound;
+    }
+    Err(format!(
+        "{name}: drain fuse: bool-switch not reachable from block {start}"
+    ))
+}
+
+fn result_discriminant_read(
+    graph: &FunctionGraph,
+    block: usize,
+    result_var: &Variable,
+) -> Option<(usize, Variable)> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if *base == *result_var
+                    && field.name == "__discriminant"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(owner_is_result_of_pyerror) =>
+            {
+                op.result.clone().map(|d| (i, d))
+            }
+            _ => None,
+        })
+}
+
+fn block_is_result_forwarding_restore(
+    graph: &FunctionGraph,
+    block: usize,
+    result_var: &Variable,
+) -> bool {
+    block_is_forwarding_restore(graph, block)
+        && graph.blocks[block].exits[0]
+            .args
+            .iter()
+            .any(|arg| matches!(arg, LinkArg::Value(v) if v == result_var))
+}
+
+fn block_is_forwarding_restore(graph: &FunctionGraph, block: usize) -> bool {
+    let b = &graph.blocks[block];
+    if b.exitswitch.is_some() || b.exits.len() != 1 {
+        return false;
+    }
+    b.operations
+        .iter()
+        .all(|op| is_forwarding_restore_op(&op.kind))
+}
+
+fn restore_op_indices(graph: &FunctionGraph, block: usize) -> Vec<usize> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| is_forwarding_restore_op(&op.kind))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn is_forwarding_restore_op(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            let leaf = segments.last().map(String::as_str);
+            leaf == Some("__cast_instance_intrinsic")
+                || (leaf == Some("get") && segments.iter().any(|s| s == "RootScope"))
+                || leaf == Some("pin_roots")
+                || leaf == Some("push_roots")
+                || leaf == Some("ll_slice_setitem_fast_r")
+                || crate::front::mir::is_shadow_stack_bracket_close(kind)
+        }
+        OpKind::ConstUInt(_) | OpKind::ConstInt(_) => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn follow_single_exit(
     graph: &FunctionGraph,
     block: usize,
@@ -4969,6 +5712,22 @@ pub(crate) fn follow_single_exit(
         .cloned()
         .ok_or_else(|| format!("block {target} lacks inputarg {pos}"))?;
     Ok((target, bound))
+}
+
+/// The one exit that targets `block`, plus the block that owns it.
+fn single_incoming_link(graph: &FunctionGraph, block: usize) -> Option<(usize, Link)> {
+    let mut found = None;
+    for (i, b) in graph.blocks.iter().enumerate() {
+        for link in &b.exits {
+            if link.target.0 == block {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((i, link.clone()));
+            }
+        }
+    }
+    found
 }
 
 /// The diamond's intermediate blocks must have exactly one
@@ -5416,14 +6175,15 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
     for si in 0..graph.blocks.len() {
         let succ = &graph.blocks[si];
         // `succ` holds the materialisation, optionally followed by
-        // `op.type(evalue)` (`exc_from_raise`), plus any root-bracket closes,
-        // and raises. Closes commute with both ops, so they are stripped
-        // before the shape check and left in the block.
+        // `op.type(evalue)` (`exc_from_raise`), plus any frame-exit cleanups
+        // (root-bracket closes, raw array frees), and raises. Cleanups commute
+        // with both ops, so they are stripped before the shape check and left
+        // in the block.
         let non_close: Vec<usize> = succ
             .operations
             .iter()
             .enumerate()
-            .filter(|(_, op)| !is_root_bracket_close(&op.kind))
+            .filter(|(_, op)| !is_frame_exit_cleanup(&op.kind))
             .map(|(i, _)| i)
             .collect();
         let (op, type_result) = match non_close.as_slice() {
@@ -5549,11 +6309,11 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
         // class-shaped (`flowcontext.py exc_from_raise`).
         let payload = graph.blocks[si].inputargs[pos].clone();
         // Drop the materialisation the constructor now performs, keep the
-        // bracket closes, then close with `op.type(payload)` so exceptblock
+        // frame-exit cleanups, then close with `op.type(payload)` so exceptblock
         // slot 0 stays class-shaped (`flowcontext.py exc_from_raise`).
         graph.blocks[si]
             .operations
-            .retain(|op| is_root_bracket_close(&op.kind));
+            .retain(|op| is_frame_exit_cleanup(&op.kind));
         crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[si].id, payload);
     }
 }
@@ -5681,6 +6441,7 @@ mod static_result_shell_tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(value),
                     ty: ValueType::Int,
@@ -5757,7 +6518,6 @@ mod static_result_shell_tests {
             vec![LinkArg::Value(unit.clone())]
         );
     }
-
     /// Build `variant` of `Result<str,Utf8Error>` in `block` with its
     /// `__discriminant` write and, when given, its `__pos_0` payload.
     fn tagged_pair_arm(
@@ -5804,6 +6564,7 @@ mod static_result_shell_tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(value),
                     ty,
@@ -5877,6 +6638,7 @@ mod static_result_shell_tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(consumed),
                 ty: ValueType::Ref(None),
@@ -5912,6 +6674,84 @@ mod static_result_shell_tests {
         let err = lower_result_exc_returns(&mut graph, 0)
             .expect_err("a returned Err without an exception value cannot lower");
         assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
+    }
+
+    /// An inlined `Result<i64, Z>::Err` with a zero-sized `Z` writes no
+    /// `__pos_0`. It is consumed inside the graph, so the callee still
+    /// lowers its own `Ok` return.
+    #[test]
+    fn payload_less_intermediate_shell_is_skipped() {
+        let (mut graph, _, _) = ok_shell_with_tag(0);
+        let entry = graph.startblock;
+        // Move the `Ok` return into a successor that ignores its input, and
+        // build the payload-less `Err` in the new entry.
+        let (ret_block, _) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(ret_block).operations =
+            std::mem::take(&mut graph.block_mut(entry).operations);
+        graph.block_mut(ret_block).exits = std::mem::take(&mut graph.block_mut(entry).exits);
+        let zst_err = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,Z>".into()],
+                        "Err",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<i64,Z>::Err".into())),
+                },
+                true,
+            )
+            .expect("zst err");
+        graph.set_goto(entry, ret_block, vec![zst_err]);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0)
+                .expect("a consumed payload-less shell does not decline the callee"),
+            1
+        );
+    }
+
+    /// `return Ok(())` of a `Result<(), E>` callee: the bare `Ok` shell
+    /// with its tag and no `__pos_0` write.
+    fn unit_ok_shell() -> FunctionGraph {
+        let (mut graph, _, payload) = ok_shell_with_tag(0);
+        let entry = graph.startblock;
+        graph.block_mut(entry).operations.retain(|op| {
+            op.result.as_ref() != Some(&payload)
+                && !matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__pos_0")
+        });
+        graph
+    }
+
+    #[test]
+    fn unit_ok_shell_returns_void_none() {
+        let mut graph = unit_ok_shell();
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0).expect("a Void-payload Ok return lowers"),
+            1
+        );
+        let entry = graph.startblock;
+        let ops = &graph.block(entry).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::Call { .. } | OpKind::FieldWrite { .. })),
+            "the ctor and its tag write are gone: {ops:?}"
+        );
+        let [link] = graph.block(entry).exits.as_slice() else {
+            panic!("single return exit");
+        };
+        assert_eq!(link.target, graph.returnblock);
+        let [LinkArg::Value(ret)] = link.args.as_slice() else {
+            panic!("one returned value");
+        };
+        assert_eq!(
+            ret.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void)
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.result.as_ref() == Some(ret) && matches!(op.kind, OpKind::ConstNone))
+        );
     }
 }
 
@@ -5953,6 +6793,62 @@ mod rewire_dead_arm_tests {
             Err(msg) => msg,
         };
         assert!(err.contains("scoped call result var has no producer block"));
+    }
+}
+
+#[cfg(test)]
+mod tail_forward_close_tests {
+    use super::*;
+
+    /// `return f(&buf)` whose return path frees a raw array buffer: the
+    /// call still tail-forwards, and its exception edge frees the buffer
+    /// before the raise.
+    #[test]
+    fn a_tail_forward_through_a_buffer_free_frees_on_the_raise_edge() {
+        let mut graph = FunctionGraph::new("tail_through_free");
+        let start = graph.startblock;
+        let buf = graph.alloc_value_var();
+        graph.blocks[start.0].inputargs.push(buf.clone());
+        let r = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::function_path(["m", "f"]),
+                    args: crate::model::call_args(vec![buf.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call result");
+        let (free_id, free_args) = graph.create_block_with_arg_vars(2);
+        let free = OpKind::Call {
+            target: CallTarget::function_path(majit_ir::rvec::SLICE_BUFFER_FREE.split("::")),
+            args: crate::model::call_args(vec![free_args[1].clone()]),
+            result_ty: ValueType::Void,
+        };
+        graph.push_op_var(free_id, free, true);
+        let returnblock = graph.returnblock;
+        graph.set_goto(free_id, returnblock, vec![free_args[0].clone()]);
+        graph.set_goto(start, free_id, vec![r.clone(), buf.clone()]);
+
+        let outcome = rewire_one_call_site(&mut graph, &r, "", &ValueType::Int, true, true)
+            .expect("tail forward");
+        assert!(matches!(outcome, SiteOutcome::TailForward));
+        let a = &graph.blocks[start.0];
+        assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
+        let [normal, exc] = a.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert_eq!(normal.target, free_id);
+        let raise = &graph.blocks[exc.target.0];
+        assert!(
+            raise
+                .operations
+                .iter()
+                .any(|op| crate::front::mir::is_shadow_stack_bracket_close(&op.kind)),
+            "the raise edge frees the buffer"
+        );
+        assert_eq!(raise.exits[0].target, graph.exceptblock);
     }
 }
 
@@ -6404,7 +7300,7 @@ mod rebuilt_shell_collapse_tests {
     }
 
     #[test]
-    fn ok_and_err_walks_that_share_a_block_decline_before_any_edit() {
+    fn ok_and_err_payloads_may_share_a_block() {
         let mut fix = fixture();
         let (shared_id, _) = fix.graph.create_block_with_arg_vars(1);
         fix.graph.set_return(shared_id, None);
@@ -6438,13 +7334,10 @@ mod rebuilt_shell_collapse_tests {
             .set_goto(BlockId(fix.ok_arm), shared_id, vec![ok_read]);
         fix.graph
             .set_goto(BlockId(err_block), shared_id, vec![err_read]);
-        let err = collapse(&mut fix).expect_err("shared block declines");
-        assert!(err.contains("predecessors"), "{err}");
-        assert_eq!(
-            shell_ctors(&fix.graph),
-            2,
-            "the decline happens before the shell builds are deleted"
-        );
+        // The shared block receives the unwrapped payloads, not the shells.
+        // A payload merge is not a shell join, so the walk does not decline.
+        collapse(&mut fix).expect("payload merge is not a shell share");
+        assert_eq!(shell_ctors(&fix.graph), 0, "the shells collapse");
     }
 
     #[test]
@@ -6592,6 +7485,133 @@ mod rebuilt_shell_collapse_tests {
             })
             .count();
         assert_eq!(rebuilds, 0, "the codewriter converts the caught value");
+    }
+
+    /// `if let Err(e) = f()` on a `Result<(), _>`: the void call writes no
+    /// register, so the normal arm must neither receive the call's result
+    /// variable nor store it as the `Ok` payload. The `Ok` shell has no
+    /// `__pos_0`; its payload is a Void `None`, and the pure match on the
+    /// rebuilt shells collapses.
+    #[test]
+    fn catch_and_rewrap_builds_unit_ok_without_the_void_result() {
+        let mut graph = FunctionGraph::new("rewrap_unit_ok");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        // match block: switch on the shell's tag.
+        let (m, m_args) = graph.create_block_with_arg_vars(1);
+        let shell_in = m_args[0].clone();
+        let disc = graph
+            .push_op_var(
+                m,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::result::Result<(),PyError>".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+        // `Ok(())` arm: nothing to read.
+        let (ok_arm, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(ok_arm, None);
+        // `Err(e)` arm: reads the payload.
+        let (err_arm, err_args) = graph.create_block_with_arg_vars(1);
+        let e = graph
+            .push_op_var(
+                err_arm,
+                OpKind::FieldRead {
+                    base: err_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::result::Result<(),PyError>::Err".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("err read");
+        graph.set_goto(err_arm, graph.returnblock, vec![e]);
+        graph.block_mut(m).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(m).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in)],
+                err_arm,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(a, m, vec![r.clone()]);
+        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void).expect("rewrap");
+        let normal = &graph.blocks[a.0].exits[0];
+        assert!(normal.exitcase.is_none(), "exit 0 is the normal edge");
+        assert!(
+            normal.args.is_empty(),
+            "the normal edge carries no payload for Ok(()): {:?}",
+            normal.args
+        );
+        let n = normal.target.0;
+        let n_ops = &graph.blocks[n].operations;
+        assert!(
+            !n_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "__pos_0"
+            )),
+            "Ok(()) stores no __pos_0: {n_ops:?}"
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if format!("{target:?}").contains("\"Tuple\"")
+                        || result_ctor_kind(target).is_some()
+                )),
+            "no unit aggregate and no Result shell survive the collapse"
+        );
+        // The collapse routed the normal arm straight to the `Ok` arm,
+        // carrying the Void `None` in the shell's slot.
+        let [n_exit] = graph.blocks[n].exits.as_slice() else {
+            panic!("normal arm has one exit");
+        };
+        assert_eq!(n_exit.target, ok_arm);
+        let [LinkArg::Value(unit)] = n_exit.args.as_slice() else {
+            panic!("the Ok arm receives one value: {:?}", n_exit.args);
+        };
+        assert_ne!(unit, &r, "the payload is not the void call result");
+        assert_eq!(
+            unit.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void)
+        );
+        if crate::decline::enabled() {
+            assert!(
+                !crate::decline::subjects_of(
+                    RESULT_EXC_CALLER_GATE,
+                    "rebuilt-shell-collapse-declined"
+                )
+                .contains(&graph.name),
+            );
+        }
     }
 }
 
@@ -7045,6 +8065,38 @@ mod unwrap_returned_scalar_shell_tests {
         assert_eq!(return_vars(&graph), vec![value]);
     }
 
+    /// `eliminate_empty_blocks` leaves each `return v` as its own link.
+    /// Both shells are the same `Result<i64, PyError>`, so one `Ok` edge
+    /// carries the payload.
+    #[test]
+    fn two_returned_some_shells_join_into_one_ok_payload() {
+        let mut graph = FunctionGraph::new("two_shells");
+        let entry = graph.startblock;
+        let (arm_a, _) = graph.create_block_with_arg_vars(0);
+        let (arm_b, _) = graph.create_block_with_arg_vars(0);
+        let shell_a = push_some_shell_in(&mut graph, arm_a);
+        let shell_b = push_some_shell_in(&mut graph, arm_b);
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .expect("cond");
+        graph.set_branch(entry, cond, arm_a, vec![], arm_b, vec![]);
+        graph.set_return(arm_a, Some(shell_a));
+        graph.set_return(arm_b, Some(shell_b));
+        unwrap_i64(&mut graph);
+        assert_unwrapped_ok_i64(&graph);
+        let raises = graph
+            .blocks
+            .iter()
+            .filter(|block| {
+                block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+            })
+            .count();
+        assert_eq!(raises, 1, "one discriminant split raises Err");
+    }
+
     #[test]
     fn a_long_copy_chain_of_a_shell_is_unwrapped() {
         let mut graph = FunctionGraph::new("long_shell_chain");
@@ -7351,6 +8403,76 @@ mod from_residual_conversion_tests {
             "pyre_interpreter::error::PyError"
         ));
         assert!(!same_type_spelling("Error<A>", "Error<B>"));
+    }
+
+    #[test]
+    fn a_from_residual_through_a_buffer_free_raises_and_frees() {
+        let (mut graph, residual) =
+            from_residual_tail("core::ops::control_flow::ControlFlow::Break");
+        let start = graph.startblock;
+        let buf = graph.alloc_value_var();
+        graph.blocks[start.0].inputargs.push(buf.clone());
+        let (free_id, free_args) = graph.create_block_with_arg_vars(2);
+        graph.push_op_var(
+            free_id,
+            OpKind::Call {
+                target: CallTarget::function_path(majit_ir::rvec::SLICE_BUFFER_FREE.split("::")),
+                args: crate::model::call_args(vec![free_args[1].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_goto(free_id, graph.returnblock, vec![free_args[0].clone()]);
+        graph.set_goto(start, free_id, vec![residual.clone(), buf.clone()]);
+
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(residual, None, ValueType::Int)],
+            true,
+            spec(),
+        )
+        .expect("from_residual through a buffer free raises");
+        assert_eq!(outcome.tail_forwards, 0);
+        let arg = raised_carrier(&graph);
+        let Some(OpKind::FieldRead { field, .. }) = producing_op(&graph, &arg) else {
+            panic!("direct raise reads Break.__pos_0");
+        };
+        assert_eq!(field.name, "__pos_0");
+        let raise_block = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+            })
+            .expect("raise block");
+        assert!(
+            raise_block.operations.iter().any(|op| {
+                crate::front::mir::is_slice_buffer_free_call(&op.kind)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call { args, .. }
+                            if args.first().and_then(LinkArg::as_variable) == Some(&buf)
+                    )
+            }),
+            "the raise block frees the producer's buffer"
+        );
+        assert!(
+            graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "from_residual"
+                    )
+                })
+            }),
+            "from_residual is removed"
+        );
     }
 
     #[test]

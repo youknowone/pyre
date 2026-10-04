@@ -327,6 +327,11 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             .iter()
                             .position(|spec| spec.field_key == *name || spec.name == *name)
                             .unwrap_or_else(|| {
+                                // This row is appended, so its slot is the new
+                                // end of the list. The incoming claim numbered
+                                // the serialized parent, which does not contain
+                                // this field.
+                                let slot = specs.len();
                                 specs.push(majit_ir::descr::SimpleFieldDescrSpec {
                                     index: u32::MAX,
                                     field_key: name.clone(),
@@ -342,11 +347,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                     is_quasi_immutable: *is_quasi_immutable,
                                     flag: *field_flag,
                                     virtualizable: false,
-                                    // `SimpleFieldDescrSpec` carries a plain
-                                    // `usize`, so the absence cannot ride any
-                                    // further: `0` is the value this field has
-                                    // always had here, spelled as a fallback.
-                                    index_in_parent: index_in_parent.unwrap_or(0),
+                                    index_in_parent: slot,
                                 });
                                 specs.len() - 1
                             });

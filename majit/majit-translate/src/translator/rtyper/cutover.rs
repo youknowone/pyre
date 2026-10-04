@@ -1275,6 +1275,8 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
             | OpKind::ConstRefNull
             | OpKind::ConstNone
             | OpKind::ConstRefAddr(_)
@@ -6183,6 +6185,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     ty: ValueType::Ref(None),
                     pure: false,
@@ -6415,6 +6418,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 ty: ValueType::Int,
                 pure: true,
@@ -6504,6 +6508,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     ty: ValueType::Int,
                     pure: true,
@@ -6569,6 +6574,7 @@ mod tests {
             taken_by_address: false,
             inline_vec: false,
             vec_part: None,
+            scalar_word: None,
         };
         let read = crate::model::SpaceOperation {
             result: Some(pay.clone()),
@@ -6595,6 +6601,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: crate::model::LinkArg::Value(pay.clone()),
                     ty: ValueType::Ref(None),
@@ -6781,6 +6788,7 @@ mod tests {
                             taken_by_address: false,
                             inline_vec: false,
                             vec_part: None,
+                            scalar_word: None,
                         },
                         ty: ValueType::Ref(None),
                         pure: false,

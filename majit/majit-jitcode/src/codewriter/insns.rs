@@ -613,6 +613,11 @@ pub const BC_RAW_STORE_F: u8 = 235;
 // `extension_insns()` alongside `abort/` / `abort_permanent/`.
 pub const BC_ABORT_RESULT_R: u8 = 195;
 
+// pyre-only `abort/>i` — the Int-result counterpart of `abort/>r`, emitted
+// when the unsupported operation owns an int SSA result (a GC interior
+// address refused by `rewrite_op_getsubstruct`).
+pub const BC_ABORT_RESULT_I: u8 = 249;
+
 // pyre-only `vtable_method_ptr/rd>i` — emitted by `OpKind::
 // VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython has no counterpart
 // because Python dispatch goes through `cpu.bh_call_*` resolved at
@@ -1394,6 +1399,9 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // exactly like `abort/` (`BC_ABORT = 13`); the destination byte exists
     // only because the unsupported operation still owns an SSA result.
     m.insert("abort/>r", BC_ABORT_RESULT_R);
+    // pyre-only `abort/>i` — Int-result variant, handled by
+    // `handler_abort_result_marker_i` exactly like `abort/`.
+    m.insert("abort/>i", BC_ABORT_RESULT_I);
     // pyre-only `vtable_method_ptr/rd>i` — emitted by
     // `OpKind::VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython's dispatch
     // resolves dyn-method addresses through `cpu.bh_call_*` at runtime

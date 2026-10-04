@@ -47,7 +47,7 @@ fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
             break;
         }
         opening += 1;
-        if !erased_root_bracket_guards(llbc, &body).is_empty() {
+        if !erased_root_bracket_guards(llbc, fd, &body).is_empty() {
             erased += 1;
         }
     }
