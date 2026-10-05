@@ -91,9 +91,9 @@ fn value_as_float_bits(value: Value) -> i64 {
 /// Heapcache key for one field access resolved from a `BhDescr::Field`.
 ///
 /// `fielddescrof` copies the parent field's slot onto a `Vec` or fat-pointer
-/// part and then reads the other word (`.data`, `.len`, `.buf`, `.meta`).
+/// part and then reads the other word (`.data`, `.len`, `.buf`, `.vtable`).
 /// `HeapCache` keys the read by `Descr::index()`, so those two words must not
-/// both answer with that slot.  `.meta` is the vtable word of `&dyn`; it
+/// both answer with that slot.  `.vtable` is the vtable word of `&dyn`; it
 /// shares the data word's slot and sits one word later.  A part the slot does
 /// not describe passes `u32::MAX`, the unassigned sentinel
 /// `ensure_heapcache_index` replaces with a unique key.  Every other access
@@ -110,7 +110,7 @@ fn heapcache_index_for_split_part(
     let split_part = name.ends_with(".data")
         || name.ends_with(".len")
         || name.ends_with(".buf")
-        || name.ends_with(".meta");
+        || name.ends_with(".vtable");
     let slot_describes_access = index_in_parent.is_some_and(|index| {
         parent.all_fielddescrs.get(index).is_some_and(|spec| {
             spec.offset == offset && spec.field_size == field_size && spec.field_type == field_type
