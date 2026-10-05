@@ -5847,7 +5847,18 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
-        OpKind::NewList { .. } => "newlist".into(),
+        // High-level `newlist(item0, …, itemN)` does not exist as a jitcode
+        // op. `rtype_newlist` (`rlist.py`) expands it to `ll_newlist` plus
+        // `ll_setitem_fast`, and `do_fixed_newlist` /
+        // `do_fixed_list_setitem` (`jtransform.py`) turn those into
+        // `new_array_clear` + `setarrayitem_gc`. `rewrite_fixed_newlist`
+        // performs that expansion on the model graph. Reaching this arm
+        // would emit `newlist/<r…>r`, which has no blackhole handler.
+        OpKind::NewList { .. } => panic!(
+            "OpKind::NewList reached the JitCode assembler; jtransform must \
+             expand newlist to new_array_clear + setarrayitem_gc \
+             (rewrite_fixed_newlist / do_fixed_newlist)"
+        ),
         // `getslice` never reaches the assembler in a lifted graph — the
         // rtyper's `rtype_getslice` replaces it with a `direct_call` to the
         // `ll_listslice_*` helper, and the gated front recognizer keeps it

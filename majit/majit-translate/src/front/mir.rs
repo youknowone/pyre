@@ -15839,6 +15839,14 @@ impl<'a> Lowering<'a> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        // `do_fixed_newlist` reads `ARRAY = op.result.concretetype.TO`.
+        // The slice is `Ptr(GcArray(Ptr(PyObject)))`.
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+        res.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+        }))));
         Some((OpKind::NewList { args: items }, res))
     }
 
