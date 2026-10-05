@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=31.7
-# Widest reading 27.5x; the ceiling is 15% over that.
+# pyre-check: max-pypy-ratio=28
+# Main #2196 widest 27.5x (31.7 = 15% over that). Native 7.0x..17.0x on
+# PR run 37225763286 and main run 37213275404. 22 fails 27.5x; 31.7's
+# floor 7.925 fails 7.0x. 28 covers 27.5x with floor 7.0x.
 # collections.deque holds its backing list solely through the deque object.
 # If the marker traces the deque with an empty offset set, that list is not
 # forwarded and is swept/moved on a collection driven by a hot allocator loop
