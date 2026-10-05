@@ -2190,7 +2190,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
         }
         // `moduledef.py` publishes these when `rposix.posix_fadvise` exists.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         for (name, val) in [
             ("POSIX_FADV_WILLNEED", libc::POSIX_FADV_WILLNEED as i64),
             ("POSIX_FADV_NORMAL", libc::POSIX_FADV_NORMAL as i64),
@@ -2202,7 +2202,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
         }
         // `moduledef.py` publishes `MFD_*` when `rposix.memfd_create` exists.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         for (name, val) in [
             ("MFD_CLOEXEC", libc::MFD_CLOEXEC as i64),
             ("MFD_ALLOW_SEALING", libc::MFD_ALLOW_SEALING as i64),
@@ -2227,7 +2227,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // `moduledef.py` publishes these when `hasattr(rposix, 'getxattr')`.
         // `rposix.XATTR_SIZE_MAX` is `linux/limits.h` (65536); libc has no
         // `XATTR_SIZE_MAX`.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         for (name, val) in [
             ("XATTR_SIZE_MAX", 65536i64),
             ("XATTR_CREATE", libc::XATTR_CREATE as i64),
@@ -7874,7 +7874,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // interp_posix.py `posix_fallocate`: `eintr_retry=True`.
         // `rposix.c_posix_fallocate` releases the GIL and saves errno.
-        #[cfg(all(not(feature = "sandbox"), target_os = "linux"))]
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "linux", target_os = "android")
+        ))]
         crate::module_ns_store(
             ns,
             "posix_fallocate",
@@ -7925,7 +7928,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // interp_posix.py `posix_fadvise`: `eintr_retry=True`.
         // `rposix.posix_fadvise` uses the C return value as the errno.
-        #[cfg(all(not(feature = "sandbox"), target_os = "linux"))]
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "linux", target_os = "android")
+        ))]
         crate::module_ns_store(
             ns,
             "posix_fadvise",
@@ -8580,7 +8586,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // is `rposix.CPU_MASK_P` (`CArrayPtr(rffi.ULONG)`). Neither retries
         // EINTR. `rposix.c_sched_getaffinity` / `c_sched_setaffinity` release
         // the GIL and save errno.
-        #[cfg(all(not(feature = "sandbox"), target_os = "linux"))]
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "linux", target_os = "android")
+        ))]
         {
             crate::module_ns_store(
                 ns,
@@ -8728,7 +8737,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // interp_posix.py `memfd_create`. `rposix.c_memfd_create` releases
         // the GIL and saves errno. Default flags are `rposix.MFD_CLOEXEC`.
-        #[cfg(all(not(feature = "sandbox"), target_os = "linux"))]
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "linux", target_os = "android")
+        ))]
         crate::module_ns_store(
             ns,
             "memfd_create",
@@ -8778,7 +8790,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // interp_posix.py `getxattr` / `setxattr` / `removexattr` / `listxattr`.
         // `rposix.c_*xattr` release the GIL and save errno. ERANGE retries
         // `rposix.buf_sizes` = [256, XATTR_SIZE_MAX] in the product builtin.
-        #[cfg(all(not(feature = "sandbox"), target_os = "linux"))]
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "linux", target_os = "android")
+        ))]
         {
             const XATTR_BUF_SIZES: [usize; 2] = [256, 65536];
             crate::module_ns_store(
@@ -12071,7 +12086,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // never sees the retry — so the transfer restarts from the range the
         // caller asked for, not from where it had got to.
         #[cfg(all(
-            any(target_os = "linux", target_os = "macos"),
+            any(target_os = "linux", target_os = "android", target_os = "macos"),
             not(feature = "sandbox")
         ))]
         crate::module_ns_store(
@@ -12093,7 +12108,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // before the descriptor argument that follows it here.
                 // Named locals replace `bound` so the `Vec<Option<PyObjectRef>>`
                 // is not live across `rposix.c_sendfile`.
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let (mut w_out_fd, mut w_in_fd, mut w_offset, mut w_count) = {
                     let (bound, _kwargs) = bind_path_args(
                         args,
@@ -12140,7 +12155,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         bound[6].unwrap_or(pyre_object::PY_NULL),
                     )
                 };
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let out_fd = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
                     crate::baseobjspace::c_int_w(w_out_fd)
                 })?;
@@ -12149,7 +12164,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
                     crate::baseobjspace::c_int_w(w_out_fd)
                 })?;
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let count_raw = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
                     crate::baseobjspace::int_w(w_count)
                 })?;
@@ -12158,7 +12173,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
                     crate::baseobjspace::int_w(w_count)
                 })?;
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let in_fd = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
                     crate::baseobjspace::c_int_w(w_in_fd)
                 })?;
@@ -12170,14 +12185,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if unsafe { pyre_object::is_none(w_offset) } {
                     // linux-only no-offset path; non-linux raises TypeError
                     // matching interp_posix.sendfile.
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
                     {
                         let _ = (out_fd, in_fd, count_raw);
                         return Err(crate::PyError::type_error(
                             "an integer is required (got None)",
                         ));
                     }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     {
                         // `rposix.sendfile_no_offset`: a null pointer, so the
                         // kernel uses the input descriptor's live position.
@@ -12211,7 +12226,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 }
                 // interp_posix.py `space.gateway_r_longlong_w(w_offset)`.
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let offset_i64 = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
                     crate::baseobjspace::int_w(w_offset)
                 })?;
@@ -12220,7 +12235,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
                     crate::baseobjspace::int_w(w_offset)
                 })?;
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
                     let count = count_raw as majit_rlib::rffi::SIZE_T;
                     loop {
@@ -15200,7 +15215,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
         // The affinity mask is the same kind of host-process leak, and carries
         // the narrower gate the pair is published under.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         for name in [
             "sched_getaffinity",
             "sched_setaffinity",

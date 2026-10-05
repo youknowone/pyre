@@ -487,7 +487,7 @@ crate::rffi::llexternal!(
 // `rposix.c_posix_fallocate` and `rposix.c_posix_fadvise` save errno.
 // `HAVE_FALLOCATE` / `HAVE_FADVISE` are linux here. `rposix.posix_fadvise`
 // uses the C return value as the errno.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_posix_fallocate = "posix_fallocate",
     [crate::rffi::INT, libc::off_t, libc::off_t],
@@ -496,7 +496,7 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_posix_fadvise = "posix_fadvise",
     [crate::rffi::INT, libc::off_t, libc::off_t, crate::rffi::INT],
@@ -1677,7 +1677,7 @@ crate::rffi::llexternal!(
 // `rposix.c_unshare`, `c_sched_getaffinity`, and `c_sched_setaffinity`
 // save errno. `sys.platform.startswith('linux')`. The affinity mask is a
 // `c_ulong` word array (`rposix.CPU_MASK_P`), not `cpu_set_t`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_unshare = "unshare",
     [crate::rffi::INT],
@@ -1686,7 +1686,7 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_sched_getaffinity = "sched_getaffinity",
     [libc::pid_t, crate::rffi::SIZE_T, crate::rffi::VOIDP],
@@ -1695,7 +1695,7 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_sched_setaffinity = "sched_setaffinity",
     [libc::pid_t, crate::rffi::SIZE_T, crate::rffi::VOIDP],
@@ -1911,7 +1911,12 @@ mod inheritable_c {
         }
         #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
         {
-            #[cfg(any(target_os = "linux", target_os = "netbsd", target_os = "openbsd"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
             {
                 static DUP3_WORKS: AtomicI32 = AtomicI32::new(-1);
                 if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
@@ -2238,14 +2243,14 @@ crate::rffi::llexternal!(
 
 // `rposix.c_sendfile` on linux takes an optional offset pointer and saves
 // errno. A null offset is `rposix.sendfile_no_offset`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::external_compilation_info! {
     const SENDFILE_ECI = {
         includes: ["sys/sendfile.h"],
     };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_sendfile = "sendfile",
     [
@@ -2307,14 +2312,14 @@ pub fn sendfile(
 }
 
 // `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::external_compilation_info! {
     const MMAN_ECI = {
         includes: ["sys/mman.h"],
     };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_memfd_create = "memfd_create",
     [*const libc::c_char, crate::rffi::UINT],
@@ -2325,14 +2330,14 @@ crate::rffi::llexternal!(
 
 // `rposix.py` xattr family under `sys.platform.startswith('linux')`.
 // `XATTR_ECI` is `sys/xattr.h` and `linux/limits.h`. Every `c_*` saves errno.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::external_compilation_info! {
     const XATTR_ECI = {
         includes: ["sys/xattr.h", "linux/limits.h"],
     };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_fgetxattr = "fgetxattr",
     [
@@ -2345,7 +2350,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_getxattr = "getxattr",
     [
@@ -2358,7 +2363,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_lgetxattr = "lgetxattr",
     [
@@ -2371,7 +2376,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_fsetxattr = "fsetxattr",
     [
@@ -2385,7 +2390,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_setxattr = "setxattr",
     [
@@ -2399,7 +2404,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_lsetxattr = "lsetxattr",
     [
@@ -2413,7 +2418,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_fremovexattr = "fremovexattr",
     [crate::rffi::INT, *const libc::c_char],
@@ -2421,7 +2426,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_removexattr = "removexattr",
     [*const libc::c_char, *const libc::c_char],
@@ -2429,7 +2434,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_lremovexattr = "lremovexattr",
     [*const libc::c_char, *const libc::c_char],
@@ -2437,7 +2442,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_flistxattr = "flistxattr",
     [crate::rffi::INT, *mut libc::c_char, crate::rffi::SIZE_T],
@@ -2445,7 +2450,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_listxattr = "listxattr",
     [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
@@ -2453,7 +2458,7 @@ crate::rffi::llexternal!(
     compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_llistxattr = "llistxattr",
     [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
@@ -3557,7 +3562,7 @@ mod tests {
             assert!(!bytes.is_empty());
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let sent = unsafe { c_sendfile(-1, -1, std::ptr::null_mut(), 0) };
             assert!(sent < 0);
@@ -3584,7 +3589,7 @@ mod tests {
         assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn c_sched_getaffinity_reads_a_c_ulong_mask() {
         let mut mask = [0 as libc::c_ulong; 16];
@@ -3609,7 +3614,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn c_memfd_create_opens_or_saves_errno() {
         let fd = unsafe {
@@ -3630,7 +3635,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn c_posix_fadvise_and_fallocate_reject_bad_fd() {
         let advice = libc::POSIX_FADV_NORMAL as crate::rffi::INT;
@@ -3667,7 +3672,7 @@ mod tests {
         assert_eq!(unsafe { c_close(fd) }, 0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn c_xattr_round_trip_on_temp_file() {
         use std::os::unix::ffi::OsStrExt;

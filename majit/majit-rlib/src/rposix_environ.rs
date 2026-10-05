@@ -87,8 +87,9 @@ crate::rffi::llexternal!(
 struct EnvKeepalive {
     /// `rposix_environ.envkeepalive.byname` — process-global dict of the
     /// `NAME=VALUE` strings `putenv` retains. A `HashMap` is that dict.
-    /// PyPy's dict is unsynchronized; the Mutex exists only so the static
-    /// is `Sync`. It does not wrap the libc call. `Send` is the raw
+    /// PyPy's dict is unsynchronized; `putenv_llimpl` runs under the GIL.
+    /// The Mutex makes the static `Sync` and, for 3.14t, holds across
+    /// `os_putenv` / `os_unsetenv` and the map update. `Send` is the raw
     /// `CCHARP` values, which are process-global malloc blocks.
     byname: HashMap<Vec<u8>, CCHARP>,
 }
@@ -165,15 +166,21 @@ pub fn putenv_llimpl(name: &[u8], value: &[u8]) -> Result<(), i32> {
     joined.push(b'=');
     joined.extend_from_slice(value);
     let l_string = rffi::str2charp(&joined, true);
+    // `putenv_llimpl` runs under the GIL in RPython. Hold the keepalive
+    // mutex across `os_putenv` and the map update so two 3.14t callers
+    // cannot free a string libc still owns.
+    let mut keepalive = byname();
     let error = (unsafe { os_putenv(l_string) }) as isize;
     if error != 0 {
+        drop(keepalive);
         unsafe { rffi::free_charp(l_string, true) };
         return Err(crate::rposix::get_saved_errno());
     }
-    let l_oldstring = byname()
+    let l_oldstring = keepalive
         .byname
         .insert(name.to_vec(), l_string)
         .unwrap_or(core::ptr::null_mut());
+    drop(keepalive);
     if !l_oldstring.is_null() {
         unsafe { rffi::free_charp(l_oldstring, true) };
     }
@@ -183,14 +190,15 @@ pub fn putenv_llimpl(name: &[u8], value: &[u8]) -> Result<(), i32> {
 /// `rposix_environ.unsetenv_llimpl`. Calls `os_unsetenv`, then drops the
 /// keepalive entry.
 pub fn unsetenv_llimpl(name: &[u8]) -> Result<(), i32> {
-    let error = {
-        let l_name = rffi::scoped_str2charp::new(Some(name));
-        (unsafe { os_unsetenv(l_name.buf) }) as isize
-    };
+    let l_name = rffi::scoped_str2charp::new(Some(name));
+    let mut keepalive = byname();
+    let error = (unsafe { os_unsetenv(l_name.buf) }) as isize;
     if error != 0 {
         return Err(crate::rposix::get_saved_errno());
     }
-    if let Some(l_oldstring) = byname().byname.remove(name) {
+    let l_oldstring = keepalive.byname.remove(name);
+    drop(keepalive);
+    if let Some(l_oldstring) = l_oldstring {
         unsafe { rffi::free_charp(l_oldstring, true) };
     }
     Ok(())
