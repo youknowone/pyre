@@ -5667,6 +5667,63 @@ pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf
         .collect()
 }
 
+/// Rebuild `Arguments` from a flat builtin rest slice so a consumer can
+/// call `Arguments.unpack` the way `descr_new_base_exception` and
+/// `W_OSError.descr_new` / `descr_init` do (`args_w, kwds_w = __args__.unpack()`).
+///
+/// The gateway still packs keywords as a trailing `__pyre_kw__` marker dict
+/// (`call.rs` PRE-EXISTING-ADAPTATION); this adapter drops that sentinel and
+/// keeps `keyword_names_w` as the original key objects. No real keywords
+/// means `positional_only`, so `_jit_few_keywords` stays true and `unpack`'s
+/// `look_inside_iff` looks inside.
+fn arguments_from_builtin_rest(rest: &[PyObjectRef]) -> crate::argument::Arguments {
+    let (pos, kwargs) = split_builtin_kwargs(rest);
+    if !has_real_kwargs(kwargs) {
+        return crate::argument::Arguments::positional_only(pos);
+    }
+    let dict = kwargs.expect("has_real_kwargs implies a marker dict");
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pos_len = pos.len();
+    let pos_base = pyre_object::gc_roots::pin_roots(pos);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let items =
+        unsafe { pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
+    let items_flat: Vec<PyObjectRef> = items.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let items_base = pyre_object::gc_roots::pin_roots(&items_flat);
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for i in 0..items.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i);
+        let value = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i + 1);
+        let is_marker = unsafe {
+            pyre_object::is_str(key)
+                && pyre_object::w_str_get_wtf8(key).as_str() == Ok("__pyre_kw__")
+        };
+        if is_marker {
+            continue;
+        }
+        names.push(key);
+        values.push(value);
+    }
+    let pos_now: Vec<PyObjectRef> = (0..pos_len)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+        .collect();
+    if names.is_empty() {
+        return crate::argument::Arguments::positional_only(&pos_now);
+    }
+    let n = names.len();
+    let names_base = pyre_object::gc_roots::pin_roots(&names);
+    let values_base = pyre_object::gc_roots::pin_roots(&values);
+    let names_now: Vec<PyObjectRef> = (0..n)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+        .collect();
+    let values_now: Vec<PyObjectRef> = (0..n)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
+        .collect();
+    crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)
+}
+
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
@@ -8732,14 +8789,33 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if !os_error_use_init(w_self) {
         return Ok(pyre_object::w_none());
     }
-    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
-    // `descr_init` line 621-623: OSError takes no keyword arguments.
-    if has_real_kwargs(kwargs) {
+    // `W_OSError.descr_init`: `args_w, kwds_w = __args__.unpack()` then
+    // reject a non-empty `kwds_w`. Pin `self` and the rest slice first —
+    // `unpack` / `text_w` can collect with those pointers live.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let rest: Vec<PyObjectRef> = if n <= 1 {
+        Vec::new()
+    } else {
+        (1..n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect()
+    };
+    let (positional, kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+    if !kwds_w.is_empty() {
         return Err(os_error_no_keywords_error(
             crate::typedef::r#type(w_self).map(|p| p.as_ptr()),
         ));
     }
-    os_error_fill_slots(w_self, positional)?;
+    let pn = positional.len();
+    let pos_base = pyre_object::gc_roots::pin_roots(&positional);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+    let positional: Vec<PyObjectRef> = (0..pn)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+        .collect();
+    os_error_fill_slots(w_self, &positional)?;
     Ok(pyre_object::w_none())
 }
 
@@ -9310,41 +9386,65 @@ fn os_error_family_new(
         &[PyObjectRef],
     ) -> Result<PyObjectRef, crate::PyError>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied();
-    let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
+    // `W_OSError.descr_new` keeps `w_subtype` live across
+    // `__args__.unpack()`. Pin the flat slice before that call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     let is_exact_os_error = matches!(
         (cls, lookup_exc_class("OSError")),
         (Some(c), Some(w_os)) if std::ptr::eq(c, w_os)
     );
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     let use_init = matches!(cls, Some(c) if os_error_type_use_init(c));
-    let (positional, kwargs) = split_builtin_kwargs(rest);
-    // `descr_new` line 590-593: only when `_use_init` is false (exact OSError
-    // and builtin subclasses) does `__new__` parse the args and reject
-    // keywords; a user subclass overriding `__init__` while keeping the
-    // inherited `__new__` defers both to `__init__`.
-    if !use_init && has_real_kwargs(kwargs) {
+    // `W_OSError.descr_new`: `args_w, kwds_w = __args__.unpack()`, then
+    // reject keywords only when `_use_init` is false (exact OSError and
+    // builtin subclasses). A user subclass overriding `__init__` while
+    // keeping the inherited `__new__` defers both to `__init__`.
+    let rest: Vec<PyObjectRef> = if n <= 1 {
+        Vec::new()
+    } else {
+        (1..n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect()
+    };
+    let (positional, kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
+    if !use_init && !kwds_w.is_empty() {
         return Err(os_error_no_keywords_error(cls));
     }
     // When `_use_init`, `__new__` allocates without parsing the args — the
     // errno/strerror/filename slots and `args_w` stay unset for `__init__` to
-    // fill (line 608-611).  Otherwise `__new__` parses them itself.
+    // fill.  Otherwise `__new__` parses them itself.
     // `ctor` formats the message, which runs every argument's `__repr__`, and
-    // both readers below consult the arguments again afterwards.  `positional`
-    // borrows the stack copy the gateway built, and a minor rewrites the
-    // shadow slots rather than that copy, so the operands are taken off the
-    // root stack once the Python is done.  `exc` joins them because
-    // `os_error_fill_slots` runs `int_w`, which is Python of its own.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let positional_base = pyre_object::gc_roots::pin_roots(positional);
-    let cls_slot = cls.map(|cls| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(cls);
-        slot
-    });
-    let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    // both readers below consult the arguments again afterwards.  `unpack`
+    // cloned `args_w`; a minor rewrites shadow slots rather than that Vec,
+    // so the operands are taken off the root stack once the Python is done.
+    // `exc` joins them because `os_error_fill_slots` runs `int_w`, which is
+    // Python of its own.
+    let positional_len = positional.len();
+    let positional_base = pyre_object::gc_roots::pin_roots(&positional);
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     // Full positional list, including when `_use_init` leaves `__new__`'s
     // own args empty: `ERRNO_MAP` still sees the original arguments.
-    let positional: Vec<PyObjectRef> = (0..positional.len())
+    let positional: Vec<PyObjectRef> = (0..positional_len)
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
     // Only the exact OSError type remaps the errno to a subclass. Resolve it
@@ -9701,28 +9801,39 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 }
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
-/// `descr_new_base_exception` unpacks unbound `__args__`, stores `args_w`,
-/// and deliberately ignores `kwds_w` (`# ignore kwds`); each exception type's
-/// descr__new__ then creates a W_<Kind>Object.  The flat builtin ABI carries
-/// those keywords in a trailing `__pyre_kw__` marker dict, so strip it and
-/// discard the dict before constructing `args_w`.
+/// `descr_new_base_exception` does `args_w, kwds_w = __args__.unpack()`
+/// (`# ignore kwds`) then `allocate_instance`. The flat builtin ABI still
+/// packs keywords as a trailing marker dict, so rebuild `Arguments` from
+/// that slice and unpack; `kwds_w` is discarded here the same way.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
         pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let cls = args.first().copied();
-            let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
-            // `# ignore kwds`: the marker dict is not an element of `args_w`.
-            let (positional, _) = split_builtin_kwargs(rest);
+            // `descr_new_base_exception` keeps `w_subtype` live across
+            // `__args__.unpack()`. Pin the flat slice before that call.
             let _roots = pyre_object::gc_roots::push_roots();
-            let cls_slot = cls.map(|cls| {
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(cls);
-                slot
-            });
-            let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+            let n = args.len();
+            let base = pyre_object::gc_roots::pin_roots(args);
+            let rest: Vec<PyObjectRef> = if n <= 1 {
+                Vec::new()
+            } else {
+                (1..n)
+                    .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                    .collect()
+            };
+            let (positional, _kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+            let pn = positional.len();
+            let pos_base = pyre_object::gc_roots::pin_roots(&positional);
+            let cls = if n == 0 {
+                None
+            } else {
+                Some(pyre_object::gc_roots::shadow_stack_get(base))
+            };
+            let positional: Vec<PyObjectRef> = (0..pn)
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+                .collect();
             // `allocate_instance` stamps `w_class` from `cls` and enqueues a
             // user finalizer when the layout is `_getusercls`.
-            let exc = $ctor(cls, positional)?;
+            let exc = $ctor(cls, &positional)?;
             Ok(exc)
         }
     };
@@ -26457,6 +26568,61 @@ mod tests {
                 Err(error) => panic!("only {index} of {THREADS} threads finished: {error}"),
             }
         }
+    }
+
+    /// `descr_new_base_exception` unpacks then `# ignore kwds`, so a
+    /// keyworded `__new__` still stores only the positional `args_w`.
+    #[test]
+    fn exc_new_wrapper_unpacks_args_and_ignores_keywords() {
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let cls = lookup_exc_class("ValueError").expect("ValueError");
+        let arg = pyre_object::w_int_new(1);
+        let foo = pyre_object::w_str_new("foo");
+        let two = pyre_object::w_int_new(2);
+        let held = roots.pin_roots(&[cls, arg, foo, two]);
+        let kwargs = crate::call::pack_pyre_kwargs(&[(roots.get(held + 2), roots.get(held + 3))]);
+        let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(kwargs);
+        let exc = exc_value_error_new(&[
+            roots.get(held),
+            roots.get(held + 1),
+            pyre_object::gc_roots::shadow_stack_get(kwargs_slot),
+        ])
+        .expect("ValueError.__new__");
+        let w_args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(exc) };
+        assert_eq!(unsafe { pyre_object::w_tuple_len(w_args) }, 1);
+        let stored = unsafe { pyre_object::w_tuple_getitem(w_args, 0) }.expect("args[0]");
+        assert_eq!(unsafe { pyre_object::w_int_get_value(stored) }, 1);
+    }
+
+    /// `W_OSError.descr_new` unpacks then rejects a non-empty `kwds_w`.
+    #[test]
+    fn os_error_new_unpacks_and_rejects_keywords() {
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let cls = lookup_exc_class("OSError").expect("OSError");
+        let errno = pyre_object::w_int_new(2);
+        let msg = pyre_object::w_str_new("x");
+        let filename = pyre_object::w_str_new("filename");
+        let path = pyre_object::w_str_new("a");
+        let held = roots.pin_roots(&[cls, errno, msg, filename, path]);
+        let kwargs = crate::call::pack_pyre_kwargs(&[(roots.get(held + 3), roots.get(held + 4))]);
+        let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(kwargs);
+        let err = exc_os_error_new(&[
+            roots.get(held),
+            roots.get(held + 1),
+            roots.get(held + 2),
+            pyre_object::gc_roots::shadow_stack_get(kwargs_slot),
+        ])
+        .expect_err("OSError.__new__ rejects keywords");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(
+            err.message_text().contains("keyword"),
+            "{}",
+            err.message_text()
+        );
     }
 
     /// `key_error_str` returns `repr(args_w[0])` for one item and the

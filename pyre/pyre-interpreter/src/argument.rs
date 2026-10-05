@@ -677,16 +677,20 @@ pub struct Arguments {
     /// must be parallel to `keyword_names_w` when present —
     /// argument.py `assert len(keywords_w) == len(keyword_names_w)`).
     pub keywords_w: Option<Vec<PyObjectRef>>,
-    /// argument.py:50 `self._jit_few_keywords = self.keyword_names_w
+    /// argument.py `__init__`: `self._jit_few_keywords = self.keyword_names_w
     /// is None or jit.isconstant(len(self.keyword_names_w))`.
-    /// Pyre's tracing JIT does not yet read this hint, but the field
-    /// is set so the unroll predicate is observable when the JIT
-    /// catches up.
+    /// `unpack` reads it through `look_inside_iff`; `_match_keywords` /
+    /// `_collect_keyword_args` take the same flag as `jiton` upstream.
     pub jit_few_keywords: bool,
     /// argument.py `self.methodcall = methodcall`.  Default `false`
     /// for the `positional_only` / `with_kw` shortcuts; the future
     /// CALL_METHOD opcode port should set it `true`.
     pub methodcall: bool,
+}
+
+/// argument.py `unpack`: `@jit.look_inside_iff(lambda self: self._jit_few_keywords)`.
+fn unpack_iff(arguments: &Arguments) -> bool {
+    arguments.jit_few_keywords
 }
 
 impl Arguments {
@@ -714,10 +718,7 @@ impl Arguments {
     ///
     /// `_jit_few_keywords` is a JIT-time elidability hint —
     /// `jit.isconstant(...)` is true when the trace recorder sees a
-    /// fixed length.  Pyre approximates with `keyword_names_w.is_none()
-    /// || keyword_names_w.len() <= JIT_FEW_KW_THRESHOLD`; the
-    /// threshold mirrors PyPy's elidable unroll in
-    /// `argument.py:73 unpack` (the JIT only unrolls a few iterations).
+    /// fixed length.  `unpack`'s `look_inside_iff` reads that field.
     ///
     /// `space` is implicit in pyre (carried by call sites).
     /// `_combine_wrapped(w_stararg, w_starstararg, w_function)` runs
@@ -752,18 +753,22 @@ impl Arguments {
             arguments_w: args_w.to_vec(),
             keyword_names_w: keyword_names_w.map(|s| s.to_vec()),
             keywords_w: keywords_w.map(|s| s.to_vec()),
-            // argument.py:50 — jit_few_keywords initial guess; the
-            // post-`_combine_wrapped` value below is the canonical one.
-            jit_few_keywords: keyword_names_w.is_none(),
+            // argument.py `__init__` writes `_jit_few_keywords` after
+            // `_combine_wrapped`; seed the same formula so the field is
+            // defined before that helper runs.
+            jit_few_keywords: match keyword_names_w {
+                None => true,
+                Some(names) => majit_rlib::jit::isconstant(&names.len()),
+            },
             methodcall,
         };
         let w_function = w_function.unwrap_or(pyre_object::PY_NULL);
         arguments._combine_wrapped(w_stararg, w_starstararg, w_function)?;
         // argument.py — recompute after `_combine_wrapped`, since
         // that helper may have grown `keyword_names_w`.
-        arguments.jit_few_keywords = match arguments.keyword_names_w.as_ref() {
+        arguments.jit_few_keywords = match arguments.keyword_names_w.as_deref() {
             None => true,
-            Some(names) => names.len() <= 8, // pyre approximation of jit.isconstant
+            Some(names) => majit_rlib::jit::isconstant(&names.len()),
         };
         Ok(arguments)
     }
@@ -974,6 +979,7 @@ impl Arguments {
     /// string — PyPy's `space.text_w(w_name)` raises TypeError in that
     /// case, and `unpack`'s upstream consumers propagate the error via
     /// `OperationError`.
+    #[majit_macros::look_inside_iff(unpack_iff)]
     pub fn unpack(
         &self,
     ) -> Result<
@@ -983,30 +989,53 @@ impl Arguments {
         ),
         crate::PyError,
     > {
+        // `text_w` / the result clone can collect. Publish every live list
+        // before the first `normalize_roots` so a safepoint cannot rewrite
+        // an unpinned sibling slice (`gc_roots::publish_roots`).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let args_n = self.arguments_w.len();
+        let args_base = pyre_object::gc_roots::publish_roots(&self.arguments_w);
+        let (names_n, names_base, values_base) =
+            match (self.keyword_names_w.as_deref(), self.keywords_w.as_deref()) {
+                (Some(names), Some(values)) => {
+                    let names_base = pyre_object::gc_roots::publish_roots(names);
+                    let values_base = pyre_object::gc_roots::publish_roots(values);
+                    (names.len(), Some(names_base), Some(values_base))
+                }
+                _ => (0, None, None),
+            };
+        pyre_object::gc_roots::normalize_roots(args_base, args_n);
+        if let (Some(names_base), Some(values_base)) = (names_base, values_base) {
+            pyre_object::gc_roots::normalize_roots(names_base, names_n);
+            pyre_object::gc_roots::normalize_roots(values_base, names_n);
+        }
         let mut kwds_w: std::collections::HashMap<String, PyObjectRef> =
             std::collections::HashMap::new();
-        if let (Some(names), Some(values)) =
-            (self.keyword_names_w.as_ref(), self.keywords_w.as_ref())
-        {
-            for (w_name, w_value) in names.iter().zip(values.iter()) {
+        if let (Some(names_base), Some(values_base)) = (names_base, values_base) {
+            for i in 0..names_n {
+                let w_name = pyre_object::gc_roots::shadow_stack_get(names_base + i);
+                let w_value = pyre_object::gc_roots::shadow_stack_get(values_base + i);
                 let key = unsafe {
-                    if pyre_object::is_str(*w_name) {
-                        crate::baseobjspace::str_utf8_w(*w_name)?.to_string()
+                    if pyre_object::is_str(w_name) {
+                        crate::baseobjspace::str_utf8_w(w_name)?.to_string()
                     } else {
-                        // argument.py:72 — `space.text_w(...)`.  PyPy's
+                        // argument.py `unpack` — `space.text_w(...)`. PyPy's
                         // `_typed_unwrap_error` (baseobjspace.py)
                         // raises `TypeError("expected str, got %T object")`.
-                        let tp = type_name_of(*w_name);
+                        let tp = type_name_of(w_name);
                         return Err(crate::PyError::type_error(format!(
                             "expected str, got {tp} object",
                         )));
                     }
                 };
-                // argument.py:74 — `kwds_w[key] = ...` overwrites on duplicate.
-                kwds_w.insert(key, *w_value);
+                // argument.py `unpack` — `kwds_w[key] = ...` overwrites on duplicate.
+                kwds_w.insert(key, w_value);
             }
         }
-        Ok((self.arguments_w.clone(), kwds_w))
+        let arguments_w = (0..args_n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(args_base + i))
+            .collect();
+        Ok((arguments_w, kwds_w))
     }
 
     /// pypy/interpreter/argument.py `replace_arguments`.
@@ -1031,10 +1060,12 @@ impl Arguments {
         let keywords_w = self.keywords_w.clone();
         Self {
             arguments_w: args_w,
-            jit_few_keywords: keyword_names_w
-                .as_ref()
-                .map(|n| n.len() <= 8)
-                .unwrap_or(true),
+            // argument.py `replace_arguments` builds a new `Arguments`
+            // through `__init__`, which recomputes `_jit_few_keywords`.
+            jit_few_keywords: match keyword_names_w.as_deref() {
+                None => true,
+                Some(names) => majit_rlib::jit::isconstant(&names.len()),
+            },
             methodcall: false,
             keyword_names_w,
             keywords_w,
@@ -2637,6 +2668,32 @@ mod tests {
                 assert!(err.message_text().contains("expected str"));
             }
         }
+    }
+
+    /// argument.py `__init__`: `_jit_few_keywords` is true when
+    /// `keyword_names_w is None`.
+    #[test]
+    fn jit_few_keywords_true_without_names() {
+        let pos = [pyre_object::w_int_new(1)];
+        let arguments = Arguments::positional_only(&pos);
+        assert!(arguments.jit_few_keywords);
+        let replaced = arguments.replace_arguments(vec![pyre_object::w_int_new(2)]);
+        assert!(replaced.jit_few_keywords);
+    }
+
+    /// argument.py `__init__`: `_jit_few_keywords` is
+    /// `jit.isconstant(len(keyword_names_w))` when the list is present.
+    /// Residual `isconstant` is false, so a present names list is not
+    /// "few" until a trace sees a constant length.
+    #[test]
+    fn jit_few_keywords_false_for_present_names_at_interp() {
+        let pos: [PyObjectRef; 0] = [];
+        let names = [pyre_object::w_str_new("k")];
+        let values = [pyre_object::w_int_new(1)];
+        let arguments = Arguments::with_kw(&pos, &names, &values);
+        assert!(!arguments.jit_few_keywords);
+        let replaced = arguments.replace_arguments(Vec::new());
+        assert!(!replaced.jit_few_keywords);
     }
 
     /// pypy/interpreter/argument.py `parse_into_scope` happy
