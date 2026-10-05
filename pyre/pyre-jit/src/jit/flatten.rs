@@ -6071,11 +6071,12 @@ where
 }
 
 /// Lower the BINARY_SLICE pyre HLOp `binary_slice(obj, start, stop)` →
-/// `result: Ref` to `residual_call_r_r(ConstInt(binary_slice_fn_idx),
+/// `result: Ref` to `inline_call_r_r` of `runtime_ops::binary_slice_values`
+/// when that body is fully bound (`jtransform.py handle_regular_call`),
+/// else `residual_call_r_r(ConstInt(binary_slice_fn_idx),
 /// ListR([obj, start, stop]), Descr) → reg`.  `bh_binary_slice_fn(obj,
-/// start, stop)` runs `runtime_ops::binary_slice_values` (the same code
-/// the interpreter's `binary_slice` runs); a user `__getitem__` fallback
-/// may force virtualizables → `MayForce`.
+/// start, stop)` is the unbound fallback; a user `__getitem__` may force
+/// virtualizables → `MayForce`.
 ///
 /// Returns `None` for non-`binary_slice` opnames so the caller can fall
 /// through to other lowering arms.
@@ -6099,6 +6100,16 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    // `jtransform.py handle_regular_call`: a bound helper is
+    // `inline_call_r_r`. A raise publishes and returns NULL;
+    // the walker promotes that to `finishframe_exception`.
+    if let Some(insn) = build_orthodox_inline_call_r_r_n(
+        inline_call_targets::BINARY_SLICE_VALUES,
+        vec![obj.clone(), start.clone(), stop.clone()],
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.binary_slice_fn_idx,
         vec![obj, start, stop],
@@ -6462,6 +6473,9 @@ where
 mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
+    /// BINARY_SLICE — `lower_binary_slice_hlop_to_insn`.
+    pub const BINARY_SLICE_VALUES: &str =
+        "pyre_interpreter::runtime_ops::binary_slice_values_inner";
     /// GET_LEN — `lower_get_len_hlop_to_insn`.
     pub const LEN: &str = "pyre_interpreter::baseobjspace::len";
     /// DELETE_SUBSCR — `lower_delsubscr_hlop_to_insn`.

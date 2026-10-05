@@ -1243,6 +1243,27 @@ pub extern "C" fn jit_runtime_ops_is_op(
     crate::runtime_ops::is_op(w_1, w_2, invert)
 }
 
+/// One-word C-ABI residual for `binary_slice_values`. Guard-failure
+/// blackholing calls this; the walker descends the named graph
+/// (`specialize.rs try_walker_orthodox_binary_slice`).
+#[majit_macros::jit_may_force]
+pub extern "C" fn jit_runtime_ops_binary_slice_values(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, start, stop]);
+    match crate::runtime_ops::binary_slice_values_inner(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+    ) {
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+    }
+}
+
 #[inline(never)]
 pub extern "C" fn jit_baseobjspace_not_(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();

@@ -11387,6 +11387,8 @@ fn make_call_descr(
 #[derive(Clone, Copy)]
 enum SymbolicBoxStrArg {
     InternedStr,
+    /// Prebuilt STR constants materialize as `_utf8` storage, not the wrapper.
+    StoragePayload,
     NonStr,
     NonConstant,
 }
@@ -11418,6 +11420,13 @@ fn run_symbolic_box_str_dispatch(
                 "__instancecheck__",
             ));
             (tc.const_ref(obj as i64), Some(obj as usize))
+        }
+        SymbolicBoxStrArg::StoragePayload => {
+            let obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                "__index__",
+            ));
+            let storage = unsafe { pyre_object::unicodeobject::w_str_storage(obj) };
+            (tc.const_ref(storage as i64), Some(obj as usize))
         }
         SymbolicBoxStrArg::NonStr => {
             let obj = pyre_object::intobject::w_int_new(42);
@@ -11491,6 +11500,27 @@ fn run_symbolic_box_str_dispatch(
 fn symbolic_box_str_constant_residual_folds_before_recording() {
     let (outcome, opcodes, dst_value, dst_is_constant, expected_ptr) =
         run_symbolic_box_str_dispatch(SymbolicBoxStrArg::InternedStr);
+
+    assert_eq!(
+        outcome.expect("registered symbolic call must fold"),
+        (DispatchOutcome::Continue, 7),
+    );
+    assert!(
+        opcodes.is_empty(),
+        "the folded residual must record no call op"
+    );
+    assert!(dst_is_constant, "the folded result must be a Ref constant");
+    assert_eq!(
+        dst_value,
+        expected_ptr.map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr))),
+        "box_str_constant must return the existing interned object",
+    );
+}
+
+#[test]
+fn symbolic_box_str_constant_residual_folds_prebuilt_storage() {
+    let (outcome, opcodes, dst_value, dst_is_constant, expected_ptr) =
+        run_symbolic_box_str_dispatch(SymbolicBoxStrArg::StoragePayload);
 
     assert_eq!(
         outcome.expect("registered symbolic call must fold"),

@@ -2549,6 +2549,27 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
+/// Step-1 `ll_listslice_startstop` wrap for `BINARY_SLICE` on a tuple.
+/// Bounds are already normalised machine indices; `eval_slice_index` must
+/// not run inside this leaf.
+///
+/// Empty is a fresh empty array. Otherwise [`tuple_getslice_step1_block`]
+/// (`ll_newlist` plus `ll_arraycopy` for an array tuple).
+#[inline(never)]
+pub(crate) unsafe fn tuple_slice_startstop(
+    obj: PyObjectRef,
+    start: usize,
+    stop: usize,
+) -> PyObjectRef {
+    let slicelength = stop.saturating_sub(start) as i64;
+    let block = if slicelength == 0 {
+        tuple_ll_newlist(0)
+    } else {
+        tuple_getslice_step1_block(obj, start as i64, slicelength)
+    };
+    pyre_object::tupleobject::wraptuple(block)
+}
+
 /// `tupleobject.py descr_getitem` → `_getslice`.
 ///
 /// `slice_unpack` then `slice_adjust_indices`. An empty slice is a fresh
@@ -11527,8 +11548,10 @@ pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
         if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
             // Heap types can still be mutated; read the live field (the
-            // caller promotes the result).
-            return pyre_object::typeobject::w_type_get_version_tag(w_type);
+            // caller promotes the result). typeobject.py `version_tag`
+            // returns `self._version_tag` here, a getfield, not the
+            // interpreter Acquire residual.
+            return pyre_object::typeobject::w_type_read_version_tag_field(w_type);
         }
         // Prebuilt objects cannot get their version_tag changed.
         return _pure_version_tag(w_type);

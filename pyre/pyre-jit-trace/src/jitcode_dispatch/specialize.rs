@@ -6837,6 +6837,132 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "BINARY-OP-SUBWALK",
 };
 
+/// BINARY_SLICE residual: walk `runtime_ops::binary_slice_values_inner`.
+///
+/// Flatten lowers the opcode to `bh_binary_slice_fn`, a MayForce pointer
+/// with no jitcode of its own. The wrapper holds `push_roots`; this inner
+/// body's `is_list` / `is_str` / `is_tuple` tests are the guards; a custom
+/// `__index__` is the body's `eval_slice_index` (`sliceobject.py`
+/// `_eval_slice_index`). Not a spec-fold row.
+const BINARY_SLICE_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::runtime_ops::binary_slice_values_inner",
+    commit_label: "binary_slice_commit",
+    call_site_label: "binary_slice_call_site",
+    decline_tag: "BINARY-SLICE-SUBWALK",
+};
+
+/// Walk `binary_slice_values_inner` for `obj[start:stop]`. Declines when
+/// the body is missing or the walk does not finish; the residual stays.
+///
+/// User `__index__` bounds are inlined first, the same preflight
+/// `try_walker_specialize_builtin_range` uses for `space.index`, so the
+/// inner descent sees exact ints and does not residualize
+/// `call_function_impl_result`.
+pub(crate) fn try_walker_orthodox_binary_slice<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let Some(start) = walker_concrete_ref_object(ctx, r_args[1]) else {
+        return Ok(None);
+    };
+    let Some(stop) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    enum BoundPlan {
+        Keep {
+            op: OpRef,
+            concrete: pyre_object::PyObjectRef,
+        },
+        UserIndex(IndexInlineCandidate),
+    }
+    let plan_bound = |ctx: &WalkContext<'_, '_, Sym>,
+                      bound_op: OpRef,
+                      bound_obj: pyre_object::PyObjectRef|
+     -> Option<BoundPlan> {
+        if bound_obj.is_null()
+            || unsafe { pyre_object::is_none(bound_obj) }
+            || walker_is_exact_machine_int_concrete(bound_obj)
+        {
+            return Some(BoundPlan::Keep {
+                op: bound_op,
+                concrete: bound_obj,
+            });
+        }
+        prepare_walker_inline_index(ctx, bound_op, bound_obj).map(BoundPlan::UserIndex)
+    };
+    let Some(start_plan) = plan_bound(ctx, r_args[1], start) else {
+        return try_walker_orthodox_descent(
+            ctx,
+            op.pc,
+            &[],
+            &[(r_args[0], obj), (r_args[1], start), (r_args[2], stop)],
+            &[],
+            dst,
+            dst_bank,
+            &BINARY_SLICE_DESCENT,
+        );
+    };
+    let Some(stop_plan) = plan_bound(ctx, r_args[2], stop) else {
+        return try_walker_orthodox_descent(
+            ctx,
+            op.pc,
+            &[],
+            &[(r_args[0], obj), (r_args[1], start), (r_args[2], stop)],
+            &[],
+            dst,
+            dst_bank,
+            &BINARY_SLICE_DESCENT,
+        );
+    };
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+    let emit_bound = |ctx: &mut WalkContext<'_, '_, Sym>,
+                      plan: BoundPlan|
+     -> Result<Option<(OpRef, pyre_object::PyObjectRef)>, DispatchError> {
+        match plan {
+            BoundPlan::Keep { op, concrete } => Ok(Some((op, concrete))),
+            BoundPlan::UserIndex(candidate) => {
+                let Some((result, ConcreteValue::Ref(concrete))) = try_walker_inline_index(
+                    ctx, op, code, funcptr, r_args, call_descr, dst, candidate,
+                )?
+                else {
+                    ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+                    ctx.trace_ctx.heap_cache_mut().reset();
+                    return Ok(None);
+                };
+                Ok(Some((result, concrete)))
+            }
+        }
+    };
+    let Some((start_op, start_obj)) = emit_bound(ctx, start_plan)? else {
+        return Ok(None);
+    };
+    let Some((stop_op, stop_obj)) = emit_bound(ctx, stop_plan)? else {
+        return Ok(None);
+    };
+    try_walker_orthodox_descent(
+        ctx,
+        op.pc,
+        &[],
+        &[(r_args[0], obj), (start_op, start_obj), (stop_op, stop_obj)],
+        &[],
+        dst,
+        dst_bank,
+        &BINARY_SLICE_DESCENT,
+    )
+}
+
 const WRITE_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "write_cell",
     commit_label: "write_cell_commit",

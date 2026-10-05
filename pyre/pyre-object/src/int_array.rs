@@ -144,6 +144,29 @@ impl IntArray {
         }
     }
 
+    /// `rlist.py ll_newlist`: a Signed items array whose live length is `len`.
+    /// `ll_listslice_startstop` fills it with `ll_arraycopy`; the payload is
+    /// uninitialized until that copy.
+    pub fn with_len(len: usize) -> Self {
+        if len == 0 {
+            return Self::empty();
+        }
+        Self {
+            block: unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) },
+            len: crate::object_array::length_cell(len),
+        }
+    }
+
+    /// Adopt an already-allocated Signed items block. The block is the
+    /// `ll_newlist` result; `ll_arraycopy` fills it before the list header
+    /// takes the edge.
+    pub fn from_block(block: *mut TypedItemsBlock, len: usize) -> Self {
+        Self {
+            block,
+            len: crate::object_array::length_cell(len),
+        }
+    }
+
     /// Pin `block` on the shadow stack and return its slot, so the block stays
     /// live across a following GC operation.
     ///
