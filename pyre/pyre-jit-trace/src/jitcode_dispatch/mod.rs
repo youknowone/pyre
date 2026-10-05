@@ -1032,15 +1032,17 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     if fbw_context_chained_contains(exc) {
         return;
     }
-    // `chain_context` is a no-op on a bare reraise (`exc is active`) and when
-    // no handler is live.  The residual still takes `exc` as an argument, so
-    // it forces the allocation the optimizer would otherwise fold away with
-    // the handler — the same forcing the `fbw_context_chained` skip exists
-    // for.  Skip the call when the body would not write.
-    let active = pyre_interpreter::eval::get_sys_exception();
-    if !pyre_interpreter::error::chain_context_would_write(exc_ptr, active) {
-        return;
-    }
+    // Do not consult recording-time `chain_context_would_write` here.
+    // `handle_bytecode` / `handle_exception_with_context` already ran
+    // `OperationError.record_context` on a residual or inlined callee's
+    // concrete exception, so that predicate sees a stamped slot and would
+    // drop the residual the compiled iterations still need: a jitted callee
+    // raises without going through that interpreter dispatch, and this
+    // catch-side store is the only write.  A same-frame bare reraise
+    // (`RAISE_VARARGS 0` / `RERAISE`, `RaiseWithExplicitTraceback`) is
+    // skipped at the `SubRaise` catch site instead, matching
+    // `pyopcode.py handle_bytecode` routing that exception around
+    // `record_context`.
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
     // the value the compiled iterations will store.
@@ -4881,14 +4883,18 @@ pub fn walk<Sym: WalkSym>(
                     let emit_runtime = !raised_in_this_frame && node.is_none();
                     // `RaiseWithExplicitTraceback` (`RAISE_VARARGS 0`, `RERAISE`)
                     // re-raises the handled instance and does not write
-                    // `__context__`.  The catch compensation's residual still
-                    // takes `exc` as an argument, which forces a pendingfields
-                    // reconstruction of a virtual exception the handler never
-                    // reads.  PyPy's reraise bridge DCEs that object; skip the
-                    // call here so the heap optimizer can too.
+                    // `__context__` (`pyopcode.py handle_bytecode` sends it
+                    // around `OperationError.record_context`).  The catch
+                    // compensation's residual still takes `exc` as an argument,
+                    // which forces a pendingfields reconstruction of a virtual
+                    // exception the handler never reads.  PyPy's reraise
+                    // bridge DCEs that object; skip the call here so the heap
+                    // optimizer can too.
                     // `recording_raise_keeps_existing_traceback` is also true
                     // for `FOR_ITER`, which keeps the iterator's traceback
                     // but still writes `__context__` for a non-StopIteration.
+                    // Gate on `raised_in_this_frame` (`raise/r` / `reraise/`)
+                    // so this skip is exactly the bare-reraise opcode case.
                     if raised_in_this_frame
                         && recording_raise_keeps_existing_traceback(ctx, opcode_position)
                     {
