@@ -19,7 +19,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // FunDecl + meta
 
@@ -57,6 +57,13 @@ pub struct FunDecl {
     /// [`FunDecl::first_arg_local_name`], decided on first query.
     #[serde(skip)]
     first_arg_local_name: OnceLock<Option<String>>,
+    /// Inlinable promoted-constant initializers for this artefact, indexed
+    /// by global decl id. Charon 0.1.281 emits each promoted constant as
+    /// its own item; [`FunDecl::unstructured`] splices the initializer at
+    /// every read, the shape 0.1.273 emitted inline. `None` when this
+    /// declaration was not loaded through [`crate::Llbc::from_slice`].
+    #[serde(skip)]
+    promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
 }
 
 impl FunDecl {
@@ -89,6 +96,11 @@ impl FunDecl {
     /// Cleanup blocks are reachable only through `on_unwind`, which the
     /// flow graph does not carry, so they are left out. Every `on_unwind`
     /// edge points at one terminal `UnwindResume` block.
+    ///
+    /// Charon 0.1.281 emits promoted constants as their own global items.
+    /// When this declaration was loaded with the artefact table, each read
+    /// of an inlinable promoted constant is replaced by the initializer's
+    /// statements, the shape 0.1.273 emitted at the use site.
     pub fn unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]
         struct Proj {
@@ -96,9 +108,16 @@ impl FunDecl {
             unstructured: Unstructured,
         }
         let body = self.body.as_ref()?;
-        serde_json::from_str::<Proj>(body.get())
+        let mut u = serde_json::from_str::<Proj>(body.get())
             .ok()
-            .map(|p| strip_cleanup_blocks(p.unstructured))
+            .map(|p| strip_cleanup_blocks(p.unstructured))?;
+        if let Some(table) = &self.promoted_inits
+            && table.iter().any(Option::is_some)
+            && body.get().contains("\"Global\"")
+        {
+            splice_promoted_reads(&mut u, table);
+        }
+        Some(u)
     }
 
     /// The `locals` table of the `Unstructured` body, without building its
@@ -1222,7 +1241,7 @@ pub struct Locals {
     pub locals: Vec<Local>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Local {
     pub index: u64,
     pub name: Option<String>,
@@ -1326,6 +1345,340 @@ fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
     });
     body.body = kept;
     body
+}
+
+/// Inlinable promoted-constant initializer, keyed by global decl id.
+///
+/// Charon 0.1.281 emits each promoted constant as its own `AnonConst`
+/// item whose last name segment is `PromotedConst`. The reader splices
+/// this initializer at every read so the body matches the inline shape
+/// 0.1.273 emitted.
+#[derive(Debug)]
+struct PromotedInit {
+    /// Init locals with index ≥ 1, in table order.
+    locals: Vec<Local>,
+    /// Statement kinds other than those that name `_0`.
+    statements: Vec<Value>,
+    /// Rvalue assigned to `_0`.
+    ret_rvalue: Value,
+}
+
+/// Build the per-artefact promoted-initializer table and store a clone on
+/// every [`FunDecl`]. Declarations deserialized any other way keep `None`.
+pub(crate) fn attach_promoted_inits(file: &mut crate::schema::LlbcFile) {
+    let table = Arc::new(collect_promoted_inits(file));
+    for fd in file.translated.fun_decls.iter_mut().flatten() {
+        fd.promoted_inits = Some(Arc::clone(&table));
+    }
+}
+
+fn collect_promoted_inits(file: &crate::schema::LlbcFile) -> Vec<Option<PromotedInit>> {
+    let n = file.translated.global_decls.len();
+    let mut table: Vec<Option<PromotedInit>> = (0..n).map(|_| None).collect();
+    for gd in file.translated.global_decls.iter().flatten() {
+        let Some(init) = promoted_init_from_global(file, gd) else {
+            continue;
+        };
+        let idx = gd.def_id as usize;
+        if idx < table.len() {
+            table[idx] = Some(init);
+        }
+    }
+    table
+}
+
+fn promoted_init_from_global(
+    file: &crate::schema::LlbcFile,
+    gd: &GlobalDecl,
+) -> Option<PromotedInit> {
+    if gd.rest.get("global_kind").and_then(Value::as_str) != Some("AnonConst") {
+        return None;
+    }
+    if !gd
+        .item_meta
+        .name
+        .last()
+        .is_some_and(is_promoted_const_segment)
+    {
+        return None;
+    }
+    let init_id = global_init_fun_id(gd)?;
+    let init_fd = file
+        .translated
+        .fun_decls
+        .get(init_id as usize)
+        .and_then(Option::as_ref)?;
+    promoted_init_from_body(&init_fd.unstructured()?)
+}
+
+fn is_promoted_const_segment(seg: &NameSeg) -> bool {
+    let NameSeg::Other(v) = seg else {
+        return false;
+    };
+    v.get("Builtin")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_str)
+        == Some("PromotedConst")
+}
+
+/// Init fun id stored in `gd.rest["value"]` as
+/// `Value[1][0].Call[0].kind.Fun`.
+fn global_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
+    let value = gd.rest.get("value")?;
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let lit = body.as_array()?.first()?;
+    lit.pointer("/Call/0/kind/Fun").and_then(Value::as_u64)
+}
+
+fn is_return_terminator(kind: &Value) -> bool {
+    match kind {
+        Value::String(s) => s == "Return",
+        Value::Object(map) => map.contains_key("Return"),
+        _ => false,
+    }
+}
+
+fn promoted_init_from_body(u: &Unstructured) -> Option<PromotedInit> {
+    if u.body.len() != 1 {
+        return None;
+    }
+    let bb = &u.body[0];
+    if !is_return_terminator(bb.terminator.kind_value()) {
+        return None;
+    }
+    let mut last_assign_to_0 = false;
+    let mut n_assign_0 = 0;
+    let mut ret_rvalue = None;
+    let mut statements = Vec::new();
+    for st in &bb.statements {
+        let kind = st.kind_value();
+        match st.stmt_kind().ok()? {
+            StmtKind::StorageLive(0) | StmtKind::StorageDead(0) => {}
+            StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {
+                statements.push(kind.clone());
+            }
+            StmtKind::Assign(place, _) => {
+                if matches!(place.kind, PlaceKind::Local(0)) {
+                    last_assign_to_0 = true;
+                    n_assign_0 += 1;
+                    ret_rvalue = Some(kind.get("Assign")?.as_array()?.get(1)?.clone());
+                } else {
+                    last_assign_to_0 = false;
+                    statements.push(kind.clone());
+                }
+            }
+            _ => return None,
+        }
+    }
+    if n_assign_0 != 1 || !last_assign_to_0 {
+        return None;
+    }
+    Some(PromotedInit {
+        locals: u
+            .locals
+            .locals
+            .iter()
+            .filter(|loc| loc.index != 0)
+            .cloned()
+            .collect(),
+        statements,
+        ret_rvalue: ret_rvalue?,
+    })
+}
+
+struct SpliceCtx<'a> {
+    table: &'a [Option<PromotedInit>],
+    locals: &'a mut Locals,
+    span: &'a SpanRef,
+    inserts: &'a mut Vec<Statement>,
+}
+
+/// Replace each inlinable promoted `Global` read with the initializer
+/// statements and a local holding the init's `_0`.
+fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]) {
+    let mut locals = Locals {
+        arg_count: body.locals.arg_count,
+        locals: std::mem::take(&mut body.locals.locals),
+    };
+    let body_span = body.span.clone();
+    for bb in &mut body.body {
+        let mut i = 0;
+        while i < bb.statements.len() {
+            let span = bb.statements[i].span.clone();
+            let mut kind = bb.statements[i].kind_value().clone();
+            let mut inserts = Vec::new();
+            let mut ctx = SpliceCtx {
+                table,
+                locals: &mut locals,
+                span: &span,
+                inserts: &mut inserts,
+            };
+            if rewrite_value(&mut kind, &mut ctx) {
+                bb.statements[i].set_kind(kind);
+                let n = inserts.len();
+                bb.statements.splice(i..i, inserts);
+                i += n;
+            }
+            i += 1;
+        }
+        let span = bb
+            .terminator
+            .span
+            .clone()
+            .unwrap_or_else(|| body_span.clone());
+        let mut kind = bb.terminator.kind_value().clone();
+        let mut inserts = Vec::new();
+        let mut ctx = SpliceCtx {
+            table,
+            locals: &mut locals,
+            span: &span,
+            inserts: &mut inserts,
+        };
+        if rewrite_value(&mut kind, &mut ctx) {
+            bb.set_terminator_kind(kind);
+            bb.statements.extend(inserts);
+        }
+    }
+    body.locals.locals = locals.locals;
+}
+
+fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    if v.get("kind").is_some() && v.get("ty").is_some() {
+        return rewrite_place(v, ctx);
+    }
+    match v {
+        Value::Array(arr) => {
+            let mut changed = false;
+            for item in arr {
+                changed |= rewrite_value(item, ctx);
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for item in map.values_mut() {
+                changed |= rewrite_value(item, ctx);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn rewrite_place(place: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    let global_id = place
+        .get("kind")
+        .and_then(|k| k.get("Global"))
+        .and_then(|g| g.get("id"))
+        .and_then(Value::as_u64);
+    if let Some(id) = global_id {
+        let Some(init) = ctx.table.get(id as usize).and_then(Option::as_ref) else {
+            return false;
+        };
+        let ty = place.get("ty").cloned().unwrap_or(Value::Null);
+        let t = materialize(init, ty, ctx);
+        if let Some(obj) = place.as_object_mut() {
+            obj.insert("kind".into(), serde_json::json!({"Local": t}));
+        }
+        return true;
+    }
+    let mut changed = false;
+    if let Some(proj) = place
+        .get_mut("kind")
+        .and_then(|k| k.get_mut("Projection"))
+        .and_then(Value::as_array_mut)
+    {
+        if let Some(inner) = proj.get_mut(0) {
+            changed |= rewrite_place(inner, ctx);
+        }
+        if let Some(elem) = proj.get_mut(1) {
+            changed |= rewrite_value(elem, ctx);
+        }
+    }
+    changed
+}
+
+fn materialize(init: &PromotedInit, use_ty: Value, ctx: &mut SpliceCtx<'_>) -> u64 {
+    let max_idx = init.locals.iter().map(|loc| loc.index).max().unwrap_or(0);
+    let mut remap = vec![None; max_idx as usize + 1];
+    for loc in &init.locals {
+        let new_idx = ctx.locals.locals.len() as u64;
+        if (loc.index as usize) < remap.len() {
+            remap[loc.index as usize] = Some(new_idx);
+        }
+        let mut new_loc = loc.clone();
+        new_loc.index = new_idx;
+        new_loc.name = None;
+        ctx.locals.locals.push(new_loc);
+    }
+    let t = ctx.locals.locals.len() as u64;
+    remap[0] = Some(t);
+    let ty = serde_json::from_value(use_ty.clone()).unwrap_or(TyRef::Other(use_ty.clone()));
+    ctx.locals.locals.push(Local {
+        index: t,
+        name: None,
+        span: ctx.span.clone(),
+        ty,
+    });
+    for kind in &init.statements {
+        let mut kind = kind.clone();
+        remap_local_indices(&mut kind, &remap);
+        ctx.inserts
+            .push(statement_from_kind(kind, ctx.span.clone()));
+    }
+    let mut rv = init.ret_rvalue.clone();
+    remap_local_indices(&mut rv, &remap);
+    let assign = serde_json::json!({
+        "Assign": [
+            {"kind": {"Local": t}, "ty": use_ty},
+            rv
+        ]
+    });
+    ctx.inserts
+        .push(statement_from_kind(assign, ctx.span.clone()));
+    t
+}
+
+fn statement_from_kind(kind: Value, span: SpanRef) -> Statement {
+    Statement {
+        kind: serde_json::value::to_raw_value(&kind).expect("a JSON value serializes"),
+        span,
+        stmt_cache: OnceLock::new(),
+        value_cache: OnceLock::from(kind),
+    }
+}
+
+/// Remap `{"Local": n}` place kinds and `StorageLive` / `StorageDead`
+/// payloads. Other integers (global ids, type ids, …) stay as they are.
+fn remap_local_indices(v: &mut Value, remap: &[Option<u64>]) {
+    match v {
+        Value::Object(map) => {
+            if map.len() == 1 {
+                for key in ["Local", "StorageLive", "StorageDead"] {
+                    if let Some(old) = map.get(key).and_then(Value::as_u64)
+                        && let Some(new) = remap.get(old as usize).copied().flatten()
+                    {
+                        map.insert(key.to_string(), Value::from(new));
+                        return;
+                    }
+                }
+            }
+            for val in map.values_mut() {
+                remap_local_indices(val, remap);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                remap_local_indices(val, remap);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn kept_block_normal_successor_is_cleanup(blocks: &[BasicBlock]) -> bool {
@@ -1552,6 +1905,14 @@ impl Statement {
             let kind = self.kind.get();
             serde_json::from_str::<StmtKind>(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
         })
+    }
+
+    /// Replace the raw statement kind, forgetting the projection of the
+    /// old one so the next [`stmt_kind`](Self::stmt_kind) reads the new kind.
+    fn set_kind(&mut self, kind: Value) {
+        self.kind = serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
+        self.value_cache = OnceLock::from(kind);
+        self.stmt_cache = OnceLock::new();
     }
 }
 
