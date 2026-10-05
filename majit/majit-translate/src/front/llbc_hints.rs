@@ -396,7 +396,7 @@ fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
     for block in &body.body {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _))) =
-                stmt.stmt_kind()
+                stmt.stmt_kind_ref()
             else {
                 continue;
             };
@@ -427,7 +427,7 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     for block in &body.body {
         for stmt in &block.statements {
             let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _)) =
-                stmt.stmt_kind().ok()?
+                stmt.stmt_kind_ref().ok()?
             else {
                 continue;
             };
@@ -466,7 +466,7 @@ fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i6
     let mut save_err: Option<i64> = None;
     for block in &body.body {
         for stmt in &block.statements {
-            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             collect_aroundstate_rvalue(llbc, &rvalue, &mut fn_id, &mut save_err);
@@ -708,14 +708,20 @@ mod tests {
         )
         .unwrap();
         let ty = serde_json::json!({"Deduplicated": 1});
-        let funcptr = super::Operand::Const(serde_json::json!([
-            {"FnDef": {"kind": {"Fun": 7}}},
-            ty
-        ]));
-        let save_err = super::Operand::Const(serde_json::json!([
-            {"Integer": {"Signed": ["I64", "5"]}},
-            ty
-        ]));
+        let funcptr = super::Operand::Const(
+            serde_json::json!([
+                {"FnDef": {"kind": {"Fun": 7}}},
+                ty
+            ])
+            .into(),
+        );
+        let save_err = super::Operand::Const(
+            serde_json::json!([
+                {"Integer": {"Signed": ["I64", "5"]}},
+                ty
+            ])
+            .into(),
+        );
         let (mut fn_id, mut save) = (None, None);
         super::collect_aroundstate_operand(&llbc, &funcptr, &mut fn_id, &mut save);
         super::collect_aroundstate_operand(&llbc, &save_err, &mut fn_id, &mut save);
