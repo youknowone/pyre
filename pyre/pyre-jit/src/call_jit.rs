@@ -3903,61 +3903,48 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
-    // resume.py `rebuild_from_resumedata`: `newframe(jitcodes[jitcode_pos])`
-    // per section, then `setup_resume_at_op` and `consume_boxes`. The portal
-    // jitcode is only the stand-in when a section has no registered jitcode.
-    if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
-        // resume.py `rebuild_from_resumedata` reads one section at a time:
-        // `newframe`, `setup_resume_at_op(pc)`, then `consume_boxes`.
-        // Outermost first. Clone the sections before the meta borrow.
-        let resume_frames = {
-            let (driver, _) = crate::eval::driver_pair();
-            driver
-                .resume_data_result
-                .as_ref()
-                .map(|result| result.frames.clone())
-                .unwrap_or_default()
-        };
-        // `frame_value_count_at` materializes `jitcodes[jitcode_pos]` before
-        // it counts the section (`resume.py` `staticdata.jitcodes`). A
-        // skeleton at that index makes `read_frame_liveness_reg_indices`
-        // return empty banks, so `consume_boxes` sees a length mismatch.
-        let materialized: Vec<Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>> =
-            resume_frames
-                .iter()
-                .map(|section| {
-                    usize::try_from(section.jitcode_index)
-                        .ok()
-                        .and_then(|index| {
-                            pyre_jit_trace::state::ensure_build_time_jitcode_at(index)
-                                .map(|payload| std::sync::Arc::clone(&payload.jitcode))
-                        })
-                })
-                .collect();
-        // `resume.py` `rebuild_from_resumedata` reads
-        // `metainterp.staticdata` for both the jitcode and `liveness_info`.
-        // The driver's lock is the one `intern_liveness` publishes
-        // (`adopt_published_liveness`), so an empty buffer selects it.
-        // `materialized` is still required: runtime Python bodies are not
-        // seated in the driver's `jitcodes` vector.
+    // resume.py `rebuild_from_resumedata` already ran inside
+    // `start_bridge_tracing` (`rebuild_state_after_failure`). A second
+    // walk would `newframe` again, `consume_boxes` again, and
+    // `handle_rvmprof_enter_on_resume` again. Rebuild here only when
+    // that start had no portal jitcode to seat frames with.
+    {
         let (driver, _) = crate::eval::driver_pair();
-        let consumed = driver.rebuild_portal_framestack_from_resumedata(
-            portal,
-            &resume_frames,
-            raw_values,
-            &exit_layout.exit_types,
-            &materialized,
-            &[],
-            0,
-        );
-        if !consumed {
-            // `resume.py consume_boxes` always consumes the section. A
-            // liveness/section length mismatch does not build the bridge;
-            // the same blackhole fallback as the other resume errors.
-            if driver.is_tracing() {
-                driver.meta_interp_mut().abort_trace(false);
+        if driver.portal_framestack_len() == 0 {
+            if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
+                let resume_frames = driver
+                    .resume_data_result
+                    .as_ref()
+                    .map(|result| result.frames.clone())
+                    .unwrap_or_default();
+                let materialized: Vec<Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>> =
+                    resume_frames
+                        .iter()
+                        .map(|section| {
+                            usize::try_from(section.jitcode_index)
+                                .ok()
+                                .and_then(|index| {
+                                    pyre_jit_trace::state::ensure_build_time_jitcode_at(index)
+                                        .map(|payload| std::sync::Arc::clone(&payload.jitcode))
+                                })
+                        })
+                        .collect();
+                let consumed = driver.rebuild_portal_framestack_from_resumedata(
+                    portal,
+                    &resume_frames,
+                    raw_values,
+                    &exit_layout.exit_types,
+                    &materialized,
+                    &[],
+                    0,
+                );
+                if !consumed {
+                    if driver.is_tracing() {
+                        driver.meta_interp_mut().abort_trace(false);
+                    }
+                    return BridgeResolution::ResumeBlackhole;
+                }
             }
-            return BridgeResolution::ResumeBlackhole;
         }
     }
     // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`

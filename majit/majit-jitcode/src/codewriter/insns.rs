@@ -1371,42 +1371,27 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // Generic walkers must consult `decode_op_at` (which knows `P`) for
     // length, not the canonical argcodes table.
     m.insert("inline_call_nested_ext/P", BC_INLINE_CALL);
-    // TODO: pyre `call_assembler_*` adapters.
-    //
-    // `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
-    // (`majit-metainterp/src/jitcode/assembler.rs`) emits a pyre-only flat
-    // payload: typed `[target_idx u16, dst u16, num_args u16,
-    // (kind u8, reg u16) × num_args]`; void omits `dst`.  RPython has
-    // no `bhimpl_call_assembler_*`; pyre re-interprets the recorded
-    // operation by direct-calling `target.concrete_ptr` via the
-    // shared `call_int_function` / `call_void_function` helpers.
-    // `P` pseudo-argcode mirrors `inline_call_nested_ext`'s opaque
-    // pyre-payload classification.
+    // Byte reservations for `BC_CALL_ASSEMBLER_{INT,REF,FLOAT,VOID}`
+    // (50-53). Tracing `opimpl_call_assembler_*` still indexes `opimpl`
+    // on these constants; `is_reserved_opcode_byte` keeps dynamic
+    // allocators off them. Jitcode no longer emits `call_assembler_*`;
+    // recursive portal calls emit `BC_RECURSIVE_CALL_*`. `blackhole.py`
+    // has no `bhimpl_call_assembler`; the production builder leaves
+    // these bytes unwired.
     m.insert("call_assembler_int_ext/P", BC_CALL_ASSEMBLER_INT);
     m.insert("call_assembler_ref_ext/P", BC_CALL_ASSEMBLER_REF);
     m.insert("call_assembler_float_ext/P", BC_CALL_ASSEMBLER_FLOAT);
     m.insert("call_assembler_void_ext/P", BC_CALL_ASSEMBLER_VOID);
-    // TODO: pyre `cond_call` / `record_known_result`
-    // adapters.
-    //
-    // `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
-    // (`majit-metainterp/src/jitcode/assembler.rs`) emit a pyre-only flat payload that
-    // does not match canonical `iiIRd` / `riIRd>r` argcodes.  The
-    // `_ext/P` handlers split semantically:
-    //
-    //   * `cond_call_*_ext` (`blackhole.rs`'s `handler_cond_call_*_ext`) execute the
-    //     conditional call directly, mirroring upstream
-    //     `bhimpl_conditional_call_ir_v` /
-    //     `bhimpl_conditional_call_value_ir_{i,r}`
-    //     (`blackhole.py`).
-    //   * `record_known_result_*_ext` (`blackhole.rs`'s
-    //     `handler_record_known_result_*_ext`)
-    //     are no-ops that skip the operand bytes, mirroring the
-    //     `pass`-bodied `bhimpl_record_known_result_{i,r}_ir_v`
-    //     (`blackhole.py`).
-    //
-    // Producers: `majit-macros/src/jit_interp/jitcode_lower/`,
-    // `pyre/pyre-jit/src/jit/assembler.rs`.
+    // Byte reservations for `BC_COND_CALL_{VOID,VALUE_INT,VALUE_REF}`
+    // and `BC_RECORD_KNOWN_RESULT_{INT,REF}` (79-83). Tracing
+    // `opimpl_cond_call_void` still indexes `opimpl` on these constants;
+    // `is_reserved_opcode_byte` keeps dynamic allocators off them.
+    // Jitcode emits the canonical `conditional_call_ir_v` /
+    // `conditional_call_value_ir_{i,r}` / `record_known_result_{i,r}_ir_v`
+    // keys. `blackhole.py` `bhimpl_conditional_call_ir_v` /
+    // `bhimpl_conditional_call_value_ir_{i,r}` / pass-bodied
+    // `bhimpl_record_known_result_{i,r}_ir_v` handle those; the
+    // production builder leaves these leftover bytes unwired.
     m.insert("cond_call_void_ext/P", BC_COND_CALL_VOID);
     m.insert("cond_call_value_int_ext/P", BC_COND_CALL_VALUE_INT);
     m.insert("cond_call_value_ref_ext/P", BC_COND_CALL_VALUE_REF);

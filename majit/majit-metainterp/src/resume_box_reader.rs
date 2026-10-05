@@ -37,7 +37,7 @@ pub fn default_bridge_array_descr(
 /// only virtual kind whose descr is minted rather than looked up in a parent
 /// `SizeDescr`); descr identity is the consumer's gccache concern, so it is
 /// injected rather than fixed in core.
-pub struct BridgeVirtualCache<'a> {
+pub struct BridgeVirtualCache {
     virtuals_ptr_cache: Vec<Option<OpRef>>,
     virtuals_int_cache: Vec<Option<OpRef>>,
     concrete_ptr_cache: Vec<Option<majit_ir::GcRef>>,
@@ -56,14 +56,19 @@ pub struct BridgeVirtualCache<'a> {
     /// for and which is sound only because the direct reader has already run
     /// for this guard: applying again would allocate a SECOND set of virtuals
     /// and record an identity the interpreter does not hold.
-    executing: Option<&'a dyn crate::resume::BlackholeAllocator>,
+    ///
+    /// Stored without a lifetime so `ResumeDataBoxReader.virtuals_cache` can
+    /// live on `TraceCtx` from `_prepare_virtuals` through `consume_boxes`.
+    /// `attach_executing` writes it at the start of a call; `detach_executing`
+    /// clears it before the cache is parked.
+    executing: Option<std::ptr::NonNull<dyn crate::resume::BlackholeAllocator>>,
     /// The guard's fail values, which `resume.py decode_ref` reads a TAGBOX
     /// operand out of (`cpu.get_ref_value(self.deadframe, num)`). Empty for
     /// the recording-only reader, which never needs a concrete.
     ///
     /// Int and float failargs only — a ref failarg is read out of
     /// [`Self::fail_ref_roots`] instead.
-    fail_values: &'a [i64],
+    fail_values: Vec<i64>,
     /// The ref-typed fail values, indexed as `fail_values` is and registered
     /// as resume-construction GC roots.
     ///
@@ -99,13 +104,23 @@ pub struct BridgeVirtualCache<'a> {
     roots_depth: usize,
 }
 
-impl Drop for BridgeVirtualCache<'_> {
+impl Drop for BridgeVirtualCache {
     fn drop(&mut self) {
         majit_gc::shadow_stack::pop_resume_ref_roots_to(self.roots_depth);
     }
 }
 
-impl<'a> BridgeVirtualCache<'a> {
+fn allocator_ptr(
+    allocator: &dyn crate::resume::BlackholeAllocator,
+) -> std::ptr::NonNull<dyn crate::resume::BlackholeAllocator> {
+    let ptr = std::ptr::NonNull::from(allocator);
+    // SAFETY: `attach_executing` writes this for the current
+    // `_prepare` / `consume_boxes` call, and `detach_executing` clears
+    // it before the cache is parked on `TraceCtx`.
+    unsafe { std::mem::transmute(ptr) }
+}
+
+impl BridgeVirtualCache {
     /// The recording-only reader, for a bridge entered after a direct reader
     /// has already applied this guard's writes.
     pub fn new(
@@ -130,7 +145,7 @@ impl<'a> BridgeVirtualCache<'a> {
             concrete_int_cache: vec![None; size],
             mint_raw_array_descr,
             executing: None,
-            fail_values: &[],
+            fail_values: Vec::new(),
             fail_ref_roots: Vec::new(),
             concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
@@ -154,8 +169,8 @@ impl<'a> BridgeVirtualCache<'a> {
             majit_ir::Type,
             bool,
         ) -> majit_ir::DescrRef,
-        allocator: &'a dyn crate::resume::BlackholeAllocator,
-        fail_values: &'a [i64],
+        allocator: &dyn crate::resume::BlackholeAllocator,
+        fail_values: &[i64],
         fail_types: &[majit_ir::Type],
     ) -> Self {
         // Built field by field rather than from `Self::new`: the cache
@@ -167,8 +182,8 @@ impl<'a> BridgeVirtualCache<'a> {
             concrete_ptr_cache: vec![None; size],
             concrete_int_cache: vec![None; size],
             mint_raw_array_descr,
-            executing: Some(allocator),
-            fail_values,
+            executing: Some(allocator_ptr(allocator)),
+            fail_values: fail_values.to_vec(),
             fail_ref_roots: fail_values
                 .iter()
                 .enumerate()
@@ -220,13 +235,61 @@ impl<'a> BridgeVirtualCache<'a> {
 
     /// The allocator the applying half stores through, or `None` when this is
     /// the recording-only reader.
-    pub fn allocator(&self) -> Option<&'a dyn crate::resume::BlackholeAllocator> {
-        self.executing
+    pub fn allocator(&self) -> Option<&dyn crate::resume::BlackholeAllocator> {
+        // SAFETY: `executing` is set from `executing()` / `attach_executing`
+        // with a reference that outlives this use, and cleared by
+        // `detach_executing` before the cache is parked.
+        self.executing.map(|ptr| unsafe { ptr.as_ref() })
+    }
+
+    /// Bind this call's applying half. `ResumeDataBoxReader.virtuals_cache`
+    /// is one object; each `_prepare` / `consume_boxes` call attaches the
+    /// allocator it was given.
+    pub fn attach_executing(
+        &mut self,
+        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
+        fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
+    ) {
+        self.executing = allocator.map(allocator_ptr);
+        if allocator.is_some() && self.fail_values.is_empty() && !fail_values.is_empty() {
+            self.fail_values = fail_values.to_vec();
+            self.fail_ref_roots = fail_values
+                .iter()
+                .enumerate()
+                .map(|(i, &bits)| match fail_types.get(i) {
+                    Some(majit_ir::Type::Ref) => bits,
+                    _ => 0,
+                })
+                .collect();
+            if !self.fail_ref_roots.is_empty() {
+                // SAFETY: `fail_ref_roots` is never resized after this push;
+                // `Drop` pops to `roots_depth`.
+                unsafe {
+                    majit_gc::shadow_stack::push_resume_ref_roots(&mut self.fail_ref_roots);
+                }
+            }
+        }
+        if allocator.is_some()
+            && self.concrete_roots.len() != self.virtuals_ptr_cache.len()
+            && !self.virtuals_ptr_cache.is_empty()
+        {
+            self.concrete_roots = vec![0i64; self.virtuals_ptr_cache.len()];
+            // SAFETY: same as `executing()`: fixed address, unregistered in `Drop`.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut self.concrete_roots);
+            }
+        }
+    }
+
+    /// Clear the applying half before the cache is parked on `TraceCtx`.
+    pub fn detach_executing(&mut self) {
+        self.executing = None;
     }
 
     /// The guard's fail values, for resolving a TAGBOX operand's concrete.
-    fn fail_values(&self) -> &'a [i64] {
-        self.fail_values
+    fn fail_values(&self) -> &[i64] {
+        &self.fail_values
     }
 
     /// The address a ref failarg currently lives at, read back through the
@@ -293,6 +356,39 @@ impl<'a> BridgeVirtualCache<'a> {
     }
 }
 
+/// resume.py `ResumeDataBoxReader.virtuals_cache`: one cache created in
+/// `_prepare_virtuals` and reused by `_prepare_pendingfields` and
+/// `consume_boxes`. `getvirtual_ptr` fills a hole lazily.
+pub fn take_or_new_virtuals_cache(
+    ctx: &mut crate::TraceCtx,
+    size: usize,
+    mint_raw_array_descr: fn(
+        usize,
+        usize,
+        Option<usize>,
+        majit_ir::Type,
+        bool,
+    ) -> majit_ir::DescrRef,
+    executing: Option<&dyn crate::resume::BlackholeAllocator>,
+    fail_values: &[i64],
+    fail_types: &[majit_ir::Type],
+) -> BridgeVirtualCache {
+    let mut cache = ctx
+        .take_bridge_virtuals_cache()
+        .unwrap_or_else(|| match executing {
+            Some(allocator) => BridgeVirtualCache::executing(
+                size,
+                mint_raw_array_descr,
+                allocator,
+                fail_values,
+                fail_types,
+            ),
+            None => BridgeVirtualCache::new(size, mint_raw_array_descr),
+        });
+    cache.attach_executing(executing, fail_values, fail_types);
+    cache
+}
+
 fn emit_stroruni_oopspec_call(
     ctx: &mut crate::TraceCtx,
     oopspec: majit_ir::effectinfo::OopSpecIndex,
@@ -346,7 +442,7 @@ pub fn decode_fieldnum(
     tagged: i16,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> OpRef {
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
     // resume.py `decode_box` dispatches purely on the tag bits;
@@ -447,7 +543,7 @@ pub fn decode_fieldnum(
 /// on the shadow the recording half already stamped.
 fn operand_concrete(
     ctx: &crate::TraceCtx,
-    cache: &BridgeVirtualCache<'_>,
+    cache: &BridgeVirtualCache,
     opref: OpRef,
 ) -> Option<majit_ir::Value> {
     // `decode_ref` reads a TAGBOX operand out of the deadframe and nothing
@@ -488,7 +584,7 @@ fn operand_concrete(
 /// the whole entry rather than carry on.
 fn apply_setfield(
     ctx: &crate::TraceCtx,
-    cache: &BridgeVirtualCache<'_>,
+    cache: &BridgeVirtualCache,
     allocator: &dyn crate::resume::BlackholeAllocator,
     struct_op: OpRef,
     value_op: OpRef,
@@ -525,7 +621,7 @@ fn apply_setfield(
 /// a `SETARRAYITEM_GC` could only blackhole.
 fn apply_setarrayitem(
     ctx: &crate::TraceCtx,
-    cache: &BridgeVirtualCache<'_>,
+    cache: &BridgeVirtualCache,
     allocator: &dyn crate::resume::BlackholeAllocator,
     array_op: OpRef,
     index: i32,
@@ -568,7 +664,7 @@ pub fn materialize_bridge_virtual(
     vidx: usize,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> OpRef {
     use majit_ir::OpCode;
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
@@ -577,13 +673,16 @@ pub fn materialize_bridge_virtual(
     // (ptr and int banks). This bridge helper is still OpRef-typed, so it
     // probes both banks before allocating.
     if let Some(cached) = cache.get_any(vidx) {
-        // The local cache already holds the box. Publish it so a later
-        // reader (`consume_boxes` after `setup_bridge_sym`) stores the
-        // same OpRef instead of allocating again.
+        // resume.py `getvirtual_ptr`: cache hit returns the box. Publish
+        // it so a later reader (`consume_boxes` after `_prepare`) stores
+        // the same OpRef. Do not allocate or setfields again.
         ctx.remember_bridge_virtual_op(vidx, cached);
         return cached;
     }
     if let Some(cached) = ctx.bridge_virtual_op(vidx) {
+        // Same `virtuals_cache` the first reader filled. `allocate()`
+        // already ran setfields; a second apply would SETFIELD a second
+        // `wrappeditems` array against the live object.
         cache.recall_op(vidx, cached);
         return cached;
     }
@@ -615,7 +714,7 @@ pub fn materialize_bridge_virtual(
         parent_descr: majit_ir::DescrRef,
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         resume_data: &crate::jit_state::ResumeDataResult,
-        cache: &mut BridgeVirtualCache<'_>,
+        cache: &mut BridgeVirtualCache,
     ) -> bool {
         // resume.py setfields — range(len(fielddescrs)), index
         // fieldnums[i]. The len-equality assert (resume.py) is in
@@ -1310,6 +1409,35 @@ pub fn materialize_bridge_virtual(
     }
 }
 
+/// `resume.py` `AbstractResumeDataReader.force_all_virtuals`.
+///
+/// `force_from_resumedata` (direct/executing reader) calls this after
+/// `_prepare` / `consume_vref_and_vable`. BoxReader `_prepare` does not:
+/// `_prepare_virtuals` builds the cache and `getvirtual_ptr` lazily
+/// `allocate()`s a hole on first TAGVIRTUAL / pending-field decode.
+/// A `None` hole (`RdVirtualInfo::Empty`) is skipped the way
+/// `if rd_virtual is not None` skips it; `getvirtual_ptr` is never
+/// called on that slot.
+pub fn force_all_bridge_virtuals(
+    ctx: &mut crate::TraceCtx,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &crate::jit_state::ResumeDataResult,
+    cache: &mut BridgeVirtualCache,
+) {
+    let Some(virtuals) = rd_virtuals else {
+        return;
+    };
+    if virtuals.is_empty() {
+        return;
+    }
+    for (vidx, entry) in virtuals.iter().enumerate() {
+        if matches!(entry.as_ref(), majit_ir::RdVirtualInfo::Empty) {
+            continue;
+        }
+        let _ = materialize_bridge_virtual(ctx, vidx, rd_virtuals, resume_data, cache);
+    }
+}
+
 /// resume.py `decode_box` symbolic parity for an already-decoded
 /// [`majit_ir::resumedata::RebuiltValue`]: mint the bridge `OpRef` (typed `InputArg` for a live box,
 /// const for a pooled const, recursively materialized virtual for a virtual).
@@ -1318,7 +1446,7 @@ pub fn rebuilt_value_to_opref(
     v: &majit_ir::resumedata::RebuiltValue,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> OpRef {
     use majit_ir::resumedata::RebuiltValue;
     match v {
@@ -1345,7 +1473,7 @@ pub fn emit_pending_field_op(
     value_op: OpRef,
     item_index: i32,
     descr: &majit_ir::DescrRef,
-    cache: &BridgeVirtualCache<'_>,
+    cache: &BridgeVirtualCache,
 ) -> bool {
     use majit_ir::OpCode;
     if item_index < 0 {
@@ -1412,7 +1540,7 @@ pub fn replay_pending_fields(
     ctx: &mut crate::TraceCtx,
     resume_data: &crate::jit_state::ResumeDataResult,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> bool {
     let __diag = crate::bridge_diag_enabled();
     let Some(storage) = resume_data.storage.as_ref() else {
@@ -1526,7 +1654,7 @@ pub fn seed_bridge_virtualizable_boxes(
     info: &std::sync::Arc<crate::virtualizable::VirtualizableInfo>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
     fail_values: &[i64],
 ) -> bool {
     use majit_ir::resumedata::RebuiltValue;
@@ -1747,6 +1875,28 @@ mod tests {
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1080)));
         assert_eq!(cache.get_concrete_ptr(1), Some(majit_ir::GcRef(0x2080)));
         assert_eq!(cache.get_concrete_int(0), None);
+    }
+
+    /// `force_all_virtuals` skips `rd_virtual is not None` holes. A
+    /// TAGVIRTUAL never names those slots; looping every index and calling
+    /// `getvirtual_ptr` on `Empty` panics the way `None.allocate` would.
+    #[test]
+    fn force_all_bridge_virtuals_skips_empty_holes() {
+        let mut ctx = crate::TraceCtx::for_test(0);
+        let resume_data = empty_resume_data(Vec::new());
+        let virtuals = vec![
+            std::rc::Rc::new(majit_ir::RdVirtualInfo::Empty),
+            std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawSliceInfo {
+                offset: 7,
+                fieldnums: vec![tag_int(5)],
+            }),
+            std::rc::Rc::new(majit_ir::RdVirtualInfo::Empty),
+        ];
+        let mut cache = BridgeVirtualCache::new(virtuals.len(), default_bridge_array_descr);
+        force_all_bridge_virtuals(&mut ctx, Some(&virtuals), &resume_data, &mut cache);
+        assert!(cache.get_any(0).is_none());
+        assert_eq!(cache.get_any(1), Some(OpRef::const_int(12)));
+        assert!(cache.get_any(2).is_none());
     }
 
     /// The funnel folds through the executor row, so the concrete this helper

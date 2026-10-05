@@ -1359,7 +1359,7 @@ impl BasicBlock {
 /// Cleanup blocks are reachable only through `on_unwind`, which the flow
 /// graph does not carry, so they are left out. Every `on_unwind` edge
 /// points at one terminal `UnwindResume` block.
-fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
+pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
     if !body.body.iter().any(|bb| bb.is_cleanup) {
         return body;
     }

@@ -1716,9 +1716,7 @@ mod tests {
 
         let mut frame = MIFrame::new(jitcode, 0);
         frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xdead_beef)));
-        frame.ref_values[0] = None;
         frame.ref_regs[1] = Some(OpRef::ref_op(7));
-        frame.ref_values[1] = None;
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(16, sd);
@@ -1729,7 +1727,6 @@ mod tests {
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
-            None,
         );
 
         let (length, consumed) =

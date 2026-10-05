@@ -2494,6 +2494,13 @@ impl<S: JitState> JitDriver<S> {
             .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
     }
 
+    /// Frames `start_bridge_tracing` already seated via
+    /// `rebuild_from_resumedata`. Zero means that rebuild has not run, so a
+    /// portal wrapper may still call it.
+    pub fn portal_framestack_len(&self) -> usize {
+        self.meta.framestack.frames.len()
+    }
+
     /// `MetaInterp::rebuild_portal_framestack_from_resumedata` with this
     /// driver's allocator, so a virtual the register rebuild materializes
     /// is allocated like one a frame value names.
@@ -11042,16 +11049,23 @@ impl<S: JitState> JitDriver<S> {
             self.last_bridge_is_exception_guard = false;
             return false;
         }
-        // resume.py:1050-1056 pushes a real MIFrame per encoded section and
-        // resumes in the INNERMOST one, which is what
-        // `bridge_from_guard_resume_position` rebuilds: every section becomes a
-        // frame with its own jitcode, its own resume pc and its own registers,
-        // and the callers underneath the guard get back the two fields the
-        // stream does not carry (their `BC_INLINE_CALL`'s result slot and the
-        // callee it named). `setup_bridge_sym` below still reads
-        // `frames.first()` alone, and that stays right: the state fields live
-        // on the root frame, and an inlined `#[jit_inline]` callee holds none
-        // of them.
+        // resume.py `ResumeDataBoxReader.__init__` parks storage, then
+        // `AbstractResumeDataReader._prepare` (`_prepare_virtuals` then
+        // `_prepare_pendingfields`) runs before `rebuild_from_resumedata`'s
+        // `newframe` / `consume_boxes`. `handle_guard_failure` already ran
+        // `create_history` (`start_retrace_from_guard` set `self.meta.tracing`).
+        // Park storage on that live ctx first; `prepare_bridge_resume` is
+        // `_prepare`; `rebuild_portal_framestack_from_resumedata` is
+        // `newframe` + `consume_boxes`; `setup_bridge_sym` fills the
+        // frontend after those frames exist.
+        if let Some(bfm) = resume_data_result.as_ref() {
+            let ctx = self
+                .meta
+                .tracing
+                .as_mut()
+                .expect("bridge: tracing context must be live after start_retrace_from_guard");
+            ctx.set_bridge_resume_data(bfm.clone());
+        }
         let mut sym = S::create_sym(&trace_meta, resume_pc);
         state.initialize_sym(&mut sym, &trace_meta);
         // `create_sym` numbers the state fields off its own `__offset`, which
@@ -11263,122 +11277,155 @@ impl<S: JitState> JitDriver<S> {
             // then a later field or box reads `fail_values[n]`). The caller
             // keeps this slice on a GC-visible holder for the whole call —
             // the deadframe, or `DeadFrameRefRoots` over the Ref slots.
-            // resume.py consume_boxes parity: decode the guard frame's
-            // per-bank live register indices here, where the dispatch JitCode
-            // + `liveness_info` are reachable, and stash them on the trace ctx.
-            // A JitDriver `setup_bridge_sym` (static, metainterp-blind) reads
-            // them back to map each decoded frame value to its sym slot. The
-            // macro mainloop bridge is single-frame, so the root frame's
-            // dispatch JitCode is the only coordinate needed.
+            // `resume.py` `rebuild_from_resumedata` walks every encoded
+            // section: `read_jitcode_pos_pc` then `newframe(jitcode)` then
+            // `consume_boxes` with that frame's `get_current_position_info`.
+            // Decode each section's live register indices here, where the
+            // jitcode table + `liveness_info` are reachable, and stash them
+            // on the trace ctx. A JitDriver `setup_bridge_sym` (static,
+            // metainterp-blind) reads the root banks back to map each
+            // decoded frame value to its sym slot.
             //
             // The frame's `pc` word is a position in the frame's OWN
-            // jitcode (`resume.py` `rebuild_from_resumedata` pairs each
-            // section's `jitcode_pos` with its `pc`; `consume_boxes` reads
-            // the live set from that jitcode). A frame resumed inside a
-            // runtime-registered jitcode carries a pc the portal jitcode
-            // cannot decode, and reading it there yields empty banks: every
-            // register of that frame then resumes unset. The dispatch
-            // jitcode is only the fallback for a section without an index.
+            // jitcode. A frame resumed inside a runtime-registered jitcode
+            // carries a pc the portal jitcode cannot decode, and reading it
+            // there yields empty banks: every register of that frame then
+            // resumes unset. The dispatch jitcode is only the fallback for
+            // a section without an index.
             let bridge_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
-            let bridge_reg_indices = bfm.frames.first().and_then(|frame| {
-                let Ok(pc) = usize::try_from(frame.pc) else {
-                    return Some(crate::resume::FrameLivenessRegIndices::default());
-                };
-                let jc = usize::try_from(frame.jitcode_index)
-                    .ok()
-                    .and_then(|pos| {
-                        S::resolve_resume_jitcode(pos)
-                            .or_else(|| self.meta.staticdata.jitcodes.get(pos).cloned())
-                    })
-                    .or_else(|| self.dispatch_jitcode().cloned())?;
-                Some(crate::resume::read_frame_liveness_reg_indices(
-                    &jc,
-                    pc,
-                    self.meta.staticdata.op_live as u8,
-                    &bridge_liveness,
-                ))
-            });
+            let bridge_section_reg_indices = crate::resume::read_resume_sections_liveness(
+                &bfm.frames,
+                |pos| {
+                    S::resolve_resume_jitcode(pos)
+                        .or_else(|| self.meta.staticdata.jitcodes.get(pos).cloned())
+                },
+                self.dispatch_jitcode(),
+                self.meta.staticdata.op_live as u8,
+                &bridge_liveness,
+            );
             // Both `self.sym` (set above via `self.sym = Some(sym)`) and
             // `self.meta.tracing` (set by `start_retrace_from_guard`) must be
             // live by construction at this point. Skipping `setup_bridge_sym`
             // silently would leave the bridge sym uninitialized.
-            let sym = self
-                .sym
-                .as_mut()
-                .expect("bridge: sym must be live after S::create_sym");
-            // `Send` is the driver's storage bound, not the reader's, so drop
-            // it here rather than push it onto the `JitState` contract.
-            let replay_allocator: Option<&dyn crate::resume::BlackholeAllocator> = if execute_replay
             {
-                self.blackhole_allocator
-                    .as_deref()
-                    .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
-            } else {
-                None
-            };
-            let ctx = self
-                .meta
-                .tracing
-                .as_mut()
-                .expect("bridge: tracing context must be live");
-            if let Some(idx) = bridge_reg_indices {
-                ctx.set_bridge_reg_indices(idx);
+                let replay_allocator: Option<&dyn crate::resume::BlackholeAllocator> =
+                    if execute_replay {
+                        self.blackhole_allocator
+                            .as_deref()
+                            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
+                    } else {
+                        None
+                    };
+                let ctx = self
+                    .meta
+                    .tracing
+                    .as_mut()
+                    .expect("bridge: tracing context must be live");
+                if let Some(idx) = bridge_section_reg_indices.first() {
+                    ctx.set_bridge_reg_indices(idx.clone());
+                }
+                ctx.set_bridge_section_reg_indices(bridge_section_reg_indices);
+                // An entry that asked to apply and has no allocator to apply
+                // through cannot fall back to recording only: nothing else will
+                // write this guard's deferred stores.
+                if execute_replay
+                    && replay_allocator.is_none()
+                    && retrace.storage.as_deref().is_some_and(|storage| {
+                        !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
+                    })
+                {
+                    ctx.mark_bridge_replay_incomplete();
+                }
+                let sym = self
+                    .sym
+                    .as_mut()
+                    .expect("bridge: sym must be live after S::create_sym");
+                S::prepare_bridge_resume(
+                    sym,
+                    ctx,
+                    bfm,
+                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    replay_allocator,
+                );
             }
-            // `consume_boxes` runs after this function returns and still
-            // has to `getvirtual_ptr` into the rebuilt `MIFrame` registers.
-            ctx.set_bridge_resume_data(bfm.clone());
-            // An entry that asked to apply and has no allocator to apply
-            // through cannot fall back to recording only: nothing else will
-            // write this guard's deferred stores.
-            //
-            // Only where there are any. `ResumeDataBoxReader` allocates and
-            // stores for the virtuals and the pending fields the stream
-            // carries and for nothing else, so a guard carrying neither asks
-            // the allocator for nothing and is served whether one exists or
-            // not.
-            if execute_replay
-                && replay_allocator.is_none()
-                && retrace.storage.as_deref().is_some_and(|storage| {
-                    !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
-                })
-            {
-                ctx.mark_bridge_replay_incomplete();
-            }
-            S::setup_bridge_sym(
-                sym,
-                ctx,
-                bfm,
-                retrace.storage.as_deref().map(|s| s.rd_virtuals()),
-                frontend_fail_values,
-                &retrace.fail_types,
-                replay_allocator,
-            );
-            // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail: the
-            // call above is `rebuild_from_resumedata`, which leaves the
-            // virtualizable described by the trace's boxes and by nothing
-            // else — the object itself still holds whatever the compiled
-            // loop last spilled into it. Upstream closes the same routine
-            // by writing those boxes back, and an entry that asked to apply
-            // is the entry upstream reaches it from: no blackhole ran ahead
-            // of it, so no one else has written them.
-            //
-            // Assembler (virtualizable.py case 4) into tracing (case 2).
-            // CALL_MAY_FORCE left `vable_token` as the jitframe; a later
-            // non-GUARD_NOT_FORCED exit does not force. Reset to TOKEN_NONE
-            // before the first residual, which asserts that.
-            // The other site is resume.py `consume_vable_info`
-            // (`seed_bridge_virtualizable_boxes`).
-            if let Some((info, ptr)) = &live_vable
-                && info.has_vable_token()
-            {
-                unsafe {
-                    if info.is_token_nonnull_gcref(*ptr) {
-                        info.reset_token_gcref(*ptr as *mut u8);
-                    }
+            // resume.py `rebuild_from_resumedata`: `newframe(jitcode)` per
+            // encoded section then `consume_boxes`. `setup_bridge_sym` is
+            // `rebuild_state_after_failure`'s vable / pending / register
+            // fill and runs after those frames exist, matching
+            // `synchronize_virtualizable` after the newframe loop.
+            if let Some(mainjitcode) = self.dispatch_jitcode().cloned() {
+                let materialized: Vec<Option<std::sync::Arc<crate::jitcode::JitCode>>> = bfm
+                    .frames
+                    .iter()
+                    .map(|section| {
+                        usize::try_from(section.jitcode_index).ok().and_then(|pos| {
+                            S::resolve_resume_jitcode(pos)
+                                .or_else(|| self.meta.staticdata.jitcodes.get(pos).cloned())
+                        })
+                    })
+                    .collect();
+                let liveness = self.meta.staticdata.liveness_info.snapshot_arc();
+                let op_live = self.meta.staticdata.op_live as u8;
+                if !self.rebuild_portal_framestack_from_resumedata(
+                    mainjitcode,
+                    &bfm.frames,
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    &materialized,
+                    liveness.as_ref(),
+                    op_live,
+                ) {
+                    self.meta.stage_abort_reason(AbortReason::Bridge.as_int());
+                    self.meta.abort_trace(false);
+                    self.clear_tracing_session_state();
+                    self.resume_data_result = None;
+                    self.last_bridge_is_exception_guard = false;
+                    return false;
                 }
             }
-            if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
-                ctx.synchronize_virtualizable_after_guard_failure();
+            {
+                let sym = self
+                    .sym
+                    .as_mut()
+                    .expect("bridge: sym must be live after S::create_sym");
+                let replay_allocator: Option<&dyn crate::resume::BlackholeAllocator> =
+                    if execute_replay {
+                        self.blackhole_allocator
+                            .as_deref()
+                            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
+                    } else {
+                        None
+                    };
+                let ctx = self
+                    .meta
+                    .tracing
+                    .as_mut()
+                    .expect("bridge: tracing context must be live");
+                S::setup_bridge_sym(
+                    sym,
+                    ctx,
+                    bfm,
+                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    replay_allocator,
+                );
+                // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail.
+                // Assembler (virtualizable.py case 4) into tracing (case 2).
+                if let Some((info, ptr)) = &live_vable
+                    && info.has_vable_token()
+                {
+                    unsafe {
+                        if info.is_token_nonnull_gcref(*ptr) {
+                            info.reset_token_gcref(*ptr as *mut u8);
+                        }
+                    }
+                }
+                if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
+                    ctx.synchronize_virtualizable_after_guard_failure();
+                }
             }
         }
         self.meta.begin_trace_session(trace_meta);
@@ -14367,6 +14414,183 @@ mod tests {
                 .and_then(|ctx| ctx.driver_descriptor())
                 .and_then(|descriptor| descriptor.index),
             Some(source_driver),
+        );
+    }
+
+    #[test]
+    fn setup_bridge_sym_runs_after_rebuild_seats_frames() {
+        // `rebuild_state_after_failure` runs `newframe` / `consume_boxes`
+        // then `synchronize_virtualizable`. `setup_bridge_sym` fills the
+        // frontend after those frames exist.
+        use std::cell::Cell;
+
+        use majit_ir::resumedata::RebuiltFrame;
+        use majit_jitcode::insns::BC_LIVE;
+        use majit_jitcode::jitcode::JitCodeBody;
+
+        thread_local! {
+            static FRAMESTACK_LEN_AT_PREPARE: Cell<Option<usize>> = const { Cell::new(None) };
+            static FRAMESTACK_LEN_AT_SETUP: Cell<Option<usize>> = const { Cell::new(None) };
+            static META_PTR: Cell<*const crate::pyjitpl::MetaInterp<()>> =
+                const { Cell::new(std::ptr::null()) };
+        }
+
+        struct MetaPtrReset;
+        impl Drop for MetaPtrReset {
+            fn drop(&mut self) {
+                META_PTR.with(|p| p.set(std::ptr::null()));
+            }
+        }
+
+        struct BridgePendingOrderState;
+        impl JitState for BridgePendingOrderState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+            fn build_meta(&self, _: usize, _: &()) {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                vec![0]
+            }
+            fn create_sym(_: &(), _: usize) {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                vec![]
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn rebuild_from_resumedata(
+                _: &mut (),
+                fail_arg_types: &[Type],
+                storage: Option<&Arc<crate::resume::ResumeStorage>>,
+            ) -> Option<crate::ResumeDataResult> {
+                assert!(fail_arg_types.is_empty());
+                Some(crate::ResumeDataResult {
+                    frames: vec![RebuiltFrame {
+                        jitcode_index: 0,
+                        pc: 0,
+                        values: vec![],
+                    }],
+                    virtualizable_values: vec![],
+                    virtualref_values: vec![],
+                    storage: storage.cloned(),
+                    num_failargs: 0,
+                    fail_arg_types: vec![],
+                })
+            }
+            fn prepare_bridge_resume(
+                _: &mut (),
+                _: &mut crate::TraceCtx,
+                _: &crate::ResumeDataResult,
+                _: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                _: &[i64],
+                _: &[Type],
+                _: Option<&dyn crate::resume::BlackholeAllocator>,
+            ) {
+                FRAMESTACK_LEN_AT_PREPARE.with(|c| {
+                    c.set(META_PTR.with(|p| {
+                        let ptr = p.get();
+                        if ptr.is_null() {
+                            None
+                        } else {
+                            Some(unsafe { &*ptr }.framestack.frames.len())
+                        }
+                    }))
+                });
+            }
+            fn setup_bridge_sym(
+                _: &mut (),
+                _: &mut crate::TraceCtx,
+                _: &crate::ResumeDataResult,
+                _: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                _: &[i64],
+                _: &[Type],
+                _: Option<&dyn crate::resume::BlackholeAllocator>,
+            ) {
+                FRAMESTACK_LEN_AT_SETUP.with(|c| {
+                    c.set(META_PTR.with(|p| {
+                        let ptr = p.get();
+                        if ptr.is_null() {
+                            None
+                        } else {
+                            Some(unsafe { &*ptr }.framestack.frames.len())
+                        }
+                    }))
+                });
+            }
+        }
+
+        FRAMESTACK_LEN_AT_PREPARE.with(|c| c.set(None));
+        FRAMESTACK_LEN_AT_SETUP.with(|c| c.set(None));
+        let mut driver = JitDriver::<BridgePendingOrderState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.register_descriptor(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+
+        let jc = crate::jitcode::JitCode::new("bridge-pending-order");
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0, 0],
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        let jitcode = std::sync::Arc::new(jc);
+        {
+            let sd = std::sync::Arc::get_mut(&mut driver.meta.staticdata)
+                .expect("staticdata uniquely owned before tracing");
+            sd.op_live = i32::from(BC_LIVE);
+            sd.jitcodes.push(jitcode.clone());
+        }
+        driver.install_extracted_portal_jitcode(jitcode);
+
+        let green_key = 407u64;
+        assert!(matches!(
+            driver
+                .meta
+                .force_start_tracing(green_key, (0, 0), None, &[Value::Int(0)]),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().unwrap();
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(guard, &[]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let failure = driver
+            .meta
+            .run_compiled_detailed(green_key, &[0])
+            .expect("guard should fail");
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
+        let descr = failure.descr_arc.clone().unwrap();
+        drop(failure);
+
+        META_PTR.with(|p| p.set(&driver.meta as *const _));
+        let _reset = MetaPtrReset;
+        let mut state = BridgePendingOrderState;
+        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false));
+        assert_eq!(
+            FRAMESTACK_LEN_AT_PREPARE.with(|c| c.get()),
+            Some(0),
+            "_prepare runs while framestack is empty"
+        );
+        assert_eq!(
+            FRAMESTACK_LEN_AT_SETUP.with(|c| c.get()),
+            Some(1),
+            "setup_bridge_sym runs after rebuild_from_resumedata seats frames"
+        );
+        assert_eq!(
+            driver.meta.framestack.frames.len(),
+            1,
+            "rebuild_portal_framestack_from_resumedata seats frames before setup_bridge_sym"
+        );
+        assert_eq!(
+            driver.portal_framestack_len(),
+            1,
+            "call_jit skips a second rebuild_from_resumedata when frames are already seated"
         );
     }
 

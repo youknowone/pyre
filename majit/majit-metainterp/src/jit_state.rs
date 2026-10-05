@@ -482,6 +482,21 @@ pub trait JitState: Sized {
     /// for an entry no direct reader preceded. `None` records only, which is
     /// sound exactly when a direct reader has already applied this guard's
     /// writes.
+    /// resume.py `AbstractResumeDataReader._prepare` (`_prepare_virtuals`
+    /// then `_prepare_pendingfields`). Runs before `newframe` /
+    /// `consume_boxes`. The default is a no-op; production fills virtuals
+    /// so `getvirtual_ptr` during consume stores the same box.
+    fn prepare_bridge_resume(
+        _sym: &mut Self::Sym,
+        _ctx: &mut crate::trace_ctx::TraceCtx,
+        _resume_data: &ResumeDataResult,
+        _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+        _fail_values: &[i64],
+        _fail_types: &[Type],
+        _executing: Option<&dyn crate::resume::BlackholeAllocator>,
+    ) {
+    }
+
     fn setup_bridge_sym(
         _sym: &mut Self::Sym,
         _ctx: &mut crate::trace_ctx::TraceCtx,

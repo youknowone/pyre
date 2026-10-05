@@ -5569,6 +5569,63 @@ mod tests {
             );
         }
 
+        /// `blackhole.py` has no `bhimpl_call_assembler`. Recursive portal
+        /// calls emit `BC_RECURSIVE_CALL_*`; bytes 50-53 stay reserved for
+        /// tracing `opimpl_call_assembler_*` and remain unwired here.
+        #[test]
+        fn production_bh_builder_leaves_call_assembler_unwired() {
+            use majit_jitcode::insns;
+            let builder =
+                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for byte in [
+                insns::BC_CALL_ASSEMBLER_INT,
+                insns::BC_CALL_ASSEMBLER_REF,
+                insns::BC_CALL_ASSEMBLER_FLOAT,
+                insns::BC_CALL_ASSEMBLER_VOID,
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_eq!(
+                    slot as usize, placeholder as usize,
+                    "byte {byte} is wired in the production builder",
+                );
+            }
+        }
+
+        /// Leftover `cond_call_*_ext` / `record_known_result_*_ext` stay
+        /// unwired. Canonical `bhimpl_conditional_call_ir_v` /
+        /// `bhimpl_conditional_call_value_ir_{i,r}` /
+        /// pass-bodied `bhimpl_record_known_result_{i,r}_ir_v` bind the
+        /// canonical bytes; leftover 79-83 stay reserved for tracing
+        /// `opimpl_cond_call_void`.
+        #[test]
+        fn production_bh_builder_leaves_cond_call_ext_unwired() {
+            use majit_jitcode::insns;
+            let builder =
+                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for byte in [
+                insns::BC_COND_CALL_VOID,
+                insns::BC_COND_CALL_VALUE_INT,
+                insns::BC_COND_CALL_VALUE_REF,
+                insns::BC_RECORD_KNOWN_RESULT_INT,
+                insns::BC_RECORD_KNOWN_RESULT_REF,
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_eq!(
+                    slot as usize, placeholder as usize,
+                    "byte {byte} is wired in the production builder",
+                );
+            }
+            let canonical = builder.dispatch_table[insns::BC_CONDITIONAL_CALL_IR_V as usize];
+            assert_ne!(
+                canonical as usize,
+                placeholder as usize,
+                "`conditional_call_ir_v/iiIRd` (byte {}) is unwired in the production builder",
+                insns::BC_CONDITIONAL_CALL_IR_V,
+            );
+        }
+
         /// `complex` arithmetic reaches the three interior-field loads in
         /// generated helper JitCodes.  They already have orthodox
         /// `bhimpl_getinteriorfield_gc_*` handlers; the production builder must
@@ -10508,10 +10565,8 @@ fn handler_residual_call_r_v(
 /// the production producers (`pyjitpl/dispatch.rs`, `majit-macros`
 /// DSL lowerer, `pyre-jit/src/jit/assembler.rs`) can emit: byte-
 /// identical canonical keys, single-byte register operands,
-/// audited residual_call / vable / state-field families, the pyre
-/// nested inline-call handler, and the `_ext/P` adapters for
-/// `BC_CALL_ASSEMBLER_*`, `BC_COND_CALL_*`, and
-/// `BC_RECORD_KNOWN_RESULT_*` (P10).  The dispatch loop has no legacy
+/// audited residual_call / vable / state-field families, and the pyre
+/// nested inline-call handler.  The dispatch loop has no legacy
 /// fallback; any emitted byte missing from this table reaches
 /// `dispatch_step`'s unwired-opcode panic.
 ///
@@ -10539,50 +10594,13 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "inline_call_nested_ext/P".to_string(),
         majit_jitcode::insns::BC_INLINE_CALL,
     );
-    // Leftover `_ext/P` adapters. Jitcode no longer emits CALL_ASSEMBLER;
-    // the keys stay so a leftover byte still reaches `wire_handler`.
-    // cond/record emit the canonical keys registered below; these ext
-    // keys remain for leftover payloads.
-    for (key, byte) in [
-        (
-            "call_assembler_int_ext/P",
-            majit_jitcode::insns::BC_CALL_ASSEMBLER_INT,
-        ),
-        (
-            "call_assembler_ref_ext/P",
-            majit_jitcode::insns::BC_CALL_ASSEMBLER_REF,
-        ),
-        (
-            "call_assembler_float_ext/P",
-            majit_jitcode::insns::BC_CALL_ASSEMBLER_FLOAT,
-        ),
-        (
-            "call_assembler_void_ext/P",
-            majit_jitcode::insns::BC_CALL_ASSEMBLER_VOID,
-        ),
-        (
-            "cond_call_void_ext/P",
-            majit_jitcode::insns::BC_COND_CALL_VOID,
-        ),
-        (
-            "cond_call_value_int_ext/P",
-            majit_jitcode::insns::BC_COND_CALL_VALUE_INT,
-        ),
-        (
-            "cond_call_value_ref_ext/P",
-            majit_jitcode::insns::BC_COND_CALL_VALUE_REF,
-        ),
-        (
-            "record_known_result_int_ext/P",
-            majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_INT,
-        ),
-        (
-            "record_known_result_ref_ext/P",
-            majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_REF,
-        ),
-    ] {
-        insns.insert(key.to_string(), byte);
-    }
+    // Leftover `_ext/P` adapters. `blackhole.py` has no
+    // `bhimpl_call_assembler`; recursive portal calls emit
+    // `BC_RECURSIVE_CALL_*` and bytes 50-53 stay unwired.
+    // Canonical `conditional_call_*` / `record_known_result_*` keys
+    // are registered below; leftover `cond_call_*_ext/P` /
+    // `record_known_result_*_ext/P` bytes stay unwired.
+    //
     // Five canonical keys whose `JitCodeBuilder` emit-side payload
     // matches the wired `bhimpl_*` handler byte-for-byte.  The rest of
     // the builder registers audited pyre families below; any byte absent
@@ -12097,27 +12115,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // pyre's nested-bytecode payload, distinct from the canonical
     // `dR`/`dIR`/`dIRF` arglists.
     builder.wire_handler("inline_call_nested_ext/P", handler_inline_call_nested_ext);
-    // Jitcode no longer emits CALL_ASSEMBLER; keep the handlers wired so a
-    // leftover byte still decodes. cond_call / record_known_result emit
-    // the canonical keys; ext handlers remain for leftover payloads.
-    builder.wire_handler("call_assembler_int_ext/P", handler_call_assembler_int_ext);
-    builder.wire_handler("call_assembler_ref_ext/P", handler_call_assembler_ref_ext);
-    builder.wire_handler(
-        "call_assembler_float_ext/P",
-        handler_call_assembler_float_ext,
-    );
-    builder.wire_handler("call_assembler_void_ext/P", handler_call_assembler_void_ext);
-    builder.wire_handler("cond_call_void_ext/P", handler_cond_call_void_ext);
-    builder.wire_handler("cond_call_value_int_ext/P", handler_cond_call_value_int_ext);
-    builder.wire_handler("cond_call_value_ref_ext/P", handler_cond_call_value_ref_ext);
-    builder.wire_handler(
-        "record_known_result_int_ext/P",
-        handler_record_known_result_int_ext,
-    );
-    builder.wire_handler(
-        "record_known_result_ref_ext/P",
-        handler_record_known_result_ref_ext,
-    );
 
     // Recursive call
     // RPython `rpython/jit/metainterp/blackhole.py:1101-1132`:
@@ -14188,380 +14185,6 @@ fn handler_inline_call_r_v(
     bh.bhimpl_inline_call_r_v(fnaddr, &ar, calldescr.get());
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
-}
-
-/// Leftover `BC_CALL_ASSEMBLER_*` resume.
-///
-/// Payload (`JitCodeBuilder::call_assembler_*_like`):
-///   typed: `[target_idx: u16, dst: u8, num_args: u16, (kind: u8, reg: u8) × num_args]`
-///   void:  `[target_idx: u16, num_args: u16, (kind: u8, reg: u8) × num_args]`
-/// RPython has no `bhimpl_call_assembler_*`. Resume still goes through
-/// `cpu.bh_call_*` the way leftover `cond_call_*_ext` and
-/// `bhimpl_residual_call_*` do: split mixed kind/reg pairs into I/R/F
-/// and build a `BhCallDescr` from the target's `effect_info_slot`.
-/// Float leftover wrappers return packed i64 bits, so that arm uses
-/// `bh_call_i` not `bh_call_f`.
-fn read_call_assembler_irf(
-    bh: &BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-    num_args: usize,
-) -> (Vec<i64>, Vec<i64>, Vec<i64>, String, usize) {
-    let mut p = p;
-    let mut args_i = Vec::new();
-    let mut args_r = Vec::new();
-    let mut args_f = Vec::new();
-    let mut arg_classes = String::with_capacity(num_args);
-    for _ in 0..num_args {
-        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_reg(code, &mut p);
-        let val = bh.read_call_arg(kind, reg as u16);
-        match kind {
-            JitArgKind::Int => {
-                args_i.push(val);
-                arg_classes.push('i');
-            }
-            JitArgKind::Ref => {
-                args_r.push(val);
-                arg_classes.push('r');
-            }
-            JitArgKind::Float => {
-                args_f.push(val);
-                arg_classes.push('f');
-            }
-        }
-    }
-    (args_i, args_r, args_f, arg_classes, p)
-}
-
-fn leftover_call_assembler_target(
-    bh: &mut BlackholeInterpreter,
-    fn_ptr_idx: usize,
-) -> Result<(crate::jitcode::JitCallTarget, i64), DispatchError> {
-    let target = *bh.jitcode.call_target(fn_ptr_idx);
-    let func = target.concrete_ptr as usize as i64;
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
-    Ok((target, func))
-}
-
-fn handler_call_assembler_int_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let dst = jitcode::read_reg(code, &mut p) as usize;
-    let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
-    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
-    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Int);
-    bh.last_exc().set(0);
-    let result = bh.cpu().bh_call_i(
-        func,
-        Some(&args_i),
-        Some(&args_r),
-        leftover_cond_call_args_f(&args_f),
-        &calldescr,
-    );
-    check_residual_call_exception_after(bh, p)?;
-    bh.registers_i[dst] = result;
-    Ok(p)
-}
-
-fn handler_call_assembler_ref_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let dst = jitcode::read_reg(code, &mut p) as usize;
-    let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
-    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
-    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Ref);
-    bh.last_exc().set(0);
-    let result = bh
-        .cpu()
-        .bh_call_r(
-            func,
-            Some(&args_i),
-            Some(&args_r),
-            leftover_cond_call_args_f(&args_f),
-            &calldescr,
-        )
-        .0 as i64;
-    check_residual_call_exception_after(bh, p)?;
-    bh.registers_r[dst] = result;
-    Ok(p)
-}
-
-fn handler_call_assembler_float_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let dst = jitcode::read_reg(code, &mut p) as usize;
-    let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
-    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
-    // Leftover wrappers return packed i64 bits (`f64::to_bits`).
-    // `bh_call_f` would use the float ABI and break that convention.
-    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Int);
-    bh.last_exc().set(0);
-    let result = bh.cpu().bh_call_i(
-        func,
-        Some(&args_i),
-        Some(&args_r),
-        leftover_cond_call_args_f(&args_f),
-        &calldescr,
-    );
-    check_residual_call_exception_after(bh, p)?;
-    bh.registers_f[dst] = result;
-    Ok(p)
-}
-
-fn handler_call_assembler_void_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
-    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
-    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Void);
-    bh.last_exc().set(0);
-    bh.cpu().bh_call_v(
-        func,
-        Some(&args_i),
-        Some(&args_r),
-        leftover_cond_call_args_f(&args_f),
-        &calldescr,
-    );
-    check_residual_call_exception_after(bh, p)?;
-    Ok(p)
-}
-
-/// TODO: pyre `cond_call` / `record_known_result`
-/// adapters.
-///
-/// `JitCodeBuilder` now emits the canonical `iiIRd` / `riIRd` layout.
-/// The `_ext` handlers below remain for any leftover `call_cond_like`
-/// payload:
-///   `cond_call_*`:    `[first_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8]`
-///   `cond_call_value`: `[value_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8, dst: u8]`
-///   `record_known_result_*`: same shape as `cond_call_*` (no dst).
-///
-/// Producers: `majit-macros/src/jit_interp/jitcode_lower`,
-/// `pyre/pyre-jit/src/jit/assembler.rs`.
-///
-/// Semantics mirror `blackhole.py:1257-1278 bhimpl_conditional_call_*`
-/// and `blackhole.py:620-628 bhimpl_record_known_result_*`:
-///   - `cond_call_void`: if `first_reg != 0`, `cpu.bh_call_v(func, args)`;
-///     no dst.
-///   - `cond_call_value_{i,r}`: if `first_reg == 0`, dst = result of
-///     `cpu.bh_call_{i,r}(func, args)`; else dst = first_reg's value.
-///   - `record_known_result_{i,r}`: pure marker, body is `pass`.
-/// Leftover `call_cond_like` payload has no `d` descr byte. Split the
-/// mixed kind/reg lists into I/R/F the way `bhimpl_conditional_call_*`
-/// takes `args_i` / `args_r`, then build a `BhCallDescr` from the
-/// target's `effect_info_slot` so resume goes through `cpu.bh_call_*`.
-fn read_cond_call_irf(
-    bh: &BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-    arg_count: usize,
-) -> (Vec<i64>, Vec<i64>, Vec<i64>, String, usize) {
-    let kinds_start = p;
-    let regs_start = kinds_start + arg_count;
-    let mut args_i = Vec::new();
-    let mut args_r = Vec::new();
-    let mut args_f = Vec::new();
-    let mut arg_classes = String::with_capacity(arg_count);
-    for i in 0..arg_count {
-        let kind = JitArgKind::decode(code[kinds_start + i]);
-        let reg = code[regs_start + i];
-        let val = bh.read_call_arg(kind, reg as u16);
-        match kind {
-            JitArgKind::Int => {
-                args_i.push(val);
-                arg_classes.push('i');
-            }
-            JitArgKind::Ref => {
-                args_r.push(val);
-                arg_classes.push('r');
-            }
-            JitArgKind::Float => {
-                args_f.push(val);
-                arg_classes.push('f');
-            }
-        }
-    }
-    (args_i, args_r, args_f, arg_classes, regs_start + arg_count)
-}
-
-fn leftover_cond_call_descr(
-    target: &crate::jitcode::JitCallTarget,
-    arg_classes: String,
-    result_type: majit_ir::Type,
-) -> majit_jitcode::jitcode::BhCallDescr {
-    majit_jitcode::jitcode::BhCallDescr::from_signature(
-        arg_classes,
-        result_type,
-        crate::call_descr::effect_info_for_slot(target.effect_info_slot),
-    )
-}
-
-fn leftover_cond_call_args_f(args_f: &[i64]) -> Option<&[i64]> {
-    if args_f.is_empty() {
-        None
-    } else {
-        Some(args_f)
-    }
-}
-
-fn handler_cond_call_void_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let cond_reg = jitcode::read_reg(code, &mut p) as usize;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let arg_count = jitcode::read_u8(code, &mut p) as usize;
-    let condition = bh.registers_i[cond_reg];
-    let (args_i, args_r, args_f, arg_classes, p_end) = read_cond_call_irf(bh, code, p, arg_count);
-    if condition != 0 {
-        let target = bh.jitcode.call_target(fn_ptr_idx);
-        let func = target.concrete_ptr as usize as i64;
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
-        let calldescr = leftover_cond_call_descr(target, arg_classes, majit_ir::Type::Void);
-        bh.last_exc().set(0);
-        // `blackhole.py bhimpl_conditional_call_ir_v` → `cpu.bh_call_v`.
-        bh.cpu().bh_call_v(
-            func,
-            Some(&args_i),
-            Some(&args_r),
-            leftover_cond_call_args_f(&args_f),
-            &calldescr,
-        );
-        check_residual_call_exception_after(bh, p_end)?;
-    }
-    Ok(p_end)
-}
-
-fn handler_cond_call_value_int_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let value_reg = jitcode::read_reg(code, &mut p) as usize;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let arg_count = jitcode::read_u8(code, &mut p) as usize;
-    let value = bh.registers_i[value_reg];
-    let (args_i, args_r, args_f, arg_classes, p_end) = read_cond_call_irf(bh, code, p, arg_count);
-    let dst = code[p_end] as usize;
-    let result = if value == 0 {
-        let target = bh.jitcode.call_target(fn_ptr_idx);
-        let func = target.concrete_ptr as usize as i64;
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
-        let calldescr = leftover_cond_call_descr(target, arg_classes, majit_ir::Type::Int);
-        bh.last_exc().set(0);
-        // `blackhole.py bhimpl_conditional_call_value_ir_i` → `cpu.bh_call_i`.
-        let r = bh.cpu().bh_call_i(
-            func,
-            Some(&args_i),
-            Some(&args_r),
-            leftover_cond_call_args_f(&args_f),
-            &calldescr,
-        );
-        check_residual_call_exception_after(bh, p_end + 1)?;
-        r
-    } else {
-        value
-    };
-    bh.registers_i[dst] = result;
-    Ok(p_end + 1)
-}
-
-fn handler_cond_call_value_ref_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    let value_reg = jitcode::read_reg(code, &mut p) as usize;
-    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
-    let arg_count = jitcode::read_u8(code, &mut p) as usize;
-    let value = bh.registers_r[value_reg];
-    let (args_i, args_r, args_f, arg_classes, p_end) = read_cond_call_irf(bh, code, p, arg_count);
-    let dst = code[p_end] as usize;
-    let result = if value == 0 {
-        let target = bh.jitcode.call_target(fn_ptr_idx);
-        let func = target.concrete_ptr as usize as i64;
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
-        let calldescr = leftover_cond_call_descr(target, arg_classes, majit_ir::Type::Ref);
-        bh.last_exc().set(0);
-        // `blackhole.py bhimpl_conditional_call_value_ir_r` → `cpu.bh_call_r`.
-        let r = bh
-            .cpu()
-            .bh_call_r(
-                func,
-                Some(&args_i),
-                Some(&args_r),
-                leftover_cond_call_args_f(&args_f),
-                &calldescr,
-            )
-            .0 as i64;
-        check_residual_call_exception_after(bh, p_end + 1)?;
-        r
-    } else {
-        value
-    };
-    bh.registers_r[dst] = result;
-    Ok(p_end + 1)
-}
-
-/// `bhimpl_record_known_result_*` body is `pass` — pure marker for
-/// the trace optimizer's known-result table.  Resume only advances
-/// past the operand bytes.
-fn handler_record_known_result_int_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let mut p = p;
-    // first_reg : u8 + fn_ptr_idx : u16
-    p += 3;
-    let arg_count = jitcode::read_u8(code, &mut p) as usize;
-    let _ = bh;
-    // kinds: arg_count × u8
-    p += arg_count;
-    // regs: arg_count × u8
-    p += arg_count;
-    Ok(p)
-}
-
-fn handler_record_known_result_ref_ext(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    handler_record_known_result_int_ext(bh, code, p)
 }
 
 /// TODO: pyre nested-bytecode `inline_call`.

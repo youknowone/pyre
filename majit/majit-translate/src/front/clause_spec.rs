@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use majit_charon_reader::ullbc::{Signature, TyRef};
+use majit_charon_reader::ullbc::{Signature, TyRef, strip_cleanup_blocks};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
@@ -269,9 +269,14 @@ pub(crate) fn substituted_unstructured(
         #[serde(rename = "Unstructured")]
         unstructured: Unstructured,
     }
+    // FunDecl::unstructured runs strip_cleanup_blocks before the template
+    // lowers. A spec copy deserializes substituted JSON and would keep
+    // rustc unwind cleanup, so the i64 instantiation of
+    // RDict::lookup_for_store never becomes a graph. getkind banks the
+    // substituted &i64 key as int (lltype.Ptr with _gckind == 'raw').
     serde_json::from_value::<Proj>(value)
         .ok()
-        .map(|proj| proj.unstructured)
+        .map(|proj| strip_cleanup_blocks(proj.unstructured))
 }
 
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
@@ -1722,6 +1727,56 @@ mod tests {
             .expect("switch arm const unresolved");
         assert_eq!(llbc.dedup_body(11), Some(&type_body));
         assert_eq!(llbc.dedup_const_body(11), Some(&const_body));
+    }
+
+    /// FunDecl::unstructured strips rustc unwind cleanup. A spec copy
+    /// that skipped that strip kept lookup_for_store's i64 body as
+    /// unwind cleanup and never built a graph.
+    #[test]
+    fn substituted_unstructured_strips_cleanup_blocks() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [{"index": 0, "name": null, "span": span, "ty": i64_ty}]
+                },
+                "body": [
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}, "is_cleanup": false},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}, "is_cleanup": true}
+                ]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["lookup_for_store", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": i64_ty},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let fd = llbc.fn_by_id(0).expect("lookup_for_store");
+        let copied =
+            substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
+        assert!(
+            copied.body.iter().all(|bb| !bb.is_cleanup),
+            "spec copy must strip cleanup the way FunDecl::unstructured does"
+        );
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {

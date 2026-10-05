@@ -5019,8 +5019,11 @@ impl<M: Clone> MetaInterp<M> {
             let threshold = self.warm_state.threshold();
             let mut proto = WarmEnterState::new(threshold);
             proto.copy_jit_params_from(&self.warm_state);
+            // rlib/rjitlog/rjitlog.py owns one JitLogger on the runner.
+            // Extra slots keep their own cells; structured stats stay on
+            // `self.warm_state`.
             self.extra_warm_states.resize_with(i + 1, || {
-                let mut ws = WarmEnterState::new(threshold);
+                let mut ws = WarmEnterState::with_jitlog(threshold, None);
                 ws.copy_jit_params_from(&proto);
                 ws
             });
@@ -5045,7 +5048,7 @@ impl<M: Clone> MetaInterp<M> {
             let mut proto = WarmEnterState::new(threshold);
             proto.copy_jit_params_from(primary);
             extras.resize_with(i + 1, || {
-                let mut ws = WarmEnterState::new(threshold);
+                let mut ws = WarmEnterState::with_jitlog(threshold, None);
                 ws.copy_jit_params_from(&proto);
                 ws
             });
@@ -10221,7 +10224,7 @@ impl<M: Clone> MetaInterp<M> {
     /// arity against the closing JUMP (compile.py:334), so decline to
     /// register rather than record a short list.
     fn register_retrace_merge_point(&mut self, jump_args: &[OpRef]) {
-        let Some(ctx) = self.tracing.as_mut() else {
+        let Some(ctx) = self.tracing.as_ref() else {
             return;
         };
         // pyjitpl.py `current_merge_points.append((live_arg_boxes, start))`
@@ -10247,12 +10250,15 @@ impl<M: Clone> MetaInterp<M> {
             .map(|k| k.get_uhash())
             .unwrap_or(ctx.green_key);
         let header_pc = ctx.close_header_pc();
-        // `compile_loop` files under `resolve_cell_key`, and `compile_retrace`
-        // reads this entry back as `mp.green_key` for `compiled_loops`. A
-        // bucket hash names a different cell once the bucket is chained.
+        let _ = ctx;
+        // `compile_loop` files under `resolve_cell_key` on
+        // `jitdriver_sd.warmstate`, and `compile_retrace` reads this entry
+        // back as `mp.green_key` for `compiled_loops`. A bucket hash names
+        // a different cell once the bucket is chained.
+        let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         let key = match key_typed.clone() {
             Some(typed) => self
-                .warm_state
+                .warm_state_for_driver(compiling_jd)
                 .resolve_cell_key(typed.get_uhash(), || typed),
             None => hash_fallback,
         };
@@ -12024,6 +12030,11 @@ impl<M: Clone> MetaInterp<M> {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
         self.warm_state_for_driver(jd_no)
             .abort_tracing(green_key, disable_noninlinable);
+        // `WarmEnterState.abort_tracing` logs on that slot's logger.
+        // Extra slots have no logger; the runner logger is `self.warm_state`.
+        if jd_no != 0 {
+            self.warm_state.log_trace_aborted();
+        }
     }
 
     /// Live-cleanup half of `abort_trace` — no stats, no hooks.
@@ -19921,9 +19932,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `next_ref` / `decode_box` writes a `TAGVIRTUAL` through
     /// `getvirtual_ptr` before that capture runs.
     ///
-    /// A liveness/section length mismatch is a pyre guard: the bridge is
-    /// not built and the caller aborts to blackhole. Upstream has no
-    /// length check and always consumes.
+    /// `resume.py` `ResumeDataBoxReader.consume_boxes` always consumes.
+    /// Pair live indices with `section.values` in bank order (int, ref,
+    /// float) up to the available values; leftover live slots stay unset.
     #[allow(clippy::too_many_arguments)]
     fn consume_portal_resume_boxes(
         &mut self,
@@ -20010,8 +20021,8 @@ impl<M: Clone> MetaInterp<M> {
             let section = &frames[i];
             // Same unrepresentable coordinate as `rebuild_from_resumedata`
             // above (`NO_JITCODE_PC` / `encode_branch_orgpc`). Upstream
-            // `read_jitcode_pos_pc` has no negative pc. Decline with the
-            // same `false` this function already returns for a length mismatch.
+            // `read_jitcode_pos_pc` has no negative pc. Decline; this is
+            // the unrepresentable-pc abort `consume_boxes` still has.
             let Ok(pc) = usize::try_from(section.pc) else {
                 return false;
             };
@@ -20028,19 +20039,8 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
             let indices =
                 crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
-            if indices.total_len() != section.values.len() {
-                // pyre guard. `resume.py` `ResumeDataBoxReader.consume_boxes`
-                // always consumes and has no length check. A mismatch must
-                // not build the bridge; the caller aborts to blackhole.
-                debug_assert!(
-                    false,
-                    "consume_boxes: liveness {} != section values {} at pc {}",
-                    indices.total_len(),
-                    section.values.len(),
-                    pc
-                );
-                return false;
-            }
+            // `resume.py` `ResumeDataBoxReader.consume_boxes` always
+            // consumes. Pair in bank order up to the available values.
             let mut order = Vec::with_capacity(indices.total_len());
             for index in indices.int {
                 order.push((majit_ir::Type::Int, index as usize));
@@ -20070,50 +20070,60 @@ impl<M: Clone> MetaInterp<M> {
                 pending.push((bank, index, opref, Some(bits)));
             }
             if !virtuals.is_empty() {
-                let Some(ctx) = tracing.as_deref_mut() else {
-                    return false;
-                };
-                if let Some(resume_data) = resume_data {
-                    let rd_virtuals = resume_data
-                        .storage
-                        .as_ref()
-                        .map(|storage| storage.rd_virtuals());
-                    let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
-                    let mut cache = match allocator {
-                        Some(allocator) => crate::BridgeVirtualCache::executing(
-                            virtual_count,
-                            crate::default_bridge_array_descr,
-                            allocator,
-                            fail_values,
-                            fail_types,
-                        ),
-                        None => crate::BridgeVirtualCache::new(
-                            virtual_count,
-                            crate::default_bridge_array_descr,
-                        ),
-                    };
-                    for (bank, index, vidx) in virtuals {
-                        let opref = crate::materialize_bridge_virtual(
-                            ctx,
-                            vidx,
-                            rd_virtuals,
-                            resume_data,
-                            &mut cache,
-                        );
-                        if opref.is_none() {
-                            return false;
-                        }
-                        let bits = virtual_box_bits(ctx, opref, cache.concrete_root_of(opref));
-                        pending.push((bank, index, opref, bits));
+                // resume.py `ResumeDataBoxReader.getvirtual_ptr` records
+                // into the live history `create_empty_history` already
+                // opened. A recoverable `false` here would have already
+                // entered earlier sections, then `ResumeBlackhole` would
+                // `handle_rvmprof_enter` again.
+                let ctx = tracing.as_deref_mut().expect(
+                    "rebuild_from_resumedata: ResumeDataBoxReader.getvirtual_ptr needs the live history",
+                );
+                // resume.py `getvirtual_ptr`: `v = virtuals_cache.get_ptr(index)`;
+                // only `rd_virtuals[index].allocate` on a miss. `_prepare`
+                // (`setup_bridge_sym`) already applied; a TAGVIRTUAL that
+                // first reader built is in `ctx.bridge_virtual_op`. A second
+                // executing `materialize_bridge_virtual` would NEW another
+                // object and SETFIELD a second field array (`wrappeditems`).
+                let resume_data =
+                    resume_data.expect("resume.py getvirtual_ptr: rd_virtuals is not None");
+                let rd_virtuals = resume_data
+                    .storage
+                    .as_ref()
+                    .map(|storage| storage.rd_virtuals());
+                let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
+                let mut cache = crate::take_or_new_virtuals_cache(
+                    ctx,
+                    virtual_count,
+                    crate::default_bridge_array_descr,
+                    allocator,
+                    fail_values,
+                    fail_types,
+                );
+                for (bank, index, vidx) in virtuals {
+                    let mut opref = crate::materialize_bridge_virtual(
+                        ctx,
+                        vidx,
+                        rd_virtuals,
+                        resume_data,
+                        &mut cache,
+                    );
+                    // resume.py getvirtual_ptr returns the cache slot
+                    // `allocate` filled, even when a later setfield
+                    // apply fails. `OpRef::NONE` is only an encoder bug.
+                    if opref.is_none() {
+                        opref = ctx
+                            .bridge_virtual_op(vidx)
+                            .filter(|op| !op.is_none())
+                            .unwrap_or(opref);
                     }
-                } else {
-                    for (bank, index, vidx) in virtuals {
-                        let Some(opref) = ctx.bridge_virtual_op(vidx) else {
-                            return false;
-                        };
-                        pending.push((bank, index, opref, virtual_box_bits(ctx, opref, None)));
-                    }
+                    assert!(
+                        !opref.is_none(),
+                        "resume.py getvirtual_ptr: allocate returned no box"
+                    );
+                    let bits = virtual_box_bits(ctx, opref, cache.concrete_root_of(opref));
+                    pending.push((bank, index, opref, bits));
                 }
+                ctx.park_bridge_virtuals_cache(cache);
             }
             let frame = &mut self.framestack.frames[i];
             for (bank, index, opref, bits) in pending {
@@ -20143,14 +20153,9 @@ impl<M: Clone> MetaInterp<M> {
                     let _ = ctx.try_set_opref_concrete(opref, stamped);
                 }
             }
-        }
-        // resume.py `rebuild_from_resumedata` calls
-        // `f.handle_rvmprof_enter_on_resume()` after each `consume_boxes`.
-        // Upstream never abandons a rebuild halfway; this one can return
-        // `false` above and then resumes through `blackhole_from_resumedata`,
-        // which emits its own enter. The hooks therefore run only once every
-        // section has been consumed.
-        for i in 0..n {
+            // resume.py `rebuild_from_resumedata` calls
+            // `f.handle_rvmprof_enter_on_resume()` after that section's
+            // `consume_boxes`, before the next `read_jitcode_pos_pc`.
             self.framestack.frames[i]
                 .handle_rvmprof_enter_on_resume(staticdata.op_live, staticdata.op_rvmprof_code);
         }
@@ -24168,6 +24173,7 @@ impl MetaInterpStaticData {
 #[cfg(test)]
 mod portal_resume_rebuild_tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
@@ -24177,10 +24183,24 @@ mod portal_resume_rebuild_tests {
 
     static RVMPROF_LEAVING: AtomicI64 = AtomicI64::new(-1);
     static RVMPROF_UID: AtomicI64 = AtomicI64::new(-1);
+    static RVMPROF_COUNT: AtomicI64 = AtomicI64::new(0);
+    static RVMPROF_UID0: AtomicI64 = AtomicI64::new(-1);
+    static RVMPROF_UID1: AtomicI64 = AtomicI64::new(-1);
+    static REBUILD_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
     fn hook(leaving: i64, unique_id: i64) {
+        let i = RVMPROF_COUNT.fetch_add(1, Ordering::SeqCst);
         RVMPROF_LEAVING.store(leaving, Ordering::SeqCst);
         RVMPROF_UID.store(unique_id, Ordering::SeqCst);
+        if i == 0 {
+            RVMPROF_UID0.store(unique_id, Ordering::SeqCst);
+        } else if i == 1 {
+            RVMPROF_UID1.store(unique_id, Ordering::SeqCst);
+        }
+    }
+
+    fn lock_rebuild() -> std::sync::MutexGuard<'static, ()> {
+        REBUILD_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn rvmprof_jitcode() -> std::sync::Arc<crate::jitcode::JitCode> {
@@ -24204,6 +24224,27 @@ mod portal_resume_rebuild_tests {
         buf
     }
 
+    fn ref_live_jitcode() -> std::sync::Arc<crate::jitcode::JitCode> {
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        let jc = crate::jitcode::JitCode::new("virtual-resume");
+        jc.set_body(JitCodeBody {
+            // A trailing opcode so `handle_rvmprof_enter_on_resume` can
+            // skip `-live-` without reading past the body.
+            code: vec![BC_LIVE, 0, 0, 0],
+            c_num_regs_r: 1,
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        std::sync::Arc::new(jc)
+    }
+
+    fn liveness_one_ref() -> Vec<u8> {
+        let mut buf = vec![0, 1, 0];
+        buf.extend(encode_liveness(&[0]));
+        buf
+    }
+
     fn install(meta: &mut MetaInterp<()>, jitcode: std::sync::Arc<crate::jitcode::JitCode>) {
         let sd = std::sync::Arc::get_mut(&mut meta.staticdata).expect("staticdata uniquely owned");
         sd.op_live = i32::from(BC_LIVE);
@@ -24221,6 +24262,7 @@ mod portal_resume_rebuild_tests {
 
     #[test]
     fn negative_section_pc_aborts_without_a_pc0_frame() {
+        let _lock = lock_rebuild();
         let mut meta = MetaInterp::<()>::new(0);
         let jitcode = rvmprof_jitcode();
         install(&mut meta, jitcode.clone());
@@ -24242,6 +24284,7 @@ mod portal_resume_rebuild_tests {
     #[test]
     #[should_panic(expected = "jitcodes[5] index error")]
     fn missing_jitcode_index_panics() {
+        let _lock = lock_rebuild();
         let mut meta = MetaInterp::<()>::new(0);
         let jitcode = rvmprof_jitcode();
         let frames = [RebuiltFrame {
@@ -24263,6 +24306,7 @@ mod portal_resume_rebuild_tests {
 
     #[test]
     fn resume_on_rvmprof_enter_emits_jit_rvmprof_code_zero() {
+        let _lock = lock_rebuild();
         struct HookReset;
         impl Drop for HookReset {
             fn drop(&mut self) {
@@ -24271,6 +24315,9 @@ mod portal_resume_rebuild_tests {
         }
         RVMPROF_LEAVING.store(-1, Ordering::SeqCst);
         RVMPROF_UID.store(-1, Ordering::SeqCst);
+        RVMPROF_COUNT.store(0, Ordering::SeqCst);
+        RVMPROF_UID0.store(-1, Ordering::SeqCst);
+        RVMPROF_UID1.store(-1, Ordering::SeqCst);
         let _reset = HookReset;
         majit_rlib::rvmprof::cintf::set_hook(Some(hook));
 
@@ -24307,6 +24354,374 @@ mod portal_resume_rebuild_tests {
         );
         assert_eq!(RVMPROF_LEAVING.load(Ordering::SeqCst), 0);
         assert_eq!(RVMPROF_UID.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn second_rebuild_from_resumedata_reseats_the_framestack() {
+        let _lock = lock_rebuild();
+        // resume.py `rebuild_from_resumedata` starts with
+        // `self.framestack = []` then `newframe` per section. A second
+        // walk drops the seated pc and rebuilds from the stream.
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        install(&mut meta, jitcode.clone());
+        let frames = [section(
+            0,
+            vec![
+                RebuiltValue::Const(majit_ir::Const::Int(1)),
+                RebuiltValue::Const(majit_ir::Const::Int(42)),
+            ],
+        )];
+        assert!(meta.rebuild_portal_framestack_from_resumedata(
+            jitcode.clone(),
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_two_ints(),
+            BC_LIVE,
+            None,
+        ));
+        assert_eq!(meta.framestack.frames[0].pc, 0);
+        meta.framestack.frames[0].pc = 99;
+        assert!(meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_two_ints(),
+            BC_LIVE,
+            None,
+        ));
+        assert_eq!(meta.framestack.frames[0].pc, 0);
+    }
+
+    #[test]
+    fn two_resume_sections_push_two_miframes() {
+        let _lock = lock_rebuild();
+        // resume.py rebuild_from_resumedata: newframe(jitcode) per section.
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        install(&mut meta, jitcode.clone());
+        let two = vec![
+            RebuiltValue::Const(majit_ir::Const::Int(1)),
+            RebuiltValue::Const(majit_ir::Const::Int(42)),
+        ];
+        let frames = [section(0, two.clone()), section(3, two)];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_two_ints(),
+            BC_LIVE,
+            None,
+        );
+        assert!(ok);
+        assert_eq!(meta.framestack.frames.len(), 2);
+        assert_eq!(meta.framestack.frames[0].pc, 0);
+        assert_eq!(meta.framestack.frames[1].pc, 3);
+    }
+
+    #[test]
+    fn each_resume_section_enters_rvmprof_after_consume_boxes() {
+        let _lock = lock_rebuild();
+        // resume.py rebuild_from_resumedata: handle_rvmprof_enter_on_resume
+        // after that section's consume_boxes, before the next section.
+        struct HookReset;
+        impl Drop for HookReset {
+            fn drop(&mut self) {
+                majit_rlib::rvmprof::cintf::set_hook(None);
+            }
+        }
+        RVMPROF_LEAVING.store(-1, Ordering::SeqCst);
+        RVMPROF_UID.store(-1, Ordering::SeqCst);
+        RVMPROF_COUNT.store(0, Ordering::SeqCst);
+        RVMPROF_UID0.store(-1, Ordering::SeqCst);
+        RVMPROF_UID1.store(-1, Ordering::SeqCst);
+        let _reset = HookReset;
+        majit_rlib::rvmprof::cintf::set_hook(Some(hook));
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        install(&mut meta, jitcode.clone());
+        let frames = [
+            section(
+                0,
+                vec![
+                    RebuiltValue::Const(majit_ir::Const::Int(1)),
+                    RebuiltValue::Const(majit_ir::Const::Int(42)),
+                ],
+            ),
+            section(
+                3,
+                vec![
+                    RebuiltValue::Const(majit_ir::Const::Int(1)),
+                    RebuiltValue::Const(majit_ir::Const::Int(99)),
+                ],
+            ),
+        ];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_two_ints(),
+            BC_LIVE,
+            None,
+        );
+        assert!(ok);
+        assert_eq!(RVMPROF_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(RVMPROF_UID0.load(Ordering::SeqCst), 42);
+        assert_eq!(RVMPROF_UID1.load(Ordering::SeqCst), 99);
+    }
+
+    #[test]
+    fn virtual_ref_rebuilds_when_resume_data_is_attached_first() {
+        let _lock = lock_rebuild();
+        // resume.py rebuild_from_resumedata: ResumeDataBoxReader has
+        // storage before consume_boxes; getvirtual_ptr records
+        // execute_new_with_vtable into the live history create_history
+        // already opened.
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = ref_live_jitcode();
+        install(&mut meta, jitcode.clone());
+
+        let mut tracing = crate::TraceCtx::for_test(0);
+        let storage = crate::resume::ResumeStorage::new(
+            vec![],
+            vec![],
+            vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+                descr: Some(majit_ir::descr::make_size_descr(16)),
+                type_id: 0,
+                known_class: None,
+                fielddescrs: vec![],
+                fieldnums: vec![],
+                descr_size: 16,
+            })],
+            vec![],
+        );
+        tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
+            frames: vec![],
+            virtualizable_values: vec![],
+            virtualref_values: vec![],
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: vec![],
+        });
+        meta.tracing = Some(tracing);
+
+        let frames = [section(0, vec![RebuiltValue::Virtual(0)])];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_one_ref(),
+            BC_LIVE,
+            None,
+        );
+        assert!(ok);
+        assert_eq!(meta.framestack.frames.len(), 1);
+        let opref = meta.framestack.frames[0].ref_regs[0];
+        assert!(opref.is_some_and(|op| !op.is_none()));
+    }
+
+    #[test]
+    fn later_virtual_section_does_not_abort_after_rvmprof_enter() {
+        let _lock = lock_rebuild();
+        // resume.py rebuild_from_resumedata: getvirtual_ptr always
+        // allocates, so a later TAGVIRTUAL cannot return false after
+        // an earlier section already called handle_rvmprof_enter_on_resume.
+        struct HookReset;
+        impl Drop for HookReset {
+            fn drop(&mut self) {
+                majit_rlib::rvmprof::cintf::set_hook(None);
+            }
+        }
+        RVMPROF_LEAVING.store(-1, Ordering::SeqCst);
+        RVMPROF_UID.store(-1, Ordering::SeqCst);
+        RVMPROF_COUNT.store(0, Ordering::SeqCst);
+        RVMPROF_UID0.store(-1, Ordering::SeqCst);
+        RVMPROF_UID1.store(-1, Ordering::SeqCst);
+        let _reset = HookReset;
+        majit_rlib::rvmprof::cintf::set_hook(Some(hook));
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let rvmprof = rvmprof_jitcode();
+        let first_liveness = liveness_two_ints();
+        let ref_offset = first_liveness.len();
+        let mut resume_liveness = first_liveness;
+        resume_liveness.extend(liveness_one_ref());
+        let refs = {
+            let mut startpoints = indexmap::IndexSet::new();
+            startpoints.insert(0);
+            let mut code = vec![BC_LIVE];
+            majit_jitcode::codewriter::liveness::encode_offset(ref_offset, &mut code);
+            code.push(0);
+            let jc = crate::jitcode::JitCode::new("virtual-resume");
+            jc.set_body(JitCodeBody {
+                code,
+                c_num_regs_r: 1,
+                startpoints: Some(startpoints),
+                ..JitCodeBody::default()
+            });
+            std::sync::Arc::new(jc)
+        };
+        install(&mut meta, rvmprof.clone());
+        {
+            let sd =
+                std::sync::Arc::get_mut(&mut meta.staticdata).expect("staticdata uniquely owned");
+            sd.jitcodes.push(refs.clone());
+        }
+
+        let mut tracing = crate::TraceCtx::for_test(0);
+        let storage = crate::resume::ResumeStorage::new(
+            vec![],
+            vec![],
+            vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+                descr: Some(majit_ir::descr::make_size_descr(16)),
+                type_id: 0,
+                known_class: None,
+                fielddescrs: vec![],
+                fieldnums: vec![],
+                descr_size: 16,
+            })],
+            vec![],
+        );
+        tracing.set_bridge_resume_data(crate::jit_state::ResumeDataResult {
+            frames: vec![],
+            virtualizable_values: vec![],
+            virtualref_values: vec![],
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: vec![],
+        });
+        meta.tracing = Some(tracing);
+
+        let frames = [
+            section(
+                0,
+                vec![
+                    RebuiltValue::Const(majit_ir::Const::Int(1)),
+                    RebuiltValue::Const(majit_ir::Const::Int(42)),
+                ],
+            ),
+            RebuiltFrame {
+                jitcode_index: 1,
+                pc: 0,
+                values: vec![RebuiltValue::Virtual(0)],
+            },
+        ];
+        let materialized = vec![Some(rvmprof.clone()), Some(refs.clone())];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            rvmprof,
+            &frames,
+            &[],
+            &[],
+            &materialized,
+            &resume_liveness,
+            BC_LIVE,
+            None,
+        );
+        assert!(ok, "getvirtual_ptr allocates; consume_boxes does not abort");
+        assert_eq!(meta.framestack.frames.len(), 2);
+        assert_eq!(RVMPROF_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(RVMPROF_UID0.load(Ordering::SeqCst), 42);
+        let opref = meta.framestack.frames[1].ref_regs[0];
+        assert!(opref.is_some_and(|op| !op.is_none()));
+    }
+
+    #[test]
+    fn consume_boxes_reuses_getvirtual_ptr_box_on_second_walk() {
+        let _lock = lock_rebuild();
+        // resume.py `getvirtual_ptr`: one `virtuals_cache`; `allocate()`
+        // fills it as soon as it has the object, before setfields.
+        // `prepare_bridge_resume` materializes every `rd_virtuals` entry
+        // first; `consume_boxes` TAGVIRTUAL must store that same box.
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = ref_live_jitcode();
+        install(&mut meta, jitcode.clone());
+        assert!(
+            meta.framestack.frames.is_empty(),
+            "rebuild starts from an empty framestack"
+        );
+
+        let field: std::sync::Arc<dyn majit_ir::FieldDescr> = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(0, 0, 8, majit_ir::Type::Ref, false),
+        );
+        let size_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0, 16, 0).with_all_fielddescrs(vec![field]),
+        );
+        let mut tracing = crate::TraceCtx::for_test(0);
+        let storage = crate::resume::ResumeStorage::new(
+            vec![],
+            vec![],
+            vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+                descr: Some(size_descr),
+                type_id: 0,
+                known_class: None,
+                fielddescrs: vec![majit_ir::FieldDescrInfo {
+                    index: 0,
+                    offset: 0,
+                    field_type: majit_ir::Type::Ref,
+                    field_size: 8,
+                }],
+                fieldnums: vec![majit_ir::resumedata::NULLREF],
+                descr_size: 16,
+            })],
+            vec![],
+        );
+        let resume_data = crate::jit_state::ResumeDataResult {
+            frames: vec![],
+            virtualizable_values: vec![],
+            virtualref_values: vec![],
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: vec![],
+        };
+        tracing.set_bridge_resume_data(resume_data.clone());
+
+        // First walk: `_prepare` / `getvirtual_ptr` allocate.
+        let rd_virtuals = resume_data
+            .storage
+            .as_ref()
+            .map(|storage| storage.rd_virtuals());
+        let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
+        let mut cache =
+            crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr);
+        let first = crate::materialize_bridge_virtual(
+            &mut tracing,
+            0,
+            rd_virtuals,
+            &resume_data,
+            &mut cache,
+        );
+        assert!(!first.is_none());
+        assert_eq!(tracing.bridge_virtual_op(0), Some(first));
+        tracing.park_bridge_virtuals_cache(cache);
+
+        meta.tracing = Some(tracing);
+        let frames = [section(0, vec![RebuiltValue::Virtual(0)])];
+        let ok = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_one_ref(),
+            BC_LIVE,
+            None,
+        );
+        assert!(ok);
+        assert_eq!(meta.framestack.frames.len(), 1);
+        let ctx = meta.tracing.as_ref().expect("tracing stays live");
+        assert_eq!(ctx.bridge_virtual_op(0), Some(first));
+        assert_eq!(meta.framestack.frames[0].ref_regs[0], Some(first));
     }
 }
 
@@ -24646,6 +25061,46 @@ mod metainterp_static_data_tests {
                 .flags
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
             "compile_loop abort does not ban the cell"
+        );
+    }
+
+    #[test]
+    fn abort_tracing_on_compiling_driver_logs_on_the_shared_runner_logger() {
+        // rlib/rjitlog/rjitlog.py owns one JitLogger on the runner.
+        // Extra slots keep the compiling cell; abort counts stay on
+        // `self.warm_state`.
+        let mut meta = MetaInterp::<()>::new(0);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let threshold = meta.warm_state.threshold();
+        meta.warm_state =
+            WarmEnterState::with_jitlog(threshold, Some(crate::logger::Logger::new(false)));
+        meta.active_jitdriver_sd = Some(idx1);
+        let _ = meta.warm_state_for_driver(idx1);
+        assert!(
+            meta.warm_state_ref_for_driver(idx1)
+                .expect("extra slot")
+                .jitlog()
+                .is_none(),
+            "extra WarmEnterState does not own a Logger"
+        );
+        meta.abort_tracing_on_compiling_driver(0xabc, false);
+        assert_eq!(
+            meta.warm_state.jitlog().map(|log| log.traces_aborted()),
+            Some(1),
+            "abort_tracing logs through the shared runner logger"
         );
     }
 
@@ -33899,6 +34354,83 @@ mod tests {
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
         let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(matches!(outcome, CompileOutcome::Cancelled));
+        let stored = meta
+            .trace_ctx()
+            .unwrap()
+            .current_merge_points
+            .last()
+            .unwrap()
+            .green_key;
+        assert_eq!(stored, minted);
+    }
+
+    #[test]
+    fn retrace_merge_point_resolves_on_the_compiling_driver() {
+        // `compile.py compile_retrace` / `pyjitpl.py reached_loop_header`
+        // file the appended merge point on `jitdriver_sd.warmstate`. A
+        // chained bucket on driver 1 must not resolve through driver 0.
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(
+            vec![("g", Type::Int)],
+            vec![("r", Type::Int)],
+        );
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second.clone());
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let pc = 11i64;
+        let extra = 7200i64;
+        let parked = majit_ir::GreenKey::new(vec![pc, extra]);
+        let hash = parked.get_uhash();
+        let squatter = std::sync::Arc::new(JitCellToken::new(
+            meta.warm_state_for_driver(idx1).alloc_token_number(),
+        ));
+        squatter.set_compiled(Box::new(()));
+        meta.warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(hash, std::sync::Arc::clone(&squatter));
+        meta.warm_state_for_driver(idx1)
+            .attach_procedure_to_interp_for_key(&parked, squatter);
+        let minted = meta
+            .warm_state_for_driver(idx1)
+            .cell_key_for(&parked)
+            .expect("typed cell on compiling driver");
+        assert_ne!(minted, hash);
+        assert_eq!(
+            meta.warm_state.resolve_cell_key(hash, || parked.clone()),
+            hash,
+            "driver 0 has no chained occupant"
+        );
+
+        for _ in 0..2 {
+            meta.on_back_edge(1, &[0]);
+        }
+        meta.active_jitdriver_sd = Some(idx1);
+        {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.set_driver_descriptor(second);
+            ctx.close_green_pc = Some(pc);
+            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+        }
+        meta.partial_trace = Some(PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(
+            matches!(outcome, CompileOutcome::Cancelled),
+            "compile_loop retrace cancel: {outcome:?}"
+        );
         let stored = meta
             .trace_ctx()
             .unwrap()

@@ -2394,9 +2394,9 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// This builder therefore registers only shapes with an explicit handler
 /// contract.  Any emitted byte outside that setup surface now reaches
 /// `dispatch_step`'s unwired-opcode panic; there is no legacy fallback.
-/// `cond_call_*` / `record_known_result_*` bytes are now wired through
-/// `_pyre/P` adapter handlers (registered by `insns.rs`'s
-/// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
+/// Leftover `cond_call_*_ext` / `record_known_result_*_ext` bytes stay
+/// unwired; canonical `conditional_call_*` / `record_known_result_*`
+/// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
     // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys

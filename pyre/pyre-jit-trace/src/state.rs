@@ -8289,7 +8289,7 @@ fn overlay_stream_ref_slots(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) {
     for &(pos, slot) in stream_slots {
         let (box_ref, value) = bridge_decode_box(
@@ -8340,7 +8340,7 @@ fn reconstruct_inline_recipe(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
     in_a_call: bool,
     pending_ref_array_writes: &[PendingRefArrayWrite],
 ) -> Option<ReconstructRecipe> {
@@ -9124,7 +9124,7 @@ fn bridge_decode_box(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> (OpRef, majit_ir::Value) {
     use majit_ir::resumedata::RebuiltValue;
     let callinfocollection = ctx.callinfocollection.clone();
@@ -9156,16 +9156,30 @@ fn bridge_decode_box(
             (opref, value_for_slot(c.get_type(), c.as_raw_i64()))
         }
         RebuiltValue::Virtual(vidx) => {
+            // resume.py `getvirtual_ptr`: a cache hit returns the box
+            // `allocate()` already filled. Capture that before this call
+            // writes the slot.
+            let already = cache.get_any(*vidx).is_some() || ctx.bridge_virtual_op(*vidx).is_some();
             let opref = materialize_bridge_virtual(ctx, *vidx, rd_virtuals, resume_data, cache);
             // The applying reader allocated the object at the `NEW` it
             // recorded and stamped it there; that object is the box's value.
             // Allocating another here would give the walk a second object
             // for one box.
-            if cache.allocator().is_some()
-                && let Some(value) = ctx.concrete_of_opref(opref)
+            if let Some(value) = ctx.concrete_of_opref(opref)
                 && value.get_type() == expected_kind
             {
                 return (opref, value);
+            }
+            if expected_kind != Type::Int
+                && let Some(gcref) = cache.get_concrete_ptr(*vidx)
+            {
+                return (opref, majit_ir::Value::Ref(gcref));
+            }
+            if already {
+                // Later TAGVIRTUAL: `virtuals_cache.get_ptr` hit. `allocate()`
+                // already ran setfields; a second concrete SETFIELD writes
+                // another `wrappeditems` array against the live tuple.
+                return (opref, majit_ir::Value::Void);
             }
             if expected_kind == Type::Int {
                 let value = materialize_concrete_virtual_int(
@@ -9197,6 +9211,46 @@ fn bridge_decode_box(
     }
 }
 
+/// resume.py `AbstractResumeDataReader._prepare`: virtual cache then
+/// `_prepare_pendingfields`. Called before `newframe` / `consume_boxes`.
+fn apply_bridge_prepare(
+    sym: &mut PyreSym,
+    ctx: &mut majit_metainterp::TraceCtx,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+) {
+    let (driver, _) = crate::driver::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let virtual_count = rd_virtuals.map_or(0, |v| v.len());
+    // resume.py `_prepare_virtuals`: `if virtuals:` builds the cache with
+    // unset holes (`virtual_ptr_default`, matching `rd_virtual is None`).
+    // `getvirtual_ptr` lazily `allocate()`s on the first TAGVIRTUAL /
+    // pending-field decode. `force_all_virtuals` is `force_from_resumedata`
+    // only (direct/executing reader), not this BoxReader `_prepare`.
+    let mut virtuals_cache = majit_metainterp::take_or_new_virtuals_cache(
+        ctx,
+        virtual_count,
+        crate::descr::make_array_descr,
+        executing,
+        fail_values,
+        fail_types,
+    );
+    let _pending = prepare_bridge_pending_fields(
+        sym,
+        ctx,
+        resume_data,
+        rd_virtuals,
+        fail_values,
+        fail_types,
+        backend,
+        &mut virtuals_cache,
+    );
+    ctx.park_bridge_virtuals_cache(virtuals_cache);
+}
+
 /// Prepare the guard-owned pending field stream for bridge tracing.
 /// `resume.py:_prepare_pendingfields` decodes these tagged values only after
 /// virtual preparation; the exception-channel entry seeds the bridge walk's
@@ -9211,7 +9265,7 @@ fn prepare_bridge_pending_fields(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> Vec<PendingRefArrayWrite> {
     let mut pending_ref_array_writes = Vec::new();
     let Some(storage) = resume_data.storage.as_ref() else {
@@ -9409,7 +9463,7 @@ fn decode_tagged_concrete(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> i64 {
     use majit_ir::resumedata::{
         NULLREF, TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, UNINITIALIZED_TAG, untag,
@@ -9526,7 +9580,7 @@ fn decode_tagged_for_kind(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> i64 {
     decode_tagged_concrete(
         tagged,
@@ -9559,7 +9613,7 @@ fn setfield_concrete_from_tagged(
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) {
     let descr = bh_field_descr_from_info(fd);
     match fd.field_type {
@@ -9624,7 +9678,7 @@ fn setarrayitem_concrete_from_tagged(
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) {
     if arraydescr.is_array_of_pointers() {
         let value = decode_tagged_for_kind(
@@ -9696,7 +9750,7 @@ fn setinteriorfield_concrete_from_tagged(
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) {
     let ifd = interior_descr
         .as_interior_field_descr()
@@ -9833,7 +9887,7 @@ fn materialize_concrete_virtual_ptr(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> majit_ir::GcRef {
     if let Some(cached) = cache.get_concrete_ptr(vidx) {
         return cached;
@@ -10264,7 +10318,7 @@ fn materialize_concrete_virtual_int(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache<'_>,
+    cache: &mut BridgeVirtualCache,
 ) -> i64 {
     if let Some(cached) = cache.get_concrete_int(vidx) {
         return cached;
@@ -10796,6 +10850,27 @@ impl JitState for PyreJitState {
                 || self.namespace_len().is_some_and(|len| len == meta.ns_len))
     }
 
+    fn prepare_bridge_resume(
+        sym: &mut Self::Sym,
+        ctx: &mut majit_metainterp::TraceCtx,
+        resume_data: &majit_metainterp::ResumeDataResult,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+        fail_values: &[i64],
+        fail_types: &[Type],
+        executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+    ) {
+        apply_bridge_prepare(
+            sym,
+            ctx,
+            resume_data,
+            rd_virtuals,
+            fail_values,
+            fail_types,
+            executing,
+        );
+        ctx.mark_bridge_prepare_done();
+    }
+
     fn setup_bridge_sym(
         sym: &mut Self::Sym,
         ctx: &mut majit_metainterp::TraceCtx,
@@ -10844,32 +10919,36 @@ impl JitState for PyreJitState {
         let (driver, _) = crate::driver::driver_pair();
         let backend = driver.meta_interp().backend();
         let virtual_count = rd_virtuals.map_or(0, |v| v.len());
-        let mut virtuals_cache = match executing {
-            Some(allocator) => BridgeVirtualCache::executing(
-                virtual_count,
-                crate::descr::make_array_descr,
-                allocator,
-                fail_values,
-                fail_types,
-            ),
-            None => BridgeVirtualCache::new(virtual_count, crate::descr::make_array_descr),
-        };
-
-        // resume.py AbstractResumeDataReader._prepare: `_prepare_virtuals`
-        // then `_prepare_pendingfields` before `consume_vref_and_vable_boxes`
-        // or `consume_boxes`. A pending SETARRAYITEM_GC targeting a
-        // materialized frame's locals must land before those slots are
-        // decoded into the reconstructed frame.
-        let pending_ref_array_writes = prepare_bridge_pending_fields(
-            sym,
+        // resume.py one `virtuals_cache` from `_prepare_virtuals`; a later
+        // TAGVIRTUAL is `getvirtual_ptr` on that cache, not a second
+        // `allocate()` / SETFIELD of `wrappeditems`.
+        let mut virtuals_cache = majit_metainterp::take_or_new_virtuals_cache(
             ctx,
-            resume_data,
-            rd_virtuals,
+            virtual_count,
+            crate::descr::make_array_descr,
+            executing,
             fail_values,
             fail_types,
-            backend,
-            &mut virtuals_cache,
         );
+
+        // `_prepare` already ran in `prepare_bridge_resume` before
+        // `consume_boxes`. Replaying pending SETFIELD here would write a
+        // second `wrappeditems` array against the live tuple.
+        let pending_ref_array_writes = if ctx.bridge_prepare_done() {
+            Vec::new()
+        } else {
+            prepare_bridge_pending_fields(
+                sym,
+                ctx,
+                resume_data,
+                rd_virtuals,
+                fail_values,
+                fail_types,
+                backend,
+                &mut virtuals_cache,
+            )
+        };
+        ctx.mark_bridge_prepare_done();
 
         // resume.py decode_box parity — unified via bridge_decode_box.
         // Each call returns (OpRef, Value), eliminating the separate
@@ -11966,6 +12045,7 @@ impl JitState for PyreJitState {
                 recipes,
             });
         }
+        ctx.park_bridge_virtuals_cache(virtuals_cache);
     }
 
     /// resume.py rebuild_from_resumedata parity.
@@ -15129,6 +15209,199 @@ mod tests {
             "ResumeDataBoxReader applies pending fields; the bridge stays complete"
         );
         assert_eq!(field_target.value, 9);
+    }
+
+    /// BoxReader `_prepare` is `_prepare_virtuals` (cache only) then
+    /// `_prepare_pendingfields`. `getvirtual_ptr` materializes the virtual a
+    /// pending field names; Empty holes and unnamed nonempty `rd_virtuals`
+    /// entries stay unset. `force_all_virtuals` is not this path.
+    #[test]
+    fn prepare_bridge_resume_materializes_only_named_virtuals() {
+        ensure_test_callbacks();
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+        let mut field_target = FieldTarget { value: 1 };
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Int, false),
+        );
+        let tagged_box = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let tagged_virtual = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGVIRTUAL)
+                .expect("small virtual index is taggable")
+        };
+        let tag_int = |value: i32| {
+            majit_metainterp::resume::tag(value, majit_metainterp::resume::TAGINT)
+                .expect("small TAGINT is taggable")
+        };
+        let named = std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawSliceInfo {
+            offset: 7,
+            fieldnums: vec![tag_int(5)],
+        });
+        let unnamed = std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawSliceInfo {
+            offset: 99,
+            fieldnums: vec![tag_int(1)],
+        });
+        let virtuals = vec![
+            named,
+            std::rc::Rc::new(majit_ir::RdVirtualInfo::Empty),
+            unnamed,
+        ];
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(field_descr),
+            item_index: -1,
+            target: OpRef::input_arg_ref(0),
+            value: OpRef::NONE,
+            target_tagged: tagged_box(0),
+            value_tagged: tagged_virtual(0),
+        }];
+        let storage =
+            majit_metainterp::resume::ResumeStorage::new(vec![], vec![], virtuals.clone(), pending);
+        let fail_values = [&mut field_target as *mut FieldTarget as i64];
+        let fail_types = [Type::Ref];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.to_vec(),
+        };
+        let mut ctx = TraceCtx::for_test_types(&fail_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        assert!(ctx.bridge_virtual_op(0).is_none());
+        assert!(ctx.bridge_virtual_op(1).is_none());
+        assert!(ctx.bridge_virtual_op(2).is_none());
+        <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            Some(&virtuals),
+            &fail_values,
+            &fail_types,
+            None,
+        );
+        assert_eq!(ctx.bridge_virtual_op(0), Some(OpRef::const_int(12)));
+        assert!(
+            ctx.bridge_virtual_op(1).is_none(),
+            "Empty hole stays unset; BoxReader `_prepare` never names it"
+        );
+        assert!(
+            ctx.bridge_virtual_op(2).is_none(),
+            "unnamed nonempty virtual stays unset until TAGVIRTUAL / pending decode"
+        );
+        assert_eq!(field_target.value, 12);
+    }
+
+    /// `ResumeDataBoxReader.virtuals_cache` is created in `_prepare_virtuals`
+    /// and reused by a later TAGVIRTUAL `getvirtual_ptr`. `allocate()` runs
+    /// setfields once; `setup_bridge_sym` must not SETFIELD a second
+    /// `wrappeditems` array.
+    #[test]
+    fn setup_bridge_sym_reuses_prepare_virtuals_cache_on_later_tagvirtual() {
+        use majit_ir::resumedata::RebuiltValue;
+
+        ensure_test_callbacks();
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+        let mut field_target = FieldTarget { value: 0 };
+        let field: std::sync::Arc<dyn majit_ir::FieldDescr> = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(0, 0, 8, Type::Ref, false),
+        );
+        let size_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0, 16, 0)
+                .with_all_fielddescrs(vec![field.clone()]),
+        );
+        let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Ref, false),
+        );
+        let tagged_box = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let tagged_virtual = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGVIRTUAL)
+                .expect("small virtual index is taggable")
+        };
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(size_descr),
+            type_id: 0,
+            known_class: None,
+            fielddescrs: vec![majit_ir::FieldDescrInfo {
+                index: 0,
+                offset: 0,
+                field_type: Type::Ref,
+                field_size: 8,
+            }],
+            fieldnums: vec![majit_ir::resumedata::NULLREF],
+            descr_size: 16,
+        })];
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(pending_descr),
+            item_index: -1,
+            target: OpRef::input_arg_ref(0),
+            value: OpRef::NONE,
+            target_tagged: tagged_box(0),
+            value_tagged: tagged_virtual(0),
+        }];
+        let storage =
+            majit_metainterp::resume::ResumeStorage::new(vec![], vec![], virtuals.clone(), pending);
+        let fail_values = [&mut field_target as *mut FieldTarget as i64];
+        let fail_types = [Type::Ref];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.to_vec(),
+        };
+        let mut ctx = TraceCtx::for_test_types(&fail_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            Some(&virtuals),
+            &fail_values,
+            &fail_types,
+            None,
+        );
+        let first = ctx
+            .bridge_virtual_op(0)
+            .expect("pending TAGVIRTUAL allocate()s once");
+        {
+            let parked = ctx
+                .take_bridge_virtuals_cache()
+                .expect("virtuals_cache parked at _prepare_virtuals");
+            assert_eq!(parked.get_any(0), Some(first));
+            ctx.park_bridge_virtuals_cache(parked);
+        }
+        let ops_after_prepare = ctx.num_ops();
+        let mut resume_later = resume_data.clone();
+        resume_later.virtualref_values =
+            vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)];
+        <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
+            &mut sym,
+            &mut ctx,
+            &resume_later,
+            Some(&virtuals),
+            &fail_values,
+            &fail_types,
+            None,
+        );
+        assert_eq!(ctx.bridge_virtual_op(0), Some(first));
+        assert_eq!(
+            ctx.num_ops(),
+            ops_after_prepare,
+            "later TAGVIRTUAL is a virtuals_cache hit; allocate() must not SETFIELD again"
+        );
     }
 
     #[test]
