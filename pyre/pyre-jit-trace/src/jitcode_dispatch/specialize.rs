@@ -2541,15 +2541,10 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // `MapDictStrategy`-backed, and the carrier read below is out of bounds
         // on a devolved one, so pin the strategy before dereferencing
         // `dstorage`.
-        let strategy = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            dict_op,
-            crate::descr::dict_strategy_word_descr(),
-        );
-        walker_guard_stamped_int(
+        walker_guard_stamped_dict_strategy(
             ctx,
             op_pc,
-            strategy,
+            dict_op,
             &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
         )?;
 
@@ -10439,12 +10434,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     let strategy_ref = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64;
     let lookup_helper = crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const ();
 
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        dict_op,
-        crate::descr::dict_strategy_word_descr(),
-    );
-    walker_guard_stamped_int(ctx, op_pc, strategy, strategy_ref)?;
+    walker_guard_stamped_dict_strategy(ctx, op_pc, dict_op, strategy_ref)?;
 
     walker_guard_exact_str(ctx, op_pc, key_op)?;
 
@@ -10559,15 +10549,10 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
         canonical_dict,
     )?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        dict_op,
-        crate::descr::dict_strategy_word_descr(),
-    );
-    walker_guard_stamped_int(
+    walker_guard_stamped_dict_strategy(
         ctx,
         op_pc,
-        strategy,
+        dict_op,
         &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
     )?;
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -14045,6 +14030,19 @@ fn walker_guard_stamped_int<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
     Ok(expected)
+}
+
+/// Getfield dict `strategy` then stamped GuardValue.
+fn walker_guard_stamped_dict_strategy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dict_op: OpRef,
+    sid: i64,
+) -> Result<(), DispatchError> {
+    let descr = crate::descr::dict_strategy_word_descr();
+    let strategy = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, dict_op, descr);
+    walker_guard_stamped_int(ctx, pc, strategy, sid)?;
+    Ok(())
 }
 
 /// Pin an arraylen a fold baked in. `GuardValue` without `replace_box`:
