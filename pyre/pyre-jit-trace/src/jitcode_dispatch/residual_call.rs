@@ -6991,9 +6991,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
             OpCode::GuardClass,
             &[cell_op, type_const],
         )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(cell_op, cell_type);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(cell_op);
     }
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(

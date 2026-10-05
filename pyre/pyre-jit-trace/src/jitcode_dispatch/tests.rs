@@ -3553,9 +3553,7 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
         "`_establish_nullity` guards the observed non-nullness"
     );
     assert!(
-        tc.heap_cache()
-            .is_nullity_known(operand, |_| None)
-            .is_some(),
+        tc.heap_cache().is_nullity_known(operand),
         "the nullity must be stamped into the heapcache"
     );
 }
@@ -5516,9 +5514,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
     let mut trace_ctx = fresh_trace_ctx();
     let expected = OpRef::input_arg_typed(0, Type::Ref);
     let regs_r = vec![expected];
-    trace_ctx
-        .heap_cache_mut()
-        .class_now_known(expected, 0x1234_5678);
+    trace_ctx.heap_cache_mut().class_now_known(expected);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut walk_ctx = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {

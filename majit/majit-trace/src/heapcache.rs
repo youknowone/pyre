@@ -6,11 +6,11 @@
 ///
 /// Translated from rpython/jit/metainterp/heapcache.py.
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 
-use bit_set::BitSet;
 use indexmap::IndexSet;
 
-use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
+use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type, Value};
 
 /// Value-equality predicate over constant OpRefs.  Mirrors
 /// `Const.same_constant` (history.py): two ConstInt/ConstFloat/
@@ -101,13 +101,76 @@ pub const HF_VERSION_MAX: u32 = 0xffff_ffff - HF_VERSION_INC;
 const _HF_VERSION_INC: u32 = HF_VERSION_INC;
 const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 
-// RPython `heapcache.py add_flags` defines module-level helpers
-// `add_flags`, `remove_flags`, `test_flags` that mutate per-op storage
-// (`ref_frontend_op._heapc_flags`). pyre routes the same logic through
-// `HeapCache::_set_flag` / `_remove_flag` / `_check_flag` because pyre's
-// `OpRef` is a bare index with no associated storage outside `HeapCache`'s
-// own `heapc_flags: Vec<u32>` table. The standalone helpers therefore
-// cannot exist as standalone functions and would be misleading stubs.
+/// Per-box heapcache state stored on the FrontendOp record
+/// (`history.py` `RefFrontendOp._heapc_flags` / `_heapc_deps`,
+/// `FrontendOp.position_and_flags & FO_REPLACED_WITH_CONST`).
+#[derive(Clone, Debug, Default)]
+pub struct HeapcRecord {
+    /// `RefFrontendOp._heapc_flags` — HF_* bits plus the version word
+    /// `HeapCache.test_head_version` / `test_likely_virtual_version` compare.
+    pub flags: u32,
+    /// `RefFrontendOp._heapc_deps` — `deps[0]` is the cached array length,
+    /// `deps[1:]` are escape dependencies from `_escape_from_write`.
+    pub deps: Option<Vec<Option<OpRef>>>,
+    /// `FrontendOp.position_and_flags & FO_REPLACED_WITH_CONST`.
+    /// The replacement Const is `constant_from_op(box)` of this box's value.
+    pub replaced_with_const: bool,
+}
+
+impl HeapcRecord {
+    /// Forward ConstPtrs stored in `_heapc_deps`.
+    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if let Some(deps) = &mut self.deps {
+            for slot in deps.iter_mut().flatten() {
+                if let OpRef::ConstPtr(gcref) = slot {
+                    visitor(gcref);
+                }
+            }
+        }
+    }
+}
+
+/// Store of FrontendOp records the heapcache reads and writes.
+///
+/// Inputargs occupy positions `0.._start`; value ops occupy `_index` after
+/// that (`opencoder.py` `Trace._start`). A `Const` has no record.
+pub trait HeapcBoxes {
+    fn heapc(&self, opref: OpRef) -> Option<&HeapcRecord>;
+    fn heapc_mut(&mut self, opref: OpRef) -> Option<&mut HeapcRecord>;
+    /// `*FrontendOp.getint` / `getref_base` / `getfloatstorage` for
+    /// `executor.constant_from_op` and `cls_of_box` / `box.nonnull()`.
+    fn box_value(&self, opref: OpRef) -> Option<Value>;
+}
+
+/// heapcache.py `add_flags(ref_frontend_op, flags)`.
+pub fn add_flags(boxes: &mut dyn HeapcBoxes, opref: OpRef, flags: HeapFlags) {
+    if let Some(rec) = boxes.heapc_mut(opref) {
+        rec.flags |= u32::from(flags.bits());
+    }
+}
+
+/// heapcache.py `remove_flags(ref_frontend_op, flags)`.
+pub fn remove_flags(boxes: &mut dyn HeapcBoxes, opref: OpRef, flags: HeapFlags) {
+    if let Some(rec) = boxes.heapc_mut(opref) {
+        rec.flags &= !u32::from(flags.bits());
+    }
+}
+
+/// heapcache.py `test_flags(ref_frontend_op, flags)`.
+pub fn test_flags(boxes: &dyn HeapcBoxes, opref: OpRef, flags: HeapFlags) -> bool {
+    let f = boxes.heapc(opref).map(|rec| rec.flags).unwrap_or(0);
+    (f & u32::from(flags.bits())) != 0
+}
+
+/// `executor.py constant_from_op(op)` — Const minted from the box's own value.
+fn constant_from_op(opref: OpRef, boxes: &dyn HeapcBoxes) -> OpRef {
+    match boxes.box_value(opref) {
+        Some(Value::Int(n)) => OpRef::const_int(n),
+        Some(Value::Ref(g)) => OpRef::const_ptr(g),
+        Some(Value::Float(f)) => OpRef::const_float(f),
+        Some(Value::Void) | None => opref,
+    }
+}
 
 /// heapcache.py CacheEntry — per-descr cache of fieldbox values.
 ///
@@ -157,8 +220,8 @@ impl CacheEntry {
     /// (RPython attaches the heapcache reference to CacheEntry at
     /// __init__ time; in Rust we pass it through to avoid a back-
     /// reference + interior mutability dance).
-    pub fn _seen_alloc(&self, ref_box: OpRef, cache: &HeapCache) -> bool {
-        cache.saw_allocation(ref_box)
+    pub fn _seen_alloc(&self, ref_box: OpRef, cache: &HeapCache, boxes: &dyn HeapcBoxes) -> bool {
+        cache.saw_allocation(ref_box, boxes)
     }
 
     /// heapcache.py _getdict
@@ -186,10 +249,11 @@ impl CacheEntry {
         ref_box: OpRef,
         fieldbox: OpRef,
         cache: &HeapCache,
+        boxes: &dyn HeapcBoxes,
         oracle: &dyn SameConstantOracle,
     ) {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
-        let seen_alloc = self._seen_alloc(ref_box, cache);
+        let seen_alloc = self._seen_alloc(ref_box, cache, boxes);
         self._clear_cache_on_write(seen_alloc);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
@@ -223,13 +287,14 @@ impl CacheEntry {
         &mut self,
         ref_box: OpRef,
         cache: &HeapCache,
+        boxes: &dyn HeapcBoxes,
         oracle: &dyn SameConstantOracle,
     ) -> Option<OpRef> {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
-        let seen_alloc = self._seen_alloc(ref_box, cache);
+        let seen_alloc = self._seen_alloc(ref_box, cache, boxes);
         self._getdict(seen_alloc)
             .get(&ref_box)
-            .map(|fieldbox| cache.maybe_replace_with_const(*fieldbox))
+            .map(|fieldbox| cache.maybe_replace_with_const(*fieldbox, boxes))
     }
 
     /// heapcache.py read_now_known
@@ -238,10 +303,11 @@ impl CacheEntry {
         ref_box: OpRef,
         fieldbox: OpRef,
         cache: &HeapCache,
+        boxes: &dyn HeapcBoxes,
         oracle: &dyn SameConstantOracle,
     ) {
         let ref_box = self._unique_const_heuristic(ref_box, oracle);
-        let seen_alloc = self._seen_alloc(ref_box, cache);
+        let seen_alloc = self._seen_alloc(ref_box, cache, boxes);
         self._getdict_mut(seen_alloc).insert(ref_box, fieldbox);
     }
 
@@ -255,15 +321,15 @@ impl CacheEntry {
     /// so the per-entry filter calls the version-gated
     /// `HeapCache.is_unescaped(ref_box)` (heapcache.py / 457-460)
     /// instead of any pre-snapshotted bit table.
-    pub fn invalidate_unescaped(&mut self, cache: &HeapCache) {
-        self._invalidate_unescaped(cache)
+    pub fn invalidate_unescaped(&mut self, cache: &HeapCache, boxes: &dyn HeapcBoxes) {
+        self._invalidate_unescaped(cache, boxes)
     }
 
-    pub fn _invalidate_unescaped(&mut self, cache: &HeapCache) {
+    pub fn _invalidate_unescaped(&mut self, cache: &HeapCache, boxes: &dyn HeapcBoxes) {
         self.cache_anything
-            .retain(|&ref_box, _| cache.is_unescaped(ref_box));
+            .retain(|&ref_box, _| cache.is_unescaped(ref_box, boxes));
         self.cache_seen_allocation
-            .retain(|&ref_box, _| cache.is_unescaped(ref_box));
+            .retain(|&ref_box, _| cache.is_unescaped(ref_box, boxes));
         if let Some(seen) = &mut self.quasiimmut_seen {
             seen.clear();
         }
@@ -277,28 +343,20 @@ impl CacheEntry {
 ///
 /// In Rust, safe ownership makes this harder to express directly, so it stores
 /// a raw pointer back to the cache for writeback.
-pub struct FieldUpdater {
+pub struct FieldUpdater<'a> {
     ref_box: OpRef,
     currfieldbox: Option<OpRef>,
     cache: *mut HeapCache,
+    boxes: *mut (dyn HeapcBoxes + 'a),
     descr: Option<u32>,
-    _marker: PhantomData<HeapCache>,
+    _marker: PhantomData<&'a mut HeapCache>,
 }
 
-impl FieldUpdater {
-    pub fn new(ref_box: OpRef) -> Self {
-        Self {
-            ref_box,
-            currfieldbox: None,
-            cache: std::ptr::null_mut(),
-            descr: None,
-            _marker: PhantomData,
-        }
-    }
-
+impl<'a> FieldUpdater<'a> {
     pub fn with_cache(
         ref_box: OpRef,
-        cache: &mut HeapCache,
+        cache: &'a mut HeapCache,
+        boxes: &'a mut dyn HeapcBoxes,
         descr: u32,
         fieldbox: Option<OpRef>,
     ) -> Self {
@@ -306,6 +364,7 @@ impl FieldUpdater {
             ref_box,
             currfieldbox: fieldbox,
             cache: cache as *mut HeapCache,
+            boxes,
             descr: Some(descr),
             _marker: PhantomData,
         }
@@ -330,12 +389,12 @@ impl FieldUpdater {
     /// ```
     pub fn getfield_now_known(&mut self, fieldbox: OpRef, oracle: &dyn SameConstantOracle) {
         let ref_box = self.ref_box;
-        let (cache, descr_index) = match self.cache_and_descr() {
+        let (cache, boxes, descr_index) = match self.cache_and_descr() {
             Some(pair) => pair,
             None => return,
         };
         let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
-        entry.read_now_known(ref_box, fieldbox, cache, oracle);
+        entry.read_now_known(ref_box, fieldbox, cache, boxes, oracle);
         cache.heap_cache.insert(descr_index, entry);
     }
 
@@ -347,28 +406,28 @@ impl FieldUpdater {
     /// ```
     pub fn setfield(&mut self, fieldbox: OpRef, oracle: &dyn SameConstantOracle) {
         let ref_box = self.ref_box;
-        let (cache, descr_index) = match self.cache_and_descr() {
+        let (cache, boxes, descr_index) = match self.cache_and_descr() {
             Some(pair) => pair,
             None => return,
         };
         let mut entry = cache.heap_cache.remove(&descr_index).unwrap_or_default();
-        entry.do_write_with_aliasing(ref_box, fieldbox, cache, oracle);
+        entry.do_write_with_aliasing(ref_box, fieldbox, cache, boxes, oracle);
         cache.heap_cache.insert(descr_index, entry);
     }
 
-    fn cache_and_descr(&mut self) -> Option<(&mut HeapCache, u32)> {
+    fn cache_and_descr(&mut self) -> Option<(&mut HeapCache, &mut (dyn HeapcBoxes + 'a), u32)> {
         let descr_index = self.descr?;
         if self.cache.is_null() {
             return None;
         }
-        // SAFETY: `cache` was supplied by `with_cache` which received
-        // an `&mut HeapCache`; the FieldUpdater's lifetime must not
-        // outlive that borrow (callers hold it stack-locally during
-        // a single trace step, matching upstream's pattern at
-        // pyjitpl.py:973-988 where `upd = heapcache.get_field_updater(...)`
-        // is consumed before any other heapcache operation).
+        // SAFETY: `cache` / `boxes` were supplied by `with_cache`; the
+        // FieldUpdater's lifetime must not outlive those borrows
+        // (callers hold it stack-locally during a single trace step,
+        // matching `pyjitpl.py` `upd = heapcache.get_field_updater(...)`
+        // consumed before any other heapcache operation).
         let cache = unsafe { &mut *self.cache };
-        Some((cache, descr_index))
+        let boxes = unsafe { &mut *self.boxes };
+        Some((cache, boxes, descr_index))
     }
 }
 
@@ -396,24 +455,6 @@ pub struct HeapCache {
     /// is the natural no-HashMap substitute.
     heap_array_cache: vecset::VecMap<u32, vecset::VecMap<i64, CacheEntry>>,
 
-    /// Known class map: object_ref -> class pointer. The class pointer is a
-    /// `ConstInt` vtable address (model.py:199-201), an integer the GC never
-    /// traces — not a ref. RPython: inside CacheEntry. Vec indexed by OpRef.0.
-    known_class: Vec<Option<i64>>,
-
-    /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
-    is_unescaped: BitSet,
-
-    /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
-    seen_allocation: BitSet,
-
-    /// RPython: FrontendOp flag. `Vec<u8>` indexed by OpRef.0.
-    /// 0 = unknown, 1 = non-null, 2 = null.
-    known_nullity: Vec<u8>,
-
-    /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
-    likely_virtual: BitSet,
-
     /// heapcache.py: loop-invariant call result cache.
     /// RPython stores exactly ONE result: (descr, arg0_int) → result.
     /// Subsequent calls overwrite the single entry.
@@ -429,25 +470,6 @@ pub struct HeapCache {
     loopinvariant_result: Option<OpRef>,
     loopinvariant_resvalue: Option<i64>,
 
-    /// heapcache.py: per-box `_heapc_deps`.
-    ///
-    /// RPython stores either `None` or a list on each FrontendOp:
-    /// `deps[0]` is the cached array length and `deps[1:]` are escape
-    /// dependencies added by `_escape_from_write`. pyre's `OpRef` is a bare
-    /// index, so the closest equivalent is a per-op side slot keyed by OpRef.
-    heapc_deps: Vec<Option<Vec<Option<OpRef>>>>,
-
-    /// heapcache.py: oldbox.set_replaced_with_const() in replace_box().
-    ///
-    /// RPython sets `FO_REPLACED_WITH_CONST` in the FrontendOp's
-    /// `position_and_flags` and recovers the constant with
-    /// `constant_from_op(box)`. Pyre keeps the per-box slot indexed by
-    /// `OpRef.raw()`, like `heapc_flags`, holding the constant. `OpRef` also
-    /// carries a typed Box identity (`IntOp(n)` and `RefOp(n)` are different
-    /// boxes upstream), and the constant has its box's type, so a read only
-    /// answers a box of the same type.
-    replaced_with_const: Vec<Option<OpRef>>,
-
     /// heapcache.py: need_guard_not_invalidated — set True on reset,
     /// consumed by quasi-immut field recording to decide whether to emit
     /// GUARD_NOT_INVALIDATED.
@@ -455,8 +477,6 @@ pub struct HeapCache {
 
     head_version: u32,
     likely_virtual_version: u32,
-    /// RPython: FrontendOp flags. `Vec<u32>` indexed by OpRef.0.
-    heapc_flags: Vec<u32>,
 }
 
 impl HeapCache {
@@ -465,54 +485,41 @@ impl HeapCache {
         HeapCache {
             heap_cache: vecset::VecMap::new(),
             heap_array_cache: vecset::VecMap::new(),
-            known_class: Vec::new(),
-            is_unescaped: BitSet::new(),
-            seen_allocation: BitSet::new(),
-            known_nullity: Vec::new(),
-            likely_virtual: BitSet::new(),
             loopinvariant_descr: None,
             loopinvariant_arg0: None,
             loopinvariant_result: None,
             loopinvariant_resvalue: None,
-            heapc_deps: Vec::new(),
-            replaced_with_const: Vec::new(),
             need_guard_not_invalidated: true,
             head_version: 0,
             likely_virtual_version: 0,
-            heapc_flags: Vec::new(),
         }
     }
 
     /// heapcache.py `maybe_replace_with_const(box)`.
-    fn maybe_replace_with_const(&self, opref: OpRef) -> OpRef {
+    pub(crate) fn maybe_replace_with_const(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> OpRef {
         if opref.is_constant() {
             return opref;
         }
-        match self.replaced_with_const.get(opref.raw() as usize) {
-            Some(Some(new)) if new.ty() == opref.ty() => *new,
-            _ => opref,
+        if boxes
+            .heapc(opref)
+            .is_some_and(|rec| rec.replaced_with_const)
+        {
+            let replaced = constant_from_op(opref, boxes);
+            if replaced.ty() == opref.ty() {
+                return replaced;
+            }
         }
+        opref
     }
 
-    fn flags_for_ref(&self, opref: OpRef) -> u32 {
-        if opref.is_constant() {
-            return 0;
-        }
-        self.heapc_flags
-            .get(opref.raw() as usize)
-            .copied()
-            .unwrap_or(0)
+    fn flags_for_ref(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> u32 {
+        boxes.heapc(opref).map(|rec| rec.flags).unwrap_or(0)
     }
 
-    fn set_flags_for_ref(&mut self, opref: OpRef, flags: u32) {
-        if opref.is_constant() {
-            return;
+    fn set_flags_for_ref(&self, opref: OpRef, flags: u32, boxes: &mut dyn HeapcBoxes) {
+        if let Some(rec) = boxes.heapc_mut(opref) {
+            rec.flags = flags;
         }
-        let i = opref.raw() as usize;
-        if i >= self.heapc_flags.len() {
-            self.heapc_flags.resize(i + 1, 0);
-        }
-        self.heapc_flags[i] = flags;
     }
 
     fn versioned_or(self_flags: u32, op_version: u32) -> bool {
@@ -520,13 +527,16 @@ impl HeapCache {
     }
 
     /// RPython: test_head_version(ref_frontend_op)
-    pub fn test_head_version(&self, opref: OpRef) -> bool {
-        Self::versioned_or(self.flags_for_ref(opref), self.head_version)
+    pub fn test_head_version(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        Self::versioned_or(self.flags_for_ref(opref, boxes), self.head_version)
     }
 
     /// RPython: test_likely_virtual_version(ref_frontend_op)
-    pub fn test_likely_virtual_version(&self, opref: OpRef) -> bool {
-        Self::versioned_or(self.flags_for_ref(opref), self.likely_virtual_version)
+    pub fn test_likely_virtual_version(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        Self::versioned_or(
+            self.flags_for_ref(opref, boxes),
+            self.likely_virtual_version,
+        )
     }
 
     /// RPython: update_version(ref_frontend_op)
@@ -545,8 +555,8 @@ impl HeapCache {
     ///          ref_frontend_op._set_heapc_flags(f)
     ///          ref_frontend_op._heapc_deps = None
     /// ```
-    pub fn update_version(&mut self, opref: OpRef) {
-        let old_flags = self.flags_for_ref(opref);
+    pub fn update_version(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
+        let old_flags = self.flags_for_ref(opref, boxes);
         if Self::versioned_or(old_flags, self.head_version) {
             return;
         }
@@ -556,88 +566,26 @@ impl HeapCache {
         {
             flags |= u32::from(HeapFlags::LIKELY_VIRTUAL.bits());
         }
-        self.set_flags_for_ref(opref, flags);
+        self.set_flags_for_ref(opref, flags, boxes);
         // RPython: ref_frontend_op._heapc_deps = None
-        self._remove_deps_for_box(opref);
+        self._remove_deps_for_box(opref, boxes);
     }
 
     /// RPython: _check_flag(box, flag)
-    pub fn _check_flag(&self, opref: OpRef, flag: HeapFlags) -> bool {
-        if !self.test_head_version(opref) {
+    pub fn _check_flag(&self, opref: OpRef, flag: HeapFlags, boxes: &dyn HeapcBoxes) -> bool {
+        if !self.test_head_version(opref, boxes) {
             return false;
         }
-        (self.flags_for_ref(opref) & u32::from(flag.bits())) != 0
+        (self.flags_for_ref(opref, boxes) & u32::from(flag.bits())) != 0
     }
 
     /// RPython: _set_flag(box, flag)
-    pub fn _set_flag(&mut self, opref: OpRef, flag: HeapFlags) {
+    pub fn _set_flag(&mut self, opref: OpRef, flag: HeapFlags, boxes: &mut dyn HeapcBoxes) {
         if opref.is_constant() {
             return;
         }
-        self.update_version(opref);
-        let flags = self.flags_for_ref(opref) | u32::from(flag.bits());
-        self.set_flags_for_ref(opref, flags);
-        // Keep mirrors: boolean flags used by this Rust implementation.
-        let i = opref.raw() as usize;
-        match flag {
-            HeapFlags::SEEN_ALLOCATION => {
-                self.seen_allocation.insert(i);
-            }
-            HeapFlags::KNOWN_CLASS => {
-                if i >= self.known_class.len() {
-                    self.known_class.resize(i + 1, None);
-                }
-            }
-            HeapFlags::KNOWN_NULLITY => {
-                if i >= self.known_nullity.len() {
-                    self.known_nullity.resize(i + 1, 0);
-                }
-                if self.known_nullity[i] == 0 {
-                    self.known_nullity[i] = 1;
-                }
-            }
-            HeapFlags::IS_UNESCAPED => {
-                self.is_unescaped.insert(i);
-            }
-            HeapFlags::LIKELY_VIRTUAL => {
-                self.likely_virtual.insert(i);
-            }
-            // HF_NONSTD_VABLE has no mirror — heapc_flags is the source of truth.
-            _ => {}
-        }
-    }
-
-    fn _remove_flag(&mut self, opref: OpRef, flag: HeapFlags) {
-        if opref.is_constant() {
-            return;
-        }
-        let flags = self.flags_for_ref(opref);
-        if flags == 0 {
-            return;
-        }
-        let updated = flags & !u32::from(flag.bits());
-        self.set_flags_for_ref(opref, updated);
-        let i = opref.raw() as usize;
-        match flag {
-            HeapFlags::IS_UNESCAPED => {
-                self.is_unescaped.remove(i);
-            }
-            HeapFlags::LIKELY_VIRTUAL => {
-                self.likely_virtual.remove(i);
-            }
-            HeapFlags::SEEN_ALLOCATION => {
-                self.seen_allocation.remove(i);
-            }
-            HeapFlags::KNOWN_NULLITY => {
-                if i < self.known_nullity.len() {
-                    self.known_nullity[i] = 0;
-                }
-            }
-            HeapFlags::KNOWN_CLASS if i < self.known_class.len() => {
-                self.known_class[i] = None;
-            }
-            _ => {}
-        }
+        self.update_version(opref, boxes);
+        add_flags(boxes, opref, flag);
     }
 
     /// `heapcache.py HeapCache._get_deps`.
@@ -653,19 +601,21 @@ impl HeapCache {
     /// ```
     ///
     /// The `isinstance` arm is why this returns an `Option`: a `Const` has no
-    /// `_heapc_deps` slot upstream and no `raw()` index here, so there is no
-    /// list to hand back. Dropping it would make `OpRef::raw()` panic, which
-    /// the tracer catches and downgrades to a silent `TraceAction::Abort`.
-    pub fn _get_deps(&mut self, opref: OpRef) -> Option<&mut Vec<Option<OpRef>>> {
+    /// `_heapc_deps` slot.
+    pub fn _get_deps<'b>(
+        &mut self,
+        opref: OpRef,
+        boxes: &'b mut dyn HeapcBoxes,
+    ) -> Option<&'b mut Vec<Option<OpRef>>> {
         if opref.is_constant() {
             return None;
         }
-        self.update_version(opref);
-        let i = opref.raw() as usize;
-        if i >= self.heapc_deps.len() {
-            self.heapc_deps.resize_with(i + 1, || None);
+        self.update_version(opref, boxes);
+        let rec = boxes.heapc_mut(opref)?;
+        if rec.deps.is_none() {
+            rec.deps = Some(vec![None]);
         }
-        let deps = self.heapc_deps[i].get_or_insert_with(|| vec![None]);
+        let deps = rec.deps.as_mut().unwrap();
         if deps.is_empty() {
             deps.push(None);
         }
@@ -682,16 +632,21 @@ impl HeapCache {
     ///      elif fieldbox is not None:
     ///          self._escape_box(fieldbox)
     /// ```
-    pub fn _escape_from_write(&mut self, r#box: OpRef, fieldbox: OpRef) {
-        if self.is_unescaped(r#box) && self.is_unescaped(fieldbox) {
+    pub fn _escape_from_write(
+        &mut self,
+        r#box: OpRef,
+        fieldbox: OpRef,
+        boxes: &mut dyn HeapcBoxes,
+    ) {
+        if self.is_unescaped(r#box, boxes) && self.is_unescaped(fieldbox, boxes) {
             let deps = self
-                ._get_deps(r#box)
+                ._get_deps(r#box, boxes)
                 .expect("is_unescaped answers false for a Const");
             deps.push(Some(fieldbox));
         } else {
             // RPython's `elif fieldbox is not None` — pyre's OpRef is always
             // present (no None equivalent), so the branch always fires.
-            self._escape_box(fieldbox);
+            self._escape_box(fieldbox, boxes);
         }
     }
 
@@ -714,45 +669,46 @@ impl HeapCache {
     ///                  for i in range(1, len(deps)):
     ///                      self._escape_box(deps[i])
     /// ```
-    pub fn _escape_box(&mut self, opref: OpRef) {
-        if opref.is_constant() {
+    pub fn _escape_box(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
+        if boxes.heapc(opref).is_none() {
             return;
         }
-        let i = opref.raw() as usize;
-        if !self.is_unescaped.contains(i) {
-            return;
-        }
-        self.is_unescaped.remove(i);
-        // RPython remove_flags(box, HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED).
-        // _remove_flag updates heapc_flags AND mirrors HF_IS_UNESCAPED /
-        // HF_LIKELY_VIRTUAL Vec<bool> back out, so the version-gated
-        // _check_flag query stays consistent.
-        self._remove_flag(opref, HeapFlags::LIKELY_VIRTUAL);
-        self._remove_flag(opref, HeapFlags::IS_UNESCAPED);
-        let i = opref.raw() as usize;
-        let deps = self.heapc_deps.get_mut(i).and_then(Option::take);
+        remove_flags(
+            boxes,
+            opref,
+            HeapFlags::LIKELY_VIRTUAL | HeapFlags::IS_UNESCAPED,
+        );
+        let deps = boxes.heapc_mut(opref).and_then(|rec| rec.deps.take());
         if let Some(deps) = deps
-            && self.test_head_version(opref)
+            && self.test_head_version(opref, boxes)
         {
             let kept_len = deps.first().cloned().flatten();
             if let Some(length) = kept_len {
-                self.heapc_deps[i] = Some(vec![Some(length)]);
+                if let Some(rec) = boxes.heapc_mut(opref) {
+                    rec.deps = Some(vec![Some(length)]);
+                }
             }
             for dep in deps.into_iter().skip(1).flatten() {
-                self._escape_box(dep);
+                self._escape_box(dep, boxes);
             }
         }
     }
 
     /// RPython: mark_escaped(opnum, descr, *argboxes) entrypoint.
-    pub fn mark_escaped(&mut self, opnum: OpCode, _descr: Option<OpRef>, argboxes: &[OpRef]) {
+    pub fn mark_escaped(
+        &mut self,
+        opnum: OpCode,
+        _descr: Option<OpRef>,
+        argboxes: &[OpRef],
+        boxes: &mut dyn HeapcBoxes,
+    ) {
         if opnum == OpCode::SetfieldGc {
             if argboxes.len() == 2 {
-                self._escape_from_write(argboxes[0], argboxes[1]);
+                self._escape_from_write(argboxes[0], argboxes[1], boxes);
             }
         } else if opnum == OpCode::SetarrayitemGc {
             if argboxes.len() == 3 {
-                self._escape_from_write(argboxes[0], argboxes[2]);
+                self._escape_from_write(argboxes[0], argboxes[2], boxes);
             }
         } else if !matches!(
             opnum,
@@ -765,7 +721,7 @@ impl HeapCache {
                 | OpCode::InstancePtrNe
                 | OpCode::AssertNotNone
         ) {
-            self._escape_argboxes(argboxes);
+            self._escape_argboxes(argboxes, boxes);
         }
     }
 
@@ -787,6 +743,7 @@ impl HeapCache {
         effectinfo: Option<&EffectInfo>,
         argboxes: &[OpRef],
         const_value: F,
+        boxes: &mut dyn HeapcBoxes,
     ) {
         if opnum == OpCode::CallN {
             if let Some(ei) = effectinfo
@@ -815,19 +772,19 @@ impl HeapCache {
                 }
             }
             // heapcache.py:291-293 fallback: escape all argboxes.
-            self._escape_argboxes(argboxes);
+            self._escape_argboxes(argboxes, boxes);
             return;
         }
-        self.mark_escaped(opnum, None, argboxes)
+        self.mark_escaped(opnum, None, argboxes, boxes)
     }
 
     /// RPython: _escape_argboxes(*argboxes)
-    pub fn _escape_argboxes(&mut self, args: &[OpRef]) {
+    pub fn _escape_argboxes(&mut self, args: &[OpRef], boxes: &mut dyn HeapcBoxes) {
         if args.is_empty() {
             return;
         }
-        self._escape_box(args[0]);
-        self._escape_argboxes(&args[1..]);
+        self._escape_box(args[0], boxes);
+        self._escape_argboxes(&args[1..], boxes);
     }
 
     /// heapcache.py `getfield(self, box, descr)`.
@@ -851,12 +808,13 @@ impl HeapCache {
         obj: OpRef,
         field_index: u32,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) -> Option<OpRef> {
         if declines_unnumbered_field(field_index) {
             return None;
         }
         let mut entry = self.heap_cache.remove(&field_index)?;
-        let result = entry.read(obj, self, oracle);
+        let result = entry.read(obj, self, boxes, oracle);
         self.heap_cache.insert(field_index, entry);
         result
     }
@@ -883,12 +841,13 @@ impl HeapCache {
         field_index: u32,
         value: OpRef,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) {
         if declines_unnumbered_field(field_index) {
             return;
         }
         let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
-        entry.do_write_with_aliasing(obj, value, self, oracle);
+        entry.do_write_with_aliasing(obj, value, self, boxes, oracle);
         self.heap_cache.insert(field_index, entry);
     }
 
@@ -910,19 +869,20 @@ impl HeapCache {
         field_index: u32,
         value: OpRef,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) {
         if declines_unnumbered_field(field_index) {
             return;
         }
         let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
-        entry.read_now_known(obj, value, self, oracle);
+        entry.read_now_known(obj, value, self, boxes, oracle);
         self.heap_cache.insert(field_index, entry);
     }
 
     /// heapcache.py: invalidate_unescaped — clear cached values for
     /// escaped objects only. Unescaped (newly allocated) objects cannot
     /// be affected by external calls, so their caches are preserved.
-    pub fn invalidate_caches_for_escaped(&mut self) {
+    pub fn invalidate_caches_for_escaped(&mut self, boxes: &dyn HeapcBoxes) {
         // heapcache.py:362-365 — `for cache in self.heap_cache.itervalues():
         //                           cache.invalidate_unescaped()`.
         // Take/restore is the borrow-split equivalent of upstream's stored
@@ -933,7 +893,7 @@ impl HeapCache {
         // tripping over `entry` and `self.heap_cache` simultaneously.
         let mut heap_cache = std::mem::take(&mut self.heap_cache);
         for entry in heap_cache.values_mut() {
-            entry.invalidate_unescaped(self);
+            entry.invalidate_unescaped(self, boxes);
         }
         self.heap_cache = heap_cache;
         // heapcache.py getarrayitem: iterate cached_arrayitems and invalidate
@@ -941,7 +901,7 @@ impl HeapCache {
         let mut heap_array_cache = std::mem::take(&mut self.heap_array_cache);
         for caches in heap_array_cache.values_mut() {
             for cache in caches.values_mut() {
-                cache.invalidate_unescaped(self);
+                cache.invalidate_unescaped(self, boxes);
             }
         }
         self.heap_array_cache = heap_array_cache;
@@ -956,18 +916,19 @@ impl HeapCache {
     ///      add_flags(box, HF_LIKELY_VIRTUAL | HF_SEEN_ALLOCATION | HF_IS_UNESCAPED
     ///                     | HF_KNOWN_NULLITY)
     /// ```
-    pub fn new_object(&mut self, opref: OpRef) {
+    pub fn new_object(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
         if opref.is_constant() {
             return;
         }
-        self.update_version(opref);
-        // RPython add_flags writes the bitwise OR of all four flags into the
-        // versioned heapc_flags. We route through _set_flag so the Vec<bool>
-        // mirrors stay in sync with heapc_flags.
-        self._set_flag(opref, HeapFlags::LIKELY_VIRTUAL);
-        self._set_flag(opref, HeapFlags::SEEN_ALLOCATION);
-        self._set_flag(opref, HeapFlags::IS_UNESCAPED);
-        self._set_flag(opref, HeapFlags::KNOWN_NULLITY);
+        self.update_version(opref, boxes);
+        add_flags(
+            boxes,
+            opref,
+            HeapFlags::LIKELY_VIRTUAL
+                | HeapFlags::SEEN_ALLOCATION
+                | HeapFlags::IS_UNESCAPED
+                | HeapFlags::KNOWN_NULLITY,
+        );
     }
 
     /// heapcache.py new_array
@@ -983,28 +944,23 @@ impl HeapCache {
     ///      add_flags(box, flags)
     ///      self.arraylen_now_known(box, lengthbox)
     /// ```
-    pub fn new_array(&mut self, opref: OpRef, lengthbox: OpRef, length_is_const: bool) {
+    pub fn new_array(
+        &mut self,
+        opref: OpRef,
+        lengthbox: OpRef,
+        length_is_const: bool,
+        boxes: &mut dyn HeapcBoxes,
+    ) {
         if opref.is_constant() {
             return;
         }
-        // RPython:
-        //     self.update_version(box)
-        //     flags = HF_SEEN_ALLOCATION | HF_KNOWN_NULLITY
-        //     if isinstance(lengthbox, Const):
-        //         flags |= HF_LIKELY_VIRTUAL | HF_IS_UNESCAPED
-        //     add_flags(box, flags)
-        //     self.arraylen_now_known(box, lengthbox)
-        self.update_version(opref);
-        self._set_flag(opref, HeapFlags::SEEN_ALLOCATION);
-        // RPython adds HF_KNOWN_NULLITY directly via add_flags. Route through
-        // nullity_now_known so the Vec<u8> value mirror also captures non-null.
-        self.nullity_now_known(opref, true);
+        self.update_version(opref, boxes);
+        let mut flags = HeapFlags::SEEN_ALLOCATION | HeapFlags::KNOWN_NULLITY;
         if length_is_const {
-            self._set_flag(opref, HeapFlags::LIKELY_VIRTUAL);
-            self._set_flag(opref, HeapFlags::IS_UNESCAPED);
+            flags |= HeapFlags::LIKELY_VIRTUAL | HeapFlags::IS_UNESCAPED;
         }
-        // heapcache.py: self.arraylen_now_known(box, lengthbox)
-        self.arraylen_now_known(opref, lengthbox);
+        add_flags(boxes, opref, flags);
+        self.arraylen_now_known(opref, lengthbox, boxes);
     }
 
     /// heapcache.py is_known_nonstandard_virtualizable
@@ -1013,9 +969,9 @@ impl HeapCache {
     ///  def is_known_nonstandard_virtualizable(self, box):
     ///      return self._check_flag(box, HF_NONSTD_VABLE) or self._check_flag(box, HF_SEEN_ALLOCATION)
     /// ```
-    pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HeapFlags::NONSTD_VABLE)
-            || self._check_flag(opref, HeapFlags::SEEN_ALLOCATION)
+    pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        self._check_flag(opref, HeapFlags::NONSTD_VABLE, boxes)
+            || self._check_flag(opref, HeapFlags::SEEN_ALLOCATION, boxes)
     }
 
     /// heapcache.py nonstandard_virtualizables_now_known
@@ -1026,11 +982,15 @@ impl HeapCache {
     ///          return
     ///      self._set_flag(box, HF_NONSTD_VABLE)
     /// ```
-    pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
+    pub fn nonstandard_virtualizables_now_known(
+        &mut self,
+        opref: OpRef,
+        boxes: &mut dyn HeapcBoxes,
+    ) {
         if opref.is_constant() {
             return;
         }
-        self._set_flag(opref, HeapFlags::NONSTD_VABLE);
+        self._set_flag(opref, HeapFlags::NONSTD_VABLE, boxes);
     }
 
     /// heapcache.py `replace_box(oldbox, newbox)`.
@@ -1042,14 +1002,12 @@ impl HeapCache {
     ///          assert newbox.same_constant(constant_from_op(oldbox))
     ///          oldbox.set_replaced_with_const()
     /// ```
-    ///
-    pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
-        if !old.is_constant() && new.is_constant() {
-            let i = old.raw() as usize;
-            if i >= self.replaced_with_const.len() {
-                self.replaced_with_const.resize(i + 1, None);
-            }
-            self.replaced_with_const[i] = Some(new);
+    pub fn replace_box(&mut self, old: OpRef, new: OpRef, boxes: &mut dyn HeapcBoxes) {
+        if !old.is_constant()
+            && new.is_constant()
+            && let Some(rec) = boxes.heapc_mut(old)
+        {
+            rec.replaced_with_const = true;
         }
     }
 
@@ -1061,60 +1019,23 @@ impl HeapCache {
     ///          return
     ///      self._set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY)
     /// ```
-    ///
-    /// pyre additionally remembers the concrete class pointer when this
-    /// layer can decode it.
-    pub fn class_now_known_maybe(&mut self, opref: OpRef, class: Option<i64>) {
+    pub fn class_now_known(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
         if opref.is_constant() {
             return;
         }
-        let i = opref.raw() as usize;
-        if i >= self.known_class.len() {
-            self.known_class.resize(i + 1, None);
-        }
-        if let Some(class) = class {
-            self.known_class[i] = Some(class);
-        }
-        // RPython _set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY).
-        self._set_flag(opref, HeapFlags::KNOWN_CLASS);
-        // RPython also writes HF_KNOWN_NULLITY in the same _set_flag call;
-        // route through nullity_now_known so the Vec<u8> value mirror also
-        // captures non-null.
-        self.nullity_now_known(opref, true);
-    }
-
-    pub fn class_now_known(&mut self, opref: OpRef, class: i64) {
-        self.class_now_known_maybe(opref, Some(class));
+        self._set_flag(
+            opref,
+            HeapFlags::KNOWN_CLASS | HeapFlags::KNOWN_NULLITY,
+            boxes,
+        );
     }
 
     /// heapcache.py is_class_known.
     ///   `return self._check_flag(box, HF_KNOWN_CLASS)`
     /// Version-gated through `_check_flag` so a `reset_keep_likely_virtuals`
     /// (which only bumps `head_version`) hides stale class info.
-    pub fn is_class_known(&self, opref: OpRef) -> bool {
-        if opref.is_constant() {
-            return false;
-        }
-        self._check_flag(opref, HeapFlags::KNOWN_CLASS)
-    }
-
-    /// Get the known class of an object, if available.
-    /// Mirrors heapcache.py is_class_known — only valid when the version is current,
-    /// because the side `known_class` Vec may hold stale entries from
-    /// before the last `reset_keep_likely_virtuals`.
-    pub fn get_known_class(&self, opref: OpRef) -> Option<i64> {
-        if opref.is_constant() {
-            return None;
-        }
-        if !self._check_flag(opref, HeapFlags::KNOWN_CLASS) {
-            return None;
-        }
-        // A stored class of 0 means the allocation's vtable address was unavailable at build
-        // time, so the value reads as no known class while the flag stays valid.
-        self.known_class
-            .get(opref.raw() as usize)
-            .and_then(|v| *v)
-            .filter(|&c| c != 0)
+    pub fn is_class_known(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        self._check_flag(opref, HeapFlags::KNOWN_CLASS, boxes)
     }
 
     /// Walk every cached *value* slot so a `ConstPtr` ref survives a moving
@@ -1124,13 +1045,16 @@ impl HeapCache {
     /// place. Every other `OpRef` kind is a no-op.
     ///
     /// Only value slots are walked — these are returned on cache hits and
-    /// emitted into the op-graph (`replaced_with_const` /
-    /// `loopinvariant_result` / `CacheEntry` field values), so a stale one
-    /// is a use-after-move. The `cache_anything` / `cache_seen_allocation`
-    /// / `quasiimmut_seen_refs` *keys* are deliberately left stale: a forwarded
-    /// lookup key simply misses the stale-keyed entry and the cache
-    /// repopulates (same contract as the `call_pure_results` cache), and an
-    /// in-place key rewrite would break the sorted-`VecMap` ordering.
+    /// emitted into the op-graph (`loopinvariant_result` / `CacheEntry`
+    /// field values), so a stale one is a use-after-move. The
+    /// `cache_anything` / `cache_seen_allocation` / `quasiimmut_seen_refs`
+    /// *keys* are deliberately left stale: a forwarded lookup key simply
+    /// misses the stale-keyed entry and the cache repopulates (same contract
+    /// as the `call_pure_results` cache), and an in-place key rewrite would
+    /// break the sorted-`VecMap` ordering.
+    ///
+    /// `FO_REPLACED_WITH_CONST` and `_heapc_deps` live on the FrontendOp
+    /// record; the recorder walks those ConstPtrs.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
             if let OpRef::ConstPtr(gcref) = slot {
@@ -1159,20 +1083,12 @@ impl HeapCache {
         if let Some(slot) = self.loopinvariant_result.as_mut() {
             forward(slot, visitor);
         }
-        for slot in self.replaced_with_const.iter_mut().flatten() {
-            forward(slot, visitor);
-        }
-        for deps in self.heapc_deps.iter_mut().flatten() {
-            for slot in deps.iter_mut().flatten() {
-                forward(slot, visitor);
-            }
-        }
     }
 
     /// heapcache.py is_unescaped.
     ///   `return self._check_flag(box, HF_IS_UNESCAPED)`
-    pub fn is_unescaped(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HeapFlags::IS_UNESCAPED)
+    pub fn is_unescaped(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        self._check_flag(opref, HeapFlags::IS_UNESCAPED, boxes)
     }
 
     /// heapcache.py `CacheEntry._seen_alloc(box)`:
@@ -1182,17 +1098,23 @@ impl HeapCache {
     ///      return False
     ///  return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
     /// ```
-    pub fn saw_allocation(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HeapFlags::SEEN_ALLOCATION)
+    pub fn saw_allocation(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        self._check_flag(opref, HeapFlags::SEEN_ALLOCATION, boxes)
     }
 
     /// Notify the cache about an operation, potentially invalidating entries.
     ///
     /// This should be called for every operation during tracing, so the cache
     /// can track which operations affect heap state.
-    pub fn notify_op(&mut self, opcode: OpCode, args: &[OpRef], result: OpRef) {
+    pub fn notify_op(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        result: OpRef,
+        boxes: &mut dyn HeapcBoxes,
+    ) {
         if opcode.is_malloc() {
-            self.new_object(result);
+            self.new_object(result, boxes);
             return;
         }
         // heapcache.py `mark_escaped` routes SETFIELD_GC /
@@ -1204,32 +1126,24 @@ impl HeapCache {
         // the value escapes (heapcache.py `elif fieldbox is not
         // None: self._escape_box(fieldbox)`).
         if opcode == OpCode::SetfieldGc && args.len() >= 2 {
-            self._escape_from_write(args[0], args[1]);
+            self._escape_from_write(args[0], args[1], boxes);
         }
         if opcode == OpCode::SetarrayitemGc && args.len() >= 3 {
-            self._escape_from_write(args[0], args[2]);
+            self._escape_from_write(args[0], args[2], boxes);
         }
         // heapcache.py: GUARD_VALUE → known constant + nonnull.
         if opcode == OpCode::GuardValue && args.len() >= 2 {
-            self.nullity_now_known(args[0], true);
+            self.nullity_now_known(args[0], boxes);
         }
         // heapcache.py `class_now_known(box)` sets HF_KNOWN_CLASS
-        // on args[0]. RPython stores only the flag; pyre additionally keeps
-        // the concrete class pointer when it can decode the class operand.
-        // Guard class operands are ConstInt vtable addresses upstream:
-        // model.py `cls_of_box()` returns ConstInt(ptr2int(typeptr))
-        // and aarch64/regalloc.py:829 reads `op.getarg(1).getint()`.
-        // Legacy pool-indexed class args still mark the class as known
-        // without a concrete side value because this layer has no pool.
+        // on args[0]. The class pointer is the box's own typeptr
+        // (`pyjitpl.py` `opimpl_guard_class` / `cls_of_box`).
         if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
-            let class = args
-                .get(1)
-                .and_then(|class_val| class_val.const_int_value());
-            self.class_now_known_maybe(args[0], class);
+            self.class_now_known(args[0], boxes);
         }
         // heapcache.py: GUARD_NONNULL → known non-null.
         if opcode == OpCode::GuardNonnull && !args.is_empty() {
-            self.nullity_now_known(args[0], true);
+            self.nullity_now_known(args[0], boxes);
         }
 
         // heapcache.py: mark_escaped — escape arguments for
@@ -1255,7 +1169,7 @@ impl HeapCache {
 
         if !dont_escape {
             for &arg in args {
-                self._escape_box(arg);
+                self._escape_box(arg, boxes);
             }
         }
     }
@@ -1273,12 +1187,13 @@ impl HeapCache {
         argboxes: &[OpRef],
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &mut dyn HeapcBoxes,
     ) {
-        self.mark_escaped_varargs(opnum, effectinfo, argboxes, &const_value);
+        self.mark_escaped_varargs(opnum, effectinfo, argboxes, &const_value, boxes);
         if Self::_clear_caches_not_necessary(opnum) {
             return;
         }
-        self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value);
+        self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value, boxes);
     }
 
     /// heapcache.py clear_caches_not_necessary
@@ -1350,8 +1265,9 @@ impl HeapCache {
         argboxes: &[OpRef],
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &mut dyn HeapcBoxes,
     ) {
-        self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
+        self.clear_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value, boxes)
     }
 
     /// heapcache.py clear_caches_varargs.
@@ -1362,6 +1278,7 @@ impl HeapCache {
         argboxes: &[OpRef],
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &mut dyn HeapcBoxes,
     ) {
         self.need_guard_not_invalidated = true;
         // RPython `heapcache.py clear_caches_varargs`:
@@ -1419,6 +1336,7 @@ impl HeapCache {
                         single_descr_idx,
                         oracle,
                         const_value,
+                        boxes,
                     );
                     return;
                 }
@@ -1430,6 +1348,7 @@ impl HeapCache {
                         single_descr_idx,
                         oracle,
                         const_value,
+                        boxes,
                     );
                     return;
                 }
@@ -1441,13 +1360,13 @@ impl HeapCache {
             // 457-460) rather than reading any pre-snapshotted bit table.
             let mut heap_cache = std::mem::take(&mut self.heap_cache);
             for cache in heap_cache.values_mut() {
-                cache.invalidate_unescaped(self);
+                cache.invalidate_unescaped(self, boxes);
             }
             self.heap_cache = heap_cache;
             let mut heap_array_cache = std::mem::take(&mut self.heap_array_cache);
             for caches in heap_array_cache.values_mut() {
                 for cache in caches.values_mut() {
-                    cache.invalidate_unescaped(self);
+                    cache.invalidate_unescaped(self, boxes);
                 }
             }
             self.heap_array_cache = heap_array_cache;
@@ -1466,8 +1385,9 @@ impl HeapCache {
         argboxes: &[OpRef],
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &mut dyn HeapcBoxes,
     ) {
-        self.mark_escaped(opnum, None, argboxes);
+        self.mark_escaped(opnum, None, argboxes, boxes);
         if Self::_clear_caches_not_necessary(opnum) {
             return;
         }
@@ -1478,7 +1398,7 @@ impl HeapCache {
         // the `mark_escaped` for the SETFIELD/SETARRAYITEM special cases
         // that `mark_escaped_varargs` would skip.  The 1:1 split is kept
         // by `mark_escaped`'s opnum filter.
-        self.invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value);
+        self.invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value, boxes);
     }
 
     /// heapcache.py _clear_caches_arraycopy
@@ -1497,6 +1417,7 @@ impl HeapCache {
         single_write_descr_array: Option<u32>,
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &dyn HeapcBoxes,
     ) {
         // argboxes layout from RPython oopspec ll_arraycopy:
         //   [func, src, dst, srcstart, dststart, length]
@@ -1513,6 +1434,7 @@ impl HeapCache {
             single_write_descr_array,
             oracle,
             const_value,
+            boxes,
         );
     }
 
@@ -1532,6 +1454,7 @@ impl HeapCache {
         single_write_descr_array: Option<u32>,
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &dyn HeapcBoxes,
     ) {
         // argboxes layout from RPython oopspec ll_arraymove:
         //   [func, arr, srcstart, dststart, length]
@@ -1548,6 +1471,7 @@ impl HeapCache {
             single_write_descr_array,
             oracle,
             const_value,
+            boxes,
         );
     }
 
@@ -1584,9 +1508,10 @@ impl HeapCache {
         single_write_descr_array: Option<u32>,
         const_value: impl Fn(OpRef) -> Option<i64>,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) {
-        let seen_allocation_of_target = self.saw_allocation(dest_box);
-        let seen_allocation_of_source = self.saw_allocation(source_box);
+        let seen_allocation_of_target = self.saw_allocation(dest_box, boxes);
+        let seen_allocation_of_source = self.saw_allocation(source_box, boxes);
         let srcstart = const_value(source_start_box);
         let dststart = const_value(dest_start_box);
         let length = const_value(length_box);
@@ -1625,7 +1550,8 @@ impl HeapCache {
                 // The Box identity is the OpRef; its intrinsic `value`
                 // travels with the frontend value slot, so the copy needs no
                 // explicit payload handling.
-                let value = raw_value.map(|fieldbox| self.maybe_replace_with_const(fieldbox));
+                let value =
+                    raw_value.map(|fieldbox| self.maybe_replace_with_const(fieldbox, boxes));
                 // heapcache.py:423-429: ...and write it to the dest cell.
                 if let Some(value) = value {
                     let dst_index = dststart + i;
@@ -1689,6 +1615,7 @@ impl HeapCache {
         single_write_descr_array: Option<u32>,
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &dyn HeapcBoxes,
     ) {
         self._clear_caches_arrayop_with_consts(
             source_box,
@@ -1699,6 +1626,7 @@ impl HeapCache {
             single_write_descr_array,
             const_value,
             oracle,
+            boxes,
         );
     }
 
@@ -1710,8 +1638,9 @@ impl HeapCache {
         argboxes: &[OpRef],
         oracle: &dyn SameConstantOracle,
         const_value: F,
+        boxes: &mut dyn HeapcBoxes,
     ) {
-        self.invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
+        self.invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value, boxes)
     }
 
     /// heapcache.py `get_field_updater(self, box, descr)`.
@@ -1733,14 +1662,15 @@ impl HeapCache {
     /// `oracle` parameter because pyre's `same_constant` lives on the
     /// `ConstOprefOracle` (inline Const OpRef value compare) rather than
     /// on the OpRef itself.
-    pub fn get_field_updater(
-        &mut self,
+    pub fn get_field_updater<'a>(
+        &'a mut self,
         obj: OpRef,
         descr_index: u32,
         oracle: &dyn SameConstantOracle,
-    ) -> FieldUpdater {
+        boxes: &'a mut dyn HeapcBoxes,
+    ) -> FieldUpdater<'a> {
         let fieldbox = if let Some(mut entry) = self.heap_cache.remove(&descr_index) {
-            let result = entry.read(obj, self, oracle);
+            let result = entry.read(obj, self, boxes, oracle);
             self.heap_cache.insert(descr_index, entry);
             result
         } else {
@@ -1748,7 +1678,7 @@ impl HeapCache {
             self.heap_cache.insert(descr_index, CacheEntry::new());
             None
         };
-        FieldUpdater::with_cache(obj, self, descr_index, fieldbox)
+        FieldUpdater::with_cache(obj, self, boxes, descr_index, fieldbox)
     }
 
     // ── Array item caching (RPython heapcache.py cached_arrayitems) ──
@@ -1768,16 +1698,17 @@ impl HeapCache {
         index_value: i64,
         descr: u32,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) -> Option<OpRef> {
         let entry = self
             .heap_array_cache
             .get_mut(&descr)?
             .get_mut(&index_value)?;
         let array = entry._unique_const_heuristic(array, oracle);
-        let seen_alloc = self.saw_allocation(array);
+        let seen_alloc = self.saw_allocation(array, boxes);
         let entry = self.heap_array_cache.get(&descr)?.get(&index_value)?;
         let cached = entry._getdict(seen_alloc).get(&array).cloned()?;
-        Some(self.maybe_replace_with_const(cached))
+        Some(self.maybe_replace_with_const(cached, boxes))
     }
 
     /// heapcache.py `setarrayitem`. Non-ConstInt index (`None`
@@ -1792,6 +1723,7 @@ impl HeapCache {
         descr: u32,
         value: OpRef,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) {
         let Some(index_value) = index_value else {
             if let Some(cache) = self.heap_array_cache.get_mut(&descr) {
@@ -1799,7 +1731,7 @@ impl HeapCache {
             }
             return;
         };
-        let seen_alloc = self.saw_allocation(array);
+        let seen_alloc = self.saw_allocation(array, boxes);
         let entry = self
             .heap_array_cache
             .entry(descr)
@@ -1823,11 +1755,12 @@ impl HeapCache {
         descr: u32,
         value: OpRef,
         oracle: &dyn SameConstantOracle,
+        boxes: &dyn HeapcBoxes,
     ) {
         let Some(index_value) = index_value else {
             return;
         };
-        let seen_alloc = self.saw_allocation(array);
+        let seen_alloc = self.saw_allocation(array, boxes);
         let entry = self
             .heap_array_cache
             .entry(descr)
@@ -1938,48 +1871,31 @@ impl HeapCache {
     ///      self._set_flag(box, HF_KNOWN_NULLITY)
     /// ```
     ///
-    /// pyre additionally tracks WHICH side of the nullity is known (1 =
-    /// non-null, 2 = null) in the `known_nullity` Vec — RPython does not
-    /// need this because callers re-read box.getref_base() at consume time.
-    pub fn nullity_now_known(&mut self, opref: OpRef, is_nonnull: bool) {
+    /// Which side of the nullity is known is the box's own `getref_base()`
+    /// (`pyjitpl.py` `opimpl_goto_if_not_ptr_nonzero`).
+    pub fn nullity_now_known(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
         if opref.is_constant() {
             return;
         }
-        let i = opref.raw() as usize;
-        if i >= self.known_nullity.len() {
-            self.known_nullity.resize(i + 1, 0);
-        }
-        self.known_nullity[i] = if is_nonnull { 1 } else { 2 };
-        // RPython _set_flag(box, HF_KNOWN_NULLITY).
-        self._set_flag(opref, HeapFlags::KNOWN_NULLITY);
+        self._set_flag(opref, HeapFlags::KNOWN_NULLITY, boxes);
     }
 
-    /// Check if a value's nullity is known.
     /// heapcache.py: is_nullity_known(box)
     ///   if isinstance(box, Const): return bool(box.getref_base())
-    ///
-    /// `const_value` resolves a constant-namespace OpRef to its raw value.
-    /// RPython reads `box.getref_base()` directly; Rust needs a lookup
-    /// into the constant pool.
-    pub fn is_nullity_known(
-        &self,
-        opref: OpRef,
-        const_value: impl Fn(OpRef) -> Option<i64>,
-    ) -> Option<bool> {
+    ///   return self._check_flag(box, HF_KNOWN_NULLITY)
+    pub fn is_nullity_known(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
         if opref.is_constant() {
             // heapcache.py:477: return bool(box.getref_base())
-            // A null ConstPtr (value 0) is known-null; non-zero is known-nonnull.
-            return Some(const_value(opref).unwrap_or(0) != 0);
+            return match boxes
+                .box_value(opref)
+                .or_else(|| opref.inline_const_to_value())
+            {
+                Some(Value::Ref(g)) => g.0 != 0,
+                Some(Value::Int(n)) => n != 0,
+                _ => false,
+            };
         }
-        // heapcache.py: return self._check_flag(box, HF_KNOWN_NULLITY).
-        // Version-gated so a stale `known_nullity` Vec entry from before
-        // the last reset_keep_likely_virtuals does not leak through.
-        if !self._check_flag(opref, HeapFlags::KNOWN_NULLITY) {
-            return None;
-        }
-        self.known_nullity
-            .get(opref.raw() as usize)
-            .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
+        self._check_flag(opref, HeapFlags::KNOWN_NULLITY, boxes)
     }
 
     // ── Array length caching (heapcache.py arraylen_now_known / arraylen) ──
@@ -1997,15 +1913,15 @@ impl HeapCache {
     ///      return None
     /// ```
     ///
-    pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
-        if array.is_constant() || !self.test_head_version(array) {
+    pub fn arraylen(&self, array: OpRef, boxes: &dyn HeapcBoxes) -> Option<OpRef> {
+        if array.is_constant() || !self.test_head_version(array, boxes) {
             return None;
         }
-        self.heapc_deps
-            .get(array.raw() as usize)
-            .and_then(|deps| deps.as_ref())
+        boxes
+            .heapc(array)
+            .and_then(|rec| rec.deps.as_ref())
             .and_then(|deps| deps.first().cloned().flatten())
-            .map(|length| self.maybe_replace_with_const(length))
+            .map(|length| self.maybe_replace_with_const(length, boxes))
     }
 
     /// heapcache.py arraylen_now_known
@@ -2024,12 +1940,12 @@ impl HeapCache {
     ///
     /// `_get_deps` runs `update_version` as a side effect and ensures the
     /// `_heapc_deps` list exists with slot 0 reserved for the array length.
-    pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef) {
+    pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef, boxes: &mut dyn HeapcBoxes) {
         if array.is_constant() {
             return;
         }
         let deps = self
-            ._get_deps(array)
+            ._get_deps(array, boxes)
             .expect("assert deps is not None — the Const arm above returned");
         deps[0] = Some(length);
     }
@@ -2039,8 +1955,8 @@ impl HeapCache {
     /// Alias for `new_object` kept under the heapcache.py name `new`.
     /// Used by `opimpl_virtual_ref` (pyjitpl.py) which calls
     /// `self.metainterp.heapcache.new(resbox)` after recording VIRTUAL_REF.
-    pub fn new_box(&mut self, opref: OpRef) {
-        self.new_object(opref);
+    pub fn new_box(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
+        self.new_object(opref, boxes);
     }
 
     /// heapcache.py is_likely_virtual.
@@ -2050,13 +1966,12 @@ impl HeapCache {
     /// Note: gates on `test_likely_virtual_version` (NOT
     /// `test_head_version`) so a `reset_keep_likely_virtuals` does not
     /// invalidate this flag — the older box is still trusted as likely
-    /// virtual until the *next* version bump (line 184).
-    pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
-        if !self.test_likely_virtual_version(opref) {
+    /// virtual until the *next* version bump.
+    pub fn is_likely_virtual(&self, opref: OpRef, boxes: &dyn HeapcBoxes) -> bool {
+        if !self.test_likely_virtual_version(opref, boxes) {
             return false;
         }
-        let f = self.flags_for_ref(opref);
-        (f as u8) & HeapFlags::LIKELY_VIRTUAL.bits() != 0
+        test_flags(boxes, opref, HeapFlags::LIKELY_VIRTUAL)
     }
 
     // ── Loop-invariant call result caching ──
@@ -2175,10 +2090,6 @@ impl HeapCache {
     ///      self.loop_invariant_arg0int = -1
     /// ```
     ///
-    /// majit also clears the standalone `Vec<bool>` flags
-    /// (`is_unescaped`/`seen_allocation`/...) because those are NOT version-
-    /// gated like RPython's `_heapc_flags` — version bump alone would not
-    /// invalidate them.
     pub fn reset(&mut self) {
         // heapcache.py:166-168: bump head_version, sync likely_virtual_version.
         assert!(self.head_version < HF_VERSION_MAX);
@@ -2196,21 +2107,9 @@ impl HeapCache {
         self.loopinvariant_descr = None;
         self.loopinvariant_arg0 = None;
         self.loopinvariant_result = None;
-        // majit-only: standalone Vec<bool> flags are not version-gated, so
-        // a version bump cannot invalidate them. Clear them explicitly.
-        self.known_class.clear();
-        self.is_unescaped = BitSet::new();
-        self.seen_allocation = BitSet::new();
-        self.known_nullity.clear();
-        self.likely_virtual = BitSet::new();
-        self.heapc_deps.clear();
-        // history.py FO_REPLACED_WITH_CONST is stored on the
-        // FrontendOp's `position_and_flags` field, so RPython's flag
-        // dies with the FrontendOp at trace teardown.  pyre's
-        // `replaced_with_const` is indexed by OpRef position and OpRef
-        // numbers are reused across traces, so clear it at the same trace
-        // boundary that drops the FrontendOp objects in upstream.
-        self.replaced_with_const.clear();
+        // Per-box `_heapc_flags` / `_heapc_deps` / FO_REPLACED_WITH_CONST live
+        // on the FrontendOp record. The version bump marks them outdated;
+        // a cut drops records past the cut point together with their flags.
     }
 
     /// heapcache.py:176: check and consume need_guard_not_invalidated.
@@ -2255,13 +2154,9 @@ impl HeapCache {
     /// `set_flags_for_ref` already answer 0 and no-op for one. Without this
     /// arm `update_version` is a no-op for a constant right up to its last
     /// line, where `raw()` panics.
-    pub fn _remove_deps_for_box(&mut self, opref: OpRef) {
-        if opref.is_constant() {
-            return;
-        }
-        let i = opref.raw() as usize;
-        if i < self.heapc_deps.len() {
-            self.heapc_deps[i] = None;
+    pub fn _remove_deps_for_box(&mut self, opref: OpRef, boxes: &mut dyn HeapcBoxes) {
+        if let Some(rec) = boxes.heapc_mut(opref) {
+            rec.deps = None;
         }
     }
 }
@@ -2272,9 +2167,328 @@ impl Default for HeapCache {
     }
 }
 
+/// Shared view of [`HeapCache`] plus the FrontendOp records it reads.
+pub struct HeapCacheView<'a> {
+    cache: &'a HeapCache,
+    boxes: &'a dyn HeapcBoxes,
+}
+
+impl<'a> HeapCacheView<'a> {
+    pub fn new(cache: &'a HeapCache, boxes: &'a dyn HeapcBoxes) -> Self {
+        Self { cache, boxes }
+    }
+
+    pub fn is_unescaped(&self, opref: OpRef) -> bool {
+        self.cache.is_unescaped(opref, self.boxes)
+    }
+    pub fn saw_allocation(&self, opref: OpRef) -> bool {
+        self.cache.saw_allocation(opref, self.boxes)
+    }
+    pub fn is_class_known(&self, opref: OpRef) -> bool {
+        self.cache.is_class_known(opref, self.boxes)
+    }
+    pub fn is_nullity_known(&self, opref: OpRef) -> bool {
+        self.cache.is_nullity_known(opref, self.boxes)
+    }
+    pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
+        self.cache.is_likely_virtual(opref, self.boxes)
+    }
+    pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef) -> bool {
+        self.cache
+            .is_known_nonstandard_virtualizable(opref, self.boxes)
+    }
+    pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
+        self.cache.arraylen(array, self.boxes)
+    }
+    pub fn test_head_version(&self, opref: OpRef) -> bool {
+        self.cache.test_head_version(opref, self.boxes)
+    }
+    pub fn test_likely_virtual_version(&self, opref: OpRef) -> bool {
+        self.cache.test_likely_virtual_version(opref, self.boxes)
+    }
+    pub fn _check_flag(&self, opref: OpRef, flag: HeapFlags) -> bool {
+        self.cache._check_flag(opref, flag, self.boxes)
+    }
+}
+
+impl Deref for HeapCacheView<'_> {
+    type Target = HeapCache;
+    fn deref(&self) -> &HeapCache {
+        self.cache
+    }
+}
+
+/// Mutable view of [`HeapCache`] plus the FrontendOp records it writes.
+pub struct HeapCacheViewMut<'a> {
+    cache: &'a mut HeapCache,
+    boxes: &'a mut dyn HeapcBoxes,
+}
+
+impl<'a> HeapCacheViewMut<'a> {
+    pub fn new(cache: &'a mut HeapCache, boxes: &'a mut dyn HeapcBoxes) -> Self {
+        Self { cache, boxes }
+    }
+
+    pub fn as_view(&self) -> HeapCacheView<'_> {
+        HeapCacheView {
+            cache: self.cache,
+            boxes: self.boxes,
+        }
+    }
+
+    pub fn is_unescaped(&self, opref: OpRef) -> bool {
+        self.cache.is_unescaped(opref, self.boxes)
+    }
+    pub fn saw_allocation(&self, opref: OpRef) -> bool {
+        self.cache.saw_allocation(opref, self.boxes)
+    }
+    pub fn is_class_known(&self, opref: OpRef) -> bool {
+        self.cache.is_class_known(opref, self.boxes)
+    }
+    pub fn is_nullity_known(&self, opref: OpRef) -> bool {
+        self.cache.is_nullity_known(opref, self.boxes)
+    }
+    pub fn is_likely_virtual(&self, opref: OpRef) -> bool {
+        self.cache.is_likely_virtual(opref, self.boxes)
+    }
+    pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef) -> bool {
+        self.cache
+            .is_known_nonstandard_virtualizable(opref, self.boxes)
+    }
+    pub fn arraylen(&self, array: OpRef) -> Option<OpRef> {
+        self.cache.arraylen(array, self.boxes)
+    }
+    pub fn new_object(&mut self, opref: OpRef) {
+        self.cache.new_object(opref, self.boxes);
+    }
+    pub fn new_box(&mut self, opref: OpRef) {
+        self.cache.new_box(opref, self.boxes);
+    }
+    pub fn new_array(&mut self, opref: OpRef, lengthbox: OpRef, length_is_const: bool) {
+        self.cache
+            .new_array(opref, lengthbox, length_is_const, self.boxes);
+    }
+    pub fn class_now_known(&mut self, opref: OpRef) {
+        self.cache.class_now_known(opref, self.boxes);
+    }
+    pub fn nullity_now_known(&mut self, opref: OpRef) {
+        self.cache.nullity_now_known(opref, self.boxes);
+    }
+    pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
+        self.cache.replace_box(old, new, self.boxes);
+    }
+    pub fn arraylen_now_known(&mut self, array: OpRef, length: OpRef) {
+        self.cache.arraylen_now_known(array, length, self.boxes);
+    }
+    pub fn nonstandard_virtualizables_now_known(&mut self, opref: OpRef) {
+        self.cache
+            .nonstandard_virtualizables_now_known(opref, self.boxes);
+    }
+    pub fn notify_op(&mut self, opcode: OpCode, args: &[OpRef], result: OpRef) {
+        self.cache.notify_op(opcode, args, result, self.boxes);
+    }
+    pub fn _escape_box(&mut self, opref: OpRef) {
+        self.cache._escape_box(opref, self.boxes);
+    }
+    pub fn _get_deps(&mut self, opref: OpRef) -> Option<&mut Vec<Option<OpRef>>> {
+        self.cache._get_deps(opref, self.boxes)
+    }
+    pub fn update_version(&mut self, opref: OpRef) {
+        self.cache.update_version(opref, self.boxes);
+    }
+    pub fn _remove_deps_for_box(&mut self, opref: OpRef) {
+        self.cache._remove_deps_for_box(opref, self.boxes);
+    }
+    pub fn getfield_cached(
+        &mut self,
+        obj: OpRef,
+        field_index: u32,
+        oracle: &dyn SameConstantOracle,
+    ) -> Option<OpRef> {
+        self.cache
+            .getfield_cached(obj, field_index, oracle, self.boxes)
+    }
+    pub fn setfield_cached(
+        &mut self,
+        obj: OpRef,
+        field_index: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        self.cache
+            .setfield_cached(obj, field_index, value, oracle, self.boxes);
+    }
+    pub fn getfield_now_known(
+        &mut self,
+        obj: OpRef,
+        field_index: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        self.cache
+            .getfield_now_known(obj, field_index, value, oracle, self.boxes);
+    }
+    pub fn invalidate_caches_for_escaped(&mut self) {
+        self.cache.invalidate_caches_for_escaped(self.boxes);
+    }
+    pub fn maybe_replace_with_const(&self, opref: OpRef) -> OpRef {
+        self.cache.maybe_replace_with_const(opref, self.boxes)
+    }
+    pub fn getarrayitem_cache(
+        &mut self,
+        array: OpRef,
+        index_value: i64,
+        descr: u32,
+        oracle: &dyn SameConstantOracle,
+    ) -> Option<OpRef> {
+        self.cache
+            .getarrayitem_cache(array, index_value, descr, oracle, self.boxes)
+    }
+    pub fn setarrayitem_cache(
+        &mut self,
+        array: OpRef,
+        index_value: Option<i64>,
+        descr: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        self.cache
+            .setarrayitem_cache(array, index_value, descr, value, oracle, self.boxes);
+    }
+    pub fn getarrayitem_now_known(
+        &mut self,
+        array: OpRef,
+        index_value: Option<i64>,
+        descr: u32,
+        value: OpRef,
+        oracle: &dyn SameConstantOracle,
+    ) {
+        self.cache
+            .getarrayitem_now_known(array, index_value, descr, value, oracle, self.boxes);
+    }
+    pub fn invalidate_caches_varargs<F: Fn(OpRef) -> Option<i64>>(
+        &mut self,
+        opnum: OpCode,
+        effectinfo: Option<&EffectInfo>,
+        argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
+    ) {
+        self.cache.invalidate_caches_varargs(
+            opnum,
+            effectinfo,
+            argboxes,
+            oracle,
+            const_value,
+            self.boxes,
+        );
+    }
+    pub fn mark_escaped(&mut self, opnum: OpCode, descr: Option<OpRef>, argboxes: &[OpRef]) {
+        self.cache.mark_escaped(opnum, descr, argboxes, self.boxes);
+    }
+    pub fn invalidate_caches<F: Fn(OpRef) -> Option<i64>>(
+        &mut self,
+        opnum: OpCode,
+        effectinfo: Option<&EffectInfo>,
+        argboxes: &[OpRef],
+        oracle: &dyn SameConstantOracle,
+        const_value: F,
+    ) {
+        self.cache
+            .invalidate_caches(opnum, effectinfo, argboxes, oracle, const_value, self.boxes);
+    }
+}
+
+impl Deref for HeapCacheViewMut<'_> {
+    type Target = HeapCache;
+    fn deref(&self) -> &HeapCache {
+        self.cache
+    }
+}
+
+impl DerefMut for HeapCacheViewMut<'_> {
+    fn deref_mut(&mut self) -> &mut HeapCache {
+        self.cache
+    }
+}
+
+/// Test FrontendOp table indexed by `OpRef.raw()`, the same coordinate
+/// value ops and inputargs share after `_start`.
+#[derive(Default)]
+pub struct TestHeapcBoxes {
+    records: Vec<HeapcRecord>,
+    values: Vec<Option<Value>>,
+}
+
+impl TestHeapcBoxes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn ensure(&mut self, opref: OpRef) {
+        if opref.is_constant() {
+            return;
+        }
+        let i = opref.raw() as usize;
+        if i >= self.records.len() {
+            self.records.resize_with(i + 1, HeapcRecord::default);
+            self.values.resize(i + 1, None);
+        }
+    }
+
+    pub fn set_value(&mut self, opref: OpRef, value: Value) {
+        self.ensure(opref);
+        if !opref.is_constant() {
+            self.values[opref.raw() as usize] = Some(value);
+        }
+    }
+}
+
+impl HeapcBoxes for TestHeapcBoxes {
+    fn heapc(&self, opref: OpRef) -> Option<&HeapcRecord> {
+        if opref.is_constant() {
+            return None;
+        }
+        self.records.get(opref.raw() as usize)
+    }
+
+    fn heapc_mut(&mut self, opref: OpRef) -> Option<&mut HeapcRecord> {
+        if opref.is_constant() {
+            return None;
+        }
+        self.ensure(opref);
+        self.records.get_mut(opref.raw() as usize)
+    }
+
+    fn box_value(&self, opref: OpRef) -> Option<Value> {
+        if opref.is_constant() {
+            return opref.inline_const_to_value();
+        }
+        self.values.get(opref.raw() as usize).and_then(|v| *v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fixture {
+        cache: HeapCache,
+        boxes: TestHeapcBoxes,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                cache: HeapCache::new(),
+                boxes: TestHeapcBoxes::new(),
+            }
+        }
+
+        fn view(&mut self) -> HeapCacheViewMut<'_> {
+            HeapCacheViewMut::new(&mut self.cache, &mut self.boxes)
+        }
+    }
 
     /// Test fixture for `_unique_const_heuristic`: two ConstPtr OpRefs
     /// `(typed-Ref, raw=10000)` and `(typed-Ref, raw=10001)` compare
@@ -2349,7 +2563,8 @@ mod tests {
     /// panics instead of declining.
     #[test]
     fn get_deps_declines_a_constant_instead_of_indexing_it() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         assert!(cache._get_deps(OpRef::const_ptr(GcRef(0x1000))).is_none());
         assert!(cache._get_deps(OpRef::const_int(42)).is_none());
         assert!(cache._get_deps(OpRef::ref_op(0)).is_some());
@@ -2360,14 +2575,16 @@ mod tests {
     /// index one.
     #[test]
     fn update_version_is_a_no_op_for_a_constant() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         cache.update_version(OpRef::const_ptr(GcRef(0x1000)));
         cache._remove_deps_for_box(OpRef::const_int(42));
     }
 
     #[test]
     fn test_field_cache_basic() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(0);
         let field = 1;
         let val = OpRef::ref_op(2);
@@ -2383,7 +2600,8 @@ mod tests {
 
     #[test]
     fn test_field_cache_overwrite() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(0);
         let field = 1;
 
@@ -2402,7 +2620,8 @@ mod tests {
 
     #[test]
     fn test_setfield_aliasing() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj_a = OpRef::ref_op(0);
         let obj_b = OpRef::ref_op(1);
         let field = 5;
@@ -2428,7 +2647,8 @@ mod tests {
     /// seen-allocation identities cannot alias each other.
     #[test]
     fn test_setfield_seen_alloc_preserves_other_seen_alloc_entries() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj_a = OpRef::ref_op(0);
         let obj_b = OpRef::ref_op(1);
         let field = 5;
@@ -2458,7 +2678,8 @@ mod tests {
     /// though the target itself is in `cache_seen_allocation`.
     #[test]
     fn test_setfield_seen_alloc_clears_cache_anything() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj_a = OpRef::ref_op(0);
         let obj_b = OpRef::ref_op(1);
         let field = 5;
@@ -2478,7 +2699,8 @@ mod tests {
 
     #[test]
     fn test_invalidate_caches() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
         cache.getfield_now_known(OpRef::ref_op(1), 2, OpRef::ref_op(20), IDENTITY_ORACLE);
 
@@ -2495,7 +2717,8 @@ mod tests {
 
     #[test]
     fn test_invalidate_caches_for_escaped() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let escaped_obj = OpRef::ref_op(0);
         let unescaped_obj = OpRef::ref_op(1);
 
@@ -2513,7 +2736,8 @@ mod tests {
 
     #[test]
     fn test_new_object() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(5);
 
         assert!(!cache.is_unescaped(obj));
@@ -2526,7 +2750,8 @@ mod tests {
 
     #[test]
     fn test_mark_escaped() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(5);
 
         cache.new_object(obj);
@@ -2540,59 +2765,49 @@ mod tests {
 
     #[test]
     fn test_known_class() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(0);
-        let cls = 0x1000_i64;
 
         assert!(!cache.is_class_known(obj));
-        assert_eq!(cache.get_known_class(obj), None);
-
-        cache.class_now_known(obj, cls);
+        cache.class_now_known(obj);
         assert!(cache.is_class_known(obj));
-        assert_eq!(cache.get_known_class(obj), Some(cls));
     }
 
     #[test]
-    fn test_zero_known_class_keeps_flag_but_has_no_value() {
-        let mut cache = HeapCache::new();
-        let obj = OpRef::ref_op(0);
-
-        cache.class_now_known(obj, 0);
-
-        assert!(cache.is_class_known(obj));
-        assert_eq!(cache.get_known_class(obj), None);
-    }
-
-    #[test]
-    fn test_notify_guard_class_preserves_inline_class_value() {
-        let mut cache = HeapCache::new();
+    fn test_notify_guard_class_sets_known_class_flag() {
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(3);
-        let cls_val = 0xCAFE_i64;
-        let cls = OpRef::const_int(cls_val);
+        let cls = OpRef::const_int(0xCAFE);
 
         cache.notify_op(OpCode::GuardClass, &[obj, cls], OpRef::NONE);
 
         assert!(cache.is_class_known(obj));
-        assert_eq!(cache.get_known_class(obj), Some(cls_val));
     }
 
     #[test]
     fn test_walk_const_ptr_refs_forwards_replaced_with_const() {
-        // history.py parity: a ConstPtr cached as a replacement
-        // value must survive a moving minor collection. Forward it and read
-        // back through maybe_replace_with_const.
-        let mut cache = HeapCache::new();
+        // `FO_REPLACED_WITH_CONST` recovers the Const from the box's own
+        // value (`constant_from_op`). Forwarding that value is the
+        // recorder's walk; HeapCache no longer stores the Const.
+        let mut fx = Fixture::new();
         let old = OpRef::ref_op(3);
-        let new = OpRef::const_ptr(GcRef(0x1000));
-        cache.replace_box(old, new);
-        assert_eq!(cache.maybe_replace_with_const(old), new);
-
-        cache.walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
+        fx.boxes.set_value(old, Value::Ref(GcRef(0x1000)));
+        {
+            let mut cache = fx.view();
+            cache.replace_box(old, OpRef::const_ptr(GcRef(0x1000)));
+            assert_eq!(
+                cache.maybe_replace_with_const(old),
+                OpRef::const_ptr(GcRef(0x1000))
+            );
+        }
+        if let Some(Value::Ref(mut gcref)) = fx.boxes.box_value(old) {
             gcref.0 = gcref.0.wrapping_add(0x1_0000);
-        });
-
+            fx.boxes.set_value(old, Value::Ref(gcref));
+        }
         assert_eq!(
-            cache.maybe_replace_with_const(old),
+            fx.view().maybe_replace_with_const(old),
             OpRef::const_ptr(GcRef(0x1_1000))
         );
     }
@@ -2604,7 +2819,8 @@ mod tests {
         // simply misses + repopulates (the live lookup arrives already
         // forwarded). A `ConstPtr` object used as a `cache_anything`
         // key must therefore stay at its pre-collection address.
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let const_obj = OpRef::const_ptr(GcRef(0x2000));
         let field = 7;
         // A non-const cached value so the walk leaves the value slot alone
@@ -2629,7 +2845,8 @@ mod tests {
 
     #[test]
     fn test_notify_op_malloc() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let result = OpRef::ref_op(3);
 
         cache.notify_op(OpCode::New, &[], result);
@@ -2639,9 +2856,10 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         cache.new_object(OpRef::ref_op(0));
-        cache.class_now_known(OpRef::ref_op(0), 0x1000);
+        cache.class_now_known(OpRef::ref_op(0));
         cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10), IDENTITY_ORACLE);
 
         cache.reset();
@@ -2655,7 +2873,8 @@ mod tests {
 
     #[test]
     fn test_different_fields_independent() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(0);
 
         cache.getfield_now_known(obj, 1, OpRef::ref_op(10), IDENTITY_ORACLE);
@@ -2675,7 +2894,8 @@ mod tests {
 
     #[test]
     fn test_recursive_escape() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let container = OpRef::ref_op(0);
         let value = OpRef::ref_op(1);
         let inner = OpRef::ref_op(2);
@@ -2703,15 +2923,13 @@ mod tests {
 
     #[test]
     fn test_nullity_tracking() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(10);
 
-        assert_eq!(cache.is_nullity_known(obj, |_| None), None);
-        cache.nullity_now_known(obj, true);
-        assert_eq!(cache.is_nullity_known(obj, |_| None), Some(true));
-
-        cache.nullity_now_known(obj, false);
-        assert_eq!(cache.is_nullity_known(obj, |_| None), Some(false));
+        assert!(!cache.is_nullity_known(obj));
+        cache.nullity_now_known(obj);
+        assert!(cache.is_nullity_known(obj));
     }
 
     /// heapcache.py is_quasi_immut_known — the mark is per (fielddescr, box), and a
@@ -2720,7 +2938,8 @@ mod tests {
     /// different descr does not.
     #[test]
     fn quasi_immut_mark_is_keyed_per_descr_and_per_ref() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::const_ptr(GcRef(0x1000));
         let same_obj = OpRef::const_ptr(GcRef(0x1000));
         let other_obj = OpRef::const_ptr(GcRef(0x2000));
@@ -2744,7 +2963,8 @@ mod tests {
     /// pinned type constant is.
     #[test]
     fn quasi_immut_mark_is_dropped_by_the_call_invalidation() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::const_ptr(GcRef(0x1000));
 
         cache.quasi_immut_now_known(7, obj);
@@ -2758,7 +2978,8 @@ mod tests {
     /// a store to the field drops the mark as well.
     #[test]
     fn quasi_immut_mark_is_dropped_by_a_store_to_the_field() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::const_ptr(GcRef(0x1000));
         let value = OpRef::int_op(3);
 
@@ -2769,7 +2990,8 @@ mod tests {
 
     #[test]
     fn test_arraylen_caching() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let arr = OpRef::ref_op(5);
 
         assert_eq!(cache.arraylen(arr), None);
@@ -2779,7 +3001,8 @@ mod tests {
 
     #[test]
     fn test_arraylen_reset_keep_likely_virtuals_invalidates_length() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let arr = OpRef::ref_op(5);
 
         cache.arraylen_now_known(arr, OpRef::int_op(100));
@@ -2791,9 +3014,11 @@ mod tests {
 
     #[test]
     fn test_replace_box_marks_old_as_const() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
         let old = OpRef::ref_op(5);
         let new = OpRef::const_ptr(majit_ir::GcRef(0xDEAD));
+        fx.boxes.set_value(old, Value::Ref(GcRef(0xDEAD)));
+        let mut cache = fx.view();
 
         cache.arraylen_now_known(old, old);
         cache.replace_box(old, new);
@@ -2803,10 +3028,12 @@ mod tests {
 
     #[test]
     fn test_replace_box_keeps_typed_opref_identity() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
         let old_ref = OpRef::ref_op(5);
         let same_raw_int = OpRef::int_op(5);
         let new_ref = OpRef::const_ptr(GcRef(0));
+        fx.boxes.set_value(old_ref, Value::Ref(GcRef(0)));
+        let mut cache = fx.view();
 
         cache.arraylen_now_known(old_ref, old_ref);
         cache.arraylen_now_known(OpRef::ref_op(6), same_raw_int);
@@ -2818,7 +3045,8 @@ mod tests {
 
     #[test]
     fn test_likely_virtual() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(3);
 
         assert!(!cache.is_likely_virtual(obj));
@@ -2836,17 +3064,19 @@ mod tests {
 
     #[test]
     fn test_guard_tracking_in_notify_op() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let obj = OpRef::ref_op(10);
 
         // GUARD_NONNULL makes nullity known
         cache.notify_op(OpCode::GuardNonnull, &[obj], OpRef::NONE);
-        assert_eq!(cache.is_nullity_known(obj, |_| None), Some(true));
+        assert!(cache.is_nullity_known(obj));
     }
 
     #[test]
     fn test_loopinvariant_void_evicts_typed_slot() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let descr_index: u32 = 7;
         let arg0_int: i64 = 0xC0FFEE;
 

@@ -4486,10 +4486,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
     if !frame.ctx().heap_cache().is_class_known(obj) {
         let type_const = frame.ctx_mut().const_int(type_addr);
         frame.generate_guard(OpCode::GuardClass, &[obj, type_const]);
-        frame
-            .ctx_mut()
-            .heap_cache_mut()
-            .class_now_known(obj, type_addr);
+        frame.ctx_mut().heap_cache_mut().class_now_known(obj);
     }
     crate::trace_unbox_int(frame.ctx_mut(), obj, type_addr, intval_descr)
 }

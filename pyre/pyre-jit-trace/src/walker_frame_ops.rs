@@ -127,17 +127,13 @@ pub trait WalkerFrameOps {
             // `store_subscr_value` precondition (concrete obj/key/value
             // are direct stack reads, not quasi-immut loads) excludes
             // that path on the walker leg.
-            self.ctx_mut()
-                .heap_cache_mut()
-                .class_now_known(obj, expected_type as usize as i64);
+            self.ctx_mut().heap_cache_mut().class_now_known(obj);
             return;
         }
         let expected_type_const = self.ctx_mut().const_int(expected_type as usize as i64);
         self.generate_guard(OpCode::GuardClass, &[obj, expected_type_const]);
         // heapcache.py `class_now_known` parity.
-        self.ctx_mut()
-            .heap_cache_mut()
-            .class_now_known(obj, expected_type as usize as i64);
+        self.ctx_mut().heap_cache_mut().class_now_known(obj);
     }
 
     /// `intobject.py` `int_intval`-pattern guard — class-guard the obj

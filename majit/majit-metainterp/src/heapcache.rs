@@ -7,5 +7,7 @@
 // path even when this crate itself does not.
 #[allow(unused_imports)]
 pub use majit_trace::heapcache::{
-    CacheEntry, FieldUpdater, HF_VERSION_MAX, HeapCache, HeapFlags, SameConstantOracle,
+    CacheEntry, FieldUpdater, HF_VERSION_MAX, HeapCache, HeapCacheView, HeapCacheViewMut,
+    HeapFlags, HeapcBoxes, HeapcRecord, SameConstantOracle, TestHeapcBoxes, add_flags,
+    remove_flags, test_flags,
 };

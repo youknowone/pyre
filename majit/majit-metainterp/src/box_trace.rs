@@ -103,7 +103,7 @@ pub fn trace_unbox_int(
     if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(int_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut().class_now_known(obj, int_type_addr);
+        ctx.heap_cache_mut().class_now_known(obj);
     }
     getfield_gc_i_pureornot(ctx, obj, intval_descr)
 }
@@ -134,7 +134,7 @@ pub fn trace_box_int(
     // rewriter writes from `size_descr` IS the class, so it is known by
     // construction and upstream records it unconditionally.
     ctx.heap_cache_mut().new_object(obj);
-    ctx.heap_cache_mut().class_now_known(obj, int_type_addr);
+    ctx.heap_cache_mut().class_now_known(obj);
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], intval_descr);
     // `upd.setfield(valuebox)` parity — the cache stores the Box
@@ -304,7 +304,7 @@ pub fn trace_unbox_float(
     if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
         ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const]);
-        ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
+        ctx.heap_cache_mut().class_now_known(obj);
     }
     getfield_gc_f_pureornot(ctx, obj, floatval_descr)
 }
@@ -324,7 +324,7 @@ pub fn trace_box_float(
     // pyjitpl.py: `execute_new_with_vtable` records the class too.
     // Same reasoning as `trace_box_int`.
     ctx.heap_cache_mut().new_object(obj);
-    ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
+    ctx.heap_cache_mut().class_now_known(obj);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
     // `upd.setfield(valuebox)` parity — the cache stores the Box

@@ -3287,8 +3287,7 @@ impl MIFrame {
             // when the type guard is skipped, otherwise the watcher and the
             // trace's quasi-immut dependency would be silently dropped.
             self.flush_guard_not_invalidated(ctx);
-            ctx.heap_cache_mut()
-                .class_now_known(obj, expected_type as usize as i64);
+            ctx.heap_cache_mut().class_now_known(obj);
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
@@ -3302,8 +3301,7 @@ impl MIFrame {
         // into GUARD_NONNULL_CLASS (rewrite.py:408-444 / optimize_guard_class).
         self.generate_guard(ctx, OpCode::GuardClass, &[obj, expected_type_const]);
         // heapcache.py: class_now_known sets class + nullity.
-        ctx.heap_cache_mut()
-            .class_now_known(obj, expected_type as usize as i64);
+        ctx.heap_cache_mut().class_now_known(obj);
     }
 
     pub(crate) fn trace_guarded_int_payload(

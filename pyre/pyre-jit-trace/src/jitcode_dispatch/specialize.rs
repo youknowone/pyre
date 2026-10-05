@@ -137,9 +137,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
         args_list,
         user,
     );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(raised, exc_type);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(raised);
     ctx.trace_ctx
         .set_opref_concrete(raised, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
     fbw_built_exc_insert(raised);
@@ -3257,9 +3255,7 @@ fn walker_guard_object_mutable_cell_payload<Sym: WalkSym>(
     let physical_type = unsafe { (*live).ob_type } as i64;
     let type_const = ctx.trace_ctx.const_int(physical_type);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[value, type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(value, physical_type);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(value);
     Ok(())
 }
 
@@ -3789,9 +3785,7 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
                 OpCode::GuardClass,
                 &[attr, type_const],
             )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(attr, method_type_addr);
+            ctx.trace_ctx.heap_cache_mut().class_now_known(attr);
         }
         let null_const = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, null_const)?;
@@ -4183,9 +4177,7 @@ fn walker_emit_super_attr_binding<Sym: WalkSym>(
     // The physical layout is `Method` either way: `restamped_bound_method_new`
     // restamps the Python-visible `w_class`, not `ob_type`.
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(method_op, method_type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(method_op);
     // The concrete bound method the walker's own execution must observe; a
     // fresh `Method` per evaluation is what `getattribute` produces anyway, so
     // the trace allocating its own is not an identity divergence.
@@ -4679,9 +4671,7 @@ fn walker_emit_super_proxy_storage<Sym: WalkSym>(
         header_w_class,
     );
     let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(proxy_op, super_type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(proxy_op);
     // The concrete proxy the walker's own execution must observe.  Built last:
     // it allocates, and every address baked above is read before it runs.
     let proxy = pyre_object::descriptor::w_super_new(
@@ -4730,9 +4720,7 @@ pub(crate) fn try_walker_fold_super_attr_unwrap<Sym: WalkSym>(
         let phys_type = unsafe { (*concrete_raw).ob_type } as i64;
         let type_const = ctx.trace_ctx.const_int(phys_type);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[raw, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(raw, phys_type);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(raw);
     }
     let value = if unsafe { pyre_object::is_method(concrete_raw) } {
         let (descr, concrete) = if which == 0 {
@@ -6209,9 +6197,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         w_builtins_const,
         w_qualname_const,
     );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(func_op, &pyre_interpreter::FUNCTION_TYPE as *const _ as i64);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(func_op);
     // Tracing is execution: build the concrete function the rest of the walk
     // observes.  A fresh `Function` per evaluation is what MAKE_FUNCTION
     // produces anyway, so the trace allocating its own is not an identity
@@ -8481,9 +8467,7 @@ fn unbox_float_slot_operand<Sym: WalkSym>(
                     OpCode::GuardClass,
                     &[obj, type_const],
                 )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(obj, type_addr);
+                ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
             }
             let raw = crate::trace_unbox_float(
                 ctx.trace_ctx,
@@ -8941,9 +8925,7 @@ fn unbox_int_slot_operand<Sym: WalkSym>(
                     OpCode::GuardClass,
                     &[obj, type_const],
                 )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(obj, type_addr);
+                ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
             }
             let raw = crate::trace_unbox_int(
                 ctx.trace_ctx,
@@ -10836,9 +10818,7 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
     let class = ctx.trace_ctx.const_ref(class as i64);
     let raised =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list, user);
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(raised, exc_type);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(raised);
     ctx.trace_ctx.set_opref_concrete(
         raised,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
@@ -11443,9 +11423,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         // constant has no later arrival.  A bound returned by an inlined
         // `__index__` is live and takes the full guard.
         if arg_op.is_constant() {
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(arg_op, int_type_addr);
+            ctx.trace_ctx.heap_cache_mut().class_now_known(arg_op);
         } else {
             walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
         }
@@ -11606,9 +11584,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         .heapcache_setfield_cached(new, promote_step_index, promote_step);
 
     let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new, range_type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(new);
     ctx.trace_ctx.set_opref_concrete(
         new,
         majit_ir::Value::Ref(majit_ir::GcRef(authentic_range as usize)),
@@ -14241,9 +14217,7 @@ fn walker_guard_fold_class<Sym: WalkSym>(
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(obj, type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     Ok(())
 }
 
@@ -14283,9 +14257,7 @@ fn walker_guard_fold_class_foriter<Sym: WalkSym>(
         }
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(obj, type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     Ok(())
 }
 
@@ -14304,9 +14276,7 @@ fn walker_guard_fold_class_if_unknown<Sym: WalkSym>(
     ctx.trace_ctx
         .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(obj, type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     Ok(())
 }
 
@@ -14320,9 +14290,7 @@ fn walker_guard_stamped_class<Sym: WalkSym>(
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, type_addr);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     Ok(())
 }
@@ -14443,7 +14411,7 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
 fn walker_exc_canonical_layout(
     exc: pyre_object::PyObjectRef,
     kind: pyre_object::interp_exceptions::ExcKind,
-) -> Option<(*const pyre_object::pyobject::PyType, bool)> {
+) -> Option<bool> {
     let header =
         unsafe { &(*(exc as *const pyre_object::interp_exceptions::W_BaseException)).ob_header };
     let exc_type_ptr = header.ob_type;
@@ -14453,9 +14421,8 @@ fn walker_exc_canonical_layout(
     ) {
         return None;
     }
-    Some((
+    Some(pyre_object::interp_exceptions::exc_typeptr_is_user_layout(
         exc_type_ptr,
-        pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr),
     ))
 }
 
@@ -14469,7 +14436,6 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
     err: &pyre_interpreter::PyError,
     exc: pyre_object::PyObjectRef,
     kind: pyre_object::interp_exceptions::ExcKind,
-    exc_type_ptr: *const pyre_object::pyobject::PyType,
     user: bool,
 ) -> DispatchOutcome {
     // Message as a trace constant: deterministic under the caller's
@@ -14499,9 +14465,7 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
         args_list,
         user,
     );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(new_op);
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
     walker_chain_exception_context(ctx, ec, new_op, exc, kind, user);
@@ -15634,9 +15598,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(callable_op, method_type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(callable_op);
     let func_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
@@ -17313,7 +17275,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
+    let Some(user) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
     };
     let is_os_error_family = matches!(
@@ -17575,9 +17537,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // `heapcache.class_now_known`).  The vtable on the NewWithVtable
     // already pins the class for the optimizer; this keeps the heapcache
     // model in agreement.
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(new_op);
 
     // Record the fresh instance so a following `RaiseVarargs` recovers
     // the concrete and takes the instance fast path; stamp the dst shadow
@@ -17749,9 +17709,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
                 OpCode::GuardClass,
                 &[method_op, type_const],
             )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(method_op, method_type_addr);
+            ctx.trace_ctx.heap_cache_mut().class_now_known(method_op);
         }
         crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -18056,7 +18014,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_class {
         return Ok(None);
     }
-    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
+    let Some(user) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
     };
 
@@ -18105,9 +18063,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setfield_cached(new_op, descr_index, w_none_const);
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(new_op);
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
     walker_chain_exception_context(ctx, ec, new_op, exc, kind, user);
@@ -18261,11 +18217,11 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::TypeError {
         return Ok(None);
     }
-    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
+    let Some(user) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
     };
     Ok(Some((
-        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, exc_type_ptr, user),
+        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, user),
         op.next_pc,
     )))
 }
@@ -18331,9 +18287,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         OpCode::GuardClass,
         &[obj_op, physical_type_const],
     )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(obj_op, physical_type);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(obj_op);
 
     // `typeobject.py` promotes the version tag before an MRO lookup.
     // Pinning the receiver type covers both the named descriptor resolution
@@ -18383,11 +18337,11 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
         return Ok(None);
     }
-    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
+    let Some(user) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
     };
     Ok(Some((
-        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, exc_type_ptr, user),
+        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, user),
         op.next_pc,
     )))
 }
@@ -19200,9 +19154,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         ctx.trace_ctx.heapcache_setfield_cached(new, index, value);
     }
 
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new, iter_type_addr);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(new);
 
     let real_iter = unsafe { pyre_object::functional::w_range_iter(range_obj) };
     ctx.trace_ctx.set_opref_concrete(

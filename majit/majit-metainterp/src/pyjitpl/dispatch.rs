@@ -2221,7 +2221,7 @@ where
         // upstream only sets the flag; `is_nullity_known` then answers
         // `Some(false)` for a known-null box rather than conflating it with
         // unknown.
-        ctx.heap_cache_mut().nullity_now_known(src, value);
+        ctx.heap_cache_mut().nullity_now_known(src);
         value
     }
 

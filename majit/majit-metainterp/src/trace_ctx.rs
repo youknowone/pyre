@@ -19,7 +19,7 @@
 //! `meta.trace_ctx` to `meta.history` + `meta.trace` (upstream
 //! parity); that cascades into every call site of `TraceCtx::*`.
 
-use crate::heapcache::HeapCache;
+use crate::heapcache::{HeapCache, HeapCacheView, HeapCacheViewMut};
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use indexmap::IndexMap;
@@ -992,13 +992,13 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py:2398: access the tracing-time heap cache.
-    pub fn heap_cache(&self) -> &HeapCache {
-        &self.heap_cache
+    pub fn heap_cache(&self) -> HeapCacheView<'_> {
+        HeapCacheView::new(&self.heap_cache, &self.recorder)
     }
 
     /// Mutable access to the tracing-time heap cache.
-    pub fn heap_cache_mut(&mut self) -> &mut HeapCache {
-        &mut self.heap_cache
+    pub fn heap_cache_mut(&mut self) -> HeapCacheViewMut<'_> {
+        HeapCacheViewMut::new(&mut self.heap_cache, &mut self.recorder)
     }
 
     /// pyjitpl.py `newframe` / `popframe` log half for a JitCodeMachine
@@ -1408,7 +1408,7 @@ impl TraceCtx {
             _ => return None,
         };
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache
+        self.heap_cache_mut()
             .getarrayitem_cache(array, index_value, descr, oracle)
     }
 
@@ -1422,7 +1422,7 @@ impl TraceCtx {
             _ => None,
         };
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache
+        self.heap_cache_mut()
             .setarrayitem_cache(array, index_value, descr, value, oracle)
     }
 
@@ -1439,7 +1439,7 @@ impl TraceCtx {
             _ => None,
         };
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache
+        self.heap_cache_mut()
             .getarrayitem_now_known(array, index_value, descr, value, oracle)
     }
 
@@ -1462,7 +1462,8 @@ impl TraceCtx {
             return None;
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache.getfield_cached(obj, field_index, oracle)
+        self.heap_cache_mut()
+            .getfield_cached(obj, field_index, oracle)
     }
 
     /// heapcache.py `setfield` parity.  Same canonicalisation
@@ -1479,7 +1480,7 @@ impl TraceCtx {
             return;
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache
+        self.heap_cache_mut()
             .setfield_cached(obj, field_index, value, oracle)
     }
 
@@ -1493,7 +1494,7 @@ impl TraceCtx {
             return;
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
-        self.heap_cache
+        self.heap_cache_mut()
             .getfield_now_known(obj, field_index, value, oracle)
     }
 
@@ -1544,8 +1545,13 @@ impl TraceCtx {
             Some(Value::Int(n)) => Some(n),
             _ => None,
         };
-        self.heap_cache
-            .invalidate_caches_varargs(opnum, effectinfo, argboxes, oracle, const_value)
+        self.heap_cache_mut().invalidate_caches_varargs(
+            opnum,
+            effectinfo,
+            argboxes,
+            oracle,
+            const_value,
+        )
     }
 
     /// `heapcache.py invalidate_caches(opnum, descr, *argboxes)`, the call
@@ -1556,7 +1562,7 @@ impl TraceCtx {
             Some(Value::Int(n)) => Some(n),
             _ => None,
         };
-        self.heap_cache
+        self.heap_cache_mut()
             .invalidate_caches(opnum, None, argboxes, oracle, const_value)
     }
 
@@ -1657,7 +1663,7 @@ impl TraceCtx {
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
     /// is likely virtual (allocated during this trace and not escaped).
     pub fn is_likely_virtual(&self, obj: OpRef) -> bool {
-        self.heap_cache.is_likely_virtual(obj)
+        self.heap_cache().is_likely_virtual(obj)
     }
 
     /// pyjitpl.py:1805-1806: record VIRTUAL_REF(box, cindex).
@@ -1666,7 +1672,7 @@ impl TraceCtx {
     pub fn virtual_ref(&mut self, obj: OpRef, cindex: OpRef) -> OpRef {
         let result = Self::do_record_op(&mut self.recorder, OpCode::VirtualRefR, &[obj, cindex]);
         // pyjitpl.py:1807: heapcache.new(resbox)
-        self.heap_cache.new_object(result);
+        self.heap_cache_mut().new_object(result);
         result
     }
 
@@ -5134,7 +5140,7 @@ impl TraceCtx {
         //         self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
         //         return True
         if self
-            .heap_cache
+            .heap_cache()
             .is_known_nonstandard_virtualizable(vable_opref)
         {
             // pyjitpl.py:1124 profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS).
@@ -5268,7 +5274,7 @@ impl TraceCtx {
         //         self.execute_varargs(
         //             rop.COND_CALL, [condbox, funcbox, box],
         //             vinfo.clear_vable_descr, False, False)
-        if !self.heap_cache.is_unescaped(vable_opref) {
+        if !self.heap_cache().is_unescaped(vable_opref) {
             // `emit_force_virtualizable` starts `vinfo = fielddescr.get_vinfo();
             // assert vinfo is not None`. A plain heap FieldDescr (test harness)
             // has no backref and no active `virtualizable_info`; skip the
@@ -5282,7 +5288,7 @@ impl TraceCtx {
         // Step 5b: mark this box as a known nonstandard virtualizable so
         // future accesses short-circuit at Step 1.
         //     self.metainterp.heapcache.nonstandard_virtualizables_now_known(box)
-        self.heap_cache
+        self.heap_cache_mut()
             .nonstandard_virtualizables_now_known(vable_opref);
         true
     }
@@ -5563,21 +5569,21 @@ impl TraceCtx {
     /// through. Reading `Some(true)` alone gets the second of those right and
     /// the first wrong, and re-guards a box whose nullity is already settled.
     pub fn heapcache_nullity_answered(&self, opref: OpRef) -> bool {
-        match self.heapcache_nullity_known(opref) {
-            Some(true) => true,
-            Some(false) => !opref.is_constant(),
-            None => false,
-        }
+        self.heap_cache().is_nullity_known(opref)
     }
 
     pub fn heapcache_nullity_known(&self, opref: OpRef) -> Option<bool> {
-        self.heap_cache.is_nullity_known(opref, |op| {
-            op.inline_const_to_value().and_then(|v| match v {
-                Value::Int(n) => Some(n),
-                Value::Ref(gc) => Some(gc.0 as i64),
-                _ => None,
-            })
-        })
+        if opref.is_constant() {
+            return Some(self.heap_cache().is_nullity_known(opref));
+        }
+        if !self.heap_cache().is_nullity_known(opref) {
+            return None;
+        }
+        match self.box_value(opref) {
+            Some(Value::Ref(g)) => Some(g.0 != 0),
+            Some(Value::Int(n)) => Some(n != 0),
+            _ => Some(true),
+        }
     }
 
     /// pyjitpl.py `opimpl_assert_not_none`:
@@ -5631,7 +5637,7 @@ impl TraceCtx {
         // pure — the funnel records it and no cpu is consulted.
         self.execute_and_record(None, OpCode::AssertNotNone, None, &[opref], None, 0);
         // pyjitpl.py:391 `self.metainterp.heapcache.nullity_now_known(box)`.
-        self.heap_cache.nullity_now_known(opref, true);
+        self.heap_cache_mut().nullity_now_known(opref);
     }
 
     /// pyjitpl.py `opimpl_record_exact_class`:
@@ -5658,7 +5664,7 @@ impl TraceCtx {
     /// pyjitpl.py.  Panics if `cls_const` resolves to a non-Int
     /// constant — the dispatcher invariant guarantees int-kind here.
     pub fn trace_record_exact_class(&mut self, opref: OpRef, cls_const: OpRef) {
-        if self.heap_cache.is_class_known(opref) {
+        if self.heap_cache().is_class_known(opref) {
             self.profiler().count_ops(
                 OpCode::RecordExactClass,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,
@@ -5688,8 +5694,9 @@ impl TraceCtx {
                 cls_const, other
             ),
         };
-        self.heap_cache.class_now_known(opref, cls_value);
-        self.heap_cache.nullity_now_known(opref, true);
+        let _ = cls_value;
+        self.heap_cache_mut().class_now_known(opref);
+        self.heap_cache_mut().nullity_now_known(opref);
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
@@ -6378,7 +6385,7 @@ impl TraceCtx {
                 self.virtualizable_boxes.as_ref().map(Vec::len),
                 self.virtualizable_array_lengths.as_deref(),
                 self.standard_virtualizable_box(),
-                self.heap_cache
+                self.heap_cache()
                     .is_known_nonstandard_virtualizable(vable_opref),
                 self.diag_virtualizable_heap_ptr(),
                 self.standard_virtualizable_concrete(),
@@ -7350,7 +7357,7 @@ mod tests {
             !ctx.heapcache_nullity_answered(box_),
             "an unknown box answers nothing",
         );
-        ctx.heap_cache_mut().nullity_now_known(box_, false);
+        ctx.heap_cache_mut().nullity_now_known(box_);
         assert!(
             ctx.heapcache_nullity_answered(box_),
             "a non-constant box known to be null short-circuits",

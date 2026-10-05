@@ -47,6 +47,9 @@ struct ValueSlot {
     /// Index in `slots` (byte mode) / `ops` (Vec recorder) of this
     /// value FrontendOp. `OpRef.raw()` is `_index`, not this sequence.
     seq: u32,
+    /// `history.py` `RefFrontendOp._heapc_flags` / `_heapc_deps` and
+    /// `FrontendOp.position_and_flags & FO_REPLACED_WITH_CONST`.
+    heapc: majit_trace::heapcache::HeapcRecord,
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -301,6 +304,9 @@ pub struct Trace {
     /// Value-producing FrontendOps, dense in `_index` after the inputarg
     /// prefix. `OpRef.raw()` for a value op *is* that `_index`.
     value_slots: Vec<ValueSlot>,
+    /// FrontendOp heapc records for inputargs at positions `0.._start`
+    /// (`warmstate.py` `wrap` builds `RefFrontendOp(position, value)`).
+    inputarg_heapc: Vec<majit_trace::heapcache::HeapcRecord>,
 }
 
 /// TAGBOX index to the recording `OpRef`, without borrowing the whole
@@ -458,6 +464,7 @@ impl Trace {
             trb: None,
             slots: Vec::new(),
             value_slots: Vec::new(),
+            inputarg_heapc: Vec::new(),
         }
     }
 
@@ -994,6 +1001,7 @@ impl Trace {
                 concrete: Cell::new(value),
                 opcode,
                 seq: self.slots.len() as u32 - 1,
+                heapc: majit_trace::heapcache::HeapcRecord::default(),
             });
             self.box_count += 1;
             OpRef::op_typed(box_index, ty)
@@ -1021,6 +1029,13 @@ impl Trace {
         box_index
             .checked_sub(n)
             .and_then(|i| self.value_slots.get(i as usize))
+    }
+
+    fn value_slot_mut(&mut self, box_index: u32) -> Option<&mut ValueSlot> {
+        let n = self.box_prefix();
+        box_index
+            .checked_sub(n)
+            .and_then(|i| self.value_slots.get_mut(i as usize))
     }
 
     fn slot_by_seq(&self, seq: u32) -> Option<&FrontendSlot> {
@@ -1173,6 +1188,8 @@ impl Trace {
         );
         let index = self.inputargs.len() as u32;
         self.inputargs.push(InputArg::from_type_rc(tp, index));
+        self.inputarg_heapc
+            .push(majit_trace::heapcache::HeapcRecord::default());
         self.inputarg_live.push(true);
         let opref = match tp {
             Type::Int => OpRef::input_arg_int(self.op_count),
@@ -1816,6 +1833,12 @@ impl Trace {
                 vs.concrete.set(Some(Value::Ref(gcref)));
             }
         }
+        for rec in &mut self.inputarg_heapc {
+            rec.walk_const_ptr_refs(visitor);
+        }
+        for vs in &mut self.value_slots {
+            vs.heapc.walk_const_ptr_refs(visitor);
+        }
         if self.trb.is_none() {
             for op in &self.ops {
                 for arg in op.args_slice().iter() {
@@ -1972,6 +1995,37 @@ impl Trace {
     }
 }
 
+impl majit_trace::heapcache::HeapcBoxes for Trace {
+    fn heapc(&self, opref: OpRef) -> Option<&majit_trace::heapcache::HeapcRecord> {
+        if opref.is_constant() {
+            return None;
+        }
+        let pos = opref.raw() as usize;
+        if pos < self.inputarg_heapc.len() {
+            return Some(&self.inputarg_heapc[pos]);
+        }
+        self.value_slot(opref.raw()).map(|vs| &vs.heapc)
+    }
+
+    fn heapc_mut(&mut self, opref: OpRef) -> Option<&mut majit_trace::heapcache::HeapcRecord> {
+        if opref.is_constant() {
+            return None;
+        }
+        let pos = opref.raw() as usize;
+        if pos < self.inputarg_heapc.len() {
+            return Some(&mut self.inputarg_heapc[pos]);
+        }
+        self.value_slot_mut(opref.raw()).map(|vs| &mut vs.heapc)
+    }
+
+    fn box_value(&self, opref: OpRef) -> Option<Value> {
+        if opref.is_constant() {
+            return opref.inline_const_to_value();
+        }
+        self.concrete_at(opref.raw())
+    }
+}
+
 impl Default for Trace {
     fn default() -> Self {
         Self::new()
@@ -2064,6 +2118,46 @@ mod tests {
         assert_eq!(rec.num_ops(), 0);
         assert_eq!(rec.recorded_ops_total(), 2);
         assert_eq!(rec.num_inputargs(), 1);
+    }
+
+    /// A flag set on a box, then `cut` before it, then a new box at the
+    /// same `_index`: the new FrontendOp record has no flags.
+    #[test]
+    fn cut_drops_heapc_flags_on_reused_index() {
+        let mut rec = Trace::new();
+        rec.record_input_arg(Type::Ref);
+        let saved = rec.get_position();
+        let first = rec.record_op(OpCode::New, &[]);
+        let mut cache = majit_trace::heapcache::HeapCache::new();
+        {
+            let mut view = majit_trace::heapcache::HeapCacheViewMut::new(&mut cache, &mut rec);
+            view.new_object(first);
+            assert!(view.is_unescaped(first));
+        }
+        rec.cut(saved);
+        let second = rec.record_op(OpCode::New, &[]);
+        assert_eq!(first.raw(), second.raw());
+        let view = majit_trace::heapcache::HeapCacheView::new(&cache, &rec);
+        assert!(!view.is_unescaped(second));
+        assert!(!view.is_class_known(second));
+        assert!(!view.saw_allocation(second));
+    }
+
+    /// An inputarg box gets and keeps a known-class flag (`warmstate.py`
+    /// `wrap` builds `RefFrontendOp` for red arguments).
+    #[test]
+    fn inputarg_keeps_known_class_flag() {
+        let mut rec = Trace::new();
+        let ia = rec.record_input_arg(Type::Ref);
+        let mut cache = majit_trace::heapcache::HeapCache::new();
+        {
+            let mut view = majit_trace::heapcache::HeapCacheViewMut::new(&mut cache, &mut rec);
+            view.class_now_known(ia);
+            assert!(view.is_class_known(ia));
+        }
+        let _ = rec.record_op(OpCode::New, &[]);
+        let view = majit_trace::heapcache::HeapCacheView::new(&cache, &rec);
+        assert!(view.is_class_known(ia));
     }
 
     #[test]

@@ -2979,7 +2979,7 @@ impl TraceCtx {
             }
         }
         // pyjitpl.py self.heapcache.replace_box(oldbox, newbox).
-        self.heap_cache.replace_box(oldbox, newbox);
+        self.heap_cache_mut().replace_box(oldbox, newbox);
     }
 
     /// Record a regular IR operation.
@@ -3025,9 +3025,9 @@ impl TraceCtx {
         let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
         let resbox =
             Self::do_record_op_with_descr(&mut self.recorder, OpCode::NewWithVtable, &[], descr);
-        self.heap_cache.new_object(resbox);
-        if let Some(class) = known_class {
-            self.heap_cache.class_now_known(resbox, class);
+        self.heap_cache_mut().new_object(resbox);
+        if known_class.is_some() {
+            self.heap_cache_mut().class_now_known(resbox);
         }
         resbox
     }
@@ -4021,7 +4021,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4237,7 +4237,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4629,7 +4629,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4687,7 +4687,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4845,7 +4845,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 OpCode::call_may_force_for_type(ret_type),
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4896,7 +4896,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -5145,7 +5145,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -5385,7 +5385,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -5459,7 +5459,7 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
-        self.heap_cache.invalidate_caches_varargs(
+        self.heap_cache_mut().invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,
             args,
@@ -5538,7 +5538,7 @@ impl TraceCtx {
             _ => None,
         };
         let allboxes = call_arg_boxes(func_ref, args);
-        self.heap_cache.invalidate_caches_varargs(
+        self.heap_cache_mut().invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,
             &allboxes,

@@ -13,6 +13,5 @@ indexmap = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }
-bit-set = { workspace = true }
 smallvec = { workspace = true }
 vecset = { workspace = true }

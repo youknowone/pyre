@@ -675,7 +675,7 @@ where
         // stays unrecorded.
         ctx.heap_cache_mut().new_object(op);
         if with_vtable && vtable != 0 {
-            ctx.heap_cache_mut().class_now_known(op, vtable as i64);
+            ctx.heap_cache_mut().class_now_known(op);
         }
         self.set_ref_reg(ctx, dest, Some(op), Some(ptr));
         TraceAction::Continue
@@ -8348,7 +8348,7 @@ where
                 opcode_pc,
                 /* after_residual_call */ false,
             );
-            ctx.heap_cache_mut().class_now_known(opref, typeptr);
+            ctx.heap_cache_mut().class_now_known(opref);
         }
         if byte == jitcode::insns::BC_GUARD_CLASS {
             self.set_int_reg(ctx, dst, Some(cls_const), Some(typeptr));
