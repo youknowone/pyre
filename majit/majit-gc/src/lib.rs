@@ -4367,6 +4367,9 @@ pub fn gc_writebarrier_before_copy(
     length: usize,
 ) -> bool {
     if !gc_sync::is_initialized() {
+        // Cranelift/wasm keep the collector in the backend TLS box, not
+        // `gc_sync`. Remember dest the same way `gc_write_barrier` does.
+        gc_write_barrier(dest);
         return true;
     }
     gc_sync::gc_op(|gc| {

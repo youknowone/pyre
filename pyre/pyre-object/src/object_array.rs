@@ -202,6 +202,19 @@ pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: P
     unsafe { *items_block_items_base(block).add(index) = value };
 }
 
+unsafe fn arraycopy_store_item(
+    block: *mut ItemsBlock,
+    index: usize,
+    value: PyObjectRef,
+    dest_managed: bool,
+) {
+    if dest_managed {
+        unsafe { items_block_set_ref(block, index, value) };
+    } else {
+        unsafe { *items_block_items_base(block).add(index) = value };
+    }
+}
+
 /// `rgc.ll_arraymove(array, source_start, dest_start, length)` — runtime
 /// target for the `list.ll_arraymove` oopspec (OS_ARRAYMOVE / 9).
 ///
@@ -327,11 +340,14 @@ pub extern "C" fn jit_ll_arraycopy(
     };
     // An unmanaged typed block has no registry entry. If only one
     // endpoint is registered, reuse that layout for both; the fallback
-    // is only for two unknown addresses.
-    let (source_layout, dest_layout) = match (
-        majit_gc::gc_varsize_layout(source_address),
-        majit_gc::gc_varsize_layout(dest_address),
-    ) {
+    // is only for two unknown addresses. Mixed ownership still copies
+    // with that layout, but the GC barrier/setter only run on a
+    // registered dest (and the 5-arg copy barrier needs both headers).
+    let source_layout_opt = majit_gc::gc_varsize_layout(source_address);
+    let dest_layout_opt = majit_gc::gc_varsize_layout(dest_address);
+    let dest_managed = dest_layout_opt.is_some();
+    let source_managed = source_layout_opt.is_some();
+    let (source_layout, dest_layout) = match (source_layout_opt, dest_layout_opt) {
         (Some(source), Some(dest)) => (source, dest),
         (Some(known), None) | (None, Some(known)) => (known, known),
         (None, None) => (fallback, fallback),
@@ -355,7 +371,8 @@ pub extern "C" fn jit_ll_arraycopy(
         .expect("ll_arraycopy byte length overflow");
 
     // rgc.py `ll_arraycopy`: length <= 1 is `copy_item` (a GC-pointer
-    // store), not the bulk barrier-plus-memcpy body.
+    // store), not the bulk barrier-plus-memcpy body. Unmanaged dests
+    // have no GC header; `items_block_set_ref` would `header_of` them.
     if dest_layout.items_have_gc_ptrs && length == 1 {
         let dest_address = follow(dest_slot);
         let source_address = follow(source_slot);
@@ -363,20 +380,29 @@ pub extern "C" fn jit_ll_arraycopy(
             *((source_address as *const u8).add(source_offset) as *const crate::PyObjectRef)
         };
         unsafe {
-            items_block_set_ref(dest_address as *mut ItemsBlock, dest_start as usize, value);
+            arraycopy_store_item(
+                dest_address as *mut ItemsBlock,
+                dest_start as usize,
+                value,
+                dest_managed,
+            );
         }
         return;
     }
 
     let mut slowpath = false;
-    if dest_layout.items_have_gc_ptrs {
-        slowpath = !majit_gc::gc_writebarrier_before_copy(
-            majit_ir::GcRef(follow(source_slot)),
-            majit_ir::GcRef(follow(dest_slot)),
-            source_start as usize,
-            dest_start as usize,
-            length as usize,
-        );
+    if dest_layout.items_have_gc_ptrs && dest_managed {
+        if source_managed {
+            slowpath = !majit_gc::gc_writebarrier_before_copy(
+                majit_ir::GcRef(follow(source_slot)),
+                majit_ir::GcRef(follow(dest_slot)),
+                source_start as usize,
+                dest_start as usize,
+                length as usize,
+            );
+        } else {
+            slowpath = true;
+        }
     }
     if slowpath {
         let mut i = 0i64;
@@ -389,10 +415,11 @@ pub extern "C" fn jit_ll_arraycopy(
                     as *const crate::PyObjectRef)
             };
             unsafe {
-                items_block_set_ref(
+                arraycopy_store_item(
                     dest_address as *mut ItemsBlock,
                     dest_start as usize + i as usize,
                     value,
+                    dest_managed,
                 );
             }
             i += 1;
