@@ -3647,10 +3647,7 @@ pub fn make_resume_guard_descr_instance_next_foriter(
             make_resume_guard_forced_descr_typed(Vec::new())
         }
         Some(OpCode::GuardException | OpCode::GuardNoException) => {
-            make_resume_guard_exc_descr_typed(
-                Vec::new(),
-                matches!(opcode, Some(OpCode::GuardException)),
-            )
+            make_resume_guard_exc_descr_typed(Vec::new())
         }
         _ => make_resume_guard_descr_typed(Vec::new()),
     };
@@ -4370,9 +4367,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
 #[derive(Debug)]
 pub struct ResumeGuardExcDescr {
     inner: ResumeGuardDescr,
-    /// True for `GUARD_EXCEPTION`. `GUARD_NO_EXCEPTION` stays false so an
-    /// empty guard cell does not revive `BH_LAST_EXC_VALUE`.
-    reads_last_exc: bool,
 }
 
 unsafe impl Send for ResumeGuardExcDescr {}
@@ -4391,9 +4385,6 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
     }
     fn is_guard_exc(&self) -> bool {
         true
-    }
-    fn reads_bh_last_exc(&self) -> bool {
-        self.reads_last_exc
     }
     fn is_resume_guard(&self) -> bool {
         true
@@ -4598,9 +4589,8 @@ impl FailDescr for ResumeGuardExcDescr {
 
 /// Create a ResumeGuardExcDescr with auto-assigned fail_index, the
 /// supplied `types`, and empty resume data.
-pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>, reads_last_exc: bool) -> DescrRef {
+pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeGuardExcDescr {
-        reads_last_exc,
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(types),
@@ -6314,7 +6304,7 @@ mod fail_descr_tests {
             resume_guard_descr(&forced).expect("Forced as_any is the wrapper, not the base");
         assert_eq!(forced_inner.fail_arg_types(), &[Type::Int]);
 
-        let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref], true);
+        let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref]);
         let exc_inner = resume_guard_descr(&exc).expect("Exc as_any is the inner base descr");
         assert_eq!(exc_inner.fail_arg_types(), &[Type::Ref]);
 
@@ -6528,7 +6518,7 @@ mod fail_descr_tests {
         );
 
         // ResumeGuardExcDescr — `is_guard_exc()` survives, identity preserved.
-        let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref, Type::Int], true);
+        let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref, Type::Int]);
         let exc_fi = exc.index();
         let exc_ptr = Arc::as_ptr(&exc);
         assert!(exc.is_guard_exc());
@@ -6677,7 +6667,7 @@ mod fail_descr_tests {
 
         // Exc-copied subtype carries the same prev and additionally
         // reports is_guard_exc() = true.
-        let exc_donor = make_resume_guard_exc_descr_typed(vec![Type::Float], true);
+        let exc_donor = make_resume_guard_exc_descr_typed(vec![Type::Float]);
         let exc_donor_ptr = Arc::as_ptr(&exc_donor);
         let copied_exc = make_resume_guard_copied_exc_descr(exc_donor);
         assert!(copied_exc.is_resume_guard_copied());
