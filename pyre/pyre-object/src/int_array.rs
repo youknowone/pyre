@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::object_array::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock, alloc_typed_items_block,
     dealloc_typed_items_block, gc_int_array_gc_type_id, grow_typed_items_block,
-    typed_items_block_capacity,
+    try_alloc_typed_items_block, typed_items_block_capacity,
 };
 
 /// Small-buffer capacity constant retained for the append/pop inline-capacity
@@ -113,7 +113,7 @@ impl IntArray {
             return Some(Self::empty());
         }
         let arr = Self {
-            block: unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) },
+            block: unsafe { try_alloc_typed_items_block(len, gc_int_array_gc_type_id())? },
             len: crate::object_array::length_cell(len),
         };
         unsafe {

@@ -2746,13 +2746,10 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
         )
         .fill(item);
     } else {
-        let src_items = {
-            let src = crate::gc_roots::shadow_stack_get(src_slot);
-            let _guard = w_list_lock(src);
-            let src = crate::gc_roots::shadow_stack_get(src_slot);
-            (*(src as *const W_ListObject)).items as PyObjectRef
-        };
-        let src_items_slot = publish_slot(src_items);
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
+        let _guard = w_list_lock(src);
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
+        let src_items_slot = publish_slot((*(src as *const W_ListObject)).items as PyObjectRef);
         let dest_items_slot = publish_slot(
             (*(crate::gc_roots::shadow_stack_get(dest_slot) as *const W_ListObject)).items
                 as PyObjectRef,
