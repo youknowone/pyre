@@ -2867,6 +2867,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "free" => "rustvec_method_free",
             "items" => "rustvec_method_items",
             "extend_from_slice" => "rustvec_method_extend_from_slice",
+            "extend" => "rustvec_method_extend",
             _ => return None,
         },
         // rstring.py — the `UnicodeBuilder` surface the rtyper
@@ -3697,7 +3698,8 @@ pub(crate) fn call_builtin_method(
         "rustvec_method_append"
         | "rustvec_method_reverse"
         | "rustvec_method_free"
-        | "rustvec_method_extend_from_slice" => {
+        | "rustvec_method_extend_from_slice"
+        | "rustvec_method_extend" => {
             let SomeValue::RustVec(_) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
@@ -3705,6 +3707,8 @@ pub(crate) fn call_builtin_method(
                 "rustvec_method_append" => &["s_item"],
                 // The `(items, length)` words of the source slice.
                 "rustvec_method_extend_from_slice" => &["s_items", "s_length"],
+                // `rlist.ll_extend(l1, l2)`: `l2` is the GcArray word.
+                "rustvec_method_extend" => &["s_l2"],
                 _ => &[],
             };
             bind_builtin_method_args(args_s, kwds, params, None, &method.analyser_name)?;
@@ -6487,13 +6491,13 @@ mod tests {
                 ("free", "rustvec_method_free"),
                 ("items", "rustvec_method_items"),
                 ("extend_from_slice", "rustvec_method_extend_from_slice"),
+                ("extend", "rustvec_method_extend"),
             ] {
                 let SomeValue::BuiltinMethod(bound) = s_self.find_method(name).unwrap() else {
                     panic!("Vec.{name} must be recognized");
                 };
                 assert_eq!(bound.analyser_name, analyser);
             }
-            assert!(s_self.find_method("extend").is_none());
         }
         let bad = HLOperation::new(
             OpKind::NewRustVec,

@@ -2776,6 +2776,22 @@ impl RPythonAnnotator {
                         "int_between" if sp.args.len() == 3 => {
                             Some(SomeValue::Bool(super::model::SomeBool::new()))
                         }
+                        // `llop.raw_load` / `llop.raw_store`.  The adapter
+                        // seeds the result with `lltype_to_annotation` of
+                        // the item descr (`_LLOpEntry.compute_result_annotation`);
+                        // take ownership via `setbinding`.  `raw_store`
+                        // returns Void (`s_None`).
+                        "raw_load" if sp.args.len() == 2 => match &sp.result {
+                            Hlvalue::Variable(v) => {
+                                v.annotation.borrow().as_ref().map(|rc| (**rc).clone())
+                            }
+                            _ => None,
+                        },
+                        "raw_store" if sp.args.len() == 3 => Some(
+                            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                            ),
+                        ),
                         // `jtransform.py` `_int_to_int_cast` emits
                         // `int_signext(v, nbytes)`. The front spells that
                         // leaf `signext`. Flowspace has no operator of that

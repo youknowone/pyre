@@ -351,8 +351,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "std.ptr.null", ptr_null_constant);
     // `Option<fn>`'s null niche. A GC pointer's null is
     // `ptr_null_constant` (classdef-less `SomeInstance`); a raw function
-    // pointer's null is the same `SomePtr(FuncType)` as the `fn` field
-    // (`raw_fn_ptr_somevalue`), so the two arms of `Option<fn>` union.
+    // pointer's null is `SomePtr(FuncType)` (`fn_null_constant`), the
+    // same `ll_ptrtype` as the matching `fn` value so the two arms union.
     analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
     // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
     // constant called by `lltype::malloc_typed` /
@@ -1481,17 +1481,37 @@ fn ptr_null_constant(
 /// Null `Option<fn>` — `lltype.nullptr(FuncType)` as `SomePtr`, not the
 /// classdef-less `SomeInstance` that `ptr_null_constant` returns for a
 /// GC pointer. `llannotation.py` `pairtype(SomePtr, SomePtr).union`
-/// requires the same `ll_ptrtype` as the function-pointer field read
-/// (`raw_fn_ptr_somevalue`).
+/// requires the same `ll_ptrtype` as the function-pointer field read.
+/// An optional constant spelling is the FUNC type `lltype.nullptr` takes
+/// (`getfunctionptr`); without it the coarse empty `FuncType` is used.
 fn fn_null_constant(
-    _bk: &Rc<Bookkeeper>,
+    bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    if !args_s.is_empty() || !kwds.is_empty() {
-        return Err(AnnotatorError::new("ptr::null_fn() takes no arguments"));
+    if !kwds.is_empty() {
+        return Err(AnnotatorError::new("ptr::null_fn() takes no keywords"));
     }
-    Ok(super::bookkeeper::raw_fn_ptr_somevalue())
+    match args_s {
+        [] => Ok(super::bookkeeper::raw_fn_ptr_somevalue()),
+        [Some(s_ty)] => {
+            let Some(spelling) = s_ty.const_().and_then(|c| c.as_pystr()) else {
+                return Err(AnnotatorError::new(
+                    "ptr::null_fn() type argument must be a constant string",
+                ));
+            };
+            super::bookkeeper::fn_ptr_somevalue_for_spelling_in(spelling, Some(bk)).ok_or_else(
+                || {
+                    AnnotatorError::new(format!(
+                        "ptr::null_fn() type argument is not a function pointer: {spelling}"
+                    ))
+                },
+            )
+        }
+        _ => Err(AnnotatorError::new(
+            "ptr::null_fn() takes an optional function-pointer type argument",
+        )),
+    }
 }
 
 /// Analyzer for `std::mem::size_of::<T>() -> usize` — compile-time
@@ -2775,6 +2795,28 @@ mod tests {
         );
     }
 
+    /// `lltype.nullptr(FUNC)` of a spelled signature is the same
+    /// `SomePtr` as a `Some` of that `fn` type (`getfunctionptr`).
+    #[test]
+    fn typed_null_fn_unions_with_matching_fn_pointer() {
+        use crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling;
+        use crate::annotator::model::{SomeValue, unionof};
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let spelling = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
+        let s_fn = fn_ptr_somevalue_for_spelling(spelling).expect("fn spelling");
+        let mut s_ty = crate::annotator::model::s_str0();
+        s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
+        let s_null = fn_null_constant(&bk(), &[Some(s_ty)], &std::collections::HashMap::new())
+            .expect("typed null_fn");
+        let merged =
+            unionof([&s_fn, &s_null]).expect("typed None unions with Some of the same fn type");
+        assert!(
+            matches!(merged, SomeValue::Ptr(_)),
+            "typed null_fn must stay SomePtr, got {merged:?}"
+        );
+    }
+
     /// Build a `SomeInstance` whose classdesc does or does not declare
     /// `_virtualizable_` — `ClassDesc.get_param` reads it off the host class.
     fn instance_of(
@@ -3361,6 +3403,137 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_object_slice_root_narrows_to_somelist() {
+        // `emit_object_vec_gcarray` narrows `gcarray_from_pyobject_vec`
+        // through this marker with the destination slice's `[Class]`
+        // root. That spelling is `project_struct_field_type`'s fixed
+        // object list, the `FixedSizeListRepr` identity a
+        // `&[PyObjectRef]` parameter already carries; `newlist` reuses
+        // the position ListDef (`Bookkeeper.getlistdef`).
+        let bk = bk();
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("object-slice root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("object-slice-root cast_instance_intrinsic must accept a pointer");
+        assert!(
+            matches!(out, SomeValue::List(_)),
+            "[PyObject] root must project dest as SomeList, got {out:?}"
+        );
+        let again = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(out.clone()), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("a SomeList operand passes through");
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_list_root_contains_after_item_noneify() {
+        // A re-flow of `__cast_instance_intrinsic(v, "[PyObject]")`
+        // at the same position must return the same ListDef
+        // (`Bookkeeper.getlistdef`). After the item is generalized to
+        // `can_be_none=true`, the next call still contains the first
+        // binding — the `setbinding` check that used to panic.
+        use crate::annotator::bookkeeper::PositionKey;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "PyObject".to_string(),
+            reg.fields["pyobject::PyObject"].clone(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        bk.set_position_key(Some(PositionKey::new(1, 2, 0)));
+
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("object-slice root constant");
+        let args = [Some(s_ptr), Some(s_root)];
+        let first = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &args,
+            &no_kwds(),
+        )
+        .expect("first list-root cast");
+        let second = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &args,
+            &no_kwds(),
+        )
+        .expect("second list-root cast at the same position");
+        let SomeValue::List(first_list) = &first else {
+            panic!("expected SomeList, got {first:?}");
+        };
+        let SomeValue::List(second_list) = &second else {
+            panic!("expected SomeList, got {second:?}");
+        };
+        assert!(
+            first_list.listdef.same_as(&second_list.listdef),
+            "re-flow at the same position must reuse the position's ListDef"
+        );
+        let SomeValue::Instance(item) = first_list.listdef.s_value() else {
+            panic!(
+                "list item must be SomeInstance(PyObject), got {:?}",
+                first_list.listdef.s_value()
+            );
+        };
+        assert!(
+            !item.can_be_none,
+            "projected PyObject item starts non-noneable"
+        );
+
+        let noneable = first_list
+            .listdef
+            .s_value()
+            .noneify()
+            .expect("SomeInstance.noneify");
+        first_list
+            .listdef
+            .generalize(&noneable)
+            .expect("generalize item to can_be_none=true");
+        let SomeValue::Instance(item) = first_list.listdef.s_value() else {
+            panic!("item must stay SomeInstance after noneify generalize");
+        };
+        assert!(item.can_be_none);
+
+        let after = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &args,
+            &no_kwds(),
+        )
+        .expect("re-flow after item noneify");
+        let SomeValue::List(after_list) = &after else {
+            panic!("expected SomeList, got {after:?}");
+        };
+        assert!(
+            after_list.listdef.same_as(&first_list.listdef),
+            "re-flow after generalize must still reuse the position's ListDef"
+        );
+        assert!(
+            after.contains(&first),
+            "setbinding: new value must contain old after the listdef item noneifies"
+        );
+    }
+
+    #[test]
     fn call_builtin_unknown_name_errors() {
         let bk = bk();
         let err = call_builtin(&bk, "definitely_not_a_builtin", &[], &no_kwds()).unwrap_err();
@@ -3858,6 +4031,18 @@ mod tests {
         };
         assert_eq!(it.variant, vec!["enumerate".to_string()]);
         assert_eq!(it.enumerate_start, Some(ConstValue::Int(5)));
+    }
+
+    #[test]
+    fn ann_cast_ptr_to_int_of_somerustvec_is_someinteger() {
+        use crate::annotator::model::SomeRustVec;
+        let s_vec = SomeValue::RustVec(SomeRustVec::for_kind(majit_ir::rvec::VecItemKind::Int));
+        let out = lltype_cast_ptr_to_int(&bk(), &[Some(s_vec)], &no_kwds())
+            .expect("ann_cast_ptr_to_int returns SomeInteger");
+        assert!(
+            matches!(out, SomeValue::Integer(_)),
+            "lltype.py ann_cast_ptr_to_int yields SomeInteger, got {out:?}"
+        );
     }
 
     #[test]

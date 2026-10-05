@@ -3571,7 +3571,9 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
 /// `core.ptr.null_fn` — `lltype.nullptr(FuncType)` (`rptr.py`
 /// `PtrRepr` over a function type). The annotation is `SomePtr`, so the
 /// null is an `LLPtr` of the result's function type rather than
-/// `convert_const(None)` on an `InstanceRepr`.
+/// `convert_const(None)` on an `InstanceRepr`. A constant spelling
+/// argument is consumed at annotation (`fn_null_constant`); `r_result`
+/// already carries that `FuncType`.
 fn rtype_null_fn(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget, nullptr};
@@ -3661,6 +3663,16 @@ pub fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// Pointer reprs `rtype_cast_ptr_to_int` consumes without the InstanceRepr
+/// swap: `PtrRepr` (`rptr.py`) and `RustVecRepr`, whose lowleveltype is
+/// `Ptr(Struct(raw) "RustVec")`.
+fn repr_is_ptr_to_int_origin(r: &dyn Repr) -> bool {
+    matches!(
+        r.repr_class_id(),
+        ReprClassId::PtrRepr | ReprClassId::RustVecRepr
+    )
+}
+
 /// RPython `@typer_for(lltype.cast_ptr_to_int)` (rbuiltin.py):
 ///
 /// ```python
@@ -3728,7 +3740,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     );
     let needs_swap = hop.args_r.borrow()[0]
         .as_ref()
-        .is_some_and(|r| r.repr_class_id() != ReprClassId::PtrRepr);
+        .is_some_and(|r| !repr_is_ptr_to_int_origin(r.as_ref()));
     if producer_set_someptr {
         debug_assert!(
             !needs_swap,
@@ -3758,10 +3770,13 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     }
 
     let r_arg1 = arg_repr(hop, 0)?;
-    // RPython `rbuiltin.py:545 assert isinstance(hop.args_r[0], rptr.PtrRepr)`.
+    // RPython `rbuiltin.py rtype_cast_ptr_to_int` asserts
+    // `isinstance(hop.args_r[0], rptr.PtrRepr)`. `RustVecRepr`'s
+    // lowleveltype is `Ptr(Struct(raw) "RustVec")`, the same pointer
+    // origin.
     assert!(
-        matches!(r_arg1.repr_class_id(), ReprClassId::PtrRepr),
-        "rtype_cast_ptr_to_int: hop.args_r[0] must be PtrRepr after \
+        repr_is_ptr_to_int_origin(r_arg1.as_ref()),
+        "rtype_cast_ptr_to_int: hop.args_r[0] must be a pointer repr after \
          InstanceRepr→PtrRepr relabel, got {:?}",
         r_arg1.repr_class_id()
     );
@@ -5254,6 +5269,56 @@ mod tests {
         let last = llops.ops.last().expect("the llop is emitted");
         assert_eq!(result, last.result);
         assert_eq!(last.opname, "cast_ptr_to_int");
+    }
+
+    #[test]
+    fn rtype_cast_ptr_to_int_with_rustvecrepr_does_not_swap() {
+        use crate::annotator::model::SomeRustVec;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use majit_ir::rvec::VecItemKind;
+
+        reset_swap_fallback_hits();
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let s_vec = SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int));
+        let r = hop.rtyper.getrepr(&s_vec).expect("RustVecRepr");
+        assert_eq!(r.repr_class_id(), ReprClassId::RustVecRepr);
+        assert!(
+            matches!(r.lowleveltype(), LowLevelType::Ptr(_)),
+            "RustVecRepr lowleveltype is Ptr"
+        );
+        let var = Variable::named("l");
+        var.set_concretetype(Some(r.lowleveltype().clone()));
+        var.annotation
+            .replace(Some(std::rc::Rc::new(s_vec.clone())));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_s.borrow_mut().push(s_vec);
+        hop.args_r.borrow_mut().push(Some(r));
+        let args_r_before = hop.args_r.borrow()[0].as_ref().map(Arc::as_ptr);
+
+        let result = rtype_cast_ptr_to_int(&hop, &HashMap::new())
+            .unwrap()
+            .expect("cast_ptr_to_int of RustVecRepr returns a Signed variable");
+        let args_r_after = hop.args_r.borrow()[0].as_ref().map(Arc::as_ptr);
+        assert_eq!(
+            args_r_after, args_r_before,
+            "RustVecRepr is a pointer repr; rtype_cast_ptr_to_int must not swap it"
+        );
+        assert_eq!(swap_fallback_hits(), 0);
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "cast_ptr_to_int");
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("expected Signed result, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "rbuiltin.py rtype_cast_ptr_to_int calls exception_cannot_occur"
+        );
     }
 
     #[test]

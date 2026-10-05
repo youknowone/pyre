@@ -55,6 +55,12 @@ use super::rffi::{
 
 const WORD: usize = std::mem::size_of::<usize>();
 
+/// Standard GcArray length word (`majit_gc` `standard_array_length_ofs`).
+const GCARRAY_LEN_OFFSET: usize = 0;
+/// Word-sized items follow the length word (`array_items_base` for a
+/// pointer element: the length word rounded up to the item's alignment).
+const GCARRAY_ITEMS_OFFSET: usize = WORD;
+
 const ITEM_SIZE_I: usize = std::mem::size_of::<usize>();
 const ITEM_ALIGN_I: usize = std::mem::align_of::<usize>();
 const ITEM_SIZE_R: usize = std::mem::size_of::<*mut u8>();
@@ -78,6 +84,14 @@ fn vec_item_addr(header: usize, index: usize, itemsize: usize) -> usize {
 
 fn vec_header_i(l: &mut Vec<usize>) -> usize {
     l as *mut Vec<usize> as usize
+}
+
+/// Buffer pointer word of any `Vec<T>` header (`rlist.py` `ll_items`:
+/// `return l.items`). Item-kind independent: every `Vec<T>` header stores
+/// that word at `VEC_PTR_WORD`, including items the one-word `ll_vec_items_*`
+/// helpers do not name.
+pub fn ll_vec_as_ptr(header: usize) -> usize {
+    vec_header_word(header, VEC_PTR_WORD)
 }
 
 fn vec_header_r(l: &mut Vec<*mut u8>) -> usize {
@@ -753,6 +767,45 @@ pub fn ll_vec_extend_from_slice_r(l: &mut Vec<*mut u8>, items: usize, length: us
     ll_slice_arraycopy_r(items, ll_vec_items_r(l), 0, len1, length);
 }
 
+/// Length of a length-prefixed object GcArray. The array is a movable GC
+/// object; callers re-read this from `l2` rather than caching it across a
+/// collection.
+fn gcarray_length_r(l2: *mut u8) -> usize {
+    raw_read_ptr(raw_ptradd(l2 as usize, GCARRAY_LEN_OFFSET))
+}
+
+/// Item `index` of a length-prefixed object GcArray, read from the array
+/// word so a collection that moves `l2` is visible on the next index.
+fn gcarray_getitem_r(l2: *mut u8, index: usize) -> *mut u8 {
+    raw_read_ptr(raw_ptradd(
+        l2 as usize,
+        GCARRAY_ITEMS_OFFSET + index * ITEM_SIZE_R,
+    )) as *mut u8
+}
+
+/// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
+/// GcArray word, not a `(items, length)` pair. Length is the array's
+/// header; each item is read by index from `l2` after `_ll_resize_ge`,
+/// which may collect.
+///
+/// `ovfcheck(len1 + len2)`: a wrapping sum would undersize the resize.
+/// Overflow is MemoryError, the same `Vec capacity overflow` panic as
+/// [`vec_buf_layout`].
+pub fn ll_vec_extend_r(l: &mut Vec<*mut u8>, l2: *mut u8) {
+    let len1 = ll_vec_length_r(l);
+    let len2 = gcarray_length_r(l2);
+    let newlength = len1
+        .checked_add(len2)
+        .unwrap_or_else(|| panic!("Vec capacity overflow"));
+    ll_vec_resize_ge_r(l, newlength);
+    let mut i = 0;
+    while i < len2 {
+        let item = gcarray_getitem_r(l2, i);
+        ll_vec_setitem_fast_r(l, len1 + i, item);
+        i += 1;
+    }
+}
+
 /// `rgc.ll_arraycopy` over raw items. The items hold no GC pointer, so the
 /// copy is the `raw_memcopy` of `length` items; `ll_arraycopy` is a residual
 /// call (`list.ll_arraycopy`, `OS_ARRAYCOPY`), and so is this.
@@ -1267,6 +1320,17 @@ mod tests {
     }
 
     #[test]
+    fn as_ptr_reads_the_header_buffer_pointer_word() {
+        let mut bytes: Vec<u8> = vec![1, 2, 3];
+        let header = &mut bytes as *mut Vec<u8> as usize;
+        assert_eq!(ll_vec_as_ptr(header), bytes.as_ptr() as usize);
+        let mut words: Vec<usize> = vec![7, 8];
+        let header = &mut words as *mut Vec<usize> as usize;
+        assert_eq!(ll_vec_as_ptr(header), words.as_ptr() as usize);
+        assert_eq!(ll_vec_as_ptr(header), ll_vec_items_i(&mut words));
+    }
+
+    #[test]
     fn helpers_grow_and_reverse_a_host_vec() {
         let mut v = ll_vec_newemptylist_i();
         for item in 0..40 {
@@ -1397,6 +1461,53 @@ mod tests {
                 "{path} is not published"
             );
         }
+    }
+
+    #[test]
+    fn extend_copies_gcarray_items_after_resize() {
+        #[repr(C)]
+        struct GcArrayWord {
+            length: usize,
+            items: [*mut u8; 2],
+        }
+        let mut src = GcArrayWord {
+            length: 2,
+            items: [0x10 as *mut u8, 0x20 as *mut u8],
+        };
+        let mut l = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut l, 0x01 as *mut u8);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
+        assert_eq!(ll_vec_length_r(&mut l), 3);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 0), 0x01 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 1), 0x10 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 2), 0x20 as *mut u8);
+
+        let mut empty = GcArrayWord {
+            length: 0,
+            items: [std::ptr::null_mut(), std::ptr::null_mut()],
+        };
+        let before = ll_vec_length_r(&mut l);
+        ll_vec_extend_r(&mut l, &mut empty as *mut GcArrayWord as *mut u8);
+        assert_eq!(ll_vec_length_r(&mut l), before);
+    }
+
+    /// `ovfcheck(len1 + len2)` in `ll_extend`: a wrapping sum is MemoryError,
+    /// the same panic [`vec_buf_layout`] uses for a capacity overflow.
+    #[test]
+    #[should_panic(expected = "Vec capacity overflow")]
+    fn extend_overflowing_length_sum_is_memory_error() {
+        #[repr(C)]
+        struct GcArrayWord {
+            length: usize,
+            items: [*mut u8; 1],
+        }
+        let mut src = GcArrayWord {
+            length: usize::MAX,
+            items: [std::ptr::null_mut()],
+        };
+        let mut l = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut l, 0x01 as *mut u8);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
     }
 
     #[test]

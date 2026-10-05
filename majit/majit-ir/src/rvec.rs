@@ -200,10 +200,13 @@ pub enum VecOp {
     Items,
     /// `v.extend_from_slice(s)` — `ll_extend` from the `(ptr, len)` pair.
     ExtendFromSlice,
+    /// `v.extend_from_slice(s)` of a one-word object slice — `rlist.ll_extend`
+    /// with `l2` the GcArray word (length at offset 0, items after it).
+    Extend,
 }
 
 impl VecOp {
-    pub const ALL: [VecOp; 11] = [
+    pub const ALL: [VecOp; 12] = [
         VecOp::NewEmpty,
         VecOp::NewHint,
         VecOp::Length,
@@ -215,6 +218,7 @@ impl VecOp {
         VecOp::Items,
         VecOp::ExtendFromSlice,
         VecOp::AllocAndSet,
+        VecOp::Extend,
     ];
 
     fn row(self) -> usize {
@@ -230,6 +234,7 @@ impl VecOp {
             VecOp::Items => 8,
             VecOp::ExtendFromSlice => 9,
             VecOp::AllocAndSet => 10,
+            VecOp::Extend => 11,
         }
     }
 }
@@ -317,7 +322,7 @@ pub const VEC_BUF_ALLOC_CLEAR: &str = "majit_rlib::lltypesystem::rvec::vec_buf_a
 
 /// `(operation, item kind)` → helper path, rows in [`VecOp::ALL`] order and
 /// columns in [`VecItemKind::ALL`] order. Every path is spelled here once.
-const VEC_HELPERS: [[&str; 3]; 11] = [
+const VEC_HELPERS: [[&str; 3]; 12] = [
     [
         "majit_rlib::lltypesystem::rvec::ll_vec_newemptylist_i",
         "majit_rlib::lltypesystem::rvec::ll_vec_newemptylist_r",
@@ -372,6 +377,15 @@ const VEC_HELPERS: [[&str; 3]; 11] = [
         "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_i",
         "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_r",
         "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_f",
+    ],
+    // Only `_r`: a one-word GcArray source is an object slice
+    // (`Ptr(GcArray(Ptr(PyObject)))`). Int/float slices stay `(ptr, len)`
+    // pairs and use [`VecOp::ExtendFromSlice`]. The `_i`/`_f` slots keep the
+    // table rectangular; the front never emits them.
+    [
+        "majit_rlib::lltypesystem::rvec::ll_vec_extend_i",
+        "majit_rlib::lltypesystem::rvec::ll_vec_extend_r",
+        "majit_rlib::lltypesystem::rvec::ll_vec_extend_f",
     ],
 ];
 

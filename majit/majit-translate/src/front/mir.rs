@@ -8367,19 +8367,33 @@ fn pygraph_initial_block(
                 // `derive_subject_inputcells` only consumes `class_root` on
                 // the `Ref` arm, so the annotation seed stays a plain
                 // `SomeInteger`.
+                // A function pointer is `Int`-colored (`history.getkind` of
+                // `Ptr(FuncType)`); carry the `fn(inputs) -> output` /
+                // `Option<fn(inputs) -> output>` spelling so
+                // `derive_subject_inputcells` seeds `SomePtr(FuncType)`
+                // (`fn_ptr_somevalue_for_spelling`) instead of
+                // `valuetype_to_someshell`'s `SomeInteger`.
                 // A `Vec` of one-word items is `Int`-colored (its header
                 // address); carry its spelling so
                 // `derive_subject_inputcells` seeds the `SomeRustVec`.
-                _ if tyref_rust_vec_item_kind(&local.ty, llbc).is_some() => {
-                    Some(tyref_to_ast_string(&local.ty, llbc))
-                }
-                _ => tyref_fieldless_enum_class_root(&local.ty, llbc).or_else(|| {
-                    if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
-                        None
-                    } else {
-                        raw_address_owner_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
-                    }
-                }),
+                _ => tyref_fn_ptr_input_class_root(&local.ty, llbc)
+                    .or_else(|| {
+                        tyref_rust_vec_item_kind(&local.ty, llbc)
+                            .map(|_| tyref_to_ast_string(&local.ty, llbc))
+                    })
+                    .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                    .or_else(|| {
+                        if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
+                            None
+                        } else {
+                            raw_address_owner_root(
+                                &local.ty,
+                                llbc,
+                                tombstoned_leaves,
+                                gc_struct_ids,
+                            )
+                        }
+                    }),
             }
         };
         if let Some(root) = cell_root {
@@ -8625,24 +8639,33 @@ impl<'a> Lowering<'a> {
                     // `derive_subject_inputcells` only consumes `class_root` on
                     // the `Ref` arm, so the annotation seed stays a plain
                     // `SomeInteger`.
+                    // A function pointer is `Int`-colored (`history.getkind` of
+                    // `Ptr(FuncType)`); carry the `fn(inputs) -> output` /
+                    // `Option<fn(inputs) -> output>` spelling so
+                    // `derive_subject_inputcells` seeds `SomePtr(FuncType)`
+                    // (`fn_ptr_somevalue_for_spelling`) instead of
+                    // `valuetype_to_someshell`'s `SomeInteger`.
                     // A `Vec` of one-word items is `Int`-colored (its header
                     // address); carry its spelling so
                     // `derive_subject_inputcells` seeds the `SomeRustVec`.
-                    _ if tyref_rust_vec_item_kind(&local.ty, llbc).is_some() => {
-                        Some(tyref_to_ast_string(&local.ty, llbc))
-                    }
-                    _ => tyref_fieldless_enum_class_root(&local.ty, llbc).or_else(|| {
-                        if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
-                            None
-                        } else {
-                            raw_address_owner_root(
-                                &local.ty,
-                                llbc,
-                                tombstoned_leaves,
-                                gc_struct_ids,
-                            )
-                        }
-                    }),
+                    _ => tyref_fn_ptr_input_class_root(&local.ty, llbc)
+                        .or_else(|| {
+                            tyref_rust_vec_item_kind(&local.ty, llbc)
+                                .map(|_| tyref_to_ast_string(&local.ty, llbc))
+                        })
+                        .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                        .or_else(|| {
+                            if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
+                                None
+                            } else {
+                                raw_address_owner_root(
+                                    &local.ty,
+                                    llbc,
+                                    tombstoned_leaves,
+                                    gc_struct_ids,
+                                )
+                            }
+                        }),
                 }
             };
             if let Some(root) = cell_root {
@@ -13275,6 +13298,11 @@ impl<'a> Lowering<'a> {
                     // `uN` as Unsigned; the latter remains the source of
                     // truth for wrapped/field place types.
                     let arg = self.resolve_operand(mir_bb, operand.clone())?;
+                    if cast_kind_is_unsize(&op_json)
+                        && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &arg)
+                    {
+                        return Ok((Some(op), res));
+                    }
                     // A transparent address-cast word is a GCREF pointer even
                     // though its place type is the inner `usize`. Reading it
                     // back (`roots[i].0 as *mut _`) must not emit
@@ -13468,6 +13496,38 @@ impl<'a> Lowering<'a> {
                             }),
                             res,
                         ));
+                    }
+                    // An Int-banked pointer — `history.getkind` of
+                    // `Ptr(FuncType)`, or of `Ptr(Struct(raw) "RustVec")` —
+                    // would otherwise take the signedness-flip `r_uint` arm
+                    // below as a bare integer retype.  The source is still a
+                    // pointer: `rbuiltin.py` `gen_cast` of a Ptr origin to
+                    // an unsigned primitive is `cast_ptr_to_int` then
+                    // `gen_cast(..., TGT=Unsigned)`, and a signed dest is
+                    // just `cast_ptr_to_int` (`rtype_cast_ptr_to_int`
+                    // resulttype=Signed).  Dest matching goes through
+                    // `int_cast_size_and_sign` so an `as fn` dest
+                    // (Int-banked, not a Scalar Integer) is not claimed.
+                    // `cast_ptr_to_int_src` is left out: that table folds
+                    // `p as usize as *mut T` back to a GC pointer
+                    // (`jtransform.py rewrite_op_cast_opaque_ptr`), and
+                    // neither a function pointer nor a RustVec header is a
+                    // GCREF — recording one would put an Int-banked value
+                    // into a Ref dest.
+                    let src_is_ptr_to_int_origin = operand_tyref(&operand)
+                        .is_some_and(|ty| tyref_is_ptr_to_int_cast_origin(ty, self.llbc));
+                    if src_is_ptr_to_int_origin {
+                        let dest_int = int_cast_size_and_sign(dest_ty, self.llbc);
+                        let bb_id = self.block_id[mir_bb];
+                        if dest_int.is_some_and(|(_, unsigned)| unsigned) {
+                            let (retype, result) =
+                                push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
+                            return Ok((Some(retype), result));
+                        }
+                        if dest_int.is_some() {
+                            let signed = push_cast_ptr_to_int(&mut self.graph, bb_id, arg);
+                            return Ok((None, signed));
+                        }
                     }
                     // The opposite signedness flip is RPython's
                     // `rarithmetic.r_uint(v)`: it keeps the machine word
@@ -13814,6 +13874,11 @@ impl<'a> Lowering<'a> {
                 let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
                 let dst_int = self.literal_int_width(&ty);
                 let v = self.resolve_operand(mir_bb, operand)?;
+                if cast_kind_is_unsize(&kind)
+                    && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
+                {
+                    return Ok((Some(op), res));
+                }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
                 // reinterprets to is load-bearing for the annotator, in both
@@ -14994,11 +15059,37 @@ impl<'a> Lowering<'a> {
             vec![header],
             ValueType::Ref(None),
         );
-        self.local_var[dest_local] = Some(LocalValue::One(view));
+        // The residual copies the vec into a length-prefixed object
+        // GcArray (`ll_fixed_items`). A list that is never resized is
+        // `FixedSizeListRepr`; its annotation is the position ListDef
+        // (`Bookkeeper.getlistdef`). Narrow through the destination
+        // slice's `[Class]` root so `cast_instance_intrinsic` reuses
+        // that ListDef (`Bookkeeper.newlist`). The helper's stub body
+        // returns `null_mut`, which would otherwise bind
+        // `SomeInstance(classdef=None)` and fail `union` with List.
+        let bb_id = self.block_id[mir_bb];
+        let dest_ty = {
+            let local = self.body.locals.locals.get(dest_local).ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: object vec gcarray dest local {dest_local} is missing"
+                ))
+            })?;
+            clone_tyref(&local.ty)
+        };
+        let list_root = object_pointer_slice_list_root(&dest_ty, self.llbc).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: object vec gcarray dest is not an object-pointer slice"
+            ))
+        })?;
+        let list = self.narrow_value_to_instance_root(bb_id, LinkArg::Value(view), &list_root);
+        self.local_var[dest_local] = Some(LocalValue::One(
+            list.as_variable()
+                .expect("cast_instance of a Variable stays a Variable")
+                .clone(),
+        ));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
-        self.graph
-            .set_goto(self.block_id[mir_bb], target_bb, link_args);
+        self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(())
     }
 
@@ -15719,6 +15810,36 @@ impl<'a> Lowering<'a> {
             .and_then(|value| value.one().ok())?;
         let len = self.emit_const_uint(mir_bb, len);
         Some((ptr, len, kind))
+    }
+
+    /// `Unsize` of an object-pointer array literal to a read-only
+    /// object slice (`&[T]` / `*const [T]`) is `newlist` of those items.
+    ///
+    /// RPython `[a, b, c]` is `newlist` (`rtype_newlist`); a list that is
+    /// never resized is `FixedSizeListRepr`, whose `LIST` becomes the
+    /// `GcArray` itself (`ll_fixed_items`). The slice parameter is that
+    /// same one-word `Ptr(GcArray(Ptr(PyObject)))`, so the unsize must
+    /// produce the list, not the `Array<T;N>` synthetic struct. Indexed
+    /// reads of the array itself keep the positional aggregate: only the
+    /// slice value is the list.
+    ///
+    /// A `&mut [T]` / `*mut [T]` destination is not rewritten: a callee
+    /// may write the slice, and those stores must land in the same
+    /// aggregate later indexed reads of the array observe.
+    fn object_array_unsize_newlist(
+        &mut self,
+        dest_ty: &TyRef,
+        array_var: &Variable,
+    ) -> Option<(OpKind, Variable)> {
+        match tyref_object_pointer_slice_mutability(dest_ty, self.llbc) {
+            Some("Shared" | "Const") => {}
+            _ => return None,
+        }
+        let items = read_array_literal_elements(&self.graph, array_var)?;
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        Some((OpKind::NewList { args: items }, res))
     }
 
     /// `(ptr, N, kind)` of `&a as &[T]`. A raw-buffer array local is
@@ -21854,6 +21975,25 @@ impl<'a> Lowering<'a> {
             }
             _ => None,
         };
+        // `v.extend_from_slice(s)` of a one-word object slice is
+        // `rlist.ll_extend` with `l2` the GcArray word.
+        let vec_extend_gcarray_kind = match &call.func {
+            CallFunc::Regular(reg)
+                if pair_lens.is_empty()
+                    && args.len() == 2
+                    && regular_call_name_path(reg, self.llbc).as_deref()
+                        == Some("alloc::vec::<Impl>::extend_from_slice")
+                    && second_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_object_pointer_slice(ty, self.llbc)) =>
+            {
+                first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc))
+                    .filter(|&kind| kind == majit_ir::rvec::VecItemKind::Ref)
+            }
+            _ => None,
+        };
         // An indirect call through a fn pointer or a vtable slot passes each
         // pair slice as its two words, the way the callee's signature
         // spells a `&[T]` parameter.
@@ -21870,6 +22010,24 @@ impl<'a> Lowering<'a> {
                     target: CallTarget::FunctionPath {
                         segments: majit_ir::rvec::vec_helper_path(
                             majit_ir::rvec::VecOp::ExtendFromSlice,
+                            kind,
+                        )
+                        .split("::")
+                        .map(str::to_string)
+                        .collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(args),
+                    result_ty: ValueType::Void,
+                }
+            }
+            (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
+                if let Some(kind) = vec_extend_gcarray_kind =>
+            {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: majit_ir::rvec::vec_helper_path(
+                            majit_ir::rvec::VecOp::Extend,
                             kind,
                         )
                         .split("::")
@@ -25233,10 +25391,13 @@ impl<'a> Lowering<'a> {
                     (segments, method_hint)
                 };
                 // A `Vec` of one-word items is the raw header `RustVecRepr`
-                // lowers; its constructors and `push` call the `ll_vec_*`
-                // helper that repr names for the item kind, as the rtyper
-                // writes `gendirectcall(ll_newlist_hint | ll_append, ...)`
-                // into the graph it hands the codewriter.
+                // lowers; its constructors, `push`, and `as_ptr` /
+                // `as_mut_ptr` call the `ll_vec_*` helper that repr names
+                // for the item kind, as the rtyper writes
+                // `gendirectcall(ll_newlist_hint | ll_append | ll_items, ...)`
+                // into the graph it hands the codewriter. `as_ptr` of any
+                // other `Vec<T>` still reads the same header pointer word
+                // (`rlist.py` `ll_items`); that helper is kind-independent.
                 let (segments, method_hint) = match rust_vec_std_call(
                     &original_segments,
                     args.len(),
@@ -25251,6 +25412,14 @@ impl<'a> Lowering<'a> {
                             args.swap(0, 1);
                         }
                         (rust_vec_helper_segments(op, kind), None)
+                    }
+                    None if args.len() == 1
+                        && matches!(
+                            rust_vec_std_leaf(&original_segments),
+                            Some("as_ptr" | "as_mut_ptr")
+                        ) =>
+                    {
+                        (rust_vec_as_ptr_helper_segments(), None)
                     }
                     None => (segments, method_hint),
                 };
@@ -31140,7 +31309,10 @@ impl<'a> Lowering<'a> {
             && (type_node_is_fn_ptr(node, self.llbc)
                 || tyref_option_payload_is_fn_ptr(dest_ty, self.llbc))
         {
-            return Some(self.graph.push_null_fn_ptr(bb_id));
+            return Some(self.graph.push_null_fn_ptr_with_spelling(
+                bb_id,
+                tyref_fn_ptr_spelling(dest_ty, self.llbc).as_deref(),
+            ));
         }
         let kind = if json_ty_is_thin_pointer_element(node, self.llbc)
             && !matches!(value_ty, ValueType::Int | ValueType::Unsigned)
@@ -31810,11 +31982,9 @@ impl<'a> Lowering<'a> {
     /// This is a fixed-array identity ONLY: it mirrors `ll_fixed_items(l) = l`
     /// (`rlist.py`, a `FixedSizeListRepr` IS its items array).  A resized
     /// list / `Vec` reaches its items buffer through `ll_items(l) = l.items`
-    /// (`rlist.py:368`, a `getfield`), so `alloc::vec::<Impl>::as_ptr` is NOT
-    /// an identity on the receiver and must not fold here — it stays a residual
-    /// (the only two callers, `IntArray`/`FloatArray::from_vec`, are host
-    /// builtins residualised to their compiled bodies, so no traced consumer
-    /// dereferences the folded header).
+    /// (`rlist.py` `ll_items`, a `getfield`), so `alloc::vec::<Impl>::as_ptr`
+    /// is NOT an identity on the receiver and must not fold here —
+    /// `rust_vec_std_call` lowers it to `ll_vec_items_*` / `ll_vec_as_ptr`.
     /// `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null` — Charon's name
     /// for `<*const T>::is_null` / `<*mut T>::is_null`.  The impl module
     /// leaf is `const_ptr` or `mut_ptr` and the method leaf is `is_null`;
@@ -34786,6 +34956,12 @@ impl<'a> Lowering<'a> {
             result_niche,
             result_fn_ptr: matches!(kind, ClosureCombinator::Map | ClosureCombinator::AndThen)
                 && tyref_option_payload_is_fn_ptr(dest_ty, self.llbc),
+            result_fn_ptr_spelling: match kind {
+                ClosureCombinator::Map | ClosureCombinator::AndThen => {
+                    tyref_fn_ptr_spelling(dest_ty, self.llbc)
+                }
+                _ => None,
+            },
             result_niche_null_cast,
             result_fieldless_none_tag,
             call_once_owner,
@@ -35197,7 +35373,10 @@ impl<'a> Lowering<'a> {
         // classdef-less `SomeInstance` and then cannot union with the
         // `fn` field read (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
         if self.option_payload_is_fn_ptr(option_ty) {
-            return self.graph.push_null_fn_ptr(bb_id);
+            return self.graph.push_null_fn_ptr_with_spelling(
+                bb_id,
+                tyref_fn_ptr_spelling(option_ty, self.llbc).as_deref(),
+            );
         }
         self.graph
             .push_niche_null(bb_id, self.option_niche_null_cast(option_ty).as_ref())
@@ -41665,6 +41844,7 @@ fn mir_successor_ids(llbc: &Llbc, bb: &BasicBlock) -> Vec<usize> {
         | TermKind::UnwindResume
         | TermKind::UnwindTerminate
         | TermKind::Abort(_)
+        | TermKind::Panic { .. }
         | TermKind::UndefinedBehavior
         | TermKind::Unknown => Vec::new(),
     };
@@ -50473,12 +50653,27 @@ pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
 /// - output is itself a foreign **opaque** ADT (`BigInt` → `BigInt`,
 ///   the `Add`/`Sub`/`Mul`/`clone` cluster) → `Ref(None)`, the
 ///   classdef-less `SomeInstance` shell `bigint_from` produces;
-/// - anything else — an `Option<i64>` (`to_i64`), an enum (`sign`), a
-///   tuple, a reference, a non-opaque ADT — is **declined** (no entry),
-///   leaving the method at the original "not registered" Skip.  Modeling
-///   an `Option<i64>` return as a bare integer or as `Ref(None)` would
-///   mis-type the value and only migrate the failure to a deeper wall, so
-///   those methods stay residual until their result type can be modeled.
+/// - output is a payload-carrying enum (`GcAllocOutcome`) →
+///   `Ref(Some(root))`, the intern key a caller `match` on
+///   `Allocated`/`Failed`/`NoRoute` getattr's `__discriminant` through;
+/// - anything else — an `Option<i64>` (`to_i64`), a fieldless enum
+///   (`sign`), a tuple, a reference, a non-opaque struct — is
+///   **declined** (no entry), leaving the method at the original "not
+///   registered" Skip.  Modeling an `Option<i64>` return as a bare
+///   integer or as `Ref(None)` would mis-type the value and only migrate
+///   the failure to a deeper wall, so those methods stay residual until
+///   their result type can be modeled.
+///
+/// A second arm harvests **bodyless foreign associated functions**
+/// (`!is_local`, no unstructured body, no `self` receiver).  `majit_gc`
+/// is not an extracted crate, so Charon records
+/// `GcAllocOutcome::from_hook` as Foreign/Opaque while the TypeDecl is
+/// the full payload Enum — not `TypeDeclKind::Opaque`, and the first
+/// argument is the hook `Option<*mut u8>`, not `self`.  The
+/// registration key is still [`impl_method_owner_for_fundecl`] +
+/// [`strip_crate_prefix`], matching the call-site
+/// `["GcAllocOutcome", "from_hook"]`.  Self-methods on a non-opaque
+/// owner (`allocated_or_abort`) stay out of this arm.
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_foreign_opaque_method_externals(
     llbc: &Llbc,
@@ -50493,11 +50688,9 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         if fd.is_global_initializer().is_some() {
             continue;
         }
-        // Owner must be an impl-block method on an opaque ADT, with the
-        // owner ADT as the first (`self`) input.  `impl_method_owner_for_fundecl`
-        // resolves the owner's qualified name; the explicit opaque-kind +
-        // self-receiver checks here mirror the gate `impl_method_owner`
-        // applies before declining the Method hint.
+        // Owner must be an impl-block item.  `impl_method_owner_for_fundecl`
+        // resolves the owner's qualified name; the two arms below pick
+        // which impl items become residuals.
         let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
             continue;
         };
@@ -50507,15 +50700,24 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         let Some(owner_td) = llbc.type_by_id(owner_def_id) else {
             continue;
         };
-        if !matches!(owner_td.kind, TypeDeclKind::Opaque) {
-            continue;
-        }
-        if !first_input_is_adt_free(llbc, fd, owner_def_id) {
+        let self_receiver = first_input_is_adt_free(llbc, fd, owner_def_id);
+        // Existing arm: method on a foreign opaque ADT with `self`
+        // (`<BigInt as Add>::add`).  Mirrors the gate `impl_method_owner`
+        // applies before declining the Method hint.
+        let opaque_self_method = matches!(owner_td.kind, TypeDeclKind::Opaque) && self_receiver;
+        // Bodyless foreign associated fn (`GcAllocOutcome::from_hook`):
+        // unextracted crate, so the FunDecl has no body while the owner
+        // TypeDecl is a full Enum.  Not a `self` method — that keeps the
+        // Opaque-owner BigInt path on the arm above and leaves
+        // `allocated_or_abort` unharvested here.
+        let foreign_assoc_fn =
+            !fd.item_meta.is_local && !fd.has_unstructured_body() && !self_receiver;
+        if !opaque_self_method && !foreign_assoc_fn {
             continue;
         }
         // Faithful result shell read from the LLBC output signature; a
-        // result type that cannot be modeled (Option / enum / tuple /
-        // reference / non-opaque ADT) declines the method.
+        // result type that cannot be modeled (Option / fieldless enum /
+        // tuple / reference / non-opaque struct) declines the method.
         let Some(result_ty) = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)
         else {
             continue;
@@ -50572,8 +50774,10 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
 /// Faithful result `ValueType` for a residualized foreign-opaque method,
 /// or `None` to decline (see [`collect_foreign_opaque_method_externals`]).
 /// A scalar literal output keeps its `ValueType`; an opaque-ADT output
-/// projects to `Ref(None)`; every other shape (`Option`, enum, tuple,
-/// reference, non-opaque ADT) is declined.
+/// projects to `Ref(None)`; a payload-carrying enum keeps
+/// `Ref(Some(root))` so the residual intern's the enum-base ClassDef;
+/// every other shape (`Option`, fieldless enum, tuple, reference,
+/// non-opaque struct) is declined.
 #[cfg(any(test, feature = "mir-frontend"))]
 fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
@@ -50587,15 +50791,28 @@ fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option
             Some(vt)
         }
         // A `Ref` projection covers every non-scalar ADT shape (`BigInt`,
-        // `Option<i64>`, tuples, …).  Accept it ONLY when the result ADT
-        // is itself a foreign opaque type (the `BigInt`-returning
-        // arithmetic cluster), which the classdef-less `SomeInstance`
-        // shell models faithfully.  A non-opaque ADT (`Option`, an enum)
-        // would be mis-typed as an opaque GcRef, so decline it.
-        ValueType::Ref(_) => {
+        // `Option<i64>`, tuples, payload enums, …).  Accept it when:
+        //
+        // - the result ADT is itself a foreign opaque type (the
+        //   `BigInt`-returning arithmetic cluster) → classdef-less
+        //   `SomeInstance`, the shell `bigint_from` produces;
+        // - the result is a payload-carrying enum (`GcAllocOutcome`)
+        //   whose class root `tyref_to_value_type` already painted →
+        //   keep `Ref(Some(root))` so registration intern's the
+        //   enum-base ClassDef a caller `match` getattr's.
+        //
+        // A non-opaque struct / `Option` / fieldless enum would be
+        // mis-typed as an opaque GcRef, so decline it.
+        ValueType::Ref(root) => {
             let def_id = output_adt_def_id_free(output, llbc)?;
             let td = llbc.type_by_id(def_id)?;
-            matches!(td.kind, TypeDeclKind::Opaque).then_some(ValueType::Ref(None))
+            match &td.kind {
+                TypeDeclKind::Opaque => Some(ValueType::Ref(None)),
+                TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
+                    root.map(|r| ValueType::Ref(Some(r)))
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -55323,6 +55540,30 @@ fn object_ref_items_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     Some(format!("[{root}]"))
 }
 
+/// List spelling of an object-pointer slice (`&[T]` / `*const [T]`).
+///
+/// `emit_object_vec_gcarray` copies a `Vec<T>` into the length-prefixed
+/// object GcArray (`ll_fixed_items`). A list that is never resized is
+/// `FixedSizeListRepr`; the slice is that list, annotated through the
+/// position ListDef (`Bookkeeper.getlistdef`) of `[Class]`. The element
+/// class is the pointee leaf, the same root `object_ref_items_list_root`
+/// names for an items pointer.
+fn object_pointer_slice_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    tyref_object_pointer_slice_mutability(ty, llbc)?;
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let pointee = match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array()?.get(1)?,
+        (None, Some(raw)) => raw.as_array()?.first()?,
+        _ => return None,
+    };
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    let item = pointee.get("Slice")?.as_array()?.first()?;
+    let item = strip_ty_indirections(item, llbc)?;
+    let root = raw_ptr_pointee_class_root(item, llbc)
+        .or_else(|| adt_node_class_root_leaf(item, llbc, no_tombstoned_leaves()))?;
+    Some(format!("[{root}]"))
+}
+
 /// Item spelling inside a `[Class]` list root. A `[T; N]` tail is not one.
 fn list_spelling_item(list_root: &str) -> Option<&str> {
     let item = list_root.strip_prefix('[')?.strip_suffix(']')?;
@@ -55394,6 +55635,17 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
     false
 }
 
+/// Int-banked pointer whose `as usize` / `as i64` is `rbuiltin.py`
+/// `gen_cast` of a Ptr origin: a function pointer (`Ptr(FuncType)`), or a
+/// raw pointer / reference whose pointee is `alloc::vec::Vec` (`RustVecRepr`,
+/// `Ptr(Struct(raw) "RustVec")`). A raw buffer address (`*mut u8`) is the
+/// type-erased byte pointer, not this origin.
+fn tyref_is_ptr_to_int_cast_origin(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_option_payload_is_fn_ptr(ty, llbc)
+        || tyref_node(ty, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+        || tyref_ptr_pointee_is_vec(ty, llbc)
+}
+
 /// `Option<fn(..)>` — the nullable raw function pointer, one machine address.
 fn tyref_option_payload_is_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     if !crate::front::result_exc::tyref_is_option(ty, llbc) {
@@ -55405,29 +55657,43 @@ fn tyref_option_payload_is_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|node| type_node_is_fn_ptr(node, llbc))
 }
 
-/// Whether a Charon type node's top-level constructor is a function pointer,
-/// after following serialization indirections.
-fn type_node_is_fn_ptr<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
-    for _ in 0..24 {
-        let Some(obj) = node.as_object() else {
-            return false;
-        };
-        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            let Some(body) = llbc.dedup_body(id) else {
-                return false;
-            };
-            node = body;
-            continue;
-        }
-        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
-            && arr.len() == 2
-        {
-            node = &arr[1];
-            continue;
-        }
-        return obj.get("FnPtr").is_some();
+/// `class_root` of an `Int`-banked function-pointer parameter. `history.getkind`
+/// of `Ptr(FuncType)` is `int`; `derive_subject_inputcells` reads this
+/// spelling to seed `SomePtr` (`fn_ptr_somevalue_for_spelling`) instead of
+/// `SomeInteger`. A `fn` and `Option<fn(...)>` both carry the signature
+/// spelling (`charon_type_value_to_ast_string`) so every producer of one
+/// Rust `fn` type annotates one `FuncType`.
+fn tyref_fn_ptr_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if tyref_option_payload_is_fn_ptr(ty, llbc)
+        || tyref_node(ty, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+    {
+        return Some(tyref_to_ast_string(ty, llbc));
     }
-    false
+    None
+}
+
+/// Inner `fn(inputs) -> output` spelling of a function pointer or of
+/// `Option<fn(...)>`. Stamps `null_fn` with the payload's `FuncType`
+/// (`lltype.nullptr`).
+fn tyref_fn_ptr_spelling(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+        && tyref_node(&payload, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+    {
+        return Some(tyref_to_ast_string(&payload, llbc));
+    }
+    tyref_node(ty, llbc)
+        .is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+        .then(|| tyref_to_ast_string(ty, llbc))
+}
+
+/// Whether a Charon type node's top-level constructor is a function pointer,
+/// after following serialization indirections and `type T = fn(…)` aliases
+/// (`TypeDeclKind::Alias`). A type alias of a function pointer is the
+/// pointer (`lltype.FuncType` / `SomePtr`), not a nominal ADT.
+fn type_node_is_fn_ptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    type_node_peel_aliases(node, llbc)
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|obj| obj.get("FnPtr").is_some())
 }
 
 /// FunDecl id of a function-item (`FnDef`) type, after following
@@ -57317,6 +57583,14 @@ pub(crate) fn charon_type_value_to_ast_string(
         }
         return "??rawptr_shape".to_string();
     }
+    // A function-pointer type, including `type T = fn(...)` aliases.
+    // `lltype.FuncType` / `getfunctionptr` derive one signature; the
+    // rendered spelling is that signature so every producer of one Rust
+    // `fn` type annotates one `Ptr(FuncType)`.
+    if type_node_is_fn_ptr(v, llbc) {
+        let peeled = type_node_peel_aliases(v, llbc).unwrap_or(v);
+        return charon_fn_ptr_to_ast_string(peeled, llbc, depth);
+    }
     // ADTs: tuples, builtins (Box/Slice/Str/Array), and named types.
     if let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) {
         return charon_adt_to_ast_string(adt, llbc, depth);
@@ -57360,12 +57634,6 @@ pub(crate) fn charon_type_value_to_ast_string(
     if obj.contains_key("DynTrait") {
         return charon_dyn_trait_to_ast_string(&obj["DynTrait"], llbc);
     }
-    // Function pointers — the JIT consumers only ever wrapper-strip and
-    // struct-name-match field types, so a coarse `fn` marker is
-    // sufficient (no consumer parses the `fn(..) -> ..` arrow form).
-    if obj.contains_key("FnPtr") {
-        return "fn".to_string();
-    }
     // A declaration field of type `T` has no concrete spelling. The index
     // is the declaration parameter, so `RawPair<f64, usize>` can substitute
     // `??TypeVar#0` and `??TypeVar#1` separately.
@@ -57374,6 +57642,39 @@ pub(crate) fn charon_type_value_to_ast_string(
     }
     let key = obj.keys().next().cloned().unwrap_or_else(|| "?".into());
     format!("??{key}")
+}
+
+/// `fn(inputs) -> output` / `unsafe fn(inputs) -> output` for a Charon
+/// `FnPtr` node. Nested types use the same renderer as the rest of a
+/// field / `class_root` spelling (`charon_type_value_to_ast_string`).
+fn charon_fn_ptr_to_ast_string(node: &serde_json::Value, llbc: &Llbc, depth: usize) -> String {
+    let fnptr = node
+        .as_object()
+        .and_then(|obj| obj.get("FnPtr"))
+        .unwrap_or(node);
+    let Some(sig) = fnptr.get("skip_binder").unwrap_or(fnptr).as_object() else {
+        return "fn".to_string();
+    };
+    let inputs = sig
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|ty| charon_type_value_to_ast_string(ty, llbc, depth + 1))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let output = sig
+        .get("output")
+        .map(|ty| charon_type_value_to_ast_string(ty, llbc, depth + 1))
+        .unwrap_or_else(|| "()".to_string());
+    if sig.get("is_unsafe").and_then(serde_json::Value::as_bool) == Some(true) {
+        format!("unsafe fn({inputs}) -> {output}")
+    } else {
+        format!("fn({inputs}) -> {output}")
+    }
 }
 
 /// Resolve a `TraitType [traitref, assoc, generics]` projection through the
@@ -64132,6 +64433,21 @@ fn tyref_is_vec_value(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc).as_deref() == Some("alloc::vec::Vec")
 }
 
+/// One `&` / `&mut` / `*const` / `*mut` whose pointee is `alloc::vec::Vec`.
+/// The value is the header address (`RustVecRepr`); `as usize` is a
+/// pointer-to-integer cast, not an integer retype. A `Vec` by value is the
+/// header itself and is not this shape.
+fn tyref_ptr_pointee_is_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) =
+        tyref_peel_one_ref_node(ty, llbc).or_else(|| tyref_peel_one_raw_ptr_node(ty, llbc))
+    else {
+        return false;
+    };
+    adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+}
+
 /// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
 /// behind a borrow, or behind a raw pointer, all of which the translator
 /// represents as the address of the raw `{ptr, len, cap}` header
@@ -64286,6 +64602,40 @@ fn tyref_option_pair_slice_item_kind(
 ) -> Option<majit_ir::rvec::VecItemKind> {
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
     tyref_pair_slice_item_kind(&payload, llbc).filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+}
+
+/// `&[PyObjectRef]` / `&[*mut PyObject]` (and the mut / raw-pointer
+/// spellings): the length-prefixed object array, one GcArray word.
+fn tyref_is_object_pointer_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_object_pointer_slice_mutability(ty, llbc).is_some()
+}
+
+/// Mutability of an object-pointer slice: `"Shared"` / `"Const"` for
+/// `&[T]` / `*const [T]`, `"Mut"` for `&mut [T]` / `*mut [T]`.
+fn tyref_object_pointer_slice_mutability<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l str> {
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let (pointee, kind) = match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => {
+            let arr = reference.as_array()?;
+            (arr.get(1)?, arr.get(2).and_then(serde_json::Value::as_str)?)
+        }
+        (None, Some(raw)) => {
+            let arr = raw.as_array()?;
+            (
+                arr.first()?,
+                arr.get(1).and_then(serde_json::Value::as_str)?,
+            )
+        }
+        (None, None) => return None,
+    };
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    let item = pointee
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())?;
+    (json_ty_is_objectptr(item, llbc)
+        || object_pointer_item_spelling(&charon_type_value_to_ast_string(item, llbc, 0)))
+    .then_some(kind)
 }
 
 /// The item kind of a `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]` whose
@@ -65194,15 +65544,16 @@ fn rust_vec_std_leaf(segments: &[String]) -> Option<&str> {
     }
 }
 
-/// The `Vec` operation and item kind of a `Vec::new()` /
-/// `Vec::with_capacity(n)` / `v.push(x)` call on a `Vec` of one-word items:
-/// the constructors read the item from the result type, `push` from its
-/// receiver.
 /// `alloc::vec::from_elem`, the call `vec![item; count]` lowers to.
 fn is_alloc_vec_from_elem(segments: &[String]) -> bool {
     matches!(segments, [a, b, c] if a == "alloc" && b == "vec" && c == "from_elem")
 }
 
+/// The `Vec` operation and item kind of a `Vec::new()` /
+/// `Vec::with_capacity(n)` / `v.push(x)` / `v.as_ptr()` / `v.as_mut_ptr()`
+/// call on a `Vec` of one-word items: the constructors read the item from
+/// the result type, `push` / `as_ptr` / `as_mut_ptr` from the receiver.
+/// `as_ptr` / `as_mut_ptr` are `ll_items` (`rlist.py`: `return l.items`).
 fn rust_vec_std_call(
     segments: &[String],
     nargs: usize,
@@ -65221,6 +65572,9 @@ fn rust_vec_std_call(
             VecOp::Append,
             tyref_rust_vec_item_kind(first_arg_ty?, llbc)?,
         )),
+        ("as_ptr" | "as_mut_ptr", 1) => {
+            Some((VecOp::Items, tyref_rust_vec_item_kind(first_arg_ty?, llbc)?))
+        }
         _ => None,
     }
 }
@@ -65318,6 +65672,16 @@ fn rust_vec_helper_segments(
 ) -> Vec<String> {
     majit_ir::rvec::vec_helper_path(op, kind)
         .split("::")
+        .map(str::to_string)
+        .collect()
+}
+
+/// Kind-independent `ll_items`: the header's buffer pointer word, for a
+/// `Vec<T>` whose item is not one word (`ll_vec_as_ptr`).
+fn rust_vec_as_ptr_helper_segments() -> Vec<String> {
+    majit_ir::rvec::RVEC_MODULE
+        .split("::")
+        .chain(std::iter::once("ll_vec_as_ptr"))
         .map(str::to_string)
         .collect()
 }
@@ -67582,10 +67946,11 @@ mod tests {
         json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, shaped_array_parts, simplify_lowered_graph,
-        static_key_segments, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_shaped_tuple_root,
-        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
-        tyref_tuple_suffix,
+        static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
+        tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
+        tyref_shaped_tuple_root, tyref_to_attr_value_type,
+        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
     };
     use crate::flowspace::model::Variable;
     use crate::model::{
@@ -69783,6 +70148,35 @@ mod tests {
         assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
+    #[test]
+    fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
+        let llbc = fixture_llbc();
+        let ty = TyRef::Other(serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [{"Slice": [{"Adt": {"id": 0}}]}],
+                    "output": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                    "is_unsafe": false
+                }
+            }
+        }));
+        assert_eq!(
+            tyref_to_value_type(&ty, &llbc),
+            ValueType::Int,
+            "history.getkind of Ptr(FuncType) is int"
+        );
+        assert_eq!(
+            tyref_fn_ptr_input_class_root(&ty, &llbc).as_deref(),
+            Some("fn([??adt#0]) -> i64"),
+            "Int-banked fn-pointer params carry the fn(inputs) -> output spelling"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type(&ty, &llbc),
+            ValueType::Int,
+            "a stored fn field uses the same Int bank as a value site"
+        );
+    }
+
     /// Every row of the fn-pointer family decision, including the two the
     /// fixture corpus structurally cannot reach: it declares one fn-pointer
     /// alias (`HostCallback`) and that alias is safe, so no corpus-driven
@@ -70843,6 +71237,39 @@ mod tests {
             object_ref_items_list_root(&header, &llbc),
             None,
             "a pointer to the object itself is not the items pointer"
+        );
+    }
+
+    #[test]
+    fn object_pointer_slice_names_its_element_list() {
+        use super::object_pointer_slice_list_root;
+
+        let object_decl = struct_decl(
+            2,
+            ident_path(&["pyobject", "PyObject"]),
+            empty_fields(),
+            false,
+        );
+        let (llbc, _) = load_handle(vec![(2, object_decl)], serde_json::json!([]), 2);
+        let objptr = serde_json::json!({
+            "RawPtr": [
+                {"Adt": {"id": 2, "generics": {"types": []}}},
+                "Mut"
+            ]
+        });
+        let slice = TyRef::Other(serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr.clone(), null]}, "Shared"]
+        }));
+        assert_eq!(
+            object_pointer_slice_list_root(&slice, &llbc).as_deref(),
+            Some("[PyObject]")
+        );
+        let raw = TyRef::Other(serde_json::json!({
+            "RawPtr": [{"Slice": [objptr, null]}, "Const"]
+        }));
+        assert_eq!(
+            object_pointer_slice_list_root(&raw, &llbc).as_deref(),
+            Some("[PyObject]")
         );
     }
 
@@ -74681,6 +75108,235 @@ mod tests {
         );
     }
 
+    /// `w_dict_getitem_str_hashed` reads `imp` on two strategy arms, merges,
+    /// then reads `method_*` after a passthrough. The FatLen metadata word
+    /// must be an inputarg of the method_* block: a dominating use of the
+    /// merge phi is not a definition (`lookup_operand`).
+    #[test]
+    fn dyn_trait_vtable_slot_base_is_defined_after_a_passthrough() {
+        use crate::model::{FieldDescriptor, OpKind, VecFieldPart};
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let empty_generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let holder_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+        });
+        let vtable_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": empty_generics}
+        });
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+        let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+        let fn_ptr =
+            serde_json::json!({"FnPtr": {"inputs": [fat_ty.clone()], "output": {"Tuple": []}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "Holder"]),
+            "kind": {"Struct": [{
+                "name": "slot",
+                "ty": fat_ty,
+                "attr_info": field_attr
+            }]}
+        });
+        let vtable = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "Storage", "{vtable}"]),
+            "kind": {"Struct": [{
+                "name": "method_head",
+                "ty": fn_ptr,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fat_ty,
+        );
+        let assign_slot = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(serde_json::json!({"Local": 3}), &fat_ty),
+            {"Use": [{"Copy": slot_place}, "No"]}
+        ]}});
+        let metadata_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 3}), &fat_ty),
+                "PtrMetadata"
+            ]}),
+            &vtable_ptr,
+        );
+        let slot_field = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    metadata_place,
+                    "Deref"
+                ]}), &vtable_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ptr,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "call_head_merged"]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [holder_ref, bool_ty],
+                "output": unit
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 2, "locals": [
+                    local(0, &unit),
+                    local(1, &holder_ref),
+                    local(2, &bool_ty),
+                    local(3, &fat_ty),
+                    local(4, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": span, "kind": {"Switch": {
+                            "discr": {"Copy": place(serde_json::json!({"Local": 2}), &bool_ty)},
+                            "targets": {"If": [1, 2]}
+                        }}}
+                    },
+                    {
+                        "statements": [assign_slot.clone()],
+                        "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}
+                    },
+                    {
+                        "statements": [assign_slot],
+                        "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}
+                    },
+                    {
+                        "statements": [{"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 4}), &fn_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
+                                {"Copy": slot_field}
+                            ]}
+                        ]}}],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 4}),
+                                    &fn_ptr
+                                )}},
+                                "args": [{"Move": place(
+                                    serde_json::json!({"Local": 3}),
+                                    &fat_ty
+                                )}],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 5,
+                            "on_unwind": 6
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [holder, vtable],
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Storage"]),
+                    "methods": [{"skip_binder": {"name": "head"}}]
+                }],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph =
+            super::lower_function(&llbc, "call_head_merged").expect("lower call_head_merged");
+
+        let mut method_reads = 0usize;
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}",
+                        block.id,
+                        operand,
+                        op.kind
+                    );
+                }
+                if let OpKind::FieldRead {
+                    field: FieldDescriptor { name, .. },
+                    ..
+                } = &op.kind
+                    && name == "method_head"
+                {
+                    method_reads += 1;
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
+        assert!(
+            method_reads > 0,
+            "lowered no method_head read\n{}",
+            graph.dump()
+        );
+        let fat_lens: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "slot" && field.vec_part == Some(VecFieldPart::FatLen)
+                )
+            })
+            .collect();
+        assert!(
+            !fat_lens.is_empty(),
+            "the vtable word must be a FatLen of slot\n{}",
+            graph.dump()
+        );
+    }
+
     #[test]
     fn a_mono_trait_object_call_names_its_method_from_assoc_item_names() {
         // Under `--monomorphize` the trait declaration of a sibling crate
@@ -75046,6 +75702,152 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("transmute fixture Llbc parses")
+    }
+
+    /// Foreign payload-enum associated fn whose FunDecl is Opaque (the
+    /// owner crate is not extracted) while the TypeDecl is a full Enum.
+    /// Mirrors `majit_gc::GcAllocOutcome::from_hook`: one non-`self`
+    /// argument, result the payload enum.  A sibling `self` method on
+    /// the same owner (`allocated_or_abort`) stays out of the harvest.
+    fn gc_alloc_outcome_from_hook_fixture() -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+        let item_meta = |name: Vec<serde_json::Value>, is_local: bool| {
+            serde_json::json!({
+                "name": name,
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let outcome_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics.clone()}
+        });
+        let raw_ptr_ty = serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+        });
+        let impl_seg = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, outcome_ty.clone()]},
+            "kind": "InherentImplBlock"
+        }}});
+        let outcome = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(vec![ident("majit_gc"), ident("GcAllocOutcome")], false),
+            "kind": {
+                "Enum": [
+                    {
+                        "name": "Allocated",
+                        "fields": [{
+                            "name": null,
+                            "is_positional": true,
+                            "ty": raw_ptr_ty.clone(),
+                            "attr_info": null
+                        }],
+                        "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}
+                    },
+                    {
+                        "name": "Failed",
+                        "fields": [],
+                        "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}
+                    },
+                    {
+                        "name": "NoRoute",
+                        "fields": [],
+                        "discriminant": {"Scalar": {"Unsigned": ["U8", "2"]}}
+                    }
+                ]
+            }
+        });
+        let from_hook = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(
+                vec![ident("majit_gc"), impl_seg.clone(), ident("from_hook")],
+                false,
+            ),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [raw_ptr_ty.clone()],
+                "output": outcome_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let allocated_or_abort = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(
+                vec![ident("majit_gc"), impl_seg, ident("allocated_or_abort")],
+                false,
+            ),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [outcome_ty.clone(), {"Scalar": {"Integer": {"Unsigned": "Usize"}}}],
+                "output": raw_ptr_ty
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [outcome],
+                "fun_decls": [from_hook, allocated_or_abort],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("GcAllocOutcome::from_hook fixture Llbc parses")
+    }
+
+    #[test]
+    fn foreign_payload_enum_associated_fn_is_harvested_as_function_path() {
+        // Call-site lookup is `impl_method_owner_for_fundecl` +
+        // `strip_crate_prefix` → `["GcAllocOutcome", "from_hook"]`.
+        // The harvest must use that same key and keep the payload-enum
+        // class root so the residual intern's a ClassDef, not a
+        // classdef-less `SomeInstance`.
+        let llbc = gc_alloc_outcome_from_hook_fixture();
+        let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+        let row = harvested.iter().find(|(segments, _, _)| {
+            segments == &["GcAllocOutcome".to_string(), "from_hook".to_string()]
+        });
+        assert!(
+            row.is_some(),
+            "from_hook must be harvested under [GcAllocOutcome, from_hook]: {harvested:?}"
+        );
+        let (_, _, result_ty) = row.unwrap();
+        assert_eq!(
+            result_ty,
+            &crate::model::ValueType::Ref(Some("GcAllocOutcome".into()))
+        );
+        assert!(
+            !harvested
+                .iter()
+                .any(|(segments, _, _)| segments.last().map(String::as_str)
+                    == Some("allocated_or_abort")),
+            "self-method on a payload enum is not this harvest arm: {harvested:?}"
+        );
     }
 
     #[test]
@@ -76179,6 +76981,8 @@ mod tests {
         });
         let unit =
             serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics(vec![])}});
+        let i64_ptr = serde_json::json!({"RawPtr": [i64_ty.clone(), "Const"]});
+        let i64_mut_ptr = serde_json::json!({"RawPtr": [i64_ty.clone(), "Mut"]});
         let vec_decl = || {
             let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
                 .iter()
@@ -76218,6 +77022,20 @@ mod tests {
                 unit,
                 VecOp::Append,
             ),
+            (
+                "vec_as_ptr",
+                "as_ptr",
+                vec![vec_ty.clone()],
+                i64_ptr,
+                VecOp::Items,
+            ),
+            (
+                "vec_as_mut_ptr",
+                "as_mut_ptr",
+                vec![vec_ty.clone()],
+                i64_mut_ptr,
+                VecOp::Items,
+            ),
         ];
         for (caller, leaf, arg_tys, dest_ty, op) in cases {
             let llbc = std_extern_call_fixture_with_types(
@@ -76244,6 +77062,632 @@ mod tests {
                 "Vec::{leaf} on Vec<i64> must call {expected:?}; ops={ops:?}"
             );
         }
+    }
+
+    #[test]
+    fn byte_item_vec_as_ptr_retargets_to_the_kind_independent_helper() {
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![u8_ty.clone()])}
+        });
+        let u8_ptr = serde_json::json!({"RawPtr": [u8_ty.clone(), "Const"]});
+        let u8_mut_ptr = serde_json::json!({"RawPtr": [u8_ty, "Mut"]});
+        let vec_decl = {
+            let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let expected = super::rust_vec_as_ptr_helper_segments();
+        for (caller, leaf, dest_ty) in [
+            ("vec_u8_as_ptr", "as_ptr", u8_ptr),
+            ("vec_u8_as_mut_ptr", "as_mut_ptr", u8_mut_ptr),
+        ] {
+            let llbc = std_extern_call_fixture_with_types(
+                caller,
+                &["alloc", "vec", "<Impl>", leaf],
+                &[vec_ty.clone()],
+                dest_ty,
+                vec![vec_decl.clone()],
+            );
+            let graph = super::lower_function(&llbc, caller).expect("lower Vec<u8> as_ptr");
+            let ops = graph_ops(&graph);
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if *segments == expected
+                )),
+                "Vec::{leaf} on Vec<u8> must call {expected:?}; ops={ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some(leaf)
+                )),
+                "Vec::{leaf} on Vec<u8> must not stay residual; ops={ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vec_extends_from_a_gcarray_word_through_ll_extend() {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let named = |path: &[&str], def_id: u64| {
+            let name: Vec<serde_json::Value> = path
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let obj_adt = serde_json::json!({
+            "Adt": {"id": 1, "generics": generics(vec![])}
+        });
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![objptr.clone()])}
+        });
+        let recv = serde_json::json!({"Ref": ["_", vec_ty, "Mut"]});
+        let slice = serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr, null]}, "Shared"]
+        });
+        let unit =
+            serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics(vec![])}});
+        let llbc = std_extern_call_fixture_with_types(
+            "extend_from_object_slice",
+            &["alloc", "vec", "<Impl>", "extend_from_slice"],
+            &[recv, slice],
+            unit,
+            vec![named(&["alloc", "vec", "Vec"], 0), named(&["PyObject"], 1)],
+        );
+        let graph = super::lower_function(&llbc, "extend_from_object_slice")
+            .expect("lower Vec::extend_from_slice of an object slice");
+        let expected: Vec<String> = vec_helper_path(VecOp::Extend, VecItemKind::Ref)
+            .split("::")
+            .map(str::to_string)
+            .collect();
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if *segments == expected && args.len() == 2
+            )),
+            "object-slice extend_from_slice must call {expected:?} with two args; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("extend_from_slice")
+            )),
+            "extend_from_slice must not remain as a residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn an_object_array_literal_unsize_is_newlist() {
+        let generics = || {
+            serde_json::json!({
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            })
+        };
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let named = |path: &[&str], def_id: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path, false),
+                "kind": {"Struct": []}
+            })
+        };
+        let obj_adt = serde_json::json!({"Adt": {"id": 0, "generics": generics()}});
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let array_len = serde_json::json!([
+            {"Integer": {"Unsigned": ["Usize", "3"]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]);
+        let array_ty = serde_json::json!({"Array": [objptr.clone(), array_len, null]});
+        let array_ref = serde_json::json!({"Ref": ["_", array_ty.clone(), "Shared"]});
+        let slice_ref = serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr.clone(), null]}, "Shared"]
+        });
+        let unit = serde_json::json!({
+            "Adt": {"id": 1, "builtin": "Tuple", "generics": generics()}
+        });
+        let place =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "span": span(), "comments_before": []});
+        let assign = |dest: u64, dest_ty: &serde_json::Value, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
+        };
+        let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+        let usize_lit = serde_json::json!({
+            "Const": [
+                {"Integer": {"Unsigned": ["Usize", "3"]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ]
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "pass_object_array_literal"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [objptr.clone(), objptr.clone(), objptr.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 3,
+                        "locals": [
+                            local(0, &unit),
+                            local(1, &objptr),
+                            local(2, &objptr),
+                            local(3, &objptr),
+                            local(4, &array_ty),
+                            local(5, &array_ref),
+                            local(6, &slice_ref)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [
+                                assign(4, &array_ty, serde_json::json!({
+                                    "Aggregate": [
+                                        {"Array": [objptr.clone(), usize_lit.clone()]},
+                                        [mv(1, &objptr), mv(2, &objptr), mv(3, &objptr)]
+                                    ]
+                                })),
+                                assign(5, &array_ref, serde_json::json!({
+                                    "Ref": {
+                                        "place": place(4, &array_ty),
+                                        "kind": "Shared",
+                                        "ptr_metadata": null
+                                    }
+                                })),
+                                assign(6, &slice_ref, serde_json::json!({
+                                    "UnaryOp": [
+                                        {"Cast": {"Unsize": [
+                                            array_ref.clone(),
+                                            slice_ref.clone(),
+                                            {"Length": usize_lit}
+                                        ]}},
+                                        mv(5, &array_ref)
+                                    ]
+                                }))
+                            ],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 1},
+                                                    "generics": generics()
+                                                }
+                                            },
+                                            "args": [copy(6, &slice_ref)],
+                                            "dest": place(0, &unit)
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["fixture", "take_object_slice"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [slice_ref],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [named(&["PyObject"], 0)],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes())
+            .expect("object array literal fixture parses");
+        let graph = super::lower_function(&llbc, "pass_object_array_literal")
+            .expect("lower object array literal passed as &[PyObjectRef]");
+        let ops = graph_ops(&graph);
+        let newlist = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::NewList { args } if args.len() == 3));
+        let Some(newlist) = newlist else {
+            panic!("object array literal unsized to a slice must become newlist; ops={ops:?}");
+        };
+        let list = newlist
+            .result
+            .as_ref()
+            .expect("newlist produces a value")
+            .clone();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("take_object_slice")
+                    && args.iter().any(|arg| arg.as_variable() == Some(&list))
+            )),
+            "the slice parameter must receive the newlist; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Array" || majit_ir::descr::is_shaped_array_name(name)
+            )),
+            "the array literal must not remain an Array synthetic ctor; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn an_object_array_literal_unsize_mut_is_not_newlist() {
+        let generics = || {
+            serde_json::json!({
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            })
+        };
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let named = |path: &[&str], def_id: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path, false),
+                "kind": {"Struct": []}
+            })
+        };
+        let obj_adt = serde_json::json!({"Adt": {"id": 0, "generics": generics()}});
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let array_len = serde_json::json!([
+            {"Integer": {"Unsigned": ["Usize", "3"]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]);
+        let array_ty = serde_json::json!({"Array": [objptr.clone(), array_len, null]});
+        let array_ref = serde_json::json!({"Ref": ["_", array_ty.clone(), "Mut"]});
+        let slice_ref = serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr.clone(), null]}, "Mut"]
+        });
+        let unit = serde_json::json!({
+            "Adt": {"id": 1, "builtin": "Tuple", "generics": generics()}
+        });
+        let place =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "span": span(), "comments_before": []});
+        let assign = |dest: u64, dest_ty: &serde_json::Value, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
+        };
+        let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+        let usize_lit = serde_json::json!({
+            "Const": [
+                {"Integer": {"Unsigned": ["Usize", "3"]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ]
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "pass_object_array_literal_mut"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [objptr.clone(), objptr.clone(), objptr.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 3,
+                        "locals": [
+                            local(0, &unit),
+                            local(1, &objptr),
+                            local(2, &objptr),
+                            local(3, &objptr),
+                            local(4, &array_ty),
+                            local(5, &array_ref),
+                            local(6, &slice_ref)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [
+                                assign(4, &array_ty, serde_json::json!({
+                                    "Aggregate": [
+                                        {"Array": [objptr.clone(), usize_lit.clone()]},
+                                        [mv(1, &objptr), mv(2, &objptr), mv(3, &objptr)]
+                                    ]
+                                })),
+                                assign(5, &array_ref, serde_json::json!({
+                                    "Ref": {
+                                        "place": place(4, &array_ty),
+                                        "kind": "Mut",
+                                        "ptr_metadata": null
+                                    }
+                                })),
+                                assign(6, &slice_ref, serde_json::json!({
+                                    "UnaryOp": [
+                                        {"Cast": {"Unsize": [
+                                            array_ref.clone(),
+                                            slice_ref.clone(),
+                                            {"Length": usize_lit}
+                                        ]}},
+                                        mv(5, &array_ref)
+                                    ]
+                                }))
+                            ],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 1},
+                                                    "generics": generics()
+                                                }
+                                            },
+                                            "args": [copy(6, &slice_ref)],
+                                            "dest": place(0, &unit)
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["fixture", "take_object_slice_mut"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [slice_ref],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [named(&["PyObject"], 0)],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes())
+            .expect("object array literal mut fixture parses");
+        let graph = super::lower_function(&llbc, "pass_object_array_literal_mut")
+            .expect("lower object array literal passed as &mut [PyObjectRef]");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewList { .. })),
+            "object array literal unsized to &mut [T] must not become newlist; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn object_vec_as_slice_is_narrowed_to_the_object_gcarray() {
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let named = |path: &[&str], def_id: u64| {
+            let name: Vec<serde_json::Value> = path
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let obj_adt = serde_json::json!({
+            "Adt": {"id": 1, "generics": generics(vec![])}
+        });
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![objptr.clone()])}
+        });
+        let recv = serde_json::json!({"Ref": ["_", vec_ty, "Shared"]});
+        let slice = serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr, null]}, "Shared"]
+        });
+        let llbc = std_extern_call_fixture_with_types(
+            "object_vec_as_slice",
+            &["alloc", "vec", "<Impl>", "as_slice"],
+            &[recv],
+            slice,
+            vec![named(&["alloc", "vec", "Vec"], 0), named(&["PyObject"], 1)],
+        );
+        let graph = super::lower_function(&llbc, "object_vec_as_slice")
+            .expect("lower Vec<PyObjectRef>::as_slice");
+        let ops = graph_ops(&graph);
+        let gcarray = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.join("::") == "pyre_object::gc_roots::gcarray_from_pyobject_vec"
+            )
+        });
+        let Some(gcarray) = gcarray else {
+            panic!("Vec<PyObjectRef>::as_slice must call gcarray_from_pyobject_vec; ops={ops:?}");
+        };
+        let view = gcarray
+            .result
+            .as_ref()
+            .expect("gcarray_from_pyobject_vec produces a value");
+        assert!(
+            ops.iter().any(|op| {
+                crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call { args, .. }
+                            if args.first().and_then(LinkArg::as_variable) == Some(view)
+                    )
+            }),
+            "gcarray_from_pyobject_vec must be narrowed through the position ListDef; ops={ops:?}"
+        );
     }
 
     #[test]
@@ -79976,6 +81420,447 @@ mod tests {
             }
             other => panic!("second cast must retype to Unsigned with r_uint: {other:?}"),
         }
+    }
+
+    /// `fn as usize` is Int-banked (`history.getkind` of `Ptr(FuncType)`),
+    /// but `rbuiltin.py gen_cast` still starts from a Ptr origin: Signed
+    /// `cast_ptr_to_int` then `r_uint`. A bare `r_uint` is the integer
+    /// signedness flip and fails rtyping (`PtrRepr` to `IntegerRepr`).
+    #[test]
+    fn fn_ptr_as_usize_emits_cast_ptr_to_int_then_r_uint() {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        let fn_ptr = serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": {
+                        "Adt": {
+                            "id": 0,
+                            "builtin": "Tuple",
+                            "generics": {"types": []}
+                        }
+                    },
+                    "is_unsafe": false
+                }
+            }
+        });
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, ty: &serde_json::Value| {
+            serde_json::json!({
+                "index": index,
+                "name": null,
+                "span": span,
+                "ty": ty
+            })
+        };
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["fn_as_usize", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [fn_ptr.clone()],
+                "output": usize_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &usize_ty),
+                    local(1, &fn_ptr)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &usize_ty),
+                            {"UnaryOp": [
+                                {"Cast": {"Scalar": [fn_ptr.clone(), usize_ty.clone()]}},
+                                {"Copy": place(1, &fn_ptr)}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "fn_as_usize").expect("lower fn_as_usize");
+
+        let calls: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    result_ty,
+                } => Some((
+                    segments.last().map(String::as_str),
+                    op.result.as_ref(),
+                    args.as_slice(),
+                    result_ty,
+                )),
+                _ => None,
+            })
+            .collect();
+        let cast_idx = calls
+            .iter()
+            .position(|(leaf, _, _, _)| *leaf == Some("cast_ptr_to_int"))
+            .expect("fn as usize emits cast_ptr_to_int");
+        let retype_idx = calls
+            .iter()
+            .position(|(leaf, _, _, _)| *leaf == Some("r_uint"))
+            .expect("fn as usize emits r_uint");
+        assert_eq!(
+            retype_idx,
+            cast_idx + 1,
+            "rbuiltin.py gen_cast is cast_ptr_to_int then r_uint, got {calls:?}"
+        );
+        let (_, signed, cast_args, cast_ty) = &calls[cast_idx];
+        assert_eq!(**cast_ty, ValueType::Int);
+        let (_, result, retype_args, retype_ty) = &calls[retype_idx];
+        assert_eq!(**retype_ty, ValueType::Unsigned);
+        assert_eq!(
+            retype_args.first().and_then(LinkArg::as_variable),
+            signed.as_deref(),
+            "r_uint retypes the Signed cast_ptr_to_int result"
+        );
+        assert!(result.is_some());
+        assert_eq!(cast_args.len(), 1);
+    }
+
+    fn vec_decl_json() -> serde_json::Value {
+        let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": name,
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }},
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [], "inline": null, "rename": null, "public": true
+                },
+                "is_local": false
+            },
+            "kind": {"Struct": []}
+        })
+    }
+
+    fn vec_usize_ty_json() -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [usize_ty()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn mut_u8_ty_json() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]})
+    }
+
+    fn as_usize_cast_fixture(
+        name: &str,
+        src_ty: serde_json::Value,
+        type_decls: Vec<serde_json::Value>,
+        extra_assign: Option<(serde_json::Value, serde_json::Value, serde_json::Value)>,
+    ) -> Llbc {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        let usize_ty = usize_ty();
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, ty: &serde_json::Value| {
+            serde_json::json!({
+                "index": index,
+                "name": null,
+                "span": span,
+                "ty": ty
+            })
+        };
+        let mut locals = vec![local(0, &usize_ty), local(1, &src_ty)];
+        let mut statements = Vec::new();
+        let (cast_src_ty, cast_src_index) = if let Some((tmp_ty, tmp_cast, tmp_src)) = extra_assign
+        {
+            locals.push(local(2, &tmp_ty));
+            statements.push(serde_json::json!({
+                "span": span,
+                "kind": {"Assign": [
+                    place(2, &tmp_ty),
+                    {"UnaryOp": [tmp_cast, tmp_src]}
+                ]}
+            }));
+            (tmp_ty, 2u64)
+        } else {
+            (src_ty.clone(), 1u64)
+        };
+        let cast_src_place = place(cast_src_index, &cast_src_ty);
+        statements.push(serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [
+                place(0, &usize_ty),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [cast_src_ty, usize_ty.clone()]}},
+                    {"Copy": cast_src_place}
+                ]}
+            ]}
+        }));
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [name, 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [src_ty],
+                "output": usize_ty
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": locals},
+                "body": [{
+                    "statements": statements,
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    fn path_call_leaves(
+        graph: &crate::model::FunctionGraph,
+    ) -> Vec<(Option<&str>, Option<&Variable>, &[LinkArg], &ValueType)> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    result_ty,
+                } => Some((
+                    segments.last().map(String::as_str),
+                    op.result.as_ref(),
+                    args.as_slice(),
+                    result_ty,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_cast_ptr_to_int_then_r_uint(graph: &crate::model::FunctionGraph, what: &str) {
+        let calls = path_call_leaves(graph);
+        let cast_idx = calls
+            .iter()
+            .position(|(leaf, _, _, _)| *leaf == Some("cast_ptr_to_int"))
+            .unwrap_or_else(|| panic!("{what} emits cast_ptr_to_int, got {calls:?}"));
+        let retype_idx = calls
+            .iter()
+            .position(|(leaf, _, _, _)| *leaf == Some("r_uint"))
+            .unwrap_or_else(|| panic!("{what} emits r_uint, got {calls:?}"));
+        assert_eq!(
+            retype_idx,
+            cast_idx + 1,
+            "rbuiltin.py gen_cast is cast_ptr_to_int then r_uint, got {calls:?}"
+        );
+        let (_, signed, cast_args, cast_ty) = &calls[cast_idx];
+        assert_eq!(**cast_ty, ValueType::Int);
+        let (_, result, retype_args, retype_ty) = &calls[retype_idx];
+        assert_eq!(**retype_ty, ValueType::Unsigned);
+        assert_eq!(
+            retype_args.first().and_then(LinkArg::as_variable),
+            signed.as_deref(),
+            "r_uint retypes the Signed cast_ptr_to_int result"
+        );
+        assert!(result.is_some());
+        assert_eq!(cast_args.len(), 1);
+    }
+
+    /// `&mut Vec<T> as *mut Vec<T> as usize` is `rbuiltin.py gen_cast` of a
+    /// Ptr origin: Signed `cast_ptr_to_int` then `r_uint`. A bare `r_uint`
+    /// keeps the `SomeRustVec` annotation and fails to join an integer
+    /// `raw_ptradd` argument (`mergeinputargs`: Integer ∪ RustVec).
+    #[test]
+    fn vec_header_as_usize_emits_cast_ptr_to_int_then_r_uint() {
+        let vec_ty = vec_usize_ty_json();
+        let ref_ty = serde_json::json!({"Ref": ["_", vec_ty.clone(), "Mut"]});
+        let raw_ty = serde_json::json!({"RawPtr": [vec_ty, "Mut"]});
+        let span_place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let llbc = as_usize_cast_fixture(
+            "vec_header_i",
+            ref_ty.clone(),
+            vec![vec_decl_json()],
+            Some((
+                raw_ty.clone(),
+                serde_json::json!({"Cast": {"RawPtr": [ref_ty.clone(), raw_ty.clone()]}}),
+                serde_json::json!({"Copy": span_place(1, &ref_ty)}),
+            )),
+        );
+        let graph = super::lower_function(&llbc, "vec_header_i").expect("lower vec_header_i");
+        assert_cast_ptr_to_int_then_r_uint(&graph, "&mut Vec as *mut Vec as usize");
+    }
+
+    /// `*mut u8 as usize` is the type-erased address (`tyref_is_raw_byte_ptr`);
+    /// it is not a Vec header and must not take the Int-banked pointer arm's
+    /// predicate. The Ref → Unsigned sequence is unchanged.
+    #[test]
+    fn mut_u8_as_usize_emits_cast_ptr_to_int_then_r_uint() {
+        let src = mut_u8_ty_json();
+        let llbc = as_usize_cast_fixture("u8_as_usize", src, vec![], None);
+        let graph = super::lower_function(&llbc, "u8_as_usize").expect("lower *mut u8 as usize");
+        assert_cast_ptr_to_int_then_r_uint(&graph, "*mut u8 as usize");
+        assert!(!tyref_is_ptr_to_int_cast_origin(
+            &TyRef::Other(mut_u8_ty_json()),
+            &llbc
+        ));
+    }
+
+    /// The pointer-to-int origin is a function pointer or a pointer /
+    /// reference to `alloc::vec::Vec`. A raw `*mut u8` buffer, a `*mut usize`
+    /// address, and a `Vec` by value are not that shape.
+    #[test]
+    fn ptr_to_int_cast_origin_is_fn_ptr_or_ptr_to_vec() {
+        let llbc = {
+            let file = serde_json::json!({
+                "charon_version": "0.1.201",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [vec_decl_json()],
+                    "fun_decls": [],
+                    "global_decls": [],
+                    "trait_decls": [],
+                    "trait_impls": []
+                }
+            });
+            Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+        };
+        let vec_ty = vec_usize_ty_json();
+        let fn_ptr = TyRef::Other(serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": {
+                        "Adt": {
+                            "id": 0,
+                            "builtin": "Tuple",
+                            "generics": {"types": []}
+                        }
+                    },
+                    "is_unsafe": false
+                }
+            }
+        }));
+        assert!(tyref_is_ptr_to_int_cast_origin(&fn_ptr, &llbc));
+        assert!(tyref_ptr_pointee_is_vec(
+            &TyRef::Other(serde_json::json!({"Ref": ["_", vec_ty.clone(), "Mut"]})),
+            &llbc
+        ));
+        assert!(tyref_ptr_pointee_is_vec(
+            &TyRef::Other(serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]})),
+            &llbc
+        ));
+        assert!(tyref_is_ptr_to_int_cast_origin(
+            &TyRef::Other(serde_json::json!({"RawPtr": [vec_ty.clone(), "Mut"]})),
+            &llbc
+        ));
+        assert!(!tyref_ptr_pointee_is_vec(
+            &TyRef::Other(vec_ty.clone()),
+            &llbc
+        ));
+        assert!(!tyref_is_ptr_to_int_cast_origin(
+            &TyRef::Other(vec_ty),
+            &llbc
+        ));
+        assert!(!tyref_is_ptr_to_int_cast_origin(
+            &TyRef::Other(mut_u8_ty_json()),
+            &llbc
+        ));
+        assert!(!tyref_is_ptr_to_int_cast_origin(
+            &TyRef::Other(serde_json::json!({
+                "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "Mut"]
+            })),
+            &llbc
+        ));
+        assert!(!tyref_is_ptr_to_int_cast_origin(
+            &TyRef::Other(usize_ty()),
+            &llbc
+        ));
     }
 
     /// Only a byte pointee spells the type-erased address; a pointee-typed

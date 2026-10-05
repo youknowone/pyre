@@ -69,6 +69,7 @@ use crate::flowspace::model::{
 };
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 /// Map from a legacy graph `Variable` to the representative typed
@@ -110,8 +111,8 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// preserved out-of-band by [`LegacyToTyped`].
 /// The high-level operations one `ll_vec_*` helper call stands for:
 /// `newrustvec(kind[, hint])`, `len`, `getitem`, `setitem`, or a
-/// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items`
-/// method.
+/// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items` /
+/// `extend_from_slice` / `extend` method.
 fn rust_vec_helper_ops(
     op: majit_ir::rvec::VecOp,
     kind: majit_ir::rvec::VecItemKind,
@@ -123,7 +124,7 @@ fn rust_vec_helper_ops(
     let arity = match op {
         VecOp::NewEmpty => 0,
         VecOp::NewHint | VecOp::Length | VecOp::Reverse | VecOp::Free | VecOp::Items => 1,
-        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet => 2,
+        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend => 2,
         VecOp::SetItem | VecOp::ExtendFromSlice => 3,
     };
     if arg_hls.len() != arity {
@@ -150,6 +151,7 @@ fn rust_vec_helper_ops(
         VecOp::Free => ("simple_call", Some("free")),
         VecOp::Items => ("simple_call", Some("items")),
         VecOp::ExtendFromSlice => ("simple_call", Some("extend_from_slice")),
+        VecOp::Extend => ("simple_call", Some("extend")),
     };
     let Some(method) = method else {
         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
@@ -573,6 +575,51 @@ fn resolve_result_hlvalue(
     match op.result.as_ref() {
         Some(var) => lookup_operand(value_map, var, op, "result"),
         None => Ok(Hlvalue::Variable(Variable::new())),
+    }
+}
+
+/// Reconstruct the item `LowLevelType` from an [`OpKind::RawLoad`] /
+/// [`OpKind::RawStore`] descr.  `ValueType` collapses integer widths;
+/// signedness selects `Signed` vs `Unsigned`.  A Rust `u8` is
+/// `rffi.UCHAR` (an unsigned `lltype.Number`), not `lltype.Char`
+/// (`SomeChar`); width stays on the original `OpKind` (`itemsize`)
+/// for `jtransform` `rewrite_op_raw_load` / `rewrite_op_raw_store`.
+/// `_LLOpEntry.compute_result_annotation` then binds
+/// `lltype_to_annotation` of this type.
+fn raw_item_lltype(
+    item_ty: &crate::model::ValueType,
+    _itemsize: usize,
+    is_item_signed: bool,
+) -> Result<LowLevelType, TyperError> {
+    use crate::model::ValueType;
+    Ok(match item_ty {
+        ValueType::Float => LowLevelType::Float,
+        ValueType::SingleFloat => LowLevelType::SingleFloat,
+        ValueType::Bool => LowLevelType::Bool,
+        ValueType::Int128 => LowLevelType::SignedLongLongLong,
+        ValueType::UInt128 => LowLevelType::UnsignedLongLongLong,
+        ValueType::Unsigned => LowLevelType::Unsigned,
+        ValueType::Int if is_item_signed => LowLevelType::Signed,
+        ValueType::Int => LowLevelType::Unsigned,
+        ValueType::Ref(_) => crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        ValueType::Void => LowLevelType::Void,
+        ValueType::Str | ValueType::StringBuilder | ValueType::State | ValueType::Unknown => {
+            return Err(TyperError::message(format!(
+                "translate_op: RawLoad/RawStore item_ty {item_ty:?} has no \
+                 lltype_to_annotation mapping from the descr"
+            )));
+        }
+    })
+}
+
+/// `_LLOpEntry.compute_result_annotation` writes
+/// `lltype_to_annotation(RESULTTYPE)` onto the result Variable.  The
+/// adapter does that here because the FlowspaceOp cannot carry the
+/// OpKind descr as a TYPE constant (`Bookkeeper.immutablevalue`
+/// rejects `ConstValue::LowLevelType`).
+fn seed_raw_item_annotation(result: &Hlvalue, lltype: LowLevelType) {
+    if let Hlvalue::Variable(v) = result {
+        *v.annotation.borrow_mut() = Some(Rc::new(lltype_to_annotation(lltype)));
     }
 }
 
@@ -1165,6 +1212,9 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // `translate_op` — it emits no raising op.  Matched before the
         // general `Call` arm, same as the elisions above.
         OpKind::Hint { .. } => false,
+        // `raw_load` / `raw_store` are llops with empty `canraise`
+        // (`LL_OPERATIONS['raw_load']` / `['raw_store']`).
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => false,
         // `core::cmp::{eq..ge}` / `core::slice::{len,iter}` /
         // `core::num::wrapping_mul` lower to pure, non-raising flowspace
         // ops (see `nonraising_core_bridge_opname`); classify the
@@ -3575,6 +3625,57 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("int_between", hl_args, result)])
         }
 
+        // `ptr::write` / `*p = v` / `*p` on raw memory.  Upstream the
+        // high-level form is an llop call (`llop.raw_load(TYPE, addr,
+        // offset)` / `llop.raw_store(addr, offset, value)`);
+        // `_LLOpEntry.compute_result_annotation` binds
+        // `lltype_to_annotation(RESULTTYPE)` and
+        // `_LLOpEntry.specialize_call` re-emits the same-named llop.
+        // The descr (`item_ty` / `itemsize` / `is_item_signed`) lives
+        // on the original `OpKind` that `jtransform` `rewrite_op_raw_load`
+        // / `rewrite_op_raw_store` still consumes.  A `ConstValue::LowLevelType`
+        // extra arg cannot carry TYPE through `hop.setup` —
+        // `Bookkeeper.immutablevalue` rejects that variant — so the
+        // adapter writes `lltype_to_annotation` of the descr onto the
+        // result Variable; `flowin` takes ownership via `setbinding`.
+        OpKind::RawLoad {
+            base,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => {
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let offset_hl = lookup_operand(value_map, offset, op, "offset")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            seed_raw_item_annotation(
+                &result,
+                raw_item_lltype(item_ty, *itemsize, *is_item_signed)?,
+            );
+            Ok(vec![FlowspaceOp::new(
+                "raw_load",
+                vec![base_hl, offset_hl],
+                result,
+            )])
+        }
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            ..
+        } => {
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let offset_hl = lookup_operand(value_map, offset, op, "offset")?;
+            let value_hl = lookup_operand(value_map, value, op, "value")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            seed_raw_item_annotation(&result, LowLevelType::Void);
+            Ok(vec![FlowspaceOp::new(
+                "raw_store",
+                vec![base_hl, offset_hl, value_hl],
+                result,
+            )])
+        }
+
         // ─── Stage-invariant fail-loud catch-all ───
         // No remaining variants reach here legitimately: every legitimate
         // pre-rtyper input shape has an explicit arm above, every
@@ -3972,37 +4073,42 @@ fn legacy_const_define_hlvalue(
             let graphs = entry.function_desc.borrow().getgraphs();
             let lift_error = entry.lift_error();
             let maybe_graph = graphs.into_iter().next();
-            // Precise fn-ptr only when the callee is lifted (cached graph, no
-            // recorded lift error) AND rtyped; every other case routes to the
-            // declared-signature fallback below.
-            let precise = match (&maybe_graph, &lift_error) {
-                (Some(graph), None) => {
-                    lltype::getfunctionptr(&graph.graph, lltype::_getconcretetype).ok()
-                }
-                _ => None,
-            };
-            let func_ptr = match precise {
-                Some(func_ptr) => func_ptr,
-                None => match entry.declared_funcptr_type() {
-                    // Keep the graph backlink when a pygraph is cached;
-                    // otherwise the declared signature alone types the entry.
-                    Some(ft) => match &maybe_graph {
-                        Some(graph) => lltype::functionptr_for_graph_with_type(&graph.graph, ft),
-                        None => lltype::functionptr(ft, &key.segments().join("::"), None, None),
-                    },
-                    None => {
-                        return Err(TyperError::message(match lift_error {
-                            Some(err) => format!(
-                                "fn const {:?} resolved to an unbuildable callee: {err}",
-                                key.segments()
-                            ),
-                            None => format!(
-                                "fn const {:?} resolved to a registry entry without a cached graph",
-                                key.segments()
-                            ),
-                        }));
-                    }
+            // The declared LLBC signature is the one `FuncType` for this
+            // Rust `fn` type (`getfunctionptr` / `FuncType` from the
+            // graph's declared args). Prefer it over a rtyped
+            // `getfunctionptr`: after rtyping, a slice arg's
+            // concretetype is a list pointer, which is a different
+            // `ll_ptrtype` from the parameter-seed spelling of the same
+            // `fn(&[PyObjectRef]) -> …`. Keep the graph backlink when a
+            // pygraph is cached.
+            let func_ptr = match entry.declared_funcptr_type() {
+                Some(ft) => match &maybe_graph {
+                    Some(graph) => lltype::functionptr_for_graph_with_type(&graph.graph, ft),
+                    None => lltype::functionptr(ft, &key.segments().join("::"), None, None),
                 },
+                None => {
+                    let precise = match (&maybe_graph, &lift_error) {
+                        (Some(graph), None) => {
+                            lltype::getfunctionptr(&graph.graph, lltype::_getconcretetype).ok()
+                        }
+                        _ => None,
+                    };
+                    match precise {
+                        Some(func_ptr) => func_ptr,
+                        None => {
+                            return Err(TyperError::message(match lift_error {
+                                Some(err) => format!(
+                                    "fn const {:?} resolved to an unbuildable callee: {err}",
+                                    key.segments()
+                                ),
+                                None => format!(
+                                    "fn const {:?} resolved to a registry entry without a cached graph",
+                                    key.segments()
+                                ),
+                            }));
+                        }
+                    }
+                }
             };
             let func_ptr_type = crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(
                 Box::new(func_ptr._TYPE.clone()),
@@ -4290,6 +4396,23 @@ pub(crate) fn derive_subject_inputcells(
                 && let Some(s_vec) = bk.project_rust_vec(root)
             {
                 cells.push(s_vec);
+                continue;
+            }
+            // A function pointer is the same Int bank (`history.getkind` of
+            // `Ptr(FuncType)`) named `fn(inputs) -> output` /
+            // `Option<fn(inputs) -> output>`. `valuetype_to_someshell` would
+            // seed `SomeInteger`; seed `SomePtr` so a `fn` argument unions
+            // with a reified fn item, a `fn` field read, and a typed
+            // `fn_null_constant` (`llannotation.py`
+            // `pairtype(SomePtr, SomePtr).union`). The coarse `Option<fn>`
+            // marker still unions with an untyped `fn_null_constant`.
+            if let Some(root) = class_root.as_deref()
+                && let Some(s_fn) = crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+                    root,
+                    bookkeeper.map(|bk| bk.as_ref()),
+                )
+            {
+                cells.push(s_fn);
                 continue;
             }
             if matches!(ty, crate::model::ValueType::Ref(_)) {
@@ -6057,6 +6180,60 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_fn_ptr_int_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_fn");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "func".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("fn-pointer Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Int + class_root fn must seed SomePtr(FuncType), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_option_fn_int_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_option_fn");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "func".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("Option<fn>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("Option<fn> Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Int + class_root Option<fn> must seed SomePtr(FuncType), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_prefers_source_root_over_legacy_shell() {
         let mut graph = LegacyGraph::new("set_locals_w");
         let entry = graph.startblock;
@@ -7151,6 +7328,162 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_raw_load_lowers_to_raw_load_spaceop() {
+        // RawLoad carries through as the `raw_load` llop (`llop.raw_load`);
+        // the descr seeds the result annotation via `lltype_to_annotation`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_raw_load_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::RawLoad {
+                base: vars[1].clone(),
+                offset: vars[2].clone(),
+                item_ty: ValueType::Int,
+                itemsize: 8,
+                is_item_signed: true,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("RawLoad arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "raw_load");
+        assert_eq!(lowered.args.len(), 2);
+        let Hlvalue::Variable(result) = &lowered.result else {
+            panic!("RawLoad result must be a Variable");
+        };
+        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+            Some(SomeValue::Integer(i)) => {
+                assert!(!i.unsigned, "i64 raw_load is signed");
+                assert_eq!(i.knowntype(), KnownType::Int);
+            }
+            other => panic!("i64 RawLoad must seed SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_op_raw_store_lowers_to_raw_store_spaceop() {
+        // RawStore carries through as the `raw_store` llop; the result is
+        // the Void annotation (`lltype_to_annotation(Void)`).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_raw_store_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base: vars[1].clone(),
+                offset: vars[2].clone(),
+                value: vars[3].clone(),
+                item_ty: ValueType::Int,
+                itemsize: 8,
+                is_item_signed: true,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("RawStore arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "raw_store");
+        assert_eq!(lowered.args.len(), 3);
+        let Hlvalue::Variable(result) = &lowered.result else {
+            panic!("RawStore result must be a Variable");
+        };
+        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+            Some(SomeValue::None_(_)) => {}
+            other => panic!("RawStore must seed s_None, got {other:?}"),
+        }
+    }
+
+    fn flowin_raw_load_item_annotation(
+        item_ty: ValueType,
+        itemsize: usize,
+        is_item_signed: bool,
+    ) -> SomeValue {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::Block as FlowspaceBlock;
+        use crate::flowspace::model::FunctionGraph as FlowspaceGraph;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("raw_load_ann_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::RawLoad {
+                base: vars[1].clone(),
+                offset: vars[2].clone(),
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("RawLoad arm must lower");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let startblock = FlowspaceBlock::shared(Vec::new());
+        startblock.borrow_mut().operations = translated;
+        let fs_graph = Rc::new(std::cell::RefCell::new(FlowspaceGraph::new(
+            "raw_load_ann_fixture",
+            startblock.clone(),
+        )));
+        ann.processblock(&fs_graph, &startblock)
+            .expect("flowin of raw_load must succeed");
+        let blk = startblock.borrow();
+        let Hlvalue::Variable(result) = &blk.operations[0].result else {
+            panic!("raw_load result must be a Variable");
+        };
+        result
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| (**rc).clone())
+            .expect("flowin must bind the raw_load result")
+    }
+
+    #[test]
+    fn raw_load_i64_u8_f64_flowin_binds_lltype_to_annotation() {
+        match flowin_raw_load_item_annotation(ValueType::Int, 8, true) {
+            SomeValue::Integer(i) => {
+                assert!(!i.unsigned, "i64 is signed");
+                assert_eq!(i.knowntype(), KnownType::Int);
+            }
+            other => panic!("i64 raw_load must bind SomeInteger, got {other:?}"),
+        }
+        match flowin_raw_load_item_annotation(ValueType::Unsigned, 1, false) {
+            SomeValue::Integer(i) => {
+                assert!(i.unsigned, "u8 is unsigned");
+                assert_eq!(i.knowntype(), KnownType::Ruint);
+            }
+            other => panic!("u8 raw_load must bind SomeInteger unsigned, got {other:?}"),
+        }
+        match flowin_raw_load_item_annotation(ValueType::Int, 1, false) {
+            SomeValue::Integer(i) => {
+                assert!(
+                    i.unsigned,
+                    "1-byte unsigned Int is rffi.UCHAR, not lltype.Char"
+                );
+                assert_eq!(i.knowntype(), KnownType::Ruint);
+            }
+            other => {
+                panic!("1-byte unsigned Int raw_load must bind SomeInteger unsigned, got {other:?}")
+            }
+        }
+        match flowin_raw_load_item_annotation(ValueType::Float, 8, false) {
+            SomeValue::Float(_) => {}
+            other => panic!("f64 raw_load must bind SomeFloat, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn translate_op_binop_lowers_to_passthrough_spaceop() {
         // BinOp arm: `add` / `sub` / `lt` / ... pass through to a
         // flowspace SpaceOperation with the same opname; lhs/rhs args
@@ -8208,7 +8541,7 @@ mod tests {
                     | VecOp::Reverse
                     | VecOp::Free
                     | VecOp::Items => 1,
-                    VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet => 2,
+                    VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend => 2,
                     VecOp::SetItem | VecOp::ExtendFromSlice => 3,
                 };
                 let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -8265,12 +8598,14 @@ mod tests {
                     | VecOp::Reverse
                     | VecOp::Free
                     | VecOp::Items
-                    | VecOp::ExtendFromSlice => {
+                    | VecOp::ExtendFromSlice
+                    | VecOp::Extend => {
                         let method = match op {
                             VecOp::Append => "append",
                             VecOp::Reverse => "reverse",
                             VecOp::Items => "items",
                             VecOp::ExtendFromSlice => "extend_from_slice",
+                            VecOp::Extend => "extend",
                             _ => "free",
                         };
                         assert_eq!(translated.len(), 2);

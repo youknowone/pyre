@@ -2304,6 +2304,47 @@ impl RPythonTyper {
                     GenopResult::LLType(LowLevelType::Bool),
                 ))
             }
+            // `_LLOpEntry.specialize_call` re-emits the same-named llop.
+            // `raw_load(addr, offset)` with `result.concretetype = T` is
+            // what `rewrite_op_raw_load` reads (`T = op.result.concretetype`);
+            // `raw_store(addr, offset, value)` takes T from the value.
+            // Addr/offset are the raw int address and byte offset; the
+            // value keeps its own repr (int or float).  Cannot raise.
+            "raw_load" => {
+                let vlist = hop.inputargs(vec![
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ])?;
+                hop.exception_cannot_occur()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message("raw_load: r_result not populated before genop")
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop("raw_load", vlist, GenopResult::LLType(result_lltype)))
+            }
+            "raw_store" => {
+                let r_value = hop
+                    .args_r
+                    .borrow()
+                    .get(2)
+                    .cloned()
+                    .flatten()
+                    .ok_or_else(|| TyperError::message("raw_store: missing value repr"))?;
+                let v_addr = hop.inputarg(&LowLevelType::Signed, 0)?;
+                let v_offs = hop.inputarg(&LowLevelType::Signed, 1)?;
+                let v_value = hop.inputarg(&r_value, 2)?;
+                hop.exception_cannot_occur()?;
+                Ok(hop.genop(
+                    "raw_store",
+                    vec![v_addr, v_offs, v_value],
+                    GenopResult::Void,
+                ))
+            }
             // rtyper.py — `translate_op_newtuple` calls the
             // free function `rtuple.rtype_newtuple(hop)` which routes
             // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.

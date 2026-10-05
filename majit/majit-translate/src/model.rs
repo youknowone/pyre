@@ -8196,7 +8196,7 @@ impl FunctionGraph {
         result: crate::flowspace::model::Variable,
     ) {
         let nullc = if fn_ptr {
-            self.push_null_fn_ptr(block)
+            self.push_null_fn_ptr_with_spelling(block, None)
         } else {
             self.push_niche_null(block, cast)
         };
@@ -8232,12 +8232,29 @@ impl FunctionGraph {
     /// `fn` field read, so the two arms union. A `null_mut()` null is a
     /// classdef-less `SomeInstance` and does not.
     pub fn push_null_fn_ptr(&mut self, block: BlockId) -> crate::flowspace::model::Variable {
+        self.push_null_fn_ptr_with_spelling(block, None)
+    }
+
+    /// [`Self::push_null_fn_ptr`] with the FUNC type `lltype.nullptr` takes.
+    /// `spelling` is the `fn(inputs) -> output` (or `Option<fn(...)>`)
+    /// signature so the null is the same `FuncType` as a `Some` of that
+    /// type. `None` keeps the coarse empty `FuncType` for a comparison
+    /// against an untyped `fn` / `Option<fn>` address.
+    pub fn push_null_fn_ptr_with_spelling(
+        &mut self,
+        block: BlockId,
+        spelling: Option<&str>,
+    ) -> crate::flowspace::model::Variable {
         let res = self.alloc_value_var();
+        let args = match spelling {
+            Some(s) if !s.is_empty() => vec![LinkArg::from(ConstValue::byte_str(s))],
+            _ => crate::model::call_args(vec![]),
+        };
         self.block_mut(block).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::Call {
                 target: CallTarget::function_path(["core", "ptr", "null_fn"]),
-                args: crate::model::call_args(vec![]),
+                args,
                 result_ty: ValueType::Int,
             },
         });
