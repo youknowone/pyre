@@ -717,7 +717,7 @@ fn lookup_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (Some(w_errors), Some(mut w_handler)) = (args.first().copied(), args.get(1).copied())
+    let (Some(mut w_errors), Some(mut w_handler)) = (args.first().copied(), args.get(1).copied())
     else {
         return Err(crate::PyError::type_error(
             "register_error() requires name and handler",
@@ -729,7 +729,8 @@ fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !is_callable(w_handler) {
         return Err(crate::PyError::type_error("handler must be callable"));
     }
-    let errors = pyre_object::with_roots!(w_handler => crate::baseobjspace::str_utf8_w(w_errors))?;
+    let errors =
+        pyre_object::with_roots!(w_handler, w_errors => crate::baseobjspace::str_utf8_w(w_errors))?;
     with_codec_state(|state| unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
             state.codec_error_registry,

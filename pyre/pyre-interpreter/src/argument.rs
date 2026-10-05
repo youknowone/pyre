@@ -147,7 +147,7 @@ pub fn check_not_duplicate_kwargs(
     _keywords_w: &[PyObjectRef],
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let Some((w_key, mut w_function)) =
+    let Some((mut w_key, mut w_function)) =
         find_duplicate_kwarg(existingkeywords_w, keyword_names_w, w_function)
     else {
         return Ok(());
@@ -156,7 +156,7 @@ pub fn check_not_duplicate_kwargs(
         if pyre_object::is_str(w_key) {
             pyre_object::w_str_get_wtf8(w_key).to_owned()
         } else {
-            pyre_object::with_roots!(w_function => crate::display::py_str_wtf8(w_key))?
+            pyre_object::with_roots!(w_key, w_function => crate::display::py_str_wtf8(w_key))?
         }
     };
     Err(raise_type_error(
@@ -552,11 +552,12 @@ pub fn combine_starstarargs_wrapped(
             // `findattr` runs `__getattribute__`: the dict type is fetched
             // again and `lhs` is compared by identity after it.
             let mut lhs = lhs.unwrap_or(pyre_object::PY_NULL);
-            let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+            let mut w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
             let rhs = if w_dict_type.is_null() {
                 None
             } else {
-                pyre_object::with_roots!(lhs => crate::baseobjspace::findattr(w_dict_type, "__iter__"))?
+                pyre_object::with_roots!(lhs, w_dict_type =>
+                    crate::baseobjspace::findattr(w_dict_type, "__iter__"))?
             };
             // `space.is_w` is pointer identity.
             match (!lhs.is_null(), rhs) {

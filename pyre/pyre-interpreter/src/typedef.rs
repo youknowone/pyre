@@ -21902,9 +21902,9 @@ fn init_float_type(ns: PyObjectRef) {
                         // Parse hexadecimal floating-point literals like '0x1.8p3'.
                         crate::type_methods::arity_exact(args, "fromhex", 1)?;
                         let mut w_cls = args[0];
-                        let w_s = args[1];
+                        let mut w_s = args[1];
                         let s_arg = if unsafe { pyre_object::is_str(w_s) } {
-                            pyre_object::with_roots!(w_cls => crate::baseobjspace::str_utf8_w(w_s).map(str::to_owned))?
+                            pyre_object::with_roots!(w_cls, w_s => crate::baseobjspace::str_utf8_w(w_s).map(str::to_owned))?
                         } else {
                             // `@unwrap_spec(s='text')` — the operand is rejected by
                             // `space.text_w`, which words it this way.
@@ -23549,14 +23549,14 @@ fn bytearray_descr_init_value(
     unsafe {
         // bytearrayobject.py:217 — str source shares bytesobject.newbytesdata_w
         if pyre_object::is_str(arg) {
-            let Some(encoding_obj) = w_encoding else {
+            let Some(mut encoding_obj) = w_encoding else {
                 return Err(crate::PyError::type_error(
                     "string argument without an encoding",
                 ));
             };
             let has_errors = w_errors.is_some();
             let mut errors_obj = w_errors.unwrap_or(pyre_object::PY_NULL);
-            let encoding = pyre_object::with_roots!(arg, errors_obj => crate::baseobjspace::str_utf8_w(encoding_obj))?;
+            let encoding = pyre_object::with_roots!(arg, errors_obj, encoding_obj => crate::baseobjspace::str_utf8_w(encoding_obj))?;
             let errors = if has_errors {
                 pyre_object::with_roots!(arg, errors_obj => crate::baseobjspace::str_utf8_w(errors_obj))?
             } else {
@@ -23687,9 +23687,8 @@ fn init_bytes_type(ns: PyObjectRef) {
                 "__buffer__",
                 |args| {
                     let mut w_self = args[0];
-                    let w_flags = args[1];
-                    let flags =
-                        pyre_object::with_roots!(w_self => crate::baseobjspace::c_int_w(w_flags))?;
+                    let mut w_flags = args[1];
+                    let flags = pyre_object::with_roots!(w_self, w_flags => crate::baseobjspace::c_int_w(w_flags))?;
                     crate::builtins::w_memoryview_new_native_with_flags(w_self, flags)
                 },
                 2,
@@ -27289,14 +27288,14 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // CPython 3.14 bytes_new: an explicit codec selects the unicode
         // encoding path before special-method lookup.
         if has_codec && pyre_object::is_str(arg) {
-            let Some(encoding_obj) = w_encoding else {
+            let Some(mut encoding_obj) = w_encoding else {
                 return Err(crate::PyError::type_error(
                     "string argument without an encoding",
                 ));
             };
             let has_errors = w_errors.is_some();
             let mut errors_obj = w_errors.unwrap_or(pyre_object::PY_NULL);
-            let encoding = pyre_object::with_roots!(arg, errors_obj => crate::baseobjspace::str_utf8_w(encoding_obj))?;
+            let encoding = pyre_object::with_roots!(arg, errors_obj, encoding_obj => crate::baseobjspace::str_utf8_w(encoding_obj))?;
             let errors = if has_errors {
                 pyre_object::with_roots!(arg, errors_obj => crate::baseobjspace::str_utf8_w(errors_obj))?
             } else {
@@ -27960,9 +27959,8 @@ fn init_bytearray_type(ns: PyObjectRef) {
                 "__buffer__",
                 |args| {
                     let mut w_self = args[0];
-                    let w_flags = args[1];
-                    let flags =
-                        pyre_object::with_roots!(w_self => crate::baseobjspace::c_int_w(w_flags))?;
+                    let mut w_flags = args[1];
+                    let flags = pyre_object::with_roots!(w_self, w_flags => crate::baseobjspace::c_int_w(w_flags))?;
                     crate::builtins::w_memoryview_new_native_with_flags(w_self, flags)
                 },
                 2,

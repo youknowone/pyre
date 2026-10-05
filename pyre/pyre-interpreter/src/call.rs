@@ -5856,7 +5856,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         ));
     }
     let mut body_fn = args[0];
-    let name_obj = args[1];
+    let mut name_obj = args[1];
 
     // compiling.py:163-167 — the body must be a Python function carrying a
     // `PyCode`.  Its code object is read directly below, so anything else is
@@ -5934,7 +5934,8 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 
     // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`
     // is `UnicodeEncodeError` ("surrogates not allowed").
-    let name = pyre_object::with_roots!(body_fn => crate::baseobjspace::str_utf8_w(name_obj))?;
+    let name =
+        pyre_object::with_roots!(body_fn, name_obj => crate::baseobjspace::str_utf8_w(name_obj))?;
     // compiling.py:166-167 — resolve __mro_entries__ before metaclass
     // inference; record the original bases for __orig_bases__ when changed.
     //
