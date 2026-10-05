@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=4.8
-# Ubuntu run 33279264115: 2.4x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=3.8
+# Dynasm floor-fail 1.0x against 4.8; 3.8 keeps the derived floor at 0.95x.
 # pyre-check: skip-cpython
 # cpython 1.00s vs pyre 0.07s (14x), and it is not gated on — only pypy is.
 # A loop that defines a function in its own body and calls it.

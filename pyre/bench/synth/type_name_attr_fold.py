@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=3.7
+# pyre-check: max-pypy-ratio=3.5
+# Local cranelift 2.4x; the ceiling is 3.5.
 # pyre-check: skip-cpython
-# Widest reading 3.2x; the ceiling is 15% over that.
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 120000
 # iterations pypy exec is inside the `?` band, so a ceiling of 40 applied
 # and the floor did not.  48000000 iterations land pypy near 0.11s.

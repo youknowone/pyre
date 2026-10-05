@@ -428,8 +428,24 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
+    // Source now marks `action_dispatcher` `dont_look_inside`. The leaf
+    // stays: this test reads `build/llbc/pyre-interpreter.ullbc`, which
+    // still harvests `_jit_unroll_safe_action_dispatcher`, and the check
+    // is harvested ⊆ reviewed.
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
+    // `argument.py unpack` is `@jit.look_inside_iff(lambda self:
+    // self._jit_few_keywords)`. `look_inside_iff.inner` does
+    // `func = unroll_safe(func)`, so the harvested name is `_orig_unpack`.
+    //
+    // Evidence: `exc_new_wrapper!` and `os_error_family_new` now rebuild
+    // `Arguments` from the flat rest slice and call `unpack` the way
+    // `descr_new_base_exception` / `W_OSError.descr_new` do. No-keyword
+    // construction is `positional_only`, so `_jit_few_keywords` is true
+    // and the body is admitted. `allocate_exception` remains
+    // `dont_look_inside`, so the walk still residualizes at allocation
+    // rather than expanding a new fold row.
+    ("_orig_unpack", "argument.py unpack"),
     (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",

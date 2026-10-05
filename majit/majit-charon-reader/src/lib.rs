@@ -282,7 +282,8 @@ impl Llbc {
         dedup_layout.dedup_by_key(|p| p.0);
         span_bodies.sort_by_key(|p| p.0);
         span_bodies.dedup_by_key(|p| p.0);
-        let file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        let mut file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
+        ullbc::attach_promoted_inits(&mut file);
         Ok(Self {
             file,
             dedup_adt,

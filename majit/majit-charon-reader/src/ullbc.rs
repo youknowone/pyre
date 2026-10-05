@@ -19,7 +19,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // FunDecl + meta
 
@@ -57,6 +57,13 @@ pub struct FunDecl {
     /// [`FunDecl::first_arg_local_name`], decided on first query.
     #[serde(skip)]
     first_arg_local_name: OnceLock<Option<String>>,
+    /// Inlinable promoted-constant initializers for this artefact, indexed
+    /// by global decl id. Charon 0.1.281 emits each promoted constant as
+    /// its own item; [`FunDecl::unstructured`] splices the initializer at
+    /// every read, the shape 0.1.273 emitted inline. `None` when this
+    /// declaration was not loaded through [`crate::Llbc::from_slice`].
+    #[serde(skip)]
+    promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
 }
 
 impl FunDecl {
@@ -85,6 +92,15 @@ impl FunDecl {
     }
 
     /// Return the `Unstructured` (basic-block CFG) body if present.
+    ///
+    /// Cleanup blocks are reachable only through `on_unwind`, which the
+    /// flow graph does not carry, so they are left out. Every `on_unwind`
+    /// edge points at one terminal `UnwindResume` block.
+    ///
+    /// Charon 0.1.281 emits promoted constants as their own global items.
+    /// When this declaration was loaded with the artefact table, each read
+    /// of an inlinable promoted constant is replaced by the initializer's
+    /// statements, the shape 0.1.273 emitted at the use site.
     pub fn unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]
         struct Proj {
@@ -92,9 +108,16 @@ impl FunDecl {
             unstructured: Unstructured,
         }
         let body = self.body.as_ref()?;
-        serde_json::from_str::<Proj>(body.get())
+        let mut u = serde_json::from_str::<Proj>(body.get())
             .ok()
-            .map(|p| p.unstructured)
+            .map(|p| strip_cleanup_blocks(p.unstructured))?;
+        if let Some(table) = &self.promoted_inits
+            && table.iter().any(Option::is_some)
+            && body.get().contains("\"Global\"")
+        {
+            splice_promoted_reads(&mut u, table);
+        }
+        Some(u)
     }
 
     /// The `locals` table of the `Unstructured` body, without building its
@@ -1218,7 +1241,7 @@ pub struct Locals {
     pub locals: Vec<Local>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Local {
     pub index: u64,
     pub name: Option<String>,
@@ -1230,6 +1253,9 @@ pub struct Local {
 pub struct BasicBlock {
     pub statements: Vec<Statement>,
     pub terminator: Terminator,
+    /// rustc unwind cleanup block (`is_cleanup` on the Charon block).
+    #[serde(default)]
+    pub is_cleanup: bool,
     /// First successful or failed projection of [`terminator`](Self::terminator).
     /// Later [`term`](Self::term) calls clone this value instead of parsing
     /// the raw JSON again.
@@ -1268,6 +1294,538 @@ impl BasicBlock {
     fn term_cached(&self, llbc: &crate::Llbc) -> &Result<TermKind, String> {
         self.term_cache
             .get_or_init(|| decode_term_kind(&self.terminator.kind, llbc))
+    }
+}
+
+/// Cleanup blocks are reachable only through `on_unwind`, which the flow
+/// graph does not carry, so they are left out. Every `on_unwind` edge
+/// points at one terminal `UnwindResume` block.
+fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
+    if !body.body.iter().any(|bb| bb.is_cleanup) {
+        return body;
+    }
+    // bb0 is the entry; a cleanup there would move another block to 0.
+    if body.body.first().is_some_and(|bb| bb.is_cleanup)
+        || kept_block_normal_successor_is_cleanup(&body.body)
+    {
+        return body;
+    }
+
+    let blocks = std::mem::take(&mut body.body);
+    let mut old_to_new = vec![None; blocks.len()];
+    let mut kept = Vec::with_capacity(blocks.len());
+    let mut first_cleanup_span = None;
+    for (i, bb) in blocks.into_iter().enumerate() {
+        if bb.is_cleanup {
+            if first_cleanup_span.is_none() {
+                first_cleanup_span = bb.terminator.span.clone();
+            }
+            continue;
+        }
+        old_to_new[i] = Some(kept.len() as u64);
+        kept.push(bb);
+    }
+
+    let resume = kept.len() as u64;
+    for bb in &mut kept {
+        let mut kind = bb.terminator.kind_value().clone();
+        remap_term_kind_block_indices(&mut kind, &old_to_new, resume);
+        bb.set_terminator_kind(kind);
+    }
+    kept.push(BasicBlock {
+        statements: Vec::new(),
+        terminator: Terminator {
+            kind: serde_json::value::to_raw_value(&Value::String("UnwindResume".into()))
+                .expect("a JSON value serializes"),
+            span: first_cleanup_span,
+            value_cache: OnceLock::new(),
+        },
+        is_cleanup: false,
+        term_cache: OnceLock::new(),
+    });
+    body.body = kept;
+    body
+}
+
+/// Inlinable promoted-constant initializer, keyed by global decl id.
+///
+/// Charon 0.1.281 emits each promoted constant as its own `AnonConst`
+/// item whose last name segment is `PromotedConst`. The reader splices
+/// this initializer at every read so the body matches the inline shape
+/// 0.1.273 emitted.
+#[derive(Debug)]
+struct PromotedInit {
+    /// Init locals with index ≥ 1, in table order.
+    locals: Vec<Local>,
+    /// Statement kinds other than those that name `_0`.
+    statements: Vec<Value>,
+    /// Rvalue assigned to `_0`.
+    ret_rvalue: Value,
+}
+
+/// Build the per-artefact promoted-initializer table and store a clone on
+/// every [`FunDecl`]. Declarations deserialized any other way keep `None`.
+pub(crate) fn attach_promoted_inits(file: &mut crate::schema::LlbcFile) {
+    let table = Arc::new(collect_promoted_inits(file));
+    for fd in file.translated.fun_decls.iter_mut().flatten() {
+        fd.promoted_inits = Some(Arc::clone(&table));
+    }
+}
+
+fn collect_promoted_inits(file: &crate::schema::LlbcFile) -> Vec<Option<PromotedInit>> {
+    let n = file.translated.global_decls.len();
+    let mut table: Vec<Option<PromotedInit>> = (0..n).map(|_| None).collect();
+    for gd in file.translated.global_decls.iter().flatten() {
+        let Some(init) = promoted_init_from_global(file, gd) else {
+            continue;
+        };
+        let idx = gd.def_id as usize;
+        if idx < table.len() {
+            table[idx] = Some(init);
+        }
+    }
+    table
+}
+
+fn promoted_init_from_global(
+    file: &crate::schema::LlbcFile,
+    gd: &GlobalDecl,
+) -> Option<PromotedInit> {
+    if gd.rest.get("global_kind").and_then(Value::as_str) != Some("AnonConst") {
+        return None;
+    }
+    if !gd
+        .item_meta
+        .name
+        .last()
+        .is_some_and(is_promoted_const_segment)
+    {
+        return None;
+    }
+    let init_id = global_init_fun_id(gd)?;
+    let init_fd = file
+        .translated
+        .fun_decls
+        .get(init_id as usize)
+        .and_then(Option::as_ref)?;
+    promoted_init_from_body(&init_fd.unstructured()?)
+}
+
+fn is_promoted_const_segment(seg: &NameSeg) -> bool {
+    let NameSeg::Other(v) = seg else {
+        return false;
+    };
+    v.get("Builtin")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_str)
+        == Some("PromotedConst")
+}
+
+/// Init fun id stored in `gd.rest["value"]` as
+/// `Value[1][0].Call[0].kind.Fun`.
+fn global_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
+    let value = gd.rest.get("value")?;
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let lit = body.as_array()?.first()?;
+    lit.pointer("/Call/0/kind/Fun").and_then(Value::as_u64)
+}
+
+fn is_return_terminator(kind: &Value) -> bool {
+    match kind {
+        Value::String(s) => s == "Return",
+        Value::Object(map) => map.contains_key("Return"),
+        _ => false,
+    }
+}
+
+fn promoted_init_from_body(u: &Unstructured) -> Option<PromotedInit> {
+    if u.body.len() != 1 {
+        return None;
+    }
+    let bb = &u.body[0];
+    if !is_return_terminator(bb.terminator.kind_value()) {
+        return None;
+    }
+    let mut last_assign_to_0 = false;
+    let mut n_assign_0 = 0;
+    let mut ret_rvalue = None;
+    let mut statements = Vec::new();
+    for st in &bb.statements {
+        let kind = st.kind_value();
+        match st.stmt_kind().ok()? {
+            StmtKind::StorageLive(0) | StmtKind::StorageDead(0) => {}
+            StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {
+                statements.push(kind.clone());
+            }
+            StmtKind::Assign(place, _) => {
+                if matches!(place.kind, PlaceKind::Local(0)) {
+                    last_assign_to_0 = true;
+                    n_assign_0 += 1;
+                    ret_rvalue = Some(kind.get("Assign")?.as_array()?.get(1)?.clone());
+                } else {
+                    last_assign_to_0 = false;
+                    statements.push(kind.clone());
+                }
+            }
+            _ => return None,
+        }
+    }
+    if n_assign_0 != 1 || !last_assign_to_0 {
+        return None;
+    }
+    Some(PromotedInit {
+        locals: u
+            .locals
+            .locals
+            .iter()
+            .filter(|loc| loc.index != 0)
+            .cloned()
+            .collect(),
+        statements,
+        ret_rvalue: ret_rvalue?,
+    })
+}
+
+struct SpliceCtx<'a> {
+    table: &'a [Option<PromotedInit>],
+    locals: &'a mut Locals,
+    span: &'a SpanRef,
+    inserts: &'a mut Vec<Statement>,
+}
+
+/// Replace each inlinable promoted `Global` read with the initializer
+/// statements and a local holding the init's `_0`.
+fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]) {
+    let mut locals = Locals {
+        arg_count: body.locals.arg_count,
+        locals: std::mem::take(&mut body.locals.locals),
+    };
+    let body_span = body.span.clone();
+    for bb in &mut body.body {
+        let mut i = 0;
+        while i < bb.statements.len() {
+            let span = bb.statements[i].span.clone();
+            let mut kind = bb.statements[i].kind_value().clone();
+            let mut inserts = Vec::new();
+            let mut ctx = SpliceCtx {
+                table,
+                locals: &mut locals,
+                span: &span,
+                inserts: &mut inserts,
+            };
+            if rewrite_value(&mut kind, &mut ctx) {
+                bb.statements[i].set_kind(kind);
+                let n = inserts.len();
+                bb.statements.splice(i..i, inserts);
+                i += n;
+            }
+            i += 1;
+        }
+        let span = bb
+            .terminator
+            .span
+            .clone()
+            .unwrap_or_else(|| body_span.clone());
+        let mut kind = bb.terminator.kind_value().clone();
+        let mut inserts = Vec::new();
+        let mut ctx = SpliceCtx {
+            table,
+            locals: &mut locals,
+            span: &span,
+            inserts: &mut inserts,
+        };
+        if rewrite_value(&mut kind, &mut ctx) {
+            bb.set_terminator_kind(kind);
+            bb.statements.extend(inserts);
+        }
+    }
+    body.locals.locals = locals.locals;
+}
+
+fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    if v.get("kind").is_some() && v.get("ty").is_some() {
+        return rewrite_place(v, ctx);
+    }
+    match v {
+        Value::Array(arr) => {
+            let mut changed = false;
+            for item in arr {
+                changed |= rewrite_value(item, ctx);
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for item in map.values_mut() {
+                changed |= rewrite_value(item, ctx);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn rewrite_place(place: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    let global_id = place
+        .get("kind")
+        .and_then(|k| k.get("Global"))
+        .and_then(|g| g.get("id"))
+        .and_then(Value::as_u64);
+    if let Some(id) = global_id {
+        let Some(init) = ctx.table.get(id as usize).and_then(Option::as_ref) else {
+            return false;
+        };
+        let ty = place.get("ty").cloned().unwrap_or(Value::Null);
+        let t = materialize(init, ty, ctx);
+        if let Some(obj) = place.as_object_mut() {
+            obj.insert("kind".into(), serde_json::json!({"Local": t}));
+        }
+        return true;
+    }
+    let mut changed = false;
+    if let Some(proj) = place
+        .get_mut("kind")
+        .and_then(|k| k.get_mut("Projection"))
+        .and_then(Value::as_array_mut)
+    {
+        if let Some(inner) = proj.get_mut(0) {
+            changed |= rewrite_place(inner, ctx);
+        }
+        if let Some(elem) = proj.get_mut(1) {
+            changed |= rewrite_value(elem, ctx);
+        }
+    }
+    changed
+}
+
+fn materialize(init: &PromotedInit, use_ty: Value, ctx: &mut SpliceCtx<'_>) -> u64 {
+    let max_idx = init.locals.iter().map(|loc| loc.index).max().unwrap_or(0);
+    let mut remap = vec![None; max_idx as usize + 1];
+    for loc in &init.locals {
+        let new_idx = ctx.locals.locals.len() as u64;
+        if (loc.index as usize) < remap.len() {
+            remap[loc.index as usize] = Some(new_idx);
+        }
+        let mut new_loc = loc.clone();
+        new_loc.index = new_idx;
+        new_loc.name = None;
+        ctx.locals.locals.push(new_loc);
+    }
+    let t = ctx.locals.locals.len() as u64;
+    remap[0] = Some(t);
+    let ty = serde_json::from_value(use_ty.clone()).unwrap_or(TyRef::Other(use_ty.clone()));
+    ctx.locals.locals.push(Local {
+        index: t,
+        name: None,
+        span: ctx.span.clone(),
+        ty,
+    });
+    for kind in &init.statements {
+        let mut kind = kind.clone();
+        remap_local_indices(&mut kind, &remap);
+        ctx.inserts
+            .push(statement_from_kind(kind, ctx.span.clone()));
+    }
+    let mut rv = init.ret_rvalue.clone();
+    remap_local_indices(&mut rv, &remap);
+    let assign = serde_json::json!({
+        "Assign": [
+            {"kind": {"Local": t}, "ty": use_ty},
+            rv
+        ]
+    });
+    ctx.inserts
+        .push(statement_from_kind(assign, ctx.span.clone()));
+    t
+}
+
+fn statement_from_kind(kind: Value, span: SpanRef) -> Statement {
+    Statement {
+        kind: serde_json::value::to_raw_value(&kind).expect("a JSON value serializes"),
+        span,
+        stmt_cache: OnceLock::new(),
+        value_cache: OnceLock::from(kind),
+    }
+}
+
+/// Remap `{"Local": n}` place kinds and `StorageLive` / `StorageDead`
+/// payloads. Other integers (global ids, type ids, …) stay as they are.
+fn remap_local_indices(v: &mut Value, remap: &[Option<u64>]) {
+    match v {
+        Value::Object(map) => {
+            if map.len() == 1 {
+                for key in ["Local", "StorageLive", "StorageDead"] {
+                    if let Some(old) = map.get(key).and_then(Value::as_u64)
+                        && let Some(new) = remap.get(old as usize).copied().flatten()
+                    {
+                        map.insert(key.to_string(), Value::from(new));
+                        return;
+                    }
+                }
+            }
+            for val in map.values_mut() {
+                remap_local_indices(val, remap);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                remap_local_indices(val, remap);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn kept_block_normal_successor_is_cleanup(blocks: &[BasicBlock]) -> bool {
+    blocks.iter().any(|bb| {
+        !bb.is_cleanup && term_normal_successor_is_cleanup(bb.terminator.kind_value(), blocks)
+    })
+}
+
+fn is_cleanup_index(blocks: &[BasicBlock], idx: u64) -> bool {
+    blocks.get(idx as usize).is_some_and(|bb| bb.is_cleanup)
+}
+
+fn term_normal_successor_is_cleanup(kind: &Value, blocks: &[BasicBlock]) -> bool {
+    let Some(obj) = kind.as_object() else {
+        return false;
+    };
+    if let Some(goto) = obj.get("Goto") {
+        return goto
+            .get("target")
+            .and_then(Value::as_u64)
+            .is_some_and(|idx| is_cleanup_index(blocks, idx));
+    }
+    if let Some(payload) = obj
+        .get("Call")
+        .or_else(|| obj.get("Drop"))
+        .or_else(|| obj.get("Assert"))
+    {
+        return payload
+            .get("target")
+            .and_then(Value::as_u64)
+            .is_some_and(|idx| is_cleanup_index(blocks, idx));
+    }
+    if let Some(switch) = obj.get("Switch") {
+        return switch_normal_successor_is_cleanup(switch, blocks);
+    }
+    false
+}
+
+fn switch_normal_successor_is_cleanup(switch: &Value, blocks: &[BasicBlock]) -> bool {
+    if let Some(branches) = switch.get("branches").and_then(Value::as_array)
+        && branches
+            .iter()
+            .any(|v| v.as_u64().is_some_and(|idx| is_cleanup_index(blocks, idx)))
+    {
+        return true;
+    }
+    let Some(targets) = switch.get("targets") else {
+        return false;
+    };
+    if let Some(if_arr) = targets.get("If").and_then(Value::as_array)
+        && if_arr
+            .iter()
+            .any(|v| v.as_u64().is_some_and(|idx| is_cleanup_index(blocks, idx)))
+    {
+        return true;
+    }
+    let Some(swint) = targets.get("SwitchInt").and_then(Value::as_array) else {
+        return false;
+    };
+    if let Some(arms) = swint.get(1).and_then(Value::as_array)
+        && arms.iter().any(|arm| {
+            arm.as_array()
+                .and_then(|pair| pair.get(1))
+                .and_then(Value::as_u64)
+                .is_some_and(|idx| is_cleanup_index(blocks, idx))
+        })
+    {
+        return true;
+    }
+    swint
+        .get(2)
+        .and_then(Value::as_u64)
+        .is_some_and(|idx| is_cleanup_index(blocks, idx))
+}
+
+fn remap_block_index(old: u64, old_to_new: &[Option<u64>], resume: u64) -> u64 {
+    old_to_new
+        .get(old as usize)
+        .copied()
+        .flatten()
+        .unwrap_or(resume)
+}
+
+fn remap_u64_slot(slot: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
+    let Some(old) = slot.as_u64() else {
+        return;
+    };
+    *slot = Value::from(remap_block_index(old, old_to_new, resume));
+}
+
+fn remap_u64_field(value: &mut Value, field: &str, old_to_new: &[Option<u64>], resume: u64) {
+    if let Some(slot) = value.get_mut(field) {
+        remap_u64_slot(slot, old_to_new, resume);
+    }
+}
+
+fn remap_u64_array(value: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
+    let Some(arr) = value.as_array_mut() else {
+        return;
+    };
+    for slot in arr {
+        remap_u64_slot(slot, old_to_new, resume);
+    }
+}
+
+fn remap_term_kind_block_indices(kind: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
+    let Some(obj) = kind.as_object_mut() else {
+        return;
+    };
+    if let Some(goto) = obj.get_mut("Goto") {
+        remap_u64_field(goto, "target", old_to_new, resume);
+        return;
+    }
+    for key in ["Call", "Drop", "Assert"] {
+        if let Some(payload) = obj.get_mut(key) {
+            remap_u64_field(payload, "target", old_to_new, resume);
+            remap_u64_field(payload, "on_unwind", old_to_new, resume);
+            return;
+        }
+    }
+    if let Some(switch) = obj.get_mut("Switch") {
+        remap_switch_block_indices(switch, old_to_new, resume);
+    }
+}
+
+fn remap_switch_block_indices(switch: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
+    if let Some(branches) = switch.get_mut("branches") {
+        remap_u64_array(branches, old_to_new, resume);
+    }
+    let Some(targets) = switch.get_mut("targets") else {
+        return;
+    };
+    if let Some(if_arr) = targets.get_mut("If") {
+        remap_u64_array(if_arr, old_to_new, resume);
+    }
+    let Some(swint) = targets.get_mut("SwitchInt").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(arms) = swint.get_mut(1).and_then(Value::as_array_mut) {
+        for arm in arms {
+            if let Some(slot) = arm.as_array_mut().and_then(|pair| pair.get_mut(1)) {
+                remap_u64_slot(slot, old_to_new, resume);
+            }
+        }
+    }
+    if let Some(default) = swint.get_mut(2) {
+        remap_u64_slot(default, old_to_new, resume);
     }
 }
 
@@ -1347,6 +1905,14 @@ impl Statement {
             let kind = self.kind.get();
             serde_json::from_str::<StmtKind>(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
         })
+    }
+
+    /// Replace the raw statement kind, forgetting the projection of the
+    /// old one so the next [`stmt_kind`](Self::stmt_kind) reads the new kind.
+    fn set_kind(&mut self, kind: Value) {
+        self.kind = serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
+        self.value_cache = OnceLock::from(kind);
+        self.stmt_cache = OnceLock::new();
     }
 }
 
@@ -1518,6 +2084,10 @@ pub enum TermKind {
         target: u64,
         on_unwind: u64,
     },
+    /// Charon `TerminatorKind::UnwindTerminate`.
+    UnwindTerminate,
+    /// Charon `TerminatorKind::UndefinedBehavior`.
+    UndefinedBehavior,
     #[serde(other)]
     Unknown,
 }
@@ -2170,5 +2740,131 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name.as_deref(), Some("S_un_b"));
         assert_eq!(fields[1].ty.label(), "ty#42");
+    }
+
+    fn span(id: u64) -> Value {
+        serde_json::json!({"Deduplicated": id})
+    }
+
+    fn fun_decl_from_blocks(blocks: Vec<Value>) -> FunDecl {
+        let json = serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [{"Ident": ["f", 0]}],
+                "span": span(0),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 0}},
+            "body": {"Unstructured": {
+                "span": span(0),
+                "locals": {"arg_count": 0, "locals": []},
+                "body": blocks
+            }}
+        });
+        serde_json::from_str(&json.to_string()).expect("FunDecl fixture parses")
+    }
+
+    fn bb(kind: Value, is_cleanup: bool, term_span: u64) -> Value {
+        serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span(term_span), "kind": kind},
+            "is_cleanup": is_cleanup
+        })
+    }
+
+    fn call_term(target: u64, on_unwind: u64) -> Value {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": 0}, "generics": {}}},
+                "args": [],
+                "dest": {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}}
+            },
+            "target": target,
+            "on_unwind": on_unwind
+        }})
+    }
+
+    fn drop_term(target: u64, on_unwind: u64) -> Value {
+        serde_json::json!({"Drop": {
+            "place": {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}},
+            "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+            "target": target,
+            "on_unwind": on_unwind
+        }})
+    }
+
+    fn call_edges(bb: &BasicBlock) -> (u64, u64) {
+        let call = bb.terminator.kind_value().get("Call").unwrap();
+        (
+            call.get("target").and_then(Value::as_u64).unwrap(),
+            call.get("on_unwind").and_then(Value::as_u64).unwrap(),
+        )
+    }
+
+    fn drop_edges(bb: &BasicBlock) -> (u64, u64) {
+        let drop = bb.terminator.kind_value().get("Drop").unwrap();
+        (
+            drop.get("target").and_then(Value::as_u64).unwrap(),
+            drop.get("on_unwind").and_then(Value::as_u64).unwrap(),
+        )
+    }
+
+    #[test]
+    fn unstructured_drops_cleanup_blocks_and_rewrites_unwind_edges() {
+        let decl = fun_decl_from_blocks(vec![
+            bb(call_term(1, 3), false, 0),
+            bb(drop_term(2, 4), false, 0),
+            bb(serde_json::json!("Return"), false, 0),
+            bb(drop_term(5, 6), true, 7),
+            bb(serde_json::json!("UnwindResume"), true, 0),
+            bb(serde_json::json!("UnwindResume"), true, 0),
+            bb(serde_json::json!("UnwindTerminate"), true, 0),
+        ]);
+        let body = decl.unstructured().expect("Unstructured body");
+        assert_eq!(body.body.len(), 4);
+        assert_eq!(call_edges(&body.body[0]), (1, 3));
+        assert_eq!(drop_edges(&body.body[1]), (2, 3));
+        assert_eq!(
+            body.body[2].terminator.kind_value(),
+            &serde_json::json!("Return")
+        );
+        assert_eq!(
+            body.body[3].terminator.kind_value(),
+            &serde_json::json!("UnwindResume")
+        );
+        assert!(body.body[3].statements.is_empty());
+        assert!(!body.body[3].is_cleanup);
+        assert!(matches!(
+            body.body[3].terminator.span,
+            Some(SpanRef::Deduplicated(7))
+        ));
+    }
+
+    #[test]
+    fn unstructured_body_without_cleanup_blocks_is_unchanged() {
+        let decl = fun_decl_from_blocks(vec![
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span(0), "kind": call_term(1, 2)}
+            }),
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span(0), "kind": drop_term(2, 2)}
+            }),
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span(0), "kind": "Return"}
+            }),
+        ]);
+        let body = decl.unstructured().expect("Unstructured body");
+        assert_eq!(body.body.len(), 3);
+        assert_eq!(call_edges(&body.body[0]), (1, 2));
+        assert_eq!(drop_edges(&body.body[1]), (2, 2));
+        assert_eq!(
+            body.body[2].terminator.kind_value(),
+            &serde_json::json!("Return")
+        );
     }
 }

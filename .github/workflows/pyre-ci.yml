@@ -6,6 +6,9 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      # `**/*` needs another slash, so a baseline that sits in `majit/`
+      # itself is named beside the tree.
+      - "majit/*"
       - "majit/**/*"
       - "pyre/**/*"
       - "lib-python/**"
@@ -28,6 +31,9 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      # `**/*` needs another slash, so a baseline that sits in `majit/`
+      # itself is named beside the tree.
+      - "majit/*"
       - "majit/**/*"
       - "pyre/**/*"
       - "lib-python/**"
@@ -53,6 +59,19 @@ concurrency:
 
 permissions:
   contents: read
+
+# Inherited by every job. Job `env:` only adds extras (Windows cargo CLI,
+# CHARON_TARGET_DIR). A pin bump is this CHARON_VERSION and
+# CHARON_VERSION_DEFAULT in scripts/install-charon.py.
+env:
+  # Redirect the shared charon/ullbc build dir INTO the workspace so
+  # actions/cache can reach it. Locally PYRE_SHARED_BUILD is unset and
+  # both scripts default to ../.pyre-build (shared across worktrees).
+  PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+  # MUST mirror CHARON_VERSION_DEFAULT in scripts/install-charon.py: it
+  # drives the cache keys and install-charon.py's .installed-version
+  # stamp, so a pin bump here misses the cache and re-installs.
+  CHARON_VERSION: nightly-2026.10.04
 
 jobs:
   pre-commit:
@@ -129,16 +148,6 @@ jobs:
     # occupies no runner -- only the wall time the gate spends queued, which
     # on a saturated pool is already the larger half of every job's latency.
     needs: pre-commit
-    env: &charon-llbc-env
-      # Redirect the shared charon/ullbc build dir INTO the workspace so
-      # actions/cache can reach it. Locally PYRE_SHARED_BUILD is unset and
-      # both scripts default to ../.pyre-build (shared across worktrees).
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      # Single source of truth for the pinned charon tag. MUST mirror
-      # CHARON_VERSION_DEFAULT in scripts/install-charon.py: it drives both
-      # the cache keys below AND install-charon.py's .installed-version
-      # stamp, so a pin bump here misses the cache and re-installs.
-      CHARON_VERSION: nightly-2026.09.26
     steps: &prepare-charon-llbc-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -532,7 +541,6 @@ jobs:
     # many times before anyone asks whether it is portable. Every job of the
     # two platforms hangs off its prepare job, so skipping here skips them all.
     if: ${{ github.event.pull_request.draft != true }}
-    env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
   prepare-charon-llbc-windows:
@@ -549,8 +557,6 @@ jobs:
     needs: pre-commit
     if: ${{ github.event.pull_request.draft != true }}
     env:
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # Cargo passes one `-L dependency=<target>/<triple>/debug/build/<pkg>/<hash>/out`
       # per dependency, and pyre-interpreter has 263 of them. Under the
@@ -579,12 +585,6 @@ jobs:
     # 3 serial) and the 60 min cap cancelled cranelift mid-link. 90 min
     # bounds a hang without cutting the sequential dynasm+cranelift work.
     timeout-minutes: 90
-    env:
-      # See prepare-charon-llbc: downstream jobs download the prepared Charon
-      # artifact into this workspace path.
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
-
     steps: &cargo-test-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -794,9 +794,6 @@ jobs:
       actions: write
     needs: prepare-charon-llbc-macos
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
-    env:
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
     steps: *cargo-test-steps
 
   cargo-test-windows:
@@ -810,8 +807,6 @@ jobs:
     needs: prepare-charon-llbc-windows
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *cargo-test-steps
 
@@ -833,11 +828,6 @@ jobs:
     # thing it needs from the rest of CI is the extracted LLBC, which is an
     # artifact download.
     timeout-minutes: 60
-    env:
-      # See prepare-charon-llbc: downstream jobs download the prepared Charon
-      # artifact into this workspace path.
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -948,11 +938,6 @@ jobs:
     # replaced measured 9 min end to end in May 2026; the ten real scripts are
     # 4.10s of user CPU between them, so the same ~100x lands near 10 min.
     timeout-minutes: 60
-    env:
-      # See prepare-charon-llbc: downstream jobs download the prepared Charon
-      # artifact into this workspace path.
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -1100,12 +1085,6 @@ jobs:
           label: dynasm
         - backend: cranelift
           label: cranelift
-    env:
-      # See prepare-charon-llbc: downstream jobs download the prepared Charon
-      # artifact into this workspace path.
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
-
     steps: &pyre-check-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -1443,9 +1422,6 @@ jobs:
         include:
         - backend: dynasm,cranelift
           label: dynasm+cranelift
-    env:
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
     steps: *pyre-check-steps
 
   pyre-check-windows:
@@ -1465,7 +1441,5 @@ jobs:
         - backend: dynasm
           label: dynasm
     env:
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *pyre-check-steps

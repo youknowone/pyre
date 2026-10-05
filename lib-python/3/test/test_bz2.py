@@ -94,6 +94,7 @@ class BaseTest(unittest.TestCase):
         os.close(fd)
 
     def tearDown(self):
+        support.gc_collect()
         unlink(self.filename)
 
 
@@ -469,6 +470,8 @@ class BZ2FileTest(BaseTest):
         for i in range(10000):
             o = BZ2File(self.filename)
             del o
+            if i % 100 == 0:
+                support.gc_collect()
 
     def testOpenNonexistent(self):
         self.assertRaises(OSError, BZ2File, "/non/existent")

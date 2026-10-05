@@ -5309,11 +5309,11 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  The arms below are every quasi-immutable
     // descr this binary mints: the hand-minted singletons, including
-    // `GilReadyState.gil_ready`, the nine `Function` fields `function.py`
-    // declares (`function_quasi_immut_slot`), and `PyCode.w_globals`.
-    // Analyzer `fielddescrof` stamps that field from `pycode.py`
-    // `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is the same slot
-    // as the reserved `pycode_w_globals_quasi_descr` index.
+    // `GilReadyState.gil_ready`, `W_TypeObject.name?`, the nine `Function`
+    // fields `function.py` declares (`function_quasi_immut_slot`), and
+    // `PyCode.w_globals`. Analyzer `fielddescrof` stamps that field from
+    // `pycode.py` `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is
+    // the same slot as the reserved `pycode_w_globals_quasi_descr` index.
     let qmut = unsafe {
         if index == crate::descr::module_dict_version_descr().index() {
             pyre_object::dictmultiobject::module_dict_strategy_current_version_qmut(
@@ -5323,6 +5323,10 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             || is_type_version_tag_descr(descr)
         {
             pyre_object::typeobject::w_type_current_qmut_instance(
+                struct_ptr as pyre_object::PyObjectRef,
+            )
+        } else if index == crate::descr::type_name_obj_descr().index() {
+            pyre_object::typeobject::w_type_current_w_name_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
             )
         } else if index == crate::descr::terminator_allow_unboxing_descr().index() {

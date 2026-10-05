@@ -3349,9 +3349,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         args.len()
                     )));
                 }
-                let w_low = args[0];
+                let mut w_low = args[0];
                 let mut w_high = args[1];
-                let low = pyre_object::with_roots!(w_high => crate::baseobjspace::c_int_w(w_low))?
+                let low = pyre_object::with_roots!(w_low, w_high => crate::baseobjspace::c_int_w(w_low))?
                     as libc::c_int;
                 let high = crate::baseobjspace::c_int_w(w_high)? as libc::c_int;
                 for fd in low..high {
@@ -3402,9 +3402,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("read() requires 2 arguments"));
                 }
-                let w_fd = args[0];
+                let mut w_fd = args[0];
                 let mut w_n = args[1];
-                let fd = pyre_object::with_roots!(w_n => crate::baseobjspace::c_int_w(w_fd))?
+                let fd = pyre_object::with_roots!(w_fd, w_n => crate::baseobjspace::c_int_w(w_fd))?
                     as libc::c_int;
                 let n_signed = crate::baseobjspace::int_w(w_n)?;
                 // A negative size would wrap to a huge `usize` (and allocation);
@@ -3568,9 +3568,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("write() requires 2 arguments"));
                 }
-                let w_fd = args[0];
+                let mut w_fd = args[0];
                 let mut w_data = args[1];
-                let fd = pyre_object::with_roots!(w_data => crate::baseobjspace::c_int_w(w_fd))?
+                let fd = pyre_object::with_roots!(w_fd, w_data => crate::baseobjspace::c_int_w(w_fd))?
                     as libc::c_int;
                 // CPython `os_write_impl` receives a `Py_buffer`: text is not
                 // accepted, while every contiguous readable exporter is.
@@ -8066,7 +8066,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_gid = args[1];
                     let user = unsafe {
                         if pyre_object::is_str(w_user) {
-                            pyre_object::with_roots!(w_gid => crate::baseobjspace::str_utf8_w(w_user))?
+                            pyre_object::with_roots!(w_user, w_gid => crate::baseobjspace::str_utf8_w(w_user))?
                                 .to_string()
                         } else {
                             return Err(crate::PyError::type_error(
@@ -8083,7 +8083,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     type GroupId = libc::c_int;
                     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     type GroupId = libc::gid_t;
-                    let gid = pyre_object::with_roots!(w_user =>
+                    let gid = pyre_object::with_roots!(w_user, w_gid =>
                         crate::baseobjspace::c_uid_t_w(w_gid))?
                         as GroupId;
                     let mut ngroups: libc::c_int = 64;
@@ -9053,10 +9053,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     "{name}() requires 2 arguments"
                 )));
             }
-            let w_first = args[0];
+            let mut w_first = args[0];
             let mut w_second = args[1];
             let first =
-                pyre_object::with_roots!(w_second => crate::baseobjspace::c_uid_t_w(w_first))?;
+                pyre_object::with_roots!(w_first, w_second => crate::baseobjspace::c_uid_t_w(w_first))?;
             let second = crate::baseobjspace::c_uid_t_w(w_second)?;
             if setter(first, second) < 0 {
                 return Err(io_err(
@@ -9876,13 +9876,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interp_posix.py `@unwrap_spec(fd=c_int, cmd=c_int,
                     // length=r_longlong)` — the length is an offset, so it is
                     // the same conversion `ftruncate` gives one.
-                    let w_fd = args[0];
+                    let mut w_fd = args[0];
                     let mut w_cmd = args[1];
                     let mut w_length = args[2];
-                    let fd = pyre_object::with_roots!(w_cmd, w_length =>
+                    let fd = pyre_object::with_roots!(w_fd, w_cmd, w_length =>
                         crate::baseobjspace::c_int_w(w_fd))?;
                     let cmd =
-                        pyre_object::with_roots!(w_length => crate::baseobjspace::c_int_w(w_cmd))?;
+                        pyre_object::with_roots!(w_cmd, w_length => crate::baseobjspace::c_int_w(w_cmd))?;
                     let length = truncate_length_w(w_length)?;
                     // `rposix.c_lockf` releases the GIL and saves errno.
                     loop {
@@ -10187,9 +10187,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // would accept any object, and `is_int` is an exact-type
                     // check, so an `int` subclass instance — `signal.SIGHUP` is
                     // an `IntEnum` member — never reaches the checked path.
-                    let w_pid = args[0];
+                    let mut w_pid = args[0];
                     let mut w_sig = args[1];
-                    let pid = pyre_object::with_roots!(w_sig => crate::baseobjspace::c_int_w(w_pid))?
+                    let pid = pyre_object::with_roots!(w_pid, w_sig => crate::baseobjspace::c_int_w(w_pid))?
                         as libc::pid_t;
                     let sig = crate::baseobjspace::c_int_w(w_sig)? as libc::c_int;
                     // `rposix.c_kill` releases the GIL and saves errno.
@@ -10712,10 +10712,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int, mode=c_int)`.
-                    let w_fd = args[0];
+                    let mut w_fd = args[0];
                     let mut w_mode = args[1];
                     let fd =
-                        pyre_object::with_roots!(w_mode => crate::baseobjspace::c_int_w(w_fd))?;
+                        pyre_object::with_roots!(w_fd, w_mode => crate::baseobjspace::c_int_w(w_fd))?;
                     let mode = crate::baseobjspace::c_int_w(w_mode)? as u32;
                     // `rposix.c_fchmod` releases the GIL and saves errno.
                     // interp_posix.py `fchmod`: retry on EINTR.
@@ -11068,10 +11068,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         ));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int, inheritable=int)`.
-                    let w_fd = args[0];
+                    let mut w_fd = args[0];
                     let mut w_inherit = args[1];
                     let fd =
-                        pyre_object::with_roots!(w_inherit => crate::baseobjspace::c_int_w(w_fd))?;
+                        pyre_object::with_roots!(w_fd, w_inherit => crate::baseobjspace::c_int_w(w_fd))?;
                     let inherit = crate::baseobjspace::int_w(w_inherit)? != 0;
                     let bfd = fd_borrow(fd)?;
                     host_posix::set_inheritable(bfd, inherit).map_err(|e| io_err(e, ""))?;
@@ -12116,10 +12116,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("tcsetpgrp() requires fd, pgid"));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int, pgid=c_gid_t)`.
-                    let w_fd = args[0];
+                    let mut w_fd = args[0];
                     let mut w_pgid = args[1];
                     let fd =
-                        pyre_object::with_roots!(w_pgid => crate::baseobjspace::c_int_w(w_fd))?;
+                        pyre_object::with_roots!(w_fd, w_pgid => crate::baseobjspace::c_int_w(w_fd))?;
                     let pgid = crate::baseobjspace::c_uid_t_w(w_pgid)? as libc::pid_t;
                     let ret = unsafe { majit_rlib::rposix::c_tcsetpgrp(fd, pgid) };
                     if ret < 0 {
@@ -12624,7 +12624,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_gid = args[1];
                     let user = unsafe {
                         if pyre_object::is_str(w_user) {
-                            pyre_object::with_roots!(w_gid => crate::baseobjspace::str_utf8_w(w_user))?
+                            pyre_object::with_roots!(w_user, w_gid => crate::baseobjspace::str_utf8_w(w_user))?
                                 .to_string()
                         } else {
                             return Err(crate::PyError::type_error(
@@ -12637,7 +12637,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     })?;
                     // interp_posix.py `@unwrap_spec(username='text', gid=c_gid_t)`.
                     // Darwin's `initgroups` takes `int`; other unix hosts take `gid_t`.
-                    let gid = pyre_object::with_roots!(w_user =>
+                    let gid = pyre_object::with_roots!(w_user, w_gid =>
                         crate::baseobjspace::c_uid_t_w(w_gid))?;
                     #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let gid = gid as libc::c_int;
@@ -12792,14 +12792,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     // interp_posix.py `@unwrap_spec(ruid=c_uid_t,
                     // euid=c_uid_t, suid=c_uid_t)`.
-                    let w_ruid = args[0];
+                    let mut w_ruid = args[0];
                     let mut w_euid = args[1];
                     let mut w_suid = args[2];
-                    let r = pyre_object::with_roots!(w_euid, w_suid => {
+                    let r = pyre_object::with_roots!(w_ruid, w_euid, w_suid => {
                         crate::baseobjspace::c_uid_t_w(w_ruid)
                     })?;
                     let e =
-                        pyre_object::with_roots!(w_suid => crate::baseobjspace::c_uid_t_w(w_euid))?;
+                        pyre_object::with_roots!(w_euid, w_suid => crate::baseobjspace::c_uid_t_w(w_euid))?;
                     let s = crate::baseobjspace::c_uid_t_w(w_suid)?;
                     // `rposix.c_setresuid` releases the GIL and saves errno.
                     let ret = unsafe {
@@ -12838,14 +12838,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     // interp_posix.py `@unwrap_spec(rgid=c_gid_t,
                     // egid=c_gid_t, sgid=c_gid_t)`.
-                    let w_rgid = args[0];
+                    let mut w_rgid = args[0];
                     let mut w_egid = args[1];
                     let mut w_sgid = args[2];
-                    let r = pyre_object::with_roots!(w_egid, w_sgid => {
+                    let r = pyre_object::with_roots!(w_rgid, w_egid, w_sgid => {
                         crate::baseobjspace::c_uid_t_w(w_rgid)
                     })?;
                     let e =
-                        pyre_object::with_roots!(w_sgid => crate::baseobjspace::c_uid_t_w(w_egid))?;
+                        pyre_object::with_roots!(w_egid, w_sgid => crate::baseobjspace::c_uid_t_w(w_egid))?;
                     let s = crate::baseobjspace::c_uid_t_w(w_sgid)?;
                     // `rposix.c_setresgid` releases the GIL and saves errno.
                     let ret = unsafe {
@@ -13559,10 +13559,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
-                    let w_fd = args[0];
+                    let mut w_fd = args[0];
                     let mut w_mode = args[1];
                     let fd =
-                        pyre_object::with_roots!(w_mode => crate::baseobjspace::c_int_w(w_fd))?;
+                        pyre_object::with_roots!(w_fd, w_mode => crate::baseobjspace::c_int_w(w_fd))?;
                     let mode = crate::baseobjspace::c_int_w(w_mode)? as u32;
                     // Every failure here is the handle call's, reported the
                     // Win32 way (`os_fchmod_impl`), which also leaves the

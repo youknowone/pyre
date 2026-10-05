@@ -1,5 +1,6 @@
 import dis
 from test.support.import_helper import import_module
+from test.support import cpython_only
 import unittest
 import opcode
 
@@ -113,7 +114,7 @@ class StackEffectTests(unittest.TestCase):
                     self.assertEqual(jump, common)
                     self.assertEqual(nojump, common)
 
-
+@cpython_only
 class SpecializationStatsTests(unittest.TestCase):
     def test_specialization_stats(self):
         stat_names = ["success", "failure", "hit", "deferred", "miss", "deopt"]

@@ -450,3 +450,121 @@ fn a_header_revisit_after_continue_rereads_kind() {
          BC_JIT_MERGE_POINT, not the merge-point stamp (0)"
     );
 }
+
+/// cel's float-bank portal: `greens = [pc, program]`, two `[; virt]` banks,
+/// no extra mut green. A compiled `cnt > 0` guard failure must end the
+/// upstream way (`blackhole.py resume_in_blackhole` / `bhimpl_jit_merge_point`):
+/// `ContinueRunningNormally`, `DoneWithThisFrame*`, or an escaping exception.
+/// A missing handoff used to panic on a torn-down `TraceCtx`.
+struct PcOnlyVirtState {
+    regs: majit_metainterp::virt_array::VirtArray<i64>,
+    fregs: majit_metainterp::virt_array::VirtArray<f64>,
+    ret: i64,
+}
+
+#[majit_macros::jit_interp(
+    state = PcOnlyVirtState,
+    env = Bytecode,
+    greens = [pc, program],
+    state_fields = {
+        regs: [int; virt],
+        fregs: [float; virt],
+        ret: int,
+    },
+)]
+#[allow(unused_assignments, unused_variables)]
+fn dispatch_pc_only_virt(program: &Bytecode, threshold: u32, n: i64) -> i64 {
+    let mut driver: JitDriver<PcOnlyVirtState> = JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_, _, _, _| {
+        COMPILES.fetch_add(1, Ordering::Relaxed);
+    });
+    let mut pc: usize = 0;
+    let mut state = PcOnlyVirtState {
+        regs: majit_metainterp::virt_array::VirtArray::from_slice(&[0, n]),
+        fregs: majit_metainterp::virt_array::VirtArray::filled(0.0, 1),
+        ret: 0,
+    };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+    loop {
+        jit_merge_point!(driver, program, pc; state);
+        if pc >= program.len() {
+            break;
+        }
+        let opcode = program[pc];
+        pc += 1;
+        match opcode {
+            OP_ADD => {
+                state.regs[0] = state.regs[0] + state.regs[1];
+            }
+            OP_DEC => {
+                state.regs[1] = state.regs[1] - 1;
+            }
+            OP_BACK => {
+                let target = program[pc] as usize;
+                pc += 1;
+                if state.regs[1] > 0 {
+                    if target < pc {
+                        can_enter_jit!(driver, target, &mut state, program, || {});
+                    }
+                    pc = target;
+                    continue;
+                }
+            }
+            OP_END => {
+                state.ret = state.regs[0];
+                break;
+            }
+            _ => break,
+        }
+    }
+    state.ret
+}
+
+fn virt_program() -> Vec<u8> {
+    vec![OP_ADD, OP_DEC, OP_BACK, 0, OP_END]
+}
+
+fn interpret_virt(n: i64) -> i64 {
+    let mut acc = 0i64;
+    let mut cnt = n;
+    loop {
+        acc += cnt;
+        cnt -= 1;
+        if cnt > 0 {
+            continue;
+        }
+        break;
+    }
+    acc
+}
+
+fn run_pc_only_virt(threshold: u32, n: i64) -> (i64, usize) {
+    let _guard = PROBE_LOCK.lock();
+    COMPILES.store(0, Ordering::Relaxed);
+    let got = dispatch_pc_only_virt(&virt_program(), threshold, n);
+    (got, COMPILES.load(Ordering::Relaxed))
+}
+
+#[test]
+fn a_pc_only_virt_guard_failure_ends_in_continue_running_normally() {
+    for (threshold, n) in [(2u32, 12i64), (3, 18)] {
+        let (got, compiles) = run_pc_only_virt(threshold, n);
+        assert!(
+            compiles >= 1,
+            "threshold={threshold} n={n}: no loop compiled"
+        );
+        assert_eq!(
+            got,
+            interpret_virt(n),
+            "threshold={threshold} n={n}: a compiled cnt>0 guard failure \
+             with greens=[pc, program] and [; virt] banks must resume from \
+             ContinueRunningNormally / DoneWithThisFrame / exception, \
+             not panic on a missing TraceCtx"
+        );
+    }
+}

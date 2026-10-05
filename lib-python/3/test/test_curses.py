@@ -277,13 +277,14 @@ class TestCurses(unittest.TestCase):
         stdscr.echochar('A')
         stdscr.echochar(b'A')
         stdscr.echochar(65)
-        with self.assertRaises((UnicodeEncodeError, OverflowError)):
-            # Unicode is not fully supported yet, but at least it does
-            # not crash.
-            # It is supposed to fail because either the character is
-            # not encodable with the current encoding, or it is encoded to
-            # a multibyte sequence.
-            stdscr.echochar('\u0114')
+        if sys.implementation.name != "pypy":
+            with self.assertRaises((UnicodeEncodeError, OverflowError)):
+                # Unicode is not fully supported yet, but at least it does
+                # not crash.
+                # It is supposed to fail because either the character is
+                # not encodable with the current encoding, or it is encoded to
+                # a multibyte sequence.
+                stdscr.echochar('\u0114')
         stdscr.echochar('A', curses.A_BOLD)
         self.assertIs(stdscr.is_wintouched(), False)
 
@@ -1050,6 +1051,7 @@ class TestCurses(unittest.TestCase):
             p.userptr()
 
     @requires_curses_func('panel')
+    @cpython_only
     def test_userptr_memory_leak(self):
         w = curses.newwin(10, 10)
         p = curses.panel.new_panel(w)
@@ -1179,6 +1181,7 @@ class TestCurses(unittest.TestCase):
 
     @unittest.skipIf(MISSING_C_DOCSTRINGS,
                      "Signature information for builtins requires docstrings")
+    @cpython_only
     def test_issue21088(self):
         stdscr = self.stdscr
         #

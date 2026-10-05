@@ -34,7 +34,8 @@ use std::collections::{HashMap, VecDeque};
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
-    FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, StmtKind, TermKind, Unstructured,
+    FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, SpanRef, StmtKind, TermKind, TyRef,
+    Unstructured,
 };
 use serde_json::{Value, json};
 
@@ -228,10 +229,9 @@ fn assign_json(dest: Value, rvalue: Value) -> Value {
 }
 
 /// Build the rewrite, or say why this body keeps its bracket.
-fn analyze(body: &Unstructured, raw: &Value, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
+fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
-    let blocks_json = raw["body"].as_array().ok_or("body-json")?;
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
     for (bb, block) in body.body.iter().enumerate() {
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
@@ -248,6 +248,10 @@ fn analyze(body: &Unstructured, raw: &Value, llbc: &Llbc) -> Result<Option<Plan>
     }
     for block in &body.body {
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+            // A classified leaf is this body's own bracket; `stack_sensitivity`
+            // models it the same way and only consults the sensitive set for
+            // a callee it does not classify.
+            && classify_call(call, llbc).is_none()
             && callee_path(call, llbc).is_some_and(|path| llbc.is_stack_sensitive_fn(&path))
         {
             return Err("calls-stack-sensitive-fn");
@@ -385,7 +389,7 @@ fn analyze(body: &Unstructured, raw: &Value, llbc: &Llbc) -> Result<Option<Plan>
                 plan.removed.entry(bb).or_default().push(si);
             }
         }
-        let term_json = &blocks_json[bb]["terminator"]["kind"];
+        let term_json = block.terminator.kind_value();
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
                 let Some(&(leaf, method)) = classified.get(&bb) else {
@@ -471,9 +475,8 @@ fn analyze(body: &Unstructured, raw: &Value, llbc: &Llbc) -> Result<Option<Plan>
                     }
                     Leaf::Publish => {
                         let slice = call.args.get(arg0).and_then(operand_local);
-                        let (agg_si, operands) =
-                            resolve_published_array(block, &blocks_json[bb], slice)
-                                .ok_or("publish-array-unresolved")?;
+                        let (agg_si, operands) = resolve_published_array(block, slice)
+                            .ok_or("publish-array-unresolved")?;
                         let mut inserted = Vec::new();
                         for (i, element) in operands.iter().enumerate() {
                             let ty = element
@@ -610,7 +613,12 @@ fn analyze(body: &Unstructured, raw: &Value, llbc: &Llbc) -> Result<Option<Plan>
                     return Err("returns-with-published-slots");
                 }
             }
-            Ok(TermKind::UnwindResume | TermKind::Abort(_)) => {}
+            Ok(
+                TermKind::UnwindResume
+                | TermKind::UnwindTerminate
+                | TermKind::Abort(_)
+                | TermKind::UndefinedBehavior,
+            ) => {}
             _ => return Err("unknown-terminator"),
         }
     }
@@ -663,9 +671,11 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
 /// Follow a published slice back to the array literal it borrows, in the same
 /// block: `_a = [x, y]; _r = &_a; _s = &*_r; _p = _s as &[_]`.  Returns the
 /// literal's statement index and its element operands.
+///
+/// Statement JSON is read off this block, the CFG after unwind-only blocks
+/// are dropped, so the index matches the rewrite.
 fn resolve_published_array(
     block: &majit_charon_reader::ullbc::BasicBlock,
-    block_json: &Value,
     slice: Option<usize>,
 ) -> Option<(usize, Vec<Value>)> {
     let mut want = slice?;
@@ -684,7 +694,7 @@ fn resolve_published_array(
                 want = place_local(src).or_else(|| deref_of_local(src))?;
             }
             Rvalue::Aggregate(kind, _) if kind.get("Array").is_some() => {
-                let operands = block_json["statements"][si]["kind"]["Assign"][1]["Aggregate"][1]
+                let operands = stmt.kind_value()["Assign"][1]["Aggregate"][1]
                     .as_array()?
                     .clone();
                 return Some((si, operands));
@@ -704,23 +714,23 @@ pub(super) fn erase_shadow_stack(
     body: &Unstructured,
     llbc: &Llbc,
 ) -> Result<Option<Unstructured>, Refusal> {
-    let Some(raw) = fd.body.as_ref() else {
+    if fd.body.is_none() {
         return Ok(None);
-    };
+    }
     // The root-stack runtime itself implements the leaves this pass removes;
     // its bodies stay as written for the callers that keep their brackets.
     if fd.item_meta.name_path().contains("::gc_roots::") {
         return Ok(None);
     }
-    let mut root: Value = serde_json::from_str(raw.get()).map_err(|_| "body-json")?;
-    let plan = {
-        let u = root.get("Unstructured").ok_or("body-json")?;
-        match analyze(body, u, llbc)? {
-            Some(plan) => plan,
-            None => return Ok(None),
-        }
+    // `body` is the CFG after unwind-only blocks are dropped (and promoted
+    // constants spliced).  The rewrite has to use that numbering: the
+    // extracted artefact still has those blocks, and mixing the two is
+    // how a same-block array publish was refused as unresolved.
+    let mut u = unstructured_json_from_body(body);
+    let plan = match analyze(body, llbc)? {
+        Some(plan) => plan,
+        None => return Ok(None),
     };
-    let u = root.get_mut("Unstructured").ok_or("body-json")?;
     let span = u["span"].clone();
     // The slot locals.
     if plan.slot_count > 0 {
@@ -775,13 +785,80 @@ pub(super) fn erase_shadow_stack(
         }
         block["statements"] = Value::Array(new);
     }
-    let body = root
-        .get_mut("Unstructured")
-        .map(Value::take)
-        .ok_or("body-json")?;
-    serde_json::from_value::<Unstructured>(body)
+    serde_json::from_value::<Unstructured>(u)
         .map(Some)
         .map_err(|_| "rewritten-body-unparsable")
+}
+
+fn span_ref_json(span: &SpanRef) -> Value {
+    match span {
+        SpanRef::Inline(data) => json!({
+            "data": {
+                "file_id": data.file_id,
+                "beg": { "line": data.beg.line, "col": data.beg.col },
+                "end": { "line": data.end.line, "col": data.end.col },
+            }
+        }),
+        SpanRef::Deduplicated(id) => json!({ "Deduplicated": id }),
+    }
+}
+
+fn ty_ref_json(ty: &TyRef) -> Value {
+    match ty {
+        TyRef::Dedup { id } => json!({ "Deduplicated": id }),
+        TyRef::Inline { value: (id, v) } => json!({ "Value": [*id, v] }),
+        TyRef::Other(v) => v.clone(),
+    }
+}
+
+/// JSON for `body` as the rewrite sees it: same blocks, same statement
+/// indices, same terminator targets as the typed CFG.
+fn unstructured_json_from_body(body: &Unstructured) -> Value {
+    let locals: Vec<Value> = body
+        .locals
+        .locals
+        .iter()
+        .map(|loc| {
+            json!({
+                "index": loc.index,
+                "name": loc.name,
+                "span": span_ref_json(&loc.span),
+                "ty": ty_ref_json(&loc.ty),
+            })
+        })
+        .collect();
+    let blocks: Vec<Value> = body
+        .body
+        .iter()
+        .map(|bb| {
+            let statements: Vec<Value> = bb
+                .statements
+                .iter()
+                .map(|st| {
+                    json!({
+                        "span": span_ref_json(&st.span),
+                        "kind": st.kind_value().clone(),
+                    })
+                })
+                .collect();
+            json!({
+                "statements": statements,
+                "terminator": {
+                    "span": bb.terminator.span.as_ref().map(span_ref_json),
+                    "kind": bb.terminator.kind_value().clone(),
+                },
+                "is_cleanup": bb.is_cleanup,
+            })
+        })
+        .collect();
+    json!({
+        "span": span_ref_json(&body.span),
+        "locals": {
+            "arg_count": body.locals.arg_count,
+            "locals": locals,
+        },
+        "body": blocks,
+    })
 }
 
 /// [`erase_shadow_stack`], falling back to the body as extracted.  A refusal is
@@ -1176,4 +1253,230 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
     let found = discover_stack_sensitive_fns(llbc);
     llbc.register_stack_sensitive_fns(found);
     llbc.mark_stack_sensitive_fns_complete();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_charon_reader::Llbc;
+
+    fn span() -> Value {
+        json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 0, "col": 0},
+                "end": {"line": 0, "col": 0}
+            },
+            "generated_from_span": null
+        })
+    }
+
+    fn fixture_llbc() -> Llbc {
+        let ident = |s: &str| json!({"Ident": [s, 0]});
+        let push_roots = json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    ident("pyre_object"),
+                    ident("gc_roots"),
+                    ident("push_roots")
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Deduplicated": 0}
+            },
+            "body": "Opaque"
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [null, push_roots]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn analyze_open_then(sink: Value) -> Result<Option<Plan>, Refusal> {
+        let ty = json!({"Deduplicated": 0});
+        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let bb = |kind: Value| {
+            json!({
+                "statements": [],
+                "terminator": {"span": span(), "kind": kind},
+                "is_cleanup": false
+            })
+        };
+        let open = json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": 1}, "generics": {}}},
+                "args": [],
+                "dest": place(1)
+            },
+            "target": 1,
+            "on_unwind": 2
+        }});
+        let raw = json!({
+            "span": span(),
+            "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+            "body": [
+                bb(open),
+                bb(sink),
+                bb(json!("UnwindResume"))
+            ]
+        });
+        let body: Unstructured = serde_json::from_value(raw.clone()).expect("fixture body");
+        analyze(&body, &fixture_llbc())
+    }
+
+    fn assert_erase_accepted(sink: Value, label: &str) {
+        match analyze_open_then(sink) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("{label}: expected accepted erase, got no bracket"),
+            Err(reason) => panic!("{label}: expected accepted erase, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn analyze_accepts_undefined_behavior_sink_like_abort() {
+        assert_erase_accepted(json!({"Abort": "UndefinedBehavior"}), "Abort");
+        assert_erase_accepted(json!("UndefinedBehavior"), "UndefinedBehavior");
+    }
+
+    #[test]
+    fn analyze_accepts_unwind_terminate_sink_like_abort() {
+        assert_erase_accepted(json!({"Abort": "UnwindTerminate"}), "Abort");
+        assert_erase_accepted(json!("UnwindTerminate"), "UnwindTerminate");
+    }
+
+    fn opaque_fun(def_id: u64, name: &[&str], body: Value) -> Value {
+        let ident = |s: &str| json!({"Ident": [s, 0]});
+        json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name.iter().map(|s| ident(s)).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Deduplicated": 0}
+            },
+            "body": body
+        })
+    }
+
+    /// A `pin_roots` of a same-block array, with an unwind-only block in
+    /// front of it in the artefact.  The CFG drop of that block must not
+    /// make the array unresolvable.
+    #[test]
+    fn erase_accepts_publish_when_cleanup_blocks_precede_the_array() {
+        let ty = json!({"Deduplicated": 0});
+        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let stmt = |kind: Value| json!({"span": span(), "kind": kind});
+        let bb = |statements: Vec<Value>, kind: Value, is_cleanup: bool| {
+            json!({
+                "statements": statements,
+                "terminator": {"span": span(), "kind": kind},
+                "is_cleanup": is_cleanup
+            })
+        };
+        let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
+            json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": on_unwind
+            }})
+        };
+        let array = json!({"Assign": [
+            place(2),
+            {"Aggregate": [
+                {"Array": [ty, {"Deduplicated": 1}, null]},
+                [
+                    {"Move": place(3)},
+                    {"Move": place(4)}
+                ]
+            ]}
+        ]});
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": (0..6).map(local).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(vec![], call(1, vec![], 1, 2, 1), false),
+                bb(vec![], json!("UnwindResume"), true),
+                bb(
+                    vec![stmt(array)],
+                    call(2, vec![json!({"Move": place(2)})], 5, 3, 1),
+                    false
+                ),
+                bb(vec![], json!("UndefinedBehavior"), false)
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(
+                        3,
+                        &["pyre_object", "celldict", "write_cell"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(3).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        assert_eq!(
+            body.body.len(),
+            4,
+            "three kept blocks plus one unwind resume"
+        );
+        assert!(
+            body.body.iter().all(|bb| !bb.is_cleanup),
+            "unwind-only block should have been dropped"
+        );
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
 }

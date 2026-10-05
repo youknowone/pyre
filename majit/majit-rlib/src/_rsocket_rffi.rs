@@ -673,6 +673,15 @@ mod winsock {
         pub sa_data: [i8; 14],
     }
 
+    /// `struct sockaddr_storage` (`SOCKADDR_STORAGE`): 128 bytes, 8-aligned.
+    #[repr(C)]
+    pub struct sockaddr_storage {
+        pub ss_family: u16,
+        pub __ss_pad1: [u8; 6],
+        pub __ss_align: i64,
+        pub __ss_pad2: [u8; 112],
+    }
+
     pub type fd_set_p = *mut fd_set;
 
     /// `_rsocket_rffi.geterrno` on Windows (`rwin32.GetLastError_saved`).

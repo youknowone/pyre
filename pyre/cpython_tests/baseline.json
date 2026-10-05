@@ -847,7 +847,7 @@
       "dynasm": "FAIL"
     },
     "test.test_patma": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pdb": {
       "dynasm": "IMPORTERROR"
@@ -1398,6 +1398,10 @@
     },
     "test.test_webbrowser": {
       "dynasm": "PASS"
+    },
+    "test.test_winconsoleio": {
+      "dynasm": "SKIP",
+      "reason": "imports `_testconsole`, a CPython test helper PyPy does not provide"
     },
     "test.test_winsound": {
       "dynasm": "SKIP",

@@ -12381,12 +12381,12 @@ pub unsafe fn classmethod_on_type_fast_path(
 /// precondition: `type` is immutable, so the getter cannot be replaced, and
 /// what it returns is the `w_name` slot.
 ///
-/// The slot is reported rather than its contents because the walker must read
-/// it live: `descr_set__name__` (typeobject.py) replaces the name without
-/// going through `mutated()`, so the version tag does not move when a class is
-/// renamed and a baked name would outlive the rename.  A slot that has not
-/// been materialised yet (`PY_NULL`) declines rather than filling it in, since
-/// filling it in means allocating.
+/// The slot is reported rather than its contents so the walker can pin
+/// `name?` and bake the object: `descr_set__name__` (typeobject.py) replaces
+/// the name without going through `mutated()`, so the version tag does not
+/// move when a class is renamed.  A slot that has not been materialised yet
+/// (`PY_NULL`) declines rather than filling it in, since filling it in means
+/// allocating.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -12402,6 +12402,33 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
     }
     let w_name = pyre_object::typeobject::w_type_peek_name_obj(w_obj);
     (!w_name.is_null()).then_some((metatype, w_name))
+}
+
+/// Side-effect-free twin of `descr_set__name__` up to `w_type.name = name`.
+///
+/// The walker asks this before the residual setattr so
+/// `opimpl_jit_force_quasi_immutable` can abort at the store, the way
+/// `setattr_would_force_quasi_immut` does for mapdict writes. A rejection
+/// (immutable type, non-str, embedded null, surrogate) never reaches the
+/// setfield, so it is not a force.
+///
+/// # Safety
+/// `w_type` and `w_value` must be null or live objects.
+pub unsafe fn type_set_name_would_store(w_type: PyObjectRef, w_value: PyObjectRef) -> bool {
+    if w_type.is_null() || !pyre_object::typeobject::is_type(w_type) {
+        return false;
+    }
+    if pyre_object::w_type_is_cpython_immutabletype(w_type) || w_value.is_null() {
+        return false;
+    }
+    if !isinstance_str_w(w_value) {
+        return false;
+    }
+    let wtf8 = pyre_object::w_str_get_wtf8(w_value);
+    if wtf8.code_points().any(|cp| cp.to_u32() == 0) {
+        return false;
+    }
+    pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false).is_ok()
 }
 
 /// `typeobject.py W_TypeObject.descr_getattribute` fast path for the

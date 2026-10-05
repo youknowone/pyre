@@ -398,6 +398,15 @@ pub struct W_TypeObject {
     /// `ModuleDictStrategy.version?`, the tree's other `?` declaration, the way
     /// upstream's one `QuasiImmut` class serves every quasi-immutable field.
     pub quasi_immut_watchers: crate::quasiimmut::QuasiImmutField,
+    /// typeobject.py `_immutable_fields_ = ['name?']` — the hidden
+    /// `mutate_name` field for the app-level `__name__` object.
+    /// `descr_set__name__` stores a new string without `mutated()`, so
+    /// `_version_tag?` does not move on a rename; loops that bake `w_name`
+    /// register here instead.
+    ///
+    /// Same ownership as [`quasi_immut_watchers`]: an `AtomicPtr` plus a lock,
+    /// no GC pointers, reclaimed by `type_object_destructor`.
+    pub w_name_watchers: crate::quasiimmut::QuasiImmutField,
     /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type join
     /// the collector's traversal. A build that keeps the global interpreter
     /// lock gives them a two-word `PyGC_Head` for it, which is what
@@ -632,6 +641,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        w_name_watchers: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     };
@@ -773,6 +783,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        w_name_watchers: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     }) as PyObjectRef;
@@ -1229,6 +1240,54 @@ pub unsafe fn w_type_notify_quasi_immut_watchers(obj: PyObjectRef) {
     crate::quasiimmut::sweep_quasi_immut_field(field);
 }
 
+/// `quasiimmut.py get_current_qmut_instance` for this type's `name?`.
+///
+/// Same contract as [`w_type_current_qmut_instance`]: resolved while the
+/// trace is still being recorded so a later write in that trace sees the
+/// instance, then handed to `heap.py OptHeap.optimize_QUASIIMMUT_FIELD
+/// is_still_valid_for` and `compile.py register_loop_token`.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_current_w_name_qmut(
+    obj: PyObjectRef,
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
+    if obj.is_null() || !is_type(obj) {
+        return None;
+    }
+    Some(
+        (*(obj as *const W_TypeObject))
+            .w_name_watchers
+            .get_current_qmut_instance(),
+    )
+}
+
+/// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()`
+/// for this type's `name?`.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_w_name_qmut_installed(obj: PyObjectRef) -> bool {
+    !obj.is_null()
+        && is_type(obj)
+        && (*(obj as *const W_TypeObject))
+            .w_name_watchers
+            .is_installed()
+}
+
+/// Force this type's `name?` qmut directly. This is the tracer's own
+/// `do_force_quasi_immutable` call, not a runtime store, so it calls
+/// [`QuasiImmutField::invalidate`] rather than the sweep.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_force_w_name_qmut(obj: PyObjectRef) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    (*(obj as *const W_TypeObject)).w_name_watchers.invalidate();
+}
+
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
 /// conservative `false` for a null / non-type pointer (matches the class
 /// default before any lookup confirms the flag).
@@ -1391,18 +1450,29 @@ pub unsafe fn w_type_peek_name_obj(obj: PyObjectRef) -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
-    let t = &mut *(obj as *mut W_TypeObject);
-    // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
-    // `w_type_get_name` returns `&str` and is read from the interpreter, the
-    // JIT GC trace, cpyext, and extension modules, so this slot is not switched
-    // to `Wtf8Buf` here. A lone surrogate has no UTF-8 `String` that is not
-    // U+FFFD; only a name with a `&str` view updates the slot. `w_name` still
-    // keeps the assigned object.
-    if let Some(name) = crate::w_str_get_value_opt(w_name) {
-        *t.name = name.to_string();
-    }
+    // `rclass.py hook_setfield` emits `jit_force_quasi_immutable` ahead of
+    // every store to `name?`, so a baked `__name__` stops being a trace
+    // constant before it stops being the live value.  `descr_set__name__`
+    // does not call `mutated()`, so `_version_tag?` is not this pin.
+    // The walker names that force as [`w_type_w_name_qmut_installed`] at the
+    // residual setattr, the way mapdict names `setattr_would_force_quasi_immut`.
+    // The sweep and the store share the watcher lock: an `is_installed`
+    // test outside it lets a recorder publish a watcher for the old
+    // pointer after the test and before the store.
+    let t = obj as *mut W_TypeObject;
+    (*t).w_name_watchers.invalidate_then_store(|| {
+        // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
+        // `w_type_get_name` returns `&str` and is read from the interpreter, the
+        // JIT GC trace, cpyext, and extension modules, so this slot is not switched
+        // to `Wtf8Buf` here. A lone surrogate has no UTF-8 `String` that is not
+        // U+FFFD; only a name with a `&str` view updates the slot. `w_name` still
+        // keeps the assigned object.
+        if let Some(name) = crate::w_str_get_value_opt(w_name) {
+            *(*t).name = name.to_string();
+        }
+        (*t).w_name = w_name;
+    });
     type_write_barrier(obj);
-    t.w_name = w_name;
 }
 
 /// `typeobject.py` / `getqualname`: the class qualified name lives
@@ -2677,12 +2747,48 @@ mod tests {
         unsafe { w_type_set_version_tag(obj, new_version_tag()) };
     }
 
+    /// typeobject.py `name?`: `descr_set__name__` stores without `mutated()`,
+    /// so the loops that baked `w_name` revoke through this field.
+    #[test]
+    fn type_name_write_unlinks_the_instance_and_revokes_its_loops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let obj = w_type_new("QuasiName", PY_NULL, std::ptr::null_mut());
+        let w_type = unsafe { &*(obj as *const W_TypeObject) };
+        assert!(
+            !w_type.w_name_watchers.is_installed(),
+            "no instance until the first registration",
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = crate::quasiimmut::test_loop_token(&flag);
+        unsafe { w_type_current_w_name_qmut(obj) }
+            .expect("a type resolves a name? instance")
+            .register_loop_token(&token);
+        assert!(w_type.w_name_watchers.is_installed());
+
+        let w_name = crate::w_str_new("D");
+        unsafe { w_type_set_name(obj, w_name) };
+        assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
+        assert!(
+            !w_type.w_name_watchers.is_installed(),
+            "the field is nulled before the sweep",
+        );
+
+        let w_name2 = crate::w_str_new("E");
+        unsafe { w_type_set_name(obj, w_name2) };
+    }
+
     /// A non-type pointer must not be walked as one.
     #[test]
     fn quasi_immut_watcher_helpers_ignore_non_types() {
         unsafe {
             assert!(w_type_current_qmut_instance(PY_NULL).is_none());
+            assert!(w_type_current_w_name_qmut(PY_NULL).is_none());
+            assert!(!w_type_w_name_qmut_installed(PY_NULL));
             w_type_notify_quasi_immut_watchers(PY_NULL);
+            w_type_force_w_name_qmut(PY_NULL);
         }
     }
 

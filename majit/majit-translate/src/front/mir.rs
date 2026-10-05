@@ -8630,7 +8630,9 @@ impl<'a> Lowering<'a> {
                 },
                 TermKind::Return
                 | TermKind::UnwindResume
+                | TermKind::UnwindTerminate
                 | TermKind::Abort(_)
+                | TermKind::UndefinedBehavior
                 | TermKind::Unknown => vec![],
             };
             raw.into_iter()
@@ -8823,7 +8825,12 @@ impl<'a> Lowering<'a> {
                     v
                 }
             },
-            TermKind::Return | TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {
+            TermKind::Return
+            | TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior
+            | TermKind::Unknown => {
                 vec![]
             }
         };
@@ -8846,7 +8853,10 @@ impl<'a> Lowering<'a> {
                 .body
                 .get(bb as usize)
                 .and_then(|b| b.term_ref(self.llbc).ok()),
-            Some(TermKind::Abort(_)) | Some(TermKind::UnwindResume)
+            Some(TermKind::Abort(_))
+                | Some(TermKind::UnwindResume)
+                | Some(TermKind::UnwindTerminate)
+                | Some(TermKind::UndefinedBehavior)
         )
     }
 
@@ -19056,9 +19066,10 @@ impl<'a> Lowering<'a> {
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
-            TermKind::Abort(_) => {
+            TermKind::Abort(_) | TermKind::UndefinedBehavior => {
                 // A Rust panic-abort (`unreachable!()`, `panic!`,
-                // failed `unwrap`).  Python-level exceptions never
+                // failed `unwrap`) or Charon `TerminatorKind::UndefinedBehavior`.
+                // Python-level exceptions never
                 // reach here — they ride the `Result<_, PyError>`
                 // Switch/Return edges as ordinary control flow — so
                 // an Abort marks a "shouldn't occur at run-time"
@@ -19075,8 +19086,9 @@ impl<'a> Lowering<'a> {
                 self.graph.set_raise_implicit(bb_id, "AssertionError");
                 Ok(())
             }
-            TermKind::UnwindResume => {
-                // Unwind-table cleanup resume.  Its only inbound edges
+            TermKind::UnwindResume | TermKind::UnwindTerminate => {
+                // Unwind-table cleanup resume, or Charon
+                // `TerminatorKind::UnwindTerminate`.  Its only inbound edges
                 // are `on_unwind` edges, all of which this lowering
                 // drops, so the block is unreachable — close it as a
                 // bare exception propagation; the flowspace adapter
@@ -37404,7 +37416,9 @@ fn term_observes_divmod_result(term: &TermKind, llbc: &Llbc, alias: &[usize]) ->
         TermKind::Call { call, .. } => call_observes_divmod_result(call, llbc, alias),
         TermKind::Return
         | TermKind::UnwindResume
+        | TermKind::UnwindTerminate
         | TermKind::Abort(_)
+        | TermKind::UndefinedBehavior
         | TermKind::Goto { .. }
         | TermKind::Drop { .. }
         | TermKind::Unknown => false,
@@ -40329,11 +40343,19 @@ fn root_bracket_stack_effects_are_known(
                 }
             }
             // An overflow or bounds check has nothing to do with the stack.
+            // `UnwindResume` is the terminator `FunDecl::unstructured` leaves
+            // after dropping rustc cleanup blocks: every `on_unwind` edge
+            // names that one block, and it does not itself change the stack.
+            // `UndefinedBehavior` is the never-returning sink Charon used to
+            // spell `Abort("UndefinedBehavior")`.
             Ok(
                 TermKind::Goto { .. }
                 | TermKind::Switch { .. }
                 | TermKind::Abort(_)
-                | TermKind::Assert { .. },
+                | TermKind::Assert { .. }
+                | TermKind::UnwindResume
+                | TermKind::UnwindTerminate
+                | TermKind::UndefinedBehavior,
             ) => {}
             _ => return false,
         }
@@ -40559,7 +40581,8 @@ fn classify_root_slot_getter_body(
             TermKind::Assert { .. }
             | TermKind::Goto { .. }
             | TermKind::Return
-            | TermKind::UnwindResume => {}
+            | TermKind::UnwindResume
+            | TermKind::UnwindTerminate => {}
             TermKind::Call { call, target, .. } => {
                 calls += 1;
                 if calls > 1 {
@@ -40583,6 +40606,7 @@ fn classify_root_slot_getter_body(
             TermKind::Drop { .. }
             | TermKind::Switch { .. }
             | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior
             | TermKind::Unknown => return None,
         }
     }
@@ -43421,7 +43445,11 @@ fn compute_mir_liveness(
                 }
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
-            TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
+            TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior
+            | TermKind::Unknown => {}
         }
     }
 
@@ -44821,7 +44849,10 @@ fn unstructured_address_escape(
                     );
                 }
                 Ok(TermKind::Return) => returned_at[index] = Some(depths),
-                Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)) => {}
+                Ok(TermKind::UnwindResume)
+                | Ok(TermKind::UnwindTerminate)
+                | Ok(TermKind::Abort(_))
+                | Ok(TermKind::UndefinedBehavior) => {}
                 Ok(TermKind::Unknown) | Err(_) => escapes = true,
             }
         }
@@ -55062,22 +55093,81 @@ fn unit_enum_discriminant(llbc: &Llbc, kind: &serde_json::Value) -> Option<u64> 
     u64::try_from(variant.discriminant_i64()?).ok()
 }
 
-/// A shared borrow of a flag carrier is the carrier. Other borrows stay
-/// residual so a pointer-identity initializer is not folded as an integer.
+/// A shared borrow of a flag carrier is the carrier. A promoted `&FLAG`
+/// copies the NamedConst and borrows it; the transparent wrapper has
+/// already peeled to the integer word, so that word is the same carrier.
+/// Other borrows stay residual so a pointer-identity initializer is not
+/// folded as an integer.
 fn const_eval_borrowed_flag(
+    llbc: &Llbc,
     locals: &std::collections::HashMap<u64, ConstLit>,
     place: &Place,
 ) -> Option<ConstLit> {
     let lit = match &place.kind {
         PlaceKind::Local(n) => locals.get(n).copied()?,
         PlaceKind::Projection(inner, elem) if elem.label() == "Deref" => {
-            const_eval_borrowed_flag(locals, inner)?
+            const_eval_borrowed_flag(llbc, locals, inner)?
         }
         _ => return None,
     };
     match lit {
         v @ (ConstLit::EnumDisc(_) | ConstLit::BitflagBits(_)) => Some(v),
+        // The peeled flag word lives in an ADT local (`CodeFlags`). A
+        // primitive integer (or `&i64`) is a pointer-identity borrow.
+        v @ (ConstLit::Int(_) | ConstLit::UInt(_)) if const_ty_peels_to_adt(llbc, &place.ty) => {
+            Some(v)
+        }
         _ => None,
+    }
+}
+
+/// Peel `Ref` / `RawPtr` / hash-cons wrappers and report whether the
+/// pointee is an ADT. Used to tell a transparent flag wrapper from a
+/// primitive integer the same borrow evaluator must not fold.
+fn const_ty_peels_to_adt(llbc: &Llbc, ty: &TyRef) -> bool {
+    let mut v: &serde_json::Value = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(body) => body,
+            None => return false,
+        },
+    };
+    loop {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            v = match llbc.dedup_body(id) {
+                Some(body) => body,
+                None => return false,
+            };
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            match arr.get(1) {
+                Some(inner) => {
+                    v = inner;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            match arr.first() {
+                Some(inner) => {
+                    v = inner;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        return obj.contains_key("Adt");
     }
 }
 
@@ -55235,7 +55325,10 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 locals.insert(dst, eval_arr_call(llbc, &locals, &call, depth)?);
                 bb = *target as usize;
             }
-            TermKind::UnwindResume | TermKind::Abort(_) => return None,
+            TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior => return None,
             _ => return None,
         }
     }
@@ -55441,13 +55534,15 @@ fn const_eval_init_body_with_locals(
                     // call.
                     PlaceKind::Global { id, .. } => {
                         let global = llbc.global_by_id(*id)?;
-                        if global
+                        // `AnonConst` is rustc's promoted `&FLAG` for a
+                        // NamedConst used by reference (`FLAG.bits()`).
+                        match global
                             .rest
                             .get("global_kind")
                             .and_then(serde_json::Value::as_str)
-                            != Some("NamedConst")
                         {
-                            return None;
+                            Some("NamedConst") | Some("AnonConst") => {}
+                            _ => return None,
                         }
                         let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
                         let init = llbc.fn_by_id(init_id)?;
@@ -55469,7 +55564,7 @@ fn const_eval_init_body_with_locals(
                     // `SubChecked` result back field-wise).
                     PlaceKind::Projection(inner, elem) => {
                         if elem.label() == "Deref" {
-                            return const_eval_borrowed_flag(locals, inner);
+                            return const_eval_borrowed_flag(llbc, locals, inner);
                         }
                         let PlaceKind::Local(n) = inner.kind else {
                             return None;
@@ -55529,7 +55624,9 @@ fn const_eval_init_body_with_locals(
                         // Shared borrow of the flag word while `.bits()`
                         // reborrows it. Only the flag carriers propagate;
                         // any other borrow still refuses the initializer.
-                        Rvalue::Ref { place, .. } => const_eval_borrowed_flag(&locals, place)?,
+                        Rvalue::Ref { place, .. } => {
+                            const_eval_borrowed_flag(llbc, &locals, place)?
+                        }
                         _ => return None,
                     };
                     // rustc computes each assignment at the destination's
@@ -75225,6 +75322,78 @@ mod tests {
         );
         assert_eq!(plan.pins.get(&2), Some(&vec![1]));
         assert!(plan.get_sites.is_empty());
+
+        // `FunDecl::unstructured` rewrites every `on_unwind` to one
+        // `UnwindResume` block. That terminator does not change the stack.
+        let call_uw = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 4
+            }})
+        };
+        let drop_uw = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 4
+            }})
+        };
+        let unwind_resume: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call_uw(1, vec![], 2, 1)),
+                block(vec![], call_uw(6, vec![copy(1)], 6, 2)),
+                block(vec![], drop_uw(2, 3)),
+                block(vec![], serde_json::json!("Return")),
+                block(vec![], serde_json::json!("UnwindResume")),
+            ]
+        }))
+        .unwrap();
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &unwind_resume,
+            &super::MovedOutLocals::with_set(&unwind_resume, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(2),
+            "an on_unwind UnwindResume does not keep the bracket"
+        );
+
+        // Charon 0.1.281 spells the former `Abort("UndefinedBehavior")` as
+        // a first-class terminator. It is a never-returning sink and does
+        // not change the stack.
+        let undefined_behavior: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call_uw(1, vec![], 2, 1)),
+                block(vec![], call_uw(6, vec![copy(1)], 6, 2)),
+                block(vec![], drop_uw(2, 3)),
+                block(vec![], serde_json::json!("Return")),
+                block(vec![], serde_json::json!("UndefinedBehavior")),
+            ]
+        }))
+        .unwrap();
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &undefined_behavior,
+            &super::MovedOutLocals::with_set(&undefined_behavior, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(2),
+            "an on_unwind UndefinedBehavior does not keep the bracket"
+        );
 
         // An unmodelled callee may append or overwrite a slot without
         // borrowing this guard. `pin_root` itself is not that callee.

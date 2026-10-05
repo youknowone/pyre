@@ -4,9 +4,10 @@
 //! Run with: `cargo test -p majit-charon-reader --features dynasm`.
 
 use majit_charon_reader::{
-    Llbc,
-    ullbc::{CallClass, StmtKind, TermKind},
+    GlobalDecl, Llbc,
+    ullbc::{CallClass, NameSeg, Operand, Place, PlaceKind, Rvalue, StmtKind, TermKind},
 };
+use serde_json::Value;
 
 const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc",);
 
@@ -54,6 +55,9 @@ fn loads_fixture_corpus() {
     // + 3 for the `mem::replace` trio, `replace_field`, `replace_elem`, and
     // `replace_reborrow_then_read`. Each is one local body.
     //
+    // + 3 for the two-word cell trio, `replace_two_words`, `swap_two_words`
+    // and `take_two_words`.
+    //
     // + 2 for `take_odd_default` and its hand-written `Default::default`.
     // + 1 for `replace_wide_payload` (a `u128` variant field).
     //
@@ -64,12 +68,12 @@ fn loads_fixture_corpus() {
     // `replace_boxed_dynlike`, `store_held_cell`, and the extra local
     // bodies Charon emits beside those items.
     //
-    // Charon nightly-2026.09.26 no longer emits
+    // Charon since nightly-2026.09.26 no longer emits
     // `bool_then_closure::closure::<Impl>::drop_in_place` as its own local
     // item. The closure env is not a separate `closure` path; its body is
     // `bool_then_closure::<Impl>::call_once`. That drop glue was a local fn
     // on nightly-2026.05.29, and it is absent from the artefact rather than
-    // dropped by the reader. The measured count is 59.
+    // dropped by the reader.
     //
     // + 1 for `char_slot_index`, the `char` element array read.
     //
@@ -106,9 +110,12 @@ fn loads_fixture_corpus() {
     //
     // + 1 for `tail_len`, `get(1..).unwrap_or(&[])` of a pair slice.
     //
-    // Measured on nightly-2026.09.26, where drop glue is no longer its own
-    // local item: 97.
-    assert_eq!(local_count, 97, "97 local fns expected");
+    // + 2 for the `::<Builtin>` bodies Charon 0.1.281 emits beside
+    // `code_flags_bits_or` and `tail_len`.
+    //
+    // Measured on Charon 0.1.281 (nightly-2026.10.04): drop glue is no
+    // longer its own local item, and this artefact holds 99.
+    assert_eq!(local_count, 99, "99 local fns expected");
 }
 
 #[test]
@@ -148,18 +155,25 @@ fn straight_line_add_shape() {
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
     assert_eq!(u.locals.arg_count, 3);
+    // Cleanup blocks are left out; every on_unwind edge shares the appended
+    // UnwindResume block. 7 MIR blocks (4 normal + 3 cleanup) become 5.
     assert_eq!(u.body.len(), 5);
 
     // bb0 should end in an overflow Assert (AddChecked + Assert).
     let bb0 = &u.body[0];
-    assert!(
-        matches!(bb0.term(&llbc).unwrap(), TermKind::Assert { .. }),
-        "bb0 terminator was not Assert",
-    );
+    match bb0.term(&llbc).unwrap() {
+        TermKind::Assert { on_unwind, .. } => assert_eq!(on_unwind, 4),
+        other => panic!("bb0 terminator was not Assert: {other:?}"),
+    }
 
-    // bb4 should be the return block.
-    let bb4 = &u.body[4];
-    assert!(matches!(bb4.term(&llbc).unwrap(), TermKind::Return));
+    // bb3 should be the return block.
+    let bb3 = &u.body[3];
+    assert!(matches!(bb3.term(&llbc).unwrap(), TermKind::Return));
+
+    assert!(matches!(
+        u.body[4].term(&llbc).unwrap(),
+        TermKind::UnwindResume
+    ));
 }
 
 #[test]
@@ -249,4 +263,170 @@ fn dedup_body_resolves_inline_shape() {
         sampled > 0,
         "expected at least one Deduplicated input TyRef in the corpus"
     );
+}
+
+fn is_promoted_anon_const(gd: &GlobalDecl) -> bool {
+    if gd.rest.get("global_kind").and_then(Value::as_str) != Some("AnonConst") {
+        return false;
+    }
+    match gd.item_meta.name.last() {
+        Some(NameSeg::Other(v)) => {
+            v.get("Builtin")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(Value::as_str)
+                == Some("PromotedConst")
+        }
+        _ => false,
+    }
+}
+
+fn json_global_ids(v: &Value, out: &mut Vec<u64>) {
+    if let Some(id) = v
+        .get("kind")
+        .and_then(|k| k.get("Global"))
+        .and_then(|g| g.get("id"))
+        .and_then(Value::as_u64)
+    {
+        out.push(id);
+    }
+    match v {
+        Value::Array(arr) => {
+            for item in arr {
+                json_global_ids(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                json_global_ids(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn unstructured_global_ids(u: &majit_charon_reader::ullbc::Unstructured) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for bb in &u.body {
+        for st in &bb.statements {
+            json_global_ids(st.kind_value(), &mut ids);
+        }
+        json_global_ids(bb.terminator.kind_value(), &mut ids);
+    }
+    ids
+}
+
+fn assert_no_promoted_anon_const_read(llbc: &Llbc, u: &majit_charon_reader::ullbc::Unstructured) {
+    for id in unstructured_global_ids(u) {
+        if let Some(gd) = llbc.global_by_id(id) {
+            assert!(
+                !is_promoted_anon_const(gd),
+                "body still reads AnonConst promoted global {id} ({})",
+                gd.item_meta.name_path()
+            );
+        }
+    }
+}
+
+fn dest_local(place: &Place) -> Option<u64> {
+    match place.kind {
+        PlaceKind::Local(n) => Some(n),
+        _ => None,
+    }
+}
+
+fn copy_global_id(rv: &Rvalue) -> Option<u64> {
+    match rv {
+        Rvalue::Use(Operand::Copy(place), _) => match place.kind {
+            PlaceKind::Global { id, .. } => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ref_of_local(rv: &Rvalue, local: u64) -> bool {
+    matches!(rv, Rvalue::Ref { place, .. } if matches!(place.kind, PlaceKind::Local(n) if n == local))
+}
+
+fn is_array_aggregate(rv: &Rvalue) -> bool {
+    matches!(rv, Rvalue::Aggregate(kind, _) if kind.get("Array").is_some())
+}
+
+fn consecutive_assigns(
+    u: &majit_charon_reader::ullbc::Unstructured,
+) -> Vec<(Place, Rvalue, Place, Rvalue)> {
+    let mut out = Vec::new();
+    for bb in &u.body {
+        for pair in bb.statements.windows(2) {
+            let Ok(StmtKind::Assign(p0, rv0)) = pair[0].stmt_kind() else {
+                continue;
+            };
+            let Ok(StmtKind::Assign(p1, rv1)) = pair[1].stmt_kind() else {
+                continue;
+            };
+            out.push((p0, rv0, p1, rv1));
+        }
+    }
+    out
+}
+
+/// Charon 0.1.281 emits the `CodeFlags::FLAT` borrow as a promoted
+/// constant item. The reader splices the initializer so the body copies
+/// `FLAT` into a local and takes a reference, the inline shape.
+#[test]
+fn code_flags_bits_or_inlines_promoted_flat_borrow() {
+    let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+    let fd = llbc
+        .local_fn("code_flags_bits_or")
+        .expect("function present");
+    let u = fd.unstructured().expect("Unstructured body");
+    assert_no_promoted_anon_const_read(&llbc, &u);
+
+    let flat_id = llbc
+        .iter_global_decls()
+        .find(|gd| gd.item_meta.name_path().ends_with("::FLAT"))
+        .map(|gd| gd.def_id)
+        .expect("CodeFlags::FLAT global");
+    let found = consecutive_assigns(&u).iter().any(|(p0, rv0, _, rv1)| {
+        copy_global_id(rv0) == Some(flat_id)
+            && dest_local(p0).is_some_and(|loc| ref_of_local(rv1, loc))
+    });
+    assert!(
+        found,
+        "expected copy Global(FLAT) into a local followed by a Ref of that local"
+    );
+}
+
+/// Charon 0.1.281 emits the `&[]` fallback in `tail_len` as a promoted
+/// constant item. The reader splices the empty-array aggregate and a
+/// reference to it.
+#[test]
+fn tail_len_inlines_promoted_empty_array() {
+    let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+    let fd = llbc.local_fn("tail_len").expect("function present");
+    let u = fd.unstructured().expect("Unstructured body");
+    assert_no_promoted_anon_const_read(&llbc, &u);
+
+    let found = consecutive_assigns(&u).iter().any(|(p0, rv0, _, rv1)| {
+        is_array_aggregate(rv0) && dest_local(p0).is_some_and(|loc| ref_of_local(rv1, loc))
+    });
+    assert!(
+        found,
+        "expected Aggregate Array assign followed by a Ref of that local"
+    );
+}
+
+/// A body that never reads a promoted constant keeps its block and
+/// statement counts after the splice pass.
+#[test]
+fn straight_line_add_unchanged_without_promoted_read() {
+    let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+    let fd = llbc
+        .local_fn("straight_line_add")
+        .expect("function present");
+    let u = fd.unstructured().expect("Unstructured body");
+    assert_eq!(u.body.len(), 5);
+    let stmt_counts: Vec<usize> = u.body.iter().map(|bb| bb.statements.len()).collect();
+    assert_eq!(stmt_counts, vec![10, 8, 8, 5, 0]);
 }

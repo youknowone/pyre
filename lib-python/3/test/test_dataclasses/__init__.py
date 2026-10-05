@@ -8,6 +8,7 @@ import abc
 import annotationlib
 import io
 import pickle
+import sys
 import inspect
 import builtins
 import types
@@ -3692,9 +3693,11 @@ class TestSlots(unittest.TestCase):
 
         self.assertNotIn("__weakref__", A.__slots__)
         a = A()
-        with self.assertRaisesRegex(TypeError,
-                                    "cannot create weak reference"):
-            weakref.ref(a)
+        #PyPy change: PyPy allows weakrefs to all objects regardless of __slots__
+        if sys.implementation.name != 'pypy':
+            with self.assertRaisesRegex(TypeError,
+                                        "cannot create weak reference"):
+                weakref.ref(a)
         with self.assertRaises(AttributeError):
             a.__weakref__
 
@@ -4564,7 +4567,8 @@ class TestMakeDataclass(unittest.TestCase):
                           lambda x:x,
                           ]:
             with self.subTest(bad_field=bad_field):
-                with self.assertRaisesRegex(TypeError, r'has no len\(\)'):
+                # PyPy only use common part of error msg
+                with self.assertRaisesRegex(TypeError, r'has no len'):
                     make_dataclass('C', ['a', bad_field])
 
     def test_duplicate_field_names(self):

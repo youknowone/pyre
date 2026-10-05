@@ -3110,13 +3110,13 @@ unsafe fn read_code_names(
     let n = pyre_object::w_tuple_len(v);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let e = pyre_object::w_tuple_getitem(v, i as i64).unwrap_or_else(pyre_object::w_none);
+        let mut e = pyre_object::w_tuple_getitem(v, i as i64).unwrap_or_else(pyre_object::w_none);
         if !unsafe { pyre_object::is_str(e) } {
             return Err(crate::PyError::type_error(format!(
                 "{field} must be a tuple of strings"
             )));
         }
-        out.push(pyre_object::with_roots!(v => crate::baseobjspace::str_utf8_w(e))?.to_string());
+        out.push(pyre_object::with_roots!(v, e => crate::baseobjspace::str_utf8_w(e))?.to_string());
     }
     Ok(out.into_boxed_slice())
 }

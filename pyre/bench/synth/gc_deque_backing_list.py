@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=55.1
-# dynasm 15.2-27.5x, cranelift 19.4-27.2x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=31.7
+# Widest reading 27.5x; the ceiling is 15% over that.
 # collections.deque holds its backing list solely through the deque object.
 # If the marker traces the deque with an empty offset set, that list is not
 # forwarded and is swept/moved on a collection driven by a hot allocator loop

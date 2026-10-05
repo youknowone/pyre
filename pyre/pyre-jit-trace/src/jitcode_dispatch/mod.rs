@@ -1032,6 +1032,17 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     if fbw_context_chained_contains(exc) {
         return;
     }
+    // Do not consult recording-time `chain_context_would_write` here.
+    // `handle_bytecode` / `handle_exception_with_context` already ran
+    // `OperationError.record_context` on a residual or inlined callee's
+    // concrete exception, so that predicate sees a stamped slot and would
+    // drop the residual the compiled iterations still need: a jitted callee
+    // raises without going through that interpreter dispatch, and this
+    // catch-side store is the only write.  A same-frame bare reraise
+    // (`RAISE_VARARGS 0` / `RERAISE`, `RaiseWithExplicitTraceback`) is
+    // skipped at the `SubRaise` catch site instead, matching
+    // `pyopcode.py handle_bytecode` routing that exception around
+    // `record_context`.
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
     // the value the compiled iterations will store.
@@ -4870,7 +4881,27 @@ pub fn walk<Sym: WalkSym>(
                         record_prepend_application_traceback(ctx, exc, exc_concrete, node_position)?
                     };
                     let emit_runtime = !raised_in_this_frame && node.is_none();
-                    record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
+                    // `RaiseWithExplicitTraceback` (`RAISE_VARARGS 0`, `RERAISE`)
+                    // re-raises the handled instance and does not write
+                    // `__context__` (`pyopcode.py handle_bytecode` sends it
+                    // around `OperationError.record_context`).  The catch
+                    // compensation's residual still takes `exc` as an argument,
+                    // which forces a pendingfields reconstruction of a virtual
+                    // exception the handler never reads.  PyPy's reraise
+                    // bridge DCEs that object; skip the call here so the heap
+                    // optimizer can too.
+                    // `recording_raise_keeps_existing_traceback` is also true
+                    // for `FOR_ITER`, which keeps the iterator's traceback
+                    // but still writes `__context__` for a non-StopIteration.
+                    // Gate on `raised_in_this_frame` (`raise/r` / `reraise/`)
+                    // so this skip is exactly the bare-reraise opcode case.
+                    if raised_in_this_frame
+                        && recording_raise_keeps_existing_traceback(ctx, opcode_position)
+                    {
+                        fbw_context_chained_insert(exc);
+                    } else {
+                        record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
+                    }
                     record_inline_application_traceback(
                         ctx,
                         exc,
@@ -14751,7 +14782,16 @@ fn handle<Sym: WalkSym>(
             // the guard.
             let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
+            // A copy is a link renaming (`flatten.py insert_renamings`,
+            // `same_as`), never the result of the Python opcode it sits in:
+            // every operand-stack push goes through `setarrayitem_vable_r`,
+            // which stamps the TOS candidate itself.  Letting the copy stamp
+            // it made the block-exit move of `output = ''` into its register,
+            // emitted after GET_ITER, stand in for GET_ITER's iterator, and a
+            // later branch guard published `''` as the FOR_ITER operand.
+            let saved = ctx.frame_state.borrow().vstack_last_ref;
             write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
+            ctx.frame_state.borrow_mut().vstack_last_ref = saved;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {

@@ -8391,7 +8391,7 @@ where
     // pyopcode.py — `for name in all:` lazy iteration.
     let mut w_iter = pyre_object::with_roots!(module => crate::baseobjspace::iter(w_iterable))?;
     loop {
-        let w_name = match pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter))
+        let mut w_name = match pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter))
         {
             Ok(v) => v,
             Err(e) if e.matches_stop_iteration() => break,
@@ -8415,7 +8415,7 @@ where
             return Err(crate::PyError::type_error(msg));
         }
         let name =
-            pyre_object::with_roots!(module, w_iter => crate::baseobjspace::str_utf8_w(w_name))?
+            pyre_object::with_roots!(module, w_iter, w_name => crate::baseobjspace::str_utf8_w(w_name))?
                 .to_string();
         // pyopcode.py:2256-2257 — leading-underscore filter (only for
         // the `__dict__.keys()` fallback).

@@ -3294,9 +3294,10 @@ fn walker_read_int_mutable_cell<Sym: WalkSym>(
 ///
 /// [`pyre_interpreter::type_name_obj_fast_path`] admits only a class whose
 /// metaclass is exactly `type`, which is the case the getset cannot be
-/// replaced. The slot is read live: `descr_set__name__` stores a new string
-/// without `mutated()`, so a baked name would outlive the rename. A null
-/// slot (not materialized yet) declines; filling it in allocates.
+/// replaced.  The slot is `typeobject.py name?`: `descr_set__name__` stores
+/// a new string without `mutated()`, so the pin is this field rather than
+/// `_version_tag?`.  A null slot (not materialized yet) declines; filling
+/// it in allocates.
 fn walker_fold_type_name<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3308,25 +3309,29 @@ fn walker_fold_type_name<Sym: WalkSym>(
     if name != "__name__" {
         return Ok(None);
     }
-    let Some((_metatype, w_name)) =
-        (unsafe { pyre_interpreter::type_name_obj_fast_path(concrete_obj) })
+    let Some((_metatype, _)) = (unsafe { pyre_interpreter::type_name_obj_fast_path(concrete_obj) })
     else {
         return Ok(None);
     };
     let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
-    let name_op = crate::state::opimpl_getfield_gc_r(
+    crate::state::record_quasiimmut_field(
         ctx.trace_ctx,
         w_type_const,
         crate::descr::type_name_obj_descr(),
     );
-    ctx.trace_ctx.set_opref_concrete(
-        name_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
-    );
-    // `w_type_get_name_obj` materializes a null slot. A later clear must
-    // leave this fold rather than publish null as the attribute.
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[name_op])?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', name_op)?;
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    // `record_quasiimmut_field` installs the watcher before it captures
+    // `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`). The
+    // eligibility peek is only the non-null test; baking it would keep a
+    // pre-rename pointer after `invalidate_then_store` completed with no
+    // watcher. Re-read after the record, the same order as the `getfield`
+    // that follows `record_quasiimmut_field` on the rewritten load.
+    let w_name = unsafe { pyre_object::typeobject::w_type_peek_name_obj(concrete_obj) };
+    if w_name.is_null() {
+        return Ok(None);
+    }
+    let name_const = ctx.trace_ctx.const_ref(w_name as i64);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', name_const)?;
     Ok(Some(()))
 }
 

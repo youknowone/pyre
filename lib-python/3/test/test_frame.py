@@ -713,6 +713,7 @@ class TestFrameCApi(unittest.TestCase):
 
 class TestIncompleteFrameAreInvisible(unittest.TestCase):
 
+    @support.impl_detail('no gc.set_threshold on PyPy', pypy=False)
     def test_issue95818(self):
         # See GH-95818 for details
         code = textwrap.dedent(f"""

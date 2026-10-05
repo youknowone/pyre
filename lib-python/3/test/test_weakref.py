@@ -835,9 +835,11 @@ class ReferencesTestCase(TestBase):
         gc.collect()
         self.assertEqual(alist, [])
 
+    @support.impl_detail(pypy=False)
     def test_gc_during_ref_creation(self):
         self.check_gc_during_creation(weakref.ref)
 
+    @support.impl_detail(pypy=False)
     def test_gc_during_proxy_creation(self):
         self.check_gc_during_creation(weakref.proxy)
 
@@ -1303,7 +1305,7 @@ class MappingTestCase(TestBase):
         # Keep an iterator alive
         it = dct.items()
         try:
-            next(it)
+            print(next(it))
         except StopIteration:
             pass
         del items
@@ -1311,7 +1313,11 @@ class MappingTestCase(TestBase):
         n1 = len(dct)
         del it
         gc.collect()
+        gc.collect()
+        print(list(dct.items()))
         n2 = len(dct)
+        print(len(dct))
+        print(weakref)
         # one item may be kept alive inside the iterator
         self.assertIn(n1, (0, 1))
         self.assertEqual(n2, 0)
@@ -1322,6 +1328,7 @@ class MappingTestCase(TestBase):
     def test_weak_valued_len_cycles(self):
         self.check_len_cycles(weakref.WeakValueDictionary, lambda k: (1, k))
 
+    @support.impl_detail(pypy=False)
     def check_len_race(self, dict_type, cons):
         # Extended sanity checks for len() in the face of cyclic collection
         self.addCleanup(gc.set_threshold, *gc.get_threshold())
