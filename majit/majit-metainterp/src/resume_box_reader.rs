@@ -1550,12 +1550,6 @@ pub fn seed_bridge_virtualizable_boxes(
     // would be a wild read.  Check it and decline instead (`compile.giveup()`,
     // compile.py:27), which is strictly more conservative than upstream: the
     // guard keeps deopting through the blackhole exactly as it did before.
-    //
-    // Of the two writes upstream pairs with the assignment, `reset_token_gcref`
-    // is inert for this seed's only consumer — the state-field vinfo is built by
-    // `VirtualizableInfo::without_vable_token()`, whose token protocol no-ops
-    // (`codegen_state.rs` `__build_virtualizable_info`) — so it is not ported.
-    // `synchronize_virtualizable()` is ported, below the seed.
     match ctx.virtualizable_heap_ptr() {
         Some(live) if live == vable_ptr => {}
         Some(_) | None => return false,
@@ -1611,6 +1605,21 @@ pub fn seed_bridge_virtualizable_boxes(
     values.push(identity_value);
     ctx.install_virtualizable_info(info.clone());
     ctx.set_virtualizable_boxes_with_info(boxes, values, info.as_ref(), &array_lengths);
+    // resume.py `ResumeDataDirectReader.consume_vable_info` and
+    // pyjitpl.py `MetaInterp.rebuild_state_after_failure` both
+    // reset_token_gcref here: assembler (virtualizable.py case 4)
+    // into tracing (case 2). CALL_MAY_FORCE stored the jitframe;
+    // a later non-GUARD_NOT_FORCED exit does not force.
+    // `tracing_before_residual_call` asserts TOKEN_NONE. Reset
+    // without forcing: resume data already holds the boxes.
+    // The other site is jitdriver.rs after setup_bridge_sym.
+    if info.has_vable_token() {
+        unsafe {
+            if info.is_token_nonnull_gcref(vable_ptr) {
+                info.reset_token_gcref(vable_ptr as *mut u8);
+            }
+        }
+    }
     // `rebuild_state_after_failure`'s trailing `self.synchronize_virtualizable()`
     // (pyjitpl.py) — the object and the shadow have to agree before the bridge
     // replays a single vable op.
@@ -1703,5 +1712,51 @@ mod tests {
             int_add_concrete(OpRef::const_int(5), OpRef::const_ptr(majit_ir::GcRef(8))),
             None
         );
+    }
+
+    /// pyjitpl.py `MetaInterp.rebuild_state_after_failure` /
+    /// resume.py `ResumeDataDirectReader.consume_vable_info`: leaving
+    /// compiled code with `vable_token` still the jitframe (CALL_MAY_FORCE
+    /// stored it; a later non-GUARD_NOT_FORCED exit does not force) must
+    /// reset it to TOKEN_NONE before tracing. `tracing_before_residual_call`
+    /// asserts that.
+    #[test]
+    fn seed_bridge_virtualizable_boxes_resets_assembler_token() {
+        let info = std::sync::Arc::new(crate::virtualizable::VirtualizableInfo::new(0));
+        let mut obj = vec![0u8; 16];
+        let obj_ptr = obj.as_mut_ptr();
+        unsafe {
+            *(obj_ptr as *mut u64) = 0xDEAD_BEEF;
+            assert!(info.is_token_nonnull_gcref(obj_ptr as *const u8));
+        }
+
+        let mut ctx = crate::TraceCtx::for_test_types(&[Type::Ref]);
+        ctx.set_virtualizable_heap_ptr(obj_ptr as *const u8);
+
+        let fail_values = [obj_ptr as usize as i64];
+        let resume_data = crate::jit_state::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: vec![majit_ir::resumedata::RebuiltValue::Box(0, Type::Ref)],
+            virtualref_values: Vec::new(),
+            storage: None,
+            num_failargs: 1,
+            fail_arg_types: vec![Type::Ref],
+        };
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let seeded = seed_bridge_virtualizable_boxes(
+            &mut ctx,
+            &info,
+            None,
+            &resume_data,
+            &mut cache,
+            &fail_values,
+        );
+        assert!(seeded, "identity matches the live heap pointer");
+        unsafe {
+            assert!(
+                !info.is_token_nonnull_gcref(obj_ptr as *const u8),
+                "reset_token_gcref must leave TOKEN_NONE"
+            );
+        }
     }
 }
