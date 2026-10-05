@@ -40343,11 +40343,16 @@ fn root_bracket_stack_effects_are_known(
                 }
             }
             // An overflow or bounds check has nothing to do with the stack.
+            // `UnwindResume` is the terminator `FunDecl::unstructured` leaves
+            // after dropping rustc cleanup blocks: every `on_unwind` edge
+            // names that one block, and it does not itself change the stack.
             Ok(
                 TermKind::Goto { .. }
                 | TermKind::Switch { .. }
                 | TermKind::Abort(_)
-                | TermKind::Assert { .. },
+                | TermKind::Assert { .. }
+                | TermKind::UnwindResume
+                | TermKind::UnwindTerminate,
             ) => {}
             _ => return false,
         }
@@ -75311,6 +75316,51 @@ mod tests {
         );
         assert_eq!(plan.pins.get(&2), Some(&vec![1]));
         assert!(plan.get_sites.is_empty());
+
+        // `FunDecl::unstructured` rewrites every `on_unwind` to one
+        // `UnwindResume` block. That terminator does not change the stack.
+        let call_uw = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 4
+            }})
+        };
+        let drop_uw = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 4
+            }})
+        };
+        let unwind_resume: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call_uw(1, vec![], 2, 1)),
+                block(vec![], call_uw(6, vec![copy(1)], 6, 2)),
+                block(vec![], drop_uw(2, 3)),
+                block(vec![], serde_json::json!("Return")),
+                block(vec![], serde_json::json!("UnwindResume")),
+            ]
+        }))
+        .unwrap();
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &unwind_resume,
+            &super::MovedOutLocals::with_set(&unwind_resume, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(2),
+            "an on_unwind UnwindResume does not keep the bracket"
+        );
 
         // An unmodelled callee may append or overwrite a slot without
         // borrowing this guard. `pin_root` itself is not that callee.

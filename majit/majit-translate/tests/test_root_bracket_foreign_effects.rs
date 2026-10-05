@@ -26,21 +26,53 @@ const INTERPRETER_LLBC: &str = concat!(
 /// minutes.
 const SAMPLE: usize = 200;
 
+fn callee_name_paths<'a>(
+    llbc: &'a Llbc,
+    body: &'a majit_charon_reader::ullbc::Unstructured,
+) -> impl Iterator<Item = String> + 'a {
+    body.body.iter().filter_map(move |bb| {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            return None;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            return None;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        llbc.fn_by_id(*id).map(|f| f.item_meta.name_path())
+    })
+}
+
+fn path_is_gc_roots_leaf(path: &str, leaf: &str) -> bool {
+    path.rsplit("::").next() == Some(leaf) && path.split("::").any(|s| s == "gc_roots")
+}
+
+/// True when every terminator callee outside `gc_roots` lives in a crate the
+/// harvest can name. An interpreter-local helper is analysed from its own
+/// body, so publishing `pyre-object` cannot change whether it touches.
+fn only_foreign_non_root_callees(paths: &[String]) -> bool {
+    paths.iter().all(|path| {
+        path.split("::").any(|s| s == "gc_roots")
+            || path.split("::").next() != Some("pyre_interpreter")
+    })
+}
+
 /// Bodies holding at least one erased bracket, over the first [`SAMPLE`]
-/// bodies that open one.
+/// bodies that open one and whose other callees are all foreign. Those are
+/// the bodies whose unknown `pyre-object` / `core` callees the harvest can
+/// answer.
 fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
     let (mut opening, mut erased) = (0, 0);
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        let opens = body.body.iter().any(|bb| {
-            matches!(bb.term(llbc), Ok(TermKind::Call { call, .. })
-                if matches!(&call.func, CallFunc::Regular(reg)
-                    if matches!(&reg.kind, CallKind::Fun(FunId::Regular { id })
-                        if llbc.fn_by_id(*id).is_some_and(|f| f.item_meta.name_path() == "pyre_object::gc_roots::push_roots"))))
-        });
-        if !opens {
+        let paths: Vec<String> = callee_name_paths(llbc, &body).collect();
+        if !paths.iter().any(|p| path_is_gc_roots_leaf(p, "push_roots")) {
+            continue;
+        }
+        if !only_foreign_non_root_callees(&paths) {
             continue;
         }
         if opening == SAMPLE {
