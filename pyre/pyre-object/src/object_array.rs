@@ -844,19 +844,28 @@ pub unsafe fn try_grow_list_items_block_gc(
     // the barrier cannot follow the items. `owns_new` is the placement
     // `try_alloc_items_block_gc` already knew.
     let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
-    let new_base = unsafe { items_block_items_base(new_block) };
-    let old = old_slot
-        .map(|slot| crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock)
-        .unwrap_or(old);
     // Old→young barrier if the grown block landed in old-gen (see
     // alloc_tuple_items_block_gc).
     if owns_new {
         crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
     }
-    if live_len > 0 {
-        let old_base = unsafe { items_block_items_base(old) };
-        unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, live_len) };
+    // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy` then
+    // `l.items = newitems`. The oopspec (`list.ll_arraycopy`) is what
+    // writeanalyze records as an array write, so `force_from_effectinfo`
+    // flushes lazy SETARRAYITEM_GC before the residual COND_CALL.
+    if let Some(old_slot) = old_slot
+        && live_len > 0
+    {
+        jit_ll_arraycopy(
+            crate::gc_roots::shadow_stack_get(old_slot),
+            crate::gc_roots::shadow_stack_get(new_block_slot),
+            0,
+            0,
+            live_len as i64,
+        );
     }
+    let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
+    let new_base = unsafe { items_block_items_base(new_block) };
     for i in live_len..new_cap {
         unsafe { *new_base.add(i) = PY_NULL };
     }
@@ -1295,15 +1304,32 @@ pub unsafe fn try_grow_typed_items_block(
         let _roots = crate::gc_roots::push_roots();
         let fresh_root = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
-        if !old.is_null() && live_len > 0 {
-            std::ptr::copy_nonoverlapping(
-                typed_items_block_items_base(old),
-                typed_items_block_items_base(fresh),
-                live_len * std::mem::size_of::<u64>(),
+        // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy` then
+        // `l.items = newitems`. The oopspec (`list.ll_arraycopy`) is what
+        // writeanalyze records as an array write, so `force_from_effectinfo`
+        // flushes lazy SETARRAYITEM_GC before the residual COND_CALL.
+        let old_root = if !old.is_null() {
+            let slot = crate::gc_roots::shadow_stack_len();
+            let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
+            Some(slot)
+        } else {
+            None
+        };
+        if let Some(old_root) = old_root
+            && live_len > 0
+        {
+            jit_ll_arraycopy(
+                crate::gc_roots::shadow_stack_get(old_root),
+                crate::gc_roots::shadow_stack_get(fresh_root),
+                0,
+                0,
+                live_len as i64,
             );
         }
-        if !old.is_null() {
-            dealloc_typed_items_block(old);
+        if let Some(old_root) = old_root {
+            dealloc_typed_items_block(
+                crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
+            );
         }
         Some(crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock)
     }

@@ -9413,6 +9413,27 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
     Some(CallPath { segments })
 }
 
+/// `rlib/jit.py` `@look_inside_iff`: the public name is a dispatch
+/// wrapper; `_orig_<name>` holds the body writeanalyze must see
+/// (`_ll_list_resize_hint_really` writes `l.items`).
+fn orig_path_behind_look_inside_iff(path: &CallPath) -> Option<CallPath> {
+    let leaf = path.segments.last()?;
+    let base = leaf
+        .strip_prefix("__majit_call_target_")
+        .unwrap_or(leaf.as_str());
+    let base = base.strip_suffix("_trampoline").unwrap_or(base);
+    if base.starts_with("_orig_") || base.is_empty() {
+        return None;
+    }
+    let orig = format!("_orig_{base}");
+    if orig == *leaf {
+        return None;
+    }
+    let mut segments = path.segments.clone();
+    *segments.last_mut()? = orig;
+    Some(CallPath { segments })
+}
+
 /// `call.py` `guess_call_kind` rejects `rposix._get_errno` and
 /// `rposix._set_errno` by function-object identity. Call sites spell
 /// those two helpers as `majit_rlib::rposix::{_get_errno,_set_errno}`
@@ -9489,6 +9510,24 @@ impl CallControl {
 
     /// `analyze_direct_call(graph, seen)` (graphanalyze.py) of the
     /// read/write analyzer.
+    /// `rgc.py` `ll_arraycopy` / `list.ll_arraycopy` residual. pyre's
+    /// helper is `extern "C"` (`jit_ll_arraycopy`) and has no graph, so
+    /// writeanalyze must not treat it as an llexternal bottom.
+    fn arraycopy_call_has_no_graph(&self, target: &CallTarget) -> bool {
+        let Some(path) = self.target_to_path(target) else {
+            return matches!(
+                target,
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().is_some_and(|s| s == "jit_ll_arraycopy")
+            );
+        };
+        let is_arraycopy = path
+            .segments
+            .last()
+            .is_some_and(|s| s == "jit_ll_arraycopy");
+        is_arraycopy && self.function_graphs.get(&path).is_none()
+    }
+
     fn analyze_readwrite(
         &self,
         path: &CallPath,
@@ -9496,11 +9535,20 @@ impl CallControl {
         analyzed: &mut ReadWriteAnalyzedCalls,
     ) -> ReadWriteEffects {
         // `analyze_external_call`: a funcobj without a graph has no
-        // `_callbacks` here, so `bottom_result()`.
+        // `_callbacks` here, so `bottom_result()`. `__majit_call_target_<fn>`
+        // is the word-ABI residual (`getfunctionptr` of the decorated
+        // function); RPython writeanalyze walks that function's graph, and
+        // the trampoline itself is `extern "C"` with none.
         let (Some(key), Some(graph)) = (
             self.function_graphs.key_for(path),
             self.function_graphs.get(path),
         ) else {
+            if let Some(user) = user_path_behind_majit_call_target(path) {
+                return self.analyze_readwrite_alias(&user, seen, analyzed);
+            }
+            if let Some(orig) = orig_path_behind_look_inside_iff(path) {
+                return self.analyze_readwrite_alias(&orig, seen, analyzed);
+            }
             return ReadWriteEffects::bottom_result();
         };
         if !seen.enter(key.clone(), analyzed) {
@@ -9512,10 +9560,26 @@ impl CallControl {
             for op in &block.operations {
                 // graphanalyze.py `analyze(op, seen, graphinfo)`.
                 let effects = match &op.kind {
-                    OpKind::Call { target, .. } => match self.target_to_path(target) {
-                        Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
-                        None => ReadWriteEffects::bottom_result(),
-                    },
+                    OpKind::Call { target, .. } => {
+                        // graphanalyze.py `analyze`: a `direct_call` whose
+                        // funcobj has no graph raises `AttributeError` and
+                        // returns `top_result`. `list.ll_arraycopy` /
+                        // `jit_ll_arraycopy` is that residual (`rgc.py`
+                        // `ll_arraycopy` has a graph of `setarrayitem`;
+                        // pyre's helper is `extern "C"`). Treating it as
+                        // `analyze_external_call` bottom dropped the dest
+                        // ARRAY write from `_ll_list_resize_hint_really`,
+                        // so `force_from_effectinfo` left lazy SETARRAYITEM_GC
+                        // across the residual COND_CALL.
+                        if self.arraycopy_call_has_no_graph(target) {
+                            ReadWriteEffects::top_result()
+                        } else {
+                            match self.target_to_path(target) {
+                                Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
+                                None => ReadWriteEffects::bottom_result(),
+                            }
+                        }
+                    }
                     OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
                         Some(graphs) => self.analyze_readwrite_indirect(graphs, seen, analyzed),
                         None => ReadWriteEffects::top_result(),
@@ -9528,9 +9592,48 @@ impl CallControl {
                 }
             }
         }
-        let result = ReadWriteEffects::finalize_builder(result);
+        let mut result = ReadWriteEffects::finalize_builder(result);
+        // The public `look_inside_iff` name is a dispatch wrapper; heap
+        // writes live on `_orig_<name>` (`rlist.py` `_ll_list_resize_hint_really`
+        // assigns `l.items`). A Call to that sibling that does not resolve
+        // would otherwise leave the COND_CALL with empty writes.
+        if let Some(orig) = orig_path_behind_look_inside_iff(path) {
+            result = ReadWriteEffects::add_to_result(
+                result,
+                self.analyze_readwrite_alias(&orig, seen, analyzed),
+            );
+        }
         seen.leave_with(key, result.clone(), analyzed);
         result
+    }
+
+    /// `analyze_readwrite` on `path`, then the crate-stripped spelling, then
+    /// the leaf. Harvested graphs often live under `listobject::_orig_foo`
+    /// while the residual names `pyre_object::listobject::_orig_foo`.
+    fn analyze_readwrite_alias(
+        &self,
+        path: &CallPath,
+        seen: &mut ReadWriteTracker,
+        analyzed: &mut ReadWriteAnalyzedCalls,
+    ) -> ReadWriteEffects {
+        if self.function_graphs.get(path).is_some() {
+            return self.analyze_readwrite(path, seen, analyzed);
+        }
+        if path.segments.len() > 1 {
+            let stripped = CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
+            if self.function_graphs.get(&stripped).is_some() {
+                return self.analyze_readwrite(&stripped, seen, analyzed);
+            }
+        }
+        if path.segments.len() > 1
+            && let Some(leaf) = path.segments.last()
+        {
+            let leaf_path = CallPath::from_segments([leaf.as_str()]);
+            if self.function_graphs.get(&leaf_path).is_some() {
+                return self.analyze_readwrite(&leaf_path, seen, analyzed);
+            }
+        }
+        self.analyze_readwrite(path, seen, analyzed)
     }
 
     /// `analyze_indirect_call(graphs, seen)` (graphanalyze.py).
@@ -16961,6 +17064,73 @@ mod tests {
                 .map(|key| key.index)
                 .collect(),
         }
+    }
+
+    /// graphanalyze.py: a `direct_call` with no graph is `top_result`.
+    /// Nested `jit_ll_arraycopy` (no graph) must not be `analyze_external_call`
+    /// bottom, or `_ll_list_resize_hint_really` would write no ARRAY.
+    #[test]
+    fn readwrite_nested_ll_arraycopy_without_graph_is_top() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        rw_register(&mut cc, "grow", vec![rw_call("jit_ll_arraycopy")]);
+        assert!(
+            is_top(&rw_of(&cc, &mut cache, "grow")),
+            "a nested list.ll_arraycopy residual is writeanalyze top"
+        );
+    }
+
+    /// Residual `COND_CALL` of a `look_inside_iff` helper uses the
+    /// `__majit_call_target_<fn>` word-ABI trampoline (`getfunctionptr`
+    /// of the decorated function). That trampoline has no graph; writeanalyze
+    /// must walk the user function, or `_ll_list_resize_hint_really` would
+    /// publish empty writes and leave lazy SETARRAYITEM_GC across grow.
+    #[test]
+    fn readwrite_call_target_trampoline_walks_the_user_graph() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        rw_register(
+            &mut cc,
+            "ll_list_obj_resize_hint_really",
+            vec![rw_call("jit_ll_arraycopy")],
+        );
+        assert!(
+            is_top(&rw_of(
+                &cc,
+                &mut cache,
+                "__majit_call_target_ll_list_obj_resize_hint_really"
+            )),
+            "call-target residual of a grow that copies is writeanalyze top"
+        );
+    }
+
+    /// `rlib/jit.py` `@look_inside_iff`: writeanalyze of the public name
+    /// must include `_orig_<name>`'s heap writes.
+    #[test]
+    fn readwrite_look_inside_iff_public_name_sees_orig_writes() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        rw_register(
+            &mut cc,
+            "_orig_ll_list_int_resize_hint_really",
+            vec![rw_write_field("W_ListObject", "int_items.block")],
+        );
+        rw_register(&mut cc, "ll_list_int_resize_hint_really", vec![]);
+        let effects = rw_of(&cc, &mut cache, "ll_list_int_resize_hint_really");
+        assert!(
+            !is_top(&effects),
+            "look_inside_iff dispatch must not be writeanalyze top"
+        );
+        assert_eq!(write_fields(&effects), vec![0]);
+        assert_eq!(
+            write_fields(&rw_of(
+                &cc,
+                &mut cache,
+                "__majit_call_target_ll_list_int_resize_hint_really"
+            )),
+            vec![0],
+            "call-target residual must see the same orig writes"
+        );
     }
 
     /// Every graph a walk enters keeps its set in `_analyzed_calls`; a

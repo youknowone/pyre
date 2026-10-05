@@ -3545,11 +3545,11 @@ impl OptHeap {
             // its only guard-named methods are the two below.
 
             // heap.py has no optimize_COND_CALL. COND_CALL is is_call
-            // (`resoperation.py` `OpHelpers.is_call`, `_CALL_FIRST`..`_CALL_LAST`),
-            // so `OptHeap.emit` → `emitting_operation` routes it through
-            // `force_from_effectinfo` when `!has_random_effects`. Flushing
-            // every lazy set here residualized still-virtual inlined-frame
-            // `JitVirtualRef`s (`virtualize.py` `optimize_VIRTUAL_REF`).
+            // (`resoperation.py` `OpHelpers.is_call`), so `OptHeap.emit` →
+            // `emitting_operation` routes it through `force_from_effectinfo`
+            // when `!has_random_effects`. A dedicated always-flush arm
+            // residualized still-virtual inlined-frame `JitVirtualRef`s
+            // (`virtualize.py` `optimize_VIRTUAL_REF`).
             OpCode::CondCallN => OptimizationResult::PassOn,
 
             // heap.py optimize_GUARD_NO_EXCEPTION / optimize_GUARD_EXCEPTION.
