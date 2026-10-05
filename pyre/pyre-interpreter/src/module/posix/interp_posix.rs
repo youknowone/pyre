@@ -7906,14 +7906,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         if ret >= 0 {
                             break ret;
                         }
-                        crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
-                            |e| io_err(e, ""),
-                        )?;
+                        pyre_object::with_roots!(w_fd, w_offset, w_length => {
+                            crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(
+                                    majit_rlib::rposix::get_saved_errno(),
+                                ),
+                                |e| io_err(e, ""),
+                            )
+                        })?;
                     };
-                    Ok(pyre_object::w_int_new(ret as i64))
+                    Ok(pyre_object::with_roots!(w_fd, w_offset, w_length => {
+                        pyre_object::w_int_new(ret as i64)
+                    }))
                 },
                 3,
             ),
@@ -7958,10 +7962,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         if error == 0 {
                             break;
                         }
-                        crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(error),
-                            |e| io_err(e, ""),
-                        )?;
+                        pyre_object::with_roots!(w_fd, w_offset, w_length, w_advice => {
+                            crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(error),
+                                |e| io_err(e, ""),
+                            )
+                        })?;
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -8606,20 +8612,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 )
                             });
                             if res >= 0 {
-                                let mut items = pyre_object::gc_roots::RootedItems::new();
-                                for (i, word) in mask.iter().copied().enumerate() {
-                                    if word == 0 {
-                                        continue;
-                                    }
-                                    for bit in 0..CPU_MASK_BITS {
-                                        if word & ((1 as libc::c_ulong) << bit) != 0 {
-                                            items.push(pyre_object::w_int_new(
-                                                (i * CPU_MASK_BITS + bit) as i64,
-                                            ));
+                                return Ok(pyre_object::with_roots!(w_pid => {
+                                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                                    for (i, word) in mask.iter().copied().enumerate() {
+                                        if word == 0 {
+                                            continue;
+                                        }
+                                        for bit in 0..CPU_MASK_BITS {
+                                            if word & ((1 as libc::c_ulong) << bit) != 0 {
+                                                items.push(pyre_object::w_int_new(
+                                                    (i * CPU_MASK_BITS + bit) as i64,
+                                                ));
+                                            }
                                         }
                                     }
-                                }
-                                return Ok(pyre_object::w_set_from_items(&items.take()));
+                                    pyre_object::w_set_from_items(&items.take())
+                                }));
                             }
                             let err = majit_rlib::rposix::get_saved_errno();
                             if err != libc::EINVAL {
@@ -8655,7 +8663,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         let pid = pyre_object::with_roots!(w_pid, w_mask => {
                             crate::baseobjspace::c_int_w(w_pid)
                         })? as libc::pid_t;
-                        let items = crate::builtins::collect_iterable(w_mask)?;
+                        let items = pyre_object::with_roots!(w_pid, w_mask => {
+                            crate::builtins::collect_iterable(w_mask)
+                        })?;
                         let mut cpus = Vec::new();
                         let _seq_roots = pyre_object::gc_roots::push_roots();
                         let items_base = pyre_object::gc_roots::pin_roots(&items);
@@ -8860,7 +8870,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         }
                     }
                     match got {
-                        Some(buf) => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf)),
+                        Some(buf) => Ok(pyre_object::with_roots!(w_path, w_attribute => {
+                            pyre_object::bytesobject::w_bytes_from_bytes(&buf)
+                        })),
                         None => Err(io_err_with_filename(
                             std::io::Error::from_raw_os_error(libc::ERANGE),
                             path.w_path(),
@@ -9148,11 +9160,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if !names.is_empty() {
                         names.pop();
                     }
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    for name in names {
-                        items.push(crate::gateway::fsdecode_filename_bytes(name));
-                    }
-                    Ok(pyre_object::w_list_new(items.take()))
+                    Ok(pyre_object::with_roots!(w_path => {
+                        let mut items = pyre_object::gc_roots::RootedItems::new();
+                        for name in names {
+                            items.push(crate::gateway::fsdecode_filename_bytes(name));
+                        }
+                        pyre_object::w_list_new(items.take())
+                    }))
                 }),
             );
         }
@@ -12073,26 +12087,89 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // `host_posix::sendfile`. Listing the BSD-only parameters
                 // makes unknown keywords fail during argument binding on
                 // every platform.
-                let (bound, _kwargs) = bind_path_args(
-                    args,
-                    "sendfile",
-                    &[
-                        "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
-                    ],
-                    4,
-                    &[],
-                )?;
                 // interp_posix.py `@unwrap_spec(out_fd=c_int, count=int)`,
-                // with `in_ = space.c_int_w(w_in_fd)` in the body (:2955). The
-                // spec runs in the gateway, so the count is converted before
-                // the descriptor argument that follows it here.
-                let out_fd = crate::baseobjspace::c_int_w(bound[0].expect("out_fd is required"))?;
-                let count_raw = crate::baseobjspace::int_w(bound[3].expect("count is required"))?;
-                let in_fd = crate::baseobjspace::c_int_w(bound[1].expect("in_fd is required"))?;
-                let w_offset = bound[2].expect("offset is required");
+                // with `in_ = space.c_int_w(w_in_fd)` in the body (`sendfile`).
+                // The spec runs in the gateway, so the count is converted
+                // before the descriptor argument that follows it here.
+                // Named locals replace `bound` so the `Vec<Option<PyObjectRef>>`
+                // is not live across `rposix.c_sendfile`.
+                #[cfg(target_os = "linux")]
+                let (mut w_out_fd, mut w_in_fd, mut w_offset, mut w_count) = {
+                    let (bound, _kwargs) = bind_path_args(
+                        args,
+                        "sendfile",
+                        &[
+                            "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
+                        ],
+                        4,
+                        &[],
+                    )?;
+                    (
+                        bound[0].expect("out_fd is required"),
+                        bound[1].expect("in_fd is required"),
+                        bound[2].expect("offset is required"),
+                        bound[3].expect("count is required"),
+                    )
+                };
+                #[cfg(target_os = "macos")]
+                let (
+                    mut w_out_fd,
+                    mut w_in_fd,
+                    mut w_offset,
+                    mut w_count,
+                    mut w_headers,
+                    mut w_trailers,
+                    mut w_flags,
+                ) = {
+                    let (bound, _kwargs) = bind_path_args(
+                        args,
+                        "sendfile",
+                        &[
+                            "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
+                        ],
+                        4,
+                        &[],
+                    )?;
+                    (
+                        bound[0].expect("out_fd is required"),
+                        bound[1].expect("in_fd is required"),
+                        bound[2].expect("offset is required"),
+                        bound[3].expect("count is required"),
+                        bound[4].unwrap_or(pyre_object::PY_NULL),
+                        bound[5].unwrap_or(pyre_object::PY_NULL),
+                        bound[6].unwrap_or(pyre_object::PY_NULL),
+                    )
+                };
+                #[cfg(target_os = "linux")]
+                let out_fd = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
+                    crate::baseobjspace::c_int_w(w_out_fd)
+                })?;
+                #[cfg(target_os = "macos")]
+                let out_fd = pyre_object::with_roots!(
+                    w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
+                    crate::baseobjspace::c_int_w(w_out_fd)
+                })?;
+                #[cfg(target_os = "linux")]
+                let count_raw = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
+                    crate::baseobjspace::int_w(w_count)
+                })?;
+                #[cfg(target_os = "macos")]
+                let count_raw = pyre_object::with_roots!(
+                    w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
+                    crate::baseobjspace::int_w(w_count)
+                })?;
+                #[cfg(target_os = "linux")]
+                let in_fd = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
+                    crate::baseobjspace::c_int_w(w_in_fd)
+                })?;
+                #[cfg(target_os = "macos")]
+                let in_fd = pyre_object::with_roots!(
+                    w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
+                    crate::baseobjspace::c_int_w(w_in_fd)
+                })?;
                 if unsafe { pyre_object::is_none(w_offset) } {
                     // linux-only no-offset path; non-linux raises TypeError
-                    // matching interp_posix.py:2946.
+                    // matching interp_posix.sendfile.
                     #[cfg(not(target_os = "linux"))]
                     {
                         let _ = (out_fd, in_fd, count_raw);
@@ -12107,28 +12184,42 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         // `rposix.c_sendfile` releases the GIL and saves errno.
                         let count = count_raw as majit_rlib::rffi::SIZE_T;
                         loop {
-                            let res = unsafe {
+                            let res = pyre_object::with_roots!(
+                                w_out_fd, w_in_fd, w_offset, w_count => unsafe {
                                 majit_rlib::rposix::c_sendfile(
                                     out_fd,
                                     in_fd,
                                     core::ptr::null_mut(),
                                     count,
                                 )
-                            };
+                            });
                             if res >= 0 {
-                                return Ok(pyre_object::w_int_new(res as i64));
+                                return Ok(pyre_object::with_roots!(
+                                    w_out_fd, w_in_fd, w_offset, w_count => {
+                                    pyre_object::w_int_new(res as i64)
+                                }));
                             }
-                            crate::builtins::eintr_retry_with(
-                                std::io::Error::from_raw_os_error(
-                                    majit_rlib::rposix::get_saved_errno(),
-                                ),
-                                |e| io_err(e, ""),
-                            )?;
+                            pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
+                                crate::builtins::eintr_retry_with(
+                                    std::io::Error::from_raw_os_error(
+                                        majit_rlib::rposix::get_saved_errno(),
+                                    ),
+                                    |e| io_err(e, ""),
+                                )
+                            })?;
                         }
                     }
                 }
                 // interp_posix.py `space.gateway_r_longlong_w(w_offset)`.
-                let offset_i64 = crate::baseobjspace::int_w(w_offset)?;
+                #[cfg(target_os = "linux")]
+                let offset_i64 = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
+                    crate::baseobjspace::int_w(w_offset)
+                })?;
+                #[cfg(target_os = "macos")]
+                let offset_i64 = pyre_object::with_roots!(
+                    w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
+                    crate::baseobjspace::int_w(w_offset)
+                })?;
                 #[cfg(target_os = "linux")]
                 {
                     let count = count_raw as majit_rlib::rffi::SIZE_T;
@@ -12140,43 +12231,64 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         // unchanged, so what a failed call left behind here is
                         // not what the next one starts from.
                         let mut offset: libc::off_t = offset_i64 as libc::off_t;
-                        let res = unsafe {
+                        let res = pyre_object::with_roots!(
+                            w_out_fd, w_in_fd, w_offset, w_count => unsafe {
                             majit_rlib::rposix::c_sendfile(out_fd, in_fd, &mut offset, count)
-                        };
+                        });
                         if res >= 0 {
-                            return Ok(pyre_object::w_int_new(res as i64));
+                            return Ok(pyre_object::with_roots!(
+                                w_out_fd, w_in_fd, w_offset, w_count => {
+                                pyre_object::w_int_new(res as i64)
+                            }));
                         }
-                        crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
-                            |e| io_err(e, ""),
-                        )?;
+                        pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
+                            crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(
+                                    majit_rlib::rposix::get_saved_errno(),
+                                ),
+                                |e| io_err(e, ""),
+                            )
+                        })?;
                     }
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    let flags = match bound[6] {
-                        Some(w) if !unsafe { pyre_object::is_none(w) } => {
-                            crate::baseobjspace::c_int_w(w)?
-                        }
-                        _ => 0,
+                    let flags = if w_flags.is_null()
+                        || unsafe { pyre_object::is_none(w_flags) }
+                    {
+                        0
+                    } else {
+                        pyre_object::with_roots!(
+                            w_out_fd, w_in_fd, w_offset, w_count,
+                            w_headers, w_trailers, w_flags => {
+                            crate::baseobjspace::c_int_w(w_flags)
+                        })?
                     };
                     // Both Python sequences and all of their buffer exports are
                     // consumed before entering the EINTR retry loop. The retry
                     // therefore reuses only Rust-owned bytes.
                     let (header_buffers, trailer_buffers) = {
                         let _roots = pyre_object::gc_roots::push_roots();
-                        let header_slot = bound[4].map(|value| {
-                            let slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(value);
-                            slot
-                        });
-                        let trailer_slot = bound[5].map(|value| {
-                            let slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(value);
-                            slot
-                        });
+                        let base = pyre_object::gc_roots::pin_roots(&[
+                            w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags,
+                        ]);
+                        w_out_fd = pyre_object::gc_roots::shadow_stack_get(base);
+                        w_in_fd = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                        w_offset = pyre_object::gc_roots::shadow_stack_get(base + 2);
+                        w_count = pyre_object::gc_roots::shadow_stack_get(base + 3);
+                        w_headers = pyre_object::gc_roots::shadow_stack_get(base + 4);
+                        w_trailers = pyre_object::gc_roots::shadow_stack_get(base + 5);
+                        w_flags = pyre_object::gc_roots::shadow_stack_get(base + 6);
+                        let header_slot = if w_headers.is_null() {
+                            None
+                        } else {
+                            Some(base + 4)
+                        };
+                        let trailer_slot = if w_trailers.is_null() {
+                            None
+                        } else {
+                            Some(base + 5)
+                        };
                         let collect_buffers = |slot: Option<usize>, name: &str| {
                             let Some(slot) = slot else {
                                 return Ok(None);
@@ -12214,28 +12326,50 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 Ok(Some(buffers))
                             }
                         };
-                        (
+                        let buffers = (
                             collect_buffers(header_slot, "headers")?,
                             collect_buffers(trailer_slot, "trailers")?,
-                        )
+                        );
+                        w_out_fd = pyre_object::gc_roots::shadow_stack_get(base);
+                        w_in_fd = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                        w_offset = pyre_object::gc_roots::shadow_stack_get(base + 2);
+                        w_count = pyre_object::gc_roots::shadow_stack_get(base + 3);
+                        w_headers = pyre_object::gc_roots::shadow_stack_get(base + 4);
+                        w_trailers = pyre_object::gc_roots::shadow_stack_get(base + 5);
+                        w_flags = pyre_object::gc_roots::shadow_stack_get(base + 6);
+                        buffers
                     };
                     if header_buffers.is_none() && trailer_buffers.is_none() && flags == 0 {
                         // `rposix.sendfile`: `c_sendfile(in_fd, out_fd, offset,
                         // p_len, NULL, 0)` then the EAGAIN/EBUSY sbytes rescue.
                         // `interp_posix.sendfile` uses `eintr_retry=True`.
                         loop {
-                            match majit_rlib::rposix::sendfile(
-                                out_fd,
-                                in_fd,
-                                offset_i64 as libc::off_t,
-                                count_raw as libc::off_t,
-                            ) {
-                                Ok(n) => return Ok(pyre_object::w_int_new(n as i64)),
+                            match pyre_object::with_roots!(
+                                w_out_fd, w_in_fd, w_offset, w_count,
+                                w_headers, w_trailers, w_flags => {
+                                majit_rlib::rposix::sendfile(
+                                    out_fd,
+                                    in_fd,
+                                    offset_i64 as libc::off_t,
+                                    count_raw as libc::off_t,
+                                )
+                            }) {
+                                Ok(n) => {
+                                    return Ok(pyre_object::with_roots!(
+                                        w_out_fd, w_in_fd, w_offset, w_count,
+                                        w_headers, w_trailers, w_flags => {
+                                        pyre_object::w_int_new(n as i64)
+                                    }));
+                                }
                                 Err(errno) => {
-                                    crate::builtins::eintr_retry_with(
-                                        std::io::Error::from_raw_os_error(errno),
-                                        |e| io_err(e, ""),
-                                    )?;
+                                    pyre_object::with_roots!(
+                                        w_out_fd, w_in_fd, w_offset, w_count,
+                                        w_headers, w_trailers, w_flags => {
+                                        crate::builtins::eintr_retry_with(
+                                            std::io::Error::from_raw_os_error(errno),
+                                            |e| io_err(e, ""),
+                                        )
+                                    })?;
                                 }
                             }
                         }
@@ -12270,7 +12404,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         _ => count_raw,
                     };
                     loop {
-                        let (res, written) = {
+                        let (res, written) = pyre_object::with_roots!(
+                            w_out_fd, w_in_fd, w_offset, w_count,
+                            w_headers, w_trailers, w_flags => {
                             let _blocked = crate::module::thread::before_external_block();
                             host_posix::sendfile(
                                 in_b,
@@ -12280,11 +12416,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 header_slices.as_deref(),
                                 trailer_slices.as_deref(),
                             )
-                        };
+                        });
                         match res {
-                            Ok(_) => return Ok(pyre_object::w_int_new(written)),
+                            Ok(_) => {
+                                return Ok(pyre_object::with_roots!(
+                                    w_out_fd, w_in_fd, w_offset, w_count,
+                                    w_headers, w_trailers, w_flags => {
+                                    pyre_object::w_int_new(written)
+                                }));
+                            }
                             Err(error) => {
-                                // rposix.py: BSD sendfile reports a
+                                // rposix.sendfile: BSD sendfile reports a
                                 // partial transfer through sbytes even when the
                                 // syscall result is EAGAIN/EBUSY. Return that
                                 // progress so asyncio advances its file offset
@@ -12298,9 +12440,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                         Some(libc::EAGAIN) | Some(libc::EBUSY)
                                     )
                                 {
-                                    return Ok(pyre_object::w_int_new(written));
+                                    return Ok(pyre_object::with_roots!(
+                                        w_out_fd, w_in_fd, w_offset, w_count,
+                                        w_headers, w_trailers, w_flags => {
+                                        pyre_object::w_int_new(written)
+                                    }));
                                 }
-                                crate::builtins::eintr_retry_with(error, |e| io_err(e, ""))?;
+                                pyre_object::with_roots!(
+                                    w_out_fd, w_in_fd, w_offset, w_count,
+                                    w_headers, w_trailers, w_flags => {
+                                    crate::builtins::eintr_retry_with(error, |e| io_err(e, ""))
+                                })?;
                             }
                         }
                     }
