@@ -12,7 +12,7 @@ use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
     dealloc_list_items_block, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
     grow_list_items_block_gc, grow_typed_items_block, items_block_capacity, items_block_items_base,
-    items_block_set_ref, typed_items_block_items_base,
+    items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -2726,24 +2726,49 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
     let total = n.checked_mul(times)?;
     let dest = object_list_with_capacity(total)?;
     let dest_slot = publish_slot(dest);
-    let pattern = {
+    // rlist.py `ll_mul`: length==1 is `ll_alloc_and_set`; a GC-ptr list
+    // otherwise loops `ll_arraycopy(l, res, 0, j, length)`.
+    if n == 1 {
         let src = crate::gc_roots::shadow_stack_get(src_slot);
         let _guard = w_list_lock(src);
         let src = crate::gc_roots::shadow_stack_get(src_slot);
-        (*(src as *const W_ListObject))
-            .object_items_as_slice()
-            .to_vec()
-    };
-    debug_assert_eq!(pattern.len() * times, total);
-    list_write_barrier(crate::gc_roots::shadow_stack_get(dest_slot));
-    for t in 0..times {
-        for (i, &item) in pattern.iter().enumerate() {
-            let dest = crate::gc_roots::shadow_stack_get(dest_slot);
-            items_block_set_ref(
-                (*(dest as *const W_ListObject)).items,
-                t * pattern.len() + i,
-                item,
+        let item = (*(src as *const W_ListObject)).object_items_as_slice()[0];
+        let item_slot = publish_slot(item);
+        // rgc.py `ll_arrayfill`: one write barrier on the items array, then
+        // `bare_setarrayitem` for every slot.
+        let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+        crate::gc_hook::try_gc_write_barrier((*(dest as *const W_ListObject)).items as *mut u8);
+        let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+        let item = crate::gc_roots::shadow_stack_get(item_slot);
+        std::slice::from_raw_parts_mut(
+            items_block_items_base((*(dest as *const W_ListObject)).items),
+            total,
+        )
+        .fill(item);
+    } else {
+        let src_items = {
+            let src = crate::gc_roots::shadow_stack_get(src_slot);
+            let _guard = w_list_lock(src);
+            let src = crate::gc_roots::shadow_stack_get(src_slot);
+            (*(src as *const W_ListObject)).items as PyObjectRef
+        };
+        let src_items_slot = publish_slot(src_items);
+        let dest_items_slot = publish_slot(
+            (*(crate::gc_roots::shadow_stack_get(dest_slot) as *const W_ListObject)).items
+                as PyObjectRef,
+        );
+        let n_i = n as i64;
+        let mut j = 0i64;
+        let total_i = total as i64;
+        while j < total_i {
+            jit_ll_arraycopy(
+                crate::gc_roots::shadow_stack_get(src_items_slot),
+                crate::gc_roots::shadow_stack_get(dest_items_slot),
+                0,
+                j,
+                n_i,
             );
+            j += n_i;
         }
     }
     let dest = crate::gc_roots::shadow_stack_get(dest_slot);
@@ -2838,24 +2863,25 @@ unsafe fn write_int_or_float_runs(dest_slot: usize, values: &[i64], dest_index: 
 }
 
 unsafe fn write_object_pointers(dest_slot: usize, src_slot: usize, dest_index: usize) -> usize {
-    let pattern = {
-        let src = crate::gc_roots::shadow_stack_get(src_slot);
-        let _guard = w_list_lock(src);
-        let src = crate::gc_roots::shadow_stack_get(src_slot);
-        (*(src as *const W_ListObject))
-            .object_items_as_slice()
-            .to_vec()
-    };
-    list_write_barrier(crate::gc_roots::shadow_stack_get(dest_slot));
-    for (offset, &item) in pattern.iter().enumerate() {
-        let dest = crate::gc_roots::shadow_stack_get(dest_slot);
-        items_block_set_ref(
-            (*(dest as *const W_ListObject)).items,
-            dest_index + offset,
-            item,
-        );
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
+    let _guard = w_list_lock(src);
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
+    let wrote = w_list_len(src);
+    if wrote == 0 {
+        return 0;
     }
-    let wrote = pattern.len();
+    let src_items_slot = publish_slot((*(src as *const W_ListObject)).items as PyObjectRef);
+    let dest_items_slot = publish_slot(
+        (*(crate::gc_roots::shadow_stack_get(dest_slot) as *const W_ListObject)).items
+            as PyObjectRef,
+    );
+    jit_ll_arraycopy(
+        crate::gc_roots::shadow_stack_get(src_items_slot),
+        crate::gc_roots::shadow_stack_get(dest_items_slot),
+        0,
+        dest_index as i64,
+        wrote as i64,
+    );
     // Same `length` publication as `write_boxed_run`: the next side may
     // allocate, and a stationary items block is traced only up to `length`.
     let dest = crate::gc_roots::shadow_stack_get(dest_slot);

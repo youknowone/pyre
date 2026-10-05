@@ -4353,6 +4353,27 @@ pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
     });
 }
 
+/// incminimark.py `writebarrier_before_copy`.
+///
+/// `rgc.py ll_arraycopy` calls this before `raw_memcopy`. `false` means the
+/// bulk form cannot express the copy and the caller owes per-item
+/// `setarrayitem_gc`. A collector that is not yet initialized has no
+/// remembered set, so the copy is unbarriered.
+pub fn gc_writebarrier_before_copy(
+    source: GcRef,
+    dest: GcRef,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) -> bool {
+    if !gc_sync::is_initialized() {
+        return true;
+    }
+    gc_sync::gc_op(|gc| {
+        gc.writebarrier_before_copy(source.0, dest.0, source_start, dest_start, length)
+    })
+}
+
 // ── TEMPORARY DIAGNOSTIC: blackhole-materialized object registry ──
 //
 // Enabled by `MAJIT_GC_BH_PROBE`. Records every old-generation birth — the
