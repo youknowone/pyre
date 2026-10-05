@@ -2203,6 +2203,24 @@ fn save_frozenset(
     Ok(())
 }
 
+/// Copy a pinned bytearray's payload. `vec` allocation can collect, so the
+/// slice is taken from `slot` again after the alloc.
+fn copy_pinned_bytearray(slot: usize) -> Vec<u8> {
+    let n = unsafe {
+        pyre_object::bytearrayobject::w_bytearray_data(pyre_object::gc_roots::shadow_stack_get(
+            slot,
+        ))
+        .len()
+    };
+    let mut owned = vec![0u8; n];
+    owned.copy_from_slice(unsafe {
+        pyre_object::bytearrayobject::w_bytearray_data(pyre_object::gc_roots::shadow_stack_get(
+            slot,
+        ))
+    });
+    owned
+}
+
 /// `interp_pickle.py save_bytearray` (proto >= 5 raw form; lower protocols
 /// reach the generic reduce path).
 fn save_bytearray(
@@ -2220,15 +2238,10 @@ fn save_bytearray(
         let _ = pyre_object::gc_roots::pin_root(w_obj);
         let w_bytearray_type =
             pyre_interpreter::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
-        let data = unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data(pyre_object::gc_roots::shadow_stack_get(
-                obj_slot,
-            ))
-        };
-        let w_args = if data.is_empty() {
+        let owned = copy_pinned_bytearray(obj_slot);
+        let w_args = if owned.is_empty() {
             pyre_object::tupleobject::w_tuple_new(Vec::new())
         } else {
-            let owned = data.to_vec();
             let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&owned));
             pyre_object::tupleobject::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(
@@ -2242,22 +2255,14 @@ fn save_bytearray(
             Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
         );
     }
-    let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_obj) };
-    let n = data.len();
-    // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
-    // so the trailing `memoize` reads it at its post-write address.
+    // interp_pickle.py save_bytearray: `view.as_str()` copies the payload
+    // before BYTEARRAY8 / memoize. Holding `w_bytearray_data` across
+    // `pin_root` leaves a nursery slice dangling after the object moves.
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    if n >= FRAME_SIZE_TARGET {
-        let mut header = vec![op::BYTEARRAY8];
-        header.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.write_large_bytes(&header, data)?;
-    } else {
-        buf.push(op::BYTEARRAY8);
-        buf.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.extend_from_slice(data);
-    }
+    let owned = copy_pinned_bytearray(slot);
+    save_raw_bytearray(buf, &owned)?;
     memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     Ok(())
 }
