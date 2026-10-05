@@ -4,6 +4,8 @@
 # parity-tests reason: the buffered streams' bytearray buffer lives outside
 # the GC heap, and only its accounting toward the major-collection threshold
 # (`rgc.add_memory_pressure`) lets a loop of dropped streams reach a major.
+# parity-env: PYPY_GC_MIN=8M
+# parity-env: PYPY_GC_MAX_DELTA=32M
 
 """Dropped buffered streams must not outlive the descriptor table.
 
