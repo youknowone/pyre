@@ -1085,6 +1085,9 @@ pub fn is_closure_leaf(leaf: &str) -> bool {
 /// - `DropGlue` renders as `drop_in_place`, the method of the drop-glue
 ///   impl.
 /// - `VTable` renders as `{vtable}`, the leaf of a trait's vtable struct.
+/// - `PromotedConst` renders as `promoted_const#N`, rustc's per-function
+///   promoted-static initializer. Leaving these on `<Builtin>` collides
+///   every `N` onto one path.
 ///
 /// Other builtins stay on the `<Builtin>` label.
 pub fn builtin_path_label(seg: &Value) -> Option<String> {
@@ -1100,6 +1103,10 @@ pub fn builtin_path_label(seg: &Value) -> Option<String> {
         }
         "DropGlue" => Some("drop_in_place".to_string()),
         "VTable" => Some("{vtable}".to_string()),
+        "PromotedConst" => {
+            let n = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
+            Some(format!("promoted_const#{n}"))
+        }
         _ => None,
     }
 }
@@ -2400,6 +2407,33 @@ mod tests {
         ]));
         assert_eq!(generic.name_path(), "core::ptr::null");
         assert_eq!(generic.instantiation(), None);
+    }
+
+    /// rustc `PathElem::Builtin(PromotedConst, N)` is one initializer per
+    /// `N`. The template path keeps that index, the way `closure#N` does.
+    #[test]
+    fn promoted_const_segment_keeps_its_index() {
+        let meta = item_meta(serde_json::json!([
+            {"Ident": ["pyre_jit", 0]},
+            {"Ident": ["eval", 0]},
+            {"Ident": ["eval_loop_jit", 0]},
+            {"Builtin": ["PromotedConst", 0]}
+        ]));
+        assert_eq!(
+            meta.name_path(),
+            "pyre_jit::eval::eval_loop_jit::promoted_const#0"
+        );
+        let other = item_meta(serde_json::json!([
+            {"Ident": ["pyre_jit", 0]},
+            {"Ident": ["eval", 0]},
+            {"Ident": ["eval_loop_jit", 0]},
+            {"Builtin": ["PromotedConst", 3]}
+        ]));
+        assert_eq!(
+            other.name_path(),
+            "pyre_jit::eval::eval_loop_jit::promoted_const#3"
+        );
+        assert_ne!(meta.name_path(), other.name_path());
     }
 
     /// A call to a monomorphized copy reads the copy's instance arguments

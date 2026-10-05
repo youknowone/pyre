@@ -14795,6 +14795,54 @@ impl<'a> Lowering<'a> {
     /// default, `is_some` / `is_none` test the address. The item kind comes
     /// from the receiver local's MIR type. Answers whether the call was one
     /// of these.
+    /// A rustc promoted-const / NamedConst accessor is a `FunDecl` whose
+    /// `src` is `GlobalInitializer` (`FunDecl::is_global_initializer`).
+    /// The body copies an existing `Place::Global` and returns a reference;
+    /// `Place::Global` already folds that inner item (`Constant` for a
+    /// `NamedConst`, `ConstRefAddr` for a prebuilt JitDriver). Emitting the
+    /// accessor as `residual_call` would keep a `symbolic_fnaddr_for_path`
+    /// that `getfunctionptr` never binds (`handle_residual_call`).
+    fn lower_global_initializer_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let gid = fd.is_global_initializer();
+        if gid.is_none() && !fundecl_is_promoted_const(fd) {
+            return Ok(false);
+        }
+        if !call.args.is_empty() {
+            return Ok(false);
+        }
+        let Some(body) = fd.unstructured() else {
+            return Ok(false);
+        };
+        let Some(inner) = promoted_const_copied_global(&body) else {
+            return Ok(false);
+        };
+        if gid == Some(inner_global_id(&inner)) {
+            return Ok(false);
+        }
+        let value = self.resolve_place(mir_bb, inner)?;
+        self.local_var[dest_local] = Some(LocalValue::One(value));
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     fn lower_item_addr_call(
         &mut self,
         mir_bb: usize,
@@ -17886,6 +17934,15 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // rustc promotes a `NamedConst` use to an `AnonConst` whose
+                // initializer FunDecl copies the real global
+                // (`PromotedConst`). Fold through that wrapper so the
+                // NamedConst lanes below see `pypyjitdriver` rather than a
+                // nullary residual of `eval_loop_jit::promoted_const#N`
+                // (`getfunctionptr` / `handle_residual_call`).
+                if let Some(inner) = self.anon_const_copied_global(id) {
+                    return self.resolve_place(mir_bb, inner);
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots
@@ -18946,6 +19003,27 @@ impl<'a> Lowering<'a> {
     /// constant is not harvested: its initializer is opaque and the host
     /// `libc` value is not the target's (`EAGAIN` is 35 on macOS and 11
     /// on Linux and wasm). Leave that read residual.
+    /// Inner `Place::Global` of an `AnonConst` whose initializer only copies
+    /// that global (`FunDecl::is_global_initializer` / PromotedConst).
+    fn anon_const_copied_global(&self, def_id: u64) -> Option<Place> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("AnonConst")
+        {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let inner = promoted_const_copied_global(&body)?;
+        if inner_global_id(&inner) == def_id {
+            return None;
+        }
+        Some(inner)
+    }
+
     fn fold_named_const_global(&self, def_id: u64) -> Option<OpKind> {
         fold_named_const_on_llbc(self.llbc, def_id).or_else(|| {
             let gd = self.llbc.global_by_id(def_id)?;
@@ -20305,6 +20383,9 @@ impl<'a> Lowering<'a> {
             return Ok(());
         }
         self.refuse_residual_owner_root_guard(mir_bb, &call)?;
+        if self.lower_global_initializer_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         if self.lower_item_addr_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
@@ -38238,7 +38319,70 @@ fn regular_call_is_panicking_abort(reg: &RegularCall, llbc: &Llbc) -> bool {
     let mut segs = path.split("::");
     matches!(segs.next(), Some("core") | Some("std")) && segs.next() == Some("panicking")
 }
+/// Charon `PathElem::Builtin(PromotedConst, N)` on a FunDecl.
+fn fundecl_is_promoted_const(fd: &FunDecl) -> bool {
+    fd.item_meta.name.last().is_some_and(|seg| match seg {
+        NameSeg::Other(v) => {
+            v.as_object()
+                .and_then(|m| m.get("Builtin"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(serde_json::Value::as_str)
+                == Some("PromotedConst")
+        }
+        _ => false,
+    })
+}
 
+fn inner_global_id(place: &Place) -> u64 {
+    match place.kind {
+        PlaceKind::Global { id, .. } => id,
+        _ => u64::MAX,
+    }
+}
+
+/// The `Place::Global` a promoted-const initializer copies before returning.
+///
+/// rustc emits `_1 = copy Global(id); _0 = &_1; return`. Anything richer
+/// (a second global, a call, a switch) is not this wrapper.
+fn promoted_const_copied_global(body: &Unstructured) -> Option<Place> {
+    let mut copied: Option<Place> = None;
+    for block in &body.body {
+        if block.is_cleanup {
+            continue;
+        }
+        for stmt in &block.statements {
+            match stmt.stmt_kind_ref().ok()? {
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::PlaceMention(_)
+                | StmtKind::Borrowck(_) => {}
+                StmtKind::Assign(_, rvalue) => match rvalue {
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => {
+                        if matches!(place.kind, PlaceKind::Global { .. }) {
+                            if copied.is_some() {
+                                return None;
+                            }
+                            copied = Some(clone_place(place));
+                        }
+                    }
+                    Rvalue::Ref { .. } | Rvalue::RawPtr { .. } => {}
+                    _ => return None,
+                },
+                StmtKind::Assert(_) => {}
+                StmtKind::Unknown => return None,
+            }
+        }
+        let kind = block.terminator.kind_value();
+        if kind.as_str() != Some("Return")
+            && kind.get("Goto").is_none()
+            && kind.get("target").is_none()
+        {
+            return None;
+        }
+    }
+    copied
+}
 /// `Result::branch` behind `?`. Charon records the impl method
 /// `core::result::<Impl>::branch`. A trait `Try::branch` is the same
 /// operator. `Result::expect` is a different leaf and stays out.
@@ -70460,6 +70604,45 @@ mod tests {
                 "marker receiver producer must be the driver sentinel: {producer:?}"
             );
         }
+    }
+
+    /// rustc's promoted-const wrapper copies one `Place::Global` and
+    /// returns a reference. That inner id is the NamedConst `getfunctionptr`
+    /// would name (`handle_residual_call`).
+    #[test]
+    fn promoted_const_initializer_copies_the_inner_global() {
+        let body: majit_charon_reader::ullbc::Unstructured = serde_json::from_value(serde_json::json!({
+            "span": {"Deduplicated": 0},
+            "locals": {"arg_count": 0, "locals": []},
+            "body": [{
+                "statements": [
+                    {"span": {"Deduplicated": 0}, "kind": {"StorageLive": 1}},
+                    {"span": {"Deduplicated": 0}, "kind": {"Assign": [
+                        {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                        {"Use": [{"Copy": {
+                            "kind": {"Global": {
+                                "id": 31,
+                                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+                            }},
+                            "ty": {"Deduplicated": 0}
+                        }}, "Yes"]}
+                    ]}},
+                    {"span": {"Deduplicated": 0}, "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}},
+                        {"Ref": {
+                            "place": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                            "kind": "Shared",
+                            "ptr_metadata": {"Const": {"Deduplicated": 0}}
+                        }}
+                    ]}}
+                ],
+                "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
+                "is_cleanup": false
+            }]
+        }))
+        .expect("promoted-const wrapper fixture parses");
+        let place = super::promoted_const_copied_global(&body).expect("inner global");
+        assert_eq!(super::inner_global_id(&place), 31);
     }
 
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
