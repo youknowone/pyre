@@ -188,8 +188,14 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
 /// classified `can_raise` and already grown a `GuardNoException`. Skip those
 /// when deciding whether the preceding barrier was a moving safepoint.
 fn last_non_guard_is_cond_call_gc_wb<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
-    for op in ctx.trace_ctx.ops().iter().rev() {
-        match op.opcode {
+    // Byte-mode `ops()` is empty until materialize. Opcode lives on
+    // `FrontendSlot` (`history.py AbstractResOp.getopnum`).
+    let n = ctx.trace_ctx.num_ops();
+    for i in (0..n).rev() {
+        let Some(opcode) = ctx.trace_ctx.opcode_at(i) else {
+            continue;
+        };
+        match opcode {
             OpCode::GuardNoException | OpCode::GuardNotForced | OpCode::GuardException => {
                 continue;
             }

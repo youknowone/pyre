@@ -3078,7 +3078,9 @@ impl TraceCtx {
     }
 
     /// Look up a captured snapshot by `rd_resume_position` (byte offset).
-    pub fn get_snapshot(&self, id: i32) -> Option<&crate::recorder::Snapshot> {
+    /// Decodes `_snapshot_data` first (`opencoder.py get_snapshot_iter`).
+    pub fn get_snapshot(&mut self, id: i32) -> Option<&crate::recorder::Snapshot> {
+        self.ensure_snapshots_materialized();
         crate::recorder::Snapshot::by_resume_position(&self.snapshots, id)
     }
 
@@ -3571,11 +3573,11 @@ impl TraceCtx {
         &self.snapshots
     }
 
-    /// Op slice accessor — returns the raw recorded operations. After the
-    /// `TraceRecordBuffer` swap this materializes via `ByteTraceIter::next`
-    /// walking the byte stream. Call [`Self::ensure_ops_materialized`] first
-    /// when the live recorder is still in byte form.
-    pub fn ops(&self) -> &[majit_ir::OpRc] {
+    /// Op slice accessor — returns the recorded operations.
+    /// Walks `opencoder.Trace.get_iter` (`ByteTraceIter`) into `ops` so
+    /// a live byte recorder is readable without a parallel `Vec<Op>`.
+    pub fn ops(&mut self) -> &[majit_ir::OpRc] {
+        self.ensure_ops_materialized();
         self.recorder.ops()
     }
 

@@ -1900,9 +1900,10 @@ impl Trace {
 
     /// Fill `self.ops` from the byte buffer so `&[Op]` readers
     /// (`get_op_by_raw_pos`, tests after `into_recorder`) see the
-    /// materialized trace. No-op on the `Vec<Op>` path or if already filled.
+    /// materialized trace. Re-walks when `slots` has grown since the last
+    /// fill (`opencoder.py Trace.get_iter`).
     pub fn materialize_into_ops(&mut self) {
-        if self.trb.is_some() && self.ops.is_empty() && !self.slots.is_empty() {
+        if self.trb.is_some() && self.ops.len() != self.slots.len() {
             self.ops = self.materialize_ops();
         }
     }

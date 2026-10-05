@@ -969,6 +969,18 @@ fn fresh_trace_ctx() -> TraceCtx {
     TraceCtx::for_test_types(&[Type::Ref])
 }
 
+/// Recorded non-const Int box. `IntAdd` is arity 2 (`opencoder.py _op_start`).
+fn dummy_int_add_box(tc: &mut TraceCtx) -> OpRef {
+    let z = tc.const_int(0);
+    tc.record_op(majit_ir::OpCode::IntAdd, &[z, z])
+}
+
+/// Recorded non-const box used as a Ref register. `PtrEq` is arity 2.
+fn dummy_ptr_eq_box(tc: &mut TraceCtx) -> OpRef {
+    let null = tc.const_null();
+    tc.record_op(majit_ir::OpCode::PtrEq, &[null, null])
+}
+
 #[test]
 fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     use crate::state::PyreSym;
@@ -2718,18 +2730,19 @@ fn drive_int_add_jump_if_ovf(
     assert_eq!(outcome, DispatchOutcome::Continue);
     let dst = wc.registers_i.get(2).expect("int register in range");
     drop(wc);
-    let ops = tc.ops();
+    let ops = tc.ops().to_vec();
     let opcodes = ops.iter().map(|op| op.opcode).collect();
     let guard_num_args = ops[1].num_args();
     let guard_has_snapshot = ops[1].rd_resume_position() >= 0;
+    let resume_pos = ops[1].rd_resume_position();
+    let resbox = ops[0].pos().get();
     let guard_resume_pc = tc
-        .get_snapshot(ops[1].rd_resume_position())
+        .get_snapshot(resume_pos)
         .expect("overflow guard snapshot must exist")
         .frames
         .last()
         .expect("overflow guard snapshot must contain its frame")
         .pc;
-    let resbox = ops[0].pos().get();
     (
         opcodes,
         guard_num_args,
@@ -3199,7 +3212,7 @@ fn assert_not_none_records_when_the_operand_has_a_concrete() {
         .expect("`assert_not_none/r` must be in insns table");
     let code = [byte, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(
         0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
@@ -3226,7 +3239,7 @@ fn assert_not_none_declines_when_the_operand_has_no_concrete() {
         .expect("`assert_not_none/r` must be in insns table");
     let code = [byte, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let ops_before = tc.num_ops();
     let mut regs_r = [operand];
     // No shadow for the slot: the walker never observed this pointer, so
@@ -3499,7 +3512,7 @@ fn hint_force_virtualizable_is_a_noop_without_virtualizable_info() {
     // `r`: 1B ref reg.
     let code = [byte, 0x00];
     let mut tc = fresh_trace_ctx();
-    let vable = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let vable = dummy_ptr_eq_box(&mut tc);
     let ops_before = tc.num_ops();
     let mut regs_r = [vable];
     let mut concrete_r = [ConcreteValue::Null];
@@ -3521,7 +3534,7 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     // `rL`: 1B ref reg + 2B label (target 9).
     let code = [byte, 0x00, 0x09, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(
         0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
@@ -3554,7 +3567,7 @@ fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
         .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
     let code = [byte, 0x00, 0x09, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(
         0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
@@ -3574,7 +3587,7 @@ fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
     let code = [byte, 0x00, 0x09, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(std::ptr::null_mut())];
     let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
@@ -3591,7 +3604,7 @@ fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
     let code = [byte, 0x00, 0x09, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let ops_before = tc.num_ops();
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Null];
@@ -3895,7 +3908,7 @@ fn record_exact_class_records_the_hint_with_both_operands() {
     // `ri`: 1B ref reg + 1B int reg holding the class vtable address.
     let code = [byte, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let operand = dummy_ptr_eq_box(&mut tc);
     let cls = tc.const_int(0x4000);
     let mut regs_r = [operand];
     let mut regs_i = [cls];
@@ -7787,7 +7800,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         finish_value, exc_box,
         "the stashed payload must carry the exception OpRef",
     );
-    let ops = tc.ops();
+    let ops = tc.ops().to_vec();
     let guard = &ops[ops_before];
     assert_eq!(guard.opcode, majit_ir::OpCode::GuardClass);
     assert_eq!(
@@ -10211,7 +10224,7 @@ fn new_array_id_records_new_array() {
     let length = tc.const_int(4);
     let descr = done_descr_ref_for_tests();
     let descr_pool = vec![descr];
-    let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let dummy = dummy_int_add_box(&mut tc);
     let regs_r = [dummy];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -10264,7 +10277,7 @@ fn canonical_cond_record_keys_have_walker_arms() {
     // walker must decode them; UnsupportedOpname here would abort a
     // `conditional_call_elidable!` / `record_known_result!` trace.
     let mut tc = fresh_trace_ctx();
-    let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let dummy = dummy_int_add_box(&mut tc);
     for key in [
         "conditional_call_value_ir_i/iiIRd>i",
         "conditional_call_value_ir_r/riIRd>r",
@@ -10293,7 +10306,7 @@ fn strlen_and_strgetitem_keys_have_walker_arms() {
     // UnsupportedOpname here aborts look-inside and leaves the residual
     // call as a black box (401-guard census).
     let mut tc = fresh_trace_ctx();
-    let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let dummy = dummy_int_add_box(&mut tc);
     for key in ["strlen/r>i", "strgetitem/ri>i", "strgetitem/rc>i"] {
         let byte = *insns_opname_to_byte()
             .get(key)
@@ -10358,18 +10371,16 @@ fn newstr_strsetitem_copystrcontent_record_their_operands() {
         bh_alloc_lowlevel_string(16, LOWLEVEL_STR_BASE_SIZE, 1),
         bh_alloc_lowlevel_string(16, LOWLEVEL_STR_BASE_SIZE, 1),
     ];
-    let r = [
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-    ];
+    let r0 = dummy_int_add_box(&mut tc);
+    let r1 = dummy_int_add_box(&mut tc);
+    let r = [r0, r1];
     for (reg, buf) in r.iter().zip(bufs) {
         tc.set_opref_concrete(*reg, majit_ir::Value::Ref(majit_ir::GcRef(buf as usize)));
     }
-    let i = [
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-    ];
+    let i0 = dummy_int_add_box(&mut tc);
+    let i1 = dummy_int_add_box(&mut tc);
+    let i2 = dummy_int_add_box(&mut tc);
+    let i = [i0, i1, i2];
     for (n, reg) in i.iter().enumerate() {
         tc.set_opref_concrete(*reg, majit_ir::Value::Int(n as i64));
     }
@@ -10481,12 +10492,11 @@ fn strsetitem_and_copystrcontent_decline_a_store_they_cannot_run() {
     };
     let mut tc = fresh_trace_ctx();
     let buf = bh_alloc_lowlevel_string(4, LOWLEVEL_STR_BASE_SIZE, 1);
-    let r = [
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-        tc.record_op(majit_ir::OpCode::IntAdd, &[]),
-    ];
+    let r0 = dummy_int_add_box(&mut tc);
+    let r1 = dummy_int_add_box(&mut tc);
+    let r = [r0, r1];
     tc.set_opref_concrete(r[0], majit_ir::Value::Ref(majit_ir::GcRef(buf as usize)));
-    let i = [tc.record_op(majit_ir::OpCode::IntAdd, &[])];
+    let i = [dummy_int_add_box(&mut tc)];
     // The copy length: srcstart 2 + 3 overruns the 4-char buffer.
     tc.set_opref_concrete(i[0], majit_ir::Value::Int(3));
     let cases: [(&'static str, Vec<u8>, &'static str); 4] = [
@@ -11052,7 +11062,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     // Symbolic side: a recorded op OpRef (not a Const).
-    let value_opref = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let value_opref = dummy_int_add_box(&mut tc);
     let ops_before = tc.num_ops();
     let regs_r = [OpRef::None];
     let regs_i = [value_opref];
@@ -13808,7 +13818,7 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
         let regs_r = distinct_const_refs(&mut tc, 4);
         // One recorded op against a zero limit: the walk is over budget before
         // its first step, so whichever frame owns the check aborts immediately.
-        tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+        dummy_ptr_eq_box(&mut tc);
         tc.set_trace_limit(0);
         assert!(tc.is_too_long(), "the walk must start over budget");
         // Bridge-shaped (pyjitpl.py:2908), so the abort's warm-state half —
