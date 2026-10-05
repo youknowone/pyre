@@ -1,7 +1,6 @@
 # pyre-check: max-pypy-ratio=11.2
 # Ubuntu run 33279264115: 5.6x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
-# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # A hot compiled CALLEE holding a try block the exception does not stay in used
 # to record its own traceback node TWICE.
 #

@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=8
-# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # Traceback nodes recorded by a compiled loop, driven by BOTH loop forms.
 #
 # The sibling exception-traceback fixtures all drive their workload with

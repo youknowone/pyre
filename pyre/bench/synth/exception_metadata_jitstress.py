@@ -6,7 +6,6 @@
 # (`pyopcode.py` `LOAD_FAST` / `_load_fast_failed`) and the tracer
 # follows the `raise` into the `except NameError` handler. Output
 # matches pypy, including `name_cleared`. The ceiling stays 15.
-# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # JIT-stress twin of exception_metadata_hot: `pypyjit.set_param` lowers the
 # trace/function thresholds to 1 so recording fires on the earliest iterations
 # of every section rather than only after the ~1600-iteration warmup. That

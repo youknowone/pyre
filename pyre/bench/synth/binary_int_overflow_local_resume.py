@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=3.9
-# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # Overflowing integer operations must resume with the values that were loaded
 # from local slots, including values produced by recursive calls and unpacking.
 

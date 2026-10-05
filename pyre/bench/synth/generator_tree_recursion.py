@@ -9,7 +9,6 @@
 # 12.5x..12.7x; 14x leaves 10% headroom. The recovery target is PyPy's
 # zero-forcing per-`MIFrame` recursive-frame/blackhole path, not restoring the
 # abort-ceiling shortcut.
-# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
