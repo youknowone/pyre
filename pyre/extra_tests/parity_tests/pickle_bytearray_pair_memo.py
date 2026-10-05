@@ -5,7 +5,11 @@
 # BYTEARRAY8 / memoize, because the bytearray is nursery-movable.
 # parity-env: PYPY_GC_NURSERY=8192
 # parity-env: MAJIT_GC_NURSERY_POISON=1
+import _pickle
 import pickle
+
+assert pickle.dumps is _pickle.dumps
+assert pickle.loads is _pickle.loads
 
 for proto in range(pickle.HIGHEST_PROTOCOL + 1):
     for payload in (b"", b"xyz", b"xyz" * 100):
