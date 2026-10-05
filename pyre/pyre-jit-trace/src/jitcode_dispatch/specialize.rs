@@ -14279,6 +14279,29 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     walker_guard_stamped_type_version(ctx, pc, w_class, w_type)
 }
 
+/// `allocate_instance` stamps the realbase vtable when `w_class` is that
+/// realbase's own type, and `_getusercls` otherwise. Matches
+/// `exc_instance_pytype` so a canonical fieldless class and an exact
+/// realbase both fold.
+fn walker_exc_canonical_layout(
+    exc: pyre_object::PyObjectRef,
+    kind: pyre_object::interp_exceptions::ExcKind,
+) -> Option<(*const pyre_object::pyobject::PyType, bool)> {
+    let header =
+        unsafe { &(*(exc as *const pyre_object::interp_exceptions::W_BaseException)).ob_header };
+    let exc_type_ptr = header.ob_type;
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_instance_pytype(kind, header.w_class),
+    ) {
+        return None;
+    }
+    Some((
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr),
+    ))
+}
+
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
@@ -17068,26 +17091,9 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
+    };
     let is_os_error_family = matches!(
         kind,
         pyre_object::interp_exceptions::ExcKind::OSError
@@ -17851,26 +17857,9 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_class {
         return Ok(None);
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
+    };
 
     let w_none = pyre_object::w_none();
     let mut w_none_slot_descrs = Vec::new();
@@ -18106,26 +18095,9 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::TypeError {
         return Ok(None);
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
+    };
 
     // Message as a trace constant: deterministic per `(obj, name)` under
     // the predicate, so one shared immutable string is exact (the same
@@ -18334,26 +18306,9 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
         return Ok(None);
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
+    };
 
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_root = pyre_object::gc_roots::shadow_stack_len();
