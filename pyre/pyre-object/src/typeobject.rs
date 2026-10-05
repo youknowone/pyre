@@ -1262,6 +1262,32 @@ pub unsafe fn w_type_current_w_name_qmut(
     )
 }
 
+/// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()`
+/// for this type's `name?`.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_w_name_qmut_installed(obj: PyObjectRef) -> bool {
+    !obj.is_null()
+        && is_type(obj)
+        && (*(obj as *const W_TypeObject))
+            .w_name_watchers
+            .is_installed()
+}
+
+/// Force this type's `name?` qmut directly. This is the tracer's own
+/// `do_force_quasi_immutable` call, not a runtime store, so it calls
+/// [`QuasiImmutField::invalidate`] rather than the sweep.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_force_w_name_qmut(obj: PyObjectRef) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    (*(obj as *const W_TypeObject)).w_name_watchers.invalidate();
+}
+
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
 /// conservative `false` for a null / non-type pointer (matches the class
 /// default before any lookup confirms the flag).
@@ -1428,6 +1454,8 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     // every store to `name?`, so a baked `__name__` stops being a trace
     // constant before it stops being the live value.  `descr_set__name__`
     // does not call `mutated()`, so `_version_tag?` is not this pin.
+    // The walker names that force as [`w_type_w_name_qmut_installed`] at the
+    // residual setattr, the way mapdict names `setattr_would_force_quasi_immut`.
     // The sweep and the store share the watcher lock: an `is_installed`
     // test outside it lets a recorder publish a watcher for the old
     // pointer after the test and before the store.
@@ -2758,7 +2786,9 @@ mod tests {
         unsafe {
             assert!(w_type_current_qmut_instance(PY_NULL).is_none());
             assert!(w_type_current_w_name_qmut(PY_NULL).is_none());
+            assert!(!w_type_w_name_qmut_installed(PY_NULL));
             w_type_notify_quasi_immut_watchers(PY_NULL);
+            w_type_force_w_name_qmut(PY_NULL);
         }
     }
 

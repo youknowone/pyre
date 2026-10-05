@@ -7085,6 +7085,31 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
         &*(code_ptr as *const pyre_interpreter::CodeObject)
     };
     let name = pyre_interpreter::pyframe::load_name_from_code(code, name_idx as usize)?;
+    // `descr_set__name__` stores `name?`. The residual setattr hides
+    // `rclass.py hook_setfield`, so the walker asks `mutatebox.nonnull()`
+    // here, the way mapdict writes name `setattr_would_force_quasi_immut`.
+    if is_store && name == "__name__" {
+        let &value_opref = r_args.get(1)?;
+        let Some(majit_ir::Value::Ref(majit_ir::GcRef(w_value_ptr))) =
+            ctx.trace_ctx.box_value(value_opref)
+        else {
+            return None;
+        };
+        if w_value_ptr == 0 {
+            return None;
+        }
+        let w_obj = w_obj_ptr as pyre_object::PyObjectRef;
+        let w_value = w_value_ptr as pyre_object::PyObjectRef;
+        if unsafe { pyre_object::typeobject::is_type(w_obj) } {
+            if unsafe { pyre_interpreter::type_set_name_would_store(w_obj, w_value) }
+                && unsafe { pyre_object::typeobject::w_type_w_name_qmut_installed(w_obj) }
+            {
+                unsafe { pyre_object::typeobject::w_type_force_w_name_qmut(w_obj) };
+                return Some(());
+            }
+            return None;
+        }
+    }
     let (attrkind, is_slot) = unsafe {
         pyre_interpreter::objspace::std::mapdict::classify_mapdict_write_attr(
             w_obj_ptr as pyre_object::PyObjectRef,

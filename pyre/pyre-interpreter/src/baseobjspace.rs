@@ -12404,6 +12404,33 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
     (!w_name.is_null()).then_some((metatype, w_name))
 }
 
+/// Side-effect-free twin of `descr_set__name__` up to `w_type.name = name`.
+///
+/// The walker asks this before the residual setattr so
+/// `opimpl_jit_force_quasi_immutable` can abort at the store, the way
+/// `setattr_would_force_quasi_immut` does for mapdict writes. A rejection
+/// (immutable type, non-str, embedded null, surrogate) never reaches the
+/// setfield, so it is not a force.
+///
+/// # Safety
+/// `w_type` and `w_value` must be null or live objects.
+pub unsafe fn type_set_name_would_store(w_type: PyObjectRef, w_value: PyObjectRef) -> bool {
+    if w_type.is_null() || !pyre_object::typeobject::is_type(w_type) {
+        return false;
+    }
+    if pyre_object::w_type_is_cpython_immutabletype(w_type) || w_value.is_null() {
+        return false;
+    }
+    if !isinstance_str_w(w_value) {
+        return false;
+    }
+    let wtf8 = pyre_object::w_str_get_wtf8(w_value);
+    if wtf8.code_points().any(|cp| cp.to_u32() == 0) {
+        return false;
+    }
+    pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false).is_ok()
+}
+
 /// `typeobject.py W_TypeObject.descr_getattribute` fast path for the
 /// exact shape that returns a value from the class namespace unchanged.  The
 /// receiver must be a cacheable type whose metaclass keeps
