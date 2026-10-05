@@ -14016,6 +14016,21 @@ fn walker_guard_fold_list_strategy<Sym: WalkSym>(
     walker_guard_fold_int(ctx, pc, strategy, sid)
 }
 
+/// GETFIELD `version_tag` then unstamped GuardValue.
+/// Distinct from [`walker_pin_type_version_tag`] (quasiimmut + GuardNotInvalidated).
+fn walker_guard_fold_type_version<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: i64,
+) -> Result<OpRef, DispatchError> {
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let descr = crate::descr::type_version_tag_descr();
+    let vt_op = walker_record_getfield_gc_i_uncached(ctx, type_const, descr);
+    walker_guard_fold_int(ctx, pc, vt_op, version_tag)?;
+    Ok(type_const)
+}
+
 /// [`walker_guard_fold_int`] recorded through
 /// [`walker_emit_fold_guard_with_snapshot`].
 fn walker_guard_stamped_int<Sym: WalkSym>(
@@ -18060,13 +18075,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     walker_guard_fold_callable(ctx, op.pc, obj_op, concrete_obj)?;
     // Pin the metaclass `version_tag` (see above): a `GETFIELD_GC_I` +
     // `GuardValue` that side-exits on any `type`/`object` dict mutation.
-    let metaclass_const = ctx.trace_ctx.const_ref(metaclass as i64);
-    let vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        metaclass_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    walker_guard_fold_int(ctx, op.pc, vt_op, metaclass_version_tag as i64)?;
+    walker_guard_fold_type_version(ctx, op.pc, metaclass, metaclass_version_tag as i64)?;
 
     // The authoritative walk's concrete execution — the same call the
     // residual executor would have made, raising before any heap
@@ -18282,23 +18291,12 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     // `typeobject.py` promotes the version tag before an MRO lookup.
     // Pinning the receiver type covers both the named descriptor resolution
     // and the default-`__setattr__` answer.
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    let w_type_vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    walker_guard_fold_int(ctx, op.pc, w_type_vt_op, w_type_version_tag as i64)?;
+    walker_guard_fold_type_version(ctx, op.pc, w_type, w_type_version_tag as i64)?;
 
     // The descriptor type's tag pins its general `__set__` / `__delete__` MRO
     // answers (`descroperation.py:117-125`).
-    let descr_type_const = ctx.trace_ctx.const_ref(descr_type as i64);
-    let descr_type_vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        descr_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    walker_guard_fold_int(ctx, op.pc, descr_type_vt_op, descr_type_version_tag as i64)?;
+    let descr_type_const =
+        walker_guard_fold_type_version(ctx, op.pc, descr_type, descr_type_version_tag as i64)?;
 
     // `typeobject.py:1046-1058` rewrites `w_name` without mutating the class
     // dictionary or its version tag.  Pin the raw slot, including its initial
@@ -18313,7 +18311,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     // Pyre stores the Python-visible class separately from the physical class
     // GuardClass reads.  Pin that class after the mandated MRO/name guard
     // sequence; unlike GuardValue on `obj_op`, this still accepts every
-    // receiver of the same class and ties `w_type_const` to the receiver.
+    // receiver of the same class and ties `w_type` to the receiver.
     walker_guard_exact_w_class(ctx, op.pc, obj_op, w_type)?;
 
     let result = {
