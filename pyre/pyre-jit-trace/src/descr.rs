@@ -11229,6 +11229,22 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     return canonical;
                 }
             }
+            // Nested `IntArray.block` / dotted `int_items.block` is the
+            // same GETFIELD slot (`list_int_items_block_descr`). Analyzer
+            // fielddescrof of `_ll_list_resize_hint_really` may intern the
+            // nested STRUCT leaf; the trace GETFIELD uses the dotted name.
+            if name.as_str() == "int_items.block"
+                || (name.as_str() == "block"
+                    && (owner.ends_with("IntArray") || owner.contains("int_array")))
+            {
+                return list_int_items_block_descr();
+            }
+            if name.as_str() == "float_items.block"
+                || (name.as_str() == "block"
+                    && (owner.ends_with("FloatArray") || owner.contains("float_array")))
+            {
+                return list_float_items_block_descr();
+            }
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
@@ -12148,6 +12164,18 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             field_name,
             ..
         } => {
+            // Nested `IntArray.block` / dotted `int_items.block` is the
+            // GETFIELD slot `list_int_items_block_descr`. Analyzer
+            // fielddescrof of `_ll_list_resize_hint_really` interned the
+            // nested STRUCT leaf; the trace GETFIELD uses the dotted name
+            // on `W_ListObject`. Same Arc so `force_from_effectinfo` can
+            // invalidate the cached block across residual COND_CALL.
+            if field_name == "int_items.block" || field_name == "block" {
+                return SetMemberLookup::Resolved(list_int_items_block_descr());
+            }
+            if field_name == "float_items.block" {
+                return SetMemberLookup::Resolved(list_float_items_block_descr());
+            }
             let struct_key = LLType::Struct(*struct_id);
             let gc = gc_cache().lock();
             match gc._cache_field.get(&struct_key) {

@@ -4031,6 +4031,33 @@ impl CallControl {
                 // heaptracker.py:102-103: `if name == 'typeptr': continue`
                 continue;
             }
+            // Dotted GETFIELD of a by-value nested struct (`int_items.block`).
+            // `heaptracker.py get_fielddescr_index_in` recurses into the
+            // nested STRUCT. Intern the descr under the outer owner plus
+            // the dotted name so runtime rehydrate
+            // (`list_int_items_block_descr`) shares the GETFIELD Arc.
+            if let Some(tail) = field_name.strip_prefix(fname)
+                && let Some(tail) = tail.strip_prefix('.')
+                && self.is_known_struct(fty)
+            {
+                if let Some((descr, member)) = self.fielddescrof_concrete(idx, fty, None, tail) {
+                    let struct_id = majit_ir::descr::struct_id_for_name(owner_root)
+                        .map(|sid| sid.as_u64())
+                        .unwrap_or_else(|| match member {
+                            majit_ir::effectinfo::DescrSetMember::Field { struct_id, .. } => {
+                                struct_id
+                            }
+                            _ => 0,
+                        });
+                    return Some((
+                        descr,
+                        majit_ir::effectinfo::DescrSetMember::Field {
+                            struct_id,
+                            field_name: field_name.to_string(),
+                        },
+                    ));
+                }
+            }
             // heaptracker.py:108-110: a by-value nested struct field is not
             // itself a leaf descr — `get_fielddescr_index_in` recurses into
             // it, so it contributes its inner leaves' bytes, never matching
@@ -9416,6 +9443,29 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
 /// `rlib/jit.py` `@look_inside_iff`: the public name is a dispatch
 /// wrapper; `_orig_<name>` holds the body writeanalyze must see
 /// (`_ll_list_resize_hint_really` writes `l.items`).
+/// Nested `IntArray.block` / `FloatArray.block` is `l.items` on the
+/// list (`rlist.py` `_ll_list_resize_hint_really` `l.items = newitems`).
+/// GETFIELD of that slot is interned as `W_ListObject.int_items.block`.
+fn list_items_block_alias_field(
+    field: &crate::model::FieldDescriptor,
+) -> Option<crate::model::FieldDescriptor> {
+    if field.name != "block" {
+        return None;
+    }
+    let owner = field.owner_root.as_deref().unwrap_or("");
+    let list_name = if owner.ends_with("IntArray") {
+        "int_items.block"
+    } else if owner.ends_with("FloatArray") {
+        "float_items.block"
+    } else {
+        return None;
+    };
+    Some(crate::model::FieldDescriptor::new(
+        list_name,
+        Some("W_ListObject".to_string()),
+    ))
+}
+
 fn orig_path_behind_look_inside_iff(path: &CallPath) -> Option<CallPath> {
     let leaf = path.segments.last()?;
     let base = leaf
@@ -9528,6 +9578,46 @@ impl CallControl {
         is_arraycopy && self.function_graphs.get(&path).is_none()
     }
 
+    /// jtransform `_handle_list_call` `list.int_set_items` /
+    /// `list.float_set_items` → `setfield_gc_r` of the list's items
+    /// block. Recover that STRUCT write here so `force_from_effectinfo`
+    /// invalidates GETFIELD of `W_ListObject.int_items.block` across
+    /// residual `COND_CALL` of `_ll_list_resize_hint_really`.
+    fn readwrite_list_set_items_call(&self, target: &CallTarget) -> Option<ReadWriteEffects> {
+        let leaf = match target {
+            CallTarget::FunctionPath { segments, .. } => segments.last()?.as_str(),
+            _ => {
+                let spec = self.get_oopspec(target)?;
+                return self.readwrite_list_set_items_oopspec(&spec);
+            }
+        };
+        let field = match leaf {
+            "ll_list_int_set_items" => "int_items.block",
+            "ll_list_float_set_items" => "float_items.block",
+            _ => {
+                let spec = self.get_oopspec(target)?;
+                return self.readwrite_list_set_items_oopspec(&spec);
+            }
+        };
+        Some(self.readwrite_struct_result(
+            RwTag::Struct,
+            &crate::model::FieldDescriptor::new(field, Some("W_ListObject".to_string())),
+        ))
+    }
+
+    fn readwrite_list_set_items_oopspec(&self, spec: &str) -> Option<ReadWriteEffects> {
+        let head = spec.split('(').next()?;
+        let field = match head {
+            "list.int_set_items" => "int_items.block",
+            "list.float_set_items" => "float_items.block",
+            _ => return None,
+        };
+        Some(self.readwrite_struct_result(
+            RwTag::Struct,
+            &crate::model::FieldDescriptor::new(field, Some("W_ListObject".to_string())),
+        ))
+    }
+
     fn analyze_readwrite(
         &self,
         path: &CallPath,
@@ -9561,17 +9651,24 @@ impl CallControl {
                 // graphanalyze.py `analyze(op, seen, graphinfo)`.
                 let effects = match &op.kind {
                     OpKind::Call { target, .. } => {
-                        // graphanalyze.py `analyze`: a `direct_call` whose
-                        // funcobj has no graph raises `AttributeError` and
-                        // returns `top_result`. `list.ll_arraycopy` /
-                        // `jit_ll_arraycopy` is that residual (`rgc.py`
-                        // `ll_arraycopy` has a graph of `setarrayitem`;
-                        // pyre's helper is `extern "C"`). Treating it as
-                        // `analyze_external_call` bottom dropped the dest
-                        // ARRAY write from `_ll_list_resize_hint_really`,
-                        // so `force_from_effectinfo` left lazy SETARRAYITEM_GC
-                        // across the residual COND_CALL.
-                        if self.arraycopy_call_has_no_graph(target) {
+                        // jtransform `_handle_list_call`: `list.int_set_items`
+                        // / `list.float_set_items` lower to
+                        // `setfield_gc_r(int_items.block)` /
+                        // `setfield_gc_r(float_items.block)`. writeanalyze of
+                        // the helper body sees `FieldWrite` on the nested
+                        // `IntArray` / `FloatArray`, which does not match the
+                        // GETFIELD descr `W_ListObject.int_items.block`.
+                        if let Some(effects) = self.readwrite_list_set_items_call(target) {
+                            effects
+                        } else if self.arraycopy_call_has_no_graph(target) {
+                            // graphanalyze.py `analyze`: a `direct_call` whose
+                            // funcobj has no graph raises `AttributeError` and
+                            // returns `top_result`. `list.ll_arraycopy` /
+                            // `jit_ll_arraycopy` is that residual (`rgc.py`
+                            // `ll_arraycopy` has a graph of `setarrayitem`;
+                            // pyre's helper is `extern "C"`). Treating it as
+                            // `analyze_external_call` bottom dropped the dest
+                            // ARRAY write from `_ll_list_resize_hint_really`.
                             ReadWriteEffects::top_result()
                         } else {
                             match self.target_to_path(target) {
@@ -9676,7 +9773,16 @@ impl CallControl {
             OpKind::FieldRead { field, .. } => {
                 self.readwrite_struct_result(RwTag::ReadStruct, field)
             }
-            OpKind::FieldWrite { field, .. } => self.readwrite_struct_result(RwTag::Struct, field),
+            OpKind::FieldWrite { field, .. } => {
+                let mut effects = self.readwrite_struct_result(RwTag::Struct, field);
+                if let Some(list_field) = list_items_block_alias_field(field) {
+                    effects = ReadWriteEffects::add_to_result(
+                        effects,
+                        self.readwrite_struct_result(RwTag::Struct, &list_field),
+                    );
+                }
+                effects
+            }
             // `getarrayitem` / `setarrayitem`.
             OpKind::ArrayRead {
                 base,
@@ -9724,13 +9830,22 @@ impl CallControl {
                 field,
                 array_type_id,
                 ..
-            } => self.readwrite_interiorfield_result(
-                RwTag::InteriorField,
-                base,
-                &field.name,
-                array_type_id,
-                graphinfo,
-            ),
+            } => {
+                let mut effects = self.readwrite_interiorfield_result(
+                    RwTag::InteriorField,
+                    base,
+                    &field.name,
+                    array_type_id,
+                    graphinfo,
+                );
+                if let Some(list_field) = list_items_block_alias_field(field) {
+                    effects = ReadWriteEffects::add_to_result(
+                        effects,
+                        self.readwrite_struct_result(RwTag::Struct, &list_field),
+                    );
+                }
+                effects
+            }
             _ => ReadWriteEffects::bottom_result(),
         }
     }
@@ -17101,6 +17216,50 @@ mod tests {
                 "__majit_call_target_ll_list_obj_resize_hint_really"
             )),
             "call-target residual of a grow that copies is writeanalyze top"
+        );
+    }
+
+    /// jtransform `_handle_list_call` `list.int_set_items` is
+    /// `setfield_gc_r(int_items.block)`. A grow that residual-calls that
+    /// helper must writeanalyze as that STRUCT, not as empty / top.
+    #[test]
+    fn readwrite_list_int_set_items_is_block_field_write() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        rw_register(
+            &mut cc,
+            "_orig_ll_list_int_resize_hint_really",
+            vec![rw_call("ll_list_int_set_items")],
+        );
+        rw_register(&mut cc, "ll_list_int_resize_hint_really", vec![]);
+        let effects = rw_of(&cc, &mut cache, "ll_list_int_resize_hint_really");
+        assert!(
+            !is_top(&effects),
+            "int_set_items must not make resize writeanalyze top"
+        );
+        assert_eq!(write_fields(&effects), vec![0]);
+    }
+
+    /// Nested `IntArray.block` is `l.items` (`rlist.py`
+    /// `_ll_list_resize_hint_really`). writeanalyze must name
+    /// `W_ListObject.int_items.block` so GETFIELD of that slot is
+    /// invalidated across residual COND_CALL.
+    #[test]
+    fn readwrite_int_array_block_aliases_list_items_block() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        rw_register(
+            &mut cc,
+            "_orig_ll_list_int_resize_hint_really",
+            vec![rw_write_field("IntArray", "block")],
+        );
+        rw_register(&mut cc, "ll_list_int_resize_hint_really", vec![]);
+        let effects = rw_of(&cc, &mut cache, "ll_list_int_resize_hint_really");
+        assert!(!is_top(&effects));
+        assert!(
+            write_fields(&effects).len() >= 2,
+            "nested IntArray.block plus W_ListObject.int_items.block, got {:?}",
+            write_fields(&effects)
         );
     }
 
