@@ -8066,7 +8066,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_gid = args[1];
                     let user = unsafe {
                         if pyre_object::is_str(w_user) {
-                            pyre_object::with_roots!(w_gid => crate::baseobjspace::str_utf8_w(w_user))?
+                            pyre_object::with_roots!(w_user, w_gid => crate::baseobjspace::str_utf8_w(w_user))?
                                 .to_string()
                         } else {
                             return Err(crate::PyError::type_error(
@@ -8083,7 +8083,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     type GroupId = libc::c_int;
                     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     type GroupId = libc::gid_t;
-                    let gid = pyre_object::with_roots!(w_user =>
+                    let gid = pyre_object::with_roots!(w_user, w_gid =>
                         crate::baseobjspace::c_uid_t_w(w_gid))?
                         as GroupId;
                     let mut ngroups: libc::c_int = 64;
@@ -12624,7 +12624,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_gid = args[1];
                     let user = unsafe {
                         if pyre_object::is_str(w_user) {
-                            pyre_object::with_roots!(w_gid => crate::baseobjspace::str_utf8_w(w_user))?
+                            pyre_object::with_roots!(w_user, w_gid => crate::baseobjspace::str_utf8_w(w_user))?
                                 .to_string()
                         } else {
                             return Err(crate::PyError::type_error(
@@ -12637,7 +12637,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     })?;
                     // interp_posix.py `@unwrap_spec(username='text', gid=c_gid_t)`.
                     // Darwin's `initgroups` takes `int`; other unix hosts take `gid_t`.
-                    let gid = pyre_object::with_roots!(w_user =>
+                    let gid = pyre_object::with_roots!(w_user, w_gid =>
                         crate::baseobjspace::c_uid_t_w(w_gid))?;
                     #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let gid = gid as libc::c_int;
