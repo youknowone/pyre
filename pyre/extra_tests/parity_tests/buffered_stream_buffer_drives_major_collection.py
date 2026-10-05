@@ -6,6 +6,7 @@
 # (`rgc.add_memory_pressure`) lets a loop of dropped streams reach a major.
 # parity-env: PYPY_GC_MIN=8M
 # parity-env: PYPY_GC_MAX_DELTA=32M
+# pyre-check: timeout=120
 
 """Dropped buffered streams must not outlive the descriptor table.
 
