@@ -687,6 +687,17 @@ impl Space {
                     Space::Ty
                 }
             }
+            // Switch `data.branches` is `[[const_expr, target_index], ...]`.
+            // Nested arrays are walked with `key = None`, so the pair must
+            // already be Const for its element 0 to stay Const.
+            Some("branches") => Space::Const,
+            // `{"Repeat": [operand, elem_ty, count, trait_info]}`.
+            Some("Repeat") => match index {
+                1 => Space::Ty,
+                2 => Space::Const,
+                3 => Space::TraitRef,
+                _ => self,
+            },
             // `[trait_ref, index]` / `[trait_ref, name]`: only the head is a
             // trait ref.
             Some("Trait" | "ParentClause" | "TraitType" | "TraitConst") if index > 0 => Space::Ty,
@@ -1613,6 +1624,104 @@ mod tests {
             !value_has_depth0_type_var(local_ty),
             "type var survived: {local_ty}"
         );
+    }
+
+    /// A switch arm `{"Deduplicated": id}` indexes the const table even when
+    /// the same id is a type whose body holds a depth-0 variable.
+    #[test]
+    fn switch_arm_dedup_id_is_read_from_the_const_table() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let bool_ty = json!({"Scalar": {"Bool": null}});
+        let type_body = json!({"Adt": {"id": 0, "generics": {"regions": [], "types": [{"TypeVar": {"Bound": [0, 0]}}], "const_generics": [], "trait_refs": []}}});
+        let const_body = json!([{"Bool": false}, bool_ty]);
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let local = |index, ty| json!({"index": index, "name": null, "span": span, "ty": ty});
+        let ret = json!({"statements": [], "terminator": {"span": span, "kind": "Return"}});
+        let body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        local(0, bool_ty.clone()),
+                        local(1, json!({"Value": [11, type_body.clone()]})),
+                    ]
+                },
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span,
+                            "kind": {"Assign": [
+                                {"kind": {"Local": 0}, "ty": bool_ty},
+                                {"Use": [{"Const": {"Value": [11, const_body]}}, "Yes"]}
+                            ]}
+                        }],
+                        "terminator": {
+                            "span": span,
+                            "kind": {"Switch": {
+                                "data": {
+                                    "scrutinee": {"Value": {"Copy": {"kind": {"Local": 0}, "ty": bool_ty}}},
+                                    "branches": [[{"Deduplicated": 11}, 1]],
+                                    "fallback": 0
+                                },
+                                "branches": [1, 2]
+                            }}
+                        }
+                    },
+                    ret,
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                ]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": bool_ty},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert_eq!(llbc.dedup_body(11).expect("type 11"), &type_body);
+        assert_eq!(llbc.dedup_const_body(11).expect("const 11"), &const_body);
+        assert!(contains_depth0_var(
+            llbc.dedup_body(11).expect("type 11"),
+            &llbc,
+            Space::Ty,
+            None,
+            0
+        ));
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied =
+            substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[]).expect("substituted body");
+        let arm =
+            copied.body[0].terminator.kind_value()["Switch"]["data"]["branches"][0][0].clone();
+        assert_ne!(arm, type_body, "switch arm resolved as the type body");
+        assert!(
+            arm == json!({"Deduplicated": 11}) || arm == const_body,
+            "switch arm is neither the const id nor the const body: {arm}"
+        );
+        assert!(
+            !value_has_depth0_type_var(&arm),
+            "type var leaked into switch arm: {arm}"
+        );
+        copied.body[0]
+            .term(&llbc)
+            .expect("switch arm const unresolved");
+        assert_eq!(llbc.dedup_body(11), Some(&type_body));
+        assert_eq!(llbc.dedup_const_body(11), Some(&const_body));
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {
