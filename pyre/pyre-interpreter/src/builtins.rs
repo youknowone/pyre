@@ -8071,14 +8071,16 @@ fn os_error_build(
         ),
         None => kind,
     };
-    let stamp_ptr = match stamp_slot.or(cls_slot) {
+    // `py_str_wtf8` / `py_repr_wtf8` collect.  `stamp` is already in a slot;
+    // a copy held across those calls is a short bracket.
+    let stamp_now = || match stamp_slot.or(cls_slot) {
         Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
         None => pyre_object::PY_NULL,
     };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
-        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_now())
     } else {
         let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
             rustpython_wtf8::Wtf8Buf::new()
@@ -8100,7 +8102,7 @@ fn os_error_build(
             parts.push_str(")");
             parts
         };
-        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_ptr)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_now())
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
@@ -11144,7 +11146,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // across them.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], positional[0], positional[1]]);
-    let mut cls = pyre_object::gc_roots::shadow_stack_get(base);
+    let cls = pyre_object::gc_roots::shadow_stack_get(base);
     let message = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_exceptions = pyre_object::gc_roots::shadow_stack_get(base + 2);
     if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
@@ -11203,18 +11205,20 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
     let exception = lookup_exc_class("Exception").unwrap();
-    let all_exceptions = exceptions
-        .iter()
-        .all(|exc| crate::baseobjspace::isinstance(*exc, exception).unwrap_or(false));
-    if std::ptr::eq(cls, base_group) && all_exceptions {
-        cls = exception_group;
-    }
-    // The retarget above replaces `cls`, and both class objects stay live
-    // across the two `issubclass` calls.
-    let live_base = pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group]);
+    // `isinstance` / `issubclass` collect.  `base_group` is still read after
+    // those calls for the layout test, so it sits in this pin with the others.
+    let live_base =
+        pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group, base_group]);
     let cls_now = || pyre_object::gc_roots::shadow_stack_get(live_base);
     let exception_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 1);
     let group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 2);
+    let base_group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 3);
+    let all_exceptions = exceptions
+        .iter()
+        .all(|exc| crate::baseobjspace::isinstance(*exc, exception_now()).unwrap_or(false));
+    if std::ptr::eq(cls_now(), base_group_now()) && all_exceptions {
+        pyre_object::gc_roots::shadow_stack_set(live_base, group_now());
+    }
     if crate::baseobjspace::issubclass(cls_now(), exception_now())? && !all_exceptions {
         let name = unsafe { pyre_object::w_type_get_name(cls_now()) };
         let msg = if std::ptr::eq(cls_now(), group_now()) {
@@ -11238,7 +11242,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // (including the promotion above) and app subclasses are `_getusercls`.
     let user_layout = !std::ptr::eq(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        base_group,
+        base_group_now(),
     );
     // Each allocation below is a safepoint, so the nascent group and the tuple
     // it stores both go on the shadow stack before the next one runs.
