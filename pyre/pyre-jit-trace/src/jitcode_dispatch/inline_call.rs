@@ -8701,12 +8701,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         }
 
-        let pycode_const = ctx
-            .trace_ctx
-            .const_ref(callee_state.borrow().inline_w_code as i64);
-        let w_globals_obj_const = ctx
-            .trace_ctx
-            .const_ref(callee_state.borrow().inline_w_globals as i64);
+        // Copy before each call: a `borrow()` temporary lives until the end of
+        // the statement, and later `FrameBox::new` collects.
+        let inline_w_code = callee_state.borrow().inline_w_code;
+        let inline_w_globals = callee_state.borrow().inline_w_globals;
+        let pycode_const = ctx.trace_ctx.const_ref(inline_w_code as i64);
+        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_w_globals as i64);
         let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
         // `finish_for_call_with_globals_obj` fills the cell band in two
         // halves: one fresh `w_cell_new(PY_NULL, family)` per pure cellvar,
@@ -8783,11 +8783,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // GC root through optimization.  A scope-owned tracer snapshot
         // would be freed when this function returns while the Box value
         // still exists, leaving a dangling recording-time pointer.
+        // Re-read after `to_pyobj` / cell emission, which can collect and
+        // forward the cell. `new_for_call_with_closure_and_globals_obj` and
+        // `FrameBox::new` also collect (`maybe_collect_for_external_malloc`).
+        let inline_w_globals = callee_state.borrow().inline_w_globals;
         let mut frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 w_code,
                 &concrete_args,
-                callee_state.borrow().inline_w_globals as pyre_object::PyObjectRef,
+                inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
                 concrete_closure,
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
