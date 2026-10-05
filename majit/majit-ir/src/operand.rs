@@ -71,6 +71,10 @@ const WIDE_MAX_CHUNKS: usize = 8192;
 static NEXT_WIDE_ID: AtomicU32 = AtomicU32::new(1);
 static WIDE_CHUNKS: [AtomicPtr<Cell<Value>>; WIDE_MAX_CHUNKS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; WIDE_MAX_CHUNKS];
+/// Recycled `pack_stamp` ids (`history.py *FrontendOp` concrete slot).
+/// Operand identity no longer uses this slab; stamps still do, and a
+/// portal compile storm drops the ops — reclaim the id then.
+static FREE_WIDE: parking_lot::Mutex<Vec<u32>> = parking_lot::Mutex::new(Vec::new());
 
 fn init_wide_chunk(chunk_i: usize) -> *mut Cell<Value> {
     let boxed: Box<[Cell<Value>]> = (0..WIDE_CHUNK)
@@ -114,15 +118,37 @@ pub(crate) fn wide_slot(id: u32) -> &'static Cell<Value> {
 }
 
 pub(crate) fn fresh_wide(value: Value) -> u64 {
-    let id = NEXT_WIDE_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
+    let id = {
+        let mut free = FREE_WIDE.lock();
+        if let Some(id) = free.pop() {
+            id
+        } else {
+            NEXT_WIDE_ID
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .unwrap_or_else(|_| panic!("wide Const identity space exhausted"))
+        }
+    };
     wide_slot(id).set(value);
     u64::from(id)
 }
 
+pub(crate) fn release_wide(id: u32) {
+    if id == 0 {
+        return;
+    }
+    let slot = wide_slot(id);
+    debug_assert_ne!(slot.get(), Value::Void, "stamp wide id {id} released twice");
+    slot.set(Value::Void);
+    FREE_WIDE.lock().push(id);
+}
+
 pub(crate) fn wide_value(id: u64) -> Value {
     wide_slot(id as u32).get()
+}
+
+#[cfg(test)]
+pub(crate) fn wide_high_water() -> u32 {
+    NEXT_WIDE_ID.load(Ordering::Relaxed)
 }
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
@@ -351,7 +377,12 @@ impl Operand {
         {
             return Operand::SmallInt(encoded);
         }
-        Operand::SmallWide(fresh_wide(value))
+        // history.py ConstFloat / ConstPtr / wide ConstInt are ordinary
+        // Const objects: they die with the trace that minted them. The
+        // SmallWide slab (rework.md F16) never frees, and a portal compile
+        // storm exhausts it; Operand::Const already has the Cell a GC walk
+        // needs to forward ConstPtr in place.
+        Operand::Const(Rc::new(Cell::new(value)))
     }
 
     /// Wrap a bound op as `Operand::Op` (`Rc::clone`, cheap). The successor
@@ -1313,7 +1344,8 @@ mod tests {
         let edge = Operand::const_(Const::Int(i32::MAX as i64));
         let outside = Operand::const_(Const::Int(i32::MAX as i64 + 1));
         assert!(edge.is_small_int());
-        assert!(outside.is_small_wide());
+        assert!(outside.is_constant());
+        assert!(!outside.is_small_int());
 
         // Tagged-word packing: four inline Operand slots stay in 32 B.
         #[cfg(target_pointer_width = "64")]
@@ -1321,18 +1353,20 @@ mod tests {
     }
 
     #[test]
-    fn wide_const_keeps_fresh_object_identity_without_rc() {
+    fn wide_const_keeps_fresh_object_identity() {
         let f1 = Operand::const_(Const::Float(1.5));
         let f2 = Operand::const_(Const::Float(1.5));
-        assert!(f1.is_small_wide());
-        assert!(f2.is_small_wide());
+        assert!(f1.is_constant());
+        assert!(!f1.is_small_int());
+        assert!(f2.is_constant());
         assert_ne!(f1, f2, "fresh ConstFloat objects have distinct identity");
         assert_eq!(f1, f1.clone(), "cloning preserves ConstFloat identity");
         assert!(f1.same_box(&f2), "ConstFloat.same_box compares bits");
 
         let p1 = Operand::const_(Const::Ref(GcRef(0x1000)));
         let p2 = Operand::const_(Const::Ref(GcRef(0x1000)));
-        assert!(p1.is_small_wide());
+        assert!(p1.is_constant());
+        assert!(!p1.is_small_int());
         assert_ne!(p1, p2, "fresh ConstPtr objects have distinct identity");
         assert_eq!(p1, p1.clone());
         assert!(p1.same_box(&p2));
@@ -1348,7 +1382,8 @@ mod tests {
         host.set_forwarded_const(Const::Ref(GcRef(0x1000)));
         let first = host.get_box_replacement(false);
         let second = host.get_box_replacement(false);
-        assert!(first.is_small_wide());
+        assert!(first.is_constant());
+        assert!(!first.is_small_int());
         assert_eq!(first, second);
         assert_eq!(first.const_value(), Some(Value::Ref(GcRef(0x1000))));
         assert!(host.get_forwarded().is_const());

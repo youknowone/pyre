@@ -8,7 +8,7 @@ use crate::{PY_NULL, PyObjectRef};
 /// Host constructor for a 3.14t length cell. Upstream `l.length`
 /// (`rlist.py`) is a plain Signed; minting the atomic word is residual.
 #[majit_macros::dont_look_inside]
-pub(crate) fn length_cell(n: usize) -> AtomicUsize {
+pub fn length_cell(n: usize) -> AtomicUsize {
     AtomicUsize::new(n)
 }
 

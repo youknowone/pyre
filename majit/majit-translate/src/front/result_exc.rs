@@ -89,10 +89,10 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
-use crate::flowspace::model::{ConstValue, Variable};
+use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link,
-    LinkArg, OpKind, SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor,
+    FunctionGraph, Link, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -2943,6 +2943,7 @@ pub(crate) fn apply_foreign_from_residuals(
                     target: CallTarget::FunctionPath {
                         segments: conv.segments.clone(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args,
                     result_ty: ValueType::Ref(None),
@@ -4422,6 +4423,30 @@ fn break_arm_closes(
         .collect()
 }
 
+/// Bind a `Call.args` Constant to a Variable (`emit_constant`).
+///
+/// Upstream `SpaceOperation.args` hold `Constant`s (`flowspace/model.py`).
+/// Our Call.args are Variables, so a recast's class-root ByteStr is a
+/// `ConstStr` on the block that uses it.
+fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Constant) -> Variable {
+    let (kind, ty) = match &c.value {
+        ConstValue::Int(n) => (OpKind::ConstInt(*n), ConcreteType::Signed),
+        ConstValue::Bool(b) => (OpKind::ConstBool(*b), ConcreteType::Signed),
+        ConstValue::ByteStr(s) => (OpKind::ConstStr(s.clone()), ConcreteType::GcRef),
+        ConstValue::Float(bits) => (OpKind::ConstFloat(*bits), ConcreteType::Float),
+        ConstValue::None => (OpKind::ConstNone, ConcreteType::GcRef),
+        other => panic!(
+            "Call.args Constant {other:?} has no SSA materialisation \
+             (`emit_constant`; flowspace SpaceOperation.args hold Constants)"
+        ),
+    };
+    let var = graph
+        .push_op_var(bb, kind, true)
+        .expect("constant materialisation produces a result");
+    FunctionGraph::set_concretetype_of_inline(&var, ty);
+    var
+}
+
 /// The exception link of a call whose raise must first run `closes`, the
 /// bracket closes (in the call block's namespace) its normal return runs.
 /// Without closes the link goes straight to `exceptblock`; with them it goes
@@ -4448,10 +4473,14 @@ fn raise_link_through_closes(
             let OpKind::Call { args, .. } = close else {
                 return Err(format!("{name}: a bracket close is not a call"));
             };
+            // Link.args carry Variables. A recast close keeps the
+            // class root as `LinkArg::Const` (`cast_instance_call`);
+            // rematerialise it on the raise block (`emit_constant`).
             for arg in args {
-                let arg = arg.clone().into_variable();
-                if !close_vars.contains(&arg) {
-                    close_vars.push(arg);
+                if let Some(var) = arg.as_variable()
+                    && !close_vars.contains(var)
+                {
+                    close_vars.push(var.clone());
                 }
             }
         }
@@ -4470,12 +4499,15 @@ fn raise_link_through_closes(
             };
             let args: Vec<Variable> = args
                 .iter()
-                .map(|arg| {
-                    let pos = close_vars
-                        .iter()
-                        .position(|v| *v == arg.clone().into_variable())
-                        .expect("collected above");
-                    r_inputs[pos].clone()
+                .map(|arg| match arg {
+                    LinkArg::Value(v) => {
+                        let pos = close_vars
+                            .iter()
+                            .position(|x| x == v)
+                            .expect("collected above");
+                        r_inputs[pos].clone()
+                    }
+                    LinkArg::Const(c) => materialize_call_arg_constant(graph, r_id, c),
                 })
                 .collect();
             graph.push_op_var(
@@ -6403,12 +6435,13 @@ fn try_fuse_drain_match(
             unreachable!("validated RootScope close is a call")
         };
         for arg in args {
-            let arg = arg.clone().into_variable();
-            if !close_vars_a.contains(&arg) {
-                close_vars_a.push(arg.clone());
-            }
-            if !forwarded.contains(&arg) {
-                forwarded.push(arg);
+            if let Some(var) = arg.as_variable() {
+                if !close_vars_a.contains(var) {
+                    close_vars_a.push(var.clone());
+                }
+                if !forwarded.contains(var) {
+                    forwarded.push(var.clone());
+                }
             }
         }
     }
@@ -6529,12 +6562,13 @@ fn try_fuse_drain_match(
         };
         let args = args
             .iter()
-            .map(|arg| {
-                close_vars_a
+            .map(|arg| match arg {
+                LinkArg::Value(v) => close_vars_a
                     .iter()
-                    .position(|v| v == arg)
+                    .position(|x| x == v)
                     .map(|i| r_inputs[i + 1].clone())
-                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument"))
+                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument")),
+                LinkArg::Const(c) => Ok(materialize_call_arg_constant(graph, r_id, c)),
             })
             .collect::<Result<Vec<_>, _>>()?;
         graph.push_op_var(
@@ -9434,6 +9468,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             };
         }
         // The constructor's result variable now holds the exception object.

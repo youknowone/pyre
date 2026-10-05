@@ -635,7 +635,7 @@ fn wtf8_from_message_str(ptr: *mut u8) -> rustpython_wtf8::Wtf8Buf {
 /// and reloaded after: `shadowstack.py expand_pop_roots` writes the forwarded
 /// pointer back into the local.
 #[majit_macros::dont_look_inside]
-fn make_pyerror(
+pub fn make_pyerror(
     kind: PyErrorKind,
     message: DisplayMessage,
     exc_object: pyre_object::PyObjectRef,

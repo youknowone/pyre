@@ -4679,6 +4679,7 @@ mod tests {
         #[test]
         fn test_convert_and_run_from_pyjitpl_starts_at_frame_pc() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::OpRef;
             use majit_jitcode::insns;
 
             let mut b = JitCodeBuilder::default();
@@ -4739,6 +4740,7 @@ mod tests {
         #[test]
         fn convert_and_run_cast_ptr_int_is_identity_on_an_even_word() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_ir::OpRef;
             use majit_translate::insns;
 
             const PTR: i64 = 0x1000;
@@ -4787,6 +4789,50 @@ mod tests {
                 outcome,
                 crate::jitexc::JitException::DoneWithThisFrameRef(GcRef(PTR as usize))
             );
+        }
+
+        /// `BlackholeInterpreter._copy_data_from_miframe` reads each
+        /// `registers_i[i].getint()`. For a ConstInt that means the inline
+        /// `value`, never pyre's execution mirror.
+        #[test]
+        fn copy_data_from_miframe_reads_constint_owner() {
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::OpRef;
+
+            let mut b = JitCodeBuilder::default();
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.int_regs[0] = Some(OpRef::const_int(42));
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.copy_data_from_miframe(&frame);
+
+            assert_eq!(bh.registers_i[0], 42);
+        }
+
+        /// `IntOp.getint` returns `_resint`, which is 0 until `setint`.
+        /// A present live box with no stamped mirror must still write that
+        /// default: skipping the write leaves a pooled leftover index.
+        #[test]
+        fn copy_data_from_miframe_writes_resint_default_for_unstamped_live_int() {
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::OpRef;
+
+            let mut b = JitCodeBuilder::default();
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.int_regs[0] = Some(OpRef::int_op(5));
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            // `setposition` grows the bank and never re-zeros a larger one.
+            bh.registers_i = vec![0x380000; 16];
+            bh.copy_data_from_miframe(&frame);
+
+            assert_eq!(bh.registers_i[0], 0);
         }
 
         /// `BlackholeInterpreter._copy_data_from_miframe` reads each

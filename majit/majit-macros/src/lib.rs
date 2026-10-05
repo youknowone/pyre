@@ -925,9 +925,11 @@ fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
 /// slice (`&[PyObjectRef]`, `&[*mut PyObject]`) is not [`pair_slice_param`].
 /// A shared `&str` or `&Wtf8` (any path whose last segment is `Wtf8`) is one
 /// `Ref` word rebuilt by [`rstr_arg_from_i64`], so it is not a fat-pointer
-/// argument either.  `&mut str`, `&Path`, `&[u8]`, an object-pointer slice,
-/// a raw pointer to `str`, `Wtf8`, or a slice, and `&dyn Trait` stay
-/// fat-pointer arguments.
+/// argument either.  An object-pointer slice (`&[PyObjectRef]`,
+/// `&[*mut PyObject]`, and their `&mut` twins) is one length-prefixed
+/// GcArray `Ref` word rebuilt by `object_gcarray_slice`.  `&mut str`,
+/// `&Path`, `&[u8]`, a raw pointer to `str`, `Wtf8`, or a slice, and
+/// `&dyn Trait` stay fat-pointer arguments.
 fn is_wide_pointee(ty: &Type) -> bool {
     if matches!(ty, Type::Slice(_) | Type::TraitObject(_)) {
         return true;
@@ -1055,6 +1057,17 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
     {
         return Some(rstr_arg_from_i64(arg_ident, &reference.elem));
     }
+    if let Some(is_mut) = object_pointer_slice_mutability(ty) {
+        return Some(if is_mut {
+            quote! {
+                unsafe { ::majit_ir::helper_fnaddr::object_gcarray_slice_mut(#arg_ident) }
+            }
+        } else {
+            quote! {
+                unsafe { ::majit_ir::helper_fnaddr::object_gcarray_slice(#arg_ident) }
+            }
+        });
+    }
     if is_gc_ref_type(ty)
         || is_raw_pointer_type(ty)
         || is_reference_type(ty)
@@ -1139,6 +1152,18 @@ fn is_object_pointer_item(ty: &Type) -> bool {
         return false;
     };
     path_type_last_ident(&ptr.elem).is_some_and(|id| id == "PyObject")
+}
+
+/// `&[PyObjectRef]` / `&mut [PyObjectRef]` / `&[*mut PyObject]`: one
+/// length-prefixed GcArray word. Returns whether the slice is mutable.
+fn object_pointer_slice_mutability(ty: &Type) -> Option<bool> {
+    let Type::Reference(reference) = ty else {
+        return None;
+    };
+    let Type::Slice(slice) = reference.elem.as_ref() else {
+        return None;
+    };
+    is_object_pointer_item(slice.elem.as_ref()).then_some(reference.mutability.is_some())
 }
 
 fn is_pair_slice_item(ty: &Type) -> bool {
@@ -1295,9 +1320,8 @@ fn wrap_result_exc_call(
 /// A pair-slice parameter ([`pair_slice_param`]) is not
 /// [`HelperFnAddrSkip::FatPointerArg`]: its pointer and length are two `i64`
 /// words.  A shared `&str` or `&Wtf8` is one `Ref` word, same as
-/// `PyObjectRef` / `GcRef`.  `&[PyObjectRef]` and `&[*mut PyObject]` stay
-/// fat-pointer arguments: that slice is one length-prefixed object-array
-/// word, and `from_raw_parts` would not rebuild it.  Every other fat
+/// `PyObjectRef` / `GcRef`.  An object-pointer slice is one length-prefixed
+/// GcArray `Ref` word (`object_gcarray_slice`).  Every other fat
 /// pointer (`&mut str`, `&Path`, `&[u8]`, `&[u32]`, `&[f64]`, `*const str`,
 /// `*const [T]`, `&dyn Trait`, a slice of any other item) still skips as
 /// `FatPointerArg`.  A return of `&str` or `&Wtf8` still skips.
@@ -1313,6 +1337,7 @@ fn trampoline_skip_reason(
         if let FnArg::Typed(pat_type) = arg
             && pair_slice_param(&pat_type.ty).is_none()
             && !is_shared_rstr_ref(&pat_type.ty)
+            && object_pointer_slice_mutability(&pat_type.ty).is_none()
             && is_fat_pointer_arg(&pat_type.ty)
         {
             return Some(HelperFnAddrSkip::FatPointerArg);
@@ -1385,14 +1410,14 @@ fn report_helper_fnaddr_skip(name: &Ident, reason: HelperFnAddrSkip) {
 
 fn emit_helper_fnaddr_registration(
     path_name: &Ident,
-    trampoline_ident: &Ident,
+    trampoline_addr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let static_name = format_ident!("__MAJIT_HELPER_FNADDR_{path_name}");
     let row = quote! {
         ::majit_ir::helper_fnaddr::HelperFnAddr::new(
             ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
-            #trampoline_ident as *const (),
+            #trampoline_addr,
             #arity,
         )
     };
@@ -1409,25 +1434,25 @@ fn emit_helper_fnaddr_registration(
 
 fn emit_helper_fnaddr_registrations(
     path_names: &[&Ident],
-    trampoline_ident: &Ident,
+    trampoline_addr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let rows = path_names
         .iter()
-        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_ident, arity));
+        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_addr, arity));
     quote! { #(#rows)* }
 }
 
 fn emit_helper_fnaddr_ctor(
     path_name: &Ident,
-    trampoline_ident: &Ident,
+    trampoline_addr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let ctor_name = format_ident!("__majit_register_helper_fnaddr_{path_name}");
     let register = quote! {
         ::majit_ir::helper_fnaddr::register(
             ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
-            #trampoline_ident as *const (),
+            #trampoline_addr,
             #arity,
         );
     };
@@ -1442,12 +1467,12 @@ fn emit_helper_fnaddr_ctor(
 
 fn emit_helper_fnaddr_ctors(
     path_names: &[&Ident],
-    trampoline_ident: &Ident,
+    trampoline_addr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let ctors = path_names
         .iter()
-        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_ident, arity));
+        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_addr, arity));
     quote! { #(#ctors)* }
 }
 
@@ -1535,8 +1560,9 @@ pub fn prebuilt_static(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { #loaded as i64 }
         };
-        let registration = emit_helper_fnaddr_registration(name, &getter, 0);
-        let ctor = emit_helper_fnaddr_ctor(name, &getter, 0);
+        let getter_addr = quote! { #getter as *const () };
+        let registration = emit_helper_fnaddr_registration(name, &getter_addr, 0);
+        let ctor = emit_helper_fnaddr_ctor(name, &getter_addr, 0);
         return quote! {
             #item
             #[doc(hidden)]
@@ -1640,10 +1666,25 @@ fn emit_helper_call_target_fn(
     let mut fnaddr_args = Vec::new();
     let mut has_float_arg = false;
     for (index, arg) in func.sig.inputs.iter().enumerate() {
+        let arg_ident = format_ident!("__majit_arg_{index}");
+        if let syn::FnArg::Receiver(recv) = arg {
+            wrapper_params.push(quote! { #arg_ident: i64 });
+            let self_ty = match &recv.reference {
+                Some(_) if recv.mutability.is_some() => quote! { &mut Self },
+                Some(_) => quote! { &Self },
+                None => quote! { Self },
+            };
+            let converted = quote! {
+                unsafe { ::majit_ir::helper_fnaddr::residual_word_to_value::<#self_ty>(#arg_ident) }
+            };
+            converted_args.push(converted.clone());
+            fnaddr_params.push(quote! { #arg_ident: i64 });
+            fnaddr_args.push(converted);
+            continue;
+        }
         let syn::FnArg::Typed(pat_type) = arg else {
             return Ok(None);
         };
-        let arg_ident = format_ident!("__majit_arg_{index}");
         if let Some((item_ty, is_mut)) = pair_slice_param(&pat_type.ty) {
             let len_ident = format_ident!("__majit_arg_{index}_len");
             wrapper_params.push(quote! { #arg_ident: i64 });
@@ -1695,16 +1736,23 @@ fn emit_helper_call_target_fn(
     };
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
-    // `unsafe` wrapper there would be an unused-unsafe warning).
-    let mut call_expr = if func.sig.unsafety.is_some() {
-        quote! { unsafe { #helper_name(#(#converted_args),*) } }
+    // `unsafe` wrapper there would be an unused-unsafe warning). A method
+    // is `Self::name` so the trampoline, emitted next to it in the impl,
+    // finds the associated function (`getfunctionptr` of that graph).
+    let callee = if func.sig.receiver().is_some() {
+        quote! { Self::#helper_name }
     } else {
-        quote! { #helper_name(#(#converted_args),*) }
+        quote! { #helper_name }
+    };
+    let mut call_expr = if func.sig.unsafety.is_some() {
+        quote! { unsafe { #callee(#(#converted_args),*) } }
+    } else {
+        quote! { #callee(#(#converted_args),*) }
     };
     let mut fnaddr_call_expr = if func.sig.unsafety.is_some() {
-        quote! { unsafe { #helper_name(#(#fnaddr_args),*) } }
+        quote! { unsafe { #callee(#(#fnaddr_args),*) } }
     } else {
-        quote! { #helper_name(#(#fnaddr_args),*) }
+        quote! { #callee(#(#fnaddr_args),*) }
     };
     let result_payload = result_exc_payload(&func.sig.output);
     let return_kind = if let Some(ok_ty) = result_payload {
@@ -1724,8 +1772,14 @@ fn emit_helper_call_target_fn(
         fnaddr_call_expr = fnaddr_wrapped;
     }
     let arity = helper_abi_words(&func.sig.inputs);
+    let has_receiver = func.sig.receiver().is_some();
+    let trampoline_addr = if has_receiver {
+        quote! { Self::#trace_target_name as *const () }
+    } else {
+        quote! { #trace_target_name as *const () }
+    };
     let shim_registration = if register_fnaddr && !has_float_arg {
-        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_target_name, arity)
+        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trampoline_addr, arity)
     } else {
         quote! {}
     };
@@ -1795,9 +1849,14 @@ fn emit_helper_call_target_fn(
 
     let registered = if register_fnaddr && has_float_arg {
         let fnaddr_name = format_ident!("__majit_fnaddr_target_{helper_name}");
+        let fnaddr_addr = if has_receiver {
+            quote! { Self::#fnaddr_name as *const () }
+        } else {
+            quote! { #fnaddr_name as *const () }
+        };
         let registration =
-            emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_name, arity);
-        let ctor = emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_name, arity);
+            emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_addr, arity);
+        let ctor = emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_addr, arity);
         let float_abi = match return_kind {
             HelperCallKind::Void => quote! {
                 #[doc(hidden)]
@@ -1843,7 +1902,7 @@ fn emit_helper_call_target_fn(
             #ctor
         }
     } else if register_fnaddr {
-        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trace_target_name, arity)
+        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trampoline_addr, arity)
     } else {
         quote! {}
     };
@@ -3614,14 +3673,23 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `jit.conditional_call(_ll_list_resize_hint_really, ...)`) needs the
     // same word-ABI entry `#[dont_look_inside]` emits. The public name is
     // the dispatch wrapper; the adapter calls that, matching
-    // `getfunctionptr` of the decorated function. It is published to
-    // `HELPER_FNADDRS` like every other residual entry.
-    let call_target_fn =
-        match emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], false) {
-            Ok(Some((_, _, tokens))) => Some(tokens),
-            Ok(None) => None,
-            Err(err) => return err.to_compile_error().into(),
-        };
+    // `getfunctionptr` of the decorated function. A jitted call whose
+    // predicate is false records the trampoline (`rlib/jit.py`
+    // `look_inside_iff.inner` `trampoline.__name__ = func.__name__ +
+    // "_trampoline"`), so both spellings are published to
+    // `HELPER_FNADDRS`.
+    let call_target_fn = match emit_helper_call_target_fn(
+        &func,
+        true,
+        Some(&trampoline_name),
+        "look_inside_iff",
+        &[],
+        false,
+    ) {
+        Ok(Some((_, _, tokens))) => Some(tokens),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let expanded = quote! {
         // rlib/jit.py — func = unroll_safe(func)
@@ -4726,17 +4794,11 @@ mod tests {
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(xs: &mut [PyObjectRef]) -> i64 { 0 }"), None);
         assert_eq!(skip("fn f(xs: &mut [i64]) -> i64 { 0 }"), None);
         assert_eq!(
             skip("fn f(p: *const [PyObjectRef]) -> i64 { 0 }"),
-            Some(HelperFnAddrSkip::FatPointerArg)
-        );
-        assert_eq!(
-            skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"),
-            Some(HelperFnAddrSkip::FatPointerArg)
-        );
-        assert_eq!(
-            skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(skip("fn f(xs: &[*mut u8]) -> i64 { 0 }"), None);
@@ -4795,6 +4857,10 @@ mod tests {
         );
         assert_eq!(
             skip("fn f(op: CompareOp) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(x: PyError) -> PyError { x }"),
             Some(HelperFnAddrSkip::Other)
         );
         assert_eq!(
@@ -4867,6 +4933,63 @@ mod tests {
             "{str_text}"
         );
         assert!(str_text.contains("as * const () , 1"), "{str_text}");
+    }
+
+    #[test]
+    fn object_pointer_slice_trampoline_is_one_ref_word() {
+        let func = parse_fn("fn f(xs: &[PyObjectRef]) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("fn __majit_call_target_f (__majit_arg_0 : i64) -> i64"),
+            "{text}"
+        );
+        assert!(text.contains("as * const () , 1"), "{text}");
+        assert!(
+            text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{text}"
+        );
+        assert!(!text.contains("__majit_arg_0_len"), "{text}");
+
+        let mut_func = parse_fn("fn g(xs: &mut [PyObjectRef]) -> i64 { 0 }");
+        let (_, _, mut_tokens) =
+            emit_helper_call_target_fn(&mut_func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let mut_text = mut_tokens.to_string();
+        assert!(
+            mut_text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice_mut"),
+            "{mut_text}"
+        );
+        assert!(mut_text.contains("as * const () , 1"), "{mut_text}");
+
+        let words: WordEnumsArg = syn::parse_str("word_enums(CallMode)").unwrap();
+        let call_func = parse_fn(
+            "fn call_non_function_callable_with_mode(\
+             execution_context: *const u8, \
+             callable: PyObjectRef, \
+             args: &[PyObjectRef], \
+             mode: CallMode, \
+             profile_frame: *mut u8) -> PyResult { loop {} }",
+        );
+        assert_eq!(
+            trampoline_skip_reason(&call_func, "dont_look_inside", &words.0),
+            None
+        );
+        let (_, _, call_tokens) =
+            emit_helper_call_target_fn(&call_func, true, None, "dont_look_inside", &words.0, false)
+                .expect("emit")
+                .expect("trampoline");
+        let call_text = call_tokens.to_string();
+        assert!(call_text.contains("as * const () , 5"), "{call_text}");
+        assert!(
+            call_text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{call_text}"
+        );
+        assert!(call_text.contains("from_discriminant"), "{call_text}");
     }
 
     #[test]

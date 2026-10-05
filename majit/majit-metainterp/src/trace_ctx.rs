@@ -120,7 +120,10 @@ fn descr_to_bh_size_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::Bh
     let size = descr.as_size_descr()?;
     Some(majit_jitcode::jitcode::BhDescr::Size {
         size: size.size(),
-        type_id: size.type_id() as u64,
+        // `descr.py` cache identity via `SizeDescr.cache_key()`, matching
+        // `eval.rs` `bh_new`. The collector tid lives on `type_id()` and
+        // is recovered by `resolved_gc_tid_checked`.
+        type_id: size.cache_key(),
         vtable: size.vtable() as u64,
         owner: String::new(),
         all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size),
@@ -4740,16 +4743,19 @@ impl TraceCtx {
         if vable_ptr.is_null() {
             return false;
         }
-        let Some(values) = self.virtualizable_values.as_ref() else {
+        let Some(boxes) = self.virtualizable_boxes.as_ref() else {
             return false;
         };
         for (i, field) in info.static_fields.iter().enumerate() {
-            let Some(shadow) = values.get(i) else {
+            let Some(&op) = boxes.get(i) else {
                 break;
+            };
+            let Some(shadow) = self.box_runtime_concrete(op) else {
+                continue;
             };
             let bits = unsafe { info.read_field(vable_ptr, i) };
             let heap = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
-            if *shadow != heap {
+            if shadow != heap {
                 return true;
             }
         }
@@ -4782,10 +4788,8 @@ impl TraceCtx {
             return;
         };
         let Some(shadow) = self
-            .virtualizable_values
-            .as_ref()
-            .and_then(|v| v.get(vsd_idx))
-            .copied()
+            .virtualizable_box_at(vsd_idx)
+            .and_then(|op| self.box_runtime_concrete(op))
         else {
             return;
         };
@@ -6180,6 +6184,7 @@ impl TraceCtx {
             // `set_opref_concrete`, so cache-hit sanity readers retrieve
             // it through `box_value(cached)`.
             self.heapcache_setfield_cached(vable_opref, field_index, value);
+            let vable_concrete = self.concrete_of_opref(vable_opref);
             if let Some(stored) = stored
                 && let Some(ptr) = match vable_concrete {
                     Some(Value::Ref(r)) => live_gc_ptr(r),

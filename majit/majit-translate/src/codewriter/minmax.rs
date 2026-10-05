@@ -328,6 +328,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: segments.iter().map(|s| (*s).to_string()).collect(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args((0..nargs).map(|_| Variable::new())),
                 result_ty: ValueType::Int,
@@ -505,6 +506,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
                 result_ty: ValueType::Int,

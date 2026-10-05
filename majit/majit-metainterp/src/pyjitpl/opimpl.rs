@@ -9126,7 +9126,8 @@ where
         };
         let (opref, _) = self.read_int_reg(ctx, src);
         let value = ctx.is_likely_virtual(opref) as i64;
-        self.set_int_reg(ctx, dest, Some(ctx.const_int(value)), Some(value));
+        let dest_box = ctx.const_int(value);
+        self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
         TraceAction::Continue
     }
 

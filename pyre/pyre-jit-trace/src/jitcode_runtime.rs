@@ -2436,12 +2436,17 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // records the byte and a guard-failure resume panics here.
     // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
     // omits that key.
+    // `setarrayitem_raw_i` is the store half of `ll_vec_reverse` /
+    // `ll_setitem_fast` (`rlist.py ll_reverse`, `blackhole.py`
+    // `bhimpl_setarrayitem_raw_i`). The handler is already wired; the
+    // assembler numbers the key only once a graph actually emits it.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
         "recursive_call_f/iIRFIRF>f",
         "recursive_call_v/iIRFIRF",
         "getarrayitem_raw_i/iid>i",
+        "setarrayitem_raw_i/iiid",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()
