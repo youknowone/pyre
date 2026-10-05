@@ -104,8 +104,14 @@ impl OperatorTail {
     /// its `*_return` and the caller's call-result register share.
     fn tail_call(self) -> (i64, char) {
         match self {
-            OperatorTail::Len => (bh_len_tail as *const () as i64, 'r'),
-            OperatorTail::Truth => (bh_truth_bool_tail as *const () as i64, 'i'),
+            OperatorTail::Len => (
+                pyre_interpreter::residual_word_addr!(1, bh_len_tail) as i64,
+                'r',
+            ),
+            OperatorTail::Truth => (
+                pyre_interpreter::residual_word_addr!(1, bh_truth_bool_tail) as i64,
+                'i',
+            ),
         }
     }
 }

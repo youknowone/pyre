@@ -284,7 +284,8 @@ macro_rules! invoke_stub {
 /// Same argument slots as [`invoke_stub`], but the Rust ABI. A two-word
 /// return such as `Option<*mut T>` is a scalar pair in registers on SysV
 /// and on Win64. `extern "C"` `(i64, i64)` is a hidden return buffer on
-/// Win64 and would shift the callee's arguments.
+/// Win64 and would shift the callee's arguments. wasm32 `bh_call_r` uses
+/// the word stub (`dispatch_word_stub`).
 macro_rules! invoke_stub_rust {
     ($func:ident, $args:ident, $ret:ty $(, $class:ident)*) => {{
         let f: unsafe extern "Rust" fn($(invoke_ty!($class)),*) -> $ret =
@@ -449,7 +450,9 @@ macro_rules! define_call_sig_stubs {
 
         /// Both return words. `Option<*mut T>` puts the discriminant in the
         /// first and the pointer in the second; a one-word return leaves the
-        /// value in the first.
+        /// value in the first. wasm32 uses [`dispatch_word_stub`] instead:
+        /// the descr FUNC is `(i64…) -> i64`.
+        #[cfg(not(target_arch = "wasm32"))]
         unsafe fn call_pair(func: usize, classes: &[ArgClass], args: &[i64]) -> (i64, i64) {
             match classes {
                 $(
@@ -552,19 +555,32 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// word. The published target's wasm type is that word. A callee with no
 /// single wasm function type stays on the host hook.
 ///
+/// Native reads both return words so `Option<*mut T>` yields the pointer
+/// (`ref_word_from_return_pair`). wasm32 `call_indirect` type-checks the
+/// descr FUNC `(i64…) -> i64` (`descr.py CallDescr.create_call_stub`); that
+/// is the same word stub `bh_call_i` uses.
+///
 /// # Safety
 /// `func` must match `classes`, and its result must be a GCREF.
 pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    if let Some(value) = wasm_residual_host_call(func, args, classes, 'r', false, 8) {
-        return value;
+    #[cfg(target_arch = "wasm32")]
+    {
+        unsafe { dispatch_word_stub(func, classes, args, 'r') }
     }
-    let (first, second) = unsafe { call_pair(func, classes, args) };
-    ref_word_from_return_pair(first, second)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(value) = wasm_residual_host_call(func, args, classes, 'r', false, 8) {
+            return value;
+        }
+        let (first, second) = unsafe { call_pair(func, classes, args) };
+        ref_word_from_return_pair(first, second)
+    }
 }
 
 /// A one-word pointer, and a niche `Option<&T>`, is the first return word.
 /// `Option<*mut T>` is the discriminant then the pointer; discriminant 1 is
 /// not an aligned address.
+#[cfg(not(target_arch = "wasm32"))]
 fn ref_word_from_return_pair(first: i64, second: i64) -> i64 {
     if first == 1 { second } else { first }
 }
@@ -1519,5 +1535,23 @@ mod tests {
         };
         assert_eq!(again, 321);
         assert!(descr.call_stub.get().is_some());
+    }
+
+    /// Native `bh_call_r` reads both return words so `Option<*mut T>`
+    /// yields the pointer (`ref_word_from_return_pair`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bh_call_r_dispatch_reads_the_option_payload() {
+        let _hook_test = hold_hook_test_lock();
+        fn option_some() -> Option<*mut u8> {
+            Some(0x2000 as *mut u8)
+        }
+        fn option_none() -> Option<*mut u8> {
+            None
+        }
+        let some = unsafe { bh_call_r_dispatch(option_some as *const () as usize, &[], &[]) };
+        let none = unsafe { bh_call_r_dispatch(option_none as *const () as usize, &[], &[]) };
+        assert_eq!(some, 0x2000);
+        assert_eq!(none, 0);
     }
 }

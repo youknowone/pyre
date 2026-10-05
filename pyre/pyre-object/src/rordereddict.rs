@@ -902,10 +902,18 @@ where
     }
 }
 
+/// Residual ABI for the `look_inside_iff` trampolines: every slot is a
+/// calldescr word. `d` / `key` are pointers; `hash` is Signed
+/// (`ll_dict_lookup(d, key, hash, flag)`, `ENTRY.f_hash`). Cast to the
+/// internal `u64` hasher / `&T` shape inside the trampoline, not in `RDict`.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 #[majit_macros::oopspec("ordereddict.lookup")]
-pub fn ll_dict_lookup_trampoline<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
+pub fn ll_dict_lookup_trampoline<K, V, S, Q>(
+    d: *const RDict<K, V, S>,
+    hash: i64,
+    key: *const Q,
+) -> i64
 where
     K: Hash + Eq + Copy + EntryDummy,
     V: Copy + EntryDummy,
@@ -913,7 +921,7 @@ where
     (K, V): GcEntriesType,
     Q: Equivalent<K> + ?Sized,
 {
-    ll_dict_lookup_orig(d, hash, key)
+    ll_dict_lookup_orig(unsafe { &*d }, hash as u64, unsafe { &*key }) as i64
 }
 
 pub fn ll_dict_lookup<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> isize
@@ -927,7 +935,7 @@ where
     if !majit_rlib::jit::we_are_jitted() || rdict_lookup_iff(d, hash, key) {
         ll_dict_lookup_orig(d, hash, key)
     } else {
-        ll_dict_lookup_trampoline(d, hash, key)
+        ll_dict_lookup_trampoline(d, hash as i64, key) as isize
     }
 }
 
@@ -936,14 +944,14 @@ pub fn ll_dict_len<K, V, S>(d: &RDict<K, V, S>) -> usize {
     if !majit_rlib::jit::we_are_jitted() || rdict_isvirtual(d) {
         d.num_live_items
     } else {
-        ll_dict_len_trampoline(d)
+        ll_dict_len_trampoline(d) as usize
     }
 }
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub fn ll_dict_len_trampoline<K, V, S>(d: &RDict<K, V, S>) -> usize {
-    d.num_live_items
+pub fn ll_dict_len_trampoline<K, V, S>(d: *const RDict<K, V, S>) -> i64 {
+    unsafe { (*d).num_live_items as i64 }
 }
 
 /// `_ll_dictnext`. Next live slot at or after `from`, or `-1`.
@@ -952,7 +960,7 @@ pub fn ll_dictnext<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
     if !majit_rlib::jit::we_are_jitted() || rdict_isvirtual(d) {
         ll_dictnext_orig(d, from)
     } else {
-        ll_dictnext_trampoline(d, from)
+        ll_dictnext_trampoline(d, from as i64) as isize
     }
 }
 
@@ -965,8 +973,8 @@ fn ll_dictnext_orig<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub fn ll_dictnext_trampoline<K, V, S>(d: &RDict<K, V, S>, from: usize) -> isize {
-    ll_dictnext_orig(d, from)
+pub fn ll_dictnext_trampoline<K, V, S>(d: *const RDict<K, V, S>, from: i64) -> i64 {
+    ll_dictnext_orig(unsafe { &*d }, from as usize) as i64
 }
 
 /// `ll_dict_contains`. look_inside_iff(isvirtual(d)).
@@ -981,13 +989,17 @@ where
     if !majit_rlib::jit::we_are_jitted() || rdict_lookup_iff(d, hash, key) {
         ll_dict_lookup_orig(d, hash, key) >= 0
     } else {
-        ll_dict_contains_trampoline(d, hash, key)
+        ll_dict_contains_trampoline(d, hash as i64, key) != 0
     }
 }
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub fn ll_dict_contains_trampoline<K, V, S, Q>(d: &RDict<K, V, S>, hash: u64, key: &Q) -> bool
+pub fn ll_dict_contains_trampoline<K, V, S, Q>(
+    d: *const RDict<K, V, S>,
+    hash: i64,
+    key: *const Q,
+) -> i64
 where
     K: Hash + Eq + Copy + EntryDummy,
     V: Copy + EntryDummy,
@@ -995,7 +1007,7 @@ where
     (K, V): GcEntriesType,
     Q: Equivalent<K> + ?Sized,
 {
-    ll_dict_lookup_orig(d, hash, key) >= 0
+    (ll_dict_lookup_orig(unsafe { &*d }, hash as u64, unsafe { &*key }) >= 0) as i64
 }
 
 /// `ll_dict_resize.oopspec = 'odict.resize(d)'`. Residual when not looked
@@ -1036,7 +1048,7 @@ where
     if !majit_rlib::jit::we_are_jitted() || rdict_isvirtual_mut(d) {
         ll_dict_grow_orig(d)
     } else {
-        ll_dict_grow_trampoline(d)
+        ll_dict_grow_trampoline(d) != 0
     }
 }
 
@@ -1068,14 +1080,14 @@ where
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub fn ll_dict_grow_trampoline<K, V, S>(d: &mut RDict<K, V, S>) -> bool
+pub fn ll_dict_grow_trampoline<K, V, S>(d: *mut RDict<K, V, S>) -> i64
 where
     K: Hash + Eq + Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
-    ll_dict_grow_orig(d)
+    ll_dict_grow_orig(unsafe { &mut *d }) as i64
 }
 
 /// `_ll_dict_setitem_lookup_done`. `i >= 0` is the live slot; `i < 0` inserts.
@@ -1095,7 +1107,7 @@ pub fn ll_dict_setitem_lookup_done<K, V, S>(
     if !majit_rlib::jit::we_are_jitted() || rdict_setitem_lookup_done_iff(d, hash, i, key, value) {
         ll_dict_setitem_lookup_done_orig(d, hash, i, key, value);
     } else {
-        ll_dict_setitem_lookup_done_trampoline(d, hash, i, key, value);
+        ll_dict_setitem_lookup_done_trampoline(d, hash as i64, i as i64, key, value);
     }
 }
 
@@ -1148,9 +1160,9 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
-    d: &mut RDict<K, V, S>,
-    hash: u64,
-    i: isize,
+    d: *mut RDict<K, V, S>,
+    hash: i64,
+    i: i64,
     key: K,
     value: V,
 ) where
@@ -1159,7 +1171,7 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
-    ll_dict_setitem_lookup_done_orig(d, hash, i, key, value);
+    ll_dict_setitem_lookup_done_orig(unsafe { &mut *d }, hash as u64, i as isize, key, value);
 }
 
 /// `_ll_dict_del`. look_inside_iff(isvirtual(d) and isconstant(i)).
@@ -1173,7 +1185,7 @@ where
     if !majit_rlib::jit::we_are_jitted() || rdict_del_iff(d, hash, index) {
         ll_dict_del_orig(d, hash, index);
     } else {
-        ll_dict_del_trampoline(d, hash, index);
+        ll_dict_del_trampoline(d, hash as i64, index as i64);
     }
 }
 
@@ -1202,14 +1214,14 @@ where
 
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub fn ll_dict_del_trampoline<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
+pub fn ll_dict_del_trampoline<K, V, S>(d: *mut RDict<K, V, S>, hash: i64, index: i64)
 where
     K: Hash + Eq + Copy + EntryDummy,
     V: Copy + EntryDummy,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
-    ll_dict_del_orig(d, hash, index);
+    ll_dict_del_orig(unsafe { &mut *d }, hash as u64, index as usize);
 }
 
 impl<K, V, S> RDict<K, V, S>

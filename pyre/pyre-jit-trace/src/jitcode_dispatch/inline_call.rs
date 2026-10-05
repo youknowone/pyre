@@ -2951,7 +2951,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         // The dict is mutable, so it cannot be the shared empty constant.
         let dict_op = crate::helpers::emit_trace_call_ref_typed(
             ctx.trace_ctx,
-            jit_empty_kwargs_dict as *const (),
+            pyre_interpreter::residual_word_addr!(0, jit_empty_kwargs_dict),
             &[],
             &[],
         );
@@ -12115,7 +12115,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             };
             let raw = crate::helpers::emit_trace_call_int_typed(
                 ctx.trace_ctx,
-                crate::helpers::jit_hash_normalize_digest as *const (),
+                pyre_interpreter::residual_word_addr!(1, crate::helpers::jit_hash_normalize_digest),
                 &[result],
                 &[majit_ir::Type::Ref],
             );
