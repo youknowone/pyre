@@ -2621,21 +2621,26 @@ impl Trace {
     /// `create_snapshot`; pyre factors it out so Phase B7's snapshot
     /// code is shorter and the assertion that the slot was indeed a
     /// guard 0-placeholder is always executed.
+    ///
+    /// `create_top_snapshot` runs while the guard is still the last
+    /// recorded op (`pyjitpl.py` `generate_guard` records, then
+    /// `capture_resumedata`). A delayed restamp of that same last
+    /// guard (the stream slot already holds a snapshot offset) uses
+    /// `patch_descr_slot_at` on the named slot instead of rewinding
+    /// `_pos`.
+    pub(crate) fn last_descr_slot_is_placeholder(&self) -> bool {
+        self._pos >= 2 && self._ops[self._pos - 2] == 0 && self._ops[self._pos - 1] == 0
+    }
+
     #[allow(dead_code)]
     pub(crate) fn patch_last_guard_descr_slot(&mut self, snapshot_index: i64) {
         debug_assert!(
             self._pos >= 2,
             "patch_last_guard_descr_slot called with _pos < 2"
         );
-        debug_assert_eq!(
-            self._ops[self._pos - 2],
-            0u8,
-            "guard descr placeholder byte 0 was not \\x00"
-        );
-        debug_assert_eq!(
-            self._ops[self._pos - 1],
-            0u8,
-            "guard descr placeholder byte 1 was not \\x00"
+        debug_assert!(
+            self.last_descr_slot_is_placeholder(),
+            "guard descr placeholder was not \\x00\\x00"
         );
         self._pos -= 2;
         self.append_int(snapshot_index);

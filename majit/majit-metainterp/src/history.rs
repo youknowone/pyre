@@ -547,6 +547,25 @@ impl TreeLoop {
         !opref.is_none() && !opref.is_constant()
     }
 
+    #[inline]
+    fn is_inputarg_ref(opref: OpRef) -> bool {
+        matches!(
+            opref,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        )
+    }
+
+    /// Producer of `r` in `self.ops`. After value boxes are numbered by
+    /// opencoder `_index` (`FrontendOp.get_position()`), `r.raw()` is not
+    /// an `ops` vector index — void ops share the `_count` sequence and
+    /// occupy slots that `_index` skips. Match the recorded `op.pos`.
+    fn op_defining(&self, r: OpRef) -> Option<&OpRc> {
+        if !Self::is_runtime_opref(r) || Self::is_inputarg_ref(r) {
+            return None;
+        }
+        self.ops.iter().find(|op| op.pos().get() == r)
+    }
+
     pub fn inputargs_cloned(&self) -> Vec<InputArgRc> {
         self.inputargs.clone()
     }
@@ -844,7 +863,6 @@ impl TreeLoop {
         use indexmap::IndexSet;
         use std::collections::VecDeque;
 
-        let num_original_inputargs = self.inputargs.len() as u32;
         let cut_ops = &self.ops[start.op_index..];
 
         // Phase 1: Build initial remap from original_boxes → new inputargs.
@@ -989,7 +1007,7 @@ impl TreeLoop {
             let mut extra: Vec<OpRef> = Vec::new();
             let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
             while let Some((r, is_root)) = stack.pop() {
-                if r.raw() < num_original_inputargs {
+                if Self::is_inputarg_ref(r) {
                     // A missing slot and an explicit `OpRef::None` (a bridge
                     // hole) are the same: there is no value to bake in, and a
                     // loop cut must not invent an inputarg for it.
@@ -1007,7 +1025,7 @@ impl TreeLoop {
                 if !seen.insert(r) {
                     continue;
                 }
-                let op = self.ops.get((r.raw() - num_original_inputargs) as usize)?;
+                let op = self.op_defining(r)?;
                 if !op.opcode.is_always_pure() {
                     if promote_snapshot_inputargs && is_root {
                         return Some(SnapshotSeed::Promote);
@@ -1071,11 +1089,7 @@ impl TreeLoop {
                     }
                     let Some(seed) = snapshot_cone_is_reemittable(r) else {
                         if crate::majit_log_enabled() {
-                            let root = r
-                                .raw()
-                                .checked_sub(num_original_inputargs)
-                                .and_then(|i| self.ops.get(i as usize))
-                                .map(|op| op.opcode);
+                            let root = self.op_defining(*r).map(|op| op.opcode);
                             eprintln!(
                                 "[jit][cut-decline] snapshot-only ref {r:?} (root {root:?}) \
                                  has a definition cone that is not replay-safe; \
@@ -1089,7 +1103,7 @@ impl TreeLoop {
                         // definition: re-executing a load or a call is the
                         // replay this path exists to avoid.
                         escaped_set.insert(*r);
-                        if r.raw() >= num_original_inputargs {
+                        if !Self::is_inputarg_ref(*r) {
                             promoted_ops.insert(*r);
                         }
                         continue;
@@ -1113,13 +1127,12 @@ impl TreeLoop {
 
         // BFS: transitively collect dependencies of escaped ops.
         while let Some(esc_ref) = queue.pop_front() {
-            if esc_ref.raw() < num_original_inputargs {
+            if Self::is_inputarg_ref(esc_ref) {
                 // Original inputarg of the full trace — must become a new
                 // inputarg (handled in phase 3 below).
                 continue;
             }
-            let op_idx = (esc_ref.raw() - num_original_inputargs) as usize;
-            if let Some(op) = self.ops.get(op_idx) {
+            if let Some(op) = self.op_defining(esc_ref) {
                 for arg in op.args_slice().iter() {
                     if is_pre_cut_ref(&arg.to_opref()) && escaped_set.insert(arg.to_opref()) {
                         queue.push_back(arg.to_opref());
@@ -1136,7 +1149,7 @@ impl TreeLoop {
         let mut op_escaped: Vec<OpRef> = Vec::new();
         let mut promoted_op_refs: Vec<OpRef> = Vec::new();
         for &r in &escaped_set {
-            if r.raw() < num_original_inputargs {
+            if Self::is_inputarg_ref(r) {
                 orig_inputarg_escaped.push(r);
             } else if promoted_ops.contains(&r) {
                 promoted_op_refs.push(r);
@@ -1145,8 +1158,14 @@ impl TreeLoop {
             }
         }
         orig_inputarg_escaped.sort_by_key(|r| r.raw());
-        op_escaped.sort_by_key(|r| r.raw()); // preserve original order
-        promoted_op_refs.sort_by_key(|r| r.raw());
+        let ops_index = |r: OpRef| {
+            self.ops
+                .iter()
+                .position(|op| op.pos().get() == r)
+                .unwrap_or(usize::MAX)
+        };
+        op_escaped.sort_by_key(|r| ops_index(*r));
+        promoted_op_refs.sort_by_key(|r| ops_index(*r));
 
         // Phase 4: Build new inputargs.
         // If concrete initial values are available, escaped original inputargs
@@ -1182,8 +1201,11 @@ impl TreeLoop {
         // cut, same as an original inputarg the snapshot still names.  They
         // are not replayed.
         for &r in &promoted_op_refs {
-            let op_idx = (r.raw() - num_original_inputargs) as usize;
-            let tp = self.ops[op_idx].opcode.result_type();
+            let tp = self
+                .op_defining(r)
+                .unwrap_or_else(|| panic!("cut-trace promoted op {r:?} has no producer"))
+                .opcode
+                .result_type();
             remap.insert(r, OpRef::input_arg_typed(new_ia_boxes.len() as u32, tp));
             new_ia_boxes.push(r);
             new_ia_types.push(tp);
@@ -1219,13 +1241,12 @@ impl TreeLoop {
                         None => unreachable!("cut-trace operand references missing inputarg {r:?}"),
                     }
                 }
-                let idx = (r.raw() - new_inputargs_count) as usize;
-                match producers.get(idx) {
+                // Value boxes are numbered by opencoder `_index`, so
+                // `r.raw() - n` is not an `ops` vector index — void ops
+                // share the `_count` sequence and occupy slots `_index`
+                // skips. Match the reminted `op.pos`.
+                match producers.iter().find(|op| op.pos().get() == r) {
                     Some(rc) => Operand::from_bound_op(rc),
-                    // Producers are re-emitted in program order, so a consumer's
-                    // producer Rc always exists by the time the consumer is built;
-                    // a miss is a hard invariant violation, not a recoverable
-                    // fallback.
                     None => unreachable!("cut-trace operand references unbuilt producer {r:?}"),
                 }
             };
@@ -1234,22 +1255,38 @@ impl TreeLoop {
         // Result type comes from the original op's opcode so the new OpRef
         // variant matches RPython's IntOp/FloatOp/RefOp dispatch.
         for (next_ref, &r) in (new_inputargs_count..).zip(op_escaped.iter()) {
-            let op_idx = (r.raw() - num_original_inputargs) as usize;
-            let result_tp = self.ops[op_idx].opcode.result_type();
+            let result_tp = self
+                .op_defining(r)
+                .unwrap_or_else(|| panic!("cut-trace escaped op {r:?} has no producer"))
+                .opcode
+                .result_type();
             remap.insert(r, OpRef::op_typed(next_ref, result_tp));
         }
 
-        // Also assign fresh refs for post-cut ops (shifted by prefix count).
+        // Also assign fresh refs for post-cut ops. Value ops continue the
+        // opencoder `_index` sequence (inputargs + escaped prefix);
+        // void ops are `VoidOp` (`record_bytes`). Numbering by the ops
+        // vector index would put voids in the value-op space, so a later
+        // TraceIterator (which advances `_fresh` only for value ops) would
+        // see snapshot boxes and reminted ops at different positions.
         let prefix_count = op_escaped.len() as u32;
-        for (i, op) in cut_ops.iter().enumerate() {
-            if !op.pos().get().is_none() {
-                remap.insert(
-                    op.pos().get(),
-                    OpRef::op_typed(
-                        new_inputargs_count + prefix_count + i as u32,
-                        op.opcode.result_type(),
-                    ),
-                );
+        let mut next_index = new_inputargs_count + prefix_count;
+        let mut next_count = new_inputargs_count + prefix_count;
+        for op in cut_ops.iter() {
+            let old = op.pos().get();
+            let ty = op.opcode.result_type();
+            let new_ref = if ty != Type::Void {
+                let r = OpRef::op_typed(next_index, ty);
+                next_index += 1;
+                next_count += 1;
+                r
+            } else {
+                let r = OpRef::void_op(next_count);
+                next_count += 1;
+                r
+            };
+            if !old.is_none() {
+                remap.insert(old, new_ref);
             }
         }
 
@@ -1266,8 +1303,9 @@ impl TreeLoop {
         // Build prefix ops (re-emitted escaped definitions).
         let mut new_ops: Vec<OpRc> = Vec::with_capacity(op_escaped.len() + cut_ops.len());
         for (pi, &r) in op_escaped.iter().enumerate() {
-            let op_idx = (r.raw() - num_original_inputargs) as usize;
-            let orig_op = &self.ops[op_idx];
+            let orig_op = self
+                .op_defining(r)
+                .unwrap_or_else(|| panic!("cut-trace escaped op {r:?} has no producer"));
             // Deep-clone through the Rc: re-emitted prefix ops must have
             // fresh identity (new pos, fresh _forwarded) per
             // history.py:551-558 cut_trace_from re-emission.
@@ -1296,10 +1334,12 @@ impl TreeLoop {
             // fresh identity in the new trace per history.py:cut_trace_from
             // semantics (RPython makes new ResOperation objects).
             let mut new_op: Op = (**op).clone();
-            new_op.pos().set(OpRef::op_typed(
-                new_inputargs_count + prefix_count + i as u32,
-                new_op.opcode.result_type(),
-            ));
+            let old = op.pos().get();
+            let new_pos = remap
+                .get(&old)
+                .copied()
+                .unwrap_or_else(|| OpRef::void_op(new_inputargs_count + prefix_count + i as u32));
+            new_op.pos().set(new_pos);
             // optimizer.py:651-652 setarg loop parity.
             for j in 0..new_op.num_args() {
                 let arg = new_op.arg(j);
@@ -2309,6 +2349,44 @@ mod tests {
         };
         assert!(!r.is_none(), "snapshot slot mapped to NONE: {slot:?}");
         assert_eq!(r, cut.ops[0].pos().get());
+    }
+
+    #[test]
+    fn test_cut_trace_from_numbers_post_cut_value_ops_by_index() {
+        // A value op after a void guard keeps opencoder `_index` (the
+        // void is `_count` only). Numbering by the ops vector would put
+        // the sub at IntOp(2) while TraceIterator `_fresh` assigns IntOp(1),
+        // and the snapshot box would miss the reminted op.
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
+        add.pos().set(iop(1));
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        guard.pos().set(vop(2));
+        guard.set_rd_resume_position(0);
+        let mut sub = Op::new(OpCode::IntSub, &[iarg_box(0), iarg_box(0)]);
+        sub.pos().set(iop(3));
+        let mut jump = Op::new(OpCode::Jump, &[iop_box(3)]);
+        jump.pos().set(vop(4));
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(iop(3), Type::Int),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, vec![add, guard, sub, jump], snapshots);
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        let cut = trace
+            .cut_trace_from(start, &original_boxes)
+            .expect("cut declined unexpectedly");
+        let sub = cut
+            .ops
+            .iter()
+            .find(|op| op.opcode == OpCode::IntSub)
+            .expect("post-cut IntSub missing");
+        assert_eq!(sub.pos().get(), iop(1));
+        let slot = cut.snapshots[0].frames[0].boxes[0];
+        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+            panic!("snapshot slot lost its box: {slot:?}");
+        };
+        assert_eq!(r, sub.pos().get());
     }
 
     #[test]

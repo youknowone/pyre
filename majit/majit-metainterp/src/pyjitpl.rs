@@ -10828,17 +10828,21 @@ impl<M: Clone> MetaInterp<M> {
         // retrace whose original last live arg was `InputArg(2)`.
         unroll_opt.trace_inputargs = trace.inputargs.iter().map(|ia| ia.opref()).collect();
         unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
+        // `compile.py compile_retrace` `trace.cut_trace_from` is a view over
+        // the same opencoder buffer, so `get_iter` seeds `_cache` at the
+        // original `get_position()` and snapshots stay in that coordinate
+        // space. Our cut materializes a remapped `TreeLoop`;
+        // `prepare_retrace_snapshot` then rewrites `trace.snapshots` onto
+        // the reminted ops. The byte recorder still holds the uncut
+        // numbering — the same split `compile_loop` already makes with
+        // `number_from_recorder = cross_loop_cut.is_none()`.
         let (
             mut retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = if ctx.recorder.has_byte_buffer() {
-            snapshot_map_from_byte_recorder(&ctx.recorder, &mut constants)
-        } else {
-            snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs)
-        };
+        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut retrace_snapshot_boxes,
             &mut retrace_snapshot_vable_boxes,
@@ -10851,9 +10855,6 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_vref_boxes = retrace_snapshot_vref_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
-        if ctx.recorder.has_byte_buffer() {
-            unroll_opt.snapshot_recorder = Some(&ctx.recorder as *const crate::recorder::Trace);
-        }
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);

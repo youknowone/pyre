@@ -2759,19 +2759,17 @@ impl TraceCtx {
     /// used as a JUMP red — `box_for_operand` would otherwise bind it to
     /// the void producer.
     pub fn opref_is_void_producer(&self, r: OpRef) -> bool {
-        if r.is_none() || r.ty() == Some(Type::Void) {
+        if r.is_none() || r.ty() == Some(Type::Void) || matches!(r, OpRef::VoidOp(_)) {
             return true;
         }
         if r.is_constant() || r.is_input_arg() {
             return false;
         }
-        let n = self.recorder.num_inputargs();
-        let Some(idx) = (r.raw() as usize).checked_sub(n) else {
-            return false;
-        };
-        self.recorder.ops().get(idx).is_some_and(|op| {
-            op.pos().get().raw() == r.raw() && op.opcode.result_type() == Type::Void
-        })
+        // Byte-mode `ops` is empty until materialize. `opcode_of` reads
+        // FrontendSlots by `_index` / `_count` (`history.py getopnum`).
+        self.recorder
+            .opcode_of(r)
+            .is_some_and(|op| op.result_type() == Type::Void)
     }
 
     /// Input argument types in loop-header order.

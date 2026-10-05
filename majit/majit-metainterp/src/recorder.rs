@@ -706,7 +706,7 @@ impl Trace {
         // op is the guard just recorded (`opencoder.py` `_pos -= 2`).
         // A later non-guard must not be rewritten as if it were the
         // placeholder; delayed restamp walks the named guard instead.
-        let last_is_guard = self.last_recorded_is_guard();
+        let patch_last = self.last_guard_has_descr_placeholder();
         let offset = if snapshot.frames.is_empty() {
             let empty_array = self.write_tagged_array(&[]);
             let vable_array = self.write_tagged_array(&snapshot.vable_boxes);
@@ -752,7 +752,7 @@ impl Trace {
             }
             s
         };
-        if last_is_guard {
+        if patch_last {
             self.trb
                 .as_mut()
                 .expect("encode_captured_snapshot requires attach_byte_buffer")
@@ -764,6 +764,17 @@ impl Trace {
     fn last_recorded_is_guard(&self) -> bool {
         self.slots.last().is_some_and(|slot| slot.opcode.is_guard())
             || self.ops.last().is_some_and(|op| op.opcode.is_guard())
+    }
+
+    /// `create_top_snapshot` rewinds the last op's descr slot only while
+    /// that op is the guard just recorded with `descr=None`
+    /// (`pyjitpl.py` `generate_guard` / `opencoder.py` `_op_end`).
+    fn last_guard_has_descr_placeholder(&self) -> bool {
+        self.last_recorded_is_guard()
+            && self
+                .trb
+                .as_ref()
+                .is_some_and(|trb| trb.last_descr_slot_is_placeholder())
     }
 
     /// opencoder.py `Trace.capture_resumedata(framestack, ...)`.
@@ -779,8 +790,9 @@ impl Trace {
         all_liveness: &[u8],
     ) -> i32 {
         // `create_top_snapshot` patches the guard's trailing descr slot
-        // (`opencoder.py`) only while that guard is still last.
-        let last_is_guard = self.last_recorded_is_guard();
+        // (`opencoder.py`) only while that guard is still last and the
+        // slot is the 0-placeholder `record_op(..., descr=None)` wrote.
+        let last_is_guard = self.last_guard_has_descr_placeholder();
         // opencoder.py Trace.create_top_snapshot encodes the existing box
         // lists directly. `OpRef.raw()` is already `_index`.
         let num_inputs = self.inputargs.len();
@@ -913,7 +925,16 @@ impl Trace {
             .as_mut()
             .expect("record_bytes requires attach_byte_buffer");
         let void_seq = trb._count;
-        let box_index = trb.record_op(opcode, &boxes, descr.as_ref());
+        // `pyjitpl.py` `generate_guard` records `descr=None`. The stream
+        // descr slot is `rd_resume_position` (`opencoder.py`
+        // `create_top_snapshot`); a foriter marker stays on the
+        // FrontendSlot and is overlaid at materialize.
+        let stream_descr = if opcode.is_guard() {
+            None
+        } else {
+            descr.as_ref()
+        };
+        let box_index = trb.record_op(opcode, &boxes, stream_descr);
         let ty = opcode.result_type();
         if opcode.is_guard() {
             self.guard_count += 1;
@@ -927,7 +948,10 @@ impl Trace {
         };
         self.slots.push(FrontendSlot {
             opcode,
-            descr: None,
+            // Guard markers (range foriter) stay on the slot; the stream
+            // descr slot is `rd_resume_position`. Non-guard descrs live
+            // only in the encoded stream (`_encode_descr`).
+            descr: if opcode.is_guard() { descr } else { None },
             descr_pos,
         });
         let opref = if ty != Type::Void {
@@ -947,8 +971,17 @@ impl Trace {
         opref
     }
 
+    /// `_index` / `_count` prefix: `Trace(max_num_inputargs)` / TRB `_start`,
+    /// equal to `inputargs.len()` after `attach_byte_buffer`.
+    fn box_prefix(&self) -> u32 {
+        self.trb
+            .as_ref()
+            .map(|t| t._start)
+            .unwrap_or(self.inputargs.len() as u32)
+    }
+
     fn value_slot(&self, box_index: u32) -> Option<&ValueSlot> {
-        let n = self.inputargs.len() as u32;
+        let n = self.box_prefix();
         box_index
             .checked_sub(n)
             .and_then(|i| self.value_slots.get(i as usize))
@@ -988,15 +1021,14 @@ impl Trace {
                 }
             }
         }
-        let mut box_i = self.inputargs.len() as u32;
         for (i, op) in ops.iter().enumerate() {
             if op.opcode.result_type() != Type::Void {
-                if let Some(vs) = self.value_slot(box_i)
+                let p = op.pos().get().raw();
+                if let Some(vs) = self.value_slot(p)
                     && let Some(v) = vs.concrete.get()
                 {
                     op.set_value(v);
                 }
-                box_i += 1;
             }
             if let Some(d) = self.slots.get(i).and_then(|s| s.descr.clone()) {
                 op.setdescr(d);
@@ -1057,43 +1089,26 @@ impl Trace {
             }
         }
 
-        let mut max_index = self.box_count.saturating_sub(1);
-        for ia in live_inputargs {
-            max_index = max_index.max(ia.as_ref().opref().raw());
-        }
-        let mut unique_cache: Vec<Option<Operand>> = vec![None; (max_index as usize) + 1];
-
-        // history.py InputArg identity: ByteTraceIter already bound
-        // decoded operands to iter.inputargs. Return those boxes
-        // (compile.py compile_trace / #1839) instead of reminting.
-        for (i, src) in live_inputargs.iter().enumerate() {
-            let p = src.as_ref().opref().raw() as usize;
-            if p >= unique_cache.len() {
-                unique_cache.resize(p + 1, None);
-            }
-            unique_cache[p] = Some(Operand::from_bound_inputarg(&iter.inputargs[i]));
-        }
-
-        let mut box_i = self.inputargs.len();
+        // Overlay FrontendOp concrete by original `_index`. Value slots
+        // are `_index - prefix`; `op.pos()` is the iterator's `_fresh`
+        // remint (`TraceIterator` `cls()`), so it is not the slot key.
+        // `opencoder.py` `TraceIterator._cache` is keyed by `_index`.
+        let mut orig = trb._start;
         for (op, slot) in ops.iter().zip(self.slots.iter()) {
             if op.opcode.result_type() != Type::Void {
-                if let Some(vs) = self.value_slot(box_i as u32)
+                if let Some(vs) = self.value_slot(orig)
                     && let Some(v) = vs.concrete.get()
                 {
                     op.set_value(v);
                 }
-                if box_i >= unique_cache.len() {
-                    unique_cache.resize(box_i + 1, None);
-                }
-                unique_cache[box_i] = Some(Operand::from_bound_op(op));
-                box_i += 1;
+                orig += 1;
             }
             if let Some(d) = slot.descr.clone() {
                 op.setdescr(d);
             }
         }
 
-        Some((ops, iter.inputargs, unique_cache))
+        Some((ops, iter.inputargs, iter._cache))
     }
 
     /// Register an input argument of the given type.
@@ -1777,10 +1792,10 @@ impl Trace {
             return None;
         }
         if let OpRef::VoidOp(count) = opref {
-            let n = self.inputargs.len() as u32;
+            let n = self.box_prefix();
             return self.slot_by_seq(count.saturating_sub(n)).map(|s| s.opcode);
         }
-        let n = self.inputargs.len() as u32;
+        let n = self.box_prefix();
         let mut box_i = n;
         for s in &self.slots {
             if s.opcode.result_type() != Type::Void {
@@ -2012,7 +2027,7 @@ impl Default for Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{DescrRef, FailDescr, Type};
+    use majit_ir::{Descr, DescrRef, FailDescr, Type};
     use std::sync::Arc;
 
     /// The three constraints that pick [`UNSTAMPED_JITCODE_INDEX`], asserted
@@ -2446,6 +2461,80 @@ mod tests {
         assert_eq!(guards[0].rd_resume_position(), off0);
         assert_eq!(guards[1].opcode, OpCode::GuardValue);
         assert_eq!(guards[1].rd_resume_position(), off2);
+    }
+
+    #[test]
+    fn guard_with_marker_descr_keeps_stream_placeholder() {
+        // `generate_guard` records descr=None; a foriter marker lives on
+        // the FrontendSlot. The stream descr slot stays the 0-placeholder
+        // so `create_top_snapshot` can rewind it.
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        let marker = make_fail_descr(7);
+        rec.record_guard(OpCode::GuardTrue, &[i0], Some(marker.clone()));
+        let frame = SnapshotFrame {
+            jitcode_index: 1,
+            pc: 11,
+            boxes: vec![SnapshotTagged::Box(i0, Type::Int)],
+        };
+        let off = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off);
+        let ops = rec.materialize_ops();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].rd_resume_position(), off);
+        assert!(ops[0].has_descr());
+        assert!(std::sync::Arc::ptr_eq(&ops[0].getdescr().unwrap(), &marker));
+    }
+
+    #[test]
+    fn recapture_of_last_guard_restamps_named_slot() {
+        // First capture occupies `_snapshot_data`; a second capture while
+        // the same guard is still last must not rewind a non-placeholder
+        // descr slot (`create_top_snapshot` `_pos -= 2` only for `\x00\x00`).
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_guard(OpCode::GuardTrue, &[i0], None);
+        let frame = |pc: u32| SnapshotFrame {
+            jitcode_index: 1,
+            pc,
+            boxes: vec![SnapshotTagged::Box(i0, Type::Int)],
+        };
+        let off0 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(11)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off0);
+        rec.record_guard(OpCode::GuardFalse, &[i0], None);
+        let off1 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(22)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off1);
+        assert!(off1 > off0);
+        let off2 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(33)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off2);
+        assert!(off2 > off1);
+        let ops = rec.materialize_ops();
+        let guards: Vec<_> = ops.iter().filter(|op| op.opcode.is_guard()).collect();
+        assert_eq!(guards.len(), 2);
+        assert_eq!(guards[0].rd_resume_position(), off0);
+        assert_eq!(guards[1].rd_resume_position(), off2);
 
         let decoded = rec.decode_captured_snapshots().expect("byte mode");
         assert_eq!(decoded.len(), 2);
@@ -2574,6 +2663,73 @@ mod tests {
             descr.as_quasi_immut_descr().unwrap().constantfieldbox(),
             Some(Value::Ref(GcRef(0x2000)))
         );
+    }
+
+    #[test]
+    fn quasiimmut_field_materialize_keeps_the_wrapper() {
+        // `opencoder.py _encode_descr` sees `AbstractDescr.get_descr_index
+        // == -1` and appends the wrapper to `Trace._descrs`. Forwarding
+        // the field's `setup_descrs` slot would restore the FieldDescr
+        // and drop the qmut (`heap.py` `isinstance(qmutdescr,
+        // QuasiImmutDescr)`).
+        #[derive(Debug)]
+        struct Handle;
+        impl majit_ir::QuasiImmutHandle for Handle {
+            fn is_current(&self) -> bool {
+                true
+            }
+            fn register_loop_token(
+                &self,
+                _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>,
+            ) {
+            }
+            fn instance_identity(&self) -> usize {
+                1
+            }
+        }
+        let field = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Ref, false));
+        field.set_descr_index(0);
+        let qmut = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field as DescrRef,
+            0x10,
+            std::sync::Arc::new(Handle),
+            Some(Value::Ref(GcRef(0x1000))),
+        )) as DescrRef;
+        let mut rec = Trace::new();
+        let obj = rec.record_input_arg(Type::Ref);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_op_with_descr(OpCode::QuasiimmutField, &[obj], qmut.clone());
+        let ops = rec.materialize_ops();
+        assert_eq!(ops.len(), 1);
+        let restored = ops[0].getdescr().expect("stream descr");
+        assert!(restored.as_quasi_immut_descr().is_some());
+        assert!(std::sync::Arc::ptr_eq(&restored, &qmut));
+    }
+
+    #[test]
+    fn byte_mode_opcode_of_and_getfield_skip_voids() {
+        // Value OpRef.raw() is `_index`; voids are `_count`. A DebugMergePoint
+        // between two value ops must not hide the GetfieldGcR from
+        // `opcode_of` / `getfield_gc_r_at` (byte-mode `ops` is empty).
+        let mut rec = Trace::new();
+        let obj = rec.record_input_arg(Type::Ref);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        let dmp = rec.record_op(OpCode::DebugMergePoint, &[]);
+        assert!(matches!(dmp, OpRef::VoidOp(_)));
+        let field_sd =
+            std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Ref, false));
+        let field = field_sd as DescrRef;
+        let loaded = rec.record_op_with_descr(OpCode::GetfieldGcR, &[obj], field.clone());
+        rec.set_concrete_at(loaded.raw(), Value::Ref(GcRef(0x20)));
+        assert_eq!(rec.opcode_of(dmp), Some(OpCode::DebugMergePoint));
+        assert_eq!(rec.opcode_of(loaded), Some(OpCode::GetfieldGcR));
+        assert_eq!(rec.concrete_at(loaded.raw()), Some(Value::Ref(GcRef(0x20))));
+        let (descr, base) = rec
+            .getfield_gc_r_at(loaded.raw())
+            .expect("GetfieldGcR args from the stream");
+        assert!(std::sync::Arc::ptr_eq(&descr, &field));
+        assert_eq!(base, obj);
+        assert!(rec.ops().is_empty());
     }
 
     #[test]
