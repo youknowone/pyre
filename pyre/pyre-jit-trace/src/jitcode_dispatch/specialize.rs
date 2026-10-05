@@ -45,6 +45,36 @@ fn walker_recorded_builtin_raise_is_supported(
     })
 }
 
+/// `GETFIELD_GC_R(ec, sys_exc_value)` then `SETFIELD_GC(exc, active,
+/// w_context)`, plus the same write on the concrete exception so the
+/// authoritative walk observes `__context__`.
+fn walker_chain_exception_context<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ec: OpRef,
+    raised: OpRef,
+    exc: pyre_object::PyObjectRef,
+    kind: pyre_object::interp_exceptions::ExcKind,
+    user: bool,
+) {
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[raised, active],
+        crate::descr::w_exception_context_descr_for(kind, user),
+    );
+    fbw_context_chained_insert(raised);
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
+}
+
 fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     ec: OpRef,
@@ -113,27 +143,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(raised, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
     fbw_built_exc_insert(raised);
-
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[raised, active],
-        crate::descr::w_exception_context_descr_for(expected_kind, user),
-    );
-    fbw_context_chained_insert(raised);
-    // The authentic helper has published the raised exception but has not
-    // chained it yet during the authoritative walk.  Mirror the recorded
-    // field write so that iteration observes the same context as replay.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, raised, exc, expected_kind, user);
 
     fbw_count_executed_residual(false, true);
     let exc_concrete = ConcreteValue::Ref(exc);
@@ -10663,23 +10673,7 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
     );
     fbw_built_exc_insert(raised);
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[raised, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(raised);
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(concrete, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, raised, concrete, kind, user);
     fbw_count_executed_residual(true, true);
     ctx.set_last_exc_value(raised, ConcreteValue::Ref(concrete));
     ctx.fbw_mode.class_of_last_exc_is_const = true;
@@ -14339,34 +14333,7 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
         .class_now_known(new_op, exc_type_ptr as usize as i64);
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    // `__context__` chaining on the still-virtual exception, the tail
-    // `try_walker_trace_raise_bare_class` carries: `active = GETFIELD_GC_R(ec,
-    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`. Without it
-    // the catch-side `record_inline_exception_context` compensation finds the
-    // context unchained and passes this exception to the resolver call, which
-    // forces the very allocation this fold exists to keep virtual.
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    // Apply the same context write to the concrete exception, which the
-    // registration above stops the compensation from performing, so Python
-    // code reached later in this authoritative walk observes the
-    // `__context__` the recorded SETFIELD performs on compiled iterations.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, new_op, exc, kind, user);
 
     // Inline-built marker: the downstream raise routing records the frame
     // node via the virtual `record_fresh_application_traceback` instead of
@@ -17825,30 +17792,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         fbw_built_exc_insert(exc_op);
         return Ok(None);
     };
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[exc_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(exc_op);
-    // The full-body walk is also the authoritative execution of the
-    // tracing iteration.  Apply the same context write to its concrete,
-    // freshly-built exception that the recorded SETFIELD performs on later
-    // compiled iterations; otherwise Python code reached later in this walk
-    // observes a missing __context__ exactly once, while the trace itself is
-    // correct.  This object is private to the inline construction, so no
-    // rollback journal is needed.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, exc_op, exc, kind, user);
 
     // The normalized publish result is the same flat builtin instance;
     // forward the inline-built exc OpRef (carrying its concrete shadow)
@@ -17995,32 +17939,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         .class_now_known(new_op, exc_type_ptr as usize as i64);
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    // `__context__` chaining on the still-virtual exception, mirroring the
-    // `try_walker_trace_raise_builtin` tail: `active = GETFIELD_GC_R(ec,
-    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  `ec` came
-    // from `walker_ensure_execution_context` above, so the read shares the one
-    // seeded EC OpRef the PUSH_EXC_INFO / POP_EXCEPT lowering consumes.
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    // Apply the same context write to the concrete, freshly-built exception so
-    // Python code reached later in this authoritative walk observes the
-    // `__context__` the recorded SETFIELD performs on compiled iterations.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, new_op, exc, kind, user);
 
     // Mark the inline-built instance FBW-built so the following `raise/r`
     // records its frame node via the virtual `record_fresh_application_
