@@ -9199,6 +9199,7 @@ mod tests {
             size: 32,
             type_id: 0xc1a5_0000_57ea_d001,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: wire,
@@ -9225,6 +9226,7 @@ mod tests {
             size: 24,
             type_id: 7,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![
@@ -9298,6 +9300,7 @@ mod tests {
             size: 232,
             type_id,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -9402,6 +9405,7 @@ mod tests {
             size: 32,
             type_id: 0xFA70_DA7A_0000_0003,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -9436,6 +9440,7 @@ mod tests {
             size: 32,
             type_id: 0xFA70_DA7A_0000_0006,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -9551,6 +9556,7 @@ mod tests {
             size: 32,
             type_id: 0xFA70_DA7A_0000_0007,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -9680,6 +9686,7 @@ mod tests {
             size: std::mem::size_of::<usize>(),
             type_id: 3938139489201595032,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![capacity.clone()],
@@ -10073,6 +10080,7 @@ mod tests {
             size: 16,
             type_id,
             vtable: 1,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -10332,6 +10340,7 @@ mod tests {
             size: 16,
             type_id: 11,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: fields.clone(),
@@ -12247,6 +12256,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     size: *size,
                     type_id: *type_id,
                     vtable: *vtable,
+                    owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless,
                     all_fielddescrs: all_fielddescrs.clone(),

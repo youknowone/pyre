@@ -1811,6 +1811,12 @@ pub struct BhSizeSpec {
     /// either way — consumers treat them as opaque identity words and
     /// re-resolve real vtables via `type_id` → `gc_cache` publish.
     pub vtable: u64,
+    /// `BhDescr::Size.owner`: type-static name while `vtable` is a
+    /// sentinel, `STRUCT._name` otherwise, or the headerless marker.
+    /// Packed at the end of the record so `peek_header` still reads
+    /// `type_id` and field count without the name bytes.
+    #[serde(default)]
+    pub owner: String,
     /// True when the struct carries a GC header (`ref - 8` type-id word),
     /// false for a natively-allocated raw struct registered via
     /// `register_struct_layout`.  Threaded to `SimpleSizeDescr.is_gc_managed`
@@ -1901,6 +1907,7 @@ impl BhSizeSpec {
                 Some(true) => 2,
             });
         }
+        push_str(out, &self.owner);
         let body_len = u32::try_from(out.len() - body_at).expect("layout record exceeds u32");
         out[len_at..len_at + 4].copy_from_slice(&body_len.to_le_bytes());
     }
@@ -1950,11 +1957,13 @@ impl BhSizeSpec {
                 is_class_word,
             });
         }
+        let owner = cursor.string();
         (
             Self {
                 size,
                 type_id,
                 vtable,
+                owner,
                 is_gc_managed: flags & 1 != 0,
                 headerless: flags & 2 != 0,
                 all_fielddescrs,
@@ -2038,6 +2047,7 @@ impl BhSizeSpec {
                 is_class_word,
             });
         }
+        let _owner = cursor.str_ref();
         (
             StaticParentLayout {
                 size,
@@ -2202,6 +2212,7 @@ mod layout_pack_tests {
             size: 24,
             type_id: 0xabc,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -2231,12 +2242,34 @@ mod layout_pack_tests {
         let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
         assert_eq!(static_consumed, leaked.len());
+        assert_eq!(decoded.owner, spec.owner);
         assert_eq!(layout.fields[0].name, "W_IntObject.intval");
         assert!(
             leaked
                 .as_ptr_range()
                 .contains(&layout.fields[0].name.as_ptr())
         );
+    }
+
+    #[test]
+    fn pack_roundtrip_keeps_the_type_static_owner() {
+        let spec = BhSizeSpec {
+            size: 16,
+            type_id: 0xdef,
+            vtable: 0x7fff_ff00,
+            owner: "INT_TYPE".into(),
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        spec.pack_into(&mut bytes);
+        let (decoded, consumed) = BhSizeSpec::unpack_from(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, spec);
+        let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
+        assert_eq!(type_id, spec.type_id);
+        assert_eq!(nfields, 0);
     }
 }
 
@@ -3323,6 +3356,11 @@ pub fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> BhSizeSpe
         // path_hash key, polluting cross-path identity.
         type_id: sd.cache_key(),
         vtable: sd.vtable() as u64,
+        owner: if sd.headerless() {
+            HEADERLESS_SIZE_OWNER_MARKER.to_string()
+        } else {
+            String::new()
+        },
         // Round-trip the GC-header flag off the descr so a raw native
         // struct stays raw through the inverse path (it must not regain
         // a spurious `GUARD_GC_TYPE`).
@@ -3354,6 +3392,7 @@ pub fn bh_interior_field_specs_from_array_descr(
                     size: array_descr.item_size(),
                     type_id: 0,
                     vtable: 0,
+                    owner: String::new(),
                     is_gc_managed: true,
                     headerless: false,
                     all_fielddescrs: vec![field.clone()],

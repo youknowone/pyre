@@ -4489,6 +4489,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         // setfield acquire different parents.
         type_id: bh_size_type_id(owner, layout_owner, is_gc_managed),
         vtable: 0,
+        owner: String::new(),
         all_fielddescrs,
     })
 }

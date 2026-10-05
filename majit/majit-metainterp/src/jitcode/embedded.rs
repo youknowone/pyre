@@ -342,6 +342,7 @@ mod tests {
                 size: 8,
                 type_id: 0x475241494e454649,
                 vtable: 0,
+                owner: String::new(),
                 is_gc_managed: false,
                 headerless: true,
                 all_fielddescrs: vec![BhFieldSpec {

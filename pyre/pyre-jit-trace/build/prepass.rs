@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v22";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v23";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -950,6 +950,7 @@ fn opcode_published_descr_members(
                     size: *size,
                     type_id: *type_id,
                     vtable: *vtable,
+                    owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
                     all_fielddescrs: all_fielddescrs.clone(),
@@ -1841,6 +1842,7 @@ fn real_main() {
                     size: *size,
                     type_id: *type_id,
                     vtable: *vtable,
+                    owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
                     headerless: owner == "__majit_headerless_size__",
                     all_fielddescrs: all_fielddescrs.clone(),

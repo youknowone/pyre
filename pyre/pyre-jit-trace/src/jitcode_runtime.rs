@@ -1139,10 +1139,10 @@ fn descr_from_indexed_bytes(bytes: &[u8], size_type_id: u64) -> BhDescr {
             "packed size record did not fill its descrs.bin slot"
         );
         assert_eq!(spec.type_id, size_type_id);
-        let owner = if spec.headerless {
+        let owner = if spec.headerless && spec.owner.is_empty() {
             "__majit_headerless_size__".to_string()
         } else {
-            String::new()
+            spec.owner
         };
         return BhDescr::Size {
             size: spec.size,
@@ -3196,10 +3196,11 @@ mod tests {
     #[test]
     fn packed_size_slot_decodes_without_bincode() {
         use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec};
-        let spec = BhSizeSpec {
+        let mut spec = BhSizeSpec {
             size: 24,
             type_id: 0xA11C_E501,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: vec![BhFieldSpec {
@@ -3232,6 +3233,21 @@ mod tests {
         assert!(owner.is_empty());
         assert_eq!(all_fielddescrs.len(), 1);
         assert_eq!(all_fielddescrs[0].field_key(), "slot");
+
+        spec.owner = "INT_TYPE".into();
+        spec.vtable = 0x7fff_ff00;
+        let mut named = Vec::new();
+        spec.pack_into(&mut named);
+        let BhDescr::Size {
+            owner: named_owner,
+            vtable: named_vtable,
+            ..
+        } = descr_from_indexed_bytes(&named, spec.type_id)
+        else {
+            panic!("packed size slot must keep owner");
+        };
+        assert_eq!(named_owner, "INT_TYPE");
+        assert_eq!(named_vtable, 0x7fff_ff00);
 
         let raw = bincode::serialize(&BhDescr::VableField { index: 3 }).unwrap();
         assert!(matches!(
