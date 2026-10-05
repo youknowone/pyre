@@ -3262,7 +3262,7 @@ pub enum DispatchError {
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
     /// `add_const_i` + patch at `finish()`), so an unresolved slot is a
     /// structural encoding bug, mirroring the `expect` on
-    /// `frame.int_values[slot]` in majit's `BC_LOOP_HEADER` arm
+    /// `frame.getint(ctx, slot)` in majit's `BC_LOOP_HEADER` arm
     /// (`pyjitpl/dispatch.rs`).
     LoopHeaderJdIndexUnresolved { pc: usize },
     /// An `inline_call_*` sub-walk surfaced `DispatchOutcome::CloseLoop`.
@@ -9224,19 +9224,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // handler takes the latch. The adopters bridge the pre-drive publication
     // window and the blackhole drivers then install their own packed roots.
     //
-    // A `MIFrame` stores each Ref register twice — the `OpRef` box and the
-    // `ref_values` concrete mirror — and the two are kept fresh by two
-    // different walkers.  `MetaInterp::walk_active_trace_refs` forwards the
-    // boxes while a trace is being recorded; once the frames are latched here
-    // that walker no longer reaches them, so both halves are forwarded below.
-    // Forwarding only the mirror leaves whichever half a future reader picks
-    // deciding whether it sees a moved object, which is not a property a
-    // reader can check.
+    // A `MIFrame` stores each Ref register as the box itself. Once the
+    // frames are latched here, `MetaInterp::walk_active_trace_refs` no
+    // longer reaches them, so ConstPtr gcrefs are forwarded below.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
-        for value in latched.miframe.ref_values.iter_mut().flatten() {
-            visitor(unsafe { &mut *(value as *mut i64).cast() });
-        }
         for slot in latched.miframe.ref_regs.iter_mut() {
             if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                 visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
@@ -9260,10 +9252,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
         for frame in latched.framestack.frames.iter_mut() {
-            for value in frame.ref_values.iter_mut().flatten() {
-                visitor(unsafe { &mut *(value as *mut i64).cast() });
-            }
-            // Both halves, for the reason the single-frame arm gives.
             for slot in frame.ref_regs.iter_mut() {
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });

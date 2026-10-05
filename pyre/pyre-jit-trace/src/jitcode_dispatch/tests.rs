@@ -1862,12 +1862,12 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     .expect("an arbitrary post-step pc must not require a -live- marker");
     assert_eq!(miframe.pc, 1);
     assert_eq!(
-        miframe.ref_values[1],
+        miframe.ref_value_for_blackhole(1),
         Some(exc_obj_ptr as i64),
         "the complete-bank image must retain non-constant register concrete values",
     );
     assert_eq!(
-        miframe.ref_values[2],
+        miframe.ref_value_for_blackhole(2),
         Some(forwarded_obj_ptr as i64),
         "the complete-bank image must prefer the GC-forwarded Box payload",
     );

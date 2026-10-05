@@ -4977,7 +4977,6 @@ mod tests {
         let mut frame = crate::pyjitpl::MIFrame::new(jc, 0);
         frame.pc = 0;
         frame.int_regs[0] = Some(majit_ir::OpRef::int_op(1));
-        frame.int_values[0] = Some(123);
 
         let mut stack = vec![frame];
         let snap = buf.capture_resumedata(

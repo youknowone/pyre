@@ -3204,29 +3204,33 @@ impl<S: JitState> JitDriver<S> {
             .map_or(std::ptr::null(), std::sync::Arc::as_ptr);
         let root = framestack.frames.first_mut()?;
         if let Some(slot) = layout.vable_identity_ref_slot()
-            && slot < root.ref_values.len()
+            && slot < root.ref_regs.len()
         {
-            root.ref_values[slot] = Some(virtualizable_ptr);
+            root.ref_regs[slot] = Some(majit_ir::OpRef::const_ptr(majit_ir::GcRef(
+                virtualizable_ptr as usize,
+            )));
         }
         // `scalar_values` is `[int scalars.., float scalars..]` — the order
         // `collect_scalar_state_field_values` builds and
         // `writeback_scalar_state_fields_from_values` consumes.
         for (field_idx, value) in scalar_values.iter().take(layout.num_scalars).enumerate() {
             let slot = layout.scalar_slot(field_idx);
-            if slot < root.int_values.len() {
-                root.int_values[slot] = Some(*value);
+            if slot < root.int_regs.len() {
+                root.int_regs[slot] = Some(majit_ir::OpRef::const_int(*value));
             }
         }
         for (field_idx, value) in scalar_values.iter().skip(layout.num_scalars).enumerate() {
             let slot = layout.float_scalar_slot(field_idx);
-            if slot < root.float_values.len() {
-                root.float_values[slot] = Some(*value);
+            if slot < root.float_regs.len() {
+                root.float_regs[slot] =
+                    Some(majit_ir::OpRef::const_float(f64::from_bits(*value as u64)));
             }
         }
         for (field_idx, value) in ref_scalar_values.iter().enumerate() {
             let slot = layout.ref_scalar_slot(field_idx);
-            if slot < root.ref_values.len() {
-                root.ref_values[slot] = Some(*value);
+            if slot < root.ref_regs.len() {
+                root.ref_regs[slot] =
+                    Some(majit_ir::OpRef::const_ptr(majit_ir::GcRef(*value as usize)));
             }
         }
 
@@ -5523,11 +5527,24 @@ impl<S: JitState> JitDriver<S> {
                         // sym's state-field image so the `jit_merge_point!` hook can
                         // finish the half-executed opcodes in the blackhole and take
                         // the resume position from the merge point they reach.
-                        let aborted = self
+                        let mut aborted = self
                             .meta
                             .tracing
                             .as_mut()
                             .and_then(|ctx| ctx.aborted_framestack.take());
+                        // `_copy_data_from_miframe` reads `getint()` off the
+                        // register box. Rewrite non-const boxes to inline
+                        // Consts while the recorder still holds `_res*`.
+                        if let Some(ctx) = self.meta.tracing.as_ref() {
+                            if let Some(ref mut fs) = aborted {
+                                for frame in fs.frames.iter_mut() {
+                                    frame.freeze_values_into_const_boxes(ctx);
+                                }
+                            }
+                            for frame in self.meta.framestack.frames.iter_mut() {
+                                frame.freeze_values_into_const_boxes(ctx);
+                            }
+                        }
                         let virt_and_ptr = self.meta.trace_ctx().map(|ctx| {
                             (
                                 ctx.collect_virtualizable_element_values(),
@@ -12870,7 +12887,10 @@ mod tests {
             let start = meta.trace_ctx().unwrap().get_trace_position();
             meta.push_portal_trace_position(0, Some((CALLEE, None)), start);
             let ctx = meta.tracing.as_mut().unwrap();
-            ctx.record_op(majit_ir::OpCode::PtrEq, &[]);
+            ctx.record_op(
+                majit_ir::OpCode::IntAdd,
+                &[majit_ir::OpRef::const_int(0), majit_ir::OpRef::const_int(0)],
+            );
             let end = ctx.get_trace_position();
             ctx.set_trace_limit(0);
             meta.push_portal_trace_position(0, None, end);

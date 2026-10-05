@@ -1233,7 +1233,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .collect();
     // ── float scalars ──
     // Native state stores f64 by default. Live-value / restore bits are the
-    // same pattern `MIFrame.float_values` and `BlackholeInterpreter.registers_f`
+    // same pattern `MIFrame.registers_f` and `BlackholeInterpreter.registers_f`
     // carry.
     let extract_float_scalar_parts: Vec<TokenStream> = float_scalars
         .iter()
@@ -2291,17 +2291,22 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn collect_portal_scalar_values(
                 &self,
                 __frame: &majit_metainterp::MIFrame,
+                __ctx: &majit_metainterp::TraceCtx,
             ) -> Vec<i64> {
                 let mut values = Vec::new();
                 for __k in 0..#num_scalars {
                     let __slot = #int_identity_base + __k;
-                    if let Some(__v) = __frame.int_values.get(__slot).copied().flatten() {
+                    if let Some(__op) = __frame.int_regs.get(__slot).copied().flatten()
+                        && let Some(__v) = __ctx.box_bits(__op)
+                    {
                         values.push(__v);
                     }
                 }
                 for __k in 0..#num_float_scalars {
                     let __slot = #float_identity_base + __k;
-                    if let Some(__v) = __frame.float_values.get(__slot).copied().flatten() {
+                    if let Some(__op) = __frame.float_regs.get(__slot).copied().flatten()
+                        && let Some(__v) = __ctx.box_bits(__op)
+                    {
                         values.push(__v);
                     }
                 }
@@ -2312,11 +2317,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn collect_portal_ref_scalar_values(
                 &self,
                 __frame: &majit_metainterp::MIFrame,
+                __ctx: &majit_metainterp::TraceCtx,
             ) -> Vec<i64> {
                 let mut values = Vec::new();
                 for __j in 0..#num_ref_scalars {
                     let __slot = #ref_identity_base + __j;
-                    if let Some(__v) = __frame.ref_values.get(__slot).copied().flatten() {
+                    if let Some(__op) = __frame.ref_regs.get(__slot).copied().flatten()
+                        && let Some(__v) = __ctx.box_bits(__op)
+                    {
                         values.push(__v);
                     }
                 }

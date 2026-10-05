@@ -291,8 +291,8 @@ where
         // `blackhole.rs handler_load_state_field_di`:
         // `registers_i[dest] = registers_i[slot(field_idx)]`.
         let slot = sym.int_identity_slots_base() + field_idx;
-        let (opref, value) = self.read_int_identity_slot(slot);
-        self.set_int_reg(dest, Some(opref), Some(value));
+        let (opref, value) = self.read_int_identity_slot(ctx, slot);
+        self.set_int_reg(ctx, dest, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -307,11 +307,11 @@ where
     ) -> TraceAction {
         let field_idx = self.frames.current_mut().next_u16() as usize;
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, value) = self.read_int_reg(src);
+        let (opref, value) = self.read_int_reg(ctx, src);
         // `blackhole.rs handler_store_state_field_di`:
         // `registers_i[slot(field_idx)] = registers_i[src]`.
         let slot = sym.int_identity_slots_base() + field_idx;
-        self.set_int_identity_slot(slot, Some(opref), Some(value));
+        self.set_int_identity_slot(ctx, slot, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -335,8 +335,8 @@ where
         let slot = sym
             .ref_scalar_slot(field_idx)
             .expect("ref state field has no identity slot");
-        let (opref, value) = self.read_ref_identity_slot(slot);
-        self.set_ref_reg(dest, Some(opref), Some(value));
+        let (opref, value) = self.read_ref_identity_slot(ctx, slot);
+        self.set_ref_reg(ctx, dest, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -351,13 +351,13 @@ where
     ) -> TraceAction {
         let field_idx = self.frames.current_mut().next_u16() as usize;
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, value) = self.read_ref_reg(src);
+        let (opref, value) = self.read_ref_reg(ctx, src);
         // `blackhole.rs handler_store_state_field_ref_dr`:
         // `registers_r[ref_slot(field_idx)] = registers_r[src]`.
         let slot = sym
             .ref_scalar_slot(field_idx)
             .expect("ref state field has no identity slot");
-        self.set_ref_identity_slot(slot, Some(opref), Some(value));
+        self.set_ref_identity_slot(ctx, slot, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -377,8 +377,8 @@ where
         let slot = sym
             .float_scalar_slot(field_idx)
             .expect("float state field has no identity slot");
-        let (opref, value) = self.read_float_identity_slot(slot);
-        self.set_float_reg(dest, Some(opref), Some(value));
+        let (opref, value) = self.read_float_identity_slot(ctx, slot);
+        self.set_float_reg(ctx, dest, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -393,13 +393,13 @@ where
     ) -> TraceAction {
         let field_idx = self.frames.current_mut().next_u16() as usize;
         let src = self.frames.current_mut().next_u8() as usize;
-        let (opref, value) = self.read_float_reg(src);
+        let (opref, value) = self.read_float_reg(ctx, src);
         // `blackhole.rs handler_store_state_field_float_df`:
         // `registers_f[float_slot(field_idx)] = registers_f[src]`.
         let slot = sym
             .float_scalar_slot(field_idx)
             .expect("float state field has no identity slot");
-        self.set_float_identity_slot(slot, Some(opref), Some(value));
+        self.set_float_identity_slot(ctx, slot, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -415,13 +415,13 @@ where
         let array_idx = self.frames.current_mut().next_u16() as usize;
         let index_reg = self.frames.current_mut().next_reg() as usize;
         let dest = self.frames.current_mut().next_reg() as usize;
-        let (_, index_concrete) = self.read_int_reg(index_reg);
+        let (_, index_concrete) = self.read_int_reg(ctx, index_reg);
         let elem_idx = index_concrete as usize;
         let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
             return TraceAction::Abort;
         };
-        let (opref, value) = self.read_int_identity_slot(slot);
-        self.set_int_reg(dest, Some(opref), Some(value));
+        let (opref, value) = self.read_int_identity_slot(ctx, slot);
+        self.set_int_reg(ctx, dest, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -437,15 +437,15 @@ where
         let array_idx = self.frames.current_mut().next_u16() as usize;
         let index_reg = self.frames.current_mut().next_reg() as usize;
         let src = self.frames.current_mut().next_reg() as usize;
-        let (_, index_concrete) = self.read_int_reg(index_reg);
+        let (_, index_concrete) = self.read_int_reg(ctx, index_reg);
         let elem_idx = index_concrete as usize;
-        let (opref, value) = self.read_int_reg(src);
+        let (opref, value) = self.read_int_reg(ctx, src);
         // `handler_store_state_array_dii` writes
         // `registers_i[StateFieldLayout::array_elem_slot]`.
         let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
             return TraceAction::Abort;
         };
-        self.set_int_identity_slot(slot, Some(opref), Some(value));
+        self.set_int_identity_slot(ctx, slot, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -485,7 +485,7 @@ where
         // Concrete struct pointer for pyjitpl.py:934-945
         // cache-hit sanity check (plumbing;
         // wires the check itself).
-        let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+        let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let guards_before = ctx.num_guards();
         let (opref, value) = ctx.vable_getfield_int(
             self.cpu.as_ref(),
@@ -495,7 +495,7 @@ where
             fielddescr,
         );
         self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-        self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
+        self.set_int_reg(ctx, dest, Some(opref), value.map(value_as_int_bits));
         TraceAction::Continue
     }
 
@@ -518,7 +518,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+        let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let guards_before = ctx.num_guards();
         let (opref, value) = ctx.vable_getfield_ref(
             self.cpu.as_ref(),
@@ -528,7 +528,7 @@ where
             fielddescr,
         );
         self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-        self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
+        self.set_ref_reg(ctx, dest, Some(opref), value.map(value_as_ref_bits));
         TraceAction::Continue
     }
 
@@ -551,7 +551,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+        let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let guards_before = ctx.num_guards();
         let (opref, value) = ctx.vable_getfield_float(
             self.cpu.as_ref(),
@@ -561,7 +561,7 @@ where
             fielddescr,
         );
         self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-        self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
+        self.set_float_reg(ctx, dest, Some(opref), value.map(value_as_float_bits));
         TraceAction::Continue
     }
 
@@ -677,7 +677,7 @@ where
         if with_vtable && vtable != 0 {
             ctx.heap_cache_mut().class_now_known(op, vtable as i64);
         }
-        self.set_ref_reg(dest, Some(op), Some(ptr));
+        self.set_ref_reg(ctx, dest, Some(op), Some(ptr));
         TraceAction::Continue
     }
 
@@ -715,15 +715,15 @@ where
                 .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
             (offset, field_size, fielddescr)
         };
-        let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
+        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
         let (value_opref, concrete) = match bytecode {
-            jitcode::insns::BC_SETFIELD_GC_R => self.read_ref_reg(value_reg),
-            jitcode::insns::BC_SETFIELD_GC_F => self.read_float_reg(value_reg),
+            jitcode::insns::BC_SETFIELD_GC_R => self.read_ref_reg(ctx, value_reg),
+            jitcode::insns::BC_SETFIELD_GC_F => self.read_float_reg(ctx, value_reg),
             jitcode::insns::BC_SETFIELD_GC_I_C => {
                 let v = value_reg as u8 as i8 as i64;
                 (OpRef::ConstInt(v), v)
             }
-            _ => self.read_int_reg(value_reg),
+            _ => self.read_int_reg(ctx, value_reg),
         };
         let field_key = heapcache_field_key(&fielddescr);
         // `_record_helper` runs `heapcache.invalidate_caches` before it
@@ -817,9 +817,9 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (base_opref, base_addr) = self.read_int_reg(base_reg);
-        let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-        let (value_opref, value) = self.read_int_reg(value_reg);
+        let (base_opref, base_addr) = self.read_int_reg(ctx, base_reg);
+        let (ea_opref, ea_value) = self.read_int_reg(ctx, ea_reg);
+        let (value_opref, value) = self.read_int_reg(ctx, value_reg);
         // pyjitpl.py `_record_helper` invalidates the
         // heapcache before recording a side-effecting op so a later
         // `raw_load` at the same `(base, ea)` re-reads instead of
@@ -892,8 +892,8 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (base_opref, base_addr) = self.read_int_reg(base_reg);
-        let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
+        let (base_opref, base_addr) = self.read_int_reg(ctx, base_reg);
+        let (ea_opref, ea_value) = self.read_int_reg(ctx, ea_reg);
         // Concrete eval: descriptor-sized read at `base + ea`. It runs
         // before the record because `execute_and_record` takes the
         // value rather than computing it.
@@ -934,7 +934,7 @@ where
             Some(Value::Int(concrete)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(concrete));
+        self.set_int_reg(ctx, dst, Some(opref), Some(concrete));
         TraceAction::Continue
     }
 
@@ -969,8 +969,8 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (base_opref, base_addr) = self.read_int_reg(base_reg);
-        let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
+        let (base_opref, base_addr) = self.read_int_reg(ctx, base_reg);
+        let (ea_opref, ea_value) = self.read_int_reg(ctx, ea_reg);
         // Concrete eval: an 8-byte f64 read at `base + ea`, carried as
         // raw bits in the float bank (set_float_reg takes i64 bits).
         //
@@ -990,7 +990,7 @@ where
             Some(Value::Float(f64::from_bits(concrete_bits as u64))),
             self.last_exception_value,
         );
-        self.set_float_reg(dst, Some(opref), Some(concrete_bits));
+        self.set_float_reg(ctx, dst, Some(opref), Some(concrete_bits));
         TraceAction::Continue
     }
 
@@ -1036,7 +1036,7 @@ where
                 .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
             (offset, field_size, is_field_signed, fielddescr)
         };
-        let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
+        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
         // blackhole.py bhimpl_getfield_gc_i reads the field through the fielddescr,
         // which carries the field's byte width; a sub-word integer field
         // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
@@ -1189,9 +1189,9 @@ where
             (op, loaded)
         };
         if is_ref {
-            self.set_ref_reg(dest, Some(op), Some(reg_concrete));
+            self.set_ref_reg(ctx, dest, Some(op), Some(reg_concrete));
         } else {
-            self.set_int_reg(dest, Some(op), Some(reg_concrete));
+            self.set_int_reg(ctx, dest, Some(op), Some(reg_concrete));
         }
         TraceAction::Continue
     }
@@ -1225,7 +1225,7 @@ where
                     .unwrap_or_else(|| field_descr_ref_from_bh(bh).1),
             )
         };
-        let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
+        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
         let loaded = if struct_ptr != 0 {
             unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
         } else {
@@ -1288,7 +1288,7 @@ where
             }
             (op, loaded)
         };
-        self.set_float_reg(dest, Some(op), Some(reg_concrete));
+        self.set_float_reg(ctx, dest, Some(op), Some(reg_concrete));
         TraceAction::Continue
     }
 
@@ -1343,7 +1343,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (value, concrete) = self.read_int_reg(src);
+        let (value, concrete) = self.read_int_reg(ctx, src);
         let guards_before = ctx.num_guards();
         let write = ctx.vable_setfield(
             opcode_pc,
@@ -1375,7 +1375,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (value, concrete) = self.read_ref_reg(src);
+        let (value, concrete) = self.read_ref_reg(ctx, src);
         let guards_before = ctx.num_guards();
         let write = ctx.vable_setfield(
             opcode_pc,
@@ -1407,7 +1407,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (value, concrete) = self.read_float_reg(src);
+        let (value, concrete) = self.read_float_reg(ctx, src);
         let guards_before = ctx.num_guards();
         let write = ctx.vable_setfield(
             opcode_pc,
@@ -1452,7 +1452,7 @@ where
         let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
             return TraceAction::Abort;
         };
-        let (array_opref, array_addr) = self.read_ref_reg(array_reg);
+        let (array_opref, array_addr) = self.read_ref_reg(ctx, array_reg);
         // Concrete length via the lendescr (`bh_arraylen_gc`); `None`
         // when the cpu is unwired or the descr lacks a lendescr, in
         // which case the recorded op is left unstamped.
@@ -1468,7 +1468,7 @@ where
             concrete,
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), reg_concrete);
+        self.set_int_reg(ctx, dst, Some(opref), reg_concrete);
         TraceAction::Continue
     }
 
@@ -1516,8 +1516,8 @@ where
         let Some((base_size, itemsize, is_signed)) = self.dispatch_array_geometry(descr_idx) else {
             return TraceAction::Abort;
         };
-        let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-        let (index_opref, index_value) = self.read_int_reg(index_reg);
+        let (array_opref, array_addr) = self.read_ref_reg(ctx, array_reg);
+        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
         // `getarrayitem_gc_i_pure` shares this body: the load, the
         // heapcache handling and the register write are identical, and
         // only the recorded opcode differs — the same reason
@@ -1692,7 +1692,7 @@ where
             ctx.heapcache_getarrayitem_now_known(array_opref, index_opref, descr_index, opref);
             (opref, concrete)
         };
-        self.set_int_reg(dst, Some(opref), Some(reg_concrete));
+        self.set_int_reg(ctx, dst, Some(opref), Some(reg_concrete));
         TraceAction::Continue
     }
 
@@ -1735,8 +1735,8 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-        let (index_opref, index_value) = self.read_int_reg(index_reg);
+        let (array_opref, array_addr) = self.read_ref_reg(ctx, array_reg);
+        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
         let opcode = if bytecode == jitcode::insns::BC_GETARRAYITEM_GC_F_PURE {
             OpCode::GetarrayitemGcPureF
         } else {
@@ -1816,7 +1816,7 @@ where
             ctx.heapcache_getarrayitem_now_known(array_opref, index_opref, descr_index, opref);
             (opref, concrete)
         };
-        self.set_float_reg(dst, Some(opref), Some(reg_concrete));
+        self.set_float_reg(ctx, dst, Some(opref), Some(reg_concrete));
         TraceAction::Continue
     }
 
@@ -1853,8 +1853,8 @@ where
         let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
             return TraceAction::Abort;
         };
-        let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-        let (index_opref, index_value) = self.read_int_reg(index_reg);
+        let (array_opref, array_addr) = self.read_ref_reg(ctx, array_reg);
+        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
         let descr_index = descr.index();
         let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
         // blackhole.py bhimpl_getarrayitem_gc_r reads GCREF through
@@ -1882,7 +1882,7 @@ where
         if pure && array_opref.is_constant() && index_opref.is_constant() {
             ctx.profiler().count_ops(opcode, crate::counters::OPS);
             let opref = ctx.const_ref(concrete);
-            self.set_ref_reg(dst, Some(opref), Some(concrete));
+            self.set_ref_reg(ctx, dst, Some(opref), Some(concrete));
         } else {
             let (opref, reg_concrete) = if let Some(cached) = cached {
                 ctx.profiler()
@@ -1928,7 +1928,7 @@ where
                 ctx.heapcache_getarrayitem_now_known(array_opref, index_opref, descr_index, opref);
                 (opref, concrete)
             };
-            self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
+            self.set_ref_reg(ctx, dst, Some(opref), Some(reg_concrete));
         }
         TraceAction::Continue
     }
@@ -1963,12 +1963,12 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-        let (index_opref, index_value) = self.read_int_reg(index_reg);
+        let (array_opref, array_addr) = self.read_ref_reg(ctx, array_reg);
+        let (index_opref, index_value) = self.read_int_reg(ctx, index_reg);
         let (value_opref, value_concrete) = match bytecode {
-            jitcode::insns::BC_SETARRAYITEM_GC_R => self.read_ref_reg(value_reg),
-            jitcode::insns::BC_SETARRAYITEM_GC_F => self.read_float_reg(value_reg),
-            _ => self.read_int_reg(value_reg),
+            jitcode::insns::BC_SETARRAYITEM_GC_R => self.read_ref_reg(ctx, value_reg),
+            jitcode::insns::BC_SETARRAYITEM_GC_F => self.read_float_reg(ctx, value_reg),
+            _ => self.read_int_reg(ctx, value_reg),
         };
         let descr_index = descr.index();
         // `execute_setarrayitem_gc` (pyjitpl.py) records through
@@ -2049,7 +2049,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         // pyjitpl.py `_opimpl_getarrayitem_vable` /
         // `_opimpl_setarrayitem_vable` reach the index through
         // `implement_guard_value` on an `MIFrame`, which owns the
@@ -2087,7 +2087,7 @@ where
             adescr,
         );
         self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-        self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
+        self.set_int_reg(ctx, dest, Some(opref), value.map(value_as_int_bits));
         TraceAction::Continue
     }
 
@@ -2116,7 +2116,13 @@ where
                 depth,
                 vable_reg,
                 frame.ref_regs[vable_reg],
-                frame.ref_values[vable_reg].map(|v| format!("0x{v:x}")),
+                frame
+                    .ref_regs
+                    .get(vable_reg)
+                    .copied()
+                    .flatten()
+                    .and_then(|op| ctx.box_bits(op))
+                    .map(|v| format!("0x{v:x}")),
             );
         }
         let Some((vable_opref, fdescr, adescr)) =
@@ -2124,7 +2130,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         // pyjitpl.py `_opimpl_getarrayitem_vable` /
         // `_opimpl_setarrayitem_vable` reach the index through
         // `implement_guard_value` on an `MIFrame`, which owns the
@@ -2162,7 +2168,7 @@ where
             adescr,
         );
         self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-        self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
+        self.set_ref_reg(ctx, dest, Some(opref), value.map(value_as_ref_bits));
         TraceAction::Continue
     }
 
@@ -2186,7 +2192,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         // pyjitpl.py `_opimpl_getarrayitem_vable` /
         // `_opimpl_setarrayitem_vable` reach the index through
         // `implement_guard_value` on an `MIFrame`, which owns the
@@ -2224,7 +2230,7 @@ where
             adescr,
         );
         self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-        self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
+        self.set_float_reg(ctx, dest, Some(opref), value.map(value_as_float_bits));
         TraceAction::Continue
     }
 
@@ -2248,7 +2254,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         // pyjitpl.py `_opimpl_getarrayitem_vable` /
         // `_opimpl_setarrayitem_vable` reach the index through
         // `implement_guard_value` on an `MIFrame`, which owns the
@@ -2275,7 +2281,7 @@ where
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
-        let (value, concrete) = self.read_int_reg(src);
+        let (value, concrete) = self.read_int_reg(ctx, src);
         let guards_before = ctx.num_guards();
         let write = match ctx.vable_setarrayitem_checked(
             nonstandard,
@@ -2319,7 +2325,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         // pyjitpl.py `_opimpl_getarrayitem_vable` /
         // `_opimpl_setarrayitem_vable` reach the index through
         // `implement_guard_value` on an `MIFrame`, which owns the
@@ -2346,7 +2352,7 @@ where
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
-        let (value, concrete) = self.read_ref_reg(src);
+        let (value, concrete) = self.read_ref_reg(ctx, src);
         let guards_before = ctx.num_guards();
         let write = match ctx.vable_setarrayitem_checked(
             nonstandard,
@@ -2387,7 +2393,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         // pyjitpl.py `_opimpl_getarrayitem_vable` /
         // `_opimpl_setarrayitem_vable` reach the index through
         // `implement_guard_value` on an `MIFrame`, which owns the
@@ -2414,7 +2420,7 @@ where
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
-        let (value, concrete) = self.read_float_reg(src);
+        let (value, concrete) = self.read_float_reg(ctx, src);
         let guards_before = ctx.num_guards();
         let write = match ctx.vable_setarrayitem_checked(
             nonstandard,
@@ -2455,7 +2461,7 @@ where
         else {
             return TraceAction::Abort;
         };
-        let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+        let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         let guards_before = ctx.num_guards();
         let result = ctx.vable_arraylen_vable(
             self.cpu.as_ref(),
@@ -2478,7 +2484,7 @@ where
             .virtualizable_array_lengths()
             .and_then(|lengths| lengths.get(array_idx).copied())
             .unwrap_or(0);
-        self.set_int_reg(dest, Some(result), Some(len as i64));
+        self.set_int_reg(ctx, dest, Some(result), Some(len as i64));
         TraceAction::Continue
     }
 
@@ -2502,14 +2508,14 @@ where
         else {
             return TraceAction::Abort;
         };
-        let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+        let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
         // An unresolvable base aborts rather than defaulting: the walk
         // really executes the residual call this address feeds, so a
         // placeholder would be handed to a live callee.
         let Some((result, addr)) = ctx.vable_arraybase_vable(vable_struct_ptr, fdescr) else {
             return TraceAction::Abort;
         };
-        self.set_int_reg(dest, Some(result), Some(addr));
+        self.set_int_reg(ctx, dest, Some(result), Some(addr));
         TraceAction::Continue
     }
 
@@ -3019,7 +3025,7 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (cond, cond_value) = self.read_int_reg(cond_idx);
+        let (cond, cond_value) = self.read_int_reg(ctx, cond_idx);
         self.pcseq_branch(
             "goto_if_not",
             opcode_pc,
@@ -3058,7 +3064,7 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (src, src_value) = self.read_int_reg(src_idx);
+        let (src, src_value) = self.read_int_reg(ctx, src_idx);
         let cond_value = (src_value != 0) as i64;
         let cond = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -3096,7 +3102,7 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (src, src_value) = self.read_int_reg(src_idx);
+        let (src, src_value) = self.read_int_reg(ctx, src_idx);
         let cond_value = if src_value == 0 { 1 } else { 0 };
         let cond = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -3138,8 +3144,8 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_int_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_int_reg(ctx, rhs_idx);
         let opcode = match bytecode {
             jitcode::insns::BC_GOTO_IF_NOT_INT_LT => OpCode::IntLt,
             jitcode::insns::BC_GOTO_IF_NOT_INT_LE => OpCode::IntLe,
@@ -3183,8 +3189,8 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_float_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_float_reg(ctx, rhs_idx);
         let a = f64::from_bits(lhs_value as u64);
         let b = f64::from_bits(rhs_value as u64);
         let (opcode, taken) = match bytecode {
@@ -3220,8 +3226,8 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_ref_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_ref_reg(ctx, rhs_idx);
         let (opcode, taken) = match bytecode {
             jitcode::insns::BC_GOTO_IF_NOT_PTR_EQ => (OpCode::PtrEq, lhs_value == rhs_value),
             jitcode::insns::BC_GOTO_IF_NOT_PTR_NE => (OpCode::PtrNe, lhs_value != rhs_value),
@@ -3263,7 +3269,7 @@ where
             .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
             .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
             .clone();
-        let (value_box, concrete_value) = self.read_int_reg(value_idx);
+        let (value_box, concrete_value) = self.read_int_reg(ctx, value_idx);
         let hit = descr.switch_lookup(concrete_value);
         self.pcseq_branch("switch", opcode_pc, concrete_value, hit);
         if let Some(target) = hit {
@@ -3276,7 +3282,7 @@ where
                 opcode_pc,
                 false,
             );
-            self.set_int_reg(value_idx, Some(const_ref), Some(concrete_value));
+            self.set_int_reg(ctx, value_idx, Some(const_ref), Some(concrete_value));
             self.frames.current_mut().code_cursor = target;
         } else {
             for &key in descr.switch_const_keys_in_order() {
@@ -3326,7 +3332,7 @@ where
                 frame.next_u16() as usize,
             )
         };
-        let (src, src_value) = self.read_ref_reg(src_idx);
+        let (src, src_value) = self.read_ref_reg(ctx, src_idx);
         let nonnull = self.establish_nullity(ctx, sym, src, src_value, opcode_pc);
         // pyjitpl.py:
         //   opimpl_goto_if_not_ptr_nonzero: if not nonnull: self.pc = target
@@ -3382,7 +3388,8 @@ where
         // standalone fallback returns the raw value for tests
         // that pre-date typed exception dispatch.
         let typeptr = self.read_typeptr_from_exception(exc_value);
-        self.set_int_reg(dst, Some(ctx.const_int(typeptr)), Some(typeptr));
+        let opref = ctx.const_int(typeptr);
+        self.set_int_reg(ctx, dst, Some(opref), Some(typeptr));
         TraceAction::Continue
     }
 
@@ -3412,7 +3419,7 @@ where
         let opref = self
             .last_exception_box
             .expect("last_exc_value without exception box");
-        self.set_ref_reg(dst, Some(opref), Some(value));
+        self.set_ref_reg(ctx, dst, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -3427,8 +3434,7 @@ where
     //
     // `class_of_last_exc_is_const` is asserted, so the typeptr is
     // constant for the trace — no guard recorded; the branch is
-    // a trace-time decision (matches the legacy
-    // `int_values[vtable_idx]` Const slot read).
+    // a trace-time decision (the vtable register box is a Const).
     #[inline(never)]
     #[allow(unused_variables)]
     fn opimpl_goto_if_exception_mismatch(
@@ -3452,7 +3458,7 @@ where
             self.class_of_last_exc_is_const,
             "goto_if_exception_mismatch requires class_of_last_exc_is_const",
         );
-        let (_, bounding_vtable) = self.read_int_reg(vtable_idx);
+        let (_, bounding_vtable) = self.read_int_reg(ctx, vtable_idx);
         // pyjitpl.py:1683-1684:
         //     real_instance = rclass.ll_cast_to_object(last_exc_value)
         //     if not rclass.ll_isinstance(real_instance, cls):
@@ -3483,8 +3489,16 @@ where
             let frame = self.frames.current_mut();
             (frame.next_reg() as usize, frame.next_reg() as usize)
         };
-        let leaving = self.frames.current_mut().int_values[leaving_idx].unwrap_or(0);
-        let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
+        let leaving = self
+            .frames
+            .current_mut()
+            .getint(ctx, leaving_idx)
+            .unwrap_or(0);
+        let unique_id = self
+            .frames
+            .current_mut()
+            .getint(ctx, unique_id_idx)
+            .unwrap_or(0);
         majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
         TraceAction::Continue
     }
@@ -3542,7 +3556,7 @@ where
             (jdindex_byte as i8) as i64 as usize
         } else {
             let slot = jdindex_byte as usize;
-            let resolved = frame.int_values.get(slot).copied().flatten().expect(
+            let resolved = frame.getint(ctx, slot).expect(
                 "BC_JIT_MERGE_POINT (i form): jdindex register slot \
                  must hold a populated int constant — assembler.py:312-346 \
                  emits an `i` argcode pointing at the post-regs constants \
@@ -3658,17 +3672,17 @@ where
                 if capture_walk_reds && slot >= 3 {
                     match slot {
                         3 => {
-                            if let Some(v) = frame.int_values.get(reg_idx).copied().flatten() {
+                            if let Some(v) = frame.getint(ctx, reg_idx) {
                                 walk_reds.push(Value::Int(v));
                             }
                         }
                         4 => {
-                            if let Some(r) = frame.ref_values.get(reg_idx).copied().flatten() {
+                            if let Some(r) = frame.getref_base(ctx, reg_idx) {
                                 walk_reds.push(Value::Ref(majit_ir::GcRef(r as usize)));
                             }
                         }
                         _ => {
-                            if let Some(b) = frame.float_values.get(reg_idx).copied().flatten() {
+                            if let Some(b) = frame.getfloat_storage(ctx, reg_idx) {
                                 walk_reds.push(Value::Float(f64::from_bits(b as u64)));
                             }
                         }
@@ -4658,16 +4672,16 @@ where
         // `loop_header`, so the only valid argcode is `i` (constants-
         // pool slot — `jitcode/assembler.rs`'s `loop_header` patches the
         // byte at finish() to `num_regs_i + const_idx`).  Decode the
-        // byte through `int_values` to recover the actual jdindex
+        // byte through the int register box to recover the actual jdindex
         // rather than reading the slot byte as the index directly,
         // mirroring `blackhole.py self.registers_i[ord(code[pos])]`.
         let frame = self.frames.current_mut();
         let jdindex_byte = frame.next_reg();
         let slot = jdindex_byte as usize;
-        let jdindex = frame.int_values.get(slot).copied().flatten().expect(
+        let jdindex = frame.getint(ctx, slot).expect(
             "BC_LOOP_HEADER (i form): jdindex register slot \
                  must hold a populated int constant — \
-                 assembler.rs:1087 loop_header emits an `i` argcode \
+                 assembler.rs loop_header emits an `i` argcode \
                  pointing into the post-regs constants suffix",
         );
         let registered_drivers = ctx.metainterp_sd().jitdrivers_sd.len();
@@ -4754,15 +4768,12 @@ where
                             caller.int_regs[caller_src],
                         );
                         sub_frame.int_regs[callee_dst] = caller.int_regs[caller_src];
-                        sub_frame.int_values[callee_dst] = caller.int_values[caller_src];
                     }
                     JitArgKind::Ref => {
                         sub_frame.ref_regs[callee_dst] = caller.ref_regs[caller_src];
-                        sub_frame.ref_values[callee_dst] = caller.ref_values[caller_src];
                     }
                     JitArgKind::Float => {
                         sub_frame.float_regs[callee_dst] = caller.float_regs[caller_src];
-                        sub_frame.float_values[callee_dst] = caller.float_values[caller_src];
                     }
                 }
             }
@@ -4882,7 +4893,7 @@ where
     ) -> TraceAction {
         self.clear_exception();
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, concrete) = self.read_int_reg(src);
+        let (opref, concrete) = self.read_int_reg(ctx, src);
         let target = self.frames.current_mut().return_i;
         if target.is_none() {
             self.capture_single_pass_finish(ctx, Some(Value::Int(concrete)));
@@ -4978,7 +4989,7 @@ where
     ) -> TraceAction {
         self.clear_exception();
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, concrete) = self.read_ref_reg(src);
+        let (opref, concrete) = self.read_ref_reg(ctx, src);
         let target = self.frames.current_mut().return_r;
         if target.is_none() {
             self.capture_single_pass_finish(
@@ -5027,7 +5038,7 @@ where
     ) -> TraceAction {
         self.clear_exception();
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, concrete) = self.read_float_reg(src);
+        let (opref, concrete) = self.read_float_reg(ctx, src);
         let target = self.frames.current_mut().return_f;
         if target.is_none() {
             self.capture_single_pass_finish(
@@ -5168,19 +5179,25 @@ where
                 .get(&calldescr_idx)
                 .copied()
                 .unwrap_or_else(|| {
-                    let func = frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_V: funcptr slot \
+                    let func = frame
+                        .int_regs
+                        .get(funcptr_reg as usize)
+                        .copied()
+                        .flatten()
+                        .and_then(|op| ctx.box_bits(op))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "BC_RESIDUAL_CALL_*_V: funcptr slot \
                              {funcptr_reg} is uninitialized"
-                        )
-                    });
+                            )
+                        });
                     JitCallTarget::from_fnaddr(func)
                 });
             (target, args_i, args_r, args_f, calldescr, trace_descr)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
-            self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
+            self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
         let trace_ptr = if target.trace_ptr.is_null() {
             target.concrete_ptr
@@ -5530,19 +5547,25 @@ where
                 .get(&calldescr_idx)
                 .copied()
                 .unwrap_or_else(|| {
-                    let func = frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_I: funcptr slot \
+                    let func = frame
+                        .int_regs
+                        .get(funcptr_reg as usize)
+                        .copied()
+                        .flatten()
+                        .and_then(|op| ctx.box_bits(op))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "BC_RESIDUAL_CALL_*_I: funcptr slot \
                                  {funcptr_reg} is uninitialized"
-                        )
-                    });
+                            )
+                        });
                     JitCallTarget::from_fnaddr(func)
                 });
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
-            self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
+            self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
         let trace_ptr = if target.trace_ptr.is_null() {
             target.concrete_ptr
@@ -5660,7 +5683,7 @@ where
                         effectinfo,
                     )
             {
-                self.set_int_reg(dst, Some(cached_traced), Some(cached_concrete));
+                self.set_int_reg(ctx, dst, Some(cached_traced), Some(cached_concrete));
                 return TraceAction::Continue;
             }
 
@@ -5804,7 +5827,7 @@ where
             // The full-body walker already stamps its own residual
             // results this way (`jitcode_dispatch/residual_call.rs`).
             ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
-            self.set_int_reg(dst, Some(traced), Some(concrete));
+            self.set_int_reg(ctx, dst, Some(traced), Some(concrete));
             if is_forces {
                 if crate::majit_log_enabled() {
                     let frame = self.frames.current_mut();
@@ -5899,19 +5922,25 @@ where
                 .get(&calldescr_idx)
                 .copied()
                 .unwrap_or_else(|| {
-                    let func = frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_R: funcptr slot \
+                    let func = frame
+                        .int_regs
+                        .get(funcptr_reg as usize)
+                        .copied()
+                        .flatten()
+                        .and_then(|op| ctx.box_bits(op))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "BC_RESIDUAL_CALL_*_R: funcptr slot \
                                  {funcptr_reg} is uninitialized"
-                        )
-                    });
+                            )
+                        });
                     JitCallTarget::from_fnaddr(func)
                 });
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
-            self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
+            self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
         let trace_ptr = if target.trace_ptr.is_null() {
             target.concrete_ptr
@@ -6020,7 +6049,7 @@ where
                         effectinfo,
                     )
             {
-                self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
+                self.set_ref_reg(ctx, dst, Some(cached_traced), Some(cached_concrete));
                 return TraceAction::Continue;
             }
 
@@ -6138,7 +6167,7 @@ where
                 traced,
                 majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
             );
-            self.set_ref_reg(dst, Some(traced), Some(concrete));
+            self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
             if is_forces {
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
                 if !matches!(action, TraceAction::Continue) {
@@ -6209,19 +6238,25 @@ where
                 .get(&calldescr_idx)
                 .copied()
                 .unwrap_or_else(|| {
-                    let func = frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                        panic!(
-                            "BC_RESIDUAL_CALL_IRF_F: funcptr slot \
+                    let func = frame
+                        .int_regs
+                        .get(funcptr_reg as usize)
+                        .copied()
+                        .flatten()
+                        .and_then(|op| ctx.box_bits(op))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "BC_RESIDUAL_CALL_IRF_F: funcptr slot \
                                  {funcptr_reg} is uninitialized"
-                        )
-                    });
+                            )
+                        });
                     JitCallTarget::from_fnaddr(func)
                 });
             (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
         };
 
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
-            self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
+            self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &args_f);
 
         let trace_ptr = if target.trace_ptr.is_null() {
             target.concrete_ptr
@@ -6319,7 +6354,7 @@ where
                         effectinfo,
                     )
             {
-                self.set_float_reg(dst, Some(cached_traced), Some(cached_concrete_bits));
+                self.set_float_reg(ctx, dst, Some(cached_traced), Some(cached_concrete_bits));
                 return TraceAction::Continue;
             }
 
@@ -6436,7 +6471,7 @@ where
             // The full-body walker already stamps its own residual
             // results this way (`jitcode_dispatch/residual_call.rs`).
             ctx.set_opref_concrete(traced, majit_ir::Value::Float(concrete));
-            self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
+            self.set_float_reg(ctx, dst, Some(traced), Some(concrete.to_bits() as i64));
             if is_forces {
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
                 if !matches!(action, TraceAction::Continue) {
@@ -6502,7 +6537,7 @@ where
         let mut raw_f = Vec::new();
         let mut arg_classes = String::new();
         for arg_spec in &arg_regs {
-            let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
+            let (arg, concrete, arg_type) = self.read_call_arg(ctx, *arg_spec);
             args.push(arg);
             concrete_args.push(concrete);
             arg_types.push(arg_type);
@@ -6646,12 +6681,18 @@ where
                 .get(&calldescr_idx)
                 .copied()
                 .unwrap_or_else(|| {
-                    let func = frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                        panic!(
-                            "canonical cond/record: funcptr slot {funcptr_reg} \
+                    let func = frame
+                        .int_regs
+                        .get(funcptr_reg as usize)
+                        .copied()
+                        .flatten()
+                        .and_then(|op| ctx.box_bits(op))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "canonical cond/record: funcptr slot {funcptr_reg} \
                              is uninitialized"
-                        )
-                    });
+                            )
+                        });
                     JitCallTarget::from_fnaddr(func)
                 });
             let dst = if matches!(
@@ -6666,7 +6707,7 @@ where
             (first_reg, target, args_i, args_r, calldescr, dst)
         };
         let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
-            self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &[]);
+            self.read_canonical_call_args(ctx, &calldescr.arg_classes, &args_i, &args_r, &[]);
         let trace_ptr = if target.trace_ptr.is_null() {
             target.concrete_ptr
         } else {
@@ -6686,7 +6727,7 @@ where
                 // ConstInt from this iteration's concrete value makes
                 // `is_constant()` true for a live register and bakes
                 // the snapshot into the trace.
-                let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                let (first_box, first_val) = self.read_int_reg(ctx, first_reg as usize);
                 // `opimpl_conditional_call_ir_v`: ConstInt(0) records
                 // nothing so the heapcache can keep args virtual.
                 if first_box.is_constant() && first_val == 0 {
@@ -6751,12 +6792,12 @@ where
                 }
             }
             jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I => {
-                let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                let (first_box, first_val) = self.read_int_reg(ctx, first_reg as usize);
                 // `_opimpl_conditional_call_value`: Const nonnull
                 // returns the value box without recording.
                 if first_box.is_constant() && first_val != 0 {
                     if let Some(dst) = dst {
-                        self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
+                        self.set_int_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
                     let patch_pos = ctx.get_trace_position();
@@ -6850,7 +6891,7 @@ where
                     if last_exc == 0
                         && let Some(dst) = dst
                     {
-                        self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
+                        self.set_int_reg(ctx, dst as usize, Some(traced), Some(concrete_result));
                     }
                     if !(last_exc == 0 && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(
@@ -6865,10 +6906,10 @@ where
                 }
             }
             jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R => {
-                let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
+                let (first_box, first_val) = self.read_ref_reg(ctx, first_reg as usize);
                 if first_box.is_constant() && first_val != 0 {
                     if let Some(dst) = dst {
-                        self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
+                        self.set_ref_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
                     let patch_pos = ctx.get_trace_position();
@@ -6960,7 +7001,7 @@ where
                     if last_exc == 0
                         && let Some(dst) = dst
                     {
-                        self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
+                        self.set_ref_reg(ctx, dst as usize, Some(traced), Some(concrete_result));
                     }
                     if !(last_exc == 0 && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(
@@ -6975,7 +7016,7 @@ where
                 }
             }
             jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V => {
-                let (first_box, _) = self.read_int_reg(first_reg as usize);
+                let (first_box, _) = self.read_int_reg(ctx, first_reg as usize);
                 ctx.profiler()
                     .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                 ctx.record_known_result_typed(
@@ -6997,7 +7038,7 @@ where
                 );
             }
             jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
-                let (first_box, _) = self.read_ref_reg(first_reg as usize);
+                let (first_box, _) = self.read_ref_reg(ctx, first_reg as usize);
                 ctx.profiler()
                     .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                 ctx.record_known_result_typed(
@@ -7061,7 +7102,7 @@ where
         let mut concrete_args = Vec::with_capacity(arg_regs.len());
         let mut arg_types = Vec::with_capacity(arg_regs.len());
         for arg_spec in &arg_regs {
-            let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
+            let (arg, concrete, arg_type) = self.read_call_arg(ctx, *arg_spec);
             args.push(arg);
             concrete_args.push(concrete);
             arg_types.push(arg_type);
@@ -7104,7 +7145,7 @@ where
             jitcode::insns::BC_COND_CALL_VOID => {
                 // RPython pyjitpl.py opimpl_conditional_call_ir_v:
                 //   if condition != 0: call func(args)
-                let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                let (first_box, first_val) = self.read_int_reg(ctx, first_reg as usize);
                 if first_box.is_constant() && first_val == 0 {
                     // skip
                 } else {
@@ -7163,10 +7204,10 @@ where
             }
             jitcode::insns::BC_COND_CALL_VALUE_INT => {
                 // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
-                let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                let (first_box, first_val) = self.read_int_reg(ctx, first_reg as usize);
                 if first_box.is_constant() && first_val != 0 {
                     if let Some(dst) = dst {
-                        self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
+                        self.set_int_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
                     let patch_pos = ctx.get_trace_position();
@@ -7255,7 +7296,7 @@ where
                     if last_exc == 0
                         && let Some(dst) = dst
                     {
-                        self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
+                        self.set_int_reg(ctx, dst as usize, Some(traced), Some(concrete_result));
                     }
                     if !(last_exc == 0 && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
@@ -7268,10 +7309,10 @@ where
             jitcode::insns::BC_COND_CALL_VALUE_REF => {
                 // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
                 // value is a ref — read from ref register bank.
-                let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
+                let (first_box, first_val) = self.read_ref_reg(ctx, first_reg as usize);
                 if first_box.is_constant() && first_val != 0 {
                     if let Some(dst) = dst {
-                        self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
+                        self.set_ref_reg(ctx, dst as usize, Some(first_box), Some(first_val));
                     }
                 } else {
                     let patch_pos = ctx.get_trace_position();
@@ -7361,7 +7402,7 @@ where
                     if last_exc == 0
                         && let Some(dst) = dst
                     {
-                        self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
+                        self.set_ref_reg(ctx, dst as usize, Some(traced), Some(concrete_result));
                     }
                     if !(last_exc == 0 && traced.is_constant()) {
                         match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
@@ -7377,7 +7418,7 @@ where
                 // known-result var) as the fake result var for
                 // `getcalldescr`; here that maps to `Type::Int`
                 // because the bytecode is `_i_ir_v`.
-                let (first_box, _) = self.read_int_reg(first_reg as usize);
+                let (first_box, _) = self.read_int_reg(ctx, first_reg as usize);
                 // `opimpl_record_known_result_i_ir_v` records without executing.
                 ctx.profiler()
                     .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
@@ -7403,7 +7444,7 @@ where
                 // RPython pyjitpl.py opimpl_record_known_result_r —
                 // `_r_ir_v` opname, calldescr result type is
                 // `Type::Ref`.
-                let (first_box, _) = self.read_ref_reg(first_reg as usize);
+                let (first_box, _) = self.read_ref_reg(ctx, first_reg as usize);
                 // `opimpl_record_known_result_r_ir_v` records without executing.
                 ctx.profiler()
                     .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
@@ -7446,8 +7487,8 @@ where
             let frame = self.frames.current_mut();
             (frame.next_reg() as usize, frame.next_reg() as usize)
         };
-        let (value, concrete) = self.read_int_reg(src);
-        self.set_int_reg(dst, Some(value), Some(concrete));
+        let (value, concrete) = self.read_int_reg(ctx, src);
+        self.set_int_reg(ctx, dst, Some(value), Some(concrete));
         TraceAction::Continue
     }
 
@@ -7468,7 +7509,7 @@ where
             let frame = self.frames.current_mut();
             (frame.next_u8() as i8 as i64, frame.next_reg() as usize)
         };
-        self.set_int_reg(dst, Some(OpRef::ConstInt(value)), Some(value));
+        self.set_int_reg(ctx, dst, Some(OpRef::ConstInt(value)), Some(value));
         TraceAction::Continue
     }
 
@@ -7513,7 +7554,7 @@ where
         let mut raw_f = Vec::new();
         let mut arg_classes = String::new();
         for arg_spec in &arg_regs {
-            let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
+            let (arg, concrete, arg_type) = self.read_call_arg(ctx, *arg_spec);
             args.push(arg);
             concrete_args.push(concrete);
             arg_types.push(arg_type);
@@ -7580,7 +7621,7 @@ where
             return TraceAction::Abort;
         };
         let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
-        self.set_int_reg(dst, Some(traced), Some(concrete));
+        self.set_int_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
         if !matches!(action, TraceAction::Continue) {
@@ -7612,8 +7653,8 @@ where
             let frame = self.frames.current_mut();
             (frame.next_reg() as usize, frame.next_reg() as usize)
         };
-        let (value, concrete) = self.read_ref_reg(src);
-        self.set_ref_reg(dst, Some(value), Some(concrete));
+        let (value, concrete) = self.read_ref_reg(ctx, src);
+        self.set_ref_reg(ctx, dst, Some(value), Some(concrete));
         TraceAction::Continue
     }
 
@@ -7656,7 +7697,7 @@ where
         let mut raw_f = Vec::new();
         let mut arg_classes = String::new();
         for arg_spec in &arg_regs {
-            let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
+            let (arg, concrete, arg_type) = self.read_call_arg(ctx, *arg_spec);
             args.push(arg);
             concrete_args.push(concrete);
             arg_types.push(arg_type);
@@ -7725,7 +7766,7 @@ where
             return TraceAction::Abort;
         };
         let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
-        self.set_ref_reg(dst, Some(traced), Some(concrete));
+        self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
         if !matches!(action, TraceAction::Continue) {
@@ -7757,8 +7798,8 @@ where
             let frame = self.frames.current_mut();
             (frame.next_reg() as usize, frame.next_reg() as usize)
         };
-        let (value, concrete) = self.read_float_reg(src);
-        self.set_float_reg(dst, Some(value), Some(concrete));
+        let (value, concrete) = self.read_float_reg(ctx, src);
+        self.set_float_reg(ctx, dst, Some(value), Some(concrete));
         TraceAction::Continue
     }
 
@@ -7801,7 +7842,7 @@ where
         let mut raw_f = Vec::new();
         let mut arg_classes = String::new();
         for arg_spec in &arg_regs {
-            let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
+            let (arg, concrete, arg_type) = self.read_call_arg(ctx, *arg_spec);
             args.push(arg);
             concrete_args.push(concrete);
             arg_types.push(arg_type);
@@ -7870,7 +7911,7 @@ where
             return TraceAction::Abort;
         };
         let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
-        self.set_float_reg(dst, Some(traced), Some(concrete));
+        self.set_float_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
         if !matches!(action, TraceAction::Continue) {
@@ -8137,7 +8178,7 @@ where
             let opcode_pc = frame.code_cursor - 1;
             (frame.next_reg() as usize, opcode_pc)
         };
-        let (opref, concrete) = self.read_int_reg(src);
+        let (opref, concrete) = self.read_int_reg(ctx, src);
         let const_ref = ctx.const_int(concrete);
         self.record_state_guard(
             ctx,
@@ -8170,7 +8211,7 @@ where
         bytecode: u8,
     ) -> TraceAction {
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, concrete) = self.read_ref_reg(src);
+        let (opref, concrete) = self.read_ref_reg(ctx, src);
         ctx.trace_assert_not_none(opref, concrete);
         TraceAction::Continue
     }
@@ -8194,8 +8235,8 @@ where
     ) -> TraceAction {
         let src = self.frames.current_mut().next_reg() as usize;
         let cls = self.frames.current_mut().next_reg() as usize;
-        let (box_opref, _) = self.read_ref_reg(src);
-        let (cls_opref, _) = self.read_int_reg(cls);
+        let (box_opref, _) = self.read_ref_reg(ctx, src);
+        let (cls_opref, _) = self.read_int_reg(ctx, cls);
         ctx.trace_record_exact_class(box_opref, cls_opref);
         TraceAction::Continue
     }
@@ -8215,7 +8256,7 @@ where
             let opcode_pc = frame.code_cursor - 1;
             (frame.next_reg() as usize, opcode_pc)
         };
-        let (opref, concrete) = self.read_ref_reg(src);
+        let (opref, concrete) = self.read_ref_reg(ctx, src);
         let const_ref = ctx.const_ref(concrete);
         self.record_state_guard(
             ctx,
@@ -8247,7 +8288,7 @@ where
             let opcode_pc = frame.code_cursor - 1;
             (frame.next_reg() as usize, opcode_pc)
         };
-        let (opref, concrete) = self.read_float_reg(src);
+        let (opref, concrete) = self.read_float_reg(ctx, src);
         let const_ref = ctx.const_float(concrete);
         self.record_state_guard(
             ctx,
@@ -8292,7 +8333,7 @@ where
             let dst = frame.next_reg() as usize;
             (opcode_pc, src, dst)
         };
-        let (opref, concrete) = self.read_ref_reg(src);
+        let (opref, concrete) = self.read_ref_reg(ctx, src);
         if concrete == 0 {
             return TraceAction::Abort;
         }
@@ -8310,10 +8351,10 @@ where
             ctx.heap_cache_mut().class_now_known(opref, typeptr);
         }
         if byte == jitcode::insns::BC_GUARD_CLASS {
-            self.set_int_reg(dst, Some(cls_const), Some(typeptr));
+            self.set_int_reg(ctx, dst, Some(cls_const), Some(typeptr));
         } else {
             let cls_ref = ctx.const_ref(typeptr);
-            self.set_ref_reg(dst, Some(cls_ref), Some(typeptr));
+            self.set_ref_reg(ctx, dst, Some(cls_ref), Some(typeptr));
         }
         TraceAction::Continue
     }
@@ -8346,7 +8387,7 @@ where
         // resumepc=orgpc)` records.
         let opcode_pc = self.frames.current_mut().code_cursor - 1;
         let src = self.frames.current_mut().next_reg() as usize;
-        let (opref, concrete) = self.read_ref_reg(src);
+        let (opref, concrete) = self.read_ref_reg(ctx, src);
         if concrete == 0 {
             return TraceAction::Abort;
         }
@@ -8486,7 +8527,7 @@ where
         let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
             return TraceAction::Abort;
         };
-        let (length_opref, length_val) = self.read_int_reg(length_reg);
+        let (length_opref, length_val) = self.read_int_reg(ctx, length_reg);
         let length_count =
             usize::try_from(length_val).expect("BC_NEW_ARRAY: negative array length");
         let array_payload = array_itemsize
@@ -8549,7 +8590,7 @@ where
         ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
         ctx.heap_cache_mut()
             .new_array(abox_op, length_opref, length_opref.is_constant());
-        self.set_ref_reg(dest, Some(abox_op), Some(array_ptr));
+        self.set_ref_reg(ctx, dest, Some(abox_op), Some(array_ptr));
         TraceAction::Continue
     }
 
@@ -8640,7 +8681,7 @@ where
         // items-block element count (opimpl_newlist_clear passes the
         // same `sizebox` to `_opimpl_setfield_gc_any` and
         // `opimpl_new_array_clear`).
-        let (length_opref, length_val) = self.read_int_reg(length_reg);
+        let (length_opref, length_val) = self.read_int_reg(ctx, length_reg);
 
         // ── 1. sbox: live-alloc the `list` header (BC_NEW no-collect
         // discipline — the struct ptr is live in the register bank,
@@ -8758,7 +8799,7 @@ where
         }
 
         // ── 5. bind the list header to the destination ref register. ──
-        self.set_ref_reg(dest, Some(sbox_op), Some(struct_ptr));
+        self.set_ref_reg(ctx, dest, Some(sbox_op), Some(struct_ptr));
         TraceAction::Continue
     }
 
@@ -8780,9 +8821,10 @@ where
             let dest = frame.next_reg() as usize;
             (src, dest)
         };
-        let (opref, _) = self.read_int_reg(src);
+        let (opref, _) = self.read_int_reg(ctx, src);
         let value = opref.is_constant() as i64;
-        self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
+        let dest_box = ctx.const_int(value);
+        self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
         TraceAction::Continue
     }
 
@@ -8804,9 +8846,10 @@ where
             let dest = frame.next_reg() as usize;
             (src, dest)
         };
-        let (opref, _) = self.read_ref_reg(src);
+        let (opref, _) = self.read_ref_reg(ctx, src);
         let value = opref.is_constant() as i64;
-        self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
+        let dest_box = ctx.const_int(value);
+        self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
         TraceAction::Continue
     }
 
@@ -8827,9 +8870,10 @@ where
             let dest = frame.next_reg() as usize;
             (src, dest)
         };
-        let (opref, _) = self.read_ref_reg(src);
+        let (opref, _) = self.read_ref_reg(ctx, src);
         let value = ctx.is_likely_virtual(opref) as i64;
-        self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
+        let dest_box = ctx.const_int(value);
+        self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
         TraceAction::Continue
     }
 
@@ -8854,7 +8898,7 @@ where
             let dst = frame.next_reg() as usize;
             (src, dst)
         };
-        let (string, addr) = self.read_ref_reg(src);
+        let (string, addr) = self.read_ref_reg(ctx, src);
         assert_ne!(addr, 0, "strlen: null string");
         let value = unsafe {
             ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
@@ -8868,7 +8912,7 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -8890,8 +8934,8 @@ where
             let dst = frame.next_reg() as usize;
             (src, index_reg, dst)
         };
-        let (string, addr) = self.read_ref_reg(src);
-        let (index, index_value) = self.read_int_reg(index_reg);
+        let (string, addr) = self.read_ref_reg(ctx, src);
+        let (index, index_value) = self.read_int_reg(ctx, index_reg);
         assert_ne!(addr, 0, "strgetitem: null string");
         let len = unsafe {
             ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
@@ -8916,7 +8960,7 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
         TraceAction::Continue
     }
 

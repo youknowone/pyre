@@ -3726,17 +3726,11 @@ impl<M: Clone> MetaInterp<M> {
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
         for frame in self.framestack.frames.iter_mut() {
-            for (slot, concrete) in frame.ref_regs.iter_mut().zip(frame.ref_values.iter_mut()) {
+            for slot in frame.ref_regs.iter_mut() {
                 // Forward the inline `ConstPtr` gcref in place; non-Const
                 // positions (ResOp / InputArg refs) carry no inline ref.
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(gcref);
-                    // The Box field above is authoritative, but pyre also
-                    // carries a concrete execution mirror.  Keep it aligned
-                    // so a later blackhole-entry root never publishes the
-                    // from-space address (`BlackholeInterpreter.
-                    // _copy_data_from_miframe` calls `box.getref_base()`).
-                    *concrete = Some(gcref.0 as i64);
                 }
             }
         }
@@ -3803,21 +3797,8 @@ impl<M: Clone> MetaInterp<M> {
 
         // Non-constant Ref registers name the recorder's `RefFrontendOp` /
         // `InputArgRef`, whose attached concrete value was forwarded above.
-        // RPython has no second value to refresh: `registers_r[i]` is that Box
-        // itself and `getref_base()` reads its updated `_resref`.  Pyre's
-        // `ref_values` mirror must be brought back into line explicitly before
-        // interpreter execution or `_copy_data_from_miframe` reads it.
-        for frame in self.framestack.frames.iter_mut() {
-            for (opref, concrete) in frame.ref_regs.iter().zip(frame.ref_values.iter_mut()) {
-                let Some(opref) = *opref else { continue };
-                if opref.is_constant() {
-                    continue;
-                }
-                if let Some(Value::Ref(gcref)) = trace_ctx.box_value(opref) {
-                    *concrete = Some(gcref.0 as i64);
-                }
-            }
-        }
+        // `registers_r[i]` is that Box and `getref_base()` reads its
+        // updated `_resref`; there is no second value to refresh.
     }
 
     /// GC walker for ConstPtr GcRefs from snapshot maps during
@@ -5619,6 +5600,7 @@ impl<M: Clone> MetaInterp<M> {
                     // in place by walk_active_trace_refs).
                     ctx.initial_inputarg_consts
                         .push(OpRef::const_inline_from_value(value));
+                    ctx.set_opref_concrete(opref, *value);
                     opref
                 })
                 .collect()
@@ -6342,6 +6324,7 @@ impl<M: Clone> MetaInterp<M> {
                     .iter()
                     .map(OpRef::const_inline_from_value)
                     .collect();
+                ctx.stamp_live_inputargs(live_values);
                 if let Some(ref descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor.clone());
                 }
@@ -6759,6 +6742,7 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(OpRef::const_inline_from_value)
             .collect();
+        ctx.stamp_live_inputargs(live_values);
         if let Some(ref descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor.clone());
         }
@@ -6853,11 +6837,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         ctx.walk_final_pc = Some(pc);
         if let Some(root) = self.framestack.frames.first() {
-            ctx.snapshot_portal_greens_from_frame(
-                &root.int_values,
-                &root.ref_values,
-                &root.float_values,
-            );
+            ctx.snapshot_portal_greens_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
         }
         ctx.adopt_live_greens_as_close();
     }
@@ -7250,6 +7230,14 @@ impl<M: Clone> MetaInterp<M> {
         // This is the runner: `convert_and_run_from_pyjitpl` below consumes
         // `self.framestack`, so `abort_trace` must not stage it for another.
         self.interpret_framestack_for_abort = false;
+        // Rewrite non-const register boxes to inline Consts while the
+        // recorder is still alive so `_copy_data_from_miframe` can read
+        // `getint()` / `getref_base()` after `abort_trace` drops it.
+        if let Some(ctx) = self.tracing.as_ref() {
+            for frame in self.framestack.frames.iter_mut() {
+                frame.freeze_values_into_const_boxes(ctx);
+            }
+        }
         self.abort_trace(false);
         builder.set_cpu(self.blackhole_cpu());
         let result = crate::jitdriver::drive_multi_frame_blackhole(
@@ -18247,6 +18235,9 @@ impl<M: Clone> MetaInterp<M> {
         let _ = self.newframe(jitcode, greenkey);
         // pyjitpl.py: f.setup_call(boxes)
         self.framestack.current_mut().setup_call(argboxes);
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.stamp_argboxes(argboxes);
+        }
         // pyjitpl.py: raise ChangeFrame
         Err(ChangeFrame)
     }
@@ -18999,14 +18990,20 @@ impl<M: Clone> MetaInterp<M> {
                         let leaving_idx = code[position + 1] as usize;
                         let unique_id_idx = code[position + 2] as usize;
                         let leaving = frame
-                            .int_values
+                            .int_regs
                             .get(leaving_idx)
-                            .and_then(|v| *v)
+                            .copied()
+                            .flatten()
+                            .and_then(|op| op.inline_const_to_value())
+                            .map(|v| v.as_raw_i64())
                             .unwrap_or(0);
                         let unique_id = frame
-                            .int_values
+                            .int_regs
                             .get(unique_id_idx)
-                            .and_then(|v| *v)
+                            .copied()
+                            .flatten()
+                            .and_then(|op| op.inline_const_to_value())
+                            .map(|v| v.as_raw_i64())
                             .unwrap_or(0);
                         majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
@@ -19212,6 +19209,9 @@ impl<M: Clone> MetaInterp<M> {
         let _ = self.newframe(mainjitcode, None);
         // pyjitpl.py: f.setup_call(original_boxes)
         self.framestack.current_mut().setup_call(original_boxes);
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.stamp_argboxes(original_boxes);
+        }
         // pyjitpl.py `initialize_state_from_start`: assert self.portal_call_depth == 0
         debug_assert_eq!(self.portal_call_depth, 0);
     }
@@ -19541,17 +19541,27 @@ impl<M: Clone> MetaInterp<M> {
                 match bank {
                     majit_ir::Type::Int if index < frame.int_regs.len() => {
                         frame.int_regs[index] = Some(opref);
-                        frame.int_values[index] = bits;
                     }
                     majit_ir::Type::Ref if index < frame.ref_regs.len() => {
                         frame.ref_regs[index] = Some(opref);
-                        frame.ref_values[index] = bits;
                     }
                     majit_ir::Type::Float if index < frame.float_regs.len() => {
                         frame.float_regs[index] = Some(opref);
-                        frame.float_values[index] = bits;
                     }
                     _ => {}
+                }
+                if let Some(bits) = bits
+                    && let Some(ctx) = tracing.as_mut()
+                {
+                    let stamped = match bank {
+                        majit_ir::Type::Int => majit_ir::Value::Int(bits),
+                        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
+                        majit_ir::Type::Float => {
+                            majit_ir::Value::Float(f64::from_bits(bits as u64))
+                        }
+                        _ => continue,
+                    };
+                    let _ = ctx.try_set_opref_concrete(opref, stamped);
                 }
             }
         }
@@ -23721,8 +23731,14 @@ mod portal_resume_rebuild_tests {
         assert!(ok);
         assert_eq!(meta.framestack.frames.len(), 1);
         assert_eq!(meta.framestack.frames[0].pc, 0);
-        assert_eq!(meta.framestack.frames[0].int_values[0], Some(1));
-        assert_eq!(meta.framestack.frames[0].int_values[1], Some(42));
+        assert_eq!(
+            meta.framestack.frames[0].int_value_for_blackhole(0),
+            Some(1)
+        );
+        assert_eq!(
+            meta.framestack.frames[0].int_value_for_blackhole(1),
+            Some(42)
+        );
         assert_eq!(RVMPROF_LEAVING.load(Ordering::SeqCst), 0);
         assert_eq!(RVMPROF_UID.load(Ordering::SeqCst), 42);
     }
@@ -23935,6 +23951,7 @@ mod metainterp_static_data_tests {
         // Empty effectinfo + Void descr → CallN emitted, returns None.
         assert!(result.is_none(), "void result must be None");
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.recorder
                 .ops()
@@ -24257,13 +24274,9 @@ mod metainterp_static_data_tests {
         let f = meta.framestack.current_mut();
         assert_eq!(f.pc, 0);
         assert_eq!(f.int_regs[0], Some(OpRef::int_op(10)));
-        assert_eq!(f.int_values[0], Some(100));
         assert_eq!(f.int_regs[1], Some(OpRef::int_op(11)));
-        assert_eq!(f.int_values[1], Some(101));
         assert_eq!(f.ref_regs[0], Some(OpRef::ref_op(20)));
-        assert_eq!(f.ref_values[0], Some(200));
         assert_eq!(f.float_regs[0], Some(OpRef::float_op(30)));
-        assert_eq!(f.float_values[0], Some(300));
     }
 
     #[test]
@@ -24319,7 +24332,6 @@ mod metainterp_static_data_tests {
         let caller_frame = meta.framestack.current_mut();
         assert_eq!(caller_frame.pc, post_call_pc);
         assert_eq!(caller_frame.int_regs[1], Some(OpRef::int_op(42)));
-        assert_eq!(caller_frame.int_values[1], Some(4242));
     }
 
     #[test]
@@ -24336,7 +24348,6 @@ mod metainterp_static_data_tests {
         // Mutate the caller's register 0 so we can detect any
         // accidental write triggered by the void return.
         meta.framestack.current_mut().int_regs[0] = Some(OpRef::int_op(7));
-        meta.framestack.current_mut().int_values[0] = Some(7);
         meta.perform_call(callee, &[], None).unwrap_err();
         let result = meta.finishframe(None, true);
         assert!(matches!(result, Err(FinishFrameSignal::ChangeFrame)));
@@ -24345,7 +24356,6 @@ mod metainterp_static_data_tests {
             meta.framestack.current_mut().int_regs[0],
             Some(OpRef::int_op(7))
         );
-        assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
     }
 
     #[test]
@@ -24403,7 +24413,8 @@ mod metainterp_static_data_tests {
             crate::TraceAction::Abort
         ));
         assert_eq!(meta.framestack.len(), 2);
-        assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
+        let i0 = meta.framestack.frames.last().unwrap().int_regs[0].unwrap();
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(i0), Some(41));
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
             "recursive_call_v/iIRFIRF",
             34,
@@ -24596,7 +24607,6 @@ mod metainterp_static_data_tests {
             meta.framestack.current_mut().int_regs[0],
             Some(OpRef::int_op(7))
         );
-        assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
         // pyjitpl.py initialize_original_boxes assert.
         assert_eq!(meta.portal_call_depth, 0);
     }
@@ -24642,11 +24652,17 @@ mod metainterp_static_data_tests {
         );
         let frame = meta.framestack.current_mut();
         assert_eq!(frame.pc, 0);
-        assert_eq!(frame.int_values[0], Some(11));
-        assert_eq!(frame.int_values[1], Some(0));
-        assert_eq!(frame.ref_values[0], Some(0xabc));
-        assert_eq!(frame.ref_values[1], Some(0x100));
-        assert_eq!(frame.ref_values[2], Some(0x200));
+        assert_eq!(frame.int_value_for_blackhole(0), Some(11));
+        assert_eq!(frame.int_value_for_blackhole(1), Some(0));
+        assert_eq!(frame.ref_value_for_blackhole(0), Some(0xabc));
+        assert_eq!(
+            frame.ref_regs[1],
+            Some(OpRef::input_arg_typed(0, majit_ir::Type::Ref))
+        );
+        assert_eq!(
+            frame.ref_regs[2],
+            Some(OpRef::input_arg_typed(1, majit_ir::Type::Ref))
+        );
         assert_eq!(meta.portal_call_depth, 0);
         assert_eq!(meta.call_ids, vec![0]);
     }
@@ -24828,6 +24844,7 @@ mod metainterp_static_data_tests {
             effect: majit_ir::EffectInfo::default(),
         };
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let funcbox_ref = ctx.const_ref(0xdead);
         let argbox0_ref = ctx.const_int(11);
         let argbox1_ref = ctx.const_ref(22);
@@ -24859,6 +24876,7 @@ mod metainterp_static_data_tests {
             effect: majit_ir::EffectInfo::default(),
         };
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let prepend_ref = ctx.const_int(0);
         let funcbox_ref = ctx.const_ref(0xfeed);
         let argbox_ref = ctx.const_int(1);
@@ -24897,6 +24915,7 @@ mod metainterp_static_data_tests {
             effect: majit_ir::EffectInfo::default(),
         };
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let funcbox_ref = ctx.const_ref(0xdead);
         let i0 = ctx.const_int(11);
         let i1 = ctx.const_int(33);
@@ -24943,6 +24962,7 @@ mod metainterp_static_data_tests {
             effect: majit_ir::EffectInfo::default(),
         };
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let funcbox_ref = ctx.const_ref(0xdead);
         let i0 = ctx.const_int(11);
         let i1 = ctx.const_int(33);
@@ -25036,6 +25056,7 @@ mod metainterp_static_data_tests {
 
         // No IR ops should have been recorded.
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.ops().is_empty(),
             "do_not_in_trace_call must not record IR ops"
@@ -25373,6 +25394,7 @@ mod metainterp_static_data_tests {
         assert_eq!(resvalue, 4 + 6 * 1000);
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let op = ctx
             .recorder
             .ops()
@@ -25524,6 +25546,7 @@ mod metainterp_static_data_tests {
         // Build a constant argbox via TraceCtx::const_int.
         let arg_const = {
             let ctx = meta.trace_ctx().expect("active trace");
+            ctx.ensure_ops_materialized();
             ctx.const_int(42)
         };
         // Snapshot the trace position before we record the call, so
@@ -25549,6 +25572,7 @@ mod metainterp_static_data_tests {
         );
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         // The CallI must have been cut from the trace.
         assert!(
             ctx.recorder
@@ -25787,6 +25811,7 @@ mod metainterp_static_data_tests {
         assert_eq!(resvalue, 0xc0ffee);
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let op = ctx
             .recorder
             .ops()
@@ -25840,6 +25865,7 @@ mod metainterp_static_data_tests {
         );
         assert!(matches!(result, Ok(None)));
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.recorder
                 .ops()
@@ -25905,6 +25931,7 @@ mod metainterp_static_data_tests {
         // through the empty-arg arm and the function returns 0 + 0*1000.
         let _ = result;
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.recorder
                 .ops()
@@ -25944,6 +25971,7 @@ mod metainterp_static_data_tests {
         let (opref, _resvalue) = result.expect("Ok").expect("Some(opref)");
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let call_op = ctx
             .recorder
             .ops()
@@ -26061,6 +26089,7 @@ mod metainterp_static_data_tests {
         assert_eq!(resvalue, 7 + 3 * 1000);
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let op = ctx
             .recorder
             .ops()
@@ -26103,6 +26132,7 @@ mod metainterp_static_data_tests {
         assert!(result.is_none(), "void call must return None");
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.recorder
                 .ops()
@@ -26155,6 +26185,7 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.framestack.current_mut().pc, 99);
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.recorder
                 .ops()
@@ -26178,6 +26209,7 @@ mod metainterp_static_data_tests {
         assert_eq!(result, Some(OpRef::int_op(42)));
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         assert!(
             ctx.recorder
                 .ops()
@@ -26200,6 +26232,7 @@ mod metainterp_static_data_tests {
         assert!(matches!(result, Ok(())));
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let resume_pos = {
             let guard = ctx
                 .recorder
@@ -26252,6 +26285,7 @@ mod metainterp_static_data_tests {
 
         let guard_pos = {
             let ctx = meta.trace_ctx().expect("active trace");
+            ctx.ensure_ops_materialized();
             let mut matches = ctx
                 .recorder
                 .ops()
@@ -26301,6 +26335,7 @@ mod metainterp_static_data_tests {
 
         let last_exc_box = meta.last_exc_box.expect("last_exc_box");
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         // GUARD_EXCEPTION must still be recorded (pyjitpl.py:3383).
         let guard_count = ctx
             .recorder
@@ -26608,6 +26643,7 @@ mod metainterp_static_data_tests {
         assert!(meta.last_exc_box.is_some());
 
         let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
         let op = ctx
             .recorder
             .ops()
@@ -26838,6 +26874,7 @@ mod metainterp_static_data_tests {
         meta.enter_portal_frame(3, 0xfeed);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
+        ctx.ensure_ops_materialized();
         let mut matches = ctx
             .recorder
             .ops()
@@ -26874,6 +26911,7 @@ mod metainterp_static_data_tests {
         let typed = majit_ir::GreenKey::new(vec![1, 0, 0xabc]);
         meta.newframe(jc, Some((0xbadd, Some(typed))));
         let ctx = meta.trace_ctx().expect("tracing");
+        ctx.ensure_ops_materialized();
         let op = ctx
             .recorder
             .ops()
@@ -26898,6 +26936,7 @@ mod metainterp_static_data_tests {
         meta.leave_portal_frame(7);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
+        ctx.ensure_ops_materialized();
         let mut matches = ctx
             .recorder
             .ops()
@@ -26933,6 +26972,7 @@ mod metainterp_static_data_tests {
         meta.popframe(true);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
+        ctx.ensure_ops_materialized();
         let enter = ctx
             .recorder
             .ops()
@@ -27088,7 +27128,10 @@ mod metainterp_static_data_tests {
     fn record_ops(meta: &mut MetaInterp<()>, n: usize) {
         let ctx = meta.tracing.as_mut().expect("tracing is Some");
         for _ in 0..n {
-            ctx.record_op(majit_ir::OpCode::PtrEq, &[]);
+            ctx.record_op(
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::const_int(0), OpRef::const_int(0)],
+            );
         }
     }
 
@@ -27797,6 +27840,7 @@ mod tests {
             }
         });
 
+        meta.tracing.as_mut().unwrap().ensure_ops_materialized();
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
         assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0xB000)));
     }
@@ -27813,7 +27857,6 @@ mod tests {
         b.ref_return(0);
         let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
         frame.ref_regs[0] = Some(input);
-        frame.ref_values[0] = Some(0x7000);
         meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
 
         meta.walk_active_trace_refs(|slot| {
@@ -27822,7 +27865,7 @@ mod tests {
             }
         });
 
-        assert_eq!(meta.framestack.frames[0].ref_values[0], Some(0x8000));
+        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
     }
 
     #[test]
@@ -27850,6 +27893,7 @@ mod tests {
             }
         });
 
+        meta.tracing.as_mut().unwrap().ensure_ops_materialized();
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
         assert!(matches!(
             ops[0].get_value(),
@@ -29788,6 +29832,7 @@ mod tests {
 
         let snapshot_id = {
             let ctx = meta.trace_ctx().expect("active trace context");
+            ctx.ensure_ops_materialized();
             ctx.capture_resumedata(crate::recorder::Snapshot {
                 resume_position: -1,
                 frames: vec![crate::recorder::SnapshotFrame {
@@ -29871,6 +29916,7 @@ mod tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let ctx = meta.trace_ctx().expect("expected active trace context");
+        ctx.ensure_ops_materialized();
         assert_eq!(ctx.recorder.num_inputargs(), 2);
         assert_eq!(ctx.inputarg_types(), vec![Type::Ref, Type::Int]);
         assert_eq!(
@@ -29906,6 +29952,7 @@ mod tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
         let ctx = meta.trace_ctx().expect("expected active trace context");
+        ctx.ensure_ops_materialized();
         assert_eq!(
             ctx.virtualizable_entry_at(0),
             Some((OpRef::input_arg_int(1), Value::Int(41)))
@@ -29955,6 +30002,7 @@ mod tests {
         assert_ne!(meta.unwrap_standard_virtualizable() as usize, old as usize);
         let forwarded = meta.unwrap_standard_virtualizable() as usize;
         let ctx = meta.trace_ctx().expect("expected active trace context");
+        ctx.ensure_ops_materialized();
         assert_eq!(
             ctx.initial_inputarg_consts.first().copied(),
             Some(OpRef::ConstPtr(majit_ir::GcRef(forwarded)))
@@ -29994,6 +30042,7 @@ mod tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let ctx = meta.trace_ctx().expect("expected active trace context");
+        ctx.ensure_ops_materialized();
         assert_eq!(
             ctx.collect_virtualizable_boxes().unwrap(),
             vec![OpRef::input_arg_ref(0)]

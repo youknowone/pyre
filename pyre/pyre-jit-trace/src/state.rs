@@ -2523,8 +2523,7 @@ pub fn per_frame_vables_from_framestack(
             if frame_reg == u16::MAX {
                 return (0, 0);
             }
-            let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten()
-            else {
+            let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
                 return (0, 0);
             };
             if frame_ptr == 0 {

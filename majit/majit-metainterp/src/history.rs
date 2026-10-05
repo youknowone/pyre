@@ -2766,10 +2766,12 @@ mod tests {
 
         let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
         let descr: DescrRef = Arc::new(TestFailDescr(0));
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
+        let g = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
+        rec.materialize_into_ops();
+        rec.set_op_fail_args(g, &[i0, i1]);
 
         let trace = rec.get_trace();
         let guards: Vec<_> = trace.iter_guards().collect();

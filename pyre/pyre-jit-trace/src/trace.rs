@@ -3181,10 +3181,7 @@ fn try_adopt_single_frame_blackhole(
     let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
     let vable_frame = latched
         .miframe
-        .ref_values
-        .get(frame_reg as usize)
-        .copied()
-        .flatten()
+        .ref_value_for_blackhole(frame_reg as usize)
         .unwrap_or(0) as usize;
     if vable_frame == 0 || vable_frame != root_addr {
         assert!(
@@ -3274,14 +3271,21 @@ fn try_adopt_single_frame_blackhole(
     // stack, and copy forwarding updates into the MIFrame.
     let image_ref_locations: Vec<usize> = latched
         .miframe
-        .ref_values
+        .ref_regs
         .iter()
         .enumerate()
-        .filter_map(|(index, value)| value.map(|_| index))
+        .filter_map(|(index, slot)| {
+            matches!(slot, Some(majit_ir::OpRef::ConstPtr(_))).then_some(index)
+        })
         .collect();
     let mut image_ref_roots: Vec<i64> = image_ref_locations
         .iter()
-        .map(|&index| latched.miframe.ref_values[index].expect("location came from Some"))
+        .map(|&index| {
+            latched
+                .miframe
+                .ref_value_for_blackhole(index)
+                .expect("location came from ConstPtr")
+        })
         .collect();
     let image_exception_root = (latched.last_exc_value != 0).then(|| {
         let index = image_ref_roots.len();
@@ -3309,17 +3313,14 @@ fn try_adopt_single_frame_blackhole(
         return false;
     }
     for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
-        latched.miframe.ref_values[index] = Some(forwarded);
+        latched.miframe.set_forwarded_ref_value(index, forwarded);
     }
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
     }
     let committed_root_addr = latched
         .miframe
-        .ref_values
-        .get(frame_reg as usize)
-        .copied()
-        .flatten()
+        .ref_value_for_blackhole(frame_reg as usize)
         .expect("preflighted frame register disappeared after forwarding")
         as usize;
     if let Some(stack) = captured_stack.as_ref() {
@@ -3640,7 +3641,7 @@ fn try_adopt_multi_frame_blackhole(
             mfdbg!("frame {index}: jitcode {jitcode_index} has no portal frame reg");
             return false;
         }
-        let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
+        let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
             mfdbg!("frame {index}: reg {frame_reg} unstamped");
             return false;
         };
@@ -3873,17 +3874,21 @@ fn try_adopt_multi_frame_blackhole(
         .enumerate()
         .flat_map(|(frame_index, frame)| {
             frame
-                .ref_values
+                .ref_regs
                 .iter()
                 .enumerate()
-                .filter_map(move |(reg_index, value)| value.map(|_| (frame_index, reg_index)))
+                .filter_map(move |(reg_index, slot)| {
+                    matches!(slot, Some(majit_ir::OpRef::ConstPtr(_)))
+                        .then_some((frame_index, reg_index))
+                })
         })
         .collect();
     let mut image_ref_roots: Vec<i64> = image_ref_locations
         .iter()
         .map(|&(frame_index, reg_index)| {
-            latched.framestack.frames[frame_index].ref_values[reg_index]
-                .expect("location came from Some")
+            latched.framestack.frames[frame_index]
+                .ref_value_for_blackhole(reg_index)
+                .expect("location came from ConstPtr")
         })
         .collect();
     let image_exception_root = (latched.last_exc_value != 0).then(|| {
@@ -3906,7 +3911,7 @@ fn try_adopt_multi_frame_blackhole(
     }
     for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
     {
-        latched.framestack.frames[frame_index].ref_values[reg_index] = Some(forwarded);
+        latched.framestack.frames[frame_index].set_forwarded_ref_value(reg_index, forwarded);
     }
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];

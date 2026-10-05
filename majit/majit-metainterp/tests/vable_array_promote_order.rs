@@ -202,8 +202,9 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     // through `execute_and_record`, so a constant on both sides folds the
     // comparison and no guard is minted — which would leave the `guards > 0`
     // line measuring nothing. A virtualizable in a register is a recorded box
-    // in production anyway; the concrete pointer arrives from the frame's
-    // `ref_values`, not from the box being constant.
+    // in production anyway; the concrete pointer lives on the box
+    // (`InputArg.getref_base` / `set_opref_concrete`), not from the
+    // box being a ConstPtr.
     let other_vable = match vable {
         VableBox::Recorded => {
             let b = OpRef::input_arg_ref(0);
@@ -229,12 +230,9 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     // MIFrame::new initializes the bytecode cursor independently of `pc`.
     frame.code_cursor = pc;
     frame.ref_regs[VABLE_REG as usize] = Some(other_vable);
-    frame.ref_values[VABLE_REG as usize] = Some(2);
     frame.int_regs[INDEX_REG as usize] = Some(index);
-    frame.int_values[INDEX_REG as usize] = Some(0);
     if arm == Arm::Set {
         frame.int_regs[VALUE_REG as usize] = Some(stored);
-        frame.int_values[VALUE_REG as usize] = Some(7);
     }
     let mut frames = MIFrameStack::empty();
     frames.frames.push(frame);

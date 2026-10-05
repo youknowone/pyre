@@ -627,9 +627,9 @@ pub struct TraceCtx {
     /// once the arm has taken it.
     pub aborted_framestack: Option<crate::pyjitpl::MIFrameStack>,
     /// Single-pass tracing: the walk-final concrete RED values captured from
-    /// the closing merge point's red operands (their live `int_values` /
-    /// `ref_values` / `float_values` shadow), in operand order (slot 3 ints,
-    /// slot 4 refs, slot 5 floats). The merge-point hook feeds these to
+    /// the closing merge point's red operands (their live register boxes),
+    /// in operand order (slot 3 ints, slot 4 refs, slot 5 floats). The
+    /// merge-point hook feeds these to
     /// `restore_values` to complete the `S_{k+1}` transfer that storage-only
     /// `recover` cannot reconstruct (loop-carried state held in a red bank but
     /// never written back to the shared heap). Empty unless single-pass.
@@ -2045,16 +2045,8 @@ impl TraceCtx {
     /// history.py `History.__init__` — bind `opencoder.Trace` once the
     /// live JIT has `metainterp_sd` and the inputarg cap. Tests that
     /// construct a `TraceCtx` without going through `setup_tracing` /
-    /// `start_retrace` keep the `Vec<Op>` recorder so they can emit
-    /// synthetic arities the byte encoder rejects.
+    /// `start_retrace` lazy-attach a dummy buffer on the first `record_*`.
     pub fn attach_live_byte_recorder(&mut self) {
-        // `cfg(test)` here is the metainterp crate's own test build.
-        // Those fixtures emit synthetic 0-arg `PtrEq` ops the byte
-        // encoder rejects (`opencoder.py _op_start` arity). The regex
-        // / pyre-jit crates compile this lib without `cfg(test)` and
-        // take the live path. The unit test
-        // `byte_buffer_materialize_keeps_unique_positions` attaches
-        // explicitly.
         #[cfg(not(test))]
         self.recorder.attach_byte_buffer(self.metainterp_sd.clone());
         #[cfg(test)]
@@ -2571,6 +2563,35 @@ impl TraceCtx {
         self.lookup_opref_concrete(opref)
     }
 
+    /// `IntOp.getint` / `RefOp.getref_base` / `FloatOp.getfloat_storage`
+    /// as machine bits. Constants are inline on the OpRef; value ops
+    /// and inputargs read `_res*` off the FrontendOp table.
+    pub fn box_bits(&self, opref: OpRef) -> Option<i64> {
+        self.box_value(opref).map(|v| v.as_raw_i64())
+    }
+
+    /// `InputArgInt(value)` construction: stamp each recorded inputarg
+    /// with the live value `create_empty_history` saw.
+    pub fn stamp_live_inputargs(&mut self, live_values: &[Value]) {
+        for (i, value) in live_values.iter().enumerate() {
+            let opref = OpRef::input_arg_typed(i as u32, value.get_type());
+            self.set_opref_concrete(opref, *value);
+        }
+    }
+
+    /// Plant-time `box.getint()`: write the argbox's concrete bits onto
+    /// the box (`try_set_opref_concrete`). Const OpRefs are a no-op.
+    pub fn stamp_argboxes(&mut self, argboxes: &[(JitArgKind, OpRef, i64)]) {
+        for (kind, opref, bits) in argboxes {
+            let concrete = match kind {
+                JitArgKind::Int => Value::Int(*bits),
+                JitArgKind::Ref => Value::Ref(majit_ir::GcRef(*bits as usize)),
+                JitArgKind::Float => Value::Float(f64::from_bits(*bits as u64)),
+            };
+            let _ = self.try_set_opref_concrete(*opref, concrete);
+        }
+    }
+
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
     /// history.py `ConstPtr.value` is inline on the Box; pyre
@@ -2935,9 +2956,9 @@ impl TraceCtx {
     /// header slot for a loop-carried green).
     pub fn snapshot_portal_greens_from_frame(
         &mut self,
-        ints: &[Option<i64>],
-        refs: &[Option<i64>],
-        floats: &[Option<i64>],
+        ints: &[Option<OpRef>],
+        refs: &[Option<OpRef>],
+        floats: &[Option<OpRef>],
     ) {
         if self.portal_green_regs_i.is_empty()
             && self.portal_green_regs_r.is_empty()
@@ -2945,12 +2966,13 @@ impl TraceCtx {
         {
             return;
         }
-        fn read(bank: &[Option<i64>], regs: &[u8], what: &str) -> Vec<i64> {
+        fn read(ctx: &TraceCtx, bank: &[Option<OpRef>], regs: &[u8], what: &str) -> Vec<i64> {
             regs.iter()
                 .map(|&reg| {
                     bank.get(reg as usize)
                         .copied()
                         .flatten()
+                        .and_then(|op| ctx.box_bits(op))
                         .unwrap_or_else(|| {
                             panic!(
                                 "merge-point green {what} register {reg} must be live \
@@ -2961,9 +2983,9 @@ impl TraceCtx {
                 .collect()
         }
         self.live_portal_greens = Some((
-            read(ints, &self.portal_green_regs_i, "int"),
-            read(refs, &self.portal_green_regs_r, "ref"),
-            read(floats, &self.portal_green_regs_f, "float"),
+            read(self, ints, &self.portal_green_regs_i, "int"),
+            read(self, refs, &self.portal_green_regs_r, "ref"),
+            read(self, floats, &self.portal_green_regs_f, "float"),
         ));
     }
 
