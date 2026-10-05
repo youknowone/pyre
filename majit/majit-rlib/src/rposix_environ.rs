@@ -44,13 +44,17 @@ pub fn os_get_environ() -> CCHARPP {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     unsafe {
         // Runtime `CExternVariable` of `environ`; not a translator helper.
-        core::ptr::addr_of!(environ).read()
+        // Nested so `envkeys_llimpl` / `envitems_llimpl` can keep the local
+        // name `environ` (`rposix_environ.envkeys_llimpl`).
+        core::ptr::addr_of!(c_environ::environ).read()
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-unsafe extern "C" {
-    static mut environ: CCHARPP;
+mod c_environ {
+    unsafe extern "C" {
+        pub static mut environ: super::CCHARPP;
+    }
 }
 
 crate::rffi::llexternal!(
