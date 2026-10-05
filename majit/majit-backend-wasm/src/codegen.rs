@@ -37,10 +37,7 @@ use wasm_encoder::{
 pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op>) {
     let produced: std::collections::HashSet<u32> = ops
         .iter()
-        .filter_map(|op| {
-            let r = op.pos().get();
-            (!r.is_none() && !r.is_constant()).then_some(r.raw())
-        })
+        .filter_map(result_value_raw)
         .chain(inputargs.iter().map(|ia| ia.index))
         .collect();
     let Some(label) = ops.iter().find(|op| op.opcode == OpCode::Label) else {
@@ -155,6 +152,34 @@ impl ConstPtrTables {
     }
 }
 
+/// Value boxes occupy wasm locals, numbered by opencoder `_index`
+/// (`InputArg*` / `IntOp` / `FloatOp` / `RefOp`). Void ops are
+/// `VoidOp(_count)` (`opencoder.py` `_op_end`); that payload shares the
+/// integer space with a later value box, so it must not index a local.
+fn value_box_raw(r: OpRef) -> Option<u32> {
+    if r.is_none() || r.is_constant() || r.is_temp_var() {
+        return None;
+    }
+    if r.ty() == Some(Type::Void) {
+        return None;
+    }
+    Some(r.raw())
+}
+
+fn result_value_raw(op: &Op) -> Option<u32> {
+    if op.result_type() == Type::Void {
+        None
+    } else {
+        value_box_raw(op.pos().get())
+    }
+}
+
+fn widen_value_id(r: OpRef, end: &mut u32) {
+    if let Some(id) = value_box_raw(r) {
+        *end = (*end).max(id + 1);
+    }
+}
+
 /// Dense wasm-local assignment for the sparse value-id namespace.
 struct ValueLocals {
     by_id: Vec<Option<u32>>,
@@ -205,13 +230,12 @@ impl ValueLocals {
             );
         }
         for op in ops {
-            let result = op.pos().get();
-            if result != OpRef::NONE && !result.is_constant() {
+            if let Some(id) = result_value_raw(op) {
                 Self::mark(
                     &mut by_id,
                     &mut id_types,
                     &mut has_authoritative_type,
-                    result.raw(),
+                    id,
                     if op.result_type() == Type::Float {
                         ValType::F64
                     } else {
@@ -222,12 +246,12 @@ impl ValueLocals {
             }
             for arg in op.getarglist() {
                 let arg = arg.to_opref();
-                if arg != OpRef::NONE && !arg.is_constant() {
+                if let Some(id) = value_box_raw(arg) {
                     Self::mark(
                         &mut by_id,
                         &mut id_types,
                         &mut has_authoritative_type,
-                        arg.raw(),
+                        id,
                         if arg.ty() == Some(Type::Float) {
                             ValType::F64
                         } else {
@@ -240,12 +264,12 @@ impl ValueLocals {
             if let Some(failargs) = op.getfailargs() {
                 for arg in failargs {
                     let arg = arg.to_opref();
-                    if arg != OpRef::NONE && !arg.is_constant() {
+                    if let Some(id) = value_box_raw(arg) {
                         Self::mark(
                             &mut by_id,
                             &mut id_types,
                             &mut has_authoritative_type,
-                            arg.raw(),
+                            id,
                             if arg.ty() == Some(Type::Float) {
                                 ValType::F64
                             } else {
@@ -272,8 +296,7 @@ impl ValueLocals {
             .iter()
             .filter(|op| op.opcode == OpCode::Label)
             .flat_map(|op| op.getarglist().into_iter().map(|arg| arg.to_opref()))
-            .filter(|arg| *arg != OpRef::NONE && !arg.is_constant())
-            .map(OpRef::raw)
+            .filter_map(value_box_raw)
         {
             label_value_ids[id as usize] = true;
         }
@@ -287,17 +310,17 @@ impl ValueLocals {
             }
             let result = op.pos().get();
             let source = op.arg(0).to_opref();
-            if result == OpRef::NONE
-                || result.is_constant()
-                || source == OpRef::NONE
-                || source.is_constant()
-                || label_value_ids[result.raw() as usize]
-                || label_value_ids[source.raw() as usize]
-            {
+            let Some(result_id) = value_box_raw(result) else {
+                continue;
+            };
+            let Some(source_id) = value_box_raw(source) else {
+                continue;
+            };
+            if label_value_ids[result_id as usize] || label_value_ids[source_id as usize] {
                 continue;
             }
-            let dst = result.raw() as usize;
-            let src = source.raw() as usize;
+            let dst = result_id as usize;
+            let src = source_id as usize;
             if dst < alias_source.len()
                 && src < by_id.len()
                 && by_id[src].is_some()
@@ -1614,18 +1637,19 @@ impl RefValues {
             }
         }
         for op in ops {
-            let r = op.pos().get();
-            if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
-                Self::mark(&mut by_id, r.raw());
+            if let Some(id) = result_value_raw(op) {
+                if op.result_type() == Type::Ref {
+                    Self::mark(&mut by_id, id);
+                }
             }
         }
         Self { by_id }
     }
 
     fn contains(&self, v: OpRef) -> bool {
-        v != OpRef::NONE
-            && !v.is_constant()
-            && self.by_id.get(v.raw() as usize).copied().unwrap_or(false)
+        value_box_raw(v)
+            .and_then(|id| self.by_id.get(id as usize).copied())
+            .unwrap_or(false)
     }
 }
 
@@ -1679,13 +1703,11 @@ impl RefHomes {
             }
         }
         for op in ops {
-            let r = op.pos().get();
-            if r != OpRef::NONE
-                && !r.is_constant()
-                && op.result_type() == Type::Ref
-                && liveness.live_across_any(r.raw(), &collect_positions)
-            {
-                Self::assign(&mut by_id, &mut next, r.raw());
+            if let Some(id) = result_value_raw(op) {
+                if op.result_type() == Type::Ref && liveness.live_across_any(id, &collect_positions)
+                {
+                    Self::assign(&mut by_id, &mut next, id);
+                }
             }
         }
         if include_ca_collects {
@@ -1777,12 +1799,9 @@ impl RefHomes {
         }
     }
 
-    /// Home index of `v`, or `None` if it is a constant or not a Ref home.
+    /// Home index of `v`, or `None` if it is a constant, a void op, or not a Ref home.
     fn home(&self, v: OpRef) -> Option<u32> {
-        if v.is_constant() {
-            return None;
-        }
-        self.home_id(v.raw())
+        value_box_raw(v).and_then(|id| self.home_id(id))
     }
 
     /// `(value id, home index)` pairs in id order (deterministic).
@@ -1868,10 +1887,8 @@ impl LabelResumeData {
             }
         }
         for op in ops {
-            let r = op.pos().get();
-            if r != OpRef::NONE
-                && !r.is_constant()
-                && let Some(v) = has_producer.get_mut(r.raw() as usize)
+            if let Some(id) = result_value_raw(op)
+                && let Some(v) = has_producer.get_mut(id as usize)
             {
                 *v = true;
             }
@@ -1945,19 +1962,15 @@ impl LabelResumeData {
                 }
             }
             for op in &ops[..label_pos] {
-                let r = op.pos().get();
-                if r != OpRef::NONE
-                    && !r.is_constant()
-                    && let Some(v) = defined_before.get_mut(r.raw() as usize)
+                if let Some(id) = result_value_raw(op)
+                    && let Some(v) = defined_before.get_mut(id as usize)
                 {
                     *v = true;
                 }
             }
             for arg in label.getarglist() {
-                let r = arg.to_opref();
-                if r != OpRef::NONE
-                    && !r.is_constant()
-                    && let Some(v) = available.get_mut(r.raw() as usize)
+                if let Some(id) = value_box_raw(arg.to_opref())
+                    && let Some(v) = available.get_mut(id as usize)
                 {
                     *v = true;
                 }
@@ -1999,10 +2012,10 @@ impl LabelResumeData {
                     reads.extend(failargs.iter().map(|a| a.to_opref()));
                 }
                 for r in reads {
-                    if r == OpRef::NONE || r.is_constant() {
+                    let Some(id) = value_box_raw(r) else {
                         continue;
-                    }
-                    let id = r.raw() as usize;
+                    };
+                    let id = id as usize;
                     if !available.get(id).copied().unwrap_or(false) {
                         if !defined_before.get(id).copied().unwrap_or(false) {
                             bad = true;
@@ -2014,10 +2027,8 @@ impl LabelResumeData {
                         }
                     }
                 }
-                let r = op.pos().get();
-                if r != OpRef::NONE
-                    && !r.is_constant()
-                    && let Some(v) = available.get_mut(r.raw() as usize)
+                if let Some(id) = result_value_raw(op)
+                    && let Some(v) = available.get_mut(id as usize)
                 {
                     *v = true;
                 }
@@ -2059,7 +2070,7 @@ impl LabelResumeData {
     }
 
     fn storage(&self, r: OpRef) -> Option<LabelCaptureStorage> {
-        self.capture_by_id.get(r.raw() as usize).copied().flatten()
+        value_box_raw(r).and_then(|id| self.capture_by_id.get(id as usize).copied().flatten())
     }
 
     fn shortage(&self, frame: FrameGeometry) -> Option<super::FrameShortage> {
@@ -2237,12 +2248,11 @@ impl HomeStoreAt {
             }
         }
         for (i, op) in ops.iter().enumerate() {
-            let r = op.pos().get();
-            if r == OpRef::NONE || r.is_constant() {
+            let Some(id) = result_value_raw(op) else {
                 continue;
-            }
+            };
             let when = i32::try_from(i + 1).unwrap_or(i32::MAX);
-            note(&mut at, r.raw(), when);
+            note(&mut at, id, when);
         }
         Self { at }
     }
@@ -2847,9 +2857,8 @@ impl HomeLiveness {
             .max()
             .unwrap_or(0);
         for op in ops {
-            let r = op.pos().get();
-            if r != OpRef::NONE && !r.is_constant() {
-                n = n.max(r.raw() as usize + 1);
+            if let Some(id) = result_value_raw(op) {
+                n = n.max(id as usize + 1);
             }
         }
         let mut def_pos = vec![i32::MAX; n];
@@ -2858,31 +2867,37 @@ impl HomeLiveness {
             def_pos[ia.index as usize] = -1;
         }
         for (i, op) in ops.iter().enumerate() {
-            let r = op.pos().get();
-            if r != OpRef::NONE && !r.is_constant() && (r.raw() as usize) < n {
-                let d = &mut def_pos[r.raw() as usize];
+            if let Some(id) = result_value_raw(op)
+                && (id as usize) < n
+            {
+                let d = &mut def_pos[id as usize];
                 *d = (*d).min(i as i32);
             }
             for a in op.getarglist().iter() {
                 let a = a.to_opref();
-                if a == OpRef::NONE || a.is_constant() || (a.raw() as usize) >= n {
+                let Some(id) = value_box_raw(a) else {
+                    continue;
+                };
+                if (id as usize) >= n {
                     continue;
                 }
-                note_home_use(&mut last_use, &def_pos, regions, a.raw() as usize, i as i32);
+                note_home_use(&mut last_use, &def_pos, regions, id as usize, i as i32);
                 // A LABEL arg is a phi def (`consider_label`). A
                 // producerless RefOp is a residual virtualizable slot,
                 // not a phi: dating it here would hide the unwritten
                 // local from the post-collection reload.
                 if op.opcode == OpCode::Label && !matches!(a, OpRef::RefOp(_)) {
-                    let d = &mut def_pos[a.raw() as usize];
+                    let d = &mut def_pos[id as usize];
                     *d = (*d).min(i as i32);
                 }
             }
             if let Some(fa) = op.getfailargs() {
                 for a in fa.iter() {
-                    let a = a.to_opref();
-                    if a != OpRef::NONE && !a.is_constant() && (a.raw() as usize) < n {
-                        note_home_use(&mut last_use, &def_pos, regions, a.raw() as usize, i as i32);
+                    let Some(id) = value_box_raw(a.to_opref()) else {
+                        continue;
+                    };
+                    if (id as usize) < n {
+                        note_home_use(&mut last_use, &def_pos, regions, id as usize, i as i32);
                     }
                 }
             }
@@ -2914,10 +2929,13 @@ impl HomeLiveness {
             };
             for a in fa.iter() {
                 let a = a.to_opref();
-                if a == OpRef::NONE || a.is_constant() || a.ty() != Some(Type::Ref) {
+                if a.ty() != Some(Type::Ref) {
                     continue;
                 }
-                let raw = a.raw() as usize;
+                let Some(id) = value_box_raw(a) else {
+                    continue;
+                };
+                let raw = id as usize;
                 if raw < last_use.len() {
                     last_use[raw] = last_use[raw].max(end);
                 }
@@ -4163,11 +4181,8 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
 
     let mut fail_index = 0u32;
     for op in ops {
-        if op.pos().get() != OpRef::NONE
-            && !op.pos().get().is_constant()
-            && op.pos().get().raw() + 1 > max_var
-        {
-            max_var = op.pos().get().raw() + 1;
+        if let Some(id) = result_value_raw(op) {
+            max_var = max_var.max(id + 1);
         }
         // Every value an op reads occupies a local, whether or not the trace
         // also contains an op that produces it: constant folding and the short
@@ -4177,17 +4192,12 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
         // through `next_value_pos`, let `remove_ref_constants` reuse its id for
         // a `LoadFromGcTable` — whose store then lands after the read, so the
         // read returns the zero wasm initializes the local to.
-        let widen = |a: OpRef, max_var: &mut u32| {
-            if a != OpRef::NONE && !a.is_constant() && a.raw() + 1 > *max_var {
-                *max_var = a.raw() + 1;
-            }
-        };
         for a in op.getarglist().iter() {
-            widen(a.to_opref(), &mut max_var);
+            widen_value_id(a.to_opref(), &mut max_var);
         }
         if let Some(fa) = op.getfailargs() {
             for a in fa.iter() {
-                widen(a.to_opref(), &mut max_var);
+                widen_value_id(a.to_opref(), &mut max_var);
             }
         }
 
@@ -5013,24 +5023,21 @@ impl Clone for ModuleBuildInputs {
 /// which stamps per-value counters onto guard descrs and must run once only.
 fn value_id_end(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
     let mut end: u32 = 0;
-    let widen = |r: OpRef, end: &mut u32| {
-        if r != OpRef::NONE && !r.is_constant() && r.raw() + 1 > *end {
-            *end = r.raw() + 1;
-        }
-    };
     for ia in inputargs {
         if ia.index + 1 > end {
             end = ia.index + 1;
         }
     }
     for op in ops {
-        widen(op.pos().get(), &mut end);
+        if let Some(id) = result_value_raw(op) {
+            end = end.max(id + 1);
+        }
         for a in op.getarglist().iter() {
-            widen(a.to_opref(), &mut end);
+            widen_value_id(a.to_opref(), &mut end);
         }
         if let Some(fa) = op.getfailargs() {
             for a in fa.iter() {
-                widen(a.to_opref(), &mut end);
+                widen_value_id(a.to_opref(), &mut end);
             }
         }
     }
@@ -5058,10 +5065,9 @@ fn rebase_region_value_ids(
     use majit_ir::operand::Operand;
 
     let shift = |r: OpRef| -> OpRef {
-        if r.is_none() || r.is_constant() || r.is_temp_var() {
-            r
-        } else {
-            r.with_raw(r.raw() + offset)
+        match value_box_raw(r) {
+            Some(id) => r.with_raw(id + offset),
+            None => r,
         }
     };
 
@@ -10789,10 +10795,11 @@ fn build_function(
         // keys Ref-typed value ids, so non-Ref / void / constant ops are
         // skipped. Each value-producing arm is operand-stack-neutral, so this
         // appended store is balanced.
-        let result = op.pos().get();
-        if let Some(h) = ref_homes.home(result) {
+        if let Some(id) = result_value_raw(op)
+            && let Some(h) = ref_homes.home_id(id)
+        {
             sink.local_get(0);
-            sink.local_get(value_types.local(result.raw()));
+            sink.local_get(value_types.local(id));
             sink.i64_store(mem64(frame.home_ofs(h as u64)));
         }
     }
@@ -11449,9 +11456,8 @@ fn unbound_pool_const_seeds(
     use std::collections::HashSet;
     let mut defined: HashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
     for op in ops {
-        let r = op.pos().get();
-        if r != OpRef::NONE && !r.is_constant() {
-            defined.insert(r.raw());
+        if let Some(id) = result_value_raw(op) {
+            defined.insert(id);
         }
         // `consider_label` / `LabelResumeData`: LABEL args are block
         // parameters. A peeled header carries loop live-ins as InputArgs
@@ -11474,12 +11480,11 @@ fn unbound_pool_const_seeds(
         if op.opcode == OpCode::Label {
             for a in op.getarglist() {
                 let r = a.to_opref();
-                if r != OpRef::NONE
-                    && !r.is_constant()
-                    && !constants.contains_key(&r.raw())
+                if let Some(id) = value_box_raw(r)
+                    && !constants.contains_key(&id)
                     && !matches!(r, OpRef::RefOp(_))
                 {
-                    defined.insert(r.raw());
+                    defined.insert(id);
                 }
             }
         }
@@ -13589,6 +13594,50 @@ mod tests {
         let _cpu = cpu();
         assert_eq!(aligned_varsize_frame_bump(20), Some(24));
         assert_eq!(aligned_varsize_frame_bump(0xffff_fffc), None);
+    }
+
+    #[test]
+    fn value_id_space_skips_void_count() {
+        // Value boxes are opencoder `_index`; voids are `_count` and must
+        // not widen the wasm local namespace to the all-ops sequence.
+        let _cpu = cpu();
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
+        guard.pos().set(OpRef::void_op(1));
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
+        );
+        add.pos().set(OpRef::int_op(1));
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+        finish.pos().set(OpRef::void_op(3));
+        let ops = vec![guard, add, finish];
+        assert_eq!(value_id_end(&inputargs, &ops), 2);
+        assert_eq!(collect_guards_and_vars(&inputargs, &ops).1, 2);
+    }
+
+    #[test]
+    fn void_count_does_not_claim_a_colliding_float_local() {
+        // A later VoidOp(_count) must not retag the FloatOp(_index) that
+        // already owns that payload; the wasm local stays f64.
+        let _cpu = cpu();
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+        let add = Op::new(
+            OpCode::FloatAdd,
+            &[rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_float(0))],
+        );
+        add.pos().set(OpRef::float_op(1));
+        let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::const_int(1))]);
+        guard.pos().set(OpRef::void_op(1));
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
+        finish.pos().set(OpRef::void_op(3));
+        let ops = vec![add, guard, finish];
+        let num_vars = collect_guards_and_vars(&inputargs, &ops).1;
+        let locals = ValueLocals::collect(&inputargs, &ops, num_vars, 1);
+        assert_eq!(locals.ty(1), ValType::F64);
+        assert_eq!(num_vars, 2);
     }
 
     #[test]
