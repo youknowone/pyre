@@ -7766,12 +7766,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         list_type_addr,
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
     )?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    walker_guard_fold_int(ctx, op_pc, strategy, sid)?;
+    walker_guard_fold_list_strategy(ctx, op_pc, list_op, sid)?;
 
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
@@ -14006,6 +14001,21 @@ fn walker_guard_fold_int<Sym: WalkSym>(
     Ok(())
 }
 
+/// Walker-native `guard_list_strategy`: getfield `strategy` then GuardValue.
+fn walker_guard_fold_list_strategy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    list_op: OpRef,
+    sid: i64,
+) -> Result<(), DispatchError> {
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    walker_guard_fold_int(ctx, pc, strategy, sid)
+}
+
 /// [`walker_guard_fold_int`] recorded through
 /// [`walker_emit_fold_guard_with_snapshot`].
 fn walker_guard_stamped_int<Sym: WalkSym>(
@@ -16222,14 +16232,9 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
             }
         };
         // Guard the current (Empty) strategy so a deopt re-enters the empty
-        // path (mirror of `MIFrame::guard_list_strategy`: getfield strategy +
+        // path (mirror of `guard_list_strategy`: getfield strategy +
         // GuardValue + replace_box).
-        let strategy_ref = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            self_ref,
-            crate::descr::list_strategy_descr(),
-        );
-        walker_guard_fold_int(ctx, op.pc, strategy_ref, ListStrategy::Empty as i64)?;
+        walker_guard_fold_list_strategy(ctx, op.pc, self_ref, ListStrategy::Empty as i64)?;
         // Emit the transition IR mutating the existing wrapper (helpers.rs).
         // It stages the same first 0 -> 4 RPython grow as the concrete helper,
         // leaving the append body to record the length/item stores.
@@ -18786,13 +18791,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         list_op,
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
     )?;
-
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    walker_guard_fold_int(ctx, op_pc, strategy, sid)?;
+    walker_guard_fold_list_strategy(ctx, op_pc, list_op, sid)?;
 
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
@@ -19973,13 +19972,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
     for &lst_op in &[list_op, value_op] {
         walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
         walker_guard_fold_class(ctx, op_pc, lst_op, list_type_addr)?;
-
-        let strategy = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            lst_op,
-            crate::descr::list_strategy_descr(),
-        );
-        walker_guard_fold_int(ctx, op_pc, strategy, sid_const_val)?;
+        walker_guard_fold_list_strategy(ctx, op_pc, lst_op, sid_const_val)?;
     }
 
     // Bounds guard on the target: the highest written index `start + slice_len -
