@@ -42,6 +42,11 @@ struct FrontendSlot {
 struct ValueSlot {
     ty: Type,
     concrete: Cell<Option<Value>>,
+    /// `history.py` `FrontendOp.getopnum` — the FrontendOp carries its opnum.
+    opcode: OpCode,
+    /// Index in `slots` (byte mode) / `ops` (Vec recorder) of this
+    /// value FrontendOp. `OpRef.raw()` is `_index`, not this sequence.
+    seq: u32,
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -104,7 +109,7 @@ impl TracePosition {
 /// RPython stores snapshots inline in the trace byte stream
 /// (`_snapshot_data` / `_snapshot_array_data`).  The live recorder writes
 /// that stream; `Vec<Snapshot>` is rebuilt at compile (`into_tree_loop`)
-/// so TreeLoop / resume keep the same index-by-`rd_resume_position` surface.
+/// so TreeLoop / resume look snapshots up by `rd_resume_position`.
 /// Each snapshot captures the live variables of each frame in the call
 /// stack at the guard point.
 #[derive(Clone, Debug)]
@@ -155,6 +160,20 @@ impl Snapshot {
                 SnapshotTagged::Const(..) | SnapshotTagged::Box(..) => {}
             }
         }
+    }
+
+    /// Guard `rd_resume_position` is the `_snapshot_data` byte offset
+    /// (`opencoder.py` `create_top_snapshot` / `get_snapshot_iter(index)`),
+    /// not a dense `Vec` index. Decode pushes snapshots in increasing
+    /// offset order (`decode_captured_snapshots`).
+    pub fn by_resume_position(snapshots: &[Snapshot], resume_position: i32) -> Option<&Snapshot> {
+        if resume_position < 0 {
+            return None;
+        }
+        snapshots
+            .binary_search_by_key(&resume_position, |s| s.resume_position)
+            .ok()
+            .map(|i| &snapshots[i])
     }
 }
 
@@ -762,8 +781,15 @@ impl Trace {
     }
 
     fn last_recorded_is_guard(&self) -> bool {
-        self.slots.last().is_some_and(|slot| slot.opcode.is_guard())
-            || self.ops.last().is_some_and(|op| op.opcode.is_guard())
+        // Byte mode keeps recording into `slots` after
+        // `materialize_into_ops`; `ops` is then a stale copy and must
+        // not decide whether the live last op is a guard
+        // (`create_top_snapshot` / `patch_last_guard_descr_slot`).
+        if self.byte_mode() {
+            self.slots.last().is_some_and(|slot| slot.opcode.is_guard())
+        } else {
+            self.ops.last().is_some_and(|op| op.opcode.is_guard())
+        }
     }
 
     /// `create_top_snapshot` rewinds the last op's descr slot only while
@@ -958,6 +984,8 @@ impl Trace {
             self.value_slots.push(ValueSlot {
                 ty,
                 concrete: Cell::new(value),
+                opcode,
+                seq: self.slots.len() as u32 - 1,
             });
             self.box_count += 1;
             OpRef::op_typed(box_index, ty)
@@ -1208,17 +1236,19 @@ impl Trace {
             return Operand::bound_from_opref(r);
         }
         // ResOp operand: value-producing `OpRef.raw()` is `_index`.
-        // The `Vec<Op>` recorder stores all ops densely, so scan by `pos`.
+        // The FrontendOp lives at `value_slots[_index - _start]`; `seq`
+        // is that op's index in `ops` / `slots` (`history.py` FrontendOp).
         if !r.is_none() && r.ty() != Some(Type::Void) && !matches!(r, OpRef::VoidOp(_)) {
-            if let Some(op) = self.ops.iter().find(|op| op.pos().get() == r) {
-                return Operand::from_bound_op(op);
+            if let Some(vs) = self.value_slot(r.raw()) {
+                if let Some(op) = self.ops.get(vs.seq as usize)
+                    && op.pos().get() == r
+                {
+                    return Operand::from_bound_op(op);
+                }
+                if self.byte_mode() {
+                    return Operand::from_opref(r);
+                }
             }
-        }
-        // Byte-mode recording has no `Op` yet (`ValueSlot` only).
-        // RPython's FrontendOp *is* the box; `from_opref` is that
-        // position-only stand-in until `ByteTraceIter` materializes.
-        if self.byte_mode() && self.value_slot(r.raw()).is_some() {
-            return Operand::from_opref(r);
         }
         // S3/#124: a ResOp operand always has a dense producer in `ops`
         // (positions are `_index` order; opencoder.py `_encode` asserts).
@@ -1297,6 +1327,8 @@ impl Trace {
             self.value_slots.push(ValueSlot {
                 ty,
                 concrete: Cell::new(value),
+                opcode,
+                seq: self.ops.len() as u32,
             });
             OpRef::op_typed(box_index, ty)
         } else {
@@ -1791,19 +1823,20 @@ impl Trace {
         if opref.is_constant() || opref.is_input_arg() || opref.is_none() {
             return None;
         }
-        if let OpRef::VoidOp(count) = opref {
-            let n = self.box_prefix();
-            return self.slot_by_seq(count.saturating_sub(n)).map(|s| s.opcode);
-        }
         let n = self.box_prefix();
-        let mut box_i = n;
-        for s in &self.slots {
-            if s.opcode.result_type() != Type::Void {
-                if box_i == opref.raw() {
-                    return Some(s.opcode);
-                }
-                box_i += 1;
+        if let OpRef::VoidOp(count) = opref {
+            if let Some(s) = self.slot_by_seq(count.saturating_sub(n)) {
+                return Some(s.opcode);
             }
+            return self
+                .ops
+                .get(count.saturating_sub(n) as usize)
+                .map(|op| op.opcode);
+        }
+        // Value FrontendOp is `value_slots[_index - _start]`
+        // (`history.py` FrontendOp carries its opnum).
+        if let Some(vs) = self.value_slot(opref.raw()) {
+            return Some(vs.opcode);
         }
         self.get_op_by_raw_pos(opref.raw()).map(|op| op.opcode)
     }
@@ -1923,14 +1956,18 @@ impl Trace {
         let trb = self.trb.as_ref()?;
         let mut found = None;
         trb.for_each_encoded_op(|op| {
-            if found.is_none()
-                && op.opcode == OpCode::GetfieldGcR
+            if op.box_index > raw {
+                return false;
+            }
+            if op.opcode == OpCode::GetfieldGcR
                 && op.opcode.result_type() != Type::Void
                 && op.box_index == raw
                 && op.arity >= 1
             {
                 found = Some((op.args_pos, op.descr_index));
+                return false;
             }
+            true
         });
         let (args_pos, descr_index) = found?;
         let descr = trb.resolve_descr_index(descr_index)?;
@@ -2730,6 +2767,41 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&descr, &field));
         assert_eq!(base, obj);
         assert!(rec.ops().is_empty());
+    }
+
+    #[test]
+    fn byte_mode_snapshot_after_materialize_does_not_patch_intadd_zero() {
+        // `clone_materialized_parts` fills `ops` and recording continues
+        // in `slots`. Deciding "last is guard" from the stale `ops` copy
+        // plus `last_descr_slot_is_placeholder` (any trailing `00 00`,
+        // including TAGINT 0) overwrote `IntAdd(x, ConstInt(0))`.
+        let mut rec = Trace::new();
+        let x = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_guard(OpCode::GuardTrue, &[x], None);
+        rec.materialize_into_ops();
+        rec.record_op(OpCode::IntAdd, &[x, OpRef::const_int(0)]);
+        let snap = Snapshot {
+            resume_position: -1,
+            frames: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                boxes: vec![],
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        };
+        rec.encode_captured_snapshot(&snap);
+        let ops = rec.materialize_ops();
+        let add = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::IntAdd)
+            .expect("IntAdd recorded after the guard");
+        assert_eq!(
+            add.arg(1).to_opref(),
+            OpRef::const_int(0),
+            "IntAdd ConstInt(0) argument must survive snapshot capture"
+        );
     }
 
     #[test]

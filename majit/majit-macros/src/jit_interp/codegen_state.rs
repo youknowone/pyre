@@ -1209,6 +1209,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     } else {
         quote! {}
     };
+    // `reached_loop_header` builds JUMP from the live portal boxes
+    // (`original_boxes`-shaped), never the vable-only subset.
+    let collect_jump_args_from_portal_method: TokenStream = quote! {
+        fn collect_jump_args_from_portal(
+            __sym: &#sym_ty,
+            __frame: &majit_metainterp::MIFrame,
+            __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
+        ) -> Vec<majit_ir::OpRef> {
+            #loop_carried_boxes_fn_name(__sym, __frame, __boxes)
+                .into_iter()
+                .map(|(__op, _)| __op)
+                .collect()
+        }
+    };
     let writeback_live_ref_scalar_arms: Vec<TokenStream> = ref_scalars
         .iter()
         .enumerate()
@@ -1596,26 +1610,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     } else {
         quote! {}
     };
-    let state_field_layout_ctor: TokenStream = if num_ref_scalars > 0 {
-        quote! {
-            majit_metainterp::blackhole::StateFieldLayout::with_ref_scalars(
-                #num_scalars,
-                ::std::vec![#(self.#create_sym_array_names.len()),*],
-                #num_vable_identity_slots,
-                #num_ref_scalars,
-                #ref_identity_base,
-                #int_identity_base,
-            ).with_float_scalars(#num_float_scalars, #float_identity_base)
-        }
-    } else {
-        quote! {
-            majit_metainterp::blackhole::StateFieldLayout::new(
-                #num_scalars,
-                ::std::vec![#(self.#create_sym_array_names.len()),*],
-                #num_vable_identity_slots,
-                #int_identity_base,
-            ).with_float_scalars(#num_float_scalars, #float_identity_base)
-        }
+    // Always pass `ref_identity_base`: a virt-array state with no ref
+    // scalars still has a vable identity at `ref_identity_base - 1`,
+    // and `StateFieldLayout::new` leaves `ref_scalar_base` at 0 so
+    // `vable_identity_ref_slot` would alias r0 (`program`).
+    let state_field_layout_ctor: TokenStream = quote! {
+        majit_metainterp::blackhole::StateFieldLayout::with_ref_scalars(
+            #num_scalars,
+            ::std::vec![#(self.#create_sym_array_names.len()),*],
+            #num_vable_identity_slots,
+            #num_ref_scalars,
+            #ref_identity_base,
+            #int_identity_base,
+        ).with_float_scalars(#num_float_scalars, #float_identity_base)
     };
 
     // Naming the virtualizable on the jitdriver static data
@@ -2280,6 +2287,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(#loop_carried_boxes_fn_name(self, __frame, __boxes))
             }
 
+            #[allow(clippy::reversed_empty_ranges)]
             fn collect_portal_scalar_values(
                 &self,
                 __frame: &majit_metainterp::MIFrame,
@@ -2300,6 +2308,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 values
             }
 
+            #[allow(clippy::reversed_empty_ranges)]
             fn collect_portal_ref_scalar_values(
                 &self,
                 __frame: &majit_metainterp::MIFrame,
@@ -2709,6 +2718,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
 
             #collect_jump_args_with_boxes_method
+
+            #collect_jump_args_from_portal_method
 
             fn validate_close(sym: &#sym_ty, meta: &#meta_ty) -> bool {
                 true #(#validate_array_checks)*

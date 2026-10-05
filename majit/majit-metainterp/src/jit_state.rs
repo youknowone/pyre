@@ -954,6 +954,20 @@ pub trait JitState: Sized {
         Self::collect_jump_args(sym)
     }
 
+    /// Closing JUMP boxes from the live portal frame
+    /// (`pyjitpl.py` `reached_loop_header` `live_arg_boxes` =
+    /// `greenboxes + redboxes` then `+= virtualizable_boxes; pop`).
+    /// Header-revisit `CloseLoop` uses this when `close_jump_boxes` is
+    /// absent so JUMP matches LABEL for a heap-frame virtualizable
+    /// that also carries scalar reds. Default is the vable-only list.
+    fn collect_jump_args_from_portal(
+        sym: &Self::Sym,
+        _frame: &crate::pyjitpl::MIFrame,
+        boxes: &[(OpRef, Type)],
+    ) -> Vec<OpRef> {
+        Self::collect_jump_args_with_boxes(sym, boxes)
+    }
+
     /// `pyjitpl.py MetaInterp.capture_resumedata` for jitdriver-level
     /// guard sites (`force_finish_trace`'s GuardAlwaysFails). Walks the
     /// live framestack; identity slots already hold the reds. Default

@@ -2787,16 +2787,11 @@ impl MIFrame {
         // Decline a resolved JitCode pc that has no forward Python-pc
         // marker. Resume recovers py_pc from the jitcode word; the
         // recorder does not store a copy.
-        let _ = match resolved {
-            Some(offset) => payload
-                .resume_position_for_jitcode_pc(offset)
-                .map(|(_, py_pc)| py_pc)
-                .unwrap_or_else(|| {
-                    crate::state::request_trace_abort();
-                    top_pc as u32
-                }),
-            None => top_pc as u32,
-        };
+        if let Some(offset) = resolved
+            && payload.resume_position_for_jitcode_pc(offset).is_none()
+        {
+            crate::state::request_trace_abort();
+        }
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,

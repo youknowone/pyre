@@ -498,6 +498,50 @@ mod virt_array_with_float_scalar {
         );
     }
 
+    #[test]
+    fn closing_jump_from_portal_includes_scalar_reds() {
+        // Header-revisit CloseLoop without `close_jump_boxes` must still
+        // emit the portal-shaped JUMP (`reached_loop_header`
+        // `live_arg_boxes`). `collect_jump_args_with_boxes` is identity
+        // plus elements only, which is fewer args than LABEL.
+        let state = MixedState {
+            sp: 0,
+            cells: vec![0; 2],
+            acc: 0.0,
+            stack: VirtArray::filled(0, 2),
+        };
+        let program: &Bytecode = &[OP_NOP, OP_STEP];
+        let meta = state.build_meta(0, program);
+        let sym = <MixedState as JitState>::create_sym(&meta, 0);
+
+        let c0 = majit_ir::OpRef::input_arg_typed(11, majit_ir::Type::Int);
+        let c1 = majit_ir::OpRef::input_arg_typed(12, majit_ir::Type::Int);
+        let e0 = majit_ir::OpRef::input_arg_typed(90, majit_ir::Type::Int);
+        let e1 = majit_ir::OpRef::input_arg_typed(91, majit_ir::Type::Int);
+        let identity = majit_ir::OpRef::input_arg_typed(92, majit_ir::Type::Ref);
+        let boxes = [
+            (e0, majit_ir::Type::Int),
+            (e1, majit_ir::Type::Int),
+            (identity, majit_ir::Type::Ref),
+        ];
+
+        let mut builder = majit_metainterp::JitCodeBuilder::new();
+        builder.load_const_i_value(2, 0);
+        builder.load_const_r_value(1, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = majit_metainterp::MIFrame::new(jitcode, 0);
+        // `sp`/`acc` sit on the virtualizable; portal reds are the fixed
+        // `[int]` cells plus the identity, then the element suffix.
+        frame.int_regs[1] = Some(c0);
+        frame.int_regs[2] = Some(c1);
+        frame.ref_regs[1] = Some(identity);
+
+        let close = <MixedState as JitState>::collect_jump_args_with_boxes(&sym, &boxes);
+        let portal = <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes);
+        assert_eq!(close, vec![identity, e0, e1]);
+        assert_eq!(portal, vec![c0, c1, identity, e0, e1]);
+    }
+
     /// The entry contract this suffix has to match: `live_value_types` is the
     /// reds only, and `JitDriver::extend_compiled_live_values` appends the
     /// elements after all of them.
