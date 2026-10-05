@@ -4345,6 +4345,8 @@ pub fn gc_write_barrier_managed(obj: GcRef) {
 /// initialized has no remembered set, so the store is unbarriered.
 pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
     if !gc_sync::is_initialized() {
+        // Cranelift/wasm keep the collector in the backend TLS box.
+        gc_write_barrier(obj);
         return;
     }
     gc_sync::gc_op(|gc| {
