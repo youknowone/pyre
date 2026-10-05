@@ -2977,6 +2977,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         Vec::new(),
     ));
     pyre_object::object_array::set_gc_float_array_gc_type_id(gc_float_array_tid);
+    // `GcLLDescr_framework.init_array_descr` writes each ARRAY's tid into
+    // its ArrayDescr. Publish the runtime descrs under their codewriter
+    // identities so `BhDescr::resolve_gc_tid` on the first `new_array`
+    // recovers the live tid (`cpu.arraydescrof(ARRAY)`).
+    pyre_jit_trace::state::publish_typed_items_gcarray_descrs();
     // `pypy/interpreter/pycode.py class PyCode(W_Root)` — code
     // objects are normal GC heap objects in PyPy.  Pre-register
     // `PyCode` here, immediately after the GcArray tids and

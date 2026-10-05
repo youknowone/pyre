@@ -10,9 +10,9 @@
 
 use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
-    dealloc_list_items_block, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
-    grow_list_items_block_gc, grow_typed_items_block, items_block_capacity, items_block_items_base,
-    items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
+    alloc_typed_items_block_nursery, dealloc_list_items_block, gc_float_array_gc_type_id,
+    gc_int_array_gc_type_id, grow_list_items_block_gc, grow_typed_items_block, items_block_capacity,
+    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -3104,6 +3104,17 @@ pub fn ll_list_int_set_items(l: &mut W_ListObject, items: *mut TypedItemsBlock) 
     l.int_items.block = items;
 }
 
+/// `rlist.py LIST.ll_items` for Integer storage (`l.items`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_r(int_items.block)`. rustc otherwise
+/// inlines the load as `FieldRead(block)` on a nested `IntArray` copy.
+#[inline(never)]
+#[majit_macros::oopspec("list.int_items(l)")]
+pub fn ll_list_int_items(l: &W_ListObject) -> *mut TypedItemsBlock {
+    l.int_items.block
+}
+
 /// `rlist.py _ll_list_resize_hint_really` for Integer storage.
 ///
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
@@ -3756,24 +3767,39 @@ pub unsafe fn ll_listslice_inner(obj: PyObjectRef, start: usize, stop: usize) ->
 
 /// `rlist.py ll_newlist` for IntegerListStrategy storage (`GcArray(Signed)`).
 ///
-/// Not `newlist_clear`: that oopspec mints the ref-`ItemsBlock` array descr
-/// (`tuple_ll_newlist`). This block is `gc_int_array_gc_type_id`.
+/// `@jit.oopspec("newlist(length)")`: `do_fixed_newlist` rewrites a Signed
+/// ARRAY to `new_array` (items stay uninitialized). The slice caller writes
+/// every slot through `ll_arraycopy`. Not `newlist_clear`: that oopspec
+/// mints the ref-`ItemsBlock` array descr (`tuple_ll_newlist`). This block
+/// is `gc_int_array_gc_type_id`.
+///
+/// The interpreter body is nursery `malloc_fast`
+/// (`Digits::new` / `alloc_typed_items_block_nursery`). No root bracket:
+/// `gct_fv_gc_malloc.push_roots` belongs on the malloc rewrite, and
+/// `push_roots` is `dont_look_inside` with no jitcode, which aborts the
+/// BINARY_SLICE subwalk. Live vars stay in the caller's scope
+/// (`binary_slice_values` / `ll_listslice`) or the JIT gcmap.
 #[inline(never)]
+#[majit_macros::oopspec("newlist(length)")]
 unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     let count = count as usize;
     if count == 0 {
         return std::ptr::null_mut();
     }
-    alloc_typed_items_block(count, gc_int_array_gc_type_id())
+    alloc_typed_items_block_nursery(count, gc_int_array_gc_type_id())
 }
 
 /// `W_ListObject.from_storage_and_strategy` for IntegerListStrategy: the
 /// header adopts an already-allocated Signed items block, the way
 /// `wraptuple` adopts `tuple_ll_newlist`'s array. Typed strategies keep
 /// `length == 0` and a null object `items` block.
+///
+/// No `push_roots`: that helper has no jitcode and aborts the BINARY_SLICE
+/// subwalk. `pin_root` is `dont_look_inside_cannot_raise` and is bound; the
+/// caller's `RootScope` (interpreter) or the JIT gcmap (trace) keeps the
+/// block live across the header malloc.
 #[inline(never)]
 unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
     let block_slot = crate::gc_roots::shadow_stack_len();
     if !block.is_null() {
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
@@ -3817,9 +3843,11 @@ unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObj
 /// declined sub-walk can residualize through `jitcode.fnaddr`. A `&[i64]`
 /// is two words (`jit_fnaddr.rs` `ResidualSlot`) and is never an argument;
 /// the copy addresses the typed blocks through `jit_ll_arraycopy`.
+///
+/// No `push_roots` in this body (`rlist.py ll_listslice_startstop` has
+/// none). Pins land on the caller's `RootScope`.
 #[inline(never)]
 pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _obj = crate::gc_roots::pin_root(obj);
     let dest = int_ll_newlist(n as i64);
@@ -3829,7 +3857,8 @@ pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize
     }
     if n > 0 {
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let src = (*(obj as *const W_ListObject)).int_items.block as PyObjectRef;
+        // rlist.py `ll_arraycopy`: `rgc.ll_arraycopy(source.ll_items(), ...)`.
+        let src = ll_list_int_items(&*(obj as *const W_ListObject)) as PyObjectRef;
         let dest_now = crate::gc_roots::shadow_stack_get(dest_slot);
         crate::object_array::jit_ll_arraycopy(src, dest_now, start as i64, 0, n as i64);
     }

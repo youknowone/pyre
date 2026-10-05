@@ -3673,15 +3673,36 @@ pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
 /// the raw `int_array_descr`.
 pub(crate) fn int_gcarray_descr() -> DescrRef {
     let token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
-    crate::descr::make_array_descr_with_full_id(
+    let live = pyre_object::gc_int_array_gc_type_id();
+    let descr = crate::descr::make_array_descr_with_full_id(
         token.base_size,
         token.item_size,
-        pyre_object::gc_int_array_gc_type_id(),
+        live,
         Some(token.len_offset),
         Type::Int,
         true,
         Some(majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string()),
-    )
+    );
+    // Same publication as `pyobject_gcarray_descr`: `register_keyed_array`
+    // is first-wins, and `opimpl_new_array` / `bh_new_array` allocate from
+    // `BhDescr::resolve_gc_tid` *before* `dispatch_array_descr_ref` would
+    // mint this descr. A cache miss truncates `path_hash(LIST_INT_ITEMS_ARRAY)`
+    // into a fake tid (`resolved_gc_tid_checked`). Force-insert the live
+    // collector tid under the codewriter ARRAY identity
+    // (`GcLLDescr_framework.init_array_descr` / `cpu.arraydescrof`).
+    if live != majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
+        && let Some(ad) = descr.as_array_descr()
+        && ad.type_id() != live
+    {
+        ad.set_type_id(live);
+    }
+    majit_ir::descr_registry::force_register_keyed_array(
+        majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(
+            majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY,
+        )),
+        descr.clone(),
+    );
+    descr
 }
 
 /// `Ptr(GcArray(OBJECTPTR))` — `W_ObjectObject.storage`, the mapdict
@@ -3721,15 +3742,38 @@ pub(crate) fn mapdict_storage_gcarray_descr() -> DescrRef {
 /// (`erase([float])`). See [`int_gcarray_descr`].
 pub(crate) fn float_gcarray_descr() -> DescrRef {
     let token = &pyre_object::TYPED_ITEMS_BLOCK_FLOAT_TOKEN;
-    crate::descr::make_array_descr_with_full_id(
+    let live = pyre_object::gc_float_array_gc_type_id();
+    let descr = crate::descr::make_array_descr_with_full_id(
         token.base_size,
         token.item_size,
-        pyre_object::gc_float_array_gc_type_id(),
+        live,
         Some(token.len_offset),
         Type::Float,
         false,
         Some(majit_jitcode::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string()),
-    )
+    );
+    if live != majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
+        && let Some(ad) = descr.as_array_descr()
+        && ad.type_id() != live
+    {
+        ad.set_type_id(live);
+    }
+    majit_ir::descr_registry::force_register_keyed_array(
+        majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(
+            majit_jitcode::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY,
+        )),
+        descr.clone(),
+    );
+    descr
+}
+
+/// `GcLLDescr_framework.init_array_descr`: after the host has declared the
+/// collector tids for `GcArray(Signed)` / `GcArray(Float)`, publish the
+/// runtime ArrayDescrs under `LIST_INT_ITEMS_ARRAY` / `LIST_FLOAT_ITEMS_ARRAY`
+/// so the first tracing `new_array` sees a real tid.
+pub fn publish_typed_items_gcarray_descrs() {
+    let _ = int_gcarray_descr();
+    let _ = float_gcarray_descr();
 }
 
 /// `descr.py SizeDescr` for the host `PyFrame` virtualizable struct.
