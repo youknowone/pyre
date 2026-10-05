@@ -234,6 +234,7 @@ where
         table[jitcode::insns::BC_NEWLIST_CLEAR as usize] = Self::opimpl_newlist_clear;
         table[jitcode::insns::BC_INT_ISCONSTANT as usize] = Self::opimpl_int_isconstant;
         table[jitcode::insns::BC_REF_ISCONSTANT as usize] = Self::opimpl_ref_isconstant;
+        table[jitcode::insns::BC_INT_ISVIRTUAL as usize] = Self::opimpl_int_isvirtual;
         table[jitcode::insns::BC_REF_ISVIRTUAL as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_STRLEN as usize] = Self::opimpl_strlen;
         table[jitcode::insns::BC_STRGETITEM as usize] = Self::opimpl_strgetitem;
@@ -3733,12 +3734,11 @@ where
                     }
                 }
                 if inner_close {
-                    // The merge point's live arg boxes (only the green
-                    // slots are populated for the state-field dispatch
-                    // model; reds are state fields restored separately).
-                    // These become the inner loop's `original_boxes` —
-                    // the promoted-green constants — for the cross-loop
-                    // cut remap (compile.py compile_loop `cut_trace_from`).
+                    // Merge-point operand boxes (greens + reds). The inner
+                    // loop's `original_boxes` are the reds plus
+                    // `virtualizable_boxes[:-1]` (`reached_loop_header`
+                    // `live_arg_boxes[num_green_args:]`); greens stay in
+                    // this list for `same_greenkey`.
                     let (opref_opt, ty) = match slot {
                         0 | 3 => (
                             frame.int_regs.get(reg_idx).copied().flatten(),
@@ -4373,20 +4373,12 @@ where
                             .find_merge_point_same_greenkey(close_key, close_key_typed.as_ref())
                             .is_none()
                     {
-                        let vable_boxes =
-                            ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                        let original_boxes = match sym
-                            .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
-                        {
-                            Some(mut boxes) => {
-                                ctx.remove_consts_and_duplicates(&mut boxes);
-                                boxes
-                                    .into_iter()
-                                    .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                    .collect()
-                            }
-                            None => live_arg_boxes.to_vec(),
-                        };
+                        let original_boxes = self.reached_loop_header_original_boxes(
+                            ctx,
+                            sym,
+                            &redboxes,
+                            &live_arg_boxes,
+                        );
                         if crate::mptrace_enabled() {
                             eprintln!(
                                 "@@@MPTRACE bridge-add-mp key={close_key} header_pc={} num_ops={}",
@@ -4676,23 +4668,16 @@ where
                     // the greens plus one unexpanded vable ref while its
                     // close expanded to one box per element — the arity
                     // mismatch that made every nested loop decline.
-                    let vable_boxes = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                    let original_boxes = match sym
-                        .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
-                    {
-                        Some(mut boxes) => {
-                            // pyjitpl.py MetaInterp.remove_consts_and_duplicates normalizes the list
-                            // before it becomes anything — the LABEL
-                            // this registration turns into cannot carry
-                            // a constant or a repeated box.
-                            ctx.remove_consts_and_duplicates(&mut boxes);
-                            boxes
-                                .into_iter()
-                                .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                .collect()
-                        }
-                        None => live_arg_boxes.into_vec(),
-                    };
+                    // (pyjitpl.py MetaInterp.reached_loop_header). Register the SAME list the
+                    // close JUMP uses (`reached_loop_header` `live_arg_boxes`
+                    // after slicing greens): reds plus
+                    // `virtualizable_boxes[:-1]`.
+                    let original_boxes = self.reached_loop_header_original_boxes(
+                        ctx,
+                        sym,
+                        &redboxes,
+                        &live_arg_boxes,
+                    );
                     if crate::mptrace_enabled() {
                         eprintln!(
                             "@@@MPTRACE add-mp pc={pc} inner_key={inner_key} num_ops={}",
@@ -9117,6 +9102,31 @@ where
         let value = opref.is_constant() as i64;
         let dest_box = ctx.const_int(value);
         self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
+        TraceAction::Continue
+    }
+
+    // pyjitpl.py `_opimpl_isvirtual`: `return ConstInt(
+    // heapcache.is_likely_virtual(box))`.  No IR op.  The int-kind
+    // spelling is `jtransform.py` `jit.isvirtual` on a raw header
+    // address; a non-ref box is never virtual.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_int_isvirtual(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let (src, dest) = {
+            let frame = self.frames.current_mut();
+            let src = frame.next_reg() as usize;
+            let dest = frame.next_reg() as usize;
+            (src, dest)
+        };
+        let (opref, _) = self.read_int_reg(ctx, src);
+        let value = ctx.is_likely_virtual(opref) as i64;
+        self.set_int_reg(ctx, dest, Some(ctx.const_int(value)), Some(value));
         TraceAction::Continue
     }
 

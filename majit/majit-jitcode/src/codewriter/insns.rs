@@ -357,6 +357,11 @@ pub const BC_INT_IS_ZERO: u8 = 236;
 pub const BC_INT_ISCONSTANT: u8 = 239;
 pub const BC_REF_ISCONSTANT: u8 = 237;
 pub const BC_REF_ISVIRTUAL: u8 = 238;
+/// `jtransform.py` `jit.isvirtual` on an int-kind operand (`%s_isvirtual`
+/// % kind). `pyjitpl.py` only aliases `opimpl_ref_isvirtual`; a raw
+/// `Vec` header is an address word, so the same `_opimpl_isvirtual`
+/// box test runs on an int register.
+pub const BC_INT_ISVIRTUAL: u8 = 250;
 pub const BC_UINT_RSHIFT: u8 = 142;
 pub const BC_UINT_MUL_HIGH: u8 = 143;
 pub const BC_UINT_LT: u8 = 144;
@@ -1153,6 +1158,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_isconstant/i>i", BC_INT_ISCONSTANT);
     m.insert("ref_isconstant/r>i", BC_REF_ISCONSTANT);
     m.insert("ref_isvirtual/r>i", BC_REF_ISVIRTUAL);
+    m.insert("int_isvirtual/i>i", BC_INT_ISVIRTUAL);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
     // `guard_class` — `blackhole.py bhimpl_guard_class`; see `BC_GUARD_CLASS`.
     m.insert("guard_class/r>i", BC_GUARD_CLASS);

@@ -1705,6 +1705,51 @@ where
         })
     }
 
+    /// pyjitpl.py `reached_loop_header` records one `live_arg_boxes` list
+    /// per visit (`current_merge_points.append((live_arg_boxes, start))`).
+    /// `compile_loop` then uses `original_boxes[num_green_args:]` as the
+    /// cut's inputargs, matching the JUMP. A virtualizable portal's reds
+    /// are the merge-point red registers; the virtualizable's fields travel
+    /// through `virtualizable_boxes` (`live_arg_boxes += virtualizable_boxes;
+    /// live_arg_boxes.pop()`). `JitCodeSym::loop_carried_boxes` is that
+    /// construction for state-field interpreters; the fallback is the same
+    /// list for a portal whose sym has no state fields
+    /// (`PortalMetatraceSym`, `append_virtualizable_boxes`).
+    fn reached_loop_header_original_boxes(
+        &self,
+        ctx: &mut TraceCtx,
+        sym: &S,
+        redboxes: &[(OpRef, majit_ir::Type)],
+        live_arg_boxes: &[crate::trace_ctx::GreenBox],
+    ) -> Vec<crate::trace_ctx::GreenBox> {
+        let vable_boxes = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+        let mut boxes = match self
+            .frames
+            .frames
+            .first()
+            .and_then(|portal| sym.loop_carried_boxes_from_portal(&vable_boxes, portal))
+        {
+            Some(boxes) => boxes,
+            None => ctx.live_arg_boxes_from_reds(redboxes),
+        };
+        if boxes.is_empty() {
+            return live_arg_boxes.to_vec();
+        }
+        ctx.remove_consts_and_duplicates(&mut boxes);
+        boxes
+            .into_iter()
+            .map(|(o, ty)| {
+                // history.py Box.type. `ty` is that type when the box has
+                // one (`OpRef::ty`), else the vable field type
+                // (`virtualizable.py` `static_extra_types` /
+                // `arrayitem_extra_types`). A missing box is an empty
+                // pointer field (ConstPtr null), not an int.
+                let ty = o.ty().unwrap_or(ty);
+                crate::trace_ctx::GreenBox::new(o, ty)
+            })
+            .collect()
+    }
+
     fn prepare_standard_virtualizable_before_residual_call(
         &mut self,
         ctx: &mut TraceCtx,

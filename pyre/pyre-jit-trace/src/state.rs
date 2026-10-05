@@ -11185,13 +11185,23 @@ impl JitState for PyreJitState {
                     // (non-empty `pcdep_color_slots`) falls to the else branch (per-slot
                     // inversion) instead of reading the color-indexed bank as if it were
                     // slot-indexed.
+                    //
+                    // virtualizable.py `read_boxes`: with no pcdep the jitcode
+                    // Ref colors are not Python local slots (a portal guard's
+                    // `-live-` list starts with the portal reds). Locals come
+                    // from the vable array; stack slots keep the color bank
+                    // and only take the vable image for NONE/null.
                     for (idx, slot) in bridge_registers_r
                         .iter_mut()
                         .enumerate()
                         .take(semantic_prefix_len)
                     {
                         let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-                        let want_vable = slot.is_none() || slot_is_null_const;
+                        let got_portal_red = idx < nlocals
+                            && !slot.is_none()
+                            && (*slot == bridge_execution_context
+                                || *slot == OpRef::input_arg_ref(0));
+                        let want_vable = got_portal_red || slot.is_none() || slot_is_null_const;
                         if want_vable {
                             if let Some(v) = vable_array_items.get(idx).copied() {
                                 if !v.is_none() {
@@ -11981,6 +11991,7 @@ impl JitState for PyreJitState {
     ) -> Option<TraceAction> {
         struct PortalResumeSym {
             header_pc: usize,
+            redboxes: Vec<(OpRef, Type)>,
         }
         impl majit_metainterp::JitCodeSym for PortalResumeSym {
             fn total_slots(&self) -> usize {
@@ -11989,9 +12000,27 @@ impl JitState for PyreJitState {
             fn loop_header_pc(&self) -> usize {
                 self.header_pc
             }
+            fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+                // pyjitpl.py `opimpl_jit_merge_point` → `reached_loop_header(greenboxes, redboxes)`.
+                self.redboxes = redboxes.to_vec();
+            }
+            fn loop_carried_boxes(
+                &self,
+                vable_boxes: &[(OpRef, Type)],
+            ) -> Option<Vec<(OpRef, Type)>> {
+                // pyjitpl.py `reached_loop_header`:
+                //   live_arg_boxes = greenboxes + redboxes
+                //   live_arg_boxes += self.virtualizable_boxes
+                //   live_arg_boxes.pop()
+                let mut boxes = self.redboxes.clone();
+                let n = vable_boxes.len().saturating_sub(1);
+                boxes.extend_from_slice(&vable_boxes[..n]);
+                if boxes.is_empty() { None } else { Some(boxes) }
+            }
         }
         let mut portal_sym = PortalResumeSym {
             header_pc: outer_program_pc,
+            redboxes: Vec::new(),
         };
         let action = majit_metainterp::trace_jitcode_at_resume_framestack_allowing_residuals(
             ctx,

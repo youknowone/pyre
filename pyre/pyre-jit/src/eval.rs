@@ -26,7 +26,7 @@ use std::rc::Rc;
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
-use majit_ir::{Type, Value};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
@@ -7779,6 +7779,7 @@ static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 struct PortalMetatraceSym {
     header_pc: usize,
+    redboxes: Vec<(OpRef, Type)>,
 }
 
 impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
@@ -7788,6 +7789,26 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
 
     fn loop_header_pc(&self) -> usize {
         self.header_pc
+    }
+
+    fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+        // pyjitpl.py `opimpl_jit_merge_point` → `reached_loop_header(greenboxes, redboxes)`.
+        self.redboxes = redboxes.to_vec();
+    }
+
+    fn loop_carried_boxes(&self, vable_boxes: &[(OpRef, Type)]) -> Option<Vec<(OpRef, Type)>> {
+        // pyjitpl.py `reached_loop_header`:
+        //   live_arg_boxes = greenboxes + redboxes
+        //   live_arg_boxes += self.virtualizable_boxes
+        //   live_arg_boxes.pop()
+        // `compile_loop` slices greens (`original_boxes[num_green_args:]`),
+        // so the LABEL/JUMP are reds plus every virtualizable field except
+        // the trailing identity. Same list `collect_jump_args_with_boxes`
+        // builds for the close.
+        let mut boxes = self.redboxes.clone();
+        let n = vable_boxes.len().saturating_sub(1);
+        boxes.extend_from_slice(&vable_boxes[..n]);
+        if boxes.is_empty() { None } else { Some(boxes) }
     }
 }
 
@@ -7876,7 +7897,13 @@ fn drive_portal_metatrace(
     // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
     // at translation. Close before the portal walk reads it.
     majit_gc::ensure_type_registry_closed();
-    let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
+    let action = meta.interpret(
+        &mut PortalMetatraceSym {
+            header_pc,
+            redboxes: Vec::new(),
+        },
+        loop_header_pc,
+    );
     let depth = meta.framestack.len();
     let (stop_jitcode, stop_cursor) = if let Some(top) = meta.framestack.frames.last() {
         (top.jitcode.name(), top.code_cursor)
@@ -12589,6 +12616,7 @@ fn compile_and_run_once(
         |meta, _sym| {
             let mut portal_sym = PortalMetatraceSym {
                 header_pc: target_pc,
+                redboxes: Vec::new(),
             };
             if majit_metainterp::majit_log_enabled() {
                 let (name, cursor, first) = if meta.framestack.is_empty() {
@@ -14628,82 +14656,26 @@ pub(crate) fn decode_and_restore_guard_failure(
     }
 
     if restored {
-        // `next_instr()` is derived from the vable `last_instr` field.  The
-        // full-body walk sets the concrete frame's `last_instr` once at the
-        // loop header and does not advance it per opcode, so for a mid-body
-        // guard that field — and hence `next_instr()` — carries the loop
-        // header pc instead of the guard's resume opcode.  The per-frame
-        // section pc (`ResumedFrame.py_pc`, the same coordinate
-        // `resume_in_blackhole` resumes at) is the correct resume point.
-        // Prefer it when the two disagree; for the retired MIFrame tracer they always
-        // match (the frame's `last_instr` tracks the Python pc), so this is
-        // a no-op there. With flipped pc words, a single-frame resume uses
-        // the restored vable position and a multi-frame resume uses the
-        // innermost decoded section position.
-        let ni = jit_state.next_instr();
-        let innermost = resumed_frames.last();
-        let resume_pc = if resumed_frames.len() == 1 {
-            ni
-        } else {
-            innermost.map(|f| f.py_pc).unwrap_or(ni)
-        };
-        // When the resume pc is overridden to the innermost section's
-        // `py_pc` (a multi-frame inlined-callee guard), the positional
-        // `write_from_resume_data_partial` has left the physical frame's
-        // `valuestackdepth` at the CHAIN frame's depth (the outer
-        // section's).  Correct it to the innermost section's depth so the
-        // interpreter does not resume at the inner pc carrying the outer
-        // depth — an over-count that materializes a stray operand slot and
-        // shifts every subsequent push by one (`PyFrame::push` overflow at
-        // the function's peak stack use).  `last_instr` is already handled
-        // via `resume_pc`; only the vsd lags.  Clear the slots above the
-        // corrected depth so a GC scan before the first re-executed push
-        // does not see a stale operand pointer.
-        //
-        // The correction must also run when a deeper inlined-callee frame is
-        // present (`resumed_frames.len() > 1`) even if the innermost
-        // section's `py_pc` numerically coincides with `ni`: the positional
-        // vsd left by `write_from_resume_data_partial` is still the CHAIN
-        // (outer) frame's depth, and the matching pc value does not make it
-        // correct.  Single-frame guards keep the prior `resume_pc != ni`
-        // behavior.
-        //
-        // It addresses the PHYSICAL frame, so it applies only while the
-        // innermost section belongs to that frame's OWN code object.
-        // `consume_vable_info` (resume.py) writes the virtualizable
-        // from its own resume section and nothing re-points it at an inlined
-        // callee: a callee frame is a separate object the rebuild
-        // materializes, and its depth does not index the portal frame's
-        // `locals_cells_stack_w`.  Writing a foreign code object's depth here
-        // left the live frame BELOW its own stack base (`_Unframer.read`'s 3
-        // on `_Unpickler.load`, base 5), and the paired `clear_stack_above`
-        // then nulled two live locals.
-        if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(code) = innermost
-                .map(|f| f.code as usize)
-                .filter(|&code| code == jit_state.pycode_as_usize())
-            {
-                if let Some(corrected_vsd) =
-                    pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
-                {
-                    jit_state.set_valuestackdepth(corrected_vsd);
-                }
-            }
-        }
+        // resume.py `rebuild_from_resumedata` resumes every rd_numb section
+        // at its jitcode pc (`setup_resume_at_op`). Helper jitcodes have no
+        // Python twin, so `resume_py_pc_for_jitcode_word` is 0. Using that
+        // mapped word as the portal merge-point green (`ctx.header_pc` /
+        // `outer_program_pc`) CloseLoops at the function entry and the
+        // bridge re-runs `q = [0]*n`. The Python pc this function returns
+        // is only the portal virtualizable's `last_instr` — the green
+        // `jit_merge_point` names — never a helper's mapped py_pc.
+        let resume_pc = jit_state.next_instr();
         // `write_from_resume_data_partial` writes the whole
         // `locals_cells_stack_w` from the vable boxes, including slots
         // above `valuestackdepth`. A popped box can still hold a young
         // pointer; the type-9 walker traces every allocated slot, so
-        // leave those words NULL. The vsd-correction arm above already
-        // trimmed when it rewrote the depth; this covers the single-frame
-        // resume that keeps the restored vsd (`test_complex_newobj_ex`
-        // after a hot `Unpickler.load`).
+        // leave those words NULL.
         jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc)` per resumed section. The caller
         // needs them to ask each frame's own exception table whether it
-        // catches at its own resume pc — `resume_pc` alone only addresses the
-        // innermost section, so it cannot answer that question for a
-        // multi-frame resume.
+        // catches at its own resume pc. `resume_pc` is the portal vable
+        // last_instr, so it cannot answer that question for a helper
+        // section.
         let coords: Vec<(usize, usize)> = resumed_frames
             .iter()
             .map(|f| (f.code as usize, f.py_pc))

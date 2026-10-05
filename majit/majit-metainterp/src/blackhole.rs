@@ -8251,6 +8251,13 @@ fn bhimpl_ref_isconstant(_a: i64) -> i64 {
 }
 
 /// blackhole.py `bhimpl_ref_isvirtual(x): return False`.
+/// `jtransform.py` `jit.isvirtual` on an int-kind operand uses the same
+/// residual: a raw header address is never a virtual GC object.
+fn bhimpl_int_isvirtual(_a: i64) -> i64 {
+    0
+}
+
+/// blackhole.py `bhimpl_ref_isvirtual(x): return False`.
 fn bhimpl_ref_isvirtual(_a: i64) -> i64 {
     0
 }
@@ -9229,6 +9236,7 @@ bhhandler_r_v!(handler_virtual_ref_finish, bhimpl_virtual_ref_finish);
 bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
+bhhandler_i_i!(handler_int_isvirtual, bhimpl_int_isvirtual);
 // Temporarily expanded from `bhhandler_goto_if_not_i!(handler_goto_if_not,
 // bhimpl_goto_if_not)` for MAJIT_BH_DEBUG cond inspection (#210).
 fn handler_goto_if_not(
@@ -11487,6 +11495,7 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             majit_jitcode::insns::BC_REF_ISCONSTANT,
         ),
         ("ref_isvirtual/r>i", majit_jitcode::insns::BC_REF_ISVIRTUAL),
+        ("int_isvirtual/i>i", majit_jitcode::insns::BC_INT_ISVIRTUAL),
         ("new/d>r", majit_jitcode::insns::BC_NEW),
         (
             "new_with_vtable/d>r",
@@ -11815,6 +11824,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("loop_header/i", handler_loop_header);
     builder.wire_handler("ref_isconstant/r>i", handler_ref_isconstant);
     builder.wire_handler("ref_isvirtual/r>i", handler_ref_isvirtual);
+    builder.wire_handler("int_isvirtual/i>i", handler_int_isvirtual);
     builder.wire_handler(
         "goto_if_not_int_is_zero/iL",
         handler_goto_if_not_int_is_zero,
