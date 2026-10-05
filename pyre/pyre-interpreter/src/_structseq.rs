@@ -354,11 +354,12 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     };
     let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(mapping);
-    let field_ty = structseqfield_type();
+    let field_ty_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(structseqfield_type());
     let fields_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_dict_new());
     for (_key, value) in unsafe { pyre_object::w_dict_items(roots.get(mapping_slot)) } {
-        if unsafe { (*value).w_class } == field_ty {
+        if unsafe { (*value).w_class } == roots.get(field_ty_slot) {
             let value_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(value);
             let index = crate::baseobjspace::getattr_str(roots.get(value_slot), "index")?;
