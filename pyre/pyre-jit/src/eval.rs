@@ -567,8 +567,11 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // The `mutate__version_tag` instance (`quasiimmut.py get_current_qmut_instance
     // get_current_qmut_instance`) is Rust-owned and off-GC too. A type that was
     // compiled against and never mutated afterwards still holds one, so without
-    // this the box outlives the only pointer to it.
+    // this the box outlives the only pointer to it.  `name?` is the same
+    // shape: `descr_set__name__` is the only writer, and a type compiled
+    // against and never renamed still holds the instance.
     unsafe { (*t).quasi_immut_watchers.reclaim() };
+    unsafe { (*t).w_name_watchers.reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` instances on sweep.

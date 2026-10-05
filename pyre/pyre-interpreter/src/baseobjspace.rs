@@ -12381,12 +12381,12 @@ pub unsafe fn classmethod_on_type_fast_path(
 /// precondition: `type` is immutable, so the getter cannot be replaced, and
 /// what it returns is the `w_name` slot.
 ///
-/// The slot is reported rather than its contents because the walker must read
-/// it live: `descr_set__name__` (typeobject.py) replaces the name without
-/// going through `mutated()`, so the version tag does not move when a class is
-/// renamed and a baked name would outlive the rename.  A slot that has not
-/// been materialised yet (`PY_NULL`) declines rather than filling it in, since
-/// filling it in means allocating.
+/// The slot is reported rather than its contents so the walker can pin
+/// `name?` and bake the object: `descr_set__name__` (typeobject.py) replaces
+/// the name without going through `mutated()`, so the version tag does not
+/// move when a class is renamed.  A slot that has not been materialised yet
+/// (`PY_NULL`) declines rather than filling it in, since filling it in means
+/// allocating.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
