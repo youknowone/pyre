@@ -499,12 +499,15 @@ pub enum CallableKind {
 /// (`baseobjspace.py`); handing them in as closures instead puts an
 /// `FnOnce::call_once` in front of every dispatch, and a closure has no
 /// lifted counterpart — RPython spells this as a plain conditional.
-pub fn classify_callable(callable: PyObjectRef) -> Result<CallableKind, PyError> {
+pub fn classify_callable(mut callable: PyObjectRef) -> Result<CallableKind, PyError> {
     // Re-raise an error `park_jit_pending_error` parked (`unpackiterable_driver`)
     // before dispatching.  A fresh stack check is performed only when a Python
     // frame is entered (`PyFrame.execute_frame.insert_stack_check_here`);
     // builtin dispatch itself is not a recursive frame entry.
-    crate::stack_check::drain_jit_pending_exception()?;
+    // `drain_jit_pending_exception` materialises a GC `PyError` handle
+    // (`from_exc_object` / `make_pyerror`); pin `callable` across it the way
+    // `PyFrame.execute_frame` pins `operr` across `stack_check`.
+    pyre_object::with_roots!(callable => crate::stack_check::drain_jit_pending_exception())?;
     unsafe {
         if crate::is_function_carrier(callable) {
             // All callables are Function objects. Check code type to distinguish

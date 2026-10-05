@@ -596,7 +596,13 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     if unsafe { is_type(cls) } {
         let flag = unsafe { typeobject::w_type_get_flag_map_or_seq(cls) };
         if flag != b'?' {
-            set_collection_flag_recursive(subclass, flag);
+            // Same livevar set as the `issubclass` / `weak_cache_add` arms
+            // above: `interp_abc.py set_collection_flag_recursive` walks
+            // `weak_subclasses`, so `subclass` is re-read from its slot
+            // before the return.
+            pyre_object::with_roots!(subclass => {
+                set_collection_flag_recursive(subclass, flag);
+            });
         }
     }
     Ok(subclass)

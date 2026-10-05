@@ -1366,11 +1366,20 @@ impl PyError {
         let Some(w_target) = crate::builtins::lookup_exc_class(class_name) else {
             return;
         };
-        self.set_w_type(w_target);
+        // `set_w_type` write-barriers the handle (`llop.gc_writebarrier`).
+        // Pin the handle and the class across it the way
+        // `enrich_attribute_error_str` pins across `w_str_new_managed`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = self.pin(&_roots);
+        let target_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(w_target);
+        self.set_w_type(_roots.get(target_slot));
+        self.reload(&_roots, handle_slot);
         if !self.has_exception_instance() {
             return;
         }
         // Fresh instance: no recorded `w_class?` read can name it yet.
+        let w_target = _roots.get(target_slot);
         unsafe {
             (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
         }
