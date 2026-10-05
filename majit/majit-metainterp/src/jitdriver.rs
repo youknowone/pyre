@@ -5384,11 +5384,6 @@ impl<S: JitState> JitDriver<S> {
                     // a failed bridge. A setup abort or a deterministic bridge
                     // abort leaves the guard's jitcounter where `jitcounter.tick`
                     // reset it, and the next failure ticks again.
-                    let det_bridge_abort = self
-                        .meta
-                        .tracing
-                        .as_ref()
-                        .is_some_and(|ctx| ctx.deterministic_bridge_abort);
                     // pyjitpl.py `run_blackhole_interp_to_cancel_tracing(stb)`
                     // consumes both the reason and raising_exception from the
                     // same signal. The Python worker returns it with the action;
@@ -5447,18 +5442,24 @@ impl<S: JitState> JitDriver<S> {
                     // interpreter, so this bridge needs the handoff for the
                     // same reason a fresh trace does.
                     //
-                    // A deterministic bridge abort (`BC_ABORT` in a helper
-                    // such as `malformed`) must not take that handoff: the
-                    // cancel-tracing blackhole would run the error-path
-                    // helper for real and leave the compiled loop's later
-                    // entries failing the same guard every iteration.
+                    // `handle_guard_failure` catches `SwitchToBlackhole` with
+                    // `run_blackhole_interp_to_cancel_tracing` →
+                    // `MetaInterp.aborted_tracing` →
+                    // `convert_and_run_from_pyjitpl` on the live framestack.
+                    // A deterministic bridge abort (`BC_ABORT`, a refused
+                    // walk-local residual) is still that abort: converting
+                    // from the abort point finishes the half-opcode. Returning
+                    // `None` from `bridge_from_guard_resume_position` would
+                    // take `ResumeGuardDescr.handle_fail`'s else-arm
+                    // (`resume_in_blackhole` from the guard deadframe) and
+                    // replay residuals the walk already executed
+                    // (`note_residual_committed` / `ITER_NEXT`).
                     if matches!(
                         action,
                         TraceAction::Abort | TraceAction::SwitchToBlackhole(_)
-                    ) && !det_bridge_abort
-                        && (self.meta.bridge_info().is_none()
-                            || self.bridge_attempt_declined
-                            || self.bridge_entered_at_guard_resume)
+                    ) && (self.meta.bridge_info().is_none()
+                        || self.bridge_attempt_declined
+                        || self.bridge_entered_at_guard_resume)
                     {
                         // This gate asks whether the session still has a bridge
                         // artifact to resume into, which is the PHASE, not the
@@ -6685,25 +6686,30 @@ impl<S: JitState> JitDriver<S> {
             };
             return Some(resume);
         }
-        // Neither walk handoff answered. A blackhole started from a
-        // guard failure (`compile.py ResumeGuardDescr.handle_fail`)
-        // never returns a "no-handoff" outcome: `_trace_and_compile_from_bridge`
+        // Neither walk handoff answered. `_trace_and_compile_from_bridge`
         // ends in `ContinueRunningNormally` / `DoneWithThisFrame*` /
-        // `ExitFrameWithExceptionRef`, and the `must_compile` else-arm is
-        // `resume_in_blackhole`. A walk that tore down its `TraceCtx`
-        // without staging a conversion (deterministic bridge abort,
-        // reachable-symbolic-residual refuse before a framestack exists)
-        // is that else-arm. `ResumeAt` would skip the loop-carried greens
+        // `ExitFrameWithExceptionRef`; the `must_compile` else-arm is
+        // `resume_in_blackhole` and runs only when tracing never started.
+        // `ResumeAt` would skip the loop-carried greens
         // `warmspot.py handle_jitexception` assigns.
         crate::mc_diag_bump(79); // guard_resume_bridge_no_handoff
         if let Some(args) = self.meta.trace_ctx().map(|ctx| ctx.portal_resume_args()) {
             state.recover_after_compiled_run();
             return Some(continue_with_args(args));
         }
-        // `compile.py` `ResumeGuardDescr.handle_fail` / `resume_in_blackhole`:
-        // the caller still holds the deadframe. Returning `None` is the
-        // decline the pre-walk ladder already uses for a guard this walk
-        // cannot serve.
+        // `ResumeGuardDescr.handle_fail` / `resume_in_blackhole` from the
+        // caller's deadframe. Reached only when `merge_point` never invoked
+        // the walk (`entered` stays false): a live `TraceCtx` with no
+        // dispatch jitcode already returned above, and every
+        // `TraceAction::Abort` / `SwitchToBlackhole` after
+        // `start_bridge_tracing` stages `pending_abort_blackhole` for
+        // `MetaInterp.aborted_tracing` → `convert_and_run_from_pyjitpl`.
+        debug_assert!(
+            !entered,
+            "guard-resume walk started; MetaInterp.aborted_tracing must convert \
+             the live framestack (blackhole.py convert_and_run_from_pyjitpl) \
+             rather than ResumeGuardDescr.handle_fail resume_in_blackhole"
+        );
         if crate::majit_log_enabled() {
             eprintln!(
                 "[bridge] no-handoff: compile_trace_success={} single_pass_finish={} \
