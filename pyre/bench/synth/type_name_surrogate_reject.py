@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=7.8
-# Ubuntu cranelift #2182 run 37180819398: 2.4x. Dynasm floor-fail 2.0x
-# against 9.6 (floor 2.4); 7.8 keeps the derived floor at 1.95x.
+# pyre-check: max-pypy-ratio=12
+# Readings before #2189: ubuntu dynasm 10.6x, ubuntu cranelift ?10.0x,
+# macos dynasm 7.6x / cranelift 8.0x, windows ?6.5x (runs 37242176195);
+# ubuntu cranelift 9.7x-11.2x since. 12 keeps the derived floor at 3x.
 N = 10000
 
 

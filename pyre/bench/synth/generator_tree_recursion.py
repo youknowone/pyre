@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=12.8
+# pyre-check: max-pypy-ratio=14
 # pyre-check: jitstats-band=guard_failures=8
 # Successful bridge closure and a pre-trace Decline are not aborts in
 # `MetaInterp._interpret`. Charging both to pyre's local abort ceiling held this
@@ -6,10 +6,10 @@
 # 48 / 7378. The PyPy oracle compiles still more (65 bridges) with forcings=0,
 # virtualizables forced=0 and nvirtuals=721, so the higher count is coverage,
 # not a regression to suppress. Four final-binary cranelift runs measured
-# 12.5x..12.7x; 12.8x leaves the cranelift reading inside the ceiling
-# while the derived floor sits under dynasm 3.2x. The recovery target is PyPy's
+# 12.5x..12.7x; 14x leaves 10% headroom. The recovery target is PyPy's
 # zero-forcing per-`MIFrame` recursive-frame/blackhole path, not restoring the
 # abort-ceiling shortcut.
+# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured

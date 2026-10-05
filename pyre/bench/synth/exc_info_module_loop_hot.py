@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=2.8
-# dynasm floor-fail 0.7x against 4.5; 2.8 drops the derived floor.
+# pyre-check: max-pypy-ratio=4.5
+# dynasm 2.3-3.0x, cranelift 2.5-3.4x. 4.5 stays above those readings.
+# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame

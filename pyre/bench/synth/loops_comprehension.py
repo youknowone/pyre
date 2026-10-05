@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=30
+# pyre-check: max-pypy-ratio=16
+# Readings 5.0x-8.1x (macos dynasm 5.0x failed floor 7.5 against 30, run 37242176195). Floor 4x.
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they

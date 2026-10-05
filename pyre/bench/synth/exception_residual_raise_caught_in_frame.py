@@ -1,9 +1,9 @@
-# pyre-check: max-pypy-ratio=15.2
-# Tightened 21 -> 15.2 on a dynasm 3.9x floor-fail against 5.25x.
+# pyre-check: max-pypy-ratio=21
 # Tightened 34 -> 27 when `seeded_callee_resume` stopped requiring the
 # callee's own exception table: execution-only time here fell 1.40x against a
 # same-day build of the parent commit, so the previous headroom is kept and
 # then some -- the ceiling moves by less than the measured gain.
+# #2189 lowered this on run 37210502972, whose pypy timings were ~3x slow; restored.
 # A frame that catches an exception a residual call raised contributes its own
 # traceback node, including once its `except` is reached from inside its own
 # compiled trace.
