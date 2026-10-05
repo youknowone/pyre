@@ -106,9 +106,9 @@ fn loads_fixture_corpus() {
     //
     // + 1 for `tail_len`, `get(1..).unwrap_or(&[])` of a pair slice.
     //
-    // Measured on nightly-2026.09.26, where drop glue is no longer its own
-    // local item: 97.
-    assert_eq!(local_count, 97, "97 local fns expected");
+    // Measured on Charon 0.1.281 (nightly-2026.10.04): drop glue is no
+    // longer its own local item, and this artefact holds 59.
+    assert_eq!(local_count, 59, "59 local fns expected");
 }
 
 #[test]
