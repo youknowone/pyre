@@ -148,18 +148,25 @@ fn straight_line_add_shape() {
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
     assert_eq!(u.locals.arg_count, 3);
-    assert_eq!(u.body.len(), 7);
+    // Cleanup blocks are left out; every on_unwind edge shares the appended
+    // UnwindResume block. 7 MIR blocks (4 normal + 3 cleanup) become 5.
+    assert_eq!(u.body.len(), 5);
 
     // bb0 should end in an overflow Assert (AddChecked + Assert).
     let bb0 = &u.body[0];
-    assert!(
-        matches!(bb0.term(&llbc).unwrap(), TermKind::Assert { .. }),
-        "bb0 terminator was not Assert",
-    );
+    match bb0.term(&llbc).unwrap() {
+        TermKind::Assert { on_unwind, .. } => assert_eq!(on_unwind, 4),
+        other => panic!("bb0 terminator was not Assert: {other:?}"),
+    }
 
     // bb3 should be the return block.
     let bb3 = &u.body[3];
     assert!(matches!(bb3.term(&llbc).unwrap(), TermKind::Return));
+
+    assert!(matches!(
+        u.body[4].term(&llbc).unwrap(),
+        TermKind::UnwindResume
+    ));
 }
 
 #[test]
