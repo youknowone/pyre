@@ -69,7 +69,7 @@ fn loads_fixture_corpus() {
     // item. The closure env is not a separate `closure` path; its body is
     // `bool_then_closure::<Impl>::call_once`. That drop glue was a local fn
     // on nightly-2026.05.29, and it is absent from the artefact rather than
-    // dropped by the reader. The measured count is 59.
+    // dropped by the reader.
     //
     // + 1 for `char_slot_index`, the `char` element array read.
     //
@@ -106,9 +106,12 @@ fn loads_fixture_corpus() {
     //
     // + 1 for `tail_len`, `get(1..).unwrap_or(&[])` of a pair slice.
     //
+    // + 2 for the `::<Builtin>` bodies Charon 0.1.281 emits beside
+    // `code_flags_bits_or` and `tail_len`.
+    //
     // Measured on Charon 0.1.281 (nightly-2026.10.04): drop glue is no
-    // longer its own local item, and this artefact holds 59.
-    assert_eq!(local_count, 59, "59 local fns expected");
+    // longer its own local item, and this artefact holds 99.
+    assert_eq!(local_count, 99, "99 local fns expected");
 }
 
 #[test]

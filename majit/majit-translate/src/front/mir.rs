@@ -55085,8 +55085,11 @@ fn unit_enum_discriminant(llbc: &Llbc, kind: &serde_json::Value) -> Option<u64> 
     u64::try_from(variant.discriminant_i64()?).ok()
 }
 
-/// A shared borrow of a flag carrier is the carrier. Other borrows stay
-/// residual so a pointer-identity initializer is not folded as an integer.
+/// A shared borrow of a flag carrier is the carrier. A promoted `&FLAG`
+/// copies the NamedConst and borrows it; the transparent wrapper has
+/// already peeled to the integer word, so that word is the same carrier.
+/// Other borrows stay residual so a pointer-identity initializer is not
+/// folded as an integer.
 fn const_eval_borrowed_flag(
     locals: &std::collections::HashMap<u64, ConstLit>,
     place: &Place,
@@ -55099,7 +55102,10 @@ fn const_eval_borrowed_flag(
         _ => return None,
     };
     match lit {
-        v @ (ConstLit::EnumDisc(_) | ConstLit::BitflagBits(_)) => Some(v),
+        v @ (ConstLit::EnumDisc(_)
+        | ConstLit::BitflagBits(_)
+        | ConstLit::Int(_)
+        | ConstLit::UInt(_)) => Some(v),
         _ => None,
     }
 }
@@ -55464,13 +55470,15 @@ fn const_eval_init_body_with_locals(
                     // call.
                     PlaceKind::Global { id, .. } => {
                         let global = llbc.global_by_id(*id)?;
-                        if global
+                        // `AnonConst` is rustc's promoted `&FLAG` for a
+                        // NamedConst used by reference (`FLAG.bits()`).
+                        match global
                             .rest
                             .get("global_kind")
                             .and_then(serde_json::Value::as_str)
-                            != Some("NamedConst")
                         {
-                            return None;
+                            Some("NamedConst") | Some("AnonConst") => {}
+                            _ => return None,
                         }
                         let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
                         let init = llbc.fn_by_id(init_id)?;

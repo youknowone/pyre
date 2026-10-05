@@ -55,14 +55,15 @@ fn lowers_straight_line_add() {
         "straight_line_add takes three i64 args"
     );
     // Charon nightly-2026.10.04 emits 7 MIR BBs: three overflow Asserts,
-    // a Return, and a dedicated UnwindResume successor per Assert. The
-    // FunctionGraph adds startblock(0)/returnblock(1)/exceptblock(2) as
-    // canonical sentinels but the MIR bb0 maps onto startblock, so the
-    // total is 7 (MIR bbs) + 2 (returnblock + exceptblock) = 9.
+    // a Return, and a dedicated UnwindResume successor per Assert.
+    // `FunDecl::unstructured` drops the three cleanup blocks and appends
+    // one shared UnwindResume, leaving 5. The FunctionGraph adds
+    // startblock(0)/returnblock(1)/exceptblock(2) as canonical sentinels
+    // but the MIR bb0 maps onto startblock, so the total is 5 + 2 = 7.
     assert_eq!(
         graph.blocks.len(),
-        9,
-        "7 MIR bbs + returnblock + exceptblock"
+        7,
+        "5 MIR bbs + returnblock + exceptblock"
     );
 
     // At least one of the MIR blocks should carry a BinOp operation
