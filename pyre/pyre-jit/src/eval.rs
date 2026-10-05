@@ -16925,7 +16925,7 @@ mod tests {
     fn test_branch_guard_preserves_pre_pop_stack_shape_with_compiled_trace_jitcode() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
-        use majit_metainterp::recorder::SnapshotTagged;
+        use majit_metainterp::recorder::{Snapshot, SnapshotTagged};
         use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
@@ -17031,7 +17031,10 @@ mod tests {
                 snapshot_id >= 0,
                 "branch guard must carry rd_resume_position pointing at its captured snapshot",
             );
-            let snapshot = &ctx.snapshots()[snapshot_id as usize];
+            // `rd_resume_position` is the `_snapshot_data` byte offset
+            // (`create_top_snapshot`), not a dense Vec index.
+            let snapshot = Snapshot::by_resume_position(ctx.snapshots(), snapshot_id)
+                .expect("branch guard snapshot must exist at its resume_position");
             let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             assert!(
                 snapshot.vable_boxes.len() >= n,
@@ -17082,7 +17085,7 @@ mod tests {
     fn test_branch_truth_uses_concrete_parameter_with_compiled_trace_jitcode() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
-        use majit_metainterp::recorder::SnapshotTagged;
+        use majit_metainterp::recorder::{Snapshot, SnapshotTagged};
         use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
@@ -17171,7 +17174,10 @@ mod tests {
             snapshot_id >= 0,
             "guard must carry rd_resume_position pointing at its captured snapshot",
         );
-        let snapshot = &ctx.snapshots()[snapshot_id as usize];
+        // `rd_resume_position` is the `_snapshot_data` byte offset
+        // (`create_top_snapshot`), not a dense Vec index.
+        let snapshot = Snapshot::by_resume_position(ctx.snapshots(), snapshot_id)
+            .expect("guard snapshot must exist at its resume_position");
         let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         assert!(
             snapshot.vable_boxes.len() >= n,
