@@ -1,3 +1,5 @@
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # pyre-check: skip-cpython
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 120000
 # iterations pypy exec is inside the `?` band, so a ceiling of 40 applied
