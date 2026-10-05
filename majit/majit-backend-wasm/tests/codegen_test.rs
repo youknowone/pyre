@@ -12214,6 +12214,80 @@ fn with_table_sig(addr: i64, encoded: Option<i64>, body: impl FnOnce()) {
     body();
 }
 
+/// `descr.py` `create_call_stub`: the callee's FUNC is the calldescr's.
+/// An i32-narrowed table type is a missing `word_publish` /
+/// `residual_word_addr` on that target, not a second wasm ABI. Encoding 0
+/// (no table type) is the legitimate `jit_call_host` case: multi-value /
+/// sret, or an import outside the guest table.
+#[test]
+fn i32_table_type_is_not_the_calldescr_word() {
+    use majit_backend_wasm::{FuncSigVal, WasmSig};
+    let descr = WasmSig {
+        params: vec![FuncSigVal::I64, FuncSigVal::I64],
+        result: Some(FuncSigVal::I64),
+    };
+    let twin = WasmSig {
+        params: vec![FuncSigVal::I32, FuncSigVal::I32],
+        result: Some(FuncSigVal::I32),
+    };
+    assert_eq!(descr, descr);
+    assert_ne!(twin, descr);
+}
+
+/// `descr.py CallDescr.create_call_stub` / `callbuilder.py load_result`:
+/// a Ref residual is one word. wasm codegen emits `(i64…) -> i64`; a
+/// two-word `(i64, i64)` result would be a different `call_indirect` type.
+fn call_r_two_refs() -> (Vec<InputArgRc>, Vec<Op>) {
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+    ];
+    let call = {
+        let op = Op::new(
+            OpCode::CallR,
+            &[
+                rb(OpRef::const_int(42)),
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+            ],
+        );
+        op.pos().set(OpRef::ref_op(2));
+        op.setdescr(majit_ir::descr::make_call_descr(
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+            EffectInfo::default(),
+        ));
+        op
+    };
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(2))])];
+    (inputargs, ops)
+}
+
+#[test]
+fn call_r_lowers_as_one_word_i64_result() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[
+            majit_backend_wasm::FuncSigVal::I64,
+            majit_backend_wasm::FuncSigVal::I64,
+        ],
+        Some(majit_backend_wasm::FuncSigVal::I64),
+    );
+    with_table_sig(42, Some(encoded), || {
+        let (inputargs, ops) = call_r_two_refs();
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        let (params, results) = function_type(&bytes, indirect_calls[0].0 as usize);
+        assert_eq!(
+            params,
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64]
+        );
+        assert_eq!(results, vec![wasmparser::ValType::I64]);
+    });
+}
+
 #[test]
 fn test_oracle_i64_call_lowers_in_module_without_vouch() {
     let encoded = majit_backend_wasm::encode_func_sig(

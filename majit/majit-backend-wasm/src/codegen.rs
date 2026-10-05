@@ -3645,6 +3645,15 @@ fn residual_callee_direct_emit_sig_at(
             if real_typed == *expected {
                 Some(expected.clone())
             } else {
+                // Native tests inject table types; the guest is where a
+                // missing `residual_word_addr` is a programming error.
+                #[cfg(target_arch = "wasm32")]
+                debug_assert_eq!(
+                    real_typed, *expected,
+                    "residual callee table type differs from the calldescr FUNC; \
+                     publish the target through residual_word_addr \
+                     (descr.py create_call_stub, callbuilder.py emit_raw_call)"
+                );
                 None
             }
         }

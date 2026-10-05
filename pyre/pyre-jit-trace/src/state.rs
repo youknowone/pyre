@@ -3067,7 +3067,13 @@ pub struct PyreSym {
     /// snapshot-owned pointer. RPython has no snapshot —
     /// `read_boxes` (virtualizable.py) always reads the live
     /// virtualizable, which is what this field restores.
-    pub(crate) live_vable_frame_addr: usize,
+    ///
+    /// A `Cell` so [`crate::trace::TraceRoots`] can forward the GCREF during
+    /// a collection (`virtualizable.py` the live virtualizable is a GC
+    /// pointer rewritten in place). A raw `usize` copy is left pointing at
+    /// the nursery corpse; the next `setarrayitem_vable` write-through
+    /// then stores into whatever object reused that slot.
+    pub(crate) live_vable_frame_addr: std::cell::Cell<usize>,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py): concrete
@@ -3254,12 +3260,12 @@ impl WalkSym for PyreSym {
 
     #[inline]
     fn live_vable_frame_addr(&self) -> usize {
-        self.live_vable_frame_addr
+        self.live_vable_frame_addr.get()
     }
 
     #[inline]
     fn set_live_vable_frame_addr(&mut self, value: usize) {
-        self.live_vable_frame_addr = value;
+        self.live_vable_frame_addr.set(value);
     }
 
     #[inline]
@@ -5099,6 +5105,19 @@ pub(crate) fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: 
     if vable_ptr == 0 {
         return;
     }
+    // `TraceRoots` rewrites `live_vable_frame_addr` in place
+    // (`virtualizable.py` `write_boxes`: the live virtualizable is a
+    // GC pointer). A silent skip of a stale copy would drop a store
+    // the trace recorded. `gc_current_object_address` returns `addr`
+    // unchanged for a non-nursery object, so this is the current
+    // address of a GC-owned frame and the identity of a stationary
+    // `FrameBox::new_boxed` frame (`pyframe.py` `PyFrame.__init__`
+    // before the collector is wired; `frame_array_write_barrier`
+    // already arms whichever side the GC owns).
+    debug_assert!(
+        majit_gc::gc_current_object_address(vable_ptr) == vable_ptr,
+        "stale live-frame address: root/forward the caller copy"
+    );
     let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
     let lp = f.locals_cells_stack_w;
     if lp.is_null() {
@@ -6974,7 +6993,7 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
-            live_vable_frame_addr: 0,
+            live_vable_frame_addr: std::cell::Cell::new(0),
             last_exc_value: Default::default(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
@@ -7406,7 +7425,7 @@ impl PyreSym {
             // an already-seeded `initialize_virtualizable` layout: that
             // length is the LABEL `inputarg_types`, and a shorter re-seed
             // made the walker JUMP one box short of it.
-            let mut array_len = concrete_frame_array_len(self.live_vable_frame_addr)
+            let mut array_len = concrete_frame_array_len(self.live_vable_frame_addr.get())
                 .or_else(|| concrete_frame_array_len(concrete_frame))
                 .or_else(|| {
                     (!self.jitcode.is_null()).then(|| {
@@ -7498,8 +7517,8 @@ impl PyreSym {
                 // runtime value (the live frame supplied by extract_live_values).
                 // Falls back to the snapshot address when no live frame was
                 // threaded (unit-test / init-before-run path).
-                let vable_identity_addr = if self.live_vable_frame_addr != 0 {
-                    self.live_vable_frame_addr
+                let vable_identity_addr = if self.live_vable_frame_addr() != 0 {
+                    self.live_vable_frame_addr()
                 } else {
                     concrete_frame
                 };
@@ -10715,8 +10734,8 @@ impl JitState for PyreJitState {
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
 
-        let frame_addr = if sym.live_vable_frame_addr != 0 {
-            sym.live_vable_frame_addr
+        let frame_addr = if sym.live_vable_frame_addr() != 0 {
+            sym.live_vable_frame_addr()
         } else {
             sym.concrete_vable_ptr as usize
         };

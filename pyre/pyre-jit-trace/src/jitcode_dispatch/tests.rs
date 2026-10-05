@@ -121,6 +121,28 @@ fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
     );
 }
 
+/// `virtualizable.py` the live virtualizable is a GC pointer rewritten in
+/// place. `TraceRoots` must forward `live_vable_frame_addr` the same way
+/// `LiveFrameRoot` does across a residual; a raw usize copy is what the
+/// `setarrayitem_vable` write-through then stores through, and after the
+/// nursery turns that slot is another object (`GC BUG` site
+/// `minor_root_target` / `rd_consts`).
+#[test]
+fn live_vable_frame_addr_is_forwarded_by_trace_roots() {
+    use crate::state::PyreSym;
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let mut sym = PyreSym::new_uninit(OpRef::NONE);
+    let _roots = crate::trace::TraceRoots::enter(&sym);
+    sym.set_live_vable_frame_addr(0x1000);
+    majit_gc::shadow_stack::walk_my_extra_areas(|gcref| {
+        if gcref.0 == 0x1000 {
+            gcref.0 = 0x2000;
+        }
+    });
+    assert_eq!(sym.live_vable_frame_addr(), 0x2000);
+}
+
 extern "C" fn count_static_refusal_prefix() {
     STATIC_REFUSAL_PREFIX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -144,7 +166,10 @@ impl JitCodeSym for StaticRefusalSym {
 fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
     let before = STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     let mut builder = majit_metainterp::JitCodeBuilder::new();
-    let bound = builder.add_fn_ptr(count_static_refusal_prefix as *const ());
+    let bound = builder.add_fn_ptr(pyre_interpreter::residual_word_addr!(
+        0,
+        count_static_refusal_prefix,
+    ));
     builder.residual_call_void_canonical_via_target_with_effect_info(
         bound,
         &[],
@@ -12233,7 +12258,8 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
     // `EF_ELIDABLE_OR_MEMORYERROR` bigint helpers use this exact shape: they
     // must not be left recorded-only merely because their opcode is CallPureI.
     let mut tc = fresh_trace_ctx();
-    let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
+    let funcbox =
+        tc.const_int(pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64);
     let arg0 = tc.const_int(40);
     let arg1 = tc.const_int(2);
     let allboxes = [funcbox, arg0, arg1];
@@ -12305,7 +12331,8 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
 }
 
 fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) {
-    let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
+    let funcbox =
+        tc.const_int(pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64);
     let arg0 = tc.const_int(40);
     let arg1 = tc.const_int(2);
     let allboxes = [funcbox, arg0, arg1];
@@ -12467,7 +12494,8 @@ extern "C" fn raises_for_walker_test() -> i64 {
 #[test]
 fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     let mut tc = fresh_trace_ctx();
-    let funcbox = tc.const_int(raises_for_walker_test as *const () as i64);
+    let funcbox =
+        tc.const_int(pyre_interpreter::residual_word_addr!(0, raises_for_walker_test,) as i64);
     let allboxes = [funcbox];
     let descr = make_call_descr(6, vec![], Type::Int, majit_ir::ExtraEffect::CanRaise);
     let recorded =
@@ -12682,7 +12710,8 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         vable_buf.as_ptr() as usize + info.token_offset,
         std::sync::atomic::Ordering::SeqCst,
     );
-    let funcbox = tc.const_int(forces_vable_for_walker_test as *const () as i64);
+    let funcbox = tc
+        .const_int(pyre_interpreter::residual_word_addr!(2, forces_vable_for_walker_test,) as i64);
     let arg0 = tc.const_int(40);
     let arg1 = tc.const_int(2);
     let allboxes = [funcbox, arg0, arg1];
@@ -12787,11 +12816,11 @@ thread_local! {
 /// Returns the outcome, how many ops the trace grew by, and how many times
 /// the callee actually ran.
 fn run_not_in_trace(
-    callee: extern "C" fn() -> i64,
+    callee: *const (),
     dst_bank: char,
 ) -> (Result<Option<DispatchOutcome>, DispatchError>, usize, u32) {
     let mut tc = fresh_trace_ctx();
-    let funcbox = tc.const_int(callee as *const () as i64);
+    let funcbox = tc.const_int(callee as i64);
     let allboxes = [funcbox];
     let descr = call_descr_with_oopspec(
         44,
@@ -12858,8 +12887,10 @@ fn not_in_trace_normal_return_executes_concretely_and_records_no_ir() {
     // `execute_varargs` and returns `None`, so `do_residual_call` hands its
     // caller no result box and the history never grows: "the trace doesn't
     // contain the call at all".
-    let (outcome, ops_recorded, calls) =
-        run_not_in_trace(not_in_trace_returns_for_walker_test, 'v');
+    let (outcome, ops_recorded, calls) = run_not_in_trace(
+        pyre_interpreter::residual_word_addr!(0, not_in_trace_returns_for_walker_test),
+        'v',
+    );
     assert_eq!(
         outcome,
         Ok(Some(DispatchOutcome::Continue)),
@@ -12882,7 +12913,10 @@ fn not_in_trace_raise_switches_to_blackhole_and_records_no_ir() {
     // exception-catching path, but the trace doesn't contain the call at
     // all" — `SwitchToBlackhole(Counters.ABORT_ESCAPE,
     // raising_exception=True)`.
-    let (outcome, ops_recorded, calls) = run_not_in_trace(not_in_trace_raises_for_walker_test, 'v');
+    let (outcome, ops_recorded, calls) = run_not_in_trace(
+        pyre_interpreter::residual_word_addr!(0, not_in_trace_raises_for_walker_test),
+        'v',
+    );
     assert_eq!(
         outcome,
         Ok(Some(DispatchOutcome::SwitchToBlackhole {
@@ -12907,7 +12941,10 @@ fn not_in_trace_with_a_destination_bank_stays_fail_loud() {
     // is not `lltype.Void`, so only the `residual_call_*_v` spellings can
     // carry this oopspec. A destination bank here is a codewriter invariant
     // violation; the walker must not invent a value for it.
-    let (outcome, _ops, calls) = run_not_in_trace(not_in_trace_returns_for_walker_test, 'r');
+    let (outcome, _ops, calls) = run_not_in_trace(
+        pyre_interpreter::residual_word_addr!(0, not_in_trace_returns_for_walker_test),
+        'r',
+    );
     assert_eq!(
         outcome,
         Err(DispatchError::NotInTraceRequiresConcreteExecution { pc: 0 }),
@@ -17691,7 +17728,8 @@ extern "C" fn halve_f64_for_walker_test(x: i64) -> f64 {
 #[test]
 fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
     let mut tc = fresh_trace_ctx();
-    let funcbox = tc.const_int(halve_f64_for_walker_test as *const () as i64);
+    let funcbox =
+        tc.const_int(pyre_interpreter::residual_word_addr!(1, halve_f64_for_walker_test,) as i64);
     let arg0 = tc.const_int(7);
     let allboxes = [funcbox, arg0];
     let descr = make_call_descr(
@@ -17711,7 +17749,7 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         majit_ir::ExtraEffect::ElidableCannotRaise,
     );
     let int_boxes = [
-        tc.const_int(add2_for_walker_test as *const () as i64),
+        tc.const_int(pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64),
         tc.const_int(40),
         tc.const_int(2),
     ];

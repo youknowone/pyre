@@ -381,6 +381,7 @@ pub struct TraceRoots {
     prev_active: bool,
     _register_roots: [crate::jitcode_dispatch::RegisterListRoot; 4],
     _exception_roots: [ExceptionRoot; 2],
+    _live_vable_frame: majit_gc::shadow_stack::MutatorExtraAreaGuard,
 }
 
 impl TraceRoots {
@@ -395,11 +396,23 @@ impl TraceRoots {
             ExceptionRoot::new(&owner.last_exc_value),
             ExceptionRoot::new(&owner.current_exc_value),
         ];
+        // `virtualizable.py` the live virtualizable is a GC pointer. pyre
+        // keeps a parallel raw address for write-through / identity bake;
+        // root it so a minor rewrites the cell in place, the way
+        // `LiveFrameRoot` already does across one residual.
+        let live_vable_frame = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_live_vable_frame,
+                (&owner.live_vable_frame_addr as *const std::cell::Cell<usize>).cast(),
+                "live_vable_frame",
+            )
+        };
         let prev_active = ACTIVE_TRACE.with(|c| c.replace(true));
         Self {
             prev_active,
             _register_roots: register_roots,
             _exception_roots: exception_roots,
+            _live_vable_frame: live_vable_frame,
         }
     }
 }
@@ -433,6 +446,17 @@ impl ExceptionRoot {
             _owner: owner.clone(),
         }
     }
+}
+
+unsafe fn walk_live_vable_frame(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let slot = unsafe { &*(data as *const std::cell::Cell<usize>) };
+    let addr = slot.get();
+    if addr == 0 {
+        return;
+    }
+    let mut gcref = majit_ir::GcRef(addr);
+    visitor(&mut gcref);
+    slot.set(gcref.0);
 }
 
 unsafe fn walk_exception_slot(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {

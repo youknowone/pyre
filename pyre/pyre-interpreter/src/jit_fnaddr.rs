@@ -759,6 +759,73 @@ pub mod word_publish {
     );
 }
 
+/// Publish `$f` at the calldescr word ABI. `$arity` is the machine-argument
+/// count; `$f` is the function path (a fn item). Same shape as `cpu_word!`
+/// / `word_fn_addr!`: the wasm32 closure calls the item, so `F` is
+/// zero-sized (`word_publish` `zeroed()`). Native keeps the raw address.
+///
+/// Rust-ABI items: `fn $arity`. `unsafe extern "C"` items: `unsafe $arity`.
+#[macro_export]
+macro_rules! residual_word_addr {
+    (0, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr0, $f,)
+    };
+    (1, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr1, $f, a0)
+    };
+    (2, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr2, $f, a0, a1)
+    };
+    (3, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr3, $f, a0, a1, a2)
+    };
+    (4, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr4, $f, a0, a1, a2, a3)
+    };
+    (5, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr5, $f, a0, a1, a2, a3, a4)
+    };
+    (6, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply extern_addr6, $f, a0, a1, a2, a3, a4, a5)
+    };
+    (fn 0, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply rust_addr0, $f,)
+    };
+    (fn 1, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply rust_addr1, $f, a0)
+    };
+    (unsafe 1, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@unsafe_extern extern_addr1, $f, a0)
+    };
+    (@apply $addr:ident, $f:path, $($a:ident),*) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            $f as *const ()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            $crate::jit_fnaddr::word_publish::$addr(|$($a),*| $f($($a),*), $f)
+        }
+    }};
+    (@unsafe_extern $addr:ident, $f:path, $($a:ident),*) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            $f as *const ()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Fn items are ZST; transmute of the item to a fn pointer is
+            // rejected. The address is a pointer-sized `as *const ()`.
+            let proof = $f as *const ();
+            #[allow(clippy::missing_transmute_annotations)]
+            $crate::jit_fnaddr::word_publish::$addr(
+                |$($a),*| unsafe { $f($($a),*) },
+                unsafe { ::core::mem::transmute(proof) },
+            )
+        }
+    }};
+}
+
 /// Extra bound on wasm32 so `word_publish` can convert each slot to a descr
 /// word. Native implements this for every type: SysV/AAPCS already pass the
 /// same values in 64-bit registers, so the raw address is published.
@@ -961,7 +1028,7 @@ macro_rules! p1 {
         publish_p1($e, $p, $f, $f);
     };
     ($e:expr, $p:expr, $f:expr $(,)?) => {
-        publish_p1($e, $p, $f, $f);
+        publish_p1($e, $p, |a0| $f(a0), $f);
     };
 }
 macro_rules! pa1 {
@@ -994,7 +1061,7 @@ macro_rules! p2 {
         publish_p2($e, $p, $f, $f);
     };
     ($e:expr, $p:expr, $f:expr $(,)?) => {
-        publish_p2($e, $p, $f, $f);
+        publish_p2($e, $p, |a0, a1| $f(a0, a1), $f);
     };
 }
 macro_rules! pa2 {
@@ -1027,7 +1094,7 @@ macro_rules! p3 {
         publish_p3($e, $p, $f, $f);
     };
     ($e:expr, $p:expr, $f:expr $(,)?) => {
-        publish_p3($e, $p, $f, $f);
+        publish_p3($e, $p, |a0, a1, a2| $f(a0, a1, a2), $f);
     };
 }
 macro_rules! pa3 {
@@ -1081,7 +1148,7 @@ macro_rules! p5 {
         publish_p5($e, $p, $f, $f);
     };
     ($e:expr, $p:expr, $f:expr $(,)?) => {
-        publish_p5($e, $p, $f, $f);
+        publish_p5($e, $p, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
     };
 }
 macro_rules! cpa5 {
@@ -5456,6 +5523,10 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `look_inside_iff` trampolines for the IntDictStorage monomorph.
     // Generic + receiver forms skip HELPER_FNADDRS; bind the free-function
     // trampolines the dispatch residualizes when the dict is not virtual.
+    // The `as fn(...)` expr arm wraps a ZST closure so wasm32 `word_publish`
+    // converts `&T` / `&mut T` / `u64` / `usize` / `bool` / `isize` at the
+    // shim (`WordAbi::from_reg` / `into_reg`); `ll_dict_lookup(d, key, hash,
+    // flag)` keeps `d` a GC pointer and `hash` a Signed.
     p3!(
         &mut entries,
         "pyre_object::rordereddict::ll_dict_lookup_trampoline",
@@ -6605,6 +6676,27 @@ mod tests {
             ascii_hint, raw_ascii as *const () as usize as i64,
             "CondCall must bind the word-ABI adapter, not the Rust fn"
         );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_publishes_list_lock_at_the_calldescr_word_abi() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "pyre_object::listobject::w_list_lock",
+                pyre_object::listobject::w_list_lock_jit_abi as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::setobject::w_set_lock",
+                pyre_object::setobject::w_set_lock_jit_abi as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(
+                bindings.get(path),
+                Some(&expected),
+                "{path} must publish the descr-word entry (`extern \"C\" fn(i64) -> i64`)"
+            );
+        }
     }
 
     #[test]
