@@ -40346,13 +40346,16 @@ fn root_bracket_stack_effects_are_known(
             // `UnwindResume` is the terminator `FunDecl::unstructured` leaves
             // after dropping rustc cleanup blocks: every `on_unwind` edge
             // names that one block, and it does not itself change the stack.
+            // `UndefinedBehavior` is the never-returning sink Charon used to
+            // spell `Abort("UndefinedBehavior")`.
             Ok(
                 TermKind::Goto { .. }
                 | TermKind::Switch { .. }
                 | TermKind::Abort(_)
                 | TermKind::Assert { .. }
                 | TermKind::UnwindResume
-                | TermKind::UnwindTerminate,
+                | TermKind::UnwindTerminate
+                | TermKind::UndefinedBehavior,
             ) => {}
             _ => return false,
         }
@@ -55322,7 +55325,10 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 locals.insert(dst, eval_arr_call(llbc, &locals, &call, depth)?);
                 bb = *target as usize;
             }
-            TermKind::UnwindResume | TermKind::Abort(_) => return None,
+            TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior => return None,
             _ => return None,
         }
     }
@@ -75360,6 +75366,33 @@ mod tests {
         assert!(
             plan.scopes.contains(2),
             "an on_unwind UnwindResume does not keep the bracket"
+        );
+
+        // Charon 0.1.281 spells the former `Abort("UndefinedBehavior")` as
+        // a first-class terminator. It is a never-returning sink and does
+        // not change the stack.
+        let undefined_behavior: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call_uw(1, vec![], 2, 1)),
+                block(vec![], call_uw(6, vec![copy(1)], 6, 2)),
+                block(vec![], drop_uw(2, 3)),
+                block(vec![], serde_json::json!("Return")),
+                block(vec![], serde_json::json!("UndefinedBehavior")),
+            ]
+        }))
+        .unwrap();
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &undefined_behavior,
+            &super::MovedOutLocals::with_set(&undefined_behavior, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(2),
+            "an on_unwind UndefinedBehavior does not keep the bracket"
         );
 
         // An unmodelled callee may append or overwrite a slot without
