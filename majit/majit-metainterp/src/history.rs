@@ -834,12 +834,14 @@ impl TreeLoop {
     /// pool-managed constants (already GC-rooted), preventing both stale
     /// pointers and entry-contract mismatches at compiled-code entry.
     ///
-    /// Returns `None` when a pre-cut box reaches the cut region through a
-    /// guard snapshot alone and its definition cone cannot be re-emitted.
-    /// The value has no representation in the cut namespace, and the only
-    /// alternatives are a wrong one (mapping the slot to `OpRef::NONE`, which
-    /// the encoder turns into a NULL in the resumed frame) or re-executing a
-    /// side effect.
+    /// Returns `None` when a pre-cut box reaches the cut region and has no
+    /// representation in the cut namespace: a snapshot whose definition cone
+    /// cannot be re-emitted, or — on a loop cut — an original inputarg that
+    /// is not in `original_boxes` and has no pool constant. The only
+    /// alternatives for the latter are a wrong one (mapping the slot to
+    /// `OpRef::NONE`, which the encoder turns into a NULL in the resumed
+    /// frame) or widening the start LABEL past every JUMP onto
+    /// `target_tokens[0]` (`unroll.py jump_to_preamble`).
     ///
     /// The caller must CANCEL the compilation, not fall back to the uncut
     /// trace: once a merge point is live, the loop token, entry contract and
@@ -967,17 +969,16 @@ impl TreeLoop {
         // are worse than not compiling: decline, and the caller cancels.
         //
         // A pre-cut ORIGINAL inputarg has no definition to re-execute, so it is
-        // a leaf — but only phase 4's pool-constant arm can actually deliver
-        // one. Its other arm appends the inputarg to the new entry contract, and
-        // `patch_new_loop_to_load_virtualizable_fields` requires that list to be
-        // exactly the red args followed by the virtualizable's static fields and
-        // array items, asserting it (`compile.py:458`). A snapshot's frame boxes
-        // ARE the frame's locals, so seeding from snapshots reaches original
-        // inputargs constantly where operand seeding reached them rarely. Purity
-        // does not cover this — an `IntAdd` cone is replay-safe and still
-        // undeliverable — so test the same predicate phase 4 branches on and
-        // decline when the constant is absent: `test.test_collections` and
-        // `test.test_urlparse` crashed on that assert with `18 != 19`.
+        // a leaf — only phase 4's pool-constant arm can deliver one on a loop
+        // cut. A snapshot's frame boxes ARE the frame's locals, so seeding
+        // from snapshots reaches original inputargs constantly where operand
+        // seeding reached them rarely. Purity does not cover this — an
+        // `IntAdd` cone is replay-safe and still undeliverable — so test the
+        // same predicate phase 4 branches on and decline when the constant is
+        // absent: `test.test_collections` and `test.test_urlparse` crashed on
+        // `patch_new_loop_to_load_virtualizable_fields` (`compile.py`) with
+        // `18 != 19`, and `test.test_itertools` hit JUMP(33) vs start
+        // LABEL(34) when the operand path appended the same extra slot.
         //
         // One impure ROOT stays admissible: an allocation, replayed TOGETHER
         // with the stores that filled it. Replaying `New*` alone is what makes
@@ -1147,7 +1148,8 @@ impl TreeLoop {
 
         // Phase 3: Partition escaped refs.
         //  - "orig_inputarg_escaped": refs to the full trace's original inputargs
-        //    that weren't in original_boxes → must become new inputargs.
+        //    that weren't in original_boxes. Phase 4 remaps them to a pool
+        //    constant, appends them on a bridge cut, or declines a loop cut.
         //  - "op_escaped": refs to pre-cut ops → re-emit as prefix operations.
         let mut orig_inputarg_escaped: Vec<OpRef> = Vec::new();
         let mut op_escaped: Vec<OpRef> = Vec::new();
@@ -1172,9 +1174,24 @@ impl TreeLoop {
         promoted_op_refs.sort_by_key(|r| ops_index(*r));
 
         // Phase 4: Build new inputargs.
-        // If concrete initial values are available, escaped original inputargs
-        // become typed constants (avoiding entry-contract mismatch at runtime).
-        // Otherwise, they become additional inputargs (original behavior).
+        //
+        // A pool constant is the only loop-cut delivery: `compile.py
+        // compile_loop` / `patch_new_loop_to_load_virtualizable_fields`
+        // requires the entry list to be exactly the merge-point red boxes
+        // plus the virtualizable fields (`assert i == len(inputargs)`), and
+        // `unroll.py jump_to_preamble` retargets every close onto
+        // `target_tokens[0]` (`virtual_state is None`) keeping the JUMP's
+        // args. Those args are `original_boxes[num_green_args:]`
+        // (`pyjitpl.py compile_loop`); appending a box that is not one of
+        // them makes the start LABEL (`start_state.renamed_inputargs`,
+        // `compile.py`) one slot wider than every JUMP onto it. Upstream
+        // `TraceIterator._get` (`opencoder.py`) would `assert res is not
+        // None` — the box is not in `force_inputargs`. Decline rather than
+        // install a loop no close can enter.
+        //
+        // A bridge/retrace cut (`promote_snapshot_inputargs`) matches
+        // `opencoder.py CutTrace`: the pre-cut box is already an inputarg
+        // of the view, so it is appended here instead of replayed.
         let mut new_ia_boxes = original_box_opref;
         let mut new_ia_types = original_box_types;
         for &r in &orig_inputarg_escaped {
@@ -1183,8 +1200,7 @@ impl TreeLoop {
             {
                 // Remap to the pre-allocated pool constant (already GC-rooted).
                 remap.insert(r, const_opref);
-            } else {
-                // No pool constant available: fall back to new inputarg.
+            } else if promote_snapshot_inputargs {
                 let tp = self.inputargs[r.raw() as usize].tp.get();
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -1199,6 +1215,17 @@ impl TreeLoop {
                 remap.insert(r, OpRef::input_arg_typed(new_ia_boxes.len() as u32, tp));
                 new_ia_boxes.push(r);
                 new_ia_types.push(tp);
+            } else {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][cut-decline] original inputarg {:?} (tp={:?}) not in \
+                         original_boxes and no pool constant; cancelling this \
+                         compilation rather than widening the entry contract",
+                        r,
+                        self.inputargs[r.raw() as usize].tp.get(),
+                    );
+                }
+                return None;
             }
         }
         // Promoted pre-cut results (`Getfield*`, `Call*`) are inputargs of the
@@ -2182,7 +2209,8 @@ mod tests {
     #[test]
     fn test_cut_trace_from_with_escaped_op() {
         // An op defined before the cut point is used after the cut.
-        // It should be re-emitted as a prefix operation.
+        // The prefix re-emit needs v1, which is an original inputarg not in
+        // `original_boxes` and has no pool constant.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
         // op0: v2 = int_add(v0, v1) — before cut
@@ -2199,15 +2227,23 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(1); // cut after op0
-        // original_boxes only has v0 — v2 is escaped
+        // original_boxes only has v0 — v2 is escaped, and so is v1 through it
         let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
 
+        // Loop cut (`compile.py compile_loop`): appending v1 would widen the
+        // start LABEL past every JUMP onto `target_tokens[0]`
+        // (`unroll.py jump_to_preamble`, `compile.py` start_label).
+        // `TraceIterator._get` (`opencoder.py`) would assert.
+        assert!(
+            trace.cut_trace_from(start, &original_boxes).is_none(),
+            "loop cut must decline rather than append an extra inputarg"
+        );
+
+        // Bridge/retrace cut (`opencoder.py CutTrace`): the pre-cut box is
+        // an inputarg of the view, so v1 is appended and the add is replayed.
         let cut = trace
-            .cut_trace_from(start, &original_boxes)
-            .expect("cut declined unexpectedly");
-        // v1 = OpRef::input_arg_int(1) is an original trace inputarg NOT in original_boxes.
-        // It's referenced by the escaped int_add op → added as extra inputarg.
-        // Result: inputargs = [v0, v1], prefix = [int_add], post-cut = [int_mul, jump]
+            .cut_trace_from_with_consts(start, &original_boxes, &[], true)
+            .expect("bridge cut promotes the escaped original inputarg");
         assert_eq!(cut.inputargs.len(), 2); // v0 + escaped v1
         assert_eq!(cut.ops.len(), 3); // prefix(int_add) + int_mul + jump
     }
@@ -2525,10 +2561,10 @@ mod tests {
         // A snapshot's frame boxes are the frame's locals, so a snapshot root's
         // cone reaches original inputargs that no post-cut argument names. Phase
         // 4 can only deliver such an inputarg from a pool constant; without one
-        // it appends an extra inputarg, and
+        // a loop cut declines, because
         // `patch_new_loop_to_load_virtualizable_fields` asserts the list is
         // exactly the red args plus the virtualizable's fields
-        // (`compile.py:458`) — `test.test_collections` and `test.test_urlparse`
+        // (`compile.py`) — `test.test_collections` and `test.test_urlparse`
         // crashed there with `assert i == len(inputargs) failed (18 != 19)`.
         // `is_always_pure()` does not cover this: the root here is an `IntAdd`,
         // so the cone is replay-safe and it is the ENTRY CONTRACT, not the
