@@ -2129,6 +2129,10 @@ fn decode_term_kind(kind: &RawValue, llbc: &crate::Llbc) -> Result<TermKind, Str
 /// `Switch { data: {scrutinee, branches, fallback}, branches }` decodes
 /// straight into [`TermKind::Switch`]. Arm constants may be
 /// `{"Deduplicated": id}` and are read from [`crate::Llbc::dedup_const_body`].
+/// A pointer-identity arm is a `Ref` / `DynTrait` place, not a
+/// `ConstantExpr` literal. Drop it and take the fallback so the
+/// function stays in the program; `SwitchInt` cannot close on a
+/// non-scalar case.
 fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
     let data = sw.get("data").ok_or("switch missing data")?;
     let bbs = sw
@@ -2154,15 +2158,20 @@ fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
             .and_then(Value::as_u64)
             .and_then(bb_of)
             .ok_or("switch arm target")?;
-        let lit = llbc
-            .const_expr_literal(pair.first().ok_or("switch arm const")?)
-            .ok_or("switch arm const unresolved")?;
+        let const_v = pair.first().ok_or("switch arm const")?;
+        let Some(lit) = llbc.const_expr_literal(const_v) else {
+            continue;
+        };
         let flag = lit.get("Bool").and_then(Value::as_bool);
         decoded.push((lit, target, flag));
     }
-    let all_bool = !decoded.is_empty() && decoded.iter().all(|(_, _, flag)| flag.is_some());
+    let default = fallback.and_then(bb_of).ok_or("switch missing fallback")?;
+    if decoded.is_empty() {
+        return Ok(TermKind::Goto { target: default });
+    }
+    let all_bool = decoded.iter().all(|(_, _, flag)| flag.is_some());
     let targets = if all_bool {
-        let mut then_bb = fallback.and_then(bb_of);
+        let mut then_bb = Some(default);
         let mut else_bb = None;
         for (_, target, flag) in &decoded {
             if flag == &Some(true) {
@@ -2172,12 +2181,9 @@ fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
             }
         }
         let then_bb = then_bb.ok_or("bool switch missing then")?;
-        let else_bb = else_bb
-            .or_else(|| fallback.and_then(bb_of))
-            .ok_or("bool switch missing else")?;
+        let else_bb = else_bb.unwrap_or(default);
         SwitchTargets::If(then_bb, else_bb)
     } else {
-        let default = fallback.and_then(bb_of).ok_or("switch missing fallback")?;
         let arms = decoded
             .into_iter()
             .map(|(scalar, target, _)| (scalar, target))
@@ -2866,5 +2872,39 @@ mod tests {
             body.body[2].terminator.kind_value(),
             &serde_json::json!("Return")
         );
+    }
+
+    /// Darwin Charon 0.1.281 emits a pointer-identity Switch arm as a
+    /// `Ref` / `DynTrait` place, not a ConstantExpr literal. Drop that
+    /// arm and take the fallback so the function stays in the program.
+    #[test]
+    fn a_pointer_identity_switch_arm_decodes() {
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[]}}"#;
+        let llbc = crate::Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        let kind = serde_json::json!({
+            "Switch": {
+                "data": {
+                    "scrutinee": {
+                        "Value": {"Copy": {"kind": {"Local": 0}, "ty": {"Deduplicated": 3}}}
+                    },
+                    "branches": [[
+                        {"Ref": [{"Body": 18}, {"DynTrait": {"id": 0}}, "Mut"]},
+                        1
+                    ]],
+                    "fallback": 0
+                },
+                "branches": [2, 5]
+            }
+        });
+        let term = decode_term_kind(
+            &serde_json::value::to_raw_value(&kind).expect("a JSON value serializes"),
+            &llbc,
+        )
+        .expect("Ref arm decodes");
+        match term {
+            TermKind::Goto { target } => assert_eq!(target, 2),
+            other => panic!("expected Goto fallback: {other:?}"),
+        }
     }
 }
