@@ -144,7 +144,7 @@ jobs:
       # CHARON_VERSION_DEFAULT in scripts/install-charon.py: it drives both
       # the cache keys below AND install-charon.py's .installed-version
       # stamp, so a pin bump here misses the cache and re-installs.
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
     steps: &prepare-charon-llbc-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -556,7 +556,7 @@ jobs:
     if: ${{ github.event.pull_request.draft != true }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       # Cargo passes one `-L dependency=<target>/<triple>/debug/build/<pkg>/<hash>/out`
       # per dependency, and pyre-interpreter has 263 of them. Under the
@@ -589,7 +589,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
 
     steps: &cargo-test-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -802,7 +802,7 @@ jobs:
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
     steps: *cargo-test-steps
 
   cargo-test-windows:
@@ -817,7 +817,7 @@ jobs:
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *cargo-test-steps
 
@@ -843,7 +843,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -958,7 +958,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -1110,7 +1110,7 @@ jobs:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
 
     steps: &pyre-check-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1451,7 +1451,7 @@ jobs:
           label: dynasm+cranelift
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
     steps: *pyre-check-steps
 
   pyre-check-windows:
@@ -1472,6 +1472,6 @@ jobs:
           label: dynasm
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.09.26
+      CHARON_VERSION: nightly-2026.10.04
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *pyre-check-steps
