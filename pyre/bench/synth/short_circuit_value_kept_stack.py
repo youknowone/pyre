@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=4.3
-# dynasm 1.1x, cranelift 2.1x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=3.6
+# macos dynasm 1.0x-1.1x (floor 1.075 against 4.3 failed at 1.0x), ubuntu
+# cranelift 2.3x-2.4x, windows dynasm 1.4x. 3.6 keeps the derived floor at 0.9x.
 # pyre-check: skip-cpython
 # cpython 2.57s vs pyre 0.67s (3.8x on the ubuntu runner), and it is not
 # gated on — only pypy is.
