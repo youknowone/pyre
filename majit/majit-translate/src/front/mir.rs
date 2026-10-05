@@ -55091,22 +55091,75 @@ fn unit_enum_discriminant(llbc: &Llbc, kind: &serde_json::Value) -> Option<u64> 
 /// Other borrows stay residual so a pointer-identity initializer is not
 /// folded as an integer.
 fn const_eval_borrowed_flag(
+    llbc: &Llbc,
     locals: &std::collections::HashMap<u64, ConstLit>,
     place: &Place,
 ) -> Option<ConstLit> {
     let lit = match &place.kind {
         PlaceKind::Local(n) => locals.get(n).copied()?,
         PlaceKind::Projection(inner, elem) if elem.label() == "Deref" => {
-            const_eval_borrowed_flag(locals, inner)?
+            const_eval_borrowed_flag(llbc, locals, inner)?
         }
         _ => return None,
     };
     match lit {
-        v @ (ConstLit::EnumDisc(_)
-        | ConstLit::BitflagBits(_)
-        | ConstLit::Int(_)
-        | ConstLit::UInt(_)) => Some(v),
+        v @ (ConstLit::EnumDisc(_) | ConstLit::BitflagBits(_)) => Some(v),
+        // The peeled flag word lives in an ADT local (`CodeFlags`). A
+        // primitive integer (or `&i64`) is a pointer-identity borrow.
+        v @ (ConstLit::Int(_) | ConstLit::UInt(_)) if const_ty_peels_to_adt(llbc, &place.ty) => {
+            Some(v)
+        }
         _ => None,
+    }
+}
+
+/// Peel `Ref` / `RawPtr` / hash-cons wrappers and report whether the
+/// pointee is an ADT. Used to tell a transparent flag wrapper from a
+/// primitive integer the same borrow evaluator must not fold.
+fn const_ty_peels_to_adt(llbc: &Llbc, ty: &TyRef) -> bool {
+    let mut v: &serde_json::Value = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(body) => body,
+            None => return false,
+        },
+    };
+    loop {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            v = match llbc.dedup_body(id) {
+                Some(body) => body,
+                None => return false,
+            };
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            match arr.get(1) {
+                Some(inner) => {
+                    v = inner;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            match arr.first() {
+                Some(inner) => {
+                    v = inner;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        return obj.contains_key("Adt");
     }
 }
 
@@ -55500,7 +55553,7 @@ fn const_eval_init_body_with_locals(
                     // `SubChecked` result back field-wise).
                     PlaceKind::Projection(inner, elem) => {
                         if elem.label() == "Deref" {
-                            return const_eval_borrowed_flag(locals, inner);
+                            return const_eval_borrowed_flag(llbc, locals, inner);
                         }
                         let PlaceKind::Local(n) = inner.kind else {
                             return None;
@@ -55560,7 +55613,9 @@ fn const_eval_init_body_with_locals(
                         // Shared borrow of the flag word while `.bits()`
                         // reborrows it. Only the flag carriers propagate;
                         // any other borrow still refuses the initializer.
-                        Rvalue::Ref { place, .. } => const_eval_borrowed_flag(&locals, place)?,
+                        Rvalue::Ref { place, .. } => {
+                            const_eval_borrowed_flag(llbc, &locals, place)?
+                        }
                         _ => return None,
                     };
                     // rustc computes each assignment at the destination's

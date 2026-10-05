@@ -54,6 +54,9 @@ fn loads_fixture_corpus() {
     // + 3 for the `mem::replace` trio, `replace_field`, `replace_elem`, and
     // `replace_reborrow_then_read`. Each is one local body.
     //
+    // + 3 for the two-word cell trio, `replace_two_words`, `swap_two_words`
+    // and `take_two_words`.
+    //
     // + 2 for `take_odd_default` and its hand-written `Default::default`.
     // + 1 for `replace_wide_payload` (a `u128` variant field).
     //

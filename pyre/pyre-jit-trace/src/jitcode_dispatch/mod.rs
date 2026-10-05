@@ -4886,7 +4886,12 @@ pub fn walk<Sym: WalkSym>(
                     // reconstruction of a virtual exception the handler never
                     // reads.  PyPy's reraise bridge DCEs that object; skip the
                     // call here so the heap optimizer can too.
-                    if recording_raise_keeps_existing_traceback(ctx, opcode_position) {
+                    // `recording_raise_keeps_existing_traceback` is also true
+                    // for `FOR_ITER`, which keeps the iterator's traceback
+                    // but still writes `__context__` for a non-StopIteration.
+                    if raised_in_this_frame
+                        && recording_raise_keeps_existing_traceback(ctx, opcode_position)
+                    {
                         fbw_context_chained_insert(exc);
                     } else {
                         record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
