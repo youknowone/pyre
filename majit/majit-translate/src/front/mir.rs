@@ -19388,8 +19388,7 @@ impl<'a> Lowering<'a> {
             return Ok(true);
         }
         if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
-            self.lower_rust_vec_drop(self.block_id[mir_bb], place);
-            return Ok(true);
+            return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
         }
         if glue.is_none() && self.tyref_is_trivially_dropless(&place.ty, 0) {
             return Ok(true);
@@ -19406,22 +19405,22 @@ impl<'a> Lowering<'a> {
     ///
     /// Only a header this graph allocated through `ll_vec_newemptylist` /
     /// `ll_vec_newlist_hint` / `ll_vec_alloc_and_set` is `raw_malloc_varsize_char`
-    /// memory; any other
-    /// `Vec` value (a phi merge, a call result) is left as before and the
-    /// decline is recorded.
-    fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) {
+    /// memory. Any other `Vec` value (a phi merge, a call result) returns
+    /// false so the caller keeps the drop glue. `true` means `ll_vec_free`
+    /// was emitted.
+    fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) -> bool {
         use majit_ir::rvec::VecOp;
         let PlaceKind::Local(local) = place.kind else {
-            return;
+            return false;
         };
         let Some(kind) = tyref_rust_vec_item_kind(&place.ty, self.llbc) else {
-            return;
+            return false;
         };
         let Some(header) = self.local_var[local as usize]
             .as_ref()
             .and_then(|value| value.one().ok())
         else {
-            return;
+            return false;
         };
         let allocated_here =
             resolve_to_producer_op(&self.graph, &header).is_some_and(|(block, index)| {
@@ -19444,7 +19443,7 @@ impl<'a> Lowering<'a> {
                 "header-not-allocated-in-graph",
                 format_args!("{}", self.graph.name),
             );
-            return;
+            return false;
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: None,
@@ -19457,6 +19456,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Void,
             },
         });
+        true
     }
 
     /// Drop a one-word guard local by passing its word to the bound release
