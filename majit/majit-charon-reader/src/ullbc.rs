@@ -1851,7 +1851,7 @@ fn remap_term_kind_block_indices(kind: &mut Value, old_to_new: &[Option<u64>], r
         remap_u64_field(goto, "target", old_to_new, resume);
         return;
     }
-    for key in ["Call", "Drop", "Assert"] {
+    for key in ["Call", "Drop", "Assert", "Panic"] {
         if let Some(payload) = obj.get_mut(key) {
             remap_u64_field(payload, "target", old_to_new, resume);
             remap_u64_field(payload, "on_unwind", old_to_new, resume);
@@ -2139,6 +2139,11 @@ pub enum TermKind {
     Return,
     UnwindResume,
     Abort(Value),
+    /// Charon `TerminatorKind::Panic`.
+    Panic {
+        name: Value,
+        on_unwind: u64,
+    },
     Goto {
         target: u64,
     },
@@ -2943,6 +2948,17 @@ mod tests {
         }})
     }
 
+    fn panic_term(on_unwind: u64) -> Value {
+        serde_json::json!({"Panic": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["panicking", 0]},
+                {"Ident": ["panic_fmt", 0]}
+            ],
+            "on_unwind": on_unwind
+        }})
+    }
+
     fn call_edges(bb: &BasicBlock) -> (u64, u64) {
         let call = bb.terminator.kind_value().get("Call").unwrap();
         (
@@ -3058,5 +3074,46 @@ mod tests {
             }
             other => panic!("expected SwitchInt Ref arm: {other:?}"),
         }
+    }
+
+    #[test]
+    fn panic_terminator_matches_charon_json() {
+        let kind: TermKind = serde_json::from_value(panic_term(5)).expect("Panic JSON decodes");
+        match kind {
+            TermKind::Panic { name, on_unwind } => {
+                assert_eq!(on_unwind, 5);
+                assert_eq!(
+                    name,
+                    serde_json::json!([
+                        {"Ident": ["core", 0]},
+                        {"Ident": ["panicking", 0]},
+                        {"Ident": ["panic_fmt", 0]}
+                    ])
+                );
+            }
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unstructured_rewrites_panic_unwind_edges() {
+        let decl = fun_decl_from_blocks(vec![
+            bb(panic_term(2), false, 0),
+            bb(serde_json::json!("Return"), false, 0),
+            bb(drop_term(3, 3), true, 7),
+            bb(serde_json::json!("UnwindResume"), true, 0),
+        ]);
+        let body = decl.unstructured().expect("Unstructured body");
+        assert_eq!(body.body.len(), 3);
+        let panic = body.body[0].terminator.kind_value().get("Panic").unwrap();
+        assert_eq!(panic.get("on_unwind").and_then(Value::as_u64).unwrap(), 2);
+        assert_eq!(
+            body.body[1].terminator.kind_value(),
+            &serde_json::json!("Return")
+        );
+        assert_eq!(
+            body.body[2].terminator.kind_value(),
+            &serde_json::json!("UnwindResume")
+        );
     }
 }

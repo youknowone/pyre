@@ -90,13 +90,13 @@ fn loads_fixture_corpus() {
     //
     // + 1 for `extend_vec_from_slice`.
     //
-    // + 9 for pair slices inside aggregates: `item_of_tupled_slice`,
+    // + 8 for pair slices inside aggregates: `item_of_tupled_slice`,
     // `tuple_a_slice`, `slice_through_a_closure`, its closure's `call`,
-    // `call_mut`, `call_once` and `drop_in_place`, `item_or_null` and
-    // `get_item_or_null`.
+    // `call_mut` and `call_once`, `item_or_null` and `get_item_or_null`.
+    // Charon 0.1.281 does not emit that closure's `drop_in_place`.
     //
-    // + 5 for `index_through_a_closure` and its closure's `call`,
-    // `call_mut`, `call_once` and `drop_in_place`.
+    // + 4 for `index_through_a_closure` and its closure's `call`,
+    // `call_mut` and `call_once`. Same missing `drop_in_place`.
     //
     // + 3 for the pair-slice copy and pointer projections:
     // `copy_slice_from_slice`, `ptr_of_slice` and `mut_ptr_of_slice`.
@@ -105,16 +105,11 @@ fn loads_fixture_corpus() {
     //
     // + 6 for an explicit `drop` of a root bracket and of two integers:
     // `mem_drop_root_scope`, `mem_drop_i64`, `mem_drop_usize`,
-    // `gc_roots::push_roots`, `RootScope`'s `Drop::drop` and its
-    // `drop_in_place`.
+    // `gc_roots::push_roots`, `RootScope`'s initializer, and
+    // `RootScope`'s `Drop::drop`. Charon 0.1.281 does not emit
+    // `drop_in_place` as its own local item.
     //
     // + 1 for `tail_len`, `get(1..).unwrap_or(&[])` of a pair slice.
-    //
-    // + 2 for the `::<Builtin>` bodies Charon 0.1.281 emits beside
-    // `code_flags_bits_or` and `tail_len`.
-    //
-    // Measured on Charon 0.1.281 (nightly-2026.10.04): drop glue is no
-    // longer its own local item, and this artefact holds 99.
     //
     // + 6 for the three `majit_gc::GcType` impls (`ClassObject`,
     // `ObjectHeader`, `TypeOnlyHeader`): each `type_id` and each `SIZE`
@@ -124,8 +119,10 @@ fn loads_fixture_corpus() {
     // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
     // contributes no body.
     //
-    // Regenerated from the merged corpus sources on nightly-2026.10.04.
-    assert_eq!(local_count, 107, "107 local fns expected");
+    // Measured on Charon 0.1.281 (nightly-2026.10.04) with
+    // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
+    // longer its own local item, and this artefact holds 105.
+    assert_eq!(local_count, 105, "105 local fns expected");
 }
 
 #[test]

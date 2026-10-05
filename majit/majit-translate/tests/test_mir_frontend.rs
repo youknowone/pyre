@@ -151,6 +151,103 @@ fn lowers_strategy_len_with_discriminant_switch() {
     assert_eq!(graph.blocks.len(), 7);
 }
 
+/// Charon `TerminatorKind::Panic` lowers the same implicit
+/// `AssertionError` raise as the older `Abort` terminator.
+#[test]
+fn a_panic_terminator_raises_implicitly_like_abort() {
+    use majit_charon_reader::ullbc::TermKind;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::LinkArg;
+
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+        "generated_from_span": null
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let local = serde_json::json!({
+        "index": 0,
+        "name": null,
+        "span": span,
+        "ty": unit
+    });
+    let panic_name = serde_json::json!([
+        {"Ident": ["core", 0]},
+        {"Ident": ["panicking", 0]},
+        {"Ident": ["panic_fmt", 0]}
+    ]);
+    let fun = |id: u64, leaf: &str, term: serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": {
+                "name": [{"Ident": ["probe", 0]}, {"Ident": [leaf, 0]}],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span, "kind": term},
+                    "is_cleanup": false
+                }]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.281",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [
+                fun(0, "abort_raise", serde_json::json!({"Abort": {"Panic": panic_name.clone()}})),
+                fun(1, "panic_raise", serde_json::json!({
+                    "Panic": {"name": panic_name, "on_unwind": 0}
+                }))
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let panic_body = llbc
+        .fn_by_id(1)
+        .and_then(|fd| fd.unstructured())
+        .expect("panic body");
+    assert!(
+        matches!(panic_body.body[0].term(&llbc), Ok(TermKind::Panic { .. })),
+        "the Panic JSON shape must decode as TermKind::Panic"
+    );
+
+    let context = LowerContext::new(&llbc);
+    let abort_graph =
+        lower_fun_decl(&context, llbc.fn_by_id(0).expect("abort_raise")).expect("lower abort");
+    let panic_graph =
+        lower_fun_decl(&context, llbc.fn_by_id(1).expect("panic_raise")).expect("lower panic");
+
+    let implicit_raises = |graph: &majit_translate::model::FunctionGraph| {
+        graph
+            .blocks
+            .iter()
+            .filter(|b| {
+                b.exits.iter().any(|l| {
+                    l.target == graph.exceptblock
+                        && l.args.len() == 2
+                        && matches!(l.args[0], LinkArg::Const(_))
+                        && matches!(l.args[1], LinkArg::Const(_))
+                })
+            })
+            .count()
+    };
+    assert_eq!(implicit_raises(&abort_graph), 1);
+    assert_eq!(implicit_raises(&panic_graph), 1);
+}
+
 #[test]
 fn lowers_desugar_mix_with_aggregate_and_question_mark() {
     // `desugar_mix` exercises every surface the corpus carries: `?`

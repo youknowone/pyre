@@ -873,6 +873,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 TermKind::UnwindResume
                 | TermKind::UnwindTerminate
                 | TermKind::Abort(_)
+                | TermKind::Panic { .. }
                 | TermKind::UndefinedBehavior,
             ) => {}
             _ => return Err("unknown-terminator"),

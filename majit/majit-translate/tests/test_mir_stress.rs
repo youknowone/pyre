@@ -746,7 +746,7 @@ fn classify_unwind_chain(
             Ok(TermKind::UnwindTerminate) => {
                 return ("UnwindTerminate", did_real_work, drop_in_chain, hops);
             }
-            Ok(TermKind::Abort(_)) => {
+            Ok(TermKind::Abort(_)) | Ok(TermKind::Panic { .. }) => {
                 return ("Abort", did_real_work, drop_in_chain, hops);
             }
             Ok(TermKind::UndefinedBehavior) => {

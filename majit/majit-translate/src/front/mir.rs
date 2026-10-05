@@ -9060,6 +9060,7 @@ impl<'a> Lowering<'a> {
                 | TermKind::UnwindResume
                 | TermKind::UnwindTerminate
                 | TermKind::Abort(_)
+                | TermKind::Panic { .. }
                 | TermKind::UndefinedBehavior
                 | TermKind::Unknown => vec![],
             };
@@ -9257,6 +9258,7 @@ impl<'a> Lowering<'a> {
             | TermKind::UnwindResume
             | TermKind::UnwindTerminate
             | TermKind::Abort(_)
+            | TermKind::Panic { .. }
             | TermKind::UndefinedBehavior
             | TermKind::Unknown => {
                 vec![]
@@ -9269,7 +9271,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// True when MIR block `bb`'s terminator is a panic/abort stub
-    /// (`Abort` / `UnwindResume`).  rustc lowers the out-of-range
+    /// (`Abort` / `Panic` / `UnwindResume`).  rustc lowers the out-of-range
     /// `default` arm of an enum-discriminant `SwitchInt` to such a block
     /// — an unreachable UB stub with no flowgraph analogue.  Excluding it
     /// from the switch's successors keeps the orphan `set_raise`
@@ -9282,6 +9284,7 @@ impl<'a> Lowering<'a> {
                 .get(bb as usize)
                 .and_then(|b| b.term_ref(self.llbc).ok()),
             Some(TermKind::Abort(_))
+                | Some(TermKind::Panic { .. })
                 | Some(TermKind::UnwindResume)
                 | Some(TermKind::UnwindTerminate)
                 | Some(TermKind::UndefinedBehavior)
@@ -20822,13 +20825,14 @@ impl<'a> Lowering<'a> {
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
-            TermKind::Abort(_) | TermKind::UndefinedBehavior => {
+            TermKind::Abort(_) | TermKind::Panic { .. } | TermKind::UndefinedBehavior => {
                 // A Rust panic-abort (`unreachable!()`, `panic!`,
-                // failed `unwrap`) or Charon `TerminatorKind::UndefinedBehavior`.
+                // failed `unwrap`), Charon `TerminatorKind::Panic`,
+                // or Charon `TerminatorKind::UndefinedBehavior`.
                 // Python-level exceptions never
                 // reach here — they ride the `Result<_, PyError>`
                 // Switch/Return edges as ordinary control flow — so
-                // an Abort marks a "shouldn't occur at run-time"
+                // an Abort or Panic marks a "shouldn't occur at run-time"
                 // path, exactly the implicit-exception raise of
                 // `RaiseImplicit.nomoreblocks`
                 // (`flowcontext.py`).  Closing the block
@@ -40059,6 +40063,7 @@ fn term_observes_divmod_result(term: &TermKind, llbc: &Llbc, alias: &[usize]) ->
         | TermKind::UnwindResume
         | TermKind::UnwindTerminate
         | TermKind::Abort(_)
+        | TermKind::Panic { .. }
         | TermKind::UndefinedBehavior
         | TermKind::Goto { .. }
         | TermKind::Drop { .. }
@@ -43143,6 +43148,7 @@ fn root_bracket_stack_effects_are_known(
                 TermKind::Goto { .. }
                 | TermKind::Switch { .. }
                 | TermKind::Abort(_)
+                | TermKind::Panic { .. }
                 | TermKind::Assert { .. }
                 | TermKind::Return
                 | TermKind::UnwindResume
@@ -43398,6 +43404,7 @@ fn classify_root_slot_getter_body(
             TermKind::Drop { .. }
             | TermKind::Switch { .. }
             | TermKind::Abort(_)
+            | TermKind::Panic { .. }
             | TermKind::UndefinedBehavior
             | TermKind::Unknown => return None,
         }
@@ -46337,6 +46344,7 @@ fn compute_mir_liveness(
             TermKind::UnwindResume
             | TermKind::UnwindTerminate
             | TermKind::Abort(_)
+            | TermKind::Panic { .. }
             | TermKind::UndefinedBehavior
             | TermKind::Unknown => {}
         }
@@ -47829,6 +47837,7 @@ fn unstructured_address_escape(
                 Ok(TermKind::UnwindResume)
                 | Ok(TermKind::UnwindTerminate)
                 | Ok(TermKind::Abort(_))
+                | Ok(TermKind::Panic { .. })
                 | Ok(TermKind::UndefinedBehavior) => {}
                 Ok(TermKind::Unknown) | Err(_) => escapes = true,
             }
@@ -59700,6 +59709,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
             TermKind::UnwindResume
             | TermKind::UnwindTerminate
             | TermKind::Abort(_)
+            | TermKind::Panic { .. }
             | TermKind::UndefinedBehavior => return None,
             _ => return None,
         }

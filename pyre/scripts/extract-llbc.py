@@ -28,6 +28,14 @@ from llbc_extract import (  # noqa: E402
 # closure manifests and Cargo.lock. The full cargo closure remains separately
 # hashed as `closure=` so inputs the file table cannot prove irrelevant still
 # produce a diagnostic when they move.
+# `--reconstruct-panic-calls` keeps panic lang-item calls as Charon's
+# `Panic` terminator and `--inline-anon-consts` keeps promoted constants
+# inline at their use site; both were Charon's default before "Make
+# `TerminatorKind::Panic` reconstruction optional" and "Make anon
+# constant inlining optional" made them opt-in. Charon documents
+# `--inline-anon-consts` as unsound only for a promoted constant used
+# at `'static`, which moves it to a local.
+CHARON_BODY_SHAPE_ARGS = ["--reconstruct-panic-calls", "--inline-anon-consts"]
 # Passed to Charon for every pyre crate. `--hide-marker-traits` drops the
 # `Sized` / `Send` / `Sync` clauses from every generic signature: nothing in
 # `majit-translate` reads a trait clause, and Charon's own help names the flag
@@ -39,7 +47,7 @@ from llbc_extract import (  # noqa: E402
 # `--include libc::_` translates the libc items an extracted crate reaches,
 # including const initializers. A foreign NamedConst otherwise stays
 # Opaque, so the named-const harvest has no literal.
-CHARON_ARGS = ["--hide-marker-traits", "--include", "libc::_"]
+CHARON_ARGS = ["--hide-marker-traits", *CHARON_BODY_SHAPE_ARGS, "--include", "libc::_"]
 
 # `pyre-native` is the stable native/backend boundary.  Charon follows local
 # workspace dependencies by default, so merely moving an implementation into
@@ -104,6 +112,7 @@ SPECS: dict[str, CrateSpec] = {
             "majit/charon-corpus/Cargo.toml",
             "majit/charon-corpus/src/",
         ],
+        charon_args=CHARON_BODY_SHAPE_ARGS,
         # A reader fixture, not a build input: nothing consumes its layouts
         # for a cross target.
         layout_targets=(),

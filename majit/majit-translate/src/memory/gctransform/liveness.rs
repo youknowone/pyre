@@ -1102,6 +1102,7 @@ fn note_term_loads(
         | TermKind::UnwindResume
         | TermKind::UnwindTerminate
         | TermKind::Abort(_)
+        | TermKind::Panic { .. }
         | TermKind::UndefinedBehavior
         | TermKind::Unknown => {}
         TermKind::Call { call, .. } => {

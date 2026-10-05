@@ -71,6 +71,7 @@ fn main() {
                 Ok(TermKind::UnwindResume) => "UnwindResume",
                 Ok(TermKind::UnwindTerminate) => "UnwindTerminate",
                 Ok(TermKind::Abort(_)) => "Abort",
+                Ok(TermKind::Panic { .. }) => "Panic",
                 Ok(TermKind::UndefinedBehavior) => "UndefinedBehavior",
                 Ok(TermKind::Goto { .. }) => "Goto",
                 Ok(TermKind::Switch { .. }) => "Switch",
