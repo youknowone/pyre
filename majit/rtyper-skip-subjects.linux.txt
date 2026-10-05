@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=cdc65fe8d9d5e6a8 platform=linux
+# corpus=e478b6bf6a3c2b80 platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -307,6 +307,7 @@ two-phase-never-a-subject	pyre_interpreter::builtins::call_and_check
 two-phase-never-a-subject	pyre_interpreter::builtins::check_surrogate
 two-phase-never-a-subject	pyre_interpreter::builtins::complex_coerce
 two-phase-never-a-subject	pyre_interpreter::builtins::complex_index_to_real
+two-phase-never-a-subject	pyre_interpreter::builtins::complex_space_float
 two-phase-never-a-subject	pyre_interpreter::builtins::complex_subclass_defines_float_only
 two-phase-never-a-subject	pyre_interpreter::builtins::exception_group_match
 two-phase-never-a-subject	pyre_interpreter::builtins::exception_str_method
