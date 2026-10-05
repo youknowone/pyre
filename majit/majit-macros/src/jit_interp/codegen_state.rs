@@ -180,6 +180,7 @@ pub fn generate_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 /// as JIT-managed values. Scalars become single OpRefs, flattened arrays become
 /// Vec<OpRef>, and virtualizable arrays (`[int; virt]`) track only a data
 /// pointer + length OpRef pair (array stays on heap, accessed via raw memory ops).
+#[allow(unused_variables, unused_assignments)]
 fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let state_type = &config.state_type;
     let env_type = &config.env_type;
@@ -337,13 +338,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // not a per-array count.
     let has_vable_identity = num_virt_arrays > 0;
     let num_vable_identity_slots = usize::from(has_vable_identity);
-    // Int-bank slots a sub-JitCode actually reserves, i.e. the ones the
-    // inline-frame snapshot trim may blank. Only `split_dispatch` pushes a
-    // sub-JitCode's register allocation past the identity range
-    // (`split_identity_floor`), so the reservation — and the trim — is empty
-    // without it. See `int_identity_reserved_end` below.
+    // Int-bank slots the inline-frame snapshot trim may blank. The
+    // alloc_reg floor always skips the identity range; the trim stays
+    // gated on `split_dispatch` so a non-split arm's live identity
+    // slots are not blanked out of the snapshot. See
+    // `int_identity_reserved_end` below.
     let num_reserved_identity_slots = if config.split_dispatch {
-        num_scalars + num_vable_identity_slots
+        num_scalars
     } else {
         0
     };
@@ -395,7 +396,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         + portal_ref_greens
         + carried_ref_greens
         + usize::from(config.virtualizable_decl.is_some() || num_virt_arrays > 0);
-    let ref_identity_end: usize = ref_identity_base + num_ref_scalars;
     // A `virtualizable_fields` object that is a `ref` state field, not the
     // state struct. `[.. ; virt]` already makes the state itself the
     // virtualizable; the two do not combine.
@@ -422,12 +422,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let carry_vable_boxes = num_virt_arrays >= 1 || heap_vable_index.is_some();
     // First int-bank register available for scalar/array identity slots —
     // the int-bank mirror of `ref_identity_base`. `pc` is i0; portal
-    // greens and loop-carried greens follow. Aliasing one of those inputs
-    // lets the guard-time canonical materialization overwrite the green
-    // before resume encode. Mirrors `LowererConfig::int_identity_base`.
+    // greens and loop-carried greens follow. An identity slot aliasing
+    // one of those inputs would overwrite the green. Mirrors
+    // `LowererConfig::int_identity_base`.
     let int_identity_base: usize = 1 + portal_int_greens + carried_int_greens;
     let float_identity_base: usize = portal_float_greens + carried_float_greens;
-    let float_identity_end: usize = float_identity_base + num_float_scalars;
 
     let recover_body: TokenStream = if let Some(ref recover_path) = config.recover {
         quote! { self.#recover_path(); }
@@ -446,51 +445,23 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
-    // `__JitSym_<fn>` fields
-    // scalar → OpRef
-    // flattened array → Vec<OpRef>
-    // virt array → an `i64` length mirror, and nothing else (see
-    //   `sym_virt_array_fields` below). This line used to read
-    //   `(OpRef, OpRef) for (data_ptr, len)`; no such pair is built here or
-    //   anywhere else. A virt array's base address is NEVER materialised as an
-    //   SSA value: the vable-relative `getarrayitem_vable_*` /
-    //   `setarrayitem_vable_*` ops carry `(fdescr, adescr)` and resolve the base
-    //   inside the op, off the live virtualizable. The only OpRef a
-    //   virtualizable gets is the single `__vable_identity` below.
-    //   Worth stating rather than deleting: read as a promise that the base is
-    //   already available, the old wording collapses the design of anything that
-    //   needs one.
-    let sym_scalar_fields: Vec<TokenStream> = scalars
+    // `__JitSym_<fn>` holds dispatcher bookkeeping, not reds. Plain reds
+    // live in the portal frame's identity slots (`MIFrame.setup_call`);
+    // vable fields live in `virtualizable_boxes`; the vable identity lives
+    // in the ref bank / `virtualizable_boxes[-1]`.
+    // Flattened-array lengths are layout (slot count), copied from meta
+    // at `create_sym` — `array_elem_slot` / jump-arg collection read them.
+    // Virt-array length mirrors feed `recursive_fresh_entry_vable_capacities`.
+    let sym_array_len_fields: Vec<TokenStream> = arrays
         .iter()
         .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { #fname: majit_ir::OpRef, }
-        })
-        .collect();
-    let sym_scalar_value_fields: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #value_name: i64, }
-        })
-        .collect();
-    let sym_array_fields: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { #fname: Vec<majit_ir::OpRef>, }
-        })
-        .collect();
-    let sym_array_value_fields: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! { #value_name: Vec<i64>, }
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { #len_name: usize, }
         })
         .collect();
     // Per virt array only a plain `i64` length mirror survives: it feeds the
-    // fresh-callee capacity and the debug dumps, and is NEVER an inputarg
-    // (`virtualizable.py:150-153` reads the length off the live object).
+    // fresh-callee capacity, and is NEVER an inputarg
+    // (`virtualizable.py VirtualizableInfo` reads the length off the live object).
     let sym_virt_array_fields: Vec<TokenStream> = virt_arrays
         .iter()
         .map(|(_, f)| {
@@ -498,189 +469,37 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { #len_value_name: i64, }
         })
         .collect();
-    // `virtualizable.py load_list_of_boxes` names the virtualizable once, so one OpRef
-    // slot serves every `[.. ; virt]` array on the state.
-    let sym_vable_identity_fields: TokenStream = if has_vable_identity {
-        quote! {
-            __vable_identity: majit_ir::OpRef,
-            __vable_identity_value: i64,
-        }
-    } else {
-        quote! {}
-    };
 
     // ── JitCodeSym: total_slots ──
-    // num_scalars + sum(flattened array lengths) + num_vable_identity_slots
+    // num_scalars + sum(flattened array lengths). The vable identity is a
+    // Ref in the ref bank / `virtualizable_boxes[-1]`, not an int slot.
     let total_slots_array_parts: Vec<TokenStream> = arrays
         .iter()
         .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { + self.#fname.len() }
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { + self.#len_name }
         })
         .collect();
 
-    // ── JitCodeSym: state_field_ref / set_state_field_ref ──
-    let state_field_ref_arms: Vec<TokenStream> = scalars
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, f))| {
-            let fname = &f.name;
-            let idx_lit = idx;
-            // OpRef field (Sym side) — return as-is.
-            quote! { #idx_lit => Some(self.#fname), }
-        })
-        .collect();
-    let set_state_field_ref_arms: Vec<TokenStream> = scalars
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, f))| {
-            let fname = &f.name;
-            let idx_lit = idx;
-            // OpRef field on Sym — direct assignment, no cast.
-            quote! { #idx_lit => { self.#fname = value; } }
-        })
-        .collect();
-    let state_field_value_arms: Vec<TokenStream> = scalars
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            let idx_lit = idx;
-            quote! { #idx_lit => Some(self.#value_name), }
-        })
-        .collect();
-    let set_state_field_value_arms: Vec<TokenStream> = scalars
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            let idx_lit = idx;
-            quote! { #idx_lit => { self.#value_name = value; } }
-        })
-        .collect();
-
-    // ── JitCodeSym: state_array_ref / set_state_array_ref (flattened only) ──
-    let state_array_ref_arms: Vec<TokenStream> = arrays
-        .iter()
-        .enumerate()
-        .map(|(arr_idx, (_, f))| {
-            let fname = &f.name;
-            let arr_idx_lit = arr_idx;
-            quote! { #arr_idx_lit => self.#fname.get(elem_idx).copied(), }
-        })
-        .collect();
-    let set_state_array_ref_arms: Vec<TokenStream> = arrays
-        .iter()
-        .enumerate()
-        .map(|(arr_idx, (_, f))| {
-            let fname = &f.name;
-            let arr_idx_lit = arr_idx;
-            quote! { #arr_idx_lit => {
-                if elem_idx < self.#fname.len() {
-                    self.#fname[elem_idx] = value;
-                }
-            } }
-        })
-        .collect();
-    let state_array_value_arms: Vec<TokenStream> = arrays
-        .iter()
-        .enumerate()
-        .map(|(arr_idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_values", f.name);
-            let arr_idx_lit = arr_idx;
-            quote! { #arr_idx_lit => self.#value_name.get(elem_idx).copied(), }
-        })
-        .collect();
-    let set_state_array_value_arms: Vec<TokenStream> = arrays
-        .iter()
-        .enumerate()
-        .map(|(arr_idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_values", f.name);
-            let arr_idx_lit = arr_idx;
-            quote! { #arr_idx_lit => {
-                if elem_idx < self.#value_name.len() {
-                    self.#value_name[elem_idx] = value;
-                }
-            } }
-        })
-        .collect();
-
-    // ── collect_jump_args: scalars, then flattened arrays, then the vable identity ──
-    let collect_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(sym.#fname); }
-        })
-        .collect();
-    let collect_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.extend_from_slice(&sym.#fname); }
-        })
-        .collect();
-    let collect_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! { args.push(sym.__vable_identity); }
-    } else {
-        quote! {}
-    };
-    // ── populate_frame_int_regs: scalars + flattened arrays ──
-    // Matches `live_slots_for_state_field_jit` slot order so a
-    // `MIFrame::get_list_of_active_boxes` walk against the canonical
-    // liveness entry decodes back the same OpRefs / values that
-    // `__JitSym_<fn>` and the macro-emitted `live/<offset>` placeholder
-    // refer to.  Virt-array populate is deferred — see
-    // the trait-method docstring.
-    let populate_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! {
-                if __slot < frame.int_regs.len() {
-                    frame.int_regs[__slot] = Some(self.#fname);
-                    frame.int_values[__slot] = Some(self.#value_name);
-                }
-                __slot += 1;
-            }
-        })
-        .collect();
-    let populate_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! {
-                for __i in 0..self.#fname.len() {
-                    if __slot + __i < frame.int_regs.len() {
-                        frame.int_regs[__slot + __i] = Some(self.#fname[__i]);
-                        frame.int_values[__slot + __i] = Some(self.#value_name[__i]);
-                    }
-                }
-                __slot += self.#fname.len();
-            }
-        })
-        .collect();
     // `StateFieldLayout::array_elem_slot`: int_scalar_base + num_scalars
-    // + sum of earlier array lengths + elem. Lengths are the sym vecs
-    // `populate_frame_int_regs` walks, so the slot matches that seed.
+    // + sum of earlier array lengths + elem. Lengths are the layout
+    // fields copied from meta at `create_sym`.
     let array_elem_slot_arms: Vec<TokenStream> = arrays
         .iter()
         .enumerate()
         .map(|(array_idx, (_, f))| {
-            let fname = &f.name;
+            let len_name = quote::format_ident!("{}_len", f.name);
             let prev: Vec<TokenStream> = arrays[..array_idx]
                 .iter()
                 .map(|(_, prev)| {
-                    let prev_name = &prev.name;
-                    quote! { + self.#prev_name.len() }
+                    let prev_len = quote::format_ident!("{}_len", prev.name);
+                    quote! { + self.#prev_len }
                 })
                 .collect();
             quote! {
                 #array_idx => {
                     let __base = #int_identity_base + #num_scalars #(#prev)*;
-                    if elem < self.#fname.len() {
+                    if elem < self.#len_name {
                         Some(__base + elem)
                     } else {
                         None
@@ -701,153 +520,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         }
     };
-    // Virtualizable populate: ONE slot holding the `&state` identity, past the
-    // scalars and fixed-array elements, matching
-    // `live_slots_for_state_field_jit` and `StateFieldLayout::total_slots`.
-    // It occupies an INT slot even though it carries a Ref: the resume reader
-    // decodes this bank by the int `live_i` index, and writing the identity to
-    // the ref bank instead would desync it, leaving `int_regs[slot]` unset when
-    // the guard snapshot is collected.
-    let populate_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! {
-            if __slot < frame.int_regs.len() {
-                frame.int_regs[__slot] = Some(self.__vable_identity);
-                frame.int_values[__slot] = Some(self.__vable_identity_value);
-            }
-            __slot += 1;
-        }
-    } else {
-        quote! {}
-    };
-
-    // ── seed_recursive_fresh_frame: fresh state as CONSTANTS ──
-    // Same slot layout as `populate_frame_int_regs`, but writes const OpRefs
-    // (a fresh inline callee's state is known at the call site) with fresh
-    // values: scalars 0, fixed-array cells 0, virt-array ptr 0 (the stack is
-    // virtual, its cells live in the vable shadow), virt-array len = caller's
-    // captured capacity (the fresh callee re-allocates at that size).
-    let seed_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, _f)| {
-            quote! {
-                if __slot < frame.int_regs.len() {
-                    frame.int_regs[__slot] = Some(majit_ir::OpRef::const_int(0));
-                    frame.int_values[__slot] = Some(0);
-                }
-                __slot += 1;
-            }
-        })
-        .collect();
-    let seed_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! {
-                for __i in 0..self.#fname.len() {
-                    if __slot + __i < frame.int_regs.len() {
-                        frame.int_regs[__slot + __i] = Some(majit_ir::OpRef::const_int(0));
-                        frame.int_values[__slot + __i] = Some(0);
-                    }
-                }
-                __slot += self.#fname.len();
-            }
-        })
-        .collect();
-    // The fresh callee's identity is not known at the call site (it allocates
-    // its own state), so seed the one identity slot as const 0; the array
-    // capacities it re-allocates at come from the caller's `<arr>_len_value`
-    // mirrors in `recursive_fresh_entry_reds`, not from a boxed length.
-    let seed_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! {
-            if __slot < frame.int_regs.len() {
-                frame.int_regs[__slot] = Some(majit_ir::OpRef::const_int(0));
-                frame.int_values[__slot] = Some(0);
-            }
-            __slot += 1;
-        }
-    } else {
-        quote! {}
-    };
-
-    // ── snapshot/reset/restore inline scalar+fixed-array sym state ──
-    // The sym holds the WORKING scalar (and fixed-array) state read/written by
-    // `BC_LOAD/STORE_STATE_FIELD` / `_STATE_ARRAY`.  An inline recursive-portal
-    // callee overwrites it in place, so nest it: snapshot → reset fresh → run →
-    // restore.  Virt arrays are excluded (their cells live in the vable shadow).
-    let snapshot_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { __out.push((self.#fname, self.#value_name)); }
-        })
-        .collect();
-    let snapshot_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! {
-                for __i in 0..self.#fname.len() {
-                    __out.push((self.#fname[__i], self.#value_name[__i]));
-                }
-            }
-        })
-        .collect();
-    let reset_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! {
-                self.#fname = majit_ir::OpRef::const_int(0);
-                self.#value_name = 0;
-            }
-        })
-        .collect();
-    let reset_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! {
-                for __i in 0..self.#fname.len() {
-                    self.#fname[__i] = majit_ir::OpRef::const_int(0);
-                    self.#value_name[__i] = 0;
-                }
-            }
-        })
-        .collect();
-    let restore_inline_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! {
-                if __k < __snapshot.len() {
-                    self.#fname = __snapshot[__k].0;
-                    self.#value_name = __snapshot[__k].1;
-                    __k += 1;
-                }
-            }
-        })
-        .collect();
-    let restore_inline_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! {
-                for __i in 0..self.#fname.len() {
-                    if __k < __snapshot.len() {
-                        self.#fname[__i] = __snapshot[__k].0;
-                        self.#value_name[__i] = __snapshot[__k].1;
-                        __k += 1;
-                    }
-                }
-            }
-        })
-        .collect();
 
     // ── build_meta: capture flattened array lengths ──
     let build_meta_fields: Vec<TokenStream> = arrays
@@ -1011,9 +683,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `recursive_fresh_entry_reds` allocates a fresh `#state_type` (scalars
     // zeroed = empty frame; arrays re-allocated at the caller's live
     // capacity) and emits its reds in `extract_live` order.  Capacities come
-    // from this symbolic state: a fixed array's sym field is a `Vec<OpRef>`
-    // of the captured length, and a virt array caches its length in
-    // `<arr>_len_value` (seeded at `JitState::initialize_sym`).  The whole
+    // from this symbolic state: a fixed array's `{name}_len` layout field,
+    // and a virt array's `{name}_len_value` (seeded at
+    // `JitState::initialize_sym`).  The whole
     // struct equals `state_fields`, so these inits build a complete fresh
     // `#state_type`.
     let fresh_entry_scalar_inits: Vec<TokenStream> = declared_scalars
@@ -1027,7 +699,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
-            quote! { #fname: ::std::vec![0i64; self.#fname.len()], }
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { #fname: ::std::vec![0i64; self.#len_name], }
         })
         .collect();
     let fresh_entry_virt_array_inits: Vec<TokenStream> = virt_arrays
@@ -1062,9 +735,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let fresh_entry_array_value_pushes: Vec<TokenStream> = arrays
         .iter()
         .map(|(_, f)| {
-            let fname = &f.name;
+            let len_name = quote::format_ident!("{}_len", f.name);
             quote! {
-                for _ in 0..self.#fname.len() {
+                for _ in 0..self.#len_name {
                     __values.push(majit_ir::Value::Int(0));
                 }
             }
@@ -1201,39 +874,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
 
-    // ── create_sym: assign sequential OpRef::from_raw(0), OpRef::from_raw(1), ... ──
-    let create_sym_scalar_inits: Vec<TokenStream> = scalars
+    // ── create_sym: dispatcher handle only. Plain reds are planted by
+    // `MIFrame.setup_call` from `__trace_*` argboxes; this no longer mints
+    // InputArgs for them. Flattened-array lengths copy from meta so
+    // `array_elem_slot` can name identity registers.
+    let create_sym_array_len_inits: Vec<TokenStream> = arrays
         .iter()
         .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! {
-                let #fname = majit_ir::OpRef::input_arg_int(__offset as u32);
-                __offset += 1;
-                let #value_name = 0i64;
-            }
-        })
-        .collect();
-    let create_sym_array_inits: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
             let len_name = quote::format_ident!("{}_len", f.name);
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! {
-                let #fname: Vec<majit_ir::OpRef> = (0..meta.#len_name)
-                    .map(|i| {
-                        // Array-typed sym storage is the i64 register
-                        // bank; each cell mints `InputArgInt`
-                        // (resoperation.py) consistent with the
-                        // scalar i64 sym above and the typed inputarg
-                        // produced by `TraceCtx::new`.
-                        majit_ir::OpRef::input_arg_int((__offset + i) as u32)
-                    })
-                    .collect();
-                let #value_name: Vec<i64> = vec![0; meta.#len_name];
-                __offset += meta.#len_name;
-            }
+            quote! { let #len_name: usize = meta.#len_name; }
         })
         .collect();
     let create_sym_virt_array_inits: Vec<TokenStream> = virt_arrays
@@ -1243,43 +892,18 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { let #len_value_name = 0i64; }
         })
         .collect();
-    // One inputarg for the whole virtualizable, in the same flat offset space
-    // as every other inputarg.  The array elements that follow are carried by
-    // `virtualizable_boxes`, so this is the last header slot — which makes the
-    // loop's entry contract the same shape as a guard's vable section
-    // (`resume.py:1404` + `virtualizable.py load_list_of_boxes`) and therefore the same  allow-line-citation
-    // shape a bridge entering that loop presents.
-    let create_sym_vable_identity_init: TokenStream = if has_vable_identity {
-        quote! {
-            let __vable_identity = majit_ir::OpRef::input_arg_ref(__offset as u32);
-            __offset += 1;
-            let __vable_identity_value = 0i64;
-        }
-    } else {
-        quote! {}
-    };
-    let create_sym_scalar_names: Vec<&syn::Ident> = scalars.iter().map(|(_, f)| &f.name).collect();
-    let create_sym_array_names: Vec<&syn::Ident> = arrays.iter().map(|(_, f)| &f.name).collect();
-    let create_sym_scalar_value_names: Vec<syn::Ident> = scalars
+    let create_sym_array_len_names: Vec<syn::Ident> = arrays
         .iter()
-        .map(|(_, f)| quote::format_ident!("{}_value", f.name))
+        .map(|(_, f)| quote::format_ident!("{}_len", f.name))
         .collect();
-    let create_sym_array_value_names: Vec<syn::Ident> = arrays
-        .iter()
-        .map(|(_, f)| quote::format_ident!("{}_values", f.name))
-        .collect();
-    let create_sym_vable_identity_field_names: TokenStream = if has_vable_identity {
-        quote! {
-            __vable_identity,
-            __vable_identity_value,
-        }
-    } else {
-        quote! {}
-    };
     let create_sym_virt_array_len_value_names: Vec<syn::Ident> = virt_arrays
         .iter()
         .map(|(_, f)| quote::format_ident!("{}_len_value", f.name))
         .collect();
+    // `create_sym_array_names` remains the field ident list for
+    // `state_field_layout` array lengths read off native state, not the
+    // sym — `self.#name.len()` there is the live `Vec`.
+    let create_sym_array_names: Vec<&syn::Ident> = arrays.iter().map(|(_, f)| &f.name).collect();
 
     // ── is_compatible: check flattened array lengths match meta ──
     // Virt arrays always compatible (their length is read off the live object).
@@ -1308,25 +932,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    // D2 per-opcode single-executor: read each scalar state field's concrete
-    // value off the walk's persistent sym in scalar index order (mirrors
-    // `state_field_value` / the `<field>_value` slots). Captured at the
-    // CloseLoop point (while the sym is still live) into
-    // `MetaInterp::single_pass_scalar_values`.
-    let collect_scalar_values_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { values.push(sym.#value_name); }
-        })
-        .collect();
-    // D2 per-opcode single-executor: write each captured scalar state-field
-    // value back into native state, the inverse of
-    // `initialize_sym_scalar_parts`. `values[idx]` is the scalar at
-    // state-field index `idx` (the order `collect_scalar_values_parts`
-    // produced). recover runs afterwards and overwrites the storage-derived
-    // caches, so only scalars recover cannot re-derive (a `selected`-style
-    // storage index, say) meaningfully carry through.
+    // Write captured scalar state-field values back into native state.
+    // `values[idx]` is the scalar at state-field index `idx`. recover runs
+    // afterwards and overwrites the storage-derived caches, so only
+    // scalars recover cannot re-derive (a `selected`-style storage index)
+    // meaningfully carry through.
     let writeback_from_values_parts: Vec<TokenStream> = scalars
         .iter()
         .enumerate()
@@ -1399,39 +1009,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    let initialize_sym_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            // Cast user's typed field to i64 for the JIT Sym slot.
-            quote! {
-                sym.#value_name = self.#fname as i64;
-            }
-        })
-        .collect();
-    let initialize_sym_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_values", f.name);
-            quote! {
-                sym.#value_name.clone_from(&self.#fname);
-            }
-        })
-        .collect();
-    // `<varr>_len_value` mirrors the current `<state>.<varr>` length for the
-    // fresh-callee capacity, and `__vable_identity_value` the `&state` identity
-    // so `populate_frame_int_regs` can fill the corresponding
-    // `MIFrame.int_values` slot without re-reading the live state at guard time
-    // TODO:
-    // accurate iff the varray's length does not change during tracing — true
-    // for the 6 macro examples, whose backings are all sized once at
-    // construction (`vec![0i64; program.len()]`, `VirtArray::filled`).  A
-    // varray the source resizes or clears mid-walk would need per-mutation
-    // refresh hooks: the capacity is read off this symbolic state by
-    // `recursive_fresh_entry_vable_capacities`, which has no live state to
-    // re-measure from, so the refresh has to reach the mirror at the mutation.
+    // `{varr}_len_value` mirrors the current `<state>.<varr>` length for the
+    // fresh-callee capacity. Accurate iff the varray's length does not
+    // change during tracing — true for the in-tree examples, whose
+    // backings are sized once at construction. A varray the source
+    // resizes mid-walk would need a refresh: the capacity is read off
+    // this symbolic state by `recursive_fresh_entry_vable_capacities`.
     let initialize_sym_virt_array_parts: Vec<TokenStream> = virt_arrays
         .iter()
         .map(|(_, f)| {
@@ -1440,14 +1023,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { sym.#len_value_name = self.#fname.len() as i64; }
         })
         .collect();
-    // Vable base identity (`&state`), matching `extract_live` and
-    // `standard_virtualizable_concrete` so the traced vable box is recognized
-    // as the standard virtualizable (no force).
-    let initialize_sym_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! { sym.__vable_identity_value = self as *const Self as i64; }
-    } else {
-        quote! {}
-    };
 
     // ── validate_close: flattened array lengths in sym match meta ──
     // Virt arrays always validate (their length is read off the live object).
@@ -1456,56 +1031,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|(_, f)| {
             let fname = &f.name;
             let len_name = quote::format_ident!("{}_len", f.name);
-            quote! { && sym.#fname.len() == meta.#len_name }
+            quote! { && sym.#len_name == meta.#len_name }
         })
         .collect();
 
     // ── ref(T) scalars ──
-    // A ref scalar mints `InputArgRef(__offset)` in the same flat position
-    // space as every other inputarg (the virt-array identity slot above
-    // does the same).  The optimizer keys inputarg identity by flat
-    // position (`OptContext::inputarg_refs[pos]`, `bind_canonical_inputarg`
-    // keyed by `OpRef::raw()`), so a bank-local 0-based index would alias
-    // `InputArgInt(0)` and `InputArgRef(0)` onto one forwarding host — a
-    // promote on the int slot would const-fold every use of the ref slot.
-    // In the value vector the ref scalar is APPENDED LAST (after int
-    // scalars/arrays/virt) so the int-bank slot layout is unchanged and the
-    // flat offset coincides with the value-vector position;
-    // `live_value_types` tags those trailing positions `Type::Ref` so
-    // `restore_values` routes them to the ref bank.  Struct storage is a
-    // `usize` carrier (raw GcRef / pointer bits).
-    let sym_ref_scalar_fields: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { #fname: majit_ir::OpRef, }
-        })
-        .collect();
-    let sym_ref_scalar_value_fields: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #value_name: i64, }
-        })
-        .collect();
-    let create_sym_ref_scalar_inits: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! {
-                let #fname = majit_ir::OpRef::input_arg_ref(__offset as u32);
-                __offset += 1;
-                let #value_name = 0i64;
-            }
-        })
-        .collect();
-    let create_sym_ref_scalar_names: Vec<&syn::Ident> =
-        ref_scalars.iter().map(|(_, f)| &f.name).collect();
-    let create_sym_ref_scalar_value_names: Vec<syn::Ident> = ref_scalars
-        .iter()
-        .map(|(_, f)| quote::format_ident!("{}_value", f.name))
-        .collect();
+    // Native `usize` carriers (raw GcRef / pointer bits). In the live-value
+    // vector they sit after int scalars/arrays and the vable identity;
+    // `live_value_types` tags those positions `Type::Ref` so `restore_values`
+    // routes them to the ref bank.
     let extract_ref_scalar_parts: Vec<TokenStream> = ref_scalars
         .iter()
         .map(|(_, f)| {
@@ -1521,56 +1055,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // `live_value_types` routes the single vable identity `Ref` into
             // the ref bank ahead of the ref scalars, so ref scalar `j` lives at
             // `ref_values[num_vable_identity_slots + j]`, not `ref_values[j]`.
-            // Mirrors `populate_ref_scalar_parts`, which skips the same prefix
-            // in the register bank via `ref_identity_base`.
             let slot = num_vable_identity_slots + ref_idx;
             quote! { self.#fname = ref_values[#slot] as usize; }
-        })
-        .collect();
-    let initialize_sym_ref_scalar_parts: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { sym.#value_name = self.#fname as i64; }
-        })
-        .collect();
-    let collect_ref_scalar_parts: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(sym.#fname); }
-        })
-        .collect();
-    // Ref-bank mirror of `collect_scalar_values_parts`: the concrete pointer
-    // bits the walk carries for each ref state field, in ref-scalar index
-    // order. Consumed by the tracing-abort blackhole conversion, which seeds
-    // `registers_r[ref_scalar_slot(j)]` before running the aborted framestack.
-    let collect_ref_scalar_values_parts: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { values.push(sym.#value_name); }
-        })
-        .collect();
-    // Canonical ref-bank identity slots: ref scalar `j` lives at
-    // `ref_regs[ref_identity_base + j]` so the guard-time snapshot's
-    // live_r decode (`get_list_of_active_boxes`) and the blackhole's
-    // `ref_scalar_slot` agree without aliasing the dispatch JitCode's
-    // ref arguments.
-    let populate_ref_scalar_parts: Vec<TokenStream> = ref_scalars
-        .iter()
-        .enumerate()
-        .map(|(ref_idx, (_, f))| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            let slot = ref_identity_base + ref_idx;
-            quote! {
-                if #slot < frame.ref_regs.len() {
-                    frame.ref_regs[#slot] = Some(self.#fname);
-                    frame.ref_values[#slot] = Some(self.#value_name);
-                }
-            }
         })
         .collect();
     // pyjitpl.py:2981-2989 `live_arg_boxes` — THE loop-carried box list, built
@@ -1583,10 +1069,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // what made every purely-virt-array interpreter's nested loop decline on
     // `jump.numargs() != label.numargs()` (compile.py:334).
     //
-    // The list must be slot-for-slot identical to the trace-entry Label, whose
-    // inputargs are minted by `create_sym` advancing `__offset` in declaration
-    // order — int scalars (Int), each fixed `[int]` array's cells (Int), the
-    // one `__vable_identity` (Ref), then ref scalars (Ref), then float scalars
+    // The list must be slot-for-slot identical to the trace-entry Label:
+    // int scalars (Int), each fixed `[int]` array's cells (Int), the
+    // vable identity (Ref), then ref scalars (Ref), then float scalars
     // (Float) — after which `JitDriver::extend_compiled_live_values` appends
     // the element block with `live_values.extend(extra_values)`.
     //
@@ -1612,41 +1097,70 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // which is why the `collect_jump_args_with_boxes` override below stays
     // gated on `num_virt_arrays >= 1` (the trait default already delegates to
     // `collect_jump_args` there).
-    let typed_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push((sym.#fname, majit_ir::Type::Int)); }
+    let vable_ref_reg: usize = ref_identity_base.saturating_sub(usize::from(has_vable_identity));
+    let typed_scalar_parts: Vec<TokenStream> = (0..num_scalars)
+        .map(|k| {
+            let slot = int_identity_base + k;
+            quote! {
+                if let Some(__op) = __frame.int_regs.get(#slot).copied().flatten() {
+                    args.push((__op, majit_ir::Type::Int));
+                }
+            }
         })
         .collect();
     let typed_array_parts: Vec<TokenStream> = arrays
         .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
+        .enumerate()
+        .map(|(array_idx, (_, f))| {
+            let len_name = quote::format_ident!("{}_len", f.name);
+            let prev: Vec<TokenStream> = arrays[..array_idx]
+                .iter()
+                .map(|(_, prev)| {
+                    let prev_len = quote::format_ident!("{}_len", prev.name);
+                    quote! { + __sym.#prev_len }
+                })
+                .collect();
             quote! {
-                for &__cell in sym.#fname.iter() {
-                    args.push((__cell, majit_ir::Type::Int));
+                {
+                    let __base = #int_identity_base + #num_scalars #(#prev)*;
+                    for __i in 0..__sym.#len_name {
+                        if let Some(__op) = __frame.int_regs.get(__base + __i).copied().flatten() {
+                            args.push((__op, majit_ir::Type::Int));
+                        }
+                    }
                 }
             }
         })
         .collect();
     let typed_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! { args.push((sym.__vable_identity, majit_ir::Type::Ref)); }
+        quote! {
+            if let Some((__op, __ty)) = __boxes.last() {
+                args.push((*__op, *__ty));
+            } else if let Some(__op) = __frame.ref_regs.get(#vable_ref_reg).copied().flatten() {
+                args.push((__op, majit_ir::Type::Ref));
+            }
+        }
     } else {
         quote! {}
     };
-    let typed_ref_scalar_parts: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push((sym.#fname, majit_ir::Type::Ref)); }
+    let typed_ref_scalar_parts: Vec<TokenStream> = (0..num_ref_scalars)
+        .map(|j| {
+            let slot = ref_identity_base + j;
+            quote! {
+                if let Some(__op) = __frame.ref_regs.get(#slot).copied().flatten() {
+                    args.push((__op, majit_ir::Type::Ref));
+                }
+            }
         })
         .collect();
-    let typed_float_scalar_parts: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push((sym.#fname, majit_ir::Type::Float)); }
+    let typed_float_scalar_parts: Vec<TokenStream> = (0..num_float_scalars)
+        .map(|k| {
+            let slot = float_identity_base + k;
+            quote! {
+                if let Some(__op) = __frame.float_regs.get(#slot).copied().flatten() {
+                    args.push((__op, majit_ir::Type::Float));
+                }
+            }
         })
         .collect();
     let typed_element_splice: TokenStream = if carry_vable_boxes {
@@ -1658,25 +1172,21 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
     let loop_carried_boxes_fn: TokenStream = quote! {
-        /// pyjitpl.py:2981-2989 `live_arg_boxes`, typed. See the emit-site
-        /// comment in `majit-macros/src/jit_interp/codegen_state.rs`.
+        /// pyjitpl.py `reached_loop_header` `live_arg_boxes`, typed.
+        /// Reds come from the portal frame's identity slots; vable
+        /// fields from `virtualizable_boxes`.
         #[allow(unused_variables)]
         fn #loop_carried_boxes_fn_name(
-            sym: &#sym_ty,
+            __sym: &#sym_ty,
+            __frame: &majit_metainterp::MIFrame,
             __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
         ) -> Vec<(majit_ir::OpRef, majit_ir::Type)> {
             let mut args: Vec<(majit_ir::OpRef, majit_ir::Type)> = Vec::new();
-            // The reds, in `extract_live` / `live_value_types` order …
             #(#typed_scalar_parts)*
             #(#typed_array_parts)*
             #typed_vable_identity_part
             #(#typed_ref_scalar_parts)*
             #(#typed_float_scalar_parts)*
-            // … then the element block as a strict SUFFIX, which is what
-            // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
-            // (pyjitpl.py:2988-2989) makes it, and what the entry contract
-            // builds with `live_values.extend(extra_values)`
-            // (`JitDriver::extend_compiled_live_values`).
             #typed_element_splice
             args
         }
@@ -1684,50 +1194,21 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let collect_jump_args_with_boxes_method: TokenStream = if carry_vable_boxes {
         quote! {
             fn collect_jump_args_with_boxes(
-                sym: &#sym_ty,
+                _sym: &#sym_ty,
                 __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
             ) -> Vec<majit_ir::OpRef> {
-                #loop_carried_boxes_fn_name(sym, __boxes)
-                    .into_iter()
-                    .map(|(__opref, _)| __opref)
-                    .collect()
+                let mut args = Vec::new();
+                if let Some((__op, _)) = __boxes.last() {
+                    args.push(*__op);
+                }
+                let __elem_count = __boxes.len().saturating_sub(1);
+                args.extend(__boxes[..__elem_count].iter().map(|(__op, _)| *__op));
+                args
             }
         }
     } else {
         quote! {}
     };
-    let state_ref_field_ref_arms: Vec<TokenStream> = ref_scalars
-        .iter()
-        .enumerate()
-        .map(|(ref_idx, (_, f))| {
-            let fname = &f.name;
-            quote! { #ref_idx => Some(self.#fname), }
-        })
-        .collect();
-    let set_state_ref_field_ref_arms: Vec<TokenStream> = ref_scalars
-        .iter()
-        .enumerate()
-        .map(|(ref_idx, (_, f))| {
-            let fname = &f.name;
-            quote! { #ref_idx => { self.#fname = value; } }
-        })
-        .collect();
-    let state_ref_field_value_arms: Vec<TokenStream> = ref_scalars
-        .iter()
-        .enumerate()
-        .map(|(ref_idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #ref_idx => Some(self.#value_name), }
-        })
-        .collect();
-    let set_state_ref_field_value_arms: Vec<TokenStream> = ref_scalars
-        .iter()
-        .enumerate()
-        .map(|(ref_idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #ref_idx => { self.#value_name = value; } }
-        })
-        .collect();
     let writeback_live_ref_scalar_arms: Vec<TokenStream> = ref_scalars
         .iter()
         .enumerate()
@@ -1737,108 +1218,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
     // ── float scalars ──
-    //
-    // Float scalar concrete shadows are raw f64 bits (`i64`) because
-    // `MIFrame.float_values` and `BlackholeInterpreter.registers_f` carry the
-    // same bit pattern. Native state stores f64 by default.
-    let sym_float_scalar_fields: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { #fname: majit_ir::OpRef, }
-        })
-        .collect();
-    let sym_float_scalar_value_fields: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #value_name: i64, }
-        })
-        .collect();
-    let create_sym_float_scalar_inits: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! {
-                let #fname = majit_ir::OpRef::input_arg_float(__offset as u32);
-                __offset += 1;
-                let #value_name = 0i64;
-            }
-        })
-        .collect();
-    let create_sym_float_scalar_names: Vec<&syn::Ident> =
-        float_scalars.iter().map(|(_, f)| &f.name).collect();
-    let create_sym_float_scalar_value_names: Vec<syn::Ident> = float_scalars
-        .iter()
-        .map(|(_, f)| quote::format_ident!("{}_value", f.name))
-        .collect();
-    // `clear_sym_inputarg_bindings`: drop every `OpRef` that `create_sym`
-    // minted off `__offset`, and only those — the `_value` / `_len_value`
-    // mirrors are concrete runtime data seeded by `initialize_sym`, not
-    // positions, so they stay.  One statement per field the `#sym_ty`
-    // constructor above lists as `OpRef` / `Vec<OpRef>`; virt arrays carry
-    // only an `i64` length mirror and so contribute nothing here.
-    // Counterpart of `clear_sym_binding_parts`, over the identical five
-    // sources so the two cannot drift: if a kind is added to the clearing and
-    // not to the count, the assertion at the call site stops covering it.
-    let count_bound_sym_parts: Vec<TokenStream> = create_sym_scalar_names
-        .iter()
-        .map(|fname| quote! { if !sym.#fname.is_none() { __bound += 1; } })
-        .chain(create_sym_array_names.iter().map(|fname| {
-            quote! {
-                for __cell in sym.#fname.iter() {
-                    if !__cell.is_none() { __bound += 1; }
-                }
-            }
-        }))
-        .chain(has_vable_identity.then(|| {
-            quote! { if !sym.__vable_identity.is_none() { __bound += 1; } }
-        }))
-        .chain(
-            create_sym_ref_scalar_names
-                .iter()
-                .map(|fname| quote! { if !sym.#fname.is_none() { __bound += 1; } }),
-        )
-        .chain(
-            create_sym_float_scalar_names
-                .iter()
-                .map(|fname| quote! { if !sym.#fname.is_none() { __bound += 1; } }),
-        )
-        .collect();
-    let clear_sym_binding_parts: Vec<TokenStream> = create_sym_scalar_names
-        .iter()
-        .map(|fname| quote! { sym.#fname = majit_ir::OpRef::NONE; })
-        .chain(create_sym_array_names.iter().map(|fname| {
-            quote! {
-                for __cell in sym.#fname.iter_mut() {
-                    *__cell = majit_ir::OpRef::NONE;
-                }
-            }
-        }))
-        .chain(has_vable_identity.then(|| {
-            quote! { sym.__vable_identity = majit_ir::OpRef::NONE; }
-        }))
-        .chain(
-            create_sym_ref_scalar_names
-                .iter()
-                .map(|fname| quote! { sym.#fname = majit_ir::OpRef::NONE; }),
-        )
-        .chain(
-            create_sym_float_scalar_names
-                .iter()
-                .map(|fname| quote! { sym.#fname = majit_ir::OpRef::NONE; }),
-        )
-        .collect();
+    // Native state stores f64 by default. Live-value / restore bits are the
+    // same pattern `MIFrame.float_values` and `BlackholeInterpreter.registers_f`
+    // carry.
     let extract_float_scalar_parts: Vec<TokenStream> = float_scalars
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
-            // Widen to f64 before taking bits so the encoding is the 64-bit
-            // representation the restore path reads back via
-            // `f64::from_bits(_ as u64) as #rust_ty`. A `float(f32)` field's
-            // own `to_bits()` yields 32-bit bits, which would round-trip
-            // through `f64::from_bits` as a bogus value.
             // Widen to f64 before taking bits so the encoding is the 64-bit
             // representation the restore path reads back via
             // `f64::from_bits(_ as u64) as #rust_ty`. A `float(f32)` field's
@@ -1856,28 +1242,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! {
                 self.#fname = f64::from_bits(float_values[#float_idx] as u64) as #rust_ty;
             }
-        })
-        .collect();
-    let initialize_sym_float_scalar_parts: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { sym.#value_name = (self.#fname as f64).to_bits() as i64; }
-        })
-        .collect();
-    let collect_float_scalar_parts: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(sym.#fname); }
-        })
-        .collect();
-    let collect_float_scalar_values_parts: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { values.push(sym.#value_name); }
         })
         .collect();
     let writeback_float_from_values_parts: Vec<TokenStream> = float_scalars
@@ -1901,53 +1265,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! {
                 #float_idx => {
                     self.#fname = f64::from_bits(value as u64) as #rust_ty;
-                }
-            }
-        })
-        .collect();
-    let state_float_field_ref_arms: Vec<TokenStream> = float_scalars
-        .iter()
-        .enumerate()
-        .map(|(float_idx, (_, f))| {
-            let fname = &f.name;
-            quote! { #float_idx => Some(self.#fname), }
-        })
-        .collect();
-    let set_state_float_field_ref_arms: Vec<TokenStream> = float_scalars
-        .iter()
-        .enumerate()
-        .map(|(float_idx, (_, f))| {
-            let fname = &f.name;
-            quote! { #float_idx => { self.#fname = value; } }
-        })
-        .collect();
-    let state_float_field_value_arms: Vec<TokenStream> = float_scalars
-        .iter()
-        .enumerate()
-        .map(|(float_idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #float_idx => Some(self.#value_name), }
-        })
-        .collect();
-    let set_state_float_field_value_arms: Vec<TokenStream> = float_scalars
-        .iter()
-        .enumerate()
-        .map(|(float_idx, (_, f))| {
-            let value_name = quote::format_ident!("{}_value", f.name);
-            quote! { #float_idx => { self.#value_name = value; } }
-        })
-        .collect();
-    let populate_float_scalar_parts: Vec<TokenStream> = float_scalars
-        .iter()
-        .enumerate()
-        .map(|(float_idx, (_, f))| {
-            let fname = &f.name;
-            let value_name = quote::format_ident!("{}_value", f.name);
-            let slot = float_identity_base + float_idx;
-            quote! {
-                if #slot < frame.float_regs.len() {
-                    frame.float_regs[#slot] = Some(self.#fname);
-                    frame.float_values[#slot] = Some(self.#value_name);
                 }
             }
         })
@@ -2252,35 +1569,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
     let float_field_accessor_overrides: TokenStream = if num_float_scalars > 0 {
         quote! {
-            fn state_float_field_ref(&self, field_idx: usize) -> Option<majit_ir::OpRef> {
-                match field_idx {
-                    #(#state_float_field_ref_arms)*
-                    _ => None,
-                }
-            }
-            fn set_state_float_field_ref(&mut self, field_idx: usize, value: majit_ir::OpRef) {
-                match field_idx {
-                    #(#set_state_float_field_ref_arms)*
-                    _ => {}
-                }
-            }
-            fn state_float_field_value(&self, field_idx: usize) -> Option<i64> {
-                match field_idx {
-                    #(#state_float_field_value_arms)*
-                    _ => None,
-                }
-            }
-            fn set_state_float_field_value(&mut self, field_idx: usize, value: i64) {
-                match field_idx {
-                    #(#set_state_float_field_value_arms)*
-                    _ => {}
-                }
-            }
             fn float_identity_slots_base(&self) -> usize {
                 #float_identity_base
-            }
-            fn float_identity_slots_end(&self) -> usize {
-                #float_identity_end
             }
             fn float_scalar_slot(&self, field_idx: usize) -> Option<usize> {
                 if field_idx < #num_float_scalars {
@@ -2295,34 +1585,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
     let ref_field_accessor_overrides: TokenStream = if num_ref_scalars > 0 {
         quote! {
-            fn state_ref_field_ref(&self, field_idx: usize) -> Option<majit_ir::OpRef> {
-                match field_idx {
-                    #(#state_ref_field_ref_arms)*
-                    _ => None,
-                }
-            }
-            fn set_state_ref_field_ref(&mut self, field_idx: usize, value: majit_ir::OpRef) {
-                match field_idx {
-                    #(#set_state_ref_field_ref_arms)*
-                    _ => {}
-                }
-            }
-            fn state_ref_field_value(&self, field_idx: usize) -> Option<i64> {
-                match field_idx {
-                    #(#state_ref_field_value_arms)*
-                    _ => None,
-                }
-            }
-            fn set_state_ref_field_value(&mut self, field_idx: usize, value: i64) {
-                match field_idx {
-                    #(#set_state_ref_field_value_arms)*
-                    _ => {}
-                }
-            }
-
-            fn ref_identity_slots_end(&self) -> usize {
-                #ref_identity_end
-            }
             fn ref_scalar_slot(&self, field_idx: usize) -> Option<usize> {
                 if field_idx < #num_ref_scalars {
                     Some(#ref_identity_base + field_idx)
@@ -2417,47 +1679,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // pyjitpl.py `rebuild_state_after_failure`:
     //     if vinfo is not None:
     //         self.virtualizable_boxes = virtualizable_boxes
-    // The guard's vable section is decoded by `rebuild_from_resumedata` above;
-    // rebuild the shadow from it so the bridge traces with the same
-    // virtualizable the parent loop had.  Without it `virtualizable_boxes`
-    // stays None for the whole bridge and `__trace_*` aborts at its first
-    // statement (`standard_virtualizable_jitcode_argbox` has nothing to
-    // resolve), so a state with `[.. ; virt]` arrays never forms a bridge at
-    // all — every guard exit deopts through the blackhole instead.
-    // Rebind the vable identity the bridge actually entered with.
-    //
-    // `clear_sym_inputarg_bindings` retires this field along with the other
-    // `create_sym` mints, and the frame-register seeding below has no arm for
-    // it: `reg_indices` addresses the int/ref/float scalar banks and this
-    // field is in none of them. Left retired it travels straight into the
-    // jump args as `OpRef::NONE` (`collect_jump_args` and
-    // `collect_jump_args_with_boxes` both push it), where the optimizer has
-    // neither an operand nor a type for it and `not_virtual` faults.
-    //
-    // `standard_virtualizable_jitcode_argbox` is the right source rather than
-    // a constant built from the mirror: it prefers the exact trace-entry red
-    // inputarg named by `index_of_virtualizable`, falling back to
-    // `virtualizable_boxes[-1]`, which `#seed_bridge_vable` has just
-    // populated. Note that seeding does not do this itself —
-    // `seed_bridge_virtualizable_boxes` takes no `Sym` and writes only the
-    // ctx-side boxes.
-    let rebind_bridge_vable_identity: TokenStream = if has_vable_identity {
-        quote! {
-            if let Some((_, __vable_op, __vable_val)) =
-                ctx.standard_virtualizable_jitcode_argbox()
-            {
-                sym.__vable_identity = __vable_op;
-                sym.__vable_identity_value = __vable_val;
-                if majit_metainterp::bridge_debug_enabled() {
-                    eprintln!("  vable identity REBOUND to {:?}", __vable_op);
-                }
-            } else if majit_metainterp::bridge_debug_enabled() {
-                eprintln!("  vable identity NOT REBOUND — no standard argbox");
-            }
-        }
-    } else {
-        quote! {}
-    };
+    // The guard's vable section is decoded by `rebuild_from_resumedata`;
+    // rebuild the shadow so the bridge traces with the same virtualizable
+    // the parent loop had. Without it `virtualizable_boxes` stays None and
+    // `__trace_*` aborts at `standard_virtualizable_jitcode_argbox`.
     let seed_bridge_vable: TokenStream = if num_virt_arrays > 0 || heap_vable_index.is_some() {
         quote! {
             if let Some(__vinfo) = Self::__build_virtualizable_info() {
@@ -3022,19 +2247,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
         #recursive_fresh_alloc_free_fns
 
-        /// Symbolic state during tracing: per-field OpRefs.
+        /// Dispatcher handle during tracing. Plain reds live in the portal
+        /// frame; vable fields live in `virtualizable_boxes`.
         #[allow(non_camel_case_types)]
         struct #sym_ty {
-            #(#sym_scalar_fields)*
-            #(#sym_scalar_value_fields)*
-            #(#sym_array_fields)*
-            #(#sym_array_value_fields)*
+            #(#sym_array_len_fields)*
             #(#sym_virt_array_fields)*
-            #sym_vable_identity_fields
-            #(#sym_ref_scalar_fields)*
-            #(#sym_ref_scalar_value_fields)*
-            #(#sym_float_scalar_fields)*
-            #(#sym_float_scalar_value_fields)*
             loop_header_pc: usize,
             trace_started: bool,
         }
@@ -3043,18 +2261,57 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
         impl majit_metainterp::JitCodeSym for #sym_ty {
             fn total_slots(&self) -> usize {
-                #num_scalars #(#total_slots_array_parts)* + #num_vable_identity_slots
+                #num_scalars #(#total_slots_array_parts)*
             }
 
             fn loop_carried_boxes(
                 &self,
                 __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
             ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
-                Some(#loop_carried_boxes_fn_name(self, __boxes))
+                let _ = __boxes;
+                None
             }
 
-            fn int_identity_slots_end(&self) -> usize {
-                #int_identity_base + self.total_slots()
+            fn loop_carried_boxes_from_portal(
+                &self,
+                __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
+                __frame: &majit_metainterp::MIFrame,
+            ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
+                Some(#loop_carried_boxes_fn_name(self, __frame, __boxes))
+            }
+
+            fn collect_portal_scalar_values(
+                &self,
+                __frame: &majit_metainterp::MIFrame,
+            ) -> Vec<i64> {
+                let mut values = Vec::new();
+                for __k in 0..#num_scalars {
+                    let __slot = #int_identity_base + __k;
+                    if let Some(__v) = __frame.int_values.get(__slot).copied().flatten() {
+                        values.push(__v);
+                    }
+                }
+                for __k in 0..#num_float_scalars {
+                    let __slot = #float_identity_base + __k;
+                    if let Some(__v) = __frame.float_values.get(__slot).copied().flatten() {
+                        values.push(__v);
+                    }
+                }
+                values
+            }
+
+            fn collect_portal_ref_scalar_values(
+                &self,
+                __frame: &majit_metainterp::MIFrame,
+            ) -> Vec<i64> {
+                let mut values = Vec::new();
+                for __j in 0..#num_ref_scalars {
+                    let __slot = #ref_identity_base + __j;
+                    if let Some(__v) = __frame.ref_values.get(__slot).copied().flatten() {
+                        values.push(__v);
+                    }
+                }
+                values
             }
 
             fn int_identity_slots_base(&self) -> usize {
@@ -3062,19 +2319,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
 
             // Mirrors `split_identity_reg_ends`' int end in
-            // `jitcode_lower/mod.rs` exactly: the working-register floor stops
-            // after the scalars plus the single vable-identity slot, because a
-            // virt array's element count is only known from the live object.
+            // `jitcode_lower/mod.rs`: the working-register floor stops after
+            // the scalars plus the single vable-identity slot, because a virt
+            // array's element count is only known from the live object.
             //
-            // It must also mirror the CONDITION under which that end is
-            // applied. `split_identity_floor` (`jitcode_lower/api.rs`) raises a
-            // sub-JitCode's `alloc_reg()` floor past the range only when
-            // `split_dispatch` is on; with it off, no sub-JitCode reserves
-            // anything and `[base, end)` holds ordinary working registers. The
-            // inline-frame snapshot trim keyed on this end blanks the range
-            // unconditionally, so reporting a non-empty range here would drop
-            // live data from a sub-frame's snapshot. Report an empty range
-            // instead, so the trim is inert exactly where the reservation is.
+            // The snapshot trim keyed on this end blanks the range
+            // unconditionally. `split_identity_floor` now always raises a
+            // sub-JitCode's `alloc_reg()` past the identity range so a temp
+            // cannot clobber a red, but the trim stays gated on
+            // `split_dispatch` (`num_reserved_identity_slots`): blanking a
+            // non-split arm's live identity slots would drop the reds
+            // capture needs. Report an empty range without `split_dispatch`.
             fn int_identity_reserved_end(&self) -> usize {
                 #int_identity_base + #num_reserved_identity_slots
             }
@@ -3083,122 +2338,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 self.loop_header_pc
             }
 
-            fn state_field_ref(&self, field_idx: usize) -> Option<majit_ir::OpRef> {
-                match field_idx {
-                    #(#state_field_ref_arms)*
-                    _ => None,
-                }
-            }
-
-            fn set_state_field_ref(&mut self, field_idx: usize, value: majit_ir::OpRef) {
-                match field_idx {
-                    #(#set_state_field_ref_arms)*
-                    _ => {}
-                }
-            }
-
-            fn state_field_value(&self, field_idx: usize) -> Option<i64> {
-                match field_idx {
-                    #(#state_field_value_arms)*
-                    _ => None,
-                }
-            }
-
-            fn set_state_field_value(&mut self, field_idx: usize, value: i64) {
-                match field_idx {
-                    #(#set_state_field_value_arms)*
-                    _ => {}
-                }
-            }
-
+            #array_elem_slot_override
             #ref_field_accessor_overrides
             #float_field_accessor_overrides
-
-            fn state_array_ref(&self, array_idx: usize, elem_idx: usize) -> Option<majit_ir::OpRef> {
-                match array_idx {
-                    #(#state_array_ref_arms)*
-                    _ => None,
-                }
-            }
-
-            fn set_state_array_ref(&mut self, array_idx: usize, elem_idx: usize, value: majit_ir::OpRef) {
-                match array_idx {
-                    #(#set_state_array_ref_arms)*
-                    _ => {}
-                }
-            }
-
-            fn state_array_value(&self, array_idx: usize, elem_idx: usize) -> Option<i64> {
-                match array_idx {
-                    #(#state_array_value_arms)*
-                    _ => None,
-                }
-            }
-
-            fn set_state_array_value(&mut self, array_idx: usize, elem_idx: usize, value: i64) {
-                match array_idx {
-                    #(#set_state_array_value_arms)*
-                    _ => {}
-                }
-            }
-
-            #array_elem_slot_override
-
-            #[allow(unused_assignments, unused_variables)]
-            fn populate_frame_int_regs(
-                &self,
-                frame: &mut majit_metainterp::MIFrame,
-            ) {
-                // Slot layout matches `live_slots_for_state_field_jit`
-                // Scalars at `int_identity_base..base+num_scalars`
-                // (the base keeps the dispatch JitCode's `pc` argument
-                // at i0 out of the seeded range),
-                // then flattened arrays, then virt-array (ptr, len)
-                // pairs.  Virt-array value mirrors are cached at
-                // `JitState::initialize_sym` time
-                // from the
-                // user state's `<varr>.as_ptr()` / `<varr>.len()`,
-                // accurate iff the Vec does not reallocate during
-                // tracing.
-                let mut __slot: usize = #int_identity_base;
-                #(#populate_scalar_parts)*
-                #(#populate_array_parts)*
-                #populate_vable_identity_part
-                let _ = __slot;
-                #(#populate_ref_scalar_parts)*
-                #(#populate_float_scalar_parts)*
-            }
-
-            #[allow(unused_assignments, unused_variables)]
-            fn seed_recursive_fresh_frame(
-                &self,
-                frame: &mut majit_metainterp::MIFrame,
-            ) {
-                let mut __slot: usize = #int_identity_base;
-                #(#seed_scalar_parts)*
-                #(#seed_array_parts)*
-                #seed_vable_identity_part
-                let _ = __slot;
-            }
-
-            fn snapshot_inline_scalar_state(&self) -> Option<Vec<(majit_ir::OpRef, i64)>> {
-                let mut __out: Vec<(majit_ir::OpRef, i64)> = Vec::new();
-                #(#snapshot_scalar_parts)*
-                #(#snapshot_array_parts)*
-                Some(__out)
-            }
-
-            fn reset_inline_scalar_state_fresh(&mut self) {
-                #(#reset_scalar_parts)*
-                #(#reset_array_parts)*
-            }
-
-            #[allow(unused_assignments, unused_variables)]
-            fn restore_inline_scalar_state(&mut self, __snapshot: Vec<(majit_ir::OpRef, i64)>) {
-                let mut __k: usize = 0;
-                #(#restore_inline_scalar_parts)*
-                #(#restore_inline_array_parts)*
-            }
 
             #recursive_fresh_entry_reds_override
             #recursive_fresh_entry_vable_capacities_override
@@ -3249,53 +2391,28 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             #fill_entry_raw_reds_override
 
             fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
-                let mut __offset: usize = 0;
-                #(#create_sym_scalar_inits)*
-                #(#create_sym_array_inits)*
+                #(#create_sym_array_len_inits)*
                 #(#create_sym_virt_array_inits)*
-                #create_sym_vable_identity_init
-                #(#create_sym_ref_scalar_inits)*
-                #(#create_sym_float_scalar_inits)*
                 #sym_ty {
-                    #(#create_sym_scalar_names,)*
-                    #(#create_sym_scalar_value_names,)*
-                    #(#create_sym_array_names,)*
-                    #(#create_sym_array_value_names,)*
+                    #(#create_sym_array_len_names,)*
                     #(#create_sym_virt_array_len_value_names,)*
-                    #create_sym_vable_identity_field_names
-                    #(#create_sym_ref_scalar_names,)*
-                    #(#create_sym_ref_scalar_value_names,)*
-                    #(#create_sym_float_scalar_names,)*
-                    #(#create_sym_float_scalar_value_names,)*
                     loop_header_pc: header_pc,
                     trace_started: false,
                 }
             }
 
             fn initialize_sym(&self, sym: &mut #sym_ty, _meta: &#meta_ty) {
-                #(#initialize_sym_scalar_parts)*
-                #(#initialize_sym_array_parts)*
                 #(#initialize_sym_virt_array_parts)*
-                #initialize_sym_vable_identity_part
-                #(#initialize_sym_ref_scalar_parts)*
-                #(#initialize_sym_float_scalar_parts)*
             }
 
-            // Retires `create_sym`'s `__offset` numbering for callers whose
-            // trace does not number its inputargs the same way — see the trait
-            // declaration for why a bridge is such a caller and why a stale
-            // mint resolves instead of missing.  Mirrors the `#sym_ty`
-            // constructor field-for-field: every `OpRef` it fills from
-            // `__offset` is cleared here, and nothing else is touched.
-            fn count_bound_sym_inputargs(sym: &#sym_ty) -> Option<usize> {
-                let mut __bound = 0usize;
-                #(#count_bound_sym_parts)*
-                Some(__bound)
+            // `create_sym` no longer mints red InputArgs; a bound count of
+            // zero is the orthodox shape (`clear_sym_inputarg_bindings` is
+            // a matching no-op).
+            fn count_bound_sym_inputargs(_sym: &#sym_ty) -> Option<usize> {
+                Some(0)
             }
 
-            fn clear_sym_inputarg_bindings(sym: &mut #sym_ty) {
-                #(#clear_sym_binding_parts)*
-            }
+            fn clear_sym_inputarg_bindings(_sym: &mut #sym_ty) {}
 
             // ── Part A (bridge resume-decode). ──
             //
@@ -3452,9 +2569,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 ))
             }
 
-            #[allow(clippy::reversed_empty_ranges)]
+            #[allow(clippy::reversed_empty_ranges, unused_variables)]
             fn setup_bridge_sym(
-                sym: &mut #sym_ty,
+                _sym: &mut #sym_ty,
                 ctx: &mut majit_metainterp::TraceCtx,
                 resume_data: &majit_metainterp::ResumeDataResult,
                 rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -3462,8 +2579,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 fail_types: &[majit_ir::Type],
                 executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
             ) {
-                use majit_ir::resumedata::RebuiltValue;
-                use majit_metainterp::JitCodeSym as _;
                 if majit_metainterp::bridge_diag_enabled() {
                     eprintln!(
                         "[setup_bridge_sym] CALLED frames={} rd_virtuals={}",
@@ -3502,251 +2617,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     ctx.mark_bridge_replay_incomplete();
                 }
                 #seed_bridge_vable
-                #rebind_bridge_vable_identity
-                let frame = match resume_data.frames.first() {
-                    Some(f) => f,
-                    None => return,
-                };
-                let __dbg = majit_metainterp::bridge_debug_enabled();
-                // Clone so `ctx` is free for `const_int`/`const_ref` below.
-                let reg_indices = match ctx.bridge_reg_indices() {
-                    Some(r) => r.clone(),
-                    None => {
-                        if __dbg {
-                            eprintln!("[bridgeB] no reg_indices stashed — declining to seed");
-                        }
-                        return;
-                    }
-                };
-                if __dbg {
-                    eprintln!(
-                        "[bridgeB] frame jc={} pc={} fail_values={:?} fail_types={:?}",
-                        frame.jitcode_index, frame.pc, fail_values, fail_types
-                    );
-                    eprintln!(
-                        "[bridgeB] reg_indices int={:?} ref={:?} float={:?} values.len={} int_base={} ref_base={} float_base={}",
-                        reg_indices.int,
-                        reg_indices.ref_,
-                        reg_indices.float,
-                        frame.values.len(),
-                        #int_identity_base,
-                        #ref_identity_base,
-                        #float_identity_base
-                    );
-                }
-                if reg_indices.total_len() != frame.values.len() {
-                    if __dbg {
-                        eprintln!("[bridgeB] reg_indices/frame length mismatch — declining");
-                    }
-                    return;
-                }
-                let __ref_off = reg_indices.int.len();
-                let __float_off = reg_indices.int.len() + reg_indices.ref_.len();
-                // int scalars: identity register = int_identity_base + k.
-                for __k in 0..#num_scalars {
-                    let __target = #int_identity_base + __k;
-                    let __pos = reg_indices.int.iter().position(|&r| r as usize == __target);
-                    let __pos = match __pos {
-                        Some(p) => p,
-                        None => {
-                            // The guard's resume frame does not carry this
-                            // field's identity register, so there is no red to
-                            // decode — measured on dualtape, where the frame's
-                            // live int set is `[0]` while the two int scalars
-                            // sit at identity registers 1 and 2.
-                            //
-                            // Its concrete value is still known: `initialize_sym`
-                            // read it off the live state at bridge entry and
-                            // `clear_sym_inputarg_bindings` preserves the value
-                            // mirrors. Bind it as a constant, which is exactly
-                            // what the `RebuiltValue::Const` arm below does for a
-                            // field the frame carries already folded — the two
-                            // cases differ in who folded it, not in what the
-                            // bridge should observe.
-                            //
-                            // Leaving it unbound instead hands the optimizer an
-                            // `OpRef::NONE`, which has no operand and no type;
-                            // `materialize_operand_at` and `not_virtual` both
-                            // reject it.
-                            //
-                            // The `.expect` is load-bearing and it has been
-                            // exercised: on `examples/dualtape` this arm is
-                            // reached 24 times in a passing run (counted off
-                            // the `MAJIT_BRIDGE_DEBUG` line below) and fires 0
-                            // times. So the mirror is populated at every reach
-                            // — the value is recovered from the state, never
-                            // fabricated, and `const_int` never mints a
-                            // stand-in zero. That separation is measured here
-                            // and nowhere else: the dualtape fixture greens on
-                            // no-panic plus correct output, so a fabricated
-                            // value would pass it. Same for the ref and float
-                            // arms below, which share this shape.
-                            let __bits = sym.state_field_value(__k).expect("state field concrete value not initialized");
-                            let __op = ctx.const_int(__bits);
-                            sym.set_state_field_ref(__k, __op);
-                            sym.set_state_field_value(__k, __bits);
-                            if __dbg {
-                                eprintln!("  int scalar {} <- reg {} ABSENT from frame, bound Const {}", __k, __target, __bits);
-                            }
-                            continue;
-                        }
-                    };
-                    match &frame.values[__pos] {
-                        RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Int) => {
-                            let (__op, __shadow) = majit_metainterp::bridge_decode_red(
-                                *n, *kind, fail_values, fail_types,
-                            );
-                            sym.set_state_field_ref(__k, __op);
-                            sym.set_state_field_value(__k, __shadow);
-                            if __dbg {
-                                eprintln!("  int scalar {} <- reg {} Box {} = {}", __k, __target, n, __shadow);
-                            }
-                        }
-                        RebuiltValue::Const(c) => {
-                            let __bits = c.as_raw_i64();
-                            let __op = ctx.const_int(__bits);
-                            sym.set_state_field_ref(__k, __op);
-                            sym.set_state_field_value(__k, __bits);
-                            if __dbg {
-                                eprintln!("  int scalar {} <- reg {} Const {}", __k, __target, __bits);
-                            }
-                        }
-                        RebuiltValue::Virtual(__vidx) => {
-                            // resume.py getvirtual_ptr getvirtual — materialize the
-                            // virtual as bridge NEW/SETFIELD_GC ops and bind the
-                            // state field to its OpRef. Symbolic only; the concrete
-                            // int shadow needs backend/callinfocollection.
-                            let __op = majit_metainterp::materialize_bridge_virtual(
-                                ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,
-                            );
-                            // `OpRef::NONE` is the applying reader declining a
-                            // virtual kind it cannot allocate. Binding the field
-                            // to it would leave the walk reading a state field
-                            // the heap does not back, so raise the same decline
-                            // `replay_pending_fields` raises above.
-                            if __op.is_none() {
-                                ctx.mark_bridge_replay_incomplete();
-                            }
-                            sym.set_state_field_ref(__k, __op);
-                            if __dbg {
-                                eprintln!("  int scalar {} <- reg {} Virtual {}", __k, __target, __vidx);
-                            }
-                        }
-                        __other => {
-                            if __dbg {
-                                eprintln!("  int scalar {} <- reg {} UNSEEDED variant={:?}", __k, __target, std::mem::discriminant(__other));
-                            }
-                        }
-                    }
-                }
-                // ref scalars: identity register = ref_identity_base + j.
-                for __j in 0..#num_ref_scalars {
-                    let __target = #ref_identity_base + __j;
-                    let __pos = reg_indices.ref_.iter().position(|&r| r as usize == __target);
-                    let __pos = match __pos {
-                        Some(p) => p,
-                        None => {
-                            // Ref twin of the int arm above — same reason, same
-                            // remedy, `const_ref` instead of `const_int`. Kept
-                            // symmetric deliberately: a bank left on the bare
-                            // `continue` reintroduces the unbound-field hazard
-                            // for any state that declares one.
-                            let __bits = sym.state_ref_field_value(__j).expect("ref state field concrete value not initialized");
-                            let __op = ctx.const_ref(__bits);
-                            sym.set_state_ref_field_ref(__j, __op);
-                            sym.set_state_ref_field_value(__j, __bits);
-                            if __dbg {
-                                eprintln!("  ref scalar {} <- reg {} ABSENT from frame, bound Const {:#x}", __j, __target, __bits);
-                            }
-                            continue;
-                        }
-                    };
-                    match &frame.values[__ref_off + __pos] {
-                        RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Ref) => {
-                            let (__op, __shadow) = majit_metainterp::bridge_decode_red(
-                                *n, *kind, fail_values, fail_types,
-                            );
-                            sym.set_state_ref_field_ref(__j, __op);
-                            sym.set_state_ref_field_value(__j, __shadow);
-                            if __dbg {
-                                eprintln!("  ref scalar {} <- reg {} Box {} = {:#x}", __j, __target, n, __shadow);
-                            }
-                        }
-                        RebuiltValue::Const(c) => {
-                            let __bits = c.as_raw_i64();
-                            let __op = ctx.const_ref(__bits);
-                            sym.set_state_ref_field_ref(__j, __op);
-                            sym.set_state_ref_field_value(__j, __bits);
-                            if __dbg {
-                                eprintln!("  ref scalar {} <- reg {} Const {:#x}", __j, __target, __bits);
-                            }
-                        }
-                        RebuiltValue::Virtual(__vidx) => {
-                            // resume.py getvirtual_ptr getvirtual — materialize the
-                            // virtual and bind the ref state field to its OpRef.
-                            let __op = majit_metainterp::materialize_bridge_virtual(
-                                ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,
-                            );
-                            // Int twin's reason, same remedy.
-                            if __op.is_none() {
-                                ctx.mark_bridge_replay_incomplete();
-                            }
-                            sym.set_state_ref_field_ref(__j, __op);
-                            if __dbg {
-                                eprintln!("  ref scalar {} <- reg {} Virtual {}", __j, __target, __vidx);
-                            }
-                        }
-                        __other => {
-                            if __dbg {
-                                eprintln!("  ref scalar {} <- reg {} UNSEEDED variant={:?}", __j, __target, std::mem::discriminant(__other));
-                            }
-                        }
-                    }
-                }
-                // float scalars: identity register = float_identity_base + k.
-                for __k in 0..#num_float_scalars {
-                    let __target = #float_identity_base + __k;
-                    let __pos = reg_indices.float.iter().position(|&r| r as usize == __target);
-                    let __pos = match __pos {
-                        Some(p) => p,
-                        None => {
-                            // Float twin of the int/ref arms above. The mirror
-                            // stores the float's raw bits, so the constant is
-                            // minted from the bit pattern, matching how
-                            // `initialize_sym` and `restore_banked3` carry it.
-                            let __bits = sym.state_float_field_value(__k).expect("float state field concrete value not initialized");
-                            let __op = ctx.const_float(__bits);
-                            sym.set_state_float_field_ref(__k, __op);
-                            sym.set_state_float_field_value(__k, __bits);
-                            if __dbg {
-                                eprintln!("  float scalar {} <- reg {} ABSENT from frame, bound Const {}", __k, __target, f64::from_bits(__bits as u64));
-                            }
-                            continue;
-                        }
-                    };
-                    match &frame.values[__float_off + __pos] {
-                        RebuiltValue::Box(n, kind) if matches!(kind, majit_ir::Type::Float) => {
-                            let (__op, __shadow) = majit_metainterp::bridge_decode_red(
-                                *n, *kind, fail_values, fail_types,
-                            );
-                            sym.set_state_float_field_ref(__k, __op);
-                            sym.set_state_float_field_value(__k, __shadow);
-                            if __dbg {
-                                eprintln!("  float scalar {} <- reg {} Box {} = {:#x}", __k, __target, n, __shadow);
-                            }
-                        }
-                        RebuiltValue::Const(c) => {
-                            let __bits = c.as_raw_i64();
-                            let __op = ctx.const_float(__bits);
-                            sym.set_state_float_field_ref(__k, __op);
-                            sym.set_state_float_field_value(__k, __bits);
-                            if __dbg {
-                                eprintln!("  float scalar {} <- reg {} Const {:#x}", __k, __target, __bits);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
             }
 
             fn is_compatible(&self, meta: &#meta_ty) -> bool {
@@ -3786,20 +2656,18 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(labels)
             }
 
-            fn collect_scalar_state_field_values(sym: &Self::Sym) -> Vec<i64> {
-                let mut values = Vec::new();
-                #(#collect_scalar_values_parts)*
-                #(#collect_float_scalar_values_parts)*
-                values
+            fn collect_scalar_state_field_values(_sym: &Self::Sym) -> Vec<i64> {
+                Vec::new()
             }
 
-            fn collect_ref_scalar_state_field_values(sym: &Self::Sym) -> Vec<i64> {
-                let mut values = Vec::new();
-                #(#collect_ref_scalar_values_parts)*
-                values
+            fn collect_ref_scalar_state_field_values(_sym: &Self::Sym) -> Vec<i64> {
+                Vec::new()
             }
 
             fn writeback_scalar_state_fields_from_values(&mut self, values: &[i64]) {
+                if values.len() < #num_scalars + #num_float_scalars {
+                    return;
+                }
                 #(#writeback_from_values_parts)*
                 #(#writeback_float_from_values_parts)*
             }
@@ -3830,21 +2698,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn state_field_layout(&self) -> majit_metainterp::blackhole::StateFieldLayout {
                 // Flat slot layout for blackhole resume: scalar count is
                 // static, each flattened fixed `[int]` array contributes its
-                // live length, and each virt array contributes two slots
-                // (ptr, len).  Ref scalars add a parallel 0-based ref-bank
-                // count.  Mirrors `extract_live` / the canonical
-                // `live_slots_for_state_field_jit` ordering.
+                // live length. The vable identity is a Ref, not an int slot.
+                // Ref scalars add a parallel 0-based ref-bank count. Mirrors
+                // `extract_live` / `live_slots_for_state_field_jit`.
                 #state_field_layout_ctor
             }
 
-            fn collect_jump_args(sym: &#sym_ty) -> Vec<majit_ir::OpRef> {
-                let mut args = Vec::new();
-                #(#collect_scalar_parts)*
-                #(#collect_array_parts)*
-                #collect_vable_identity_part
-                #(#collect_ref_scalar_parts)*
-                #(#collect_float_scalar_parts)*
-                args
+            fn collect_jump_args(_sym: &#sym_ty) -> Vec<majit_ir::OpRef> {
+                Vec::new()
             }
 
             #collect_jump_args_with_boxes_method
@@ -3853,15 +2714,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 true #(#validate_array_checks)*
             }
 
-            // State-field JIT
-            // override of `JitState::populate_frame_for_guard` so
-            // jitdriver-level guard sites (e.g. `force_finish_trace`'s
-            // GuardAlwaysFails fallback) get the same snapshot wire-up
-            // as the dispatch-level `record_state_guard`
-            // (`pyjitpl/dispatch.rs`).  Calls the macro-emitted
-            // `JitCodeSym::populate_frame_int_regs` to bridge
-            // `__JitSym_<fn>` slots onto `MIFrame.int_regs`, then builds a
-            // single-frame snapshot via the canonical helper.
+            // `pyjitpl.py MetaInterp.capture_resumedata` for jitdriver-level
+            // guard sites (e.g. `force_finish_trace`'s GuardAlwaysFails).
+            // Identity slots already hold the reds; this only walks the
+            // live framestack.
             fn populate_frame_for_guard(
                 sym: &#sym_ty,
                 frames: &mut majit_metainterp::MIFrameStack,
@@ -3874,37 +2730,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 if frames.frames.is_empty() {
                     return None;
                 }
-                let __root = &mut frames.frames[0];
-                let __n = sym.int_identity_slots_end().min(__root.int_regs.len());
-                let __saved_int_regs: Vec<Option<majit_ir::OpRef>> =
-                    __root.int_regs[..__n].to_vec();
-                let __saved_int_values: Vec<Option<i64>> =
-                    __root.int_values[..__n].to_vec();
-                // `populate_frame_int_regs` also seeds the ref-scalar
-                // identity slots (`ref_regs[ref_identity_base..]`,
-                // `codegen_state.rs` populate_ref_scalar_parts), so the ref
-                // bank needs the same transient save/restore the int bank
-                // gets — mirrors `record_state_guard`
-                // (`pyjitpl/dispatch.rs`).  Without it the ref
-                // scalars stay clobbered in the live frame after the
-                // jitdriver-level GuardAlwaysFails snapshot is built.
-                let __rn = sym.ref_identity_slots_end().min(__root.ref_regs.len());
-                let __saved_ref_regs: Vec<Option<majit_ir::OpRef>> =
-                    __root.ref_regs[..__rn].to_vec();
-                let __saved_ref_values: Vec<Option<i64>> =
-                    __root.ref_values[..__rn].to_vec();
-                let __fn = sym.float_identity_slots_end().min(__root.float_regs.len());
-                let __saved_float_regs: Vec<Option<majit_ir::OpRef>> =
-                    __root.float_regs[..__fn].to_vec();
-                let __saved_float_values: Vec<Option<i64>> =
-                    __root.float_values[..__fn].to_vec();
-                sym.populate_frame_int_regs(__root);
-                // pyjitpl.py `capture_resumedata(framestack,
-                // virtualizable_boxes, virtualref_boxes,
-                // last_snapshot)` — the snapshot must carry the live
-                // vable + vref box lists or the resume reader sees
-                // empty arrays on guard failure.
-                let __snapshot = majit_metainterp::build_state_field_snapshot(
+                Some(majit_metainterp::build_state_field_snapshot(
                     frames,
                     __op_live,
                     __all_liveness,
@@ -3912,15 +2738,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     __virtualizable_boxes,
                     __virtualref_boxes,
                     Some((sym.int_identity_slots_base(), sym.int_identity_reserved_end())),
-                );
-                let __root = &mut frames.frames[0];
-                __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);
-                __root.int_values[..__n].copy_from_slice(&__saved_int_values);
-                __root.ref_regs[..__rn].copy_from_slice(&__saved_ref_regs);
-                __root.ref_values[..__rn].copy_from_slice(&__saved_ref_values);
-                __root.float_regs[..__fn].copy_from_slice(&__saved_float_regs);
-                __root.float_values[..__fn].copy_from_slice(&__saved_float_values);
-                Some(__snapshot)
+                ))
             }
 
             #build_vinfo_override

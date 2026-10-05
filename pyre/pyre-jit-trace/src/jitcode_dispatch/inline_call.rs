@@ -15367,7 +15367,10 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
-    let region_from = ctx.trace_ctx.get_trace_position()._count;
+    // Value-producing boxes are numbered by opencoder `_index` (`OpRef::RefOp`
+    // `raw()`); `_count` also counts voids, so a store into a region-fresh
+    // allocation would fail `obj.raw() >= from` and residualize the dunder.
+    let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
     let rewind_guard =
         admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
@@ -15646,7 +15649,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
-    let region_from = ctx.trace_ctx.get_trace_position()._count;
+    // Value-producing boxes are numbered by opencoder `_index` (`OpRef::RefOp`
+    // `raw()`); `_count` also counts voids, so a store into a region-fresh
+    // allocation would fail `obj.raw() >= from` and residualize the dunder.
+    let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
     let rewind_guard =
         admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));

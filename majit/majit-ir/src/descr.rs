@@ -4051,10 +4051,10 @@ pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
 /// read resolved: the struct, the field, and the `QuasiImmut` instance
 /// `get_current_qmut_instance` handed back.
 ///
-/// Everything else about it is the wrapped field descr, so the whole `Descr`
-/// surface delegates and the op stays indistinguishable from one carrying the
-/// field descr directly — including `index()`, which the heap cache and the
-/// tracer key on.
+/// `index()` (heapcache / field identity) still delegates to the wrapped
+/// field. `get_descr_index()` does not: `AbstractDescr.get_descr_index`
+/// stays `-1`, so `opencoder.py _encode_descr` appends this wrapper to
+/// `Trace._descrs` instead of encoding the field's global slot.
 ///
 /// `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`) is
 /// captured on the descr, matching `record1(QUASIIMMUT_FIELD, box,
@@ -4144,11 +4144,12 @@ impl Descr for QuasiImmutDescr {
         self.fielddescr.set_index(index);
     }
     fn get_descr_index(&self) -> i32 {
-        self.fielddescr.get_descr_index()
+        // `history.py AbstractDescr.get_descr_index` — not the wrapped
+        // field's `setup_descrs` slot. Encoding that slot would make
+        // `TraceIterator` restore the FieldDescr and drop the qmut.
+        -1
     }
-    fn set_descr_index(&self, index: i32) {
-        self.fielddescr.set_descr_index(index);
-    }
+    fn set_descr_index(&self, _index: i32) {}
     fn get_ei_index(&self) -> u32 {
         self.fielddescr.get_ei_index()
     }
@@ -8452,6 +8453,27 @@ mod register_keyed_size_authority_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quasi_immut_descr_encoder_index_is_not_the_fields() {
+        #[derive(Debug)]
+        struct Handle;
+        impl QuasiImmutHandle for Handle {
+            fn is_current(&self) -> bool {
+                true
+            }
+            fn register_loop_token(&self, _token: &std::sync::Arc<dyn QuasiImmutLoopToken>) {}
+            fn instance_identity(&self) -> usize {
+                1
+            }
+        }
+        let field = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false));
+        field.set_descr_index(7);
+        let qmut = QuasiImmutDescr::new(field.clone() as DescrRef, 0, Arc::new(Handle), None);
+        assert_eq!(qmut.index(), field.index());
+        assert_eq!(qmut.get_descr_index(), -1);
+        assert_eq!(field.get_descr_index(), 7);
+    }
 
     #[test]
     fn gc_fielddescrs_drops_offsets_outside_the_fixed_part() {

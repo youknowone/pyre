@@ -486,24 +486,15 @@ mod virt_array_with_float_scalar {
         let reds = <MixedState as JitState>::collect_jump_args(&sym);
         let close = <MixedState as JitState>::collect_jump_args_with_boxes(&sym, &boxes);
 
-        assert_eq!(
-            close.len(),
-            reds.len() + 2,
-            "the close carries every red plus one box per element, minus the \
-             trailing identity (pyjitpl.py:2988-2989)"
+        assert!(
+            reds.is_empty(),
+            "plain reds live in the portal frame, not on __JitSym"
         );
         assert_eq!(
-            &close[..reds.len()],
-            &reds[..],
-            "the reds must lead, in `collect_jump_args` order and unshifted — a \
-             float scalar displaced by an element box binds the JUMP to the wrong \
-             LABEL slot at equal arity"
-        );
-        assert_eq!(
-            &close[reds.len()..],
-            &[e0, e1],
-            "the element block must be the strict suffix `live_arg_boxes += \
-             virtualizable_boxes; live_arg_boxes.pop()` produces"
+            close,
+            vec![identity, e0, e1],
+            "without a portal frame the JUMP is the vable identity plus the \
+             element suffix (`live_arg_boxes += virtualizable_boxes; pop`)"
         );
     }
 
@@ -529,7 +520,7 @@ mod virt_array_with_float_scalar {
             vec![
                 majit_ir::Type::Int, // cells[0]
                 majit_ir::Type::Int, // cells[1]
-                majit_ir::Type::Ref, // __vable_identity
+                majit_ir::Type::Ref, // vable identity
             ],
             "no `stack` element belongs in the red block",
         );
@@ -537,7 +528,7 @@ mod virt_array_with_float_scalar {
     }
 
     #[test]
-    fn clearing_the_sym_bindings_drops_positions_and_keeps_values() {
+    fn create_sym_holds_layout_not_red_inputargs() {
         let state = MixedState {
             sp: 7,
             cells: vec![11, 13],
@@ -549,26 +540,13 @@ mod virt_array_with_float_scalar {
         let mut sym = <MixedState as JitState>::create_sym(&meta, 0);
         state.initialize_sym(&mut sym, &meta);
 
-        // The mints that remain on the JitSym. `sp` / `acc` belong to the
-        // virtualizable (`virtualizable.py VirtualizableInfo.__init__`) and
-        // are not JitSym slots.
-        assert_eq!(sym.cells[0], majit_ir::OpRef::input_arg_int(0));
-        assert_eq!(sym.cells[1], majit_ir::OpRef::input_arg_int(1));
-        assert_eq!(sym.__vable_identity, majit_ir::OpRef::input_arg_ref(2));
-
-        <MixedState as JitState>::clear_sym_inputarg_bindings(&mut sym);
-
-        assert!(sym.cells[0].is_none(), "array cell 0 kept its position");
-        assert!(sym.cells[1].is_none(), "array cell 1 kept its position");
-        assert!(
-            sym.__vable_identity.is_none(),
-            "the virtualizable identity kept its position"
-        );
-
-        // The concrete mirrors are runtime data, not positions: clearing must
-        // not touch them, or the bridge loses the values `initialize_sym` read
-        // off the live state.
-        assert_eq!(sym.cells_values, vec![11, 13]);
+        // Plain reds live in the portal frame; `__JitSym` keeps flattened-array
+        // lengths (layout) and virt-array length mirrors (fresh-callee capacity).
+        assert_eq!(sym.cells_len, 2);
         assert_eq!(sym.stack_len_value, 2);
+        assert_eq!(
+            <MixedState as JitState>::count_bound_sym_inputargs(&sym),
+            Some(0)
+        );
     }
 }

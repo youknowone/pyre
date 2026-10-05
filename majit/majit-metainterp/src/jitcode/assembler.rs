@@ -7287,15 +7287,10 @@ pub fn live_slots_for_state_field_jit(
     float_scalar_base: usize,
     int_scalar_base: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let total_slots: usize =
-        num_scalars + array_lens.iter().sum::<usize>() + num_vable_identity_slots;
+    let total_slots: usize = num_scalars + array_lens.iter().sum::<usize>();
     // Int identity slots start past the dispatch JitCode's int-bank
-    // argument registers (`pc` at i0), mirroring the ref-bank base
-    // below: the guard-time canonical materialization writes the
-    // identity slots into the frame registers, so a slot aliasing an
-    // argument register would overwrite it before the resume stream is
-    // encoded (the re-executed jit_merge_point op then reads the state
-    // scalar where it expects the green `pc`).
+    // argument registers (`pc` at i0). The vable identity is a Ref in
+    // the ref bank / `virtualizable_boxes[-1]`, not an int slot.
     let int_scalar_end = int_scalar_base + total_slots;
     // End-exclusive: `int_scalar_base..int_scalar_end` fills indices up to
     // `int_scalar_end - 1`, so an end of exactly 256 (highest index 255) is
@@ -7327,7 +7322,14 @@ pub fn live_slots_for_state_field_jit(
     let live_i: Vec<u8> = (int_scalar_base as u32..int_scalar_end as u32)
         .map(|i| i as u8)
         .collect();
-    let live_r: Vec<u8> = (ref_scalar_base as u32..ref_scalar_end as u32)
+    // Vable identity is the portal ref argument immediately before the
+    // ref-scalar identity prefix (`ref_scalar_base - 1`).
+    let live_r_start = if num_vable_identity_slots > 0 {
+        ref_scalar_base.saturating_sub(1)
+    } else {
+        ref_scalar_base
+    };
+    let live_r: Vec<u8> = (live_r_start as u32..ref_scalar_end as u32)
         .map(|i| i as u8)
         .collect();
     let live_f: Vec<u8> = (float_scalar_base as u32..float_scalar_end as u32)
@@ -8339,16 +8341,13 @@ mod tests {
 
     #[test]
     fn state_field_canonical_slots_mixed_layout() {
-        // Mirrors the `tlc` example shape: 1 scalar (`stackpos`) + a
-        // virtualizable (`stack`) plus a synthetic 3-element flattened
-        // array.  The virtualizable contributes ONE slot — its identity —
-        // however many `[.. ; virt]` arrays it declares, so
-        // total_slots = 1 + 3 + 1 = 5 and live_i = [0, 1, 2, 3, 4] with
-        // the ref/float banks empty.
+        // 1 scalar + a 3-element flattened array in the int bank, plus a
+        // virtualizable identity in the ref bank (portal r1, with
+        // `ref_scalar_base` = 2 past `program` at r0 and the identity).
         let (live_i, live_r, live_f) =
-            super::live_slots_for_state_field_jit(1, &[3], 1, 0, 0, 0, 0, 0);
-        assert_eq!(live_i, vec![0u8, 1, 2, 3, 4]);
-        assert!(live_r.is_empty());
+            super::live_slots_for_state_field_jit(1, &[3], 1, 0, 2, 0, 0, 0);
+        assert_eq!(live_i, vec![0u8, 1, 2, 3]);
+        assert_eq!(live_r, vec![1u8]);
         assert!(live_f.is_empty());
     }
 

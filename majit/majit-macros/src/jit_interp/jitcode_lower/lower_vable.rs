@@ -1380,7 +1380,7 @@ impl<'c> Lowerer<'c> {
             self.emit_op(
                 OpMeta::linear(
                     OpKind::StateField,
-                    vec![Register::int(slot)],
+                    self.identity_use(Register::int(slot)),
                     vec![Register::int(reg)],
                 ),
                 quote! { __builder.load_state_field(#fi, #reg); },
@@ -1408,7 +1408,7 @@ impl<'c> Lowerer<'c> {
             self.emit_op(
                 OpMeta::linear(
                     OpKind::StateField,
-                    vec![Register::ref_(slot)],
+                    self.identity_use(Register::ref_(slot)),
                     vec![Register::ref_(reg)],
                 ),
                 quote! { __builder.load_state_field_ref(#fi, #reg); },
@@ -1431,7 +1431,7 @@ impl<'c> Lowerer<'c> {
             self.emit_op(
                 OpMeta::linear(
                     OpKind::StateField,
-                    vec![Register::float(slot)],
+                    self.identity_use(Register::float(slot)),
                     vec![Register::float(reg)],
                 ),
                 quote! { __builder.load_state_field_float(#fi, #reg); },

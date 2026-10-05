@@ -335,10 +335,9 @@ impl LowererConfig {
     /// slots — the int-bank mirror of `ref_identity_base`. `pc` is i0;
     /// portal-parameter greens and loop-carried greens follow
     /// (`portal_input_kind_counts`). An identity slot aliasing one of
-    /// those inputs lets the guard-time canonical materialization
-    /// overwrite the green before the resume stream is encoded, so the
-    /// blackhole's re-executed jit_merge_point reads a state scalar
-    /// where it expects that green.
+    /// those inputs would overwrite the green, so the blackhole's
+    /// re-executed jit_merge_point would read a state scalar where it
+    /// expects that green.
     pub(super) fn int_identity_base(&self) -> u16 {
         self.portal_input_kind_counts().0
     }
@@ -373,11 +372,12 @@ impl LowererConfig {
     /// whenever the state declares any `[.. ; virt]` array — the
     /// virtualizable is one red, `warmspot.py:538`, and array lengths are
     /// read off the live object, `virtualizable.py:150-153`);
-    /// ref identity = the ref scalars. A split sub-JitCode must reserve the
+    /// ref identity = the ref scalars. An arm sub-JitCode must reserve the
     /// SAME prefix so its register file spans the identity slots that the
-    /// arm body's `load/store_state_field` ops address and that the resume
-    /// path re-derives at deopt. Returns `0` for a bank with no identity
-    /// slots so the caller's `.max()` floor is inert there.
+    /// arm body's `load/store_state_field` ops address (`MIFrame.setup_call`
+    /// plants them on the portal; the arm addresses the same range).
+    /// Returns `0` for a bank with no identity slots so the caller's `.max()`
+    /// floor is inert there.
     pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
         // Scalars redirected onto the virtualizable (`vable_fields`) are
         // not independent identity slots. Counting them here would
@@ -390,8 +390,7 @@ impl LowererConfig {
             .map(|(_, index)| *index as u16 + 1)
             .max()
             .unwrap_or(0);
-        let int_end =
-            self.int_identity_base() + int_scalars + u16::from(!self.state_virt_arrays.is_empty());
+        let int_end = self.int_identity_base() + int_scalars;
         let ref_scalars = self
             .state_ref_scalars
             .iter()
@@ -405,6 +404,40 @@ impl LowererConfig {
             self.ref_identity_base() + ref_scalars
         };
         (int_end, ref_end)
+    }
+
+    /// Portal identity-slot registers that `load/store_state_field*` address.
+    ///
+    /// `jtransform.py handle_regular_call` emits `inline_call_*` then `-live-`.
+    /// `MIFrame.get_list_of_active_boxes(in_a_call=True)` reads that marker
+    /// on the caller frame, so the reds that live in the portal identity
+    /// prefix must be force-alive there. A later `load_state_field` already
+    /// keeps a slot live; a working-register reuse of the same value does
+    /// not, and the slot would drop from the parent snapshot.
+    pub(super) fn identity_slot_registers(&self) -> Vec<Register> {
+        let mut regs = Vec::new();
+        let int_base = self.int_identity_base();
+        for (name, index) in &self.state_scalars {
+            if self.is_state_vable_field(name) {
+                continue;
+            }
+            regs.push(Register::int(int_base + *index as u16));
+        }
+        let ref_base = self.ref_identity_base();
+        for (name, (index, _)) in &self.state_ref_scalars {
+            if self.is_state_vable_field(name) {
+                continue;
+            }
+            regs.push(Register::ref_(ref_base + *index as u16));
+        }
+        let float_base = self.float_identity_base();
+        for (name, index) in &self.state_float_scalars {
+            if self.is_state_vable_field(name) {
+                continue;
+            }
+            regs.push(Register::float(float_base + *index as u16));
+        }
+        regs
     }
 }
 
@@ -2427,6 +2460,31 @@ mod tests {
         assert_eq!(
             config.float_identity_end(),
             config.float_identity_base() + 251
+        );
+    }
+
+    #[test]
+    fn identity_slot_registers_list_plain_reds_not_vable_fields() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".into());
+        config.state_scalars.insert("redirected".into(), 0);
+        config.state_scalars.insert("kept".into(), 3);
+        config
+            .state_ref_scalars
+            .insert("kept_ref".into(), (1, syn::parse_quote!(Object)));
+        config.state_float_scalars.insert("kept_f".into(), 0);
+        config
+            .vable_fields
+            .insert("redirected".into(), (0, ValueKind::Int));
+        let mut regs = config.identity_slot_registers();
+        regs.sort();
+        assert_eq!(
+            regs,
+            vec![
+                Register::int(config.int_identity_base() + 3),
+                Register::ref_(config.ref_identity_base() + 1),
+                Register::float(config.float_identity_base()),
+            ]
         );
     }
 

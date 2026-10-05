@@ -634,6 +634,14 @@ pub struct TraceCtx {
     /// `recover` cannot reconstruct (loop-carried state held in a red bank but
     /// never written back to the shared heap). Empty unless single-pass.
     pub walk_final_reds: Vec<majit_ir::Value>,
+    /// Loop-carried boxes collected from the portal frame at walk end,
+    /// the `pyjitpl.py reached_loop_header` `live_arg_boxes` list.
+    pub close_jump_boxes: Option<Vec<(OpRef, Type)>>,
+    /// Walk-final int+float scalar identity values, in
+    /// `collect_scalar_state_field_values` order.
+    pub close_scalar_values: Option<Vec<i64>>,
+    /// Walk-final ref scalar identity values.
+    pub close_ref_scalar_values: Option<Vec<i64>>,
     /// Concrete payload of a root-frame FINISH reached by the tracing walk.
     /// RPython's return Box carries this value intrinsically; state-field
     /// synthetic register OpRefs do not all name recorder entries, so preserve
@@ -2112,6 +2120,9 @@ impl TraceCtx {
             deterministic_bridge_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
+            close_jump_boxes: None,
+            close_scalar_values: None,
+            close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
@@ -2202,6 +2213,9 @@ impl TraceCtx {
             deterministic_bridge_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
+            close_jump_boxes: None,
+            close_scalar_values: None,
+            close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
@@ -2418,7 +2432,7 @@ impl TraceCtx {
     /// silently swallow the value under the previous `if let Some`
     /// shape and hide cache-hit sanity-check mismatches.  Panic instead.
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
-        if opref.is_constant() {
+        if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return;
         }
         // Stamp the concrete value on the canonical `InputArg`/`Op` identity
@@ -2446,7 +2460,7 @@ impl TraceCtx {
     /// frame's result).  Leaving that result symbolic makes the downstream
     /// branch abort the trace cleanly rather than crash the tracer.
     pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
-        if opref.is_constant() {
+        if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return true;
         }
         self.recorder.set_concrete_at(opref.raw(), concrete)
@@ -2504,6 +2518,9 @@ impl TraceCtx {
     pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             return opref.inline_const_to_value();
+        }
+        if matches!(opref, OpRef::VoidOp(_)) {
+            return None;
         }
         self.recorder.concrete_at(opref.raw())
     }
@@ -2742,19 +2759,17 @@ impl TraceCtx {
     /// used as a JUMP red — `box_for_operand` would otherwise bind it to
     /// the void producer.
     pub fn opref_is_void_producer(&self, r: OpRef) -> bool {
-        if r.is_none() || r.ty() == Some(Type::Void) {
+        if r.is_none() || r.ty() == Some(Type::Void) || matches!(r, OpRef::VoidOp(_)) {
             return true;
         }
         if r.is_constant() || r.is_input_arg() {
             return false;
         }
-        let n = self.recorder.num_inputargs();
-        let Some(idx) = (r.raw() as usize).checked_sub(n) else {
-            return false;
-        };
-        self.recorder.ops().get(idx).is_some_and(|op| {
-            op.pos().get().raw() == r.raw() && op.opcode.result_type() == Type::Void
-        })
+        // Byte-mode `ops` is empty until materialize. `opcode_of` reads
+        // FrontendSlots by `_index` / `_count` (`history.py getopnum`).
+        self.recorder
+            .opcode_of(r)
+            .is_some_and(|op| op.result_type() == Type::Void)
     }
 
     /// Input argument types in loop-header order.
@@ -3158,11 +3173,7 @@ impl TraceCtx {
         let value = self
             .concrete_of_opref(opref)
             .or_else(|| self.virtualizable_payload_concrete(opref));
-        let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
-        if let Some(value) = value {
-            self.try_set_opref_concrete(same_as, value);
-        }
-        same_as
+        self.record_op_with_value(majit_ir::OpCode::same_as_for_type(tp), &[opref], value)
     }
 
     fn virtualizable_payload_concrete(&self, opref: OpRef) -> Option<Value> {
@@ -3592,9 +3603,12 @@ impl TraceCtx {
             };
             let bits = unsafe { info.read_field(vable_ptr as *const u8, field_index) };
             let concrete = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
-            let opref =
-                self.record_op_with_descr(opcode, &[vable], info.static_field_descr(field_index));
-            self.set_opref_concrete(opref, concrete);
+            let opref = self.record_op_with_descr_value(
+                opcode,
+                &[vable],
+                info.static_field_descr(field_index),
+                Some(concrete),
+            );
             boxes.push(opref);
             values.push(concrete);
         }
@@ -3622,12 +3636,12 @@ impl TraceCtx {
                     info.read_array_item(vable_ptr as *const u8, array_index, item_index)
                 };
                 let concrete = crate::pyjitpl::heap_value_for_pub(item_type, bits);
-                let opref = self.record_op_with_descr(
+                let opref = self.record_op_with_descr_value(
                     item_opcode,
                     &[array_ref, index],
                     array_descr.clone(),
+                    Some(concrete),
                 );
-                self.set_opref_concrete(opref, concrete);
                 boxes.push(opref);
                 values.push(concrete);
             }

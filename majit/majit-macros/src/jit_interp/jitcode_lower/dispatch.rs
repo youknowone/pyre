@@ -3137,6 +3137,11 @@ pub(super) fn lower_dispatch_chain(
                                     arm_inline_call_reads
                                         .push(Register::new(entry.kind, entry.parent_reg));
                                 }
+                                for reg in config.identity_slot_registers() {
+                                    if !arm_inline_call_reads.contains(&reg) {
+                                        arm_inline_call_reads.push(reg);
+                                    }
+                                }
                                 let inline_call_emit = match pc_return_reg {
                                     Some(pc_reg) => {
                                         dispatch_arm_inline_call_tokens_i(&layout, pc_reg)
@@ -3148,11 +3153,12 @@ pub(super) fn lower_dispatch_chain(
                                 // ref[ref_identity_base..ref_end) exist as real
                                 // registers — the arm body's state-field ops address
                                 // them and the resume path re-derives them at deopt.
-                                let (__split_int_end, __split_ref_end) = if config.split_dispatch {
-                                    config.split_identity_reg_ends()
-                                } else {
-                                    (0u16, 0u16)
-                                };
+                                // Identity slots are the portal's argument
+                                // registers (`MIFrame.setup_call`) and must
+                                // exist in every arm whose `load/store_state_field*`
+                                // addresses them, including `switch_dispatch`.
+                                let (__split_int_end, __split_ref_end) =
+                                    config.split_identity_reg_ends();
                                 let min_i_regs = layout
                                     .iter()
                                     .filter(|e| matches!(e.kind, BindingKind::Int))
@@ -3260,8 +3266,7 @@ pub(super) fn lower_dispatch_chain(
                         arm_inline_call_emit,
                     );
                     // handle_regular_call — trailing -live- after inline_call_*.
-                    lowerer.emit_op(
-                        OpMeta::live_marker(),
+                    lowerer.emit_post_inline_live_marker(
                         quote::quote! { let _ = __builder.live_placeholder(); },
                     );
                 }
@@ -3990,33 +3995,15 @@ pub(crate) fn lower_dispatch_body(
     // (`pc` at i0, then portal and loop-carried int greens), and ref scalars at
     // `ref_regs[base..base+num_ref_scalars)` where base =
     // `ref_identity_base()` skips the dispatch JitCode's ref-bank arguments
-    // (`program` at r0, vable identity at r1 when present), populated by
-    // populate_frame_int_regs / restore_banked.  `alloc_reg` draws BOTH int
-    // and ref working registers from the single `next_reg` counter, so floor
-    // it above the larger prefix: a working register that aliased an identity
-    // slot in either bank would overwrite the field value the blackhole
-    // resume seeder restored, corrupting the live interpreter state on guard
-    // failure.  With no scalars `int_identity_end` is just the base, which
-    // keeps pc's i0 reserved.
-    let ref_identity_end = if config.state_ref_scalars.is_empty() {
-        0
-    } else {
-        config.ref_identity_base() + config.state_ref_scalars.len() as u16
-    };
-    // After the scalars the dispatch frame seeds ONE int slot for the
-    // virtualizable identity, however many `[.. ; virt]` arrays the state
-    // declares (`pyjitpl.py:2984-2989` carries the virtualizable once;
-    // `virtualizable.py:150-153` reads each array length off the live object).
-    // `populate_frame_int_regs` / `total_slots` count it the same way.  Reserve
-    // it in the working-register floor: a working register landing on the
-    // seeded identity slot is overwritten by the guard-failure resume seeder,
-    // corrupting the live state the snapshot captures.  Fixed `[int]` arrays seed one slot per live element, but their
-    // length is only known at runtime (tlr reassigns `regs = vec![0; n]`), so
-    // this compile-time floor cannot reserve those element slots; that residual
-    // affects only fixed-array consumers (none of which also carry a virt array).
-    let int_identity_end = config.int_identity_base()
-        + config.state_scalars.len() as u16
-        + u16::from(!config.state_virt_arrays.is_empty());
+    // (`program` at r0, vable identity at r1 when present), seeded at walk
+    // start by `MIFrame.setup_call`.
+    // `alloc_reg` draws BOTH int and ref working registers from the single
+    // `next_reg` counter, so floor it above the larger prefix: a working
+    // register that aliased an identity slot would clobber a red
+    // `load_state_field*` / `store_state_field*` addresses. With no scalars
+    // `int_identity_end` is just the base, which keeps pc's i0 reserved.
+    // The vable identity is a Ref, not an extra int slot.
+    let (int_identity_end, ref_identity_end) = config.split_identity_reg_ends();
     // Float scalars seed their own reserved prefix at
     // `float_regs[float_identity_base()..float_identity_end())`, restored by
     // the guard-failure resume seeder just like the int/ref banks. `alloc_reg`

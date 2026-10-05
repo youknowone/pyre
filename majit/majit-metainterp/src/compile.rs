@@ -6002,11 +6002,9 @@ impl TraceCtx {
         green_boxes: Vec<crate::trace_ctx::GreenBox>,
         header_pc: usize,
     ) {
-        // Use the TraceCtx-level position so `snapshot_data_len` reflects
-        // the current Vec<Snapshot> side table length (moved
-        // snapshots off `recorder::Trace`; a bare `recorder.get_position()`
-        // would report `snapshot_data_len: 0`, causing `cut_trace` to
-        // truncate valid snapshots when this merge point is restored).
+        // Use the TraceCtx-level position so `snapshot_data_len` is
+        // `len(_snapshot_data)` in byte mode and `Vec<Snapshot>` length
+        // on the structured recorder.
         let position = self.get_trace_position();
         // `green_boxes` describes the virtualizable that is live right now, so
         // pair the snapshot with its address: `compile.py:510` reads the frame

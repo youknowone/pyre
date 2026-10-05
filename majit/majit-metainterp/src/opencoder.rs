@@ -632,15 +632,9 @@ where
             // pointing at the slot we just wrote.
             self._index = orig as u32 + 1;
         } else if !src.pos().get().is_none() {
-            // Void op carrying a raw trace position: still allocate a
-            // fresh OpRef so the `_fresh` counter stays in lockstep with
-            // the raw trace position counter. The op is not cached
-            // (RPython doesn't cache void results either), so later args
-            // never reference it. `AbstractResOp.type = 'v'`
-            // (resoperation.py) → VoidOp variant.
-            let f = OpRef::void_op(self._fresh);
-            self._fresh += 1;
-            res.pos().set(f);
+            // Void ops are not `_index` boxes. Name them by the walk's
+            // `_count` so `_fresh` stays aligned with value `_index`.
+            res.pos().set(OpRef::void_op(self._count));
         } else {
             res.pos().set(src.pos().get());
         }
@@ -796,9 +790,11 @@ impl<'a> ByteTraceIter<'a> {
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
         let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
+        // `_cache` is keyed by original `_index` (`get_position()`). The
+        // fresh InputArg objects are the iterator's `cls()` identity;
+        // their own index is `_fresh` so the optimizer can tell them
+        // apart from the parent loop's boxes.
         let mut _fresh = start_fresh;
-        // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
-        // self.trace.inputargs]` — type comes from each `InputArg.tp.get()`.
         let inputargs: Vec<majit_ir::InputArgRc> = live_inputargs
             .iter()
             .map(|ia| {
@@ -1069,17 +1065,24 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
         // the ResOp class is intrinsically typed via the IntOp/FloatOp/
         // RefOp mixin (resoperation.py) or the AbstractResOp
-        // default `'v'` (resoperation.py). pyre routes through
-        // `op_typed` which lands on the matching variant.
-        let fresh_pos = OpRef::op_typed(self._fresh, opcode.result_type());
-        self._fresh += 1;
-        op.pos().set(fresh_pos);
+        // default `'v'` (resoperation.py). Value ops use `_index` as
+        // `FrontendOp.get_position()`; void ops are named by the
+        // op-sequence count of this walk.
+        let ty = opcode.result_type();
+        let pos = if ty != Type::Void {
+            let p = OpRef::op_typed(self._fresh, ty);
+            self._fresh += 1;
+            p
+        } else {
+            OpRef::void_op(self._count)
+        };
+        op.pos().set(pos);
         // opencoder.py `self._cache[self._index] = res` — the
         // fresh op IS the cached box object, so a later TAGBOX arg binds
         // to this exact `Rc` (`from_bound_op` → `Operand::Op`).
         let op: majit_ir::OpRc = OpRc::new(op);
         // opencoder.py combine_uint — cache non-void result at `_index`, bump.
-        if opcode.result_type() != Type::Void {
+        if ty != Type::Void {
             let slot = self._index as usize;
             if slot >= self._cache.len() {
                 self._cache.resize(slot + 1, None);
@@ -1657,6 +1660,21 @@ pub struct Trace {
     pub all_descr_len: u32,
 }
 
+/// One recorded op in `_ops` without a `cls()` object.
+///
+/// `TraceIterator.next` is the materialize walk; this is the skip
+/// walk used to patch a named guard's descr slot or recover a
+/// GetfieldGcR's args before that `cls()` exists.
+pub(crate) struct EncodedOp {
+    pub opcode: OpCode,
+    pub args_pos: usize,
+    pub arity: usize,
+    pub descr_index: i64,
+    /// Pre-bump `_index` of this op (`record_op` return). Void ops
+    /// share it with the next value-producing op.
+    pub box_index: u32,
+}
+
 impl BaseTrace for Trace {}
 
 impl Trace {
@@ -1691,7 +1709,7 @@ impl Trace {
             // A fresh Trace per bridge grew these through the 64 B / 128 B
             // classes on the regex and/or timed row (`_encode_ptr`,
             // `encode_varint_signed`). One reserve matches
-            // `recorder::Trace::attach_byte_buffer`'s slots/py_pc reserve.
+            // `recorder::Trace::attach_byte_buffer`'s slots reserve.
             _refs: {
                 let mut refs = Vec::with_capacity(32);
                 refs.push(0);
@@ -2326,7 +2344,6 @@ impl Trace {
         all_liveness: &[u8],
         after_residual_call: bool,
         is_last: bool,
-        unique_to_box: Option<&[u32]>,
         patch_guard_descr: bool,
     ) -> i64 {
         self._total_snapshots += 1;
@@ -2340,7 +2357,6 @@ impl Trace {
             op_live,
             all_liveness,
             after_residual_call,
-            unique_to_box,
         );
         // opencoder.py:771-780 — write vable / vref arrays, then the
         // snapshot record. `s` captures the snapshot_data offset
@@ -2354,8 +2370,8 @@ impl Trace {
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last);
-        // Live pyre keeps the sequential resume id on FrontendSlot
-        // and must not grow the guard's 2-byte 0-placeholder.
+        // `create_top_snapshot` writes the snapshot byte offset into the
+        // guard's trailing descr slot (`opencoder.py` `_pos -= 2`).
         if patch_guard_descr {
             self.patch_last_guard_descr_slot(s);
         }
@@ -2384,7 +2400,6 @@ impl Trace {
         op_live: u8,
         all_liveness: &[u8],
         is_last: bool,
-        unique_to_box: Option<&[u32]>,
     ) -> i64 {
         self._total_snapshots += 1;
         let array = frame.get_list_of_active_boxes(
@@ -2394,7 +2409,6 @@ impl Trace {
             op_live,
             all_liveness,
             /* after_residual_call */ false,
-            unique_to_box,
         );
         self.snapshot_add_prev(SNAPSHOT_PREV_COMES_NEXT);
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
@@ -2432,7 +2446,6 @@ impl Trace {
             op_live,
             all_liveness,
             after_residual_call,
-            None,
             true,
         )
     }
@@ -2450,7 +2463,6 @@ impl Trace {
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
-        unique_to_box: Option<&[u32]>,
         patch_guard_descr: bool,
     ) -> i64 {
         // opencoder.py `n = len(framestack) - 1`.
@@ -2471,7 +2483,6 @@ impl Trace {
                     all_liveness,
                     after_residual_call,
                     /* is_last */ n == 0,
-                    unique_to_box,
                     patch_guard_descr,
                 )
             };
@@ -2484,7 +2495,6 @@ impl Trace {
                 clear_result_register,
                 op_live,
                 all_liveness,
-                unique_to_box,
             );
             result
         } else {
@@ -2516,7 +2526,6 @@ impl Trace {
         clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
-        unique_to_box: Option<&[u32]>,
     ) {
         let mut n = n;
         while n > 0 {
@@ -2536,7 +2545,6 @@ impl Trace {
                     op_live,
                     all_liveness,
                     is_last,
-                    unique_to_box,
                 )
             };
             // opencoder.py `target.parent_snapshot = s`.
@@ -2613,24 +2621,140 @@ impl Trace {
     /// `create_snapshot`; pyre factors it out so Phase B7's snapshot
     /// code is shorter and the assertion that the slot was indeed a
     /// guard 0-placeholder is always executed.
+    ///
+    /// `create_top_snapshot` runs while the guard is still the last
+    /// recorded op (`pyjitpl.py` `generate_guard` records, then
+    /// `capture_resumedata`). A delayed restamp of that same last
+    /// guard (the stream slot already holds a snapshot offset) uses
+    /// `patch_descr_slot_at` on the named slot instead of rewinding
+    /// `_pos`.
+    pub(crate) fn last_descr_slot_is_placeholder(&self) -> bool {
+        self._pos >= 2 && self._ops[self._pos - 2] == 0 && self._ops[self._pos - 1] == 0
+    }
+
     #[allow(dead_code)]
     pub(crate) fn patch_last_guard_descr_slot(&mut self, snapshot_index: i64) {
         debug_assert!(
             self._pos >= 2,
             "patch_last_guard_descr_slot called with _pos < 2"
         );
-        debug_assert_eq!(
-            self._ops[self._pos - 2],
-            0u8,
-            "guard descr placeholder byte 0 was not \\x00"
-        );
-        debug_assert_eq!(
-            self._ops[self._pos - 1],
-            0u8,
-            "guard descr placeholder byte 1 was not \\x00"
+        debug_assert!(
+            self.last_descr_slot_is_placeholder(),
+            "guard descr placeholder was not \\x00\\x00"
         );
         self._pos -= 2;
         self.append_int(snapshot_index);
+    }
+
+    /// Visit each recorded op in `_ops`[`_start`, `_pos`).
+    pub(crate) fn for_each_encoded_op(&self, mut f: impl FnMut(EncodedOp)) {
+        let mut pos = self._start as usize;
+        let end = self._pos;
+        let mut index = self._start;
+        while pos < end {
+            let opnum = self._ops[pos];
+            pos += 1;
+            let opcode = OpCode::from_u16(opnum as u16)
+                .unwrap_or_else(|| panic!("encoded op: unknown opnum {opnum}"));
+            let arity = match opcode.arity() {
+                Some(n) => n as usize,
+                None => {
+                    let (v, n) = decode_varint_signed(&self._ops[pos..]);
+                    pos += n;
+                    v as usize
+                }
+            };
+            let args_pos = pos;
+            for _ in 0..arity {
+                let (_, n) = decode_varint_signed(&self._ops[pos..]);
+                pos += n;
+            }
+            let descr_index = if opcode.has_descr() {
+                let (idx, n) = decode_varint_signed(&self._ops[pos..]);
+                pos += n;
+                idx
+            } else {
+                0
+            };
+            f(EncodedOp {
+                opcode,
+                args_pos,
+                arity,
+                descr_index,
+                box_index: index,
+            });
+            if opcode.result_type() != Type::Void {
+                index += 1;
+            }
+        }
+    }
+
+    /// Tagged arg `i` of an encoded op, starting at `args_pos`.
+    pub(crate) fn encoded_arg_at(ops: &[u8], args_pos: usize, i: usize) -> i64 {
+        let mut pos = args_pos;
+        for _ in 0..i {
+            let (_, n) = decode_varint_signed(&ops[pos..]);
+            pos += n;
+        }
+        decode_varint_signed(&ops[pos..]).0
+    }
+
+    /// Overwrite a descr varint in the middle of `_ops`. A 2-byte
+    /// placeholder can grow to 4 bytes (`append_int`); later ops shift.
+    pub(crate) fn patch_descr_slot_at(&mut self, descr_pos: usize, snapshot_index: i64) {
+        let mut value = snapshot_index;
+        if !(MIN_VALUE..=MAX_VALUE).contains(&value) {
+            self.tag_overflow = true;
+            value = 0;
+        }
+        let (_, old_len) = decode_varint_signed(&self._ops[descr_pos..]);
+        let mut encoded = Vec::with_capacity(4);
+        encode_varint_signed(&mut encoded, value);
+        let new_len = encoded.len();
+        if new_len != old_len {
+            let tail = descr_pos + old_len;
+            if new_len > old_len {
+                let d = new_len - old_len;
+                while self._pos + d > self._ops.len() {
+                    self._double_ops();
+                }
+                self._ops.copy_within(tail..self._pos, tail + d);
+                self._pos += d;
+            } else {
+                let d = old_len - new_len;
+                self._ops.copy_within(tail..self._pos, tail - d);
+                self._pos -= d;
+            }
+        }
+        self._ops[descr_pos..descr_pos + new_len].copy_from_slice(&encoded);
+    }
+
+    /// Patch the named guard's trailing descr slot to `snapshot_index`.
+    /// The last recorded op being that guard uses
+    /// `patch_last_guard_descr_slot` (`create_top_snapshot`).
+    /// `TraceIterator.next` descr lookup for a non-guard encoded index.
+    pub(crate) fn resolve_descr_index(&self, descr_index: i64) -> Option<majit_ir::DescrRef> {
+        if descr_index == 0 {
+            return None;
+        }
+        let all_descr_len = self.all_descr_len as i64;
+        if descr_index < all_descr_len + 1 {
+            let all_descrs = self.metainterp_sd.all_descrs().lock();
+            Some(all_descrs[(descr_index - 1) as usize].clone())
+        } else {
+            self._descrs[(descr_index - all_descr_len - 1) as usize].clone()
+        }
+    }
+
+    pub(crate) fn walk_descr_const_ptr_refs(
+        &mut self,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        for d in self._descrs.iter().flatten() {
+            if let Some(qd) = d.as_quasi_immut_descr() {
+                qd.walk_const_ptr_refs(visitor);
+            }
+        }
     }
 
     /// opencoder.py `_encode_descr(descr)`.
@@ -4557,9 +4681,7 @@ mod tests {
     /// `get_op_by_pos` returns the Op whose `.pos` equals the
     /// requested OpRef. `ByteTraceIter` seeds `_fresh` at
     /// `max_num_inputargs` and then bumps it once per inputarg before
-    /// any op, so with 2 inputargs the first op has `op.pos == IntOp(4)`
-    /// (pyre-only disjoint-namespace behaviour documented on
-    /// `ByteTraceIter::new`).
+    /// any op, so with 2 inputargs the first op has `op.pos == IntOp(4)`.
     #[test]
     fn test_get_op_by_pos_2c() {
         let mut buf = TraceRecordBuffer::new(2, empty_sd());

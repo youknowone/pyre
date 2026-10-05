@@ -2678,20 +2678,16 @@ impl MIFrame {
         let active_boxes =
             self.get_list_of_active_boxes(ctx, false, after_residual_call, Some(self.orgpc));
         let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
-        let fail_arg_types = snapshot_full_types.clone();
 
         // Snapshot is the source of truth — the
         // optimizer's `store_final_boxes_in_guard`
         // (`optimizeopt/mod.rs`) overwrites `op.fail_args` from the
         // snapshot built below via `op.store_final_boxes(liveboxes)`
-        // (`resoperation.rs`), so the inline `fail_args` copy that the legacy
-        // `record_guard_typed_with_fail_args` path used to write was
-        // redundant.  Mirrors RPython
-        // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py)
-        // which records the guard with no inline fail_args and lets
-        // `capture_resumedata` + `_number_boxes` populate them from the
-        // snapshot chain.
-        ctx.record_guard_typed(opcode, args, fail_arg_types);
+        // (`resoperation.rs`). `generate_guard` records the guard with
+        // no inline fail_args; `capture_resumedata` + `_number_boxes`
+        // populate them from the snapshot chain. Types come from the
+        // live boxes at `store_final_boxes` (`compile.py`).
+        ctx.record_guard_typed(opcode, args);
 
         // pyjitpl.py: self.capture_resumedata(resumepc, after_residual_call)
         self.capture_resumedata(
@@ -2788,10 +2784,10 @@ impl MIFrame {
             crate::state::request_trace_abort();
             top_pc as u32
         });
-        let top_py_pc = match resolved {
-            // A resolved JitCode pc with no forward Python-pc marker cannot be
-            // resumed; decline the trace exactly like the `top_pc_word` arm
-            // above rather than silently publishing a fallback Python pc.
+        // Decline a resolved JitCode pc that has no forward Python-pc
+        // marker. Resume recovers py_pc from the jitcode word; the
+        // recorder does not store a copy.
+        let _ = match resolved {
             Some(offset) => payload
                 .resume_position_for_jitcode_pc(offset)
                 .map(|(_, py_pc)| py_pc)
@@ -2799,14 +2795,11 @@ impl MIFrame {
                     crate::state::request_trace_abort();
                     top_pc as u32
                 }),
-            // `resolved` was None: the `top_pc_word` arm already requested the
-            // abort, so mirror its fallback without asking twice.
             None => top_pc as u32,
         };
         let top_frame = majit_metainterp::recorder::SnapshotFrame {
             jitcode_index: top_jitcode_index,
             pc: top_pc_word,
-            py_pc: top_py_pc,
             boxes: Self::fail_args_to_snapshot_boxes_typed(
                 top_active_boxes,
                 top_snapshot_types,
@@ -2864,6 +2857,7 @@ impl MIFrame {
             );
         }
         majit_metainterp::recorder::Snapshot {
+            resume_position: -1,
             frames,
             vable_boxes,
             vref_boxes,

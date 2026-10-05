@@ -2064,7 +2064,7 @@ impl<'c> Lowerer<'c> {
                             #inline_call
                         },
                     );
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    self.emit_post_inline_live_marker(post_live);
                 }
                 crate::jit_interp::CallPolicyKind::InlinePipelineInt
                 | crate::jit_interp::CallPolicyKind::InlinePipelineRef
@@ -2119,7 +2119,7 @@ impl<'c> Lowerer<'c> {
                             #inline_call
                         },
                     );
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    self.emit_post_inline_live_marker(post_live);
                 }
                 _ => return None,
             },

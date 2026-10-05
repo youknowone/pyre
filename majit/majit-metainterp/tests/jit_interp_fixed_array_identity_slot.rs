@@ -123,7 +123,7 @@ mod fixed_array_before_virt_array {
             vec![
                 majit_ir::Type::Int, // cells[0]
                 majit_ir::Type::Int, // cells[1]
-                majit_ir::Type::Ref, // __vable_identity
+                majit_ir::Type::Ref, // vable identity
             ],
             "the identity must follow the fixed array's cells, so its flat slot \
              is `cells.len()` = 2 — not the legacy frame-first 0",

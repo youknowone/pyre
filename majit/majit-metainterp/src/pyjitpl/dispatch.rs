@@ -793,10 +793,32 @@ pub trait JitCodeSym {
         None
     }
 
+    /// `pyjitpl.py reached_loop_header`: loop-carried boxes from the live
+    /// portal frame's identity slots plus `virtualizable_boxes`.
+    fn loop_carried_boxes_from_portal(
+        &self,
+        vable_boxes: &[(OpRef, majit_ir::Type)],
+        _portal: &MIFrame,
+    ) -> Option<Vec<(OpRef, majit_ir::Type)>> {
+        self.loop_carried_boxes(vable_boxes)
+    }
+
+    /// Walk-final int+float scalar values in `collect_scalar_state_field_values`
+    /// order, read off the portal frame.
+    fn collect_portal_scalar_values(&self, _portal: &MIFrame) -> Vec<i64> {
+        Vec::new()
+    }
+
+    /// Walk-final ref scalar values, read off the portal frame.
+    fn collect_portal_ref_scalar_values(&self, _portal: &MIFrame) -> Vec<i64> {
+        Vec::new()
+    }
+
     // -- State field support (register/tape machines)
     //
-    // When state_fields is configured, scalar and array fields on the
-    // interpreter state are tracked as OpRefs in the Sym.
+    // When state_fields is configured, plain reds live in the portal
+    // frame's identity slots (`MIFrame.setup_call`). These accessors are
+    // leftover defaults; generated symbols do not override them.
 
     /// Read a scalar state field's current OpRef.
     fn state_field_ref(&self, _field_idx: usize) -> Option<OpRef> {
@@ -877,12 +899,6 @@ pub trait JitCodeSym {
         0
     }
 
-    /// One past the last float-bank register used as a canonical float
-    /// identity slot.
-    fn float_identity_slots_end(&self) -> usize {
-        0
-    }
-
     /// `StateFieldLayout::ref_scalar_slot`. `None` when this symbol has no
     /// ref-scalar identity slot for `field_idx`.
     fn ref_scalar_slot(&self, _field_idx: usize) -> Option<usize> {
@@ -901,46 +917,24 @@ pub trait JitCodeSym {
         None
     }
 
-    /// One past the last ref-bank register used as a canonical
-    /// ref-scalar identity slot (`StateFieldLayout::ref_scalar_slot`).
-    /// `record_state_guard` saves/restores `ref_regs[..end]` around the
-    /// transient canonical-slot seeding the same way it does for the
-    /// int bank.  Zero when the state has no ref scalars.
-    fn ref_identity_slots_end(&self) -> usize {
-        0
-    }
-
-    /// One past the last int-bank register used as a canonical
-    /// identity slot (`StateFieldLayout::scalar_slot` /
-    /// `array_elem_slot`), i.e. `int_scalar_base + total_slots()`.
-    /// `record_state_guard` saves/restores `int_regs[..end]` around
-    /// the transient canonical-slot seeding; the base keeps the
-    /// dispatch JitCode's int argument registers (`pc` at i0) out of
-    /// the seeded range.
-    fn int_identity_slots_end(&self) -> usize {
-        self.total_slots()
-    }
-
     /// One past the last int-bank register the *register allocator*
     /// reserves for identity slots, i.e. `int_identity_base +
     /// num_scalars + num_vable_identity_slots`.
     ///
-    /// This is deliberately NOT `int_identity_slots_end()`. That one is
-    /// `base + total_slots()`, and `total_slots()` adds every virt array's
-    /// **live `Vec::len()`** — a runtime quantity the jitcode lowerer cannot
-    /// see, so the lowering floor (`split_identity_reg_ends`) stops after the
-    /// scalars plus the single vable-identity slot. Registers between the two
-    /// ends are ordinary working registers; only `[base, reserved_end)` is
-    /// guaranteed to hold nothing but identity.
+    /// `total_slots()` adds every virt array's live `Vec::len()` — a
+    /// runtime quantity the jitcode lowerer cannot see — so the lowering
+    /// floor (`split_identity_reg_ends`) stops after the scalars plus the
+    /// single vable-identity slot. Registers past this end are ordinary
+    /// working registers; only `[base, reserved_end)` is guaranteed to
+    /// hold nothing but identity.
     ///
     /// The inline-frame snapshot trim must use THIS end: it blanks the range
     /// unconditionally, and blanking a working register would drop live data.
     ///
-    /// The default is the EMPTY range, not `int_identity_slots_end()`. A
-    /// symbol reserves identity slots in its sub-JitCodes only by opting in
-    /// (`split_dispatch`, which is what raises `split_identity_floor`); a
-    /// symbol that has not opted in has ordinary working registers there, and
-    /// an over-wide default would silently blank them out of the snapshot.
+    /// The default is the EMPTY range. The snapshot trim is inert unless
+    /// `split_dispatch` raised `split_identity_floor`; a non-split arm
+    /// still *allocates* past the identity range so a temp cannot clobber
+    /// a red, but it does not blank those slots out of the snapshot.
     fn int_identity_reserved_end(&self) -> usize {
         self.int_identity_slots_base()
     }
@@ -954,98 +948,18 @@ pub trait JitCodeSym {
         0
     }
 
-    /// Bridge state-field JIT's `__JitSym_<fn>` storage onto
-    /// `MIFrame.int_regs` / `int_values` ahead of guard capture.
-    ///
-    /// TODO (state-field JIT divergence):
-    /// RPython stores live state in `MIFrame.{int,ref,float}_regs`
-    /// directly via `setfield_*` opimpls during dispatch
-    /// (`pyjitpl.py MIFrame.setup` + per-opcode register
-    /// assignments).  pyre's state-field JIT instead stores OpRefs +
-    /// concrete values in `__JitSym_<fn>.<field>` / `<field>_value` etc.
-    /// because the macro emits per-opcode jitcodes that read state
-    /// directly from the symbolic side-channel.  At guard-capture
-    /// time `MIFrame::get_list_of_active_boxes`
-    /// (`pyjitpl/frame.rs`) still expects live state in
-    /// `int_regs` / `int_values`, so this hook copies the
-    /// `__JitSym_<fn>` slots into the frame's banks at the canonical
-    /// liveness indices defined by `live_slots_for_state_field_jit`
-    /// (orth-6): scalars at `0..num_scalars`, then
-    /// flattened arrays, then virt-array (ptr, len) pairs.  Virt-
-    /// array value mirrors are cached at `JitState::initialize_sym`
-    /// time from the user state's `<varr>.as_ptr() as i64` /
-    /// `<varr>.len() as i64` (framestack-lift 1)
-    /// — accurate iff the Vec does not reallocate during tracing
-    /// (the examples allocate backing storage once at a fixed capacity
-    /// before tracing and never grow it). An example that pushes onto
-    /// that storage, or sizes it from something that changes during the
-    /// trace, breaks the mirror.
-    ///
-    /// Convergence path: when the macro switches to RPython
-    /// MIFrame-regs storage, this
-    /// method's default no-op impl matches RPython's "regs already
-    /// populated by dispatch" semantics and the macro override drops
-    /// out.  Until then, callers with a state-field JIT pass
-    /// `&__JitSym_<fn>` here right before invoking
-    /// `TraceRecordBuffer::capture_resumedata` so the framestack-walk
-    /// snapshot has matching slot data.
-    ///
-    /// Codex review (2026-04-26): this is a TODO bridge
-    /// hook with no RPython counterpart.  RPython's dispatch
-    /// (`pyjitpl.py:opimpl_setfield_gc_*`,
-    /// `opimpl_int_add` etc.) writes directly into
-    /// `MIFrame.{int,ref,float}_regs[i]` while interpreting the
-    /// jitcode bytestream — by the time `MetaInterp.generate_guard`
-    /// calls `capture_resumedata`, every register bank is already
-    /// up-to-date and `MIFrame::get_list_of_active_boxes` reads them
-    /// without any side-channel sync.  pyre's macro instead routes
-    /// the same data through `__JitSym_<fn>.<field>` for ergonomic reasons
-    /// (the proc-macro can derive symbolic state-field accesses
-    /// statically), and this trait method is the back-door that
-    /// re-establishes the RPython invariant just before the snapshot
-    /// is captured.  Convergence path: (codegen.rs / macro
-    /// → register-machine jitcode) eliminates `__JitSym_<fn>` as a
-    /// distinct storage; macro-emitted opimpls then write directly to
-    /// `MIFrame.regs`, and this method (along with its `__JitSym_<fn>`
-    /// value-mirror seeding from `JitState::initialize_sym`) is
-    /// removed.
-    fn populate_frame_int_regs(&self, _frame: &mut MIFrame) {}
-
-    /// \[FR\] Seed an INLINE recursive-portal callee frame's int register bank
-    /// with its FRESH state as compile-time CONSTANTS (scalars zeroed, virt
-    /// arrays sized at the caller's captured capacity).  The state-field
-    /// dispatch keeps each scalar (e.g. `stackpos`) in a working int register
-    /// threaded through the loop, distinct from the vable shadow; entering the
-    /// callee at offset 0 re-reads that register, so it must hold the fresh 0
-    /// rather than inheriting the caller's promoted value.  Constants (not the
-    /// input-arg OpRefs `populate_frame_int_regs` uses) because an inline
-    /// callee's fresh state is known at the call site.  Slot layout mirrors
-    /// `populate_frame_int_regs` / `live_slots_for_state_field_jit`.  Default
-    /// no-op: shapes without a fresh-entry (ref scalars / opaque carriers)
-    /// never reach the inline path.
-    fn seed_recursive_fresh_frame(&self, _frame: &mut MIFrame) {}
-
-    /// \[FR\] Snapshot the sym's WORKING scalar (and fixed-array) state before an
-    /// inline recursive-portal callee overwrites it.  `BC_LOAD/STORE_STATE_FIELD`
-    /// read/write the single shared sym, not a per-frame
-    /// register, so an inline callee mutates the caller's live scalar state in
-    /// place; the caller's values must be saved here and restored on return.
-    /// Virt-array elements live in the vable shadow (nested separately), so only
-    /// scalars + fixed arrays are captured.  Flat `(OpRef, value)` pairs in
-    /// `state_field` then `state_array` order.  `None` default: non-state-field
-    /// syms never reach the inline path.
+    /// Snapshot portal identity slots before an inline recursive-portal
+    /// callee. Default `None`: reds live on the portal frame, so there is
+    /// no `__JitSym` copy to nest.
     fn snapshot_inline_scalar_state(&self) -> Option<Vec<(majit_ir::OpRef, i64)>> {
         None
     }
 
-    /// \[FR\] Reset the sym's working scalar/fixed-array state to FRESH (zeroed),
-    /// so the inline callee starts from a clean state rather than inheriting the
-    /// caller's.  Paired with [`Self::snapshot_inline_scalar_state`].
+    /// Reset leftover `__JitSym` scalar copies. Default no-op: those
+    /// copies are gone.
     fn reset_inline_scalar_state_fresh(&mut self) {}
 
-    /// \[FR\] Restore the sym's working scalar/fixed-array state from a snapshot
-    /// when the inline callee returns.  Paired with
-    /// [`Self::snapshot_inline_scalar_state`].
+    /// Restore leftover `__JitSym` scalar copies. Default no-op.
     fn restore_inline_scalar_state(&mut self, _snapshot: Vec<(majit_ir::OpRef, i64)>) {}
 
     /// recursive-call recursive CALL_ASSEMBLER portal entry: build the fresh-frame
@@ -1908,15 +1822,13 @@ where
 
     /// Record a state-field-JIT guard.  Records the guard with no
     /// inline `op.fail_args` and attaches a snapshot built from the
-    /// current `MIFrame`'s `int_regs` (populated from `__JitSym_<fn>` via
-    /// `JitCodeSym::populate_frame_int_regs`).  The optimizer's
+    /// live `MIFrame` register banks (`pyjitpl.py MetaInterp.generate_guard`
+    /// → `capture_resumedata`).  The optimizer's
     /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) then
     /// derives `op.fail_args` from the snapshot via `_number_boxes`,
-    /// matching RPython's `pyjitpl.MetaInterp.generate_guard`
-    /// (`pyjitpl.py`) +
-    /// `capture_resumedata` (`opencoder.py`) +
-    /// `store_final_boxes_in_guard` (`resume.py`)
-    /// snapshot-as-source-of-truth invariant.
+    /// matching `pyjitpl.py MetaInterp.generate_guard` +
+    /// `opencoder.py capture_resumedata` +
+    /// `resume.py store_final_boxes_in_guard`.
     ///
     /// `resume_pc` is the bytecode position blackhole resumes at on
     /// guard fail.  Mirrors RPython
@@ -2052,16 +1964,15 @@ where
         }
     }
 
-    /// Attach a resume snapshot built from the live framestack to the guard
-    /// the caller just recorded, and point that guard's
-    /// `rd_resume_position` at it.
+    /// `pyjitpl.py MetaInterp.capture_resumedata`: swap the top frame's
+    /// `pc` to `resume_pc`, walk the live framestack, restore `pc`, stamp
+    /// the guard. Identity slots already hold the portal reds
+    /// (`MIFrame.setup_call` / the walk-start seed); capture does not
+    /// copy them.
     ///
-    /// RPython `pyjitpl.py capture_resumedata` temporarily swaps
-    /// `frame.pc = resumepc` ahead of the framestack walk, then restores the
-    /// original `frame.pc`. `build_state_field_snapshot` reads `frame.pc`
-    /// directly, so the swap pins the snapshot's `SnapshotFrame.pc` to the
-    /// guard's resumepc independent of the dispatcher's post-decode
-    /// `frame.pc`.
+    /// `build_state_field_snapshot` reads `frame.pc` directly, so the swap
+    /// pins the snapshot's `SnapshotFrame.pc` to the guard's resumepc
+    /// independent of the dispatcher's post-decode `frame.pc`.
     ///
     /// `target` selects which recorded op receives the position: the last op,
     /// or a *guard* op counted back from the most recent one. They differ
@@ -2089,12 +2000,12 @@ where
             .checked_sub(1)
             .expect("publish_last_guard_resume_snapshot: empty framestack");
         let saved_top_pc = self.frames.frames[top_idx].pc;
-        // RPython pyjitpl.py capture_resumedata swaps
+        // `pyjitpl.py MetaInterp.capture_resumedata` swaps
         // `frame.pc = resumepc` (a JitCode bytecode PC) before the
         // framestack walk. `resume_pc` here is `opcode_pc =
-        // code_cursor - 1` (dispatch.rs ~2203), the guard op's JitCode
+        // code_cursor - 1`, the guard op's JitCode
         // position, whose `opcode_pc - SIZE_LIVE_OP` points at the LIVE
-        // marker that `get_list_of_active_boxes` (frame.rs) reads.
+        // marker that `get_list_of_active_boxes` reads.
         // The snapshot's liveness decode REQUIRES this to be a JitCode
         // PC; using an interpreter PC underflows `pc - SIZE_LIVE_OP`.
         // For an `after_residual_call` guard
@@ -2105,11 +2016,6 @@ where
         // step-back. `MIFrame::pc` (the saved resume position) stays 0 in
         // an inline sub-frame, so it must not be used here.
         self.frames.frames[top_idx].pc = resume_pc;
-        // RPython only swaps the top frame pc before
-        // `capture_resumedata`; it never writes portal state into an
-        // inline callee frame.  State-field JIT still needs to
-        // materialize `__JitSym_<fn>` scalars into an MIFrame register bank,
-        // but the only orthodox destination is the root/portal frame.
         if crate::bh_debug_enabled() {
             eprintln!(
                 "[rec-guard] resume_pc={} frames={} root_i0_reg={:?} root_i0_val={:?}",
@@ -2119,59 +2025,6 @@ where
                 self.frames.frames[0].int_values.first(),
             );
         }
-        let n = sym
-            .int_identity_slots_end()
-            .min(self.frames.frames[0].int_regs.len());
-        let saved_int_regs: smallvec::SmallVec<[Option<OpRef>; 8]> = self.frames.frames[0].int_regs
-            [..n]
-            .iter()
-            .copied()
-            .collect();
-        let saved_int_values: smallvec::SmallVec<[Option<i64>; 8]> = self.frames.frames[0]
-            .int_values[..n]
-            .iter()
-            .copied()
-            .collect();
-        let rn = sym
-            .ref_identity_slots_end()
-            .min(self.frames.frames[0].ref_regs.len());
-        let saved_ref_regs: smallvec::SmallVec<[Option<OpRef>; 8]> = self.frames.frames[0].ref_regs
-            [..rn]
-            .iter()
-            .copied()
-            .collect();
-        let saved_ref_values: smallvec::SmallVec<[Option<i64>; 8]> = self.frames.frames[0]
-            .ref_values[..rn]
-            .iter()
-            .copied()
-            .collect();
-        let root_inflight_int_result =
-            if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'i' {
-                self.frames.frames[0].result_arg_index.or_else(|| {
-                    let pc = self.frames.frames[0].pc;
-                    pc.checked_sub(1)
-                        .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
-                        .map(|idx| idx as usize)
-                })
-            } else {
-                None
-            };
-        let root_inflight_ref_result =
-            if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'r' {
-                self.frames.frames[0].result_arg_index.or_else(|| {
-                    let pc = self.frames.frames[0].pc;
-                    pc.checked_sub(1)
-                        .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
-                        .map(|idx| idx as usize)
-                })
-            } else {
-                None
-            };
-        // The root portal frame's reds live in `__JitSym` and are copied
-        // into its register bank for this capture only. A callee frame
-        // already holds its identity slots: `exec_typed_inline_call` seeded
-        // them when the frame was pushed (`pyjitpl.py` `MIFrame.setup_call`).
-        sym.populate_frame_int_regs(&mut self.frames.frames[0]);
         if crate::callee_rca_enabled() {
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
             let virtualref_snapshot = ctx.virtualref_boxes.clone();
@@ -2222,28 +2075,6 @@ where
             );
             ctx.capture_resumedata(snapshot)
         };
-        for idx in 0..n {
-            // RPython pyjitpl.py:180-193 leaves the parent frame's
-            // in-flight int result slot cleared after get_list_of_active_boxes(True).
-            // Preserve that mutation instead of restoring the pre-snapshot
-            // state-field materialization save.
-            if Some(idx) != root_inflight_int_result {
-                #[cfg(feature = "jit-audits")]
-                majit_ir::reg_write_audit::note_int_write(
-                    self.frames.frames[0].int_regs.as_ptr() as usize,
-                    idx,
-                    saved_int_regs[idx],
-                );
-                self.frames.frames[0].int_regs[idx] = saved_int_regs[idx];
-                self.frames.frames[0].int_values[idx] = saved_int_values[idx];
-            }
-        }
-        for idx in 0..rn {
-            if Some(idx) != root_inflight_ref_result {
-                self.frames.frames[0].ref_regs[idx] = saved_ref_regs[idx];
-                self.frames.frames[0].ref_values[idx] = saved_ref_values[idx];
-            }
-        }
         self.frames.frames[top_idx].pc = saved_top_pc;
         match target {
             GuardStampTarget::LastOp => ctx.set_last_guard_resume_position(snapshot_id),
@@ -3409,6 +3240,24 @@ where
         }
     }
 
+    fn stash_portal_reds(&self, ctx: &mut TraceCtx, sym: &S) {
+        let Some(root) = self.frames.frames.first() else {
+            return;
+        };
+        let vable = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+        if let Some(boxes) = sym.loop_carried_boxes_from_portal(&vable, root) {
+            ctx.close_jump_boxes = Some(boxes);
+        }
+        let scalars = sym.collect_portal_scalar_values(root);
+        if !scalars.is_empty() {
+            ctx.close_scalar_values = Some(scalars);
+        }
+        let refs = sym.collect_portal_ref_scalar_values(root);
+        if !refs.is_empty() {
+            ctx.close_ref_scalar_values = Some(refs);
+        }
+    }
+
     /// `pyjitpl.py` `MetaInterp._interpret`: step the top frame until the
     /// framestack drains or a step returns a terminal action. After each
     /// continued step, `TraceCtx::is_too_long` aborts the trace the way
@@ -3478,6 +3327,7 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
+                self.stash_portal_reds(ctx, sym);
                 if (crate::majit_log_enabled() || crate::tldbg_enabled()) && self.frames.is_empty()
                 {
                     // Every `Finish` return drains the framestack first.
@@ -3562,6 +3412,7 @@ where
                         portal_pc
                     );
                 }
+                self.stash_portal_reds(ctx, sym);
                 self.snapshot_live_portal_greens(ctx);
                 sym.abort_portal_op();
                 return TraceAction::Abort;
@@ -4278,24 +4129,16 @@ where
         Self::OPCODE_IMPLEMENTATIONS[bytecode as usize](self, ctx, sym, runtime, bytecode)
     }
 
-    /// `MetaInterp.newframe` creates the frame. A per-arm sub-JitCode also
-    /// reads the portal identity slots, which are not inline-call arguments,
-    /// so those slots are seeded from `__JitSym` before the frame is pushed
-    /// and then left in place.
-    fn seed_pushed_frame_identity_slots(&self, sym: &S, frame: &mut MIFrame) {
-        // Only a `; state` arm sub-JitCode addresses these indices as
-        // identity slots. An ordinary inline JitCode uses them as working
-        // registers (`goto_if_not` reads one as a bool).
-        if frame.jitcode.reads_identity_slots() {
-            sym.populate_frame_int_regs(frame);
-        }
-    }
-
     /// Trace the canonical `inline_call_{r,ir,irf}_*` family by entering a
     /// callee frame.  RPython `rpython/jit/metainterp/pyjitpl.py _opimpl_inline_call1`
     /// enters the frame, and `:144-160` copies each grouped argument
     /// positionally.
-    fn exec_typed_inline_call(&mut self, ctx: &mut TraceCtx, sym: &S, bytecode: u8) -> TraceAction {
+    fn exec_typed_inline_call(
+        &mut self,
+        ctx: &mut TraceCtx,
+        _sym: &S,
+        bytecode: u8,
+    ) -> TraceAction {
         let (has_i_list, has_f_list, return_kind) = match bytecode {
             jitcode::insns::BC_INLINE_CALL_R_I => (false, false, Some(JitArgKind::Int)),
             jitcode::insns::BC_INLINE_CALL_R_R => (false, false, Some(JitArgKind::Ref)),
@@ -4405,7 +4248,6 @@ where
             }
             None => {}
         }
-        self.seed_pushed_frame_identity_slots(sym, &mut sub_frame);
         self.frames.push(sub_frame);
         TraceAction::Continue
     }
@@ -4416,6 +4258,51 @@ where
         majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, reg, opref);
         frame.int_regs[reg] = opref;
         frame.int_values[reg] = value;
+    }
+
+    /// Write an identity-slot red on the portal frame (`MIFrame.setup_call`).
+    fn set_int_identity_slot(&mut self, slot: usize, opref: Option<OpRef>, value: Option<i64>) {
+        let frame = &mut self.frames.frames[0];
+        #[cfg(feature = "jit-audits")]
+        majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, slot, opref);
+        frame.int_regs[slot] = opref;
+        frame.int_values[slot] = value;
+    }
+
+    fn set_ref_identity_slot(&mut self, slot: usize, opref: Option<OpRef>, value: Option<i64>) {
+        let frame = &mut self.frames.frames[0];
+        frame.ref_regs[slot] = opref;
+        frame.ref_values[slot] = value;
+    }
+
+    fn set_float_identity_slot(&mut self, slot: usize, opref: Option<OpRef>, value: Option<i64>) {
+        let frame = &mut self.frames.frames[0];
+        frame.float_regs[slot] = opref;
+        frame.float_values[slot] = value;
+    }
+
+    fn read_int_identity_slot(&self, slot: usize) -> (OpRef, i64) {
+        let frame = &self.frames.frames[0];
+        (
+            frame.int_regs[slot].expect("portal int identity slot uninitialized"),
+            frame.int_values[slot].expect("portal int identity value uninitialized"),
+        )
+    }
+
+    fn read_ref_identity_slot(&self, slot: usize) -> (OpRef, i64) {
+        let frame = &self.frames.frames[0];
+        (
+            frame.ref_regs[slot].expect("portal ref identity slot uninitialized"),
+            frame.ref_values[slot].expect("portal ref identity value uninitialized"),
+        )
+    }
+
+    fn read_float_identity_slot(&self, slot: usize) -> (OpRef, i64) {
+        let frame = &self.frames.frames[0];
+        (
+            frame.float_regs[slot].expect("portal float identity slot uninitialized"),
+            frame.float_values[slot].expect("portal float identity value uninitialized"),
+        )
     }
 
     fn read_int_reg(&mut self, reg: usize) -> (OpRef, i64) {
@@ -5350,16 +5237,9 @@ where
             None,
             Some(ctx),
         );
-        // `resume.py` `rebuild_from_resumedata` does `newframe`, then
+        // `resume.py rebuild_from_resumedata` does `newframe`, then
         // `setup_resume_at_op`, then `consume_boxes` into that frame's
-        // registers. Seed the identity slots the same way a pushed arm
-        // frame is seeded, then let the resume registers overwrite any
-        // slot the guard actually captured (`consume_boxes`). An ordinary
-        // inline frame has no identity slots; seeding would overwrite a
-        // working register the resume list does not restore.
-        if resume_frame.jitcode.reads_identity_slots() {
-            sym.populate_frame_int_regs(&mut frame);
-        }
+        // registers. The resume list already holds the portal reds.
         for reg in &resume_frame.regs {
             let index = reg.index as usize;
             let (bank_regs, bank_values) = match reg.bank {
@@ -5950,14 +5830,11 @@ pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[
     }
 }
 
-/// RPython captures snapshots by walking `MetaInterp.framestack` and
-/// reading per-frame liveness via `MIFrame.get_list_of_active_boxes`
-/// (`opencoder.py capture_resumedata`).  The Rust state-field JIT
-/// follows the same consumer shape: each frame decodes the current
-/// BC_LIVE liveness entry and emits only live int/ref/float registers.
-/// The macro-generated `JitCodeSym::populate_frame_int_regs` bridge is
-/// only used to materialize root state fields into the root frame's
-/// register banks before this PyPy-shaped walk.
+/// `opencoder.py capture_resumedata` walks `MetaInterp.framestack` and
+/// reads per-frame liveness via `MIFrame.get_list_of_active_boxes`.
+/// Each frame decodes the current BC_LIVE liveness entry and emits only
+/// live int/ref/float registers. Portal reds already sit in those
+/// registers (`MIFrame.setup_call` / the walk-start identity-slot seed).
 ///
 /// The top frame's `pc` here holds the *JitCode-internal* resume position
 /// (`record_state_guard` swapped it to the guard's orgpc just before this
@@ -6023,7 +5900,6 @@ pub fn build_state_field_snapshot(
         snapshot_frames.push(crate::recorder::SnapshotFrame {
             jitcode_index,
             pc: frame.pc as u32,
-            py_pc: frame.pc as u32,
             boxes,
         });
     }
@@ -6052,6 +5928,7 @@ pub fn build_state_field_snapshot(
     let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes);
     let vref_boxes_snap = build_vref_snapshot_boxes(virtualref_boxes);
     crate::recorder::Snapshot {
+        resume_position: -1,
         frames: snapshot_frames,
         vable_boxes: vable_boxes_snap,
         vref_boxes: vref_boxes_snap,
@@ -8713,10 +8590,6 @@ mod tests {
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
-                frame.int_regs[0] = Some(OpRef::int_op(50));
-                frame.int_values[0] = Some(500);
-            }
         }
 
         let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
@@ -8725,7 +8598,9 @@ mod tests {
         let live_pc = builder.current_pos();
         builder.live(&mut asm, &[0], &[], &[]);
         let jitcode = std::sync::Arc::new(builder.finish());
-        let frame = MIFrame::new(jitcode, live_pc);
+        let mut frame = MIFrame::new(jitcode, live_pc);
+        frame.int_regs[0] = Some(OpRef::int_op(50));
+        frame.int_values[0] = Some(500);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
 
@@ -8837,7 +8712,7 @@ mod tests {
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::int_op(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::int_op(1)).unwrap().opcode,
             OpCode::CallMayForceI
         );
         assert_eq!(
@@ -8898,7 +8773,7 @@ mod tests {
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::ref_op(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(1)).unwrap().opcode,
             OpCode::CallMayForceR
         );
         assert_eq!(
@@ -8959,7 +8834,7 @@ mod tests {
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::float_op(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::float_op(1)).unwrap().opcode,
             OpCode::CallMayForceF
         );
         assert_eq!(
@@ -10108,82 +9983,22 @@ mod tests {
     }
 
     #[test]
-    fn populate_frame_int_regs_default_is_no_op() {
-        // Trait method is a default no-op when not overridden.  Existing
-        // `JitCodeSym` impls (e.g. `DummySym`, `NoopSym`, the `()` unit
-        // bridge) inherit this default — they must not silently
-        // overwrite frame banks during the framestack-lift wiring
-        // (guarantee for non-state-field JIT users).
-        let mut builder = JitCodeBuilder::new();
-        builder.load_const_i_value(0, 0);
-        builder.load_const_i_value(1, 0);
-        builder.load_const_i_value(2, 0);
-        builder.load_const_i_value(3, 0);
-        let jitcode = std::sync::Arc::new(builder.finish());
-
-        let mut frame = MIFrame::new(jitcode, 0);
-        // Pre-fill regs with sentinels so a stray write would surface.
-        for slot in &mut frame.int_regs {
-            *slot = Some(majit_ir::OpRef::int_op(99));
-        }
-        for slot in &mut frame.int_values {
-            *slot = Some(0xDEAD);
-        }
-        let saved_regs = frame.int_regs.clone();
-        let saved_values = frame.int_values.clone();
-
-        let sym = DummySym;
-        sym.populate_frame_int_regs(&mut frame);
-
-        assert_eq!(frame.int_regs, saved_regs);
-        assert_eq!(frame.int_values, saved_values);
-    }
-
-    #[test]
-    fn populate_frame_int_regs_writes_scalars_and_arrays() {
-        // Hand-rolled override that mirrors the macro emit
-        // (`majit-macros/src/jit_interp/codegen_state.rs`):
-        //   - 2 scalar slots (idx 0, 1) → `(OpRef::int_op(10), 100)`,
-        //     `(OpRef::int_op(11), 101)`.
-        //   - 1 array slot of length 3 (idx 2..5) →
-        //     `(OpRef::int_op(20+i), 200+i)` for `i in 0..3`.
-        // Asserts the canonical liveness slot layout from
-        // `live_slots_for_state_field_jit(num_scalars=2,
-        // array_lens=&[3], num_virt_arrays=0)` is honored.
-        struct StateFieldLikeSym;
-        impl JitCodeSym for StateFieldLikeSym {
-            fn total_slots(&self) -> usize {
-                5
-            }
-            fn loop_header_pc(&self) -> usize {
-                0
-            }
-            fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
-                let mut slot = 0;
-                // scalars
-                frame.int_regs[slot] = Some(majit_ir::OpRef::int_op(10));
-                frame.int_values[slot] = Some(100);
-                slot += 1;
-                frame.int_regs[slot] = Some(majit_ir::OpRef::int_op(11));
-                frame.int_values[slot] = Some(101);
-                slot += 1;
-                // array (len 3)
-                for i in 0..3 {
-                    frame.int_regs[slot + i] = Some(majit_ir::OpRef::int_op(20 + i as u32));
-                    frame.int_values[slot + i] = Some(200 + i as i64);
-                }
-            }
-        }
-
+    fn setup_call_plants_plain_reds_in_identity_slots() {
+        // `MIFrame.setup_call` plants greens then plain reds densely by
+        // kind. Two int scalars then three array cells land at i0..i4.
         let mut builder = JitCodeBuilder::new();
         for i in 0..5 {
             builder.load_const_i_value(i, 0);
         }
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, 0);
-
-        let sym = StateFieldLikeSym;
-        sym.populate_frame_int_regs(&mut frame);
+        frame.setup_call(&[
+            (JitArgKind::Int, majit_ir::OpRef::int_op(10), 100),
+            (JitArgKind::Int, majit_ir::OpRef::int_op(11), 101),
+            (JitArgKind::Int, majit_ir::OpRef::int_op(20), 200),
+            (JitArgKind::Int, majit_ir::OpRef::int_op(21), 201),
+            (JitArgKind::Int, majit_ir::OpRef::int_op(22), 202),
+        ]);
 
         assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef::int_op(10)));
         assert_eq!(frame.int_values[0], Some(100));
@@ -10199,48 +10014,83 @@ mod tests {
     }
 
     #[test]
-    fn record_state_guard_captures_frames_without_building_legacy_fail_args() {
-        // `pyjitpl.py MetaInterp.generate_guard` captures the live frames,
-        // without first constructing a second full list of guard failargs.
-        // With the macro-emitted state-field-JIT shape, every guard
-        // recorded via `record_state_guard` must
-        //   (a) push a snapshot through `TraceCtx::capture_resumedata`,
-        //   (b) patch the just-recorded guard's `rd_resume_position`
-        //       to that snapshot's id (matching
-        //       `recorder.rs`'s `set_last_op_resume_position`),
-        //   (c) populate the snapshot's frame.boxes from the same
-        //       slots `populate_frame_int_regs` writes.
-        // This ensures a future regression
-        // (e.g. accidentally dropping the `set_last_guard_resume_position`
-        // call) is caught at the unit level rather than only via the
-        // macro-example end-to-end suites.
-        struct StateFieldLikeSym {
-            populated: Vec<(usize, OpRef, i64)>,
+    fn opimpl_load_state_field_reads_identity_slot_not_sym() {
+        // After STORE, `int_regs[slot]` holds the stored box.
+        // LOAD copies that slot into dest without consulting
+        // `state_field_ref`. Matches `blackhole.rs handler_load_state_field_di`.
+        struct SlotSym {
+            sentinel: OpRef,
         }
-        impl JitCodeSym for StateFieldLikeSym {
+        impl JitCodeSym for SlotSym {
             fn total_slots(&self) -> usize {
-                self.populated.len()
+                1
             }
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
-                for &(slot, opref, value) in &self.populated {
-                    frame.int_regs[slot] = Some(opref);
-                    frame.int_values[slot] = Some(value);
-                }
+            fn state_field_ref(&self, field_idx: usize) -> Option<OpRef> {
+                assert_eq!(field_idx, 0);
+                Some(self.sentinel)
             }
+            fn set_state_field_ref(&mut self, _field_idx: usize, _value: OpRef) {}
+            fn state_field_value(&self, _field_idx: usize) -> Option<i64> {
+                Some(0)
+            }
+            fn set_state_field_value(&mut self, _field_idx: usize, _value: i64) {}
         }
 
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(3);
+        builder.store_state_field(0, 1);
+        builder.load_state_field(0, 2);
+        builder.int_return(2);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = SlotSym {
+            sentinel: OpRef::int_op(99),
+        };
+        let stored = OpRef::int_op(20);
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[
+                (JitArgKind::Int, OpRef::int_op(10), 100),
+                (JitArgKind::Int, stored, 200),
+            ],
+        );
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                exit_with_exception: false,
+                ..
+            } => finish_args,
+            other => panic!("expected store+load to finish, got {other:?}"),
+        };
+        assert_eq!(
+            finish_args[0], stored,
+            "LOAD must return the stored identity-slot box, not state_field_ref",
+        );
+        assert_ne!(finish_args[0], sym.sentinel);
+    }
+
+    #[test]
+    fn record_state_guard_captures_frames_without_building_legacy_fail_args() {
+        // `pyjitpl.py MetaInterp.generate_guard` captures the live frames,
+        // without first constructing a second full list of guard failargs.
+        // Snapshot boxes equal the portal frame's live registers after
+        // `MIFrame.setup_call`; capture does not copy from a side store.
         // The guard operands are non-constant input args (regs 0, 1), so the
         // fused compare is NOT folded (opimpl_goto_if_not_int_lt only folds
         // when both operands are Const). 5 < 3 is false, so the guard records
-        // `IntLt` + `GuardFalse`. Reg 2 is a live slot for the snapshot.
+        // `IntLt` + `GuardFalse`.
         let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
-        builder.load_const_i_value(2, 0);
-        builder.live(&mut asm, &[0, 1, 2], &[], &[]);
+        builder.live(&mut asm, &[0, 1], &[], &[]);
         builder.goto_if_not_int_lt(0, 1, target);
         builder.mark_label(target);
         let jitcode = builder.finish();
@@ -10252,16 +10102,9 @@ mod tests {
         recorder.record_input_arg(majit_ir::Type::Int);
         recorder.record_input_arg(majit_ir::Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
-        // Pre-populate three plausible state-field OpRefs (50, 51, 52)
-        // — the actual values are arbitrary; the snapshot must mirror
-        // them slot-for-slot post-`populate_frame_int_regs`.
-        let mut sym = StateFieldLikeSym {
-            populated: vec![
-                (0, OpRef::int_op(50), 500),
-                (1, OpRef::int_op(51), 510),
-                (2, OpRef::int_op(52), 520),
-            ],
-        };
+        let mut sym = DummySym;
+        let box0 = OpRef::input_arg_int(0);
+        let box1 = OpRef::input_arg_int(1);
 
         let action = trace_jitcode_with_args(
             &mut ctx,
@@ -10269,34 +10112,27 @@ mod tests {
             &jitcode,
             0,
             |_pc| 0,
-            &[
-                (JitArgKind::Int, OpRef::input_arg_int(0), 5),
-                (JitArgKind::Int, OpRef::input_arg_int(1), 3),
-            ],
+            &[(JitArgKind::Int, box0, 5), (JitArgKind::Int, box1, 3)],
         );
         assert!(matches!(action, TraceAction::Continue));
 
-        // (a): exactly one snapshot was published.
         let snapshots = ctx.snapshots().to_vec();
         assert_eq!(
             snapshots.len(),
             1,
             "record_state_guard must publish exactly one snapshot per guard",
         );
-        // (c): snapshot's single frame mirrors populate_frame_int_regs.
         let snap = &snapshots[0];
         assert_eq!(snap.frames.len(), 1);
         assert_eq!(
             snap.frames[0].boxes,
             vec![
-                crate::recorder::SnapshotTagged::Box(OpRef::int_op(50), majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(OpRef::int_op(51), majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(OpRef::int_op(52), majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(box0, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(box1, majit_ir::Type::Int),
             ],
-            "snapshot boxes must match populate_frame_int_regs output",
+            "snapshot boxes must equal the live portal registers with no pre-capture copy",
         );
 
-        // (b): the recorded guard op carries the matching resume_position.
         let recorder = ctx.into_recorder();
         let guard = recorder
             .ops()

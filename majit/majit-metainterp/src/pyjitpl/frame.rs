@@ -16,35 +16,17 @@ use crate::recorder::SnapshotTagged;
 
 /// Map an int register (OpRef, concrete value) to an `OpBox`.
 /// Constant OpRefs materialize as `ConstInt(value)`; real trace slots
-/// materialize as `ResOp(opref.raw())`. Mirrors RPython's implicit
-/// isinstance dispatch in `_encode(box)` when the caller passes
+/// materialize as `ResOp(opref.raw())`. `OpRef.raw()` of a value op *is*
+/// the TAGBOX `_index` (`FrontendOp.get_position()`). Mirrors RPython's
+/// implicit isinstance dispatch in `_encode(box)` when the caller passes
 /// `self.registers_i[index]` (which is already a `ConstInt` /
 /// `InputArg` / `AbstractResOp`).
 #[inline]
-/// Map a live `OpRef.raw()` onto the opencoder TAGBOX `_index`.
-/// `None` keeps `raw()` — TRB-only tests mint boxes in `_index` order.
-fn remap_resop(opref: OpRef, unique_to_box: Option<&[u32]>) -> u32 {
-    let raw = opref.raw();
-    match unique_to_box {
-        None => raw,
-        Some(map) => {
-            let mapped = *map.get(raw as usize).unwrap_or_else(|| {
-                panic!("get_list_of_active_boxes: OpRef {opref:?} has no TAGBOX index")
-            });
-            assert!(
-                mapped != u32::MAX,
-                "get_list_of_active_boxes: void op {opref:?} used as a value box"
-            );
-            mapped
-        }
-    }
-}
-
-fn register_to_box_int(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>) -> OpBox {
+fn register_to_box_int(opref: OpRef, value: i64) -> OpBox {
     if opref.is_constant() {
         OpBox::ConstInt(value)
     } else {
-        OpBox::ResOp(remap_resop(opref, unique_to_box))
+        OpBox::ResOp(opref.raw())
     }
 }
 
@@ -52,7 +34,7 @@ fn register_to_box_int(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>) 
 /// `value` stores the raw address of the GC ref (cast to i64 at write
 /// time).
 #[inline]
-fn register_to_box_ref(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>) -> OpBox {
+fn register_to_box_ref(opref: OpRef, value: i64) -> OpBox {
     if opref.is_constant() {
         // history.py `ConstPtr.value` is the single object field. The
         // forwarded gcref lives in the inline `OpRef::ConstPtr` payload
@@ -65,18 +47,18 @@ fn register_to_box_ref(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>) 
         };
         OpBox::ConstPtr(bits)
     } else {
-        OpBox::ResOp(remap_resop(opref, unique_to_box))
+        OpBox::ResOp(opref.raw())
     }
 }
 
 /// Map a float register (OpRef, raw bits) to an `OpBox`.
 /// `value` stores the bit-casted `f64` payload.
 #[inline]
-fn register_to_box_float(opref: OpRef, value: i64, unique_to_box: Option<&[u32]>) -> OpBox {
+fn register_to_box_float(opref: OpRef, value: i64) -> OpBox {
     if opref.is_constant() {
         OpBox::ConstFloat(value as u64)
     } else {
-        OpBox::ResOp(remap_resop(opref, unique_to_box))
+        OpBox::ResOp(opref.raw())
     }
 }
 
@@ -841,7 +823,6 @@ impl MIFrame {
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
-        unique_to_box: Option<&[u32]>,
     ) -> i64 {
         const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
         use majit_jitcode::liveness::{LivenessIterator, decode_offset};
@@ -966,7 +947,7 @@ impl MIFrame {
                         .expect("get_list_of_active_boxes: int register uninitialized");
                     let value = self.int_values[idx]
                         .expect("get_list_of_active_boxes: int value uninitialized");
-                    register_to_box_int(opref, value, unique_to_box)
+                    register_to_box_int(opref, value)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_i, ...,
                     // ConstInt)` — constants live in the `[num_regs_i ..
@@ -995,7 +976,7 @@ impl MIFrame {
                         .expect("get_list_of_active_boxes: ref register uninitialized");
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_boxes: ref value uninitialized");
-                    register_to_box_ref(opref, value, unique_to_box)
+                    register_to_box_ref(opref, value)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
@@ -1020,7 +1001,7 @@ impl MIFrame {
                         .expect("get_list_of_active_boxes: float register uninitialized");
                     let value = self.float_values[idx]
                         .expect("get_list_of_active_boxes: float value uninitialized");
-                    register_to_box_float(opref, value, unique_to_box)
+                    register_to_box_float(opref, value)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_f,
                     // ..., ConstFloat)` — `constants_f[i]` stores the
@@ -1183,10 +1164,11 @@ impl MIFrame {
                     // seeded back as a live Int and used as an array index,
                     // faulting in `handler_getarrayitem_vable_i`.
                     //
-                    // `end` here is `int_identity_reserved_end()`, NOT
-                    // `int_identity_slots_end()` — see that method: the latter
-                    // spans the virt arrays' live element counts, and blanking
-                    // those would drop ordinary working registers.
+                    // `end` here is `int_identity_reserved_end()`: that
+                    // stops after the scalars plus the vable-identity slot.
+                    // Virt-array live element counts sit past it as ordinary
+                    // working registers, and blanking those would drop live
+                    // data.
                     //
                     // Count the slots this actually TAKES something away from.
                     // The range is `num_scalars` int state-field slots plus the
@@ -1397,6 +1379,28 @@ impl MIFrame {
     pub fn setup_call(&mut self, argboxes: &[(JitArgKind, OpRef, i64)]) {
         self.pc = 0;
         self.parent_snapshot = -1;
+        let mut need_i = 0usize;
+        let mut need_r = 0usize;
+        let mut need_f = 0usize;
+        for (kind, _, _) in argboxes {
+            match kind {
+                JitArgKind::Int => need_i += 1,
+                JitArgKind::Ref => need_r += 1,
+                JitArgKind::Float => need_f += 1,
+            }
+        }
+        if self.int_regs.len() < need_i {
+            self.int_regs.resize(need_i, None);
+            self.int_values.resize(need_i, None);
+        }
+        if self.ref_regs.len() < need_r {
+            self.ref_regs.resize(need_r, None);
+            self.ref_values.resize(need_r, None);
+        }
+        if self.float_regs.len() < need_f {
+            self.float_regs.resize(need_f, None);
+            self.float_values.resize(need_f, None);
+        }
         let mut count_i = 0;
         let mut count_r = 0;
         let mut count_f = 0;
@@ -1669,7 +1673,6 @@ mod tests {
             LIVE_OP,
             &all_liveness,
             /* after_residual_call */ true,
-            None,
         );
 
         // Two boxes pushed → array length prefix + 2 varints.
@@ -1751,7 +1754,6 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
-            None,
         );
 
         // pyjitpl.py:193 — `_result_argcode` flips to `b'?'` after
@@ -1807,7 +1809,6 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             /* after_residual_call */ false,
-            None,
         );
 
         // Register slot now holds the zero ConstInt inline-Const OpRef,
@@ -1862,7 +1863,6 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             false,
-            None,
         );
         assert_eq!(frame._result_argcode, b'?');
 
@@ -1923,7 +1923,6 @@ mod tests {
             OP_LIVE,
             &all_liveness,
             false,
-            None,
         );
 
         let (length, consumed) =
