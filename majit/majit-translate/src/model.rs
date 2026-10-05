@@ -7732,6 +7732,11 @@ pub struct FunctionGraph {
     /// `cutover::check_access_directly_sanity` and nothing sets this field
     /// before the policy reads it.
     pub access_directly: bool,
+    /// Start-block input ids that arrived already carrying
+    /// `access_directly`. `default_specialize` binds the flagged actual
+    /// onto that formal, and `hint_fresh_virtualizable` copies the flag
+    /// from it. Empty until a caller passes a hinted actual.
+    pub access_directly_inputs: Vec<u64>,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
     /// (all unset) for `FunctionGraph::new` fixtures; production
@@ -7844,6 +7849,16 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_is_str: graph.return_is_str,
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
+        access_directly_inputs: graph
+            .access_directly_inputs
+            .iter()
+            .filter_map(|id| {
+                varmap
+                    .iter()
+                    .find(|(var, _)| var.id() == *id)
+                    .map(|(_, copied)| copied.id())
+            })
+            .collect(),
         func: graph.func.clone(),
     }
 }
@@ -7914,6 +7929,7 @@ impl FunctionGraph {
             fun_decl_id: None,
             hints: Vec::new(),
             access_directly: false,
+            access_directly_inputs: Vec::new(),
             func: FuncEffects::default(),
         }
     }

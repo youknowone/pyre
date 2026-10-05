@@ -2300,12 +2300,10 @@ impl AbstractActionFlag {
     ///
     /// Pyre's `action_dispatcher` (`ActionFlagOps` trait default,
     /// in this module) iterates `_periodic_actions`
-    /// directly each call.  Rebuilding the closure would produce no
-    /// observable change because (a) majit's loop optimizer subsumes
-    /// the unroll role for hot dispatchers and (b) the periodic list
-    /// is small (typically 1–3 entries — release-the-GIL,
-    /// report-the-signals).  Empty body preserved as the canonical
-    /// "rebuild is a no-op in pyre" marker.
+    /// directly each call.  That body is `@jit.dont_look_inside`, so
+    /// the tracer never unrolls the periodic loop.
+    /// `unrolling_iterable` only froze the closure's captured list;
+    /// rebuilding it changes nothing the tracer records.
     pub fn _rebuild_action_dispatcher(&mut self) {}
 }
 
@@ -2425,7 +2423,17 @@ pub trait ActionFlagOps {
     ///         # to run at the next possible bytecode
     ///         self.reset_ticker(-1)
     /// ```
+    ///
+    /// `@jit.dont_look_inside` (`AbstractActionFlag.fire`). GC callbacks
+    /// write `_fired_bitmask` at allocations the tracer cannot see, so
+    /// this body stays opaque. The marker is a body-local const:
+    /// `#[dont_look_inside]` emits a generic prebuild method, and that
+    /// method would make object-safe `ActionFlagOps` unusable as
+    /// `dyn ActionFlagOps`.
     fn fire(&mut self, action: *mut dyn AsyncActionOps) {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        const _jit_look_inside_fire: bool = false;
         if action.is_null() {
             return;
         }
@@ -2486,13 +2494,22 @@ pub trait ActionFlagOps {
     /// `CheckSignalAction` delivering `KeyboardInterrupt`); the error
     /// propagates out via `?`, aborting the remaining actions, exactly
     /// like PyPy's `action.perform(...)` raising an `OperationError`.
-    /// `executioncontext.py action_dispatcher` is `@jit.unroll_safe`.
-    #[majit_macros::unroll_safe]
+    ///
+    /// `@jit.dont_look_inside` (`_rebuild_action_dispatcher`'s
+    /// `action_dispatcher`; also `@objectmodel.dont_inline`). The
+    /// bitmask is written from GC callbacks, so the tracer must not
+    /// record this body. The marker is a body-local const:
+    /// `#[dont_look_inside]` emits a generic prebuild method, and that
+    /// method would make object-safe `ActionFlagOps` unusable as
+    /// `dyn ActionFlagOps`.
     fn action_dispatcher(
         &mut self,
         ec: *mut ExecutionContext,
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        const _jit_look_inside_action_dispatcher: bool = false;
         // Each `perform` may deliver a signal, which runs the handler at
         // app level; the next action in the loop is handed the same frame.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };

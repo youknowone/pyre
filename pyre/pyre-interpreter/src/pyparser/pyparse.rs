@@ -262,8 +262,15 @@ fn rewrite_named_escapes_in_literal(contents: &str, out: &mut String) -> bool {
                 continue;
             }
         }
+        // A backslash that is not a resolved `\N{...}` escapes the next
+        // character. Copy both, or `\\N{SNOWMAN}` is read as a named escape.
         out.push('\\');
         cursor += 1;
+        if cursor < bytes.len() {
+            let ch = contents[cursor..].chars().next().unwrap();
+            out.push(ch);
+            cursor += ch.len_utf8();
+        }
     }
     changed
 }
@@ -566,6 +573,17 @@ mod tests {
         assert!(rewritten.contains(r"\U000001A2"), "{rewritten}");
         assert!(rewrite_resolved_named_escapes(r#"x = r"\N{TANGUT IDEOGRAPH-17000}""#).is_none());
         assert!(rewrite_resolved_named_escapes(r#"x = "\N{SNOWMAN}""#).is_some());
+    }
+
+    #[test]
+    fn escaped_backslash_does_not_start_a_named_escape() {
+        assert!(rewrite_resolved_named_escapes(r#"x = "\\N{SNOWMAN}""#).is_none());
+        let rewritten =
+            rewrite_resolved_named_escapes(r#"x = "\N{TANGUT IDEOGRAPH-17000}\\N{SNOWMAN}""#)
+                .unwrap();
+        assert!(rewritten.contains(r"\U00017000"), "{rewritten}");
+        assert!(rewritten.contains(r"\\N{SNOWMAN}"), "{rewritten}");
+        assert!(!rewritten.contains("02603"), "{rewritten}");
     }
 
     #[test]
