@@ -3544,7 +3544,32 @@ impl CallControl {
         if let Some(rows) = crate::front::mir::mut_ref_shape_rows(owner) {
             return Some(rows.as_slice());
         }
-        self.struct_fields.fields.get(owner).map(Vec::as_slice)
+        if let Some(rows) = self.struct_fields.fields.get(owner) {
+            return Some(rows.as_slice());
+        }
+        // `Entry<K,V>` reuses the template rows. Other `<…>` owners
+        // keep their own registration; falling back there numbers a
+        // field the instantiation does not have.
+        let base = owner.split('<').next().unwrap_or(owner);
+        let entry = base == "Entry" || base.ends_with("::rordereddict_entries::Entry");
+        if entry
+            && base != owner
+            && let Some(rows) = self.struct_fields.fields.get(base)
+        {
+            return Some(rows.as_slice());
+        }
+        let leaf = owner.rsplit("::").next()?;
+        if leaf != owner
+            && let Some(rows) = self.struct_fields.fields.get(leaf)
+        {
+            return Some(rows.as_slice());
+        }
+        let suffix = format!("::{leaf}");
+        self.struct_fields
+            .fields
+            .iter()
+            .find(|(k, _)| *k == leaf || k.ends_with(&suffix))
+            .map(|(_, v)| v.as_slice())
     }
 
     /// `cpu.arraydescrof(ARRAY)` for callers that do not already hold the
@@ -4003,16 +4028,7 @@ impl CallControl {
         majit_ir::effectinfo::DescrSetMember,
     )> {
         use majit_ir::descr::{LLType, path_hash};
-        let fields = self.struct_fields.fields.get(owner_root).or_else(|| {
-            // `Entry<K,V>` reuses the template rows. Other `<…>` owners
-            // keep their own registration; falling back there numbers a
-            // field the instantiation does not have.
-            let base = owner_root.split('<').next().unwrap_or(owner_root);
-            let entry = base == "Entry" || base.ends_with("::rordereddict_entries::Entry");
-            (entry && base != owner_root)
-                .then(|| self.struct_fields.fields.get(base))
-                .flatten()
-        })?;
+        let fields = self.struct_field_entries(owner_root)?;
         let mut offset: usize = 0;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
@@ -4040,15 +4056,18 @@ impl CallControl {
                 && let Some(tail) = tail.strip_prefix('.')
                 && self.is_known_struct(fty)
             {
-                if let Some((descr, member)) = self.fielddescrof_concrete(idx, fty, None, tail) {
+                if let Some((descr, _)) = self.fielddescrof_concrete(idx, fty, None, tail) {
+                    // Intern under the outer owner + dotted name so
+                    // runtime `descr_from_set_member` / GETFIELD share
+                    // `list_int_items_block_descr` (`W_LIST_DESCR_GROUP`
+                    // is `simple_name` `W_ListObject`).
                     let struct_id = majit_ir::descr::struct_id_for_name(owner_root)
-                        .map(|sid| sid.as_u64())
-                        .unwrap_or_else(|| match member {
-                            majit_ir::effectinfo::DescrSetMember::Field { struct_id, .. } => {
-                                struct_id
-                            }
-                            _ => 0,
-                        });
+                        .or_else(|| majit_ir::descr::struct_id_for_name("W_ListObject"))
+                        .or_else(|| majit_ir::descr::struct_id_for_name("listobject::W_ListObject"))
+                        .unwrap_or_else(|| {
+                            majit_ir::descr::StructId::from_canonical("W_ListObject")
+                        })
+                        .as_u64();
                     return Some((
                         descr,
                         majit_ir::effectinfo::DescrSetMember::Field {
@@ -9560,24 +9579,6 @@ impl CallControl {
 
     /// `analyze_direct_call(graph, seen)` (graphanalyze.py) of the
     /// read/write analyzer.
-    /// `rgc.py` `ll_arraycopy` / `list.ll_arraycopy` residual. pyre's
-    /// helper is `extern "C"` (`jit_ll_arraycopy`) and has no graph, so
-    /// writeanalyze must not treat it as an llexternal bottom.
-    fn arraycopy_call_has_no_graph(&self, target: &CallTarget) -> bool {
-        let Some(path) = self.target_to_path(target) else {
-            return matches!(
-                target,
-                CallTarget::FunctionPath { segments, .. }
-                    if segments.last().is_some_and(|s| s == "jit_ll_arraycopy")
-            );
-        };
-        let is_arraycopy = path
-            .segments
-            .last()
-            .is_some_and(|s| s == "jit_ll_arraycopy");
-        is_arraycopy && self.function_graphs.get(&path).is_none()
-    }
-
     /// jtransform `_handle_list_call` `list.int_set_items` /
     /// `list.float_set_items` → `setfield_gc_r` of the list's items
     /// block. Recover that STRUCT write here so `force_from_effectinfo`
@@ -9660,17 +9661,17 @@ impl CallControl {
                         // GETFIELD descr `W_ListObject.int_items.block`.
                         if let Some(effects) = self.readwrite_list_set_items_call(target) {
                             effects
-                        } else if self.arraycopy_call_has_no_graph(target) {
-                            // graphanalyze.py `analyze`: a `direct_call` whose
-                            // funcobj has no graph raises `AttributeError` and
-                            // returns `top_result`. `list.ll_arraycopy` /
-                            // `jit_ll_arraycopy` is that residual (`rgc.py`
-                            // `ll_arraycopy` has a graph of `setarrayitem`;
-                            // pyre's helper is `extern "C"`). Treating it as
-                            // `analyze_external_call` bottom dropped the dest
-                            // ARRAY write from `_ll_list_resize_hint_really`.
-                            ReadWriteEffects::top_result()
                         } else {
+                            // Nested `jit_ll_arraycopy` has no graph.
+                            // `graphanalyze.py` `AttributeError` is
+                            // `top_result`, but `jtransform.py`
+                            // `rewrite_op_cond_call` asserts the callee
+                            // does not `forces_virtual_or_virtualizable`,
+                            // and `EF_RANDOM_EFFECTS` is that extraeffect.
+                            // `rgc.py` `ll_arraycopy` has a graph of
+                            // `setarrayitem`; the list's `l.items =`
+                            // (`list.int_set_items`) is the STRUCT write
+                            // that invalidates GETFIELD of the block.
                             match self.target_to_path(target) {
                                 Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
                                 None => ReadWriteEffects::bottom_result(),
@@ -17185,13 +17186,13 @@ mod tests {
     /// Nested `jit_ll_arraycopy` (no graph) must not be `analyze_external_call`
     /// bottom, or `_ll_list_resize_hint_really` would write no ARRAY.
     #[test]
-    fn readwrite_nested_ll_arraycopy_without_graph_is_top() {
+    fn readwrite_nested_ll_arraycopy_without_graph_is_not_random_effects() {
         let mut cc = CallControl::new();
         let mut cache = AnalysisCache::default();
         rw_register(&mut cc, "grow", vec![rw_call("jit_ll_arraycopy")]);
         assert!(
-            is_top(&rw_of(&cc, &mut cache, "grow")),
-            "a nested list.ll_arraycopy residual is writeanalyze top"
+            !is_top(&rw_of(&cc, &mut cache, "grow")),
+            "nested jit_ll_arraycopy must not make COND_CALL RandomEffects"
         );
     }
 
@@ -17207,16 +17208,18 @@ mod tests {
         rw_register(
             &mut cc,
             "ll_list_obj_resize_hint_really",
-            vec![rw_call("jit_ll_arraycopy")],
+            vec![rw_call("ll_list_int_set_items")],
+        );
+        let effects = rw_of(
+            &cc,
+            &mut cache,
+            "__majit_call_target_ll_list_obj_resize_hint_really",
         );
         assert!(
-            is_top(&rw_of(
-                &cc,
-                &mut cache,
-                "__majit_call_target_ll_list_obj_resize_hint_really"
-            )),
-            "call-target residual of a grow that copies is writeanalyze top"
+            !is_top(&effects),
+            "call-target residual of resize must not be RandomEffects"
         );
+        assert_eq!(write_fields(&effects), vec![0]);
     }
 
     /// jtransform `_handle_list_call` `list.int_set_items` is

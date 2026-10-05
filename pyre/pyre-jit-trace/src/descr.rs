@@ -12170,7 +12170,7 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             // nested STRUCT leaf; the trace GETFIELD uses the dotted name
             // on `W_ListObject`. Same Arc so `force_from_effectinfo` can
             // invalidate the cached block across residual COND_CALL.
-            if field_name == "int_items.block" || field_name == "block" {
+            if field_name == "int_items.block" {
                 return SetMemberLookup::Resolved(list_int_items_block_descr());
             }
             if field_name == "float_items.block" {
