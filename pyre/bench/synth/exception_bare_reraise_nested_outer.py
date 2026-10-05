@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=4
-# The measured reading stays under 4, so the ceiling is 4.
+# pyre-check: max-pypy-ratio=3.5
+# Local cranelift 2.0x; the ceiling is 3.5.
 # pyre-check: skip-cpython
 # cpython 2.30s vs pyre 0.42s (5.5x on the ubuntu runner), and it is not
 # gated on — only pypy is.
