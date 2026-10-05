@@ -671,6 +671,47 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     );
 }
 
+fn call_target_leaf(target: &CallTarget) -> String {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.last().cloned().unwrap_or_default(),
+        CallTarget::Method { name, .. } => name.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `execute_opcode_step`'s `Instruction::ForIter` arm is `return execute_for_iter(...)`:
+/// a scoped Result tail-forward.  That call must carry `LastException` so a
+/// StopIteration from `iter_next` / `space.next` becomes `catch_exception`
+/// (`flatten.py make_exception_link`) rather than the portal's abort arm.
+#[test]
+fn execute_for_iter_tail_forward_gets_lastexception_exits() {
+    let graph = lower_function(interp(), "execute_opcode_step").expect("lower execute_opcode_step");
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|b| {
+            b.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if call_target_leaf(target) == "execute_for_iter"
+                )
+            })
+        })
+        .expect("execute_opcode_step calls execute_for_iter");
+    assert!(
+        matches!(call_block.exitswitch, Some(ExitSwitch::LastException)),
+        "FOR_ITER tail-forward must get LastException exits"
+    );
+    assert!(
+        call_block
+            .exits
+            .iter()
+            .any(|link| link.last_exception.is_some() && link.last_exc_value.is_some()),
+        "FOR_ITER tail-forward exception link carries last_exception/last_exc_value"
+    );
+}
+
 #[test]
 fn eval_loop_custom_match_gets_catch_and_rewrap() {
     let llbc = interp();

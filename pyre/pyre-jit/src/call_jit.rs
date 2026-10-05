@@ -1878,6 +1878,12 @@ fn make_portal_quasi_immut_descr(
     pyre_jit_trace::state::quasi_immut_descr_for_struct(struct_ptr, field, None)
 }
 
+fn resolve_host_symbolic_residual_fnaddr(fnaddr: i64) -> i64 {
+    pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path(fnaddr)
+        .and_then(pyre_jit_trace::runtime_fnaddr_patch::runtime_fnaddr_by_path)
+        .unwrap_or(0)
+}
+
 pub fn publish_pyre_host_hooks() {
     fn criticalcode_start_adapter() {
         pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
@@ -1902,6 +1908,7 @@ pub fn publish_pyre_host_hooks() {
         ),
         make_quasi_immut_descr: Some(make_portal_quasi_immut_descr),
     });
+    majit_metainterp::register_symbolic_residual_fnaddr(resolve_host_symbolic_residual_fnaddr);
 }
 
 pub fn install_jit_call_bridge() {

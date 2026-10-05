@@ -620,32 +620,56 @@ fn rewire_checked_arith_ok_or_else(
         }
     }
 
-    if graph.blocks[c].exitswitch.is_some() {
-        return Err("ok_or_else continuation has an exitswitch".to_string());
-    }
-    let [c_exit] = graph.blocks[c].exits.as_slice() else {
-        return Err("ok_or_else continuation does not have one exit".to_string());
-    };
-    if c_exit.exitcase.is_some()
-        || c_exit.last_exception.is_some()
-        || c_exit.last_exc_value.is_some()
-    {
-        return Err("ok_or_else continuation exit is not a plain goto".to_string());
-    }
     // After remint the Call produces the payload Variable, not the
     // recorded Result identity; the continuation forwards that live result.
     let live_result = graph.blocks[c].operations[ok_idx]
         .result
         .clone()
         .ok_or_else(|| "ok_or_else continuation has no result".to_string())?;
-    if c_exit
+    // `result_exc` tail-forwards a returned `ok_or_else` Result with
+    // `LastException` (normal → returnblock with the payload, exception →
+    // exceptblock).  That is the same continuation this rewrite fuses into
+    // `*_ovf`; take the normal exit and replace the exception edge with
+    // OverflowError.  A plain goto is the pre-`result_exc` shape.
+    let saved_c_exit = if matches!(graph.blocks[c].exitswitch, Some(ExitSwitch::LastException)) {
+        let normal = graph.blocks[c]
+            .exits
+            .iter()
+            .find(|link| link.exitcase.is_none())
+            .cloned()
+            .ok_or_else(|| "ok_or_else LastException block has no normal exit".to_string())?;
+        if !graph.blocks[c]
+            .exits
+            .iter()
+            .any(|link| link.target == graph.exceptblock)
+        {
+            return Err(
+                "ok_or_else LastException exception exit is not the exceptblock".to_string(),
+            );
+        }
+        normal
+    } else {
+        if graph.blocks[c].exitswitch.is_some() {
+            return Err("ok_or_else continuation has an exitswitch".to_string());
+        }
+        let [c_exit] = graph.blocks[c].exits.as_slice() else {
+            return Err("ok_or_else continuation does not have one exit".to_string());
+        };
+        if c_exit.exitcase.is_some()
+            || c_exit.last_exception.is_some()
+            || c_exit.last_exc_value.is_some()
+        {
+            return Err("ok_or_else continuation exit is not a plain goto".to_string());
+        }
+        c_exit.clone()
+    };
+    if saved_c_exit
         .args
         .iter()
         .any(|arg| matches!(arg, LinkArg::Value(value) if *value != live_result))
     {
         return Err("ok_or_else continuation forwards a non-result value".to_string());
     }
-    let saved_c_exit = c_exit.clone();
     let [a_exit] = graph.blocks[a].exits.as_slice() else {
         return Err("checked-arith block does not have one exit".to_string());
     };

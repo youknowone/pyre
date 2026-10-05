@@ -858,12 +858,10 @@ fn lower_result_exc_returns_inner(
         // `?`-diamond into a direct forward of the callee's `Result` to
         // `returnblock`, leaving no `Ok`/`Err` shell to rewrite, so
         // `tail_forwarded_returns` is 0.
-        // This is the same disposition as a scoped tail-forward
-        // (`SiteOutcome::TailForward`): the residual-call ABI erases the
-        // shell (`Ok` → value, `Err` → `BH_LAST_EXC_VALUE`) and the
-        // codewriter re-derives `guard_no_exception` op-locally, so the
-        // forward already carries `T` and the raise propagates
-        // implicitly — no rewrite is needed.
+        // This is a scoped callee whose only Result is an *unscoped*
+        // callee's return forwarded as a value.  The caller rule never
+        // saw that site (it only records scoped `Result<T, PyError>`
+        // callees), so there is no exception edge to install here.
         if has_tail_forwarded_call_result(graph) {
             return Ok(0);
         }
@@ -4018,8 +4016,14 @@ fn rewire_one_call_site(
                  switches would read garbage"
             ));
         }
-        // The forward needs no CFG rewrite — but it does need the same
-        // retyping the diamond arm performs, and for the same reason.
+        // The forward still needs the exception edge the diamond arm
+        // installs: after the callee raises, `Err` no longer flows as a
+        // Result value on the returnblock link (`exceptiontransform.py`
+        // `create_exception_handling`, `jtransform.py`
+        // `rewrite_op_direct_call`).  An empty close list is the
+        // `return f(...)` form — `raise_link_through_closes` then points
+        // straight at `exceptblock`.  It also needs the same retyping
+        // the diamond arm performs, and for the same reason.
         // `front::mir` types every aggregate `Ref`, so the call declares
         // the `Result` shell; once the callee is transformed it hands
         // back `T` and the raise travels the exception edge, so the value
@@ -4062,15 +4066,13 @@ fn rewire_one_call_site(
         }
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
-        if !tail_closes.is_empty() {
-            let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
-            let normal = graph.blocks[a].exits[0].clone();
-            graph.set_control_flow_metadata(
-                BlockId(a),
-                Some(ExitSwitch::LastException),
-                vec![normal, exc_link],
-            );
-        }
+        let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
+        let normal = graph.blocks[a].exits[0].clone();
+        graph.set_control_flow_metadata(
+            BlockId(a),
+            Some(ExitSwitch::LastException),
+            vec![normal, exc_link],
+        );
         separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
@@ -10506,6 +10508,50 @@ mod tail_forward_close_tests {
             "the raise edge frees the buffer"
         );
         assert_eq!(raise.exits[0].target, graph.exceptblock);
+    }
+
+    /// `return f()` with no bracket closes: the call still needs
+    /// `LastException` so flatten emits `catch_exception` rather than
+    /// dropping the exception exit (`flatten.py insert_exits` when the
+    /// last op is not `-live-`).
+    #[test]
+    fn a_direct_tail_forward_gets_an_exception_edge() {
+        let mut graph = FunctionGraph::new("tail_direct");
+        let start = graph.startblock;
+        let r = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::function_path(["m", "f"]),
+                    args: crate::model::call_args(Vec::new()),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call result");
+        graph.set_goto(start, graph.returnblock, vec![r.clone()]);
+
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "",
+            &ValueType::Int,
+            true,
+            true,
+            &[(r.clone(), None, ValueType::Int)],
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("tail forward");
+        assert!(matches!(outcome, SiteOutcome::TailForward));
+        let a = &graph.blocks[start.0];
+        assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
+        let [normal, exc] = a.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert_eq!(normal.target, graph.returnblock);
+        assert_eq!(exc.target, graph.exceptblock);
+        assert!(exc.last_exception.is_some());
+        assert!(exc.last_exc_value.is_some());
     }
 }
 
