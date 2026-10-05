@@ -3309,8 +3309,7 @@ fn walker_fold_type_name<Sym: WalkSym>(
     if name != "__name__" {
         return Ok(None);
     }
-    let Some((_metatype, w_name)) =
-        (unsafe { pyre_interpreter::type_name_obj_fast_path(concrete_obj) })
+    let Some((_metatype, _)) = (unsafe { pyre_interpreter::type_name_obj_fast_path(concrete_obj) })
     else {
         return Ok(None);
     };
@@ -3321,6 +3320,16 @@ fn walker_fold_type_name<Sym: WalkSym>(
         crate::descr::type_name_obj_descr(),
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    // `record_quasiimmut_field` installs the watcher before it captures
+    // `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`). The
+    // eligibility peek is only the non-null test; baking it would keep a
+    // pre-rename pointer after `invalidate_then_store` completed with no
+    // watcher. Re-read after the record, the same order as the `getfield`
+    // that follows `record_quasiimmut_field` on the rewritten load.
+    let w_name = unsafe { pyre_object::typeobject::w_type_peek_name_obj(concrete_obj) };
+    if w_name.is_null() {
+        return Ok(None);
+    }
     let name_const = ctx.trace_ctx.const_ref(w_name as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', name_const)?;
     Ok(Some(()))
