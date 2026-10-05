@@ -791,11 +791,15 @@ impl UnrollOptimizer {
     /// unroll.py: jump_to_preamble(cell_token, jump_op).
     ///
     /// Redirect the closing JUMP to the preamble entry token
-    /// (`target_tokens[0]`, `virtual_state=None`). Only changes the
-    /// descriptor, keeping arglist intact — RPython parity.
+    /// (`target_tokens[0]`, `virtual_state=None`). Upstream
+    /// `copy_and_change` keeps the arglist; majit then reshapes it to
+    /// `start_state.renamed_inputargs` so the assembler remap sees the
+    /// same JUMP/LABEL arity `x86/regalloc.py`
+    /// `_compute_hint_locations_from_descr` asserts for a compiled target.
     pub fn jump_to_preamble(
         body_ops: &[majit_ir::OpRc],
         preamble_target: &TargetToken,
+        preamble_args: &[OpRef],
     ) -> Vec<majit_ir::OpRc> {
         assert!(
             preamble_target.virtual_state.is_none(),
@@ -805,8 +809,9 @@ impl UnrollOptimizer {
         if let Some(idx) = result.iter().rposition(|op| op.opcode == OpCode::Jump) {
             // Re-clone before the descr write: the input Rc may still be
             // registered in the optimizer's producer stores.
-            let jump = (*result[idx]).clone();
+            let mut jump = (*result[idx]).clone();
             jump.setdescr(preamble_target.as_jump_target_descr());
+            apply_preamble_shape_to_jump(&mut jump, preamble_args);
             result[idx] = OpRc::new(jump);
         }
         result
@@ -2110,6 +2115,12 @@ impl UnrollOptimizer {
             }
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.setdescr(preamble_target.as_jump_target_descr());
+                // Retrace mismatches already gave up above. A compile_loop
+                // close onto the same-artifact start LABEL may still be one
+                // box short of `exported_renamed_inputargs` (an entry-only
+                // invariant). Pad/truncate here so consider_jump /
+                // the assembler remap never sees JUMP 33 vs LABEL 34.
+                apply_preamble_shape_to_jump(&mut end_jump, &exported_renamed_inputargs);
                 if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                     // unroll.py parity: jump_to_preamble retargets
                     // the live end_jump and routes it through
@@ -2129,7 +2140,11 @@ impl UnrollOptimizer {
                     body_ops = replace_terminal_jump(&body_ops, end_jump);
                 }
             } else {
-                body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
+                body_ops = Self::jump_to_preamble(
+                    &body_ops,
+                    &preamble_target,
+                    &exported_renamed_inputargs,
+                );
             }
             crate::debug::log_one(
                 "jit-tracing",
@@ -6103,7 +6118,12 @@ fn replace_terminal_jump(body_ops: &[majit_ir::OpRc], jump_op: Op) -> Vec<majit_
     result
 }
 
-#[allow(dead_code)]
+/// Match a jump_to_preamble JUMP to the start LABEL's
+/// `ExportedState.renamed_inputargs`. Extra LABEL slots are
+/// loop-invariant entry boxes: pad with the preamble arg at that
+/// index so `x86/regalloc.py` `consider_jump` identity-remaps them.
+/// A longer JUMP is truncated to the LABEL contract
+/// (`_compute_hint_locations_from_descr` asserts equal length).
 fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[OpRef]) {
     if jump_args.len() > preamble_args.len() {
         jump_args.truncate(preamble_args.len());
@@ -6111,6 +6131,24 @@ fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[O
     while jump_args.len() < preamble_args.len() {
         jump_args.push(preamble_args[jump_args.len()]);
     }
+}
+
+fn apply_preamble_shape_to_jump(jump: &mut Op, preamble_args: &[OpRef]) {
+    let mut jump_args: Vec<OpRef> = jump.args_slice().iter().map(|a| a.to_opref()).collect();
+    let old_len = jump_args.len();
+    reshape_jump_args_for_preamble(&mut jump_args, preamble_args);
+    if jump_args.len() == old_len {
+        return;
+    }
+    let mut boxes: Vec<Operand> = jump.args_slice().iter().cloned().collect();
+    if jump_args.len() < old_len {
+        boxes.truncate(jump_args.len());
+    } else {
+        for extra in &jump_args[old_len..] {
+            boxes.push(Operand::bound_from_opref(*extra));
+        }
+    }
+    jump.initarglist(boxes);
 }
 
 fn pick_virtual_state(
@@ -6609,7 +6647,8 @@ mod tests {
         let preamble_target = TargetToken::new_preamble(7);
 
         let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
-        let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
+        let preamble_args = [OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)];
+        let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target, &preamble_args);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1]
@@ -6630,6 +6669,28 @@ mod tests {
         let mut jump_args = vec![OpRef::int_op(0)];
         reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::int_op(0), OpRef::int_op(1)]);
         assert_eq!(jump_args.as_slice(), &[OpRef::int_op(0), OpRef::int_op(1)]);
+    }
+
+    #[test]
+    fn test_jump_to_preamble_pads_a_short_body_jump() {
+        let body_ops = vec![Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)])];
+        let preamble_target = TargetToken::new_preamble(7);
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
+        let preamble_args = [OpRef::int_op(0), OpRef::int_op(1)];
+        let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target, &preamble_args);
+        assert_eq!(result[0].opcode, OpCode::Jump);
+        assert_eq!(
+            result[0]
+                .args_slice()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            &[OpRef::int_op(0), OpRef::int_op(1)]
+        );
+        assert_eq!(
+            result[0].getdescr().map(|descr| descr.repr()),
+            Some("LoopTargetDescr(start:7)".to_string())
+        );
     }
 
     #[test]

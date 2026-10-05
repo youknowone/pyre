@@ -4763,6 +4763,23 @@ impl Optimizer {
             .first()
             .map(|token| token.as_jump_target_descr());
         let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, Some(preamble));
+        // A compiled preamble already stored `_x86_arglocs`.
+        // `_compute_hint_locations_from_descr` asserts
+        // `len(arglocs) == jump_op.numargs()`; a short JUMP would panic
+        // in the assembler. Give up like `unroll.py` `InvalidLoop` so
+        // the bridge is cancelled instead.
+        if let Some(target) = jump_op
+            .getdescr()
+            .as_ref()
+            .and_then(|d| d.as_loop_target_descr())
+        {
+            let n = target.target_arglocs().len();
+            if n > 0 && jump_op.num_args() != n {
+                return Err(crate::optimize::InvalidLoop(
+                    "jump_to_preamble: JUMP arity != compiled preamble LABEL arity",
+                ));
+            }
+        }
         self.send_extra_operation(&OpRc::new(jump_op.clone()), ctx)?;
         optimized_ops.append(&mut ctx.new_operations);
         Ok((optimized_ops, false))
