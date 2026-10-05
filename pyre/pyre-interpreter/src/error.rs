@@ -4665,6 +4665,9 @@ pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
 /// the `except:` arm, which is also the one that reads `e` — reporting the
 /// failure instead of discarding it.  `extra` names the traceback
 /// `debug_print_traceback` dumps, and nothing dumps one here.
+///
+/// `@jit.dont_look_inside` (`error.py get_converted_unexpected_exception`).
+#[majit_macros::dont_look_inside]
 pub fn get_converted_unexpected_exception(
     _space: PyObjectRef,
     error: &dyn std::error::Error,

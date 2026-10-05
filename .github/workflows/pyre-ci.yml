@@ -6,6 +6,9 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      # `**/*` needs another slash, so a baseline that sits in `majit/`
+      # itself is named beside the tree.
+      - "majit/*"
       - "majit/**/*"
       - "pyre/**/*"
       - "lib-python/**"
@@ -28,6 +31,9 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      # `**/*` needs another slash, so a baseline that sits in `majit/`
+      # itself is named beside the tree.
+      - "majit/*"
       - "majit/**/*"
       - "pyre/**/*"
       - "lib-python/**"
