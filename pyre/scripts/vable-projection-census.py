@@ -117,6 +117,11 @@ def render(path: Path) -> str:
 
 
 BARE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# Charon pretty-print embeds the source of `assert!(self.field)` in
+# `panic(const "assertion failed: … self.field")`. That is a string, not a
+# projection; matching it attributes a non-deref to the function that only
+# reads `(*self).field`.
+STRING_LIT = re.compile(r'"(?:\\.|[^"\\])*"')
 
 
 def base_of(line: str, close: int) -> str | None:
@@ -174,17 +179,18 @@ def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
     counts: dict[str, int] = defaultdict(int)
     unclassified: list[str] = []
     fn = "<toplevel>"
-    for line in dump.split("\n"):
-        m = FN_RE.match(line)
+    for raw in dump.split("\n"):
+        m = FN_RE.match(raw)
         if m:
             fn = m.group(1).strip()
             continue
-        if line.lstrip().startswith("//"):
+        if raw.lstrip().startswith("//"):
             continue
+        line = STRING_LIT.sub('""', raw)
         for hit in any_proj.finditer(line):
             found = projection_base(line, hit.start())
             if found is None:
-                unclassified.append(f"{fn}: {line.strip()}")
+                unclassified.append(f"{fn}: {raw.strip()}")
                 continue
             base, parenthesised = found
             if BARE_IDENT.fullmatch(base):
@@ -192,11 +198,25 @@ def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
             elif parenthesised and "*" in base:
                 pass
             else:
-                unclassified.append(f"{fn}: {line.strip()}")
+                unclassified.append(f"{fn}: {raw.strip()}")
     return counts, unclassified
 
 
+def _panic_string_is_not_a_projection() -> None:
+    dump = """
+pub fn settopvalue(self: &mut PyFrame)
+{
+        _5 = copy (*self).valuestackdepth;
+        _15 = panic(const "assertion failed: index < self.valuestackdepth");
+}
+"""
+    counts, unclassified = census(dump, ["valuestackdepth"])
+    assert unclassified == [], unclassified
+    assert "settopvalue" not in counts, counts
+
+
 def main() -> int:
+    _panic_string_is_not_a_projection()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("inputs", nargs="+", type=Path)
     args = ap.parse_args()
