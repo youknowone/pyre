@@ -8051,12 +8051,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         );
 
         // os.getgrouplist(user, group) -> list of groups
-        crate::module_ns_store(
-            ns,
+        // `function_new_with_fixed_code` and `w_dict_setitem_str_no_proxy`
+        // collect (`get_livevars_for_roots`). `ns` is the module dict still
+        // stored into after this pair.
+        {
+            let _ns_roots = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ns);
+            let w_getgrouplist = crate::make_builtin_function_with_arity(
             "getgrouplist",
-            crate::make_builtin_function_with_arity(
-                "getgrouplist",
-                |args| {
+            |args| {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(
                             "getgrouplist() requires username, gid",
@@ -8129,9 +8133,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::with_roots!(w_user, w_gid =>
                         pyre_object::w_list_new(items.take())))
                 },
-                2,
-            ),
+            2,
         );
+        let _ = pyre_object::gc_roots::pin_root(w_getgrouplist);
+        crate::module_ns_store(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "getgrouplist",
+            pyre_object::gc_roots::shadow_stack_get(ns_slot + 1),
+        );
+        ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        }
 
         // os.sched_get_priority_max(policy) -> int
         crate::module_ns_store(
@@ -12609,12 +12620,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             target_os = "macos",
             target_os = "ios"
         ))]
-        crate::module_ns_store(
-            ns,
+        {
+        // `function_new_with_fixed_code` and `w_dict_setitem_str_no_proxy`
+        // collect (`get_livevars_for_roots`). `ns` is the module dict still
+        // stored into after this pair. Darwin newly compiles this store
+        // (`target_os = "macos"`).
+        let _ns_roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ns);
+        let w_initgroups = crate::make_builtin_function_with_arity(
             "initgroups",
-            crate::make_builtin_function_with_arity(
-                "initgroups",
-                |args| {
+            |args| {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(
                             "initgroups() requires username, gid",
@@ -12657,9 +12673,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     Ok(pyre_object::w_none())
                 },
-                2,
-            ),
+            2,
         );
+        let _ = pyre_object::gc_roots::pin_root(w_initgroups);
+        crate::module_ns_store(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "initgroups",
+            pyre_object::gc_roots::shadow_stack_get(ns_slot + 1),
+        );
+        ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        }
 
         // os.openpty() -> (master_fd, slave_fd)
         crate::module_ns_store(

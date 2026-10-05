@@ -195,6 +195,10 @@ pub struct ShortBracket {
 /// rather than merely stored or returned.  The set is not the whole moving
 /// heap: it is the part of it a callee's *name* identifies, and the entries
 /// below record which kind each spelling was checked against.
+///
+/// A new spelling that matches an existing prefix (a `w_list_*` helper)
+/// re-ranks an already-unresolved live pointer as tier 1.5; it does not add
+/// an unrooted call.
 pub const MOVABLE_GC_MARKERS: &[&str] = &[
     "w_list_",
     "w_dict_",
