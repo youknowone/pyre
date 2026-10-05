@@ -398,10 +398,11 @@ pub struct W_TypeObject {
     /// `ModuleDictStrategy.version?`, the tree's other `?` declaration, the way
     /// upstream's one `QuasiImmut` class serves every quasi-immutable field.
     pub quasi_immut_watchers: crate::quasiimmut::QuasiImmutField,
-    /// typeobject.py:179 `name?` — the hidden `mutate_name` field for the
-    /// app-level `__name__` object.  `descr_set__name__` stores a new string
-    /// without `mutated()`, so `_version_tag?` does not move on a rename;
-    /// loops that bake `w_name` register here instead.
+    /// typeobject.py `_immutable_fields_ = ['name?']` — the hidden
+    /// `mutate_name` field for the app-level `__name__` object.
+    /// `descr_set__name__` stores a new string without `mutated()`, so
+    /// `_version_tag?` does not move on a rename; loops that bake `w_name`
+    /// register here instead.
     ///
     /// Same ownership as [`quasi_immut_watchers`]: an `AtomicPtr` plus a lock,
     /// no GC pointers, reclaimed by `type_object_destructor`.
@@ -1427,26 +1428,23 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     // every store to `name?`, so a baked `__name__` stops being a trace
     // constant before it stops being the live value.  `descr_set__name__`
     // does not call `mutated()`, so `_version_tag?` is not this pin.
-    if (*(obj as *const W_TypeObject))
-        .w_name_watchers
-        .is_installed()
-    {
-        crate::quasiimmut::sweep_quasi_immut_field(
-            &(*(obj as *const W_TypeObject)).w_name_watchers,
-        );
-    }
-    let t = &mut *(obj as *mut W_TypeObject);
-    // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
-    // `w_type_get_name` returns `&str` and is read from the interpreter, the
-    // JIT GC trace, cpyext, and extension modules, so this slot is not switched
-    // to `Wtf8Buf` here. A lone surrogate has no UTF-8 `String` that is not
-    // U+FFFD; only a name with a `&str` view updates the slot. `w_name` still
-    // keeps the assigned object.
-    if let Some(name) = crate::w_str_get_value_opt(w_name) {
-        *t.name = name.to_string();
-    }
+    // The sweep and the store share the watcher lock: an `is_installed`
+    // test outside it lets a recorder publish a watcher for the old
+    // pointer after the test and before the store.
+    let t = obj as *mut W_TypeObject;
+    (*t).w_name_watchers.invalidate_then_store(|| {
+        // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
+        // `w_type_get_name` returns `&str` and is read from the interpreter, the
+        // JIT GC trace, cpyext, and extension modules, so this slot is not switched
+        // to `Wtf8Buf` here. A lone surrogate has no UTF-8 `String` that is not
+        // U+FFFD; only a name with a `&str` view updates the slot. `w_name` still
+        // keeps the assigned object.
+        if let Some(name) = crate::w_str_get_value_opt(w_name) {
+            *(*t).name = name.to_string();
+        }
+        (*t).w_name = w_name;
+    });
     type_write_barrier(obj);
-    t.w_name = w_name;
 }
 
 /// `typeobject.py` / `getqualname`: the class qualified name lives

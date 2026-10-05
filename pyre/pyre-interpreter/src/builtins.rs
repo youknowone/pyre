@@ -11146,7 +11146,6 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // across them.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], positional[0], positional[1]]);
-    let cls = pyre_object::gc_roots::shadow_stack_get(base);
     let message = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_exceptions = pyre_object::gc_roots::shadow_stack_get(base + 2);
     if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
@@ -11159,8 +11158,16 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         crate::baseobjspace::isinstance_list_w(w_exceptions) || pyre_object::is_tuple(w_exceptions)
     };
     if !is_list_or_tuple {
-        let has_len = crate::baseobjspace::getattr_str(w_exceptions, "__len__").is_ok();
-        let has_getitem = crate::baseobjspace::getattr_str(w_exceptions, "__getitem__").is_ok();
+        let has_len = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+            "__len__",
+        )
+        .is_ok();
+        let has_getitem = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+            "__getitem__",
+        )
+        .is_ok();
         if !has_len || !has_getitem {
             return Err(crate::PyError::type_error(
                 "second argument (exceptions) must be a sequence",
@@ -11187,15 +11194,14 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // `fixedview` returns an untraced Vec and the membership checks below run
     // Python, so publish every element before walking them.
     let items = pyre_object::gc_roots::pin_roots(&exceptions);
-    let exceptions: Vec<_> = (0..exceptions.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(items + i))
-        .collect();
-    if exceptions.is_empty() {
+    let exception_count = exceptions.len();
+    if exception_count == 0 {
         return Err(crate::PyError::value_error(
             "second argument (exceptions) must be a non-empty sequence",
         ));
     }
-    for (index, exc) in exceptions.iter().copied().enumerate() {
+    for index in 0..exception_count {
+        let exc = pyre_object::gc_roots::shadow_stack_get(items + index);
         if !unsafe { pyre_object::is_exception(exc) } {
             return Err(crate::PyError::value_error(format!(
                 "Item {index} of second argument (exceptions) is not an exception"
@@ -11207,15 +11213,27 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let exception = lookup_exc_class("Exception").unwrap();
     // `isinstance` / `issubclass` collect.  `base_group` is still read after
     // those calls for the layout test, so it sits in this pin with the others.
-    let live_base =
-        pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group, base_group]);
+    // Reload `cls` from `base`: `getattr` / `py_repr` / `fixedview` already
+    // ran, so a Rust local taken before those calls is a pre-move address.
+    let live_base = pyre_object::gc_roots::pin_roots(&[
+        pyre_object::gc_roots::shadow_stack_get(base),
+        exception,
+        exception_group,
+        base_group,
+    ]);
     let cls_now = || pyre_object::gc_roots::shadow_stack_get(live_base);
     let exception_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 1);
     let group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 2);
     let base_group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 3);
-    let all_exceptions = exceptions
-        .iter()
-        .all(|exc| crate::baseobjspace::isinstance(*exc, exception_now()).unwrap_or(false));
+    // Each `isinstance` collects, so re-read `items + index` immediately
+    // before the call instead of walking a copied Vec of pre-move words.
+    let all_exceptions = (0..exception_count).all(|index| {
+        crate::baseobjspace::isinstance(
+            pyre_object::gc_roots::shadow_stack_get(items + index),
+            exception_now(),
+        )
+        .unwrap_or(false)
+    });
     if std::ptr::eq(cls_now(), base_group_now()) && all_exceptions {
         pyre_object::gc_roots::shadow_stack_set(live_base, group_now());
     }
@@ -11269,7 +11287,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             source
         } else {
             pyre_object::w_tuple_new(
-                (0..exceptions.len())
+                (0..exception_count)
                     .map(|i| pyre_object::gc_roots::shadow_stack_get(items + i))
                     .collect(),
             )
