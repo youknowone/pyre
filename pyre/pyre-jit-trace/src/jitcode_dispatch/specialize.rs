@@ -14302,6 +14302,98 @@ fn walker_exc_canonical_layout(
     ))
 }
 
+/// Pin the authentic exception, intern `message_wtf8` as a ConstPtr, emit
+/// `NewWithVtable` plus the `__context__` SETFIELD, and route as `SubRaise`.
+/// Shared by the immutable-type and read-only-descriptor attr-raise folds
+/// after `exc_instance_pytype` has already passed.
+fn walker_emit_canonical_message_raise<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ec: OpRef,
+    err: &pyre_interpreter::PyError,
+    exc: pyre_object::PyObjectRef,
+    kind: pyre_object::interp_exceptions::ExcKind,
+    exc_type_ptr: *const pyre_object::pyobject::PyType,
+    user: bool,
+) -> DispatchOutcome {
+    // Message as a trace constant: deterministic under the caller's
+    // predicate, so one shared immutable string is exact (the same sharing
+    // a `raise TypeError("...")` gets from co_consts). Pin the fresh
+    // exception across the string allocation; the recorded ConstPtr slot
+    // is forwarded across minor collections by the op-graph walker and
+    // rooted by the compiled loop's gcref table thereafter.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
+    // The root keeps the exception alive across that allocation but does
+    // not fix its address: a minor collection moves the object and rewrites
+    // the slot, which leaves this local naming a forwarded corpse. Read the
+    // address back out of the slot the pin claimed.
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
+    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
+    let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
+    let class_const = ctx
+        .trace_ctx
+        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
+    let new_op = crate::helpers::emit_exception_new_inline(
+        ctx.trace_ctx,
+        kind,
+        class_const,
+        args_list,
+        user,
+    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+
+    // `__context__` chaining on the still-virtual exception, the tail
+    // `try_walker_trace_raise_bare_class` carries: `active = GETFIELD_GC_R(ec,
+    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`. Without it
+    // the catch-side `record_inline_exception_context` compensation finds the
+    // context unchained and passes this exception to the resolver call, which
+    // forces the very allocation this fold exists to keep virtual.
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, active],
+        crate::descr::w_exception_context_descr_for(kind, user),
+    );
+    fbw_context_chained_insert(new_op);
+    // Apply the same context write to the concrete exception, which the
+    // registration above stops the compensation from performing, so Python
+    // code reached later in this authoritative walk observes the
+    // `__context__` the recorded SETFIELD performs on compiled iterations.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
+
+    // Inline-built marker: the downstream raise routing records the frame
+    // node via the virtual `record_fresh_application_traceback` instead of
+    // the forcing runtime hook (mirrors `try_walker_trace_raise_bare_class`).
+    fbw_built_exc_insert(new_op);
+    // Residual-executor Err-arm state minus the call itself: seed the
+    // standing exception for `SubRaise` (`execute_raised` analogue) and
+    // restore the blackhole cell so an aborting walk still delivers the
+    // pending raise. The `NewWithVtable` vtable pins the class.
+    fbw_count_executed_residual(true, true);
+    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
+    DispatchOutcome::SubRaise {
+        exc: new_op,
+        exc_concrete: ConcreteValue::Ref(exc),
+    }
+}
+
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
@@ -18098,89 +18190,8 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
     };
-
-    // Message as a trace constant: deterministic per `(obj, name)` under
-    // the predicate, so one shared immutable string is exact (the same
-    // sharing a `raise TypeError("...")` gets from co_consts).  Pin the
-    // fresh exception across the string allocation; the recorded ConstPtr
-    // slot is forwarded across minor collections by the op-graph walker
-    // and rooted by the compiled loop's gcref table thereafter.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
-    // The root keeps the exception alive across that allocation but does not
-    // fix its address: a minor collection moves the object and rewrites the
-    // slot, which leaves this local naming a forwarded corpse.  Read the
-    // address back out of the slot the pin claimed.
-    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
-    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
-    let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
-
-    let class_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
-    let new_op = crate::helpers::emit_exception_new_inline(
-        ctx.trace_ctx,
-        kind,
-        class_const,
-        args_list,
-        user,
-    );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
-    ctx.trace_ctx
-        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    // `__context__` chaining on the still-virtual exception, the tail
-    // `try_walker_trace_raise_bare_class` carries: `active = GETFIELD_GC_R(ec,
-    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  Without it
-    // the catch-side `record_inline_exception_context` compensation finds the
-    // context unchained and passes this exception to the resolver call, which
-    // forces the very allocation this fold exists to keep virtual.
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    // Apply the same context write to the concrete exception, which the
-    // registration above stops the compensation from performing, so Python
-    // code reached later in this authoritative walk observes the
-    // `__context__` the recorded SETFIELD performs on compiled iterations.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
-
-    // Inline-built marker: the downstream raise routing records the frame
-    // node via the virtual `record_fresh_application_traceback` instead of
-    // the forcing runtime hook (mirrors `try_walker_trace_raise_bare_class`).
-    fbw_built_exc_insert(new_op);
-
-    // The residual-executor Err-arm state, minus the call itself: seed the
-    // standing exception for the `SubRaise` routing (`execute_raised`
-    // analogue) and restore the blackhole cell so an aborting walk still
-    // delivers the pending raise to the live frame.  The class IS proven
-    // constant here — the `NewWithVtable` vtable pins it.
-    fbw_count_executed_residual(true, true);
-    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
-    ctx.fbw_mode.class_of_last_exc_is_const = true;
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-
     Ok(Some((
-        DispatchOutcome::SubRaise {
-            exc: new_op,
-            exc_concrete: ConcreteValue::Ref(exc),
-        },
+        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, exc_type_ptr, user),
         op.next_pc,
     )))
 }
@@ -18309,62 +18320,8 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
     };
-
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
-    // The allocation may move the exception and leave the local pointer naming
-    // its forwarded corpse; the shadow slot contains the live address.
-    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
-    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
-    let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
-
-    let class_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
-    let new_op = crate::helpers::emit_exception_new_inline(
-        ctx.trace_ctx,
-        kind,
-        class_const,
-        args_list,
-        user,
-    );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
-    ctx.trace_ctx
-        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
-
-    fbw_built_exc_insert(new_op);
-    fbw_count_executed_residual(true, true);
-    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
-    ctx.fbw_mode.class_of_last_exc_is_const = true;
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-
     Ok(Some((
-        DispatchOutcome::SubRaise {
-            exc: new_op,
-            exc_concrete: ConcreteValue::Ref(exc),
-        },
+        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, exc_type_ptr, user),
         op.next_pc,
     )))
 }
