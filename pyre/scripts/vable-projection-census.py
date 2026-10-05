@@ -187,6 +187,9 @@ def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
         if raw.lstrip().startswith("//"):
             continue
         line = STRING_LIT.sub('""', raw)
+        cut = line.find("//")
+        if cut != -1:
+            line = line[:cut]
         for hit in any_proj.finditer(line):
             found = projection_base(line, hit.start())
             if found is None:
@@ -208,6 +211,7 @@ pub fn settopvalue(self: &mut PyFrame)
 {
         _5 = copy (*self).valuestackdepth;
         _15 = panic(const "assertion failed: index < self.valuestackdepth");
+        _16 = copy (*self).valuestackdepth; // frame.valuestackdepth
 }
 """
     counts, unclassified = census(dump, ["valuestackdepth"])
