@@ -2803,7 +2803,13 @@ where
     /// it replaces `walk_finish_values` here so the hook returns the walk's
     /// result rather than a stale one from an earlier close.
     fn capture_single_pass_finish(&mut self, ctx: &mut TraceCtx, value: Option<Value>) {
-        if self.outer_program_pc.is_none() || self.frames.len() != 1 {
+        // `pyjitpl.py finishframe`: the root frame is still live here
+        // (`target.is_none()`), then `popframe` drains it and
+        // `jitexc.DoneWithThisFrame*` carries `resultbox`. A guard-resume
+        // walk never calls `set_outer_program_pc`; skipping the result
+        // because that slot is empty drops `resultbox` and the portal
+        // runner re-enters from pc 0.
+        if self.frames.len() != 1 {
             return;
         }
         if let Some(pc) = self
