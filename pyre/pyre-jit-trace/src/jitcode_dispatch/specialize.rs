@@ -4813,16 +4813,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
@@ -18101,16 +18093,8 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         }
         None => None,
     };
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     if !pyre_interpreter::baseobjspace::type_immutable_attr_raise_is_stable(
         concrete_obj,
@@ -18220,16 +18204,8 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     };
     let concrete_value =
         walker_concrete_ref_object(ctx, value_op).unwrap_or_else(pyre_object::w_none);
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     let Some(descr) =
         pyre_interpreter::baseobjspace::readonly_descr_attr_raise_is_stable(concrete_obj, &name)
@@ -20045,20 +20021,12 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     // `namei` is the raw `LOAD_GLOBAL` oparg; bit 0 is the push-NULL flag,
     // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).
     let name_idx = (namei as usize) >> 1;
-    let name = unsafe {
-        // The wrapper being non-null does not make its `code_ptr` non-null:
-        // `w_code_new_with_hidden_applevel` (pycode.rs) leaves the field
-        // null for a gateway builtin or a test fixture, and every sibling
-        // name lookup screens it the same way.
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(false);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(false),
-        }
+    // The wrapper being non-null does not make its `code_ptr` non-null:
+    // `w_code_new_with_hidden_applevel` leaves the field null for a
+    // gateway builtin or a test fixture, and every sibling name lookup
+    // screens it the same way.
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(false);
     };
     if code_deletes_name_from_ptr(w_code_ptr, &name) {
         return Ok(false);
