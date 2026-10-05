@@ -372,6 +372,25 @@ pub(crate) fn system_error_from_cause(message: String, mut cause: PyError) -> Py
     unsafe { PyError::from_exc_object(w_error) }
 }
 
+/// Whether [`chain_context`] would write `exc.__context__`.
+///
+/// A residual call that takes `exc` forces a still-virtual exception even
+/// when the body would return without storing.  The in-trace catch
+/// compensation uses this to skip that call on a no-op (self-reraise,
+/// already-stamped context, no active handler).
+pub fn chain_context_would_write(exc: PyObjectRef, active: PyObjectRef) -> bool {
+    if exc.is_null()
+        || active.is_null()
+        || std::ptr::eq(exc, active)
+        || unsafe { pyre_object::is_none(active) }
+        || !unsafe { pyre_object::is_exception(exc) }
+        || !unsafe { pyre_object::is_exception(active) }
+    {
+        return false;
+    }
+    unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) }.is_null()
+}
+
 /// Record `active` as `exc.__context__` when `exc` is raised while `active`
 /// is the exception currently being handled — the shared primitive for both
 /// explicit (`raise`) and implicit (builtin/operator) raises.  Only writes
@@ -380,20 +399,11 @@ pub(crate) fn system_error_from_cause(message: String, mut cause: PyError) -> Py
 /// untouched) and skips self-context; any cycle through the context chain is
 /// broken first via `_break_context_cycle`.
 pub fn chain_context(exc: PyObjectRef, active: PyObjectRef) {
-    if exc.is_null()
-        || active.is_null()
-        || std::ptr::eq(exc, active)
-        || unsafe { pyre_object::is_none(active) }
-        || !unsafe { pyre_object::is_exception(exc) }
-        || !unsafe { pyre_object::is_exception(active) }
-    {
+    if !chain_context_would_write(exc, active) {
         return;
     }
-    let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
-    if existing.is_null() {
-        let _ = _break_context_cycle(exc, active);
-        unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
-    }
+    let _ = _break_context_cycle(exc, active);
+    unsafe { pyre_object::interp_exceptions::w_exception_set_context(exc, active) };
 }
 
 #[derive(Debug, Clone)]

@@ -1032,6 +1032,15 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     if fbw_context_chained_contains(exc) {
         return;
     }
+    // `chain_context` is a no-op on a bare reraise (`exc is active`) and when
+    // no handler is live.  The residual still takes `exc` as an argument, so
+    // it forces the allocation the optimizer would otherwise fold away with
+    // the handler — the same forcing the `fbw_context_chained` skip exists
+    // for.  Skip the call when the body would not write.
+    let active = pyre_interpreter::eval::get_sys_exception();
+    if !pyre_interpreter::error::chain_context_would_write(exc_ptr, active) {
+        return;
+    }
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
     // the value the compiled iterations will store.
@@ -4870,7 +4879,18 @@ pub fn walk<Sym: WalkSym>(
                         record_prepend_application_traceback(ctx, exc, exc_concrete, node_position)?
                     };
                     let emit_runtime = !raised_in_this_frame && node.is_none();
-                    record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
+                    // `RaiseWithExplicitTraceback` (`RAISE_VARARGS 0`, `RERAISE`)
+                    // re-raises the handled instance and does not write
+                    // `__context__`.  The catch compensation's residual still
+                    // takes `exc` as an argument, which forces a pendingfields
+                    // reconstruction of a virtual exception the handler never
+                    // reads.  PyPy's reraise bridge DCEs that object; skip the
+                    // call here so the heap optimizer can too.
+                    if recording_raise_keeps_existing_traceback(ctx, opcode_position) {
+                        fbw_context_chained_insert(exc);
+                    } else {
+                        record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
+                    }
                     record_inline_application_traceback(
                         ctx,
                         exc,
