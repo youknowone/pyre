@@ -505,16 +505,18 @@ pub(crate) fn is_map_adapter_path(path: &str) -> bool {
     path.ends_with("::iter::adapters::map::Map")
 }
 
-/// Residual `Map::collect` / `Iterator::collect` on a `Map` adapter.
-/// The capture site still proves the receiver is `Map` and the dest is
-/// `Vec`; this only names the leaf so a `HashMap::collect` Method is
-/// not rejected before that type gate.
+/// Residual `Map::collect` / `Iterator::collect` / `FromIterator::from_iter`
+/// on a `Map` adapter. The capture site still proves the receiver (or the
+/// `from_iter` argument) is `Map` and the dest is `Vec`; this only names
+/// the leaf so a `HashMap::collect` Method is not rejected before that
+/// type gate. rustc may spell `(0..n).map(f).collect()` as `from_iter`.
 pub(crate) fn is_map_collect_target(target: &CallTarget) -> bool {
     match target {
-        CallTarget::Method { name, .. } => name == "collect",
-        CallTarget::FunctionPath { segments, .. } => {
-            segments.last().map(String::as_str) == Some("collect")
-        }
+        CallTarget::Method { name, .. } => name == "collect" || name == "from_iter",
+        CallTarget::FunctionPath { segments, .. } => matches!(
+            segments.last().map(String::as_str),
+            Some("collect" | "from_iter")
+        ),
         _ => false,
     }
 }
@@ -540,10 +542,22 @@ fn originates_from_range_ctor(graph: &FunctionGraph, var: &Variable) -> bool {
                     name, owner_path, ..
                 },
             ..
-        } if name == "Range" || owner_path.last().map(String::as_str) == Some("Range") => Some(()),
+        } if range_ctor_name(name)
+            || owner_path.last().is_some_and(|leaf| range_ctor_name(leaf)) =>
+        {
+            Some(())
+        }
         _ => None,
     })
     .is_some()
+}
+
+/// `Range` / `Range<usize>` — the aggregate capture in `front::mir` records
+/// exclusive int ranges after stripping the per-instantiation suffix, and
+/// this walk must see the same ctor or `map(it, f).collect()` leaves
+/// `ops::range::Range::map` as an unregistered FunctionPath.
+fn range_ctor_name(name: &str) -> bool {
+    name.split('<').next() == Some("Range")
 }
 
 fn inner_is_list_or_range(graph: &FunctionGraph, inner: &Variable) -> bool {
@@ -792,7 +806,14 @@ pub(crate) fn rewire_map_collect_sites(
         }
         match rewire_one_map_collect_site(graph, site) {
             Ok(next_opt) => next_results.push((next_opt, site.inner_item_ty.clone())),
-            Err(_decline) => {}
+            Err(decline) => {
+                crate::decline::record_reason(
+                    crate::decline::gate::ITER_ADAPTER,
+                    "map-collect-site-declined",
+                    &decline,
+                    &graph.name,
+                );
+            }
         }
     }
     next_results
@@ -2563,6 +2584,63 @@ mod tests {
         assert!(
             threads_original,
             "the loop header must carry the original env, not the reborrow"
+        );
+    }
+
+    /// `(0..n).map(f).collect()` — Charon spells the exclusive range as
+    /// `Range<usize>`, matching `front::mir`'s aggregate capture which
+    /// strips the suffix. A literal `"Range"` probe left `Range::map` as
+    /// an unregistered FunctionPath (`call_args_and_c_profile_args`).
+    #[test]
+    fn rewrite_lowers_suffixed_range_map_collect() {
+        let mut g = FunctionGraph::new("test_range_map_collect");
+        let n = g.startblock;
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".to_string(), "ops".to_string(), "range".to_string()],
+                        "Range<usize>".to_string(),
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let env = g.push_op_var(n, OpKind::ConstInt(7), true).unwrap();
+        let mapped = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::function_path(["ops", "range", "Range", "map"]),
+                    args: crate::model::call_args(vec![range, env]),
+                    result_ty: ValueType::Ref(Some("Map".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let collected = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: map_collect_target(),
+                    args: crate::model::call_args(vec![mapped]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (ret, _) = g.create_block_with_arg_vars(1);
+        g.set_return(ret, None);
+        g.set_goto(n, ret, vec![collected.clone()]);
+        let nexts = rewire_map_collect_sites(&mut g, &[collect_site(collected)]);
+        assert_eq!(nexts.len(), 1, "Range<usize>.map.collect must fold");
+        assert_eq!(
+            count_calls(&g, is_map_ctor_target),
+            0,
+            "Range::map residual must be gone"
         );
     }
 }

@@ -4575,6 +4575,29 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &mut lo.graph,
             &lo.result_map_err_sites,
         );
+        // `map(it, f).collect()` denotes a loop. Rewrite it at the
+        // construction site — where `f` is a concrete closure ADT —
+        // into `Vec::new` + `next` + `call_mut` + `push` BEFORE the extra
+        // simplify and `result_exc`. A Result-of-carrier call in the same
+        // body (`c_call_trace`) turns that extra simplify on; it collapses
+        // empty blocks and `result_exc` then hangs `LastException` on the
+        // collect block, so the collect-site gate fails and
+        // `ops::range::Range::map` stays an unregistered FunctionPath
+        // (phaseA never records the graph as a prepass subject). Fail-safe:
+        // a site whose closure env is not a concrete ADT, or whose inner
+        // iterator is not a list `iter` / exclusive Range, is left as the
+        // residual `collect`. The synthesized `next` is recorded after
+        // this extra-simplify gate so a map-collect-only graph does not
+        // grow a simplify it did not previously run; Result-of-carrier
+        // graphs still simplify because their own sites already trip it.
+        let map_collect_synthesized = if !lo.map_collect_sites.is_empty() {
+            crate::front::iter_adapter::rewire_map_collect_sites(
+                &mut lo.graph,
+                &lo.map_collect_sites,
+            )
+        } else {
+            Vec::new()
+        };
         if !lo.result_exc_call_results.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
             || !lo.result_map_err_sites.is_empty()
@@ -4605,6 +4628,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &expand_inline_struct,
             )?;
         }
+        lo.next_call_results.extend(map_collect_synthesized);
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_rangefrom_sites(
@@ -4721,21 +4745,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `["core","slice","iter"]` op and folds the loop.  Runs on the same
         // simplified graph; fail-safe — an unpaired / multi-consumer range
         // aggregate stays the ordinary ADT ctor (census Skip).
-        // `map(it, f).collect()` denotes a loop.  Rewrite it at the
-        // construction site — where `f` is a concrete closure ADT —
-        // into `Vec::new` + `next` + `call_mut` + `push` BEFORE the
-        // range divert and `next`-diamond run, so those passes see the
-        // synthesized `next` the same way they see a source-level
-        // for-loop.  Fail-safe: a site whose closure env is not a
-        // concrete ADT, or whose inner iterator is not a list `iter` /
-        // exclusive Range, is left as the residual `collect`.
-        if !lo.map_collect_sites.is_empty() {
-            let synthesized = crate::front::iter_adapter::rewire_map_collect_sites(
-                &mut lo.graph,
-                &lo.map_collect_sites,
-            );
-            lo.next_call_results.extend(synthesized);
-        }
+        // `map(it, f).collect()` already ran before the extra simplify /
+        // `result_exc` above; `next_call_results` holds any synthesized
+        // `next` from that rewrite.
         if !lo.range_iter_new_sites.is_empty() && !lo.next_call_results.is_empty() {
             // The range rewrite only locates the `next()` producer; the
             // element kind recorded beside it belongs to the diamond fold.
@@ -7859,7 +7871,7 @@ fn pygraph_initial_block(
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc);
+    let len_shadow = pair_len_shadows_of(locals, llbc, &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
     // Arguments become startblock inputargs in source order
@@ -8104,8 +8116,8 @@ impl<'a> Lowering<'a> {
         let n_locals = body.locals.locals.len();
         let len_shadow = pair_len_shadows(body, llbc);
         let raw_array = raw_array_roles(body, llbc);
-        let item_addr = item_addr_locals(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
+        let item_addr = item_addr_locals(body, llbc, &slice_next_iter);
         let n_slots = n_locals + len_shadow.iter().flatten().count();
         // A body returning a pair slice takes the address of the caller's
         // length slot as a trailing parameter, held in one more local slot.
@@ -9766,8 +9778,16 @@ impl<'a> Lowering<'a> {
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
-                // overwrites the slot.
-                self.local_var[i as usize] = Some(LocalValue::One(result_var.clone()));
+                // overwrites the slot. A pair-slice item address
+                // (`IterMut` payload) keeps the address, so `*slot = v`
+                // writes through `ptr`.
+                self.local_var[i as usize] = Some(
+                    if self.item_addr.get(i as usize).copied().unwrap_or(false) {
+                        LocalValue::ItemAddr(result_var.clone())
+                    } else {
+                        LocalValue::One(result_var.clone())
+                    },
+                );
                 // Keep the aggregate-local map in sync with the
                 // last-write-wins slot: a non-aggregate rebind clears
                 // the marker so the slot's reads collapse again.
@@ -10372,6 +10392,24 @@ impl<'a> Lowering<'a> {
             PlaceKind::Local(i) => Some(*i as usize),
             _ => None,
         };
+        // `*slot = v` over a pair-slice item address (`IterMut` payload,
+        // `first` / `get` of a mut slice): write through `ptr` at index 0.
+        if matches!(elem, ProjectionElem::Atom(ref s) if s == "Deref")
+            && let Some(local) = inner_local
+            && matches!(
+                self.local_var.get(local).and_then(|slot| slot.as_ref()),
+                Some(LocalValue::ItemAddr(_))
+            )
+            && let Some((kind, item_ty)) = self.item_addr_slot_kind(local)
+        {
+            let addr = self.item_addr_var(mir_bb, local)?;
+            let value = value.as_variable().cloned().ok_or_else(|| {
+                LowerError::Schema(format!("bb{mir_bb}: pair slice item write of a constant"))
+            })?;
+            let index = self.emit_const_uint(mir_bb, 0);
+            self.emit_slice_setitem(mir_bb, addr, index, kind, value, &item_ty);
+            return Ok(());
+        }
         // Container shape, captured before `inner` is consumed below —
         // the write-side counterpart of the `resolve_place` Field arm.
         let base_is_deref = matches!(
@@ -13930,6 +13968,9 @@ impl<'a> Lowering<'a> {
         };
         match self.pair_place_parts(mir_bb, place)? {
             Some((ptr, len)) => Ok(Some((ptr, len, kind))),
+            // A pair-shaped type with no length slot in this frame is the
+            // one-word helper ABI (an object-pointer `&mut [T]` parameter).
+            None if matches!(place.kind, PlaceKind::Local(_)) => Ok(None),
             None => Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: pair slice read through a projection"
             ))),
@@ -14418,6 +14459,15 @@ impl<'a> Lowering<'a> {
         self.local_var[opt] = saved;
         let index = index?;
         let index = self.retype_word(mir_bb, index, &ValueType::Int, &ValueType::Unsigned);
+        // `IterMut` yields `&mut T`: the item's address in the slice buffer,
+        // so a later `*slot = v` writes through `ptr`. Shared `Iter` yields
+        // the loaded item, the list-iteration value.
+        if ref_kind_is_mut(payload_ty, self.llbc) {
+            let (size, _) = kind.size_align(crate::layout::target_word_size());
+            let size = self.emit_const_uint(mir_bb, size as u64);
+            let offset = self.emit_uint_binop(mir_bb, "mul", index, size);
+            return Ok(self.emit_uint_binop(mir_bb, "add", ptr, offset));
+        }
         let item_ty = tyref_ref_pointee_value_type(payload_ty, self.llbc, self.tombstoned_leaves)
             .ok_or_else(|| {
             LowerError::Unsupported(format!(
@@ -14609,6 +14659,34 @@ impl<'a> Lowering<'a> {
             .then_some((kind, by_ref))
     }
 
+    /// Item kind and pointee bank of a `&mut T` / `&T` local that holds a
+    /// pair-slice item address. `None` for an `Option<&T>` address (the
+    /// `first` / `get` result), which is not a store slot.
+    fn item_addr_slot_kind(
+        &self,
+        local: usize,
+    ) -> Option<(majit_ir::rvec::VecItemKind, ValueType)> {
+        let ty = &self.body.locals.locals.get(local)?.ty;
+        if crate::front::result_exc::tyref_is_option(ty, self.llbc) {
+            return None;
+        }
+        let pointee = ref_pointee_ty(ty, self.llbc)?;
+        let spelling = tyref_to_ast_string(&pointee, self.llbc);
+        let kind = majit_ir::rvec::rust_slice_item_kind_for_spelling(
+            &format!("[{spelling}]"),
+            crate::layout::target_word_size(),
+        )?;
+        PAIR_SLICE_ITEM_KINDS.contains(&kind).then(|| {
+            (
+                kind,
+                self.with_item_class_root(
+                    tyref_to_value_type_with(&pointee, self.llbc, self.tombstoned_leaves),
+                    &pointee,
+                ),
+            )
+        })
+    }
+
     /// The address word when `local` holds a slice-item option.
     fn item_addr_var(&self, mir_bb: usize, local: usize) -> Result<Variable, LowerError> {
         match self.local_var.get(local).and_then(|slot| slot.as_ref()) {
@@ -14767,16 +14845,51 @@ impl<'a> Lowering<'a> {
     /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
     /// pair slice, or it is a slice method that reads one.
     fn is_pair_call(&self, call: &CallPayload, dest_local: usize) -> bool {
-        if self.len_shadow[dest_local].is_some() {
+        // A length slot means this dest is a pair in this frame only when
+        // its MIR type is a pair slice, an option of one, or a slice
+        // iterator. `IterMut::next` writes `Option<&mut T>`, which is an
+        // item address, not a slice.
+        if self.len_shadow[dest_local].is_some()
+            && self.body.locals.locals.get(dest_local).is_some_and(|loc| {
+                let pair_dest = self.pair_slice_kind(&loc.ty).is_some()
+                    || self.pair_iter_kind(&loc.ty).is_some()
+                    || self.option_pair_slice_kind(&loc.ty).is_some();
+                if !pair_dest {
+                    return false;
+                }
+                // An object-pointer `&mut [T]` dest is the aliasing view
+                // only when the receiver is a `Vec` (`pair_of_vec`). The
+                // same type from a length-prefixed object array stays one
+                // word. `IterMut` of those items is the iterator of that
+                // view and keeps the dest-shadow path.
+                if slice_ty_item_is_object_pointer(&loc.ty, self.llbc)
+                    && (ref_kind_is_mut(&loc.ty, self.llbc)
+                        || raw_ptr_kind_is_mut(&loc.ty, self.llbc))
+                {
+                    call.args
+                        .first()
+                        .and_then(operand_tyref)
+                        .is_some_and(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_some())
+                } else {
+                    true
+                }
+            })
+        {
             return true;
         }
         let CallFunc::Regular(reg) = &call.func else {
             return false;
         };
-        call.args
-            .first()
-            .and_then(operand_tyref)
-            .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
+        // The receiver must be a pair in this frame (a length slot), not
+        // merely a pair-shaped type. An object-pointer `&mut [T]` parameter
+        // keeps the one-word helper ABI; only a body local of that type is
+        // the `{ptr, len}` view.
+        operand_local(call.args.first()).is_some_and(|local| self.len_shadow[local].is_some())
+            && call
+                .args
+                .first()
+                .and_then(operand_tyref)
+                .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
             && regular_call_name_path(reg, self.llbc).is_some_and(|path| match path.as_str() {
                 "core::slice::<Impl>::len"
                 | "core::slice::<Impl>::is_empty"
@@ -17401,6 +17514,25 @@ impl<'a> Lowering<'a> {
                     if let Some(root) = self.gc_mut_ref_param_root(local) {
                         let base = self.defined_local(mir_bb, local)?;
                         return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
+                    }
+                    if matches!(
+                        self.local_var.get(local).and_then(|slot| slot.as_ref()),
+                        Some(LocalValue::ItemAddr(_))
+                    ) && let Some((kind, item_ty)) = self.item_addr_slot_kind(local)
+                    {
+                        let addr = self.item_addr_var(mir_bb, local)?;
+                        let index = self.emit_const_uint(mir_bb, 0);
+                        let helper_ty = Self::pair_helper_item_ty(kind);
+                        let item = self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::slice_helper_path(
+                                majit_ir::rvec::SliceOp::GetItem,
+                                kind,
+                            ),
+                            vec![addr, index],
+                            helper_ty.clone(),
+                        );
+                        return Ok(self.retype_word(mir_bb, item, &helper_ty, &item_ty));
                     }
                     if let Some(recorded) = self.atomic_ref_place.get(&local).cloned() {
                         let followed = self.concrete_borrow_place(recorded);
@@ -20798,11 +20930,14 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Vec<PyObjectRef>::deref` yields `&[PyObjectRef]`. The vec
-                // is the address of its header; the slice is one
-                // length-prefixed object array. Copy the items across.
-                // `<[T]>::reverse` keeps the header alias below, and
-                // `deref_mut` stays a residual call.
+                // `Vec<PyObjectRef>::deref` yields `&[T]`. The vec is the
+                // address of its header; a shared slice is one
+                // length-prefixed object array, so copy the items
+                // (`gcarray_from_pyobject_vec`). `deref_mut` yields
+                // `&mut [T]`, the `{ptr, len}` view that aliases the
+                // vec's item buffer (`pair_of_vec`); a copy would drop
+                // stores (`arguments_w.iter_mut()`). `<[T]>::reverse`
+                // keeps the header alias below.
                 if args.len() == 1
                     && self.is_container_identity_deref(&reg)
                     && regular_call_name_path(&reg, self.llbc)
@@ -32963,6 +33098,16 @@ impl<'a> Lowering<'a> {
     /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
     fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
+            return false;
+        }
+        // A `Vec` of one-word items is the header address, never null
+        // (`RustVecRepr`). Charon's `Option<Vec<T>>` layout may still be
+        // a pointer niche (the source `Unique` word); the translated
+        // Option keeps its tag so the payload stays `Int` for
+        // `ll_vec_length` / `gcarray_from_pyobject_vec`.
+        if crate::front::result_exc::tyref_option_payload(ty, self.llbc)
+            .is_some_and(|payload| tyref_rust_vec_item_kind(&payload, self.llbc).is_some())
+        {
             return false;
         }
         // Instantiated `Option<T>` whose Charon layout occupies one
@@ -48786,10 +48931,18 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 
 /// An inline `Vec<T, A>` value, not `Box<Vec<_>>` and not `&Vec<_>`.
 ///
+/// A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
+/// header (`RustVecRepr`, kind `int`), not a 24-byte inline aggregate.
+/// Marking that field `inline_vec` would pass the header as `Ref` to
+/// `ll_vec_length` / `gcarray_from_pyobject_vec`.
+///
 /// The ADT is the type decl whose name segments are `alloc::vec::Vec`
 /// (that decl's identity). The use site's type-argument count is the
 /// decl's generic arity: one (`T`) or two (`T` and the allocator).
 fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return false;
+    }
     let body = match tyref_node(ty, llbc) {
         Some(body) => body,
         None => return false,
@@ -50659,6 +50812,14 @@ fn tyref_to_attr_value_type_with(
     // the cheap `Literal` fast-path so primitive fields never pay it.
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
+    }
+    // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
+    // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
+    // `int`). Leaving the field `Ref` seeds a classdef-less instance and
+    // a later `ll_vec_length` / `gcarray_from_pyobject_vec` call passes
+    // that ref for an `Int` parameter.
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return ValueType::Int;
     }
     // `rutf8.py` `Utf8StringBuilder._s` is a `StringBuilder` instance
     // attribute: seed it `SomeStringBuilder`, matching the value site.
@@ -53764,6 +53925,13 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
             .and_then(|arg| serde_json::from_value::<TyRef>(arg.clone()).ok())
             .map(|arg| tyref_to_ast_string(&arg, llbc))
             .unwrap_or_else(|| "*mut PyObject".to_string());
+    }
+    // A `Vec` of one-word items is the header address (`RustVecRepr`,
+    // kind `int`): one pointer-sized word, not the 24-byte inline Vec.
+    // Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
+    // size disagrees with the Int publish.
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return "isize".to_string();
     }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
     // plus one reserved value for `None`.  Preserve that physical width in
@@ -60956,9 +61124,10 @@ fn splice_pair_lens(args: Vec<Variable>, pair_lens: Vec<(usize, Variable)>) -> V
 /// `(ptr, len)` pair: the pointer in the local itself and the length in its
 /// shadow slot (see [`pair_len_shadows`]).
 ///
-/// An object-pointer item (`PyObjectRef`, `*mut PyObject`) is not in this
-/// set. That slice is the length-prefixed object array, one `Ref` word
-/// (`arraylen_gc` / `getarrayitem_gc`).
+/// A shared object-pointer slice (`&[PyObjectRef]`) is the length-prefixed
+/// object array, one `Ref` word (`arraylen_gc` / `getarrayitem_gc`). A
+/// mutable object-pointer slice (`&mut [PyObjectRef]`) is the pair: the
+/// view that aliases a `Vec`'s item buffer (`pair_of_vec`).
 const PAIR_SLICE_ITEM_KINDS: &[majit_ir::rvec::VecItemKind] = &[
     majit_ir::rvec::VecItemKind::Int,
     majit_ir::rvec::VecItemKind::Ref,
@@ -60981,6 +61150,9 @@ fn tyref_pair_field_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecI
             tyref_pair_slice_item_kind(&TyRef::Other(referent.clone()), llbc)
         })
         .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+        // A struct field of `&mut [PyObjectRef]` stays the one-word object
+        // array. Body locals of that type are the `{ptr, len}` view.
+        .filter(|_| !tyref_is_object_pointer_mut_slice_or_iter(ty, llbc))
 }
 
 /// [`tyref_pair_field_kind`] over a rendered field spelling, where a
@@ -61047,7 +61219,23 @@ fn tyref_pair_slice_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec:
     let pointee = strip_ty_indirections(pointee, llbc)?;
     // `[T]` spells `{"Slice": [elem, trait_ref]}`.
     let item = pointee.get("Slice")?.as_array()?.first()?;
-    pair_item_kind_of_node(item, llbc)
+    if let Some(kind) = pair_item_kind_of_node(item, llbc) {
+        return Some(kind);
+    }
+    // Object-pointer `&mut [T]` / `*mut [T]`: the `{ptr, len}` view that
+    // aliases a `Vec` item buffer. A shared `&[T]` of those items is the
+    // length-prefixed object array (`gcarray_from_pyobject_vec`).
+    if slice_item_node_is_object_pointer(item, llbc)
+        && (ref_kind_is_mut(ty, llbc) || raw_ptr_kind_is_mut(ty, llbc))
+    {
+        return Some(majit_ir::rvec::VecItemKind::Ref);
+    }
+    None
+}
+
+fn slice_item_node_is_object_pointer(item: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_ty_is_objectptr(item, llbc)
+        || object_pointer_item_spelling(&charon_type_value_to_ast_string(item, llbc, 0))
 }
 
 /// The item kind of a one-word slice item type node.  A reference item `&T`
@@ -61092,7 +61280,68 @@ fn tyref_pair_slice_iter_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::
         .get("types")?
         .as_array()?
         .first()?;
-    pair_item_kind_of_node(item, llbc)
+    if let Some(kind) = pair_item_kind_of_node(item, llbc) {
+        return Some(kind);
+    }
+    // `IterMut` over an object pointer: the iterator of the `{ptr, len}`
+    // view. Shared `Iter` of those items stays the object-array walk.
+    if path == "core::slice::iter::IterMut" && slice_item_node_is_object_pointer(item, llbc) {
+        return Some(majit_ir::rvec::VecItemKind::Ref);
+    }
+    None
+}
+
+/// An object-pointer `&mut [T]` / `IterMut<T>` whose parameter form keeps
+/// the one-word helper ABI. Body locals of the same type are the pair view.
+fn tyref_is_object_pointer_mut_slice_or_iter(ty: &TyRef, llbc: &Llbc) -> bool {
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
+        return tyref_is_object_pointer_mut_slice_or_iter(&payload, llbc);
+    }
+    slice_ty_item_is_object_pointer(ty, llbc)
+        && (ref_kind_is_mut(ty, llbc) || raw_ptr_kind_is_mut(ty, llbc))
+        || iter_mut_item_is_object_pointer(ty, llbc)
+}
+
+fn slice_ty_item_is_object_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = (match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array().and_then(|a| a.get(1)),
+        (None, Some(raw)) => raw.as_array().and_then(|a| a.first()),
+        (None, None) => None,
+    }) else {
+        return false;
+    };
+    let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
+        return false;
+    };
+    pointee
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.first())
+        .is_some_and(|item| slice_item_node_is_object_pointer(item, llbc))
+}
+
+fn iter_mut_item_is_object_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(path) = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| td.item_meta.name_path())
+    else {
+        return false;
+    };
+    if path != "core::slice::iter::IterMut" {
+        return false;
+    }
+    node.get("Adt")
+        .and_then(|adt| adt.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+        .is_some_and(|item| slice_item_node_is_object_pointer(item, llbc))
 }
 
 /// The value type of the pointee of a `&T` / `&mut T`.
@@ -61227,13 +61476,55 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
     out
 }
 
-fn item_addr_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+fn item_addr_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+    slice_next_iter: &[Option<usize>],
+) -> Vec<bool> {
     let n = body.locals.locals.len();
     let mut addr = vec![false; n];
     let mut changed = true;
     while changed {
         changed = false;
         for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if dest >= n || addr[dest] {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue else {
+                    continue;
+                };
+                let from_addr = match &src.kind {
+                    PlaceKind::Local(src_local) => {
+                        addr.get(*src_local as usize).copied().unwrap_or(false)
+                    }
+                    PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                        if v.get("Field").is_some() =>
+                    {
+                        let PlaceKind::Local(opt) = inner.kind else {
+                            continue;
+                        };
+                        slice_next_iter
+                            .get(opt as usize)
+                            .copied()
+                            .flatten()
+                            .is_some()
+                            && ref_kind_is_mut(&place.ty, llbc)
+                    }
+                    _ => false,
+                };
+                if from_addr {
+                    addr[dest] = true;
+                    changed = true;
+                }
+            }
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
@@ -61282,12 +61573,80 @@ fn item_addr_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
 }
 
 fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
-    pair_len_shadows_of(&body.locals, llbc)
+    let views = objectptr_pair_view_locals(body, llbc);
+    pair_len_shadows_of(&body.locals, llbc, &views)
+}
+
+/// Locals that hold the `{ptr, len}` view of an object-pointer `Vec`
+/// buffer: dest of a `Vec` method that yields `&mut [T]`, and dest of
+/// `iter_mut` over one of those slices.
+fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    let mut view = vec![false; n];
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            continue;
+        };
+        let PlaceKind::Local(dest) = call.dest.kind else {
+            continue;
+        };
+        let dest = dest as usize;
+        if dest >= n {
+            continue;
+        }
+        let Some(first_ty) = call.args.first().and_then(operand_tyref) else {
+            continue;
+        };
+        if tyref_rust_vec_item_kind(first_ty, llbc).is_some()
+            && slice_ty_item_is_object_pointer(&call.dest.ty, llbc)
+            && (ref_kind_is_mut(&call.dest.ty, llbc) || raw_ptr_kind_is_mut(&call.dest.ty, llbc))
+        {
+            view[dest] = true;
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = call.dest.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n || view[dest] {
+                continue;
+            }
+            if !iter_mut_item_is_object_pointer(&call.dest.ty, llbc) {
+                continue;
+            }
+            let recv = match call.args.first() {
+                Some(Operand::Copy(place) | Operand::Move(place)) => match &place.kind {
+                    PlaceKind::Local(local) => *local as usize,
+                    PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                        let PlaceKind::Local(local) = &inner.kind else {
+                            continue;
+                        };
+                        *local as usize
+                    }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if view.get(recv).copied().unwrap_or(false) {
+                view[dest] = true;
+                changed = true;
+            }
+        }
+    }
+    view
 }
 
 fn pair_len_shadows_of(
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
+    view_locals: &[bool],
 ) -> Vec<Option<usize>> {
     let n_locals = locals.locals.len();
     let arg_count = locals.arg_count as usize;
@@ -61301,9 +61660,18 @@ fn pair_len_shadows_of(
                 tyref_pair_slice_item_kind(&local.ty, llbc)
             } else {
                 tyref_pair_field_kind(&local.ty, llbc)
+                    .or_else(|| tyref_pair_slice_item_kind(&local.ty, llbc))
             }
             .or_else(|| tyref_pair_slice_iter_item_kind(&local.ty, llbc))
             .or_else(|| tyref_option_pair_slice_item_kind(&local.ty, llbc))?;
+            // Parameters keep the one-word helper ABI. Body locals of an
+            // object-pointer `&mut [T]` / `IterMut<T>` are the `{ptr, len}`
+            // view only when they alias a `Vec` buffer (`pair_of_vec`).
+            if tyref_is_object_pointer_mut_slice_or_iter(&local.ty, llbc)
+                && (index <= arg_count || !view_locals.get(index).copied().unwrap_or(false))
+            {
+                return None;
+            }
             PAIR_SLICE_ITEM_KINDS.contains(&kind).then(|| {
                 next += 1;
                 next - 1
@@ -83075,12 +83443,20 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "fixture",
-                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": fixture_item_meta(ident_path(&["PyObject"])),
+                    "kind": {"Struct": []}
+                }],
+                "fun_decls": [], "global_decls": [],
                 "trait_decls": [], "trait_impls": [],
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
+        let objptr = serde_json::json!({
+            "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
+        });
         let kind =
             |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
         assert_eq!(
@@ -83127,6 +83503,179 @@ mod tests {
         assert_eq!(
             super::spelling_pair_field_kind("[usize]"),
             Some(VecItemKind::Int)
+        );
+        assert_eq!(
+            kind(serde_json::json!({
+                "Ref": ["'_", { "Slice": [objptr.clone(), null] }, "Mut"]
+            })),
+            Some(VecItemKind::Ref),
+            "object-pointer &mut [T] is the {{ptr, len}} view"
+        );
+        assert_eq!(
+            kind(serde_json::json!({
+                "Ref": ["'_", { "Slice": [objptr, null] }, "Shared"]
+            })),
+            None,
+            "object-pointer &[T] stays the length-prefixed object array"
+        );
+    }
+
+    /// `Vec<PyObjectRef>::deref_mut` plus `iter_mut` and a store through the
+    /// slot write the vec's own item buffer (`ll_vec_items` / `ll_slice_setitem_fast`).
+    /// A `gcarray_from_pyobject_vec` copy would drop those stores.
+    #[test]
+    fn object_vec_deref_mut_iter_mut_store_writes_through_the_buffer() {
+        use crate::model::{CallTarget, OpKind};
+        let span = fixture_span();
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let obj = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let objptr = serde_json::json!({"RawPtr": [obj, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {"types": [objptr.clone()]}}
+        });
+        let vec_mut = serde_json::json!({"Ref": ["'_", vec_ty, "Mut"]});
+        let slice_ty = serde_json::json!({
+            "Ref": ["'_", {"Slice": [objptr.clone(), null]}, "Mut"]
+        });
+        let iter_ty = serde_json::json!({
+            "Adt": {"id": 2, "generics": {"types": [objptr.clone()]}}
+        });
+        let opt_ty = serde_json::json!({
+            "Adt": {"id": 3, "generics": {"types": [
+                {"Ref": ["'_", objptr.clone(), "Mut"]}
+            ]}}
+        });
+        let slot_ty = serde_json::json!({"Ref": ["'_", objptr.clone(), "Mut"]});
+        let iter_mut_ref = serde_json::json!({"Ref": ["'_", iter_ty.clone(), "Mut"]});
+        let unit = serde_json::json!({"Tuple": []});
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+        let call = |fun: u64,
+                    args: Vec<serde_json::Value>,
+                    dest: serde_json::Value,
+                    target: u64,
+                    statements: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "statements": statements,
+                "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": generics}},
+                        "args": args,
+                        "dest": dest
+                    },
+                    "target": target,
+                    "on_unwind": 5
+                }}}
+            })
+        };
+        let init_ret = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(0, &unit),
+            {"Aggregate": ["Tuple", []]}
+        ]}});
+        let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
+        let fun = |id: u64,
+                   path: &[&str],
+                   inputs: Vec<serde_json::Value>,
+                   output: serde_json::Value,
+                   body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(path),
+                "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+                "body": body
+            })
+        };
+        let field_place = serde_json::json!({
+            "kind": {"Projection": [place(5, &opt_ty), {"Field": [null, 0]}]},
+            "ty": slot_ty
+        });
+        let deref_slot = serde_json::json!({
+            "kind": {"Projection": [place(6, &slot_ty), "Deref"]},
+            "ty": objptr
+        });
+        let refresh_body = serde_json::json!({"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                local(0, Some("ret"), &unit),
+                local(1, Some("vec"), &vec_mut),
+                local(2, Some("new"), &objptr),
+                local(3, Some("slice"), &slice_ty),
+                local(4, Some("iter"), &iter_ty),
+                local(5, Some("opt"), &opt_ty),
+                local(6, Some("slot"), &slot_ty),
+                local(7, Some("iter_ref"), &iter_mut_ref),
+            ]},
+            "body": [
+                call(1, vec![serde_json::json!({"Copy": place(1, &vec_mut)})], place(3, &slice_ty), 1, vec![init_ret]),
+                call(2, vec![serde_json::json!({"Copy": place(3, &slice_ty)})], place(4, &iter_ty), 2, vec![]),
+                call(3, vec![serde_json::json!({"Copy": place(7, &iter_mut_ref)})], place(5, &opt_ty), 3, vec![
+                    serde_json::json!({"span": span, "kind": {"Assign": [
+                        place(7, &iter_mut_ref),
+                        {"Ref": {"place": place(4, &iter_ty), "kind": "Mut", "ptr_metadata": null}}
+                    ]}})
+                ]),
+                {"statements": [
+                    {"span": span, "kind": {"Assign": [
+                        place(6, &slot_ty),
+                        {"Use": [{"Copy": field_place}, "No"]}
+                    ]}},
+                    {"span": span, "kind": {"Assign": [
+                        deref_slot,
+                        {"Use": [{"Copy": place(2, &objptr)}, "No"]}
+                    ]}}
+                ], "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta(&["PyObject"]), "kind": {"Struct": []}},
+                    {"def_id": 1, "item_meta": meta(&["alloc", "vec", "Vec"]), "kind": {"Struct": []}},
+                    {"def_id": 2, "item_meta": meta(&["core", "slice", "iter", "IterMut"]), "kind": {"Struct": []}},
+                    {"def_id": 3, "item_meta": meta(&["core", "option", "Option"]), "kind": {"Enum": []}},
+                ],
+                "fun_decls": [
+                    fun(0, &["fixture", "refresh"], vec![vec_mut.clone(), objptr.clone()], unit.clone(), refresh_body),
+                    fun(1, &["alloc", "vec", "<Impl>", "deref_mut"], vec![vec_mut.clone()], slice_ty.clone(), serde_json::json!("Opaque")),
+                    fun(2, &["core", "slice", "<Impl>", "iter_mut"], vec![slice_ty.clone()], iter_ty.clone(), serde_json::json!("Opaque")),
+                    fun(3, &["core", "slice", "iter", "<Impl>", "next"], vec![iter_mut_ref.clone()], opt_ty.clone(), serde_json::json!("Opaque")),
+                ],
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "refresh")
+            .unwrap_or_else(|err| panic!("lower refresh: {err}"));
+        let leaves: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            leaves.iter().any(|l| l == "ll_vec_items_r"),
+            "deref_mut must alias the vec buffer: {leaves:?}"
+        );
+        assert!(
+            leaves.iter().any(|l| l == "ll_slice_setitem_fast_r"),
+            "iter_mut store must write through ptr: {leaves:?}"
+        );
+        assert!(
+            !leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+            "deref_mut must not copy into a gcarray: {leaves:?}"
         );
     }
 

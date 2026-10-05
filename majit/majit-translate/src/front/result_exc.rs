@@ -1094,7 +1094,9 @@ fn producer_is_some_shell(graph: &FunctionGraph, var: &Variable, result_owner: &
 }
 
 /// `Result<i64, …>` / `Result<bool, …>` / `Result<f64, …>`: the `Ok`
-/// payload is a machine scalar. Other spellings stay shells.
+/// payload is a machine scalar. A `Vec` of one-word items is the same
+/// bank (`RustVecRepr`, kind `int`): the header address, not a GC
+/// aggregate. Other spellings stay shells.
 fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
     let Some(args) = generic_args_body(spelling) else {
         return false;
@@ -1102,6 +1104,11 @@ fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
     let Some(ok) = split_top_level_args(args).into_iter().next() else {
         return false;
     };
+    if majit_ir::rvec::rust_vec_item_kind_for_spelling(ok, crate::layout::target_word_size())
+        .is_some()
+    {
+        return true;
+    }
     matches!(
         type_leaf(ok),
         "i8" | "i16"
@@ -9521,6 +9528,19 @@ mod static_result_shell_tests {
     use super::*;
     use crate::model::SpaceOperation;
 
+    #[test]
+    fn one_word_vec_ok_is_an_int_payload() {
+        assert!(result_spelling_ok_is_scalar(
+            "Result<Vec<PyObjectRef>, PyError>"
+        ));
+        assert!(result_spelling_ok_is_scalar(
+            "Result<alloc::vec::Vec<*mut u8>, E>"
+        ));
+        assert!(!result_spelling_ok_is_scalar(
+            "Result<PyObjectRef, PyError>"
+        ));
+    }
+
     fn ok_shell_with_tag(tag: i64) -> (FunctionGraph, Variable, Variable) {
         let mut graph = FunctionGraph::new("static_result_shell");
         let entry = graph.startblock;
@@ -10332,7 +10352,7 @@ mod static_result_shell_tests {
             .expect("zst err");
         graph.set_goto(entry, ret_block, vec![zst_err]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0)
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
                 .expect("a consumed payload-less shell does not decline the callee"),
             1
         );
@@ -10354,7 +10374,8 @@ mod static_result_shell_tests {
     fn unit_ok_shell_returns_void_none() {
         let mut graph = unit_ok_shell();
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("a Void-payload Ok return lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("a Void-payload Ok return lowers"),
             1
         );
         let entry = graph.startblock;
@@ -10458,8 +10479,17 @@ mod tail_forward_close_tests {
         graph.set_goto(free_id, returnblock, vec![free_args[0].clone()]);
         graph.set_goto(start, free_id, vec![r.clone(), buf.clone()]);
 
-        let outcome = rewire_one_call_site(&mut graph, &r, "", &ValueType::Int, true, true)
-            .expect("tail forward");
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "",
+            &ValueType::Int,
+            true,
+            true,
+            &[(r.clone(), None, ValueType::Int)],
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("tail forward");
         assert!(matches!(outcome, SiteOutcome::TailForward));
         let a = &graph.blocks[start.0];
         assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
