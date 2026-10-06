@@ -55,6 +55,8 @@ enum Leaf {
     Normalize,
     NormalizeMoved,
     Get,
+    /// `RootedItems::get(i)`: `i` is an offset from the set's open depth.
+    GetRelative,
     Set,
     ReloadTop,
     /// Touches the stack in a way this pass does not model.
@@ -100,7 +102,7 @@ fn classify_call(
         if receiver_ty.is_some_and(|ty| names_type(ty, super::ROOTED_ITEMS_TYPE)) {
             let kind = match leaf {
                 "push" => Leaf::Pin,
-                "get" => Leaf::Get,
+                "get" => Leaf::GetRelative,
                 "drop" | "drop_in_place" => Leaf::Close,
                 // `take` builds a `Vec` of every slot; the rewrite has no
                 // Vec constructor, so a body that `take`s keeps its bracket.
@@ -178,9 +180,25 @@ struct Plan {
     terms: HashMap<usize, TermRewrite>,
     slot_count: usize,
     slot_ty: Option<Value>,
+    /// Pins published through each `RootedItems` / `RootScope` guard.
+    pin_count: HashMap<usize, usize>,
     /// Blocks no path from the entry reaches once the rewritten calls lose
     /// their unwind edges.
     unreachable: Vec<usize>,
+}
+
+impl Plan {
+    /// Drop pin-count keys for a guard closed at `closed_depth` and every
+    /// set opened inside it. Nested exclusive RootScopes (`zip_two_tuple_next`)
+    /// close before they merge with a sibling that never opened them;
+    /// leftover keys would refuse that join (`pin-count-disagrees-at-merge`).
+    fn forget_closed_guards(&mut self, closed_depth: usize) {
+        self.pin_count
+            .retain(|other, _| match self.specials.get(other) {
+                Some(Special::Guard(gd)) => *gd < closed_depth,
+                _ => false,
+            });
+    }
 }
 
 type Refusal = &'static str;
@@ -544,6 +562,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         terms: HashMap::new(),
         slot_count: 0,
         slot_ty: None,
+        pin_count: HashMap::new(),
         unreachable: Vec::new(),
     };
     // `RootedItems::get(i)` takes a compile-time offset from the set's
@@ -562,28 +581,39 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
     let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
+    let mut pin_count_in: Vec<Option<HashMap<usize, usize>>> = vec![None; n_blocks];
     let mut queue: VecDeque<usize> = VecDeque::new();
     if n_blocks == 0 {
         return Ok(None);
     }
     depth_in[0] = Some(0);
+    pin_count_in[0] = Some(HashMap::new());
     queue.push_back(0);
     let mut visited = vec![false; n_blocks];
     let reach = |depth_in: &mut Vec<Option<usize>>,
+                 pin_count_in: &mut Vec<Option<HashMap<usize, usize>>>,
                  queue: &mut VecDeque<usize>,
                  target: u64,
-                 depth: usize|
+                 depth: usize,
+                 pins: &HashMap<usize, usize>|
      -> Result<(), Refusal> {
         let target = target as usize;
         if target >= n_blocks {
             return Ok(());
         }
         match depth_in[target] {
-            Some(d) if d != depth => Err("depth-disagrees-at-merge"),
-            Some(_) => Ok(()),
+            Some(d) if d != depth => return Err("depth-disagrees-at-merge"),
+            Some(_) => {}
             None => {
                 depth_in[target] = Some(depth);
                 queue.push_back(target);
+            }
+        }
+        match &pin_count_in[target] {
+            Some(prev) if prev != pins => Err("pin-count-disagrees-at-merge"),
+            Some(_) => Ok(()),
+            None => {
+                pin_count_in[target] = Some(pins.clone());
                 Ok(())
             }
         }
@@ -595,7 +625,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         }
         visited[bb] = true;
         let mut depth = depth_in[bb].expect("queued blocks have a depth");
+        plan.pin_count = pin_count_in[bb]
+            .clone()
+            .expect("queued blocks have a pin_count");
         let block = &body.body[bb];
+        // A `usize` local is only a compile-time index inside this block.
+        // Crossing a join with a stale constant would rewrite `get(i)` to the
+        // wrong slot; a later non-const store of the same local must drop it.
+        const_locals.clear();
         // Statements: the index, pair and alias definitions.
         for (si, stmt) in block.statements.iter().enumerate() {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
@@ -604,6 +641,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             let Some(dest) = place_local(place) else {
                 continue;
             };
+            const_locals.remove(&dest);
             match rvalue {
                 Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
                     if single_def(dest) {
@@ -733,7 +771,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
                 let Some(&(leaf, method)) = classified.get(&bb) else {
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
+                    reach(
+                        &mut depth_in,
+                        &mut pin_count_in,
+                        &mut queue,
+                        *target,
+                        depth,
+                        &plan.pin_count,
+                    )?;
                     continue;
                 };
                 let args_json = &term_json["Call"]["call"]["args"];
@@ -769,12 +814,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     Leaf::Open => {
                         let dest = dest.ok_or("guard-dest-projected")?;
                         bind(&mut plan.specials, dest, Special::Guard(depth))?;
+                        plan.pin_count.insert(dest, 0);
                     }
                     Leaf::Close => {
                         let d = guard_depth(guard.ok_or("close-without-guard")?)?;
                         if d > depth {
                             return Err("close-above-depth");
                         }
+                        plan.forget_closed_guards(d);
                         depth = d;
                     }
                     Leaf::Base => {
@@ -816,6 +863,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         }
                         depth += 1;
                         plan.slot_count = plan.slot_count.max(depth);
+                        if let Some(g) = guard {
+                            *plan.pin_count.entry(g).or_insert(0) += 1;
+                        }
                     }
                     Leaf::Publish => {
                         let slice = call.args.get(arg0).and_then(operand_local);
@@ -856,24 +906,43 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     Leaf::Get => {
                         let k = match index_arg(arg0) {
                             Ok(k) => k,
-                            Err(_) => {
-                                // `RootedItems::get(i)`: `i` is an offset from
-                                // the set's open depth (`gc_roots.rs`
-                                // `RootedItems::get`).
-                                let d = guard_depth(guard.ok_or("get-without-guard")?)?;
-                                let rel = call
-                                    .args
-                                    .get(arg0)
-                                    .and_then(|op| {
-                                        const_usize(op, llbc).or_else(|| {
-                                            operand_local(op)
-                                                .and_then(|l| const_locals.get(&l).copied())
-                                        })
+                            Err(_) => call
+                                .args
+                                .get(arg0)
+                                .and_then(|op| {
+                                    const_usize(op, llbc).or_else(|| {
+                                        operand_local(op)
+                                            .and_then(|l| const_locals.get(&l).copied())
                                     })
-                                    .ok_or("index-not-static")?;
-                                d + rel
-                            }
+                                })
+                                .ok_or("index-not-static")?,
                         };
+                        if k >= depth {
+                            return Err("get-above-depth");
+                        }
+                        let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
+                        stmts.push(assign_json(
+                            dest_json.clone(),
+                            json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                        ));
+                    }
+                    Leaf::GetRelative => {
+                        let g = guard.ok_or("get-without-guard")?;
+                        let d = guard_depth(g)?;
+                        let rel = call
+                            .args
+                            .get(arg0)
+                            .and_then(|op| {
+                                const_usize(op, llbc).or_else(|| {
+                                    operand_local(op).and_then(|l| const_locals.get(&l).copied())
+                                })
+                            })
+                            .ok_or("index-not-static")?;
+                        let pins = *plan.pin_count.get(&g).unwrap_or(&0);
+                        if rel >= pins {
+                            return Err("get-out-of-set");
+                        }
+                        let k = d.checked_add(rel).ok_or("get-offset-overflow")?;
                         if k >= depth {
                             return Err("get-above-depth");
                         }
@@ -913,17 +982,28 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         stmts,
                     },
                 );
-                reach(&mut depth_in, &mut queue, *target, depth)?;
+                reach(
+                    &mut depth_in,
+                    &mut pin_count_in,
+                    &mut queue,
+                    *target,
+                    depth,
+                    &plan.pin_count,
+                )?;
             }
             Ok(TermKind::Drop { place, target, .. }) => {
                 let dropped = place_local(place);
-                if let Some(Special::Guard(d)) = dropped.and_then(|l| plan.specials.get(&l)) {
+                if let Some(d) = dropped.and_then(|l| match plan.specials.get(&l) {
+                    Some(Special::Guard(d)) => Some(*d),
+                    _ => None,
+                }) {
                     // A drop flag the artefact does not carry can leave the
                     // guard unopened on this path; the depth says so.
-                    if *d > depth {
+                    if d > depth {
                         return Err("close-above-depth");
                     }
-                    depth = *d;
+                    plan.forget_closed_guards(d);
+                    depth = d;
                     plan.terms.insert(
                         bb,
                         TermRewrite {
@@ -931,11 +1011,25 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             stmts: Vec::new(),
                         },
                     );
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
+                    reach(
+                        &mut depth_in,
+                        &mut pin_count_in,
+                        &mut queue,
+                        *target,
+                        depth,
+                        &plan.pin_count,
+                    )?;
                 } else if dropped.is_some_and(|l| is_root_scope_local(body, llbc, l)) {
                     return Err("drop-of-unopened-guard");
                 } else {
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
+                    reach(
+                        &mut depth_in,
+                        &mut pin_count_in,
+                        &mut queue,
+                        *target,
+                        depth,
+                        &plan.pin_count,
+                    )?;
                 }
             }
             Ok(TermKind::Assert { assert, target, .. }) => {
@@ -948,19 +1042,61 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         },
                     );
                 }
-                reach(&mut depth_in, &mut queue, *target, depth)?;
+                reach(
+                    &mut depth_in,
+                    &mut pin_count_in,
+                    &mut queue,
+                    *target,
+                    depth,
+                    &plan.pin_count,
+                )?;
             }
-            Ok(TermKind::Goto { target }) => reach(&mut depth_in, &mut queue, *target, depth)?,
+            Ok(TermKind::Goto { target }) => reach(
+                &mut depth_in,
+                &mut pin_count_in,
+                &mut queue,
+                *target,
+                depth,
+                &plan.pin_count,
+            )?,
             Ok(TermKind::Switch { targets, .. }) => match targets {
                 majit_charon_reader::ullbc::SwitchTargets::If(a, b) => {
-                    reach(&mut depth_in, &mut queue, *a, depth)?;
-                    reach(&mut depth_in, &mut queue, *b, depth)?;
+                    reach(
+                        &mut depth_in,
+                        &mut pin_count_in,
+                        &mut queue,
+                        *a,
+                        depth,
+                        &plan.pin_count,
+                    )?;
+                    reach(
+                        &mut depth_in,
+                        &mut pin_count_in,
+                        &mut queue,
+                        *b,
+                        depth,
+                        &plan.pin_count,
+                    )?;
                 }
                 majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
                     for (_, t) in arms {
-                        reach(&mut depth_in, &mut queue, *t, depth)?;
+                        reach(
+                            &mut depth_in,
+                            &mut pin_count_in,
+                            &mut queue,
+                            *t,
+                            depth,
+                            &plan.pin_count,
+                        )?;
                     }
-                    reach(&mut depth_in, &mut queue, *default, depth)?;
+                    reach(
+                        &mut depth_in,
+                        &mut pin_count_in,
+                        &mut queue,
+                        *default,
+                        depth,
+                        &plan.pin_count,
+                    )?;
                 }
             },
             Ok(TermKind::Return) => {
@@ -1583,26 +1719,28 @@ fn stack_walk(body: &Unstructured, llbc: &Llbc, sensitive: &dyn Fn(&str) -> bool
                             Leaf::Normalize | Leaf::NormalizeMoved => {}
                             Leaf::Get | Leaf::Set => {
                                 if !index_ok(arg0, depth) {
-                                    // `RootedItems::get(i)`: offset from the
-                                    // set's open depth.
-                                    let rel = call.args.get(arg0).and_then(|op| {
-                                        const_usize(op, llbc).or_else(|| {
-                                            operand_local(op).and_then(|l| consts.get(&l).copied())
-                                        })
-                                    });
-                                    let base = guard.and_then(|g| guards.get(&g).copied());
-                                    let ok = matches!(
-                                        (rel, base, depth),
-                                        (
-                                            Some(r),
-                                            Some(Depth::Known(b)),
-                                            Depth::Known(d)
-                                        ) if b + r < d
-                                    );
-                                    if !ok {
-                                        reads_below = true;
-                                        why = format!("index-not-own bb{bb}");
-                                    }
+                                    reads_below = true;
+                                    why = format!("index-not-own bb{bb}");
+                                }
+                            }
+                            Leaf::GetRelative => {
+                                let rel = call.args.get(arg0).and_then(|op| {
+                                    const_usize(op, llbc).or_else(|| {
+                                        operand_local(op).and_then(|l| consts.get(&l).copied())
+                                    })
+                                });
+                                let base = guard.and_then(|g| guards.get(&g).copied());
+                                let ok = matches!(
+                                    (rel, base, depth),
+                                    (
+                                        Some(r),
+                                        Some(Depth::Known(b)),
+                                        Depth::Known(d)
+                                    ) if b.checked_add(r).is_some_and(|s| s < d)
+                                );
+                                if !ok {
+                                    reads_below = true;
+                                    why = format!("index-not-own bb{bb}");
                                 }
                             }
                             Leaf::ReloadTop => {
@@ -2281,6 +2419,35 @@ mod tests {
         )
     }
 
+    /// `zip_two_tuple_next`: an inner RootScope opens on one arm and closes
+    /// before the join with the arm that never opened it. Closing must drop
+    /// that set's pin-count key so both sides arrive with the outer map.
+    #[test]
+    fn analyze_accepts_nested_scope_closed_before_merge() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            4,
+            vec![
+                term_bb(call_fun(1, vec![], 1, 1)),
+                term_bb(call_fun(4, vec![copy(0)], 3, 2)),
+                term_bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [3, 5]}
+                }})),
+                term_bb(call_fun(1, vec![], 2, 4)),
+                term_bb(drop_local(2, 5)),
+                term_bb(drop_local(1, 6)),
+                term_bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
     #[test]
     fn analyze_accepts_len_minus_one_after_pin() {
         let llbc = stack_ops_llbc();
@@ -2789,6 +2956,181 @@ mod tests {
             assign_copies_local(&erased, 6, 10),
             "get(_t) with _t = const 1 should read the value pinned at slot 1"
         );
+    }
+
+    /// `_t = 0; _t = 1; get(_t)` is not a single-definition constant:
+    /// keep the bracket rather than rewrite `get(1)`.
+    #[test]
+    fn rooted_items_get_follows_reassigned_const() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Copy": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let t_zero = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(0), "Yes"]}]
+        }));
+        let t_one = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(1), "Yes"]}]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, value.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, unit.clone()),
+                    local_ty(7, usize.clone())
+                ]
+            },
+            "body": [
+                bb(vec![], call_term(1, vec![], place_ty(1, &items), 1, 6)),
+                bb(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(6, &unit),
+                        2,
+                        6
+                    )
+                ),
+                bb(
+                    vec![],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(4, &value)],
+                        place_ty(6, &unit),
+                        3,
+                        6
+                    )
+                ),
+                bb(
+                    vec![t_zero, t_one],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), copy(7, &usize)],
+                        place_ty(5, &value),
+                        4,
+                        6
+                    )
+                ),
+                bb(vec![], drop_term(1, &items, 5, 6)),
+                bb(vec![], json!("Return")),
+                bb(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("reassigned const index should refuse the rewrite, not erase"),
+            Ok(None) => {
+                panic!("reassigned const index should refuse the rewrite, not skip as no bracket")
+            }
+            Err(reason) => panic!("expected index-not-static, got {reason}"),
+        }
+    }
+
+    /// `_t = const 0` then `_t = copy(dynamic)` then `get(_t)` is not a
+    /// static index: keep the bracket rather than rewrite `get(0)`.
+    #[test]
+    fn rooted_items_get_after_dynamic_index_keeps_the_bracket() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Copy": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let t_const = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(0), "Yes"]}]
+        }));
+        let t_dyn = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [copy(8, &usize), "Yes"]}]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, value.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, unit.clone()),
+                    local_ty(7, usize.clone()),
+                    local_ty(8, usize.clone())
+                ]
+            },
+            "body": [
+                bb(vec![], call_term(1, vec![], place_ty(1, &items), 1, 6)),
+                bb(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(6, &unit),
+                        2,
+                        6
+                    )
+                ),
+                bb(
+                    vec![],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(4, &value)],
+                        place_ty(6, &unit),
+                        3,
+                        6
+                    )
+                ),
+                bb(
+                    vec![t_const, t_dyn],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), copy(7, &usize)],
+                        place_ty(5, &value),
+                        4,
+                        6
+                    )
+                ),
+                bb(vec![], drop_term(1, &items, 5, 6)),
+                bb(vec![], json!("Return")),
+                bb(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("dynamic index should refuse the rewrite, not erase"),
+            Ok(None) => panic!("dynamic index should refuse the rewrite, not skip as no bracket"),
+            Err(reason) => panic!("expected index-not-static, got {reason}"),
+        }
     }
 
     /// `RootedItems::take` is Unmodeled: new → push → take → drop keeps the
