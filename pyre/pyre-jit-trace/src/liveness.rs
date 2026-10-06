@@ -982,11 +982,33 @@ pub(crate) fn exception_target_pc(code: &CodeObject, pc: usize) -> Option<usize>
 pub fn liveness_for(code: *const CodeObject) -> &'static LiveVars {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    /// Pointer-keyed: `usize` identity, not SipHash. `depth_based_vsd_for_wcode`
+    /// consults this cache on a back-edge, and SipHash of the `CodeObject`
+    /// address was the digest paid after the JIT had already given up.
+    #[derive(Default)]
+    struct IdentityUsizeHasher(u64);
+    impl Hasher for IdentityUsizeHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = self.0.rotate_left(8) ^ (b as u64);
+            }
+        }
+        fn write_usize(&mut self, i: usize) {
+            self.0 = i as u64;
+        }
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+    type PtrMap<V> = HashMap<usize, V, BuildHasherDefault<IdentityUsizeHasher>>;
+
     thread_local! {
         // SAFETY: LiveVars is computed once and never mutated.
         // The 'static lifetime is safe because CodeObject outlives the JIT.
-        static CACHE: RefCell<HashMap<usize, Box<LiveVars>>> =
-            RefCell::new(HashMap::new());
+        static CACHE: RefCell<PtrMap<Box<LiveVars>>> =
+            RefCell::new(PtrMap::default());
     }
     let key = code as usize;
     CACHE.with(|c| {

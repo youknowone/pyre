@@ -3027,6 +3027,25 @@ impl<S: JitState> JitDriver<S> {
             .is_some_and(|cell| cell.is_tracing())
     }
 
+    /// True when this green key has already hit `MAX_TRACE_ABORT_COUNT` and
+    /// a later back-edge must not enter `bound_reached`.
+    ///
+    /// `warmstate.py maybe_compile_and_run` answers this from the cell it
+    /// already holds; pyre's u64 door has to look the cell up. A dead
+    /// procedure token still belongs to `cleanup_chain`, so it is not
+    /// treated as a ban.
+    #[inline]
+    pub fn cell_is_abort_ceiling_banned(&self, green_key: u64) -> bool {
+        self.meta
+            .warm_state_ref()
+            .get_cell(green_key)
+            .is_some_and(|cell| {
+                let dead_token =
+                    cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
+                !dead_token && cell.abort_count >= crate::warmstate::MAX_TRACE_ABORT_COUNT
+            })
+    }
+
     /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds, green banks)`
     /// snapshot captured at a terminal trace transition. CloseLoop and Finish
     /// publish it before draining the ctx; a fresh TraceAction::Abort publishes

@@ -29,6 +29,7 @@
 //! `CodeWriter::instance()`; interior mutability of the queue/cache is
 //! expressed with `UnsafeCell` on the owning `CodeWriter`.
 
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
 use majit_jitcode::jitcode::BhCallDescr;
@@ -190,12 +191,12 @@ pub struct CallControl {
     /// remaining gate arms are removed, keep their likewise immutable result
     /// under the same per-graph owner and raw graph key as `jitcodes`, rather
     /// than re-walking a user code object's constants and bytecode on every
-    /// invocation.  This is deliberately a `HashMap` because the corresponding
-    /// upstream owner is `CallControl.jitcodes`, a graph-keyed Python dict; it
-    /// is not a per-box optimizer side table.  Values are the private
-    /// `UnsupportedJitShape` discriminants, kept as `u8` to avoid making the
-    /// codewriter layer depend on the portal evaluator.
-    pub graph_jit_shapes: HashMap<usize, u8>,
+    /// invocation.  The owner is the same graph-keyed table as
+    /// `CallControl.jitcodes`; FxHash keeps a pointer-keyed probe off
+    /// SipHash.  Values are the private `UnsupportedJitShape` discriminants,
+    /// kept as `u8` to avoid making the codewriter layer depend on the
+    /// portal evaluator.
+    pub graph_jit_shapes: FxHashMap<usize, u8>,
 }
 
 /// Slot of `PyPyJitDriver` in `MetaInterpStaticData.jitdrivers_sd`.
@@ -233,7 +234,7 @@ impl CallControl {
             jitcodes: HashMap::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: CallInfoCollection::new(),
-            graph_jit_shapes: HashMap::new(),
+            graph_jit_shapes: FxHashMap::default(),
         }
     }
 
