@@ -3550,6 +3550,59 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
 }
 
+/// pyjitpl.py `MetaInterp.__init__` stores `last_exc_value` as an ordinary
+/// `OBJECTPTR` field (`lltype.nullptr(rclass.OBJECT)`), so RPython's
+/// collector traces it with the MetaInterp object. `handle_possible_exception`
+/// may also keep `last_exc_box = ConstPtr(val)` of that same object.
+/// Pyre parks both onto `ParkedTraceAttempt` for a nested attempt, so the
+/// extra-root walker has to forward the live slots and the parked copies.
+fn walk_raw_gcref_i64(slot: &mut i64, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if *slot != 0 {
+        let mut gcref = GcRef(*slot as usize);
+        visitor(&mut gcref);
+        *slot = gcref.0 as i64;
+    }
+}
+
+fn walk_raw_gcref_ptr(slot: &mut *const u8, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if slot.is_null() {
+        return;
+    }
+    let mut gcref = GcRef(*slot as usize);
+    visitor(&mut gcref);
+    *slot = gcref.0 as *const u8;
+}
+
+fn walk_last_exc_refs(
+    last_exc_value: &mut i64,
+    last_exc_box: &mut Option<OpRef>,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    walk_raw_gcref_i64(last_exc_value, visitor);
+    if let Some(exc_box) = last_exc_box.as_mut() {
+        exc_box.walk_const_ptr_refs_mut(visitor);
+    }
+}
+
+fn walk_pending_abort_blackhole_refs(
+    pending: &mut crate::PendingAbortBlackhole,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    walk_raw_gcref_i64(&mut pending.last_exc_value, visitor);
+    walk_raw_gcref_i64(&mut pending.virtualizable_ptr, visitor);
+    for value in pending.ref_scalar_values.iter_mut() {
+        walk_raw_gcref_i64(value, visitor);
+    }
+    for frame in pending.framestack.frames.iter_mut() {
+        for (slot, concrete) in frame.ref_regs.iter_mut().zip(frame.ref_values.iter_mut()) {
+            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
+                visitor(gcref);
+                *concrete = Some(gcref.0 as i64);
+            }
+        }
+    }
+}
+
 /// Values produced by the collection-capable half of
 /// `pyjitpl.py initialize_virtualizable`, consumed by the TraceCtx-writing
 /// half. Split so a parked recorder in `compile_tracing` is not borrowed
@@ -4004,6 +4057,21 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
+        walk_last_exc_refs(
+            &mut self.last_exc_value,
+            &mut self.last_exc_box,
+            &mut visitor,
+        );
+        walk_raw_gcref_i64(&mut self.forced_virtualizable, &mut visitor);
+        walk_raw_gcref_ptr(&mut self.pending_vable_ptr, &mut visitor);
+        if let Some(values) = self.single_pass_ref_scalar_values.as_mut() {
+            for value in values.iter_mut() {
+                walk_raw_gcref_i64(value, &mut visitor);
+            }
+        }
+        if let Some(pending) = self.pending_abort_blackhole.as_mut() {
+            walk_pending_abort_blackhole_refs(pending, &mut visitor);
+        }
         if let Some(trace_ctx) = self.tracing.as_mut().or(self.compile_tracing.as_mut()) {
             trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
             // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
@@ -4087,6 +4155,21 @@ impl<M: Clone> MetaInterp<M> {
                         *value = gcref.0 as i64;
                     }
                 }
+            }
+            walk_last_exc_refs(
+                &mut parked.last_exc_value,
+                &mut parked.last_exc_box,
+                &mut visitor,
+            );
+            walk_raw_gcref_i64(&mut parked.forced_virtualizable, &mut visitor);
+            walk_raw_gcref_ptr(&mut parked.pending_vable_ptr, &mut visitor);
+            if let Some(values) = parked.single_pass_ref_scalar_values.as_mut() {
+                for value in values.iter_mut() {
+                    walk_raw_gcref_i64(value, &mut visitor);
+                }
+            }
+            if let Some(pending) = parked.pending_abort_blackhole.as_mut() {
+                walk_pending_abort_blackhole_refs(pending, &mut visitor);
             }
             if let Some(partial) = parked.partial_trace.as_mut() {
                 for op in partial.ops.iter_mut() {
@@ -31303,6 +31386,59 @@ mod tests {
         let mut visited = 0u32;
         meta.walk_active_trace_refs(|_| visited += 1);
         assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_active_last_exc_value_and_box() {
+        // pyjitpl.py `MetaInterp.__init__` `self.last_exc_value` is an
+        // ordinary `OBJECTPTR` GC field; `handle_possible_exception`
+        // stores `last_exc_box = ConstPtr(val)` of the same object.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xA000;
+        meta.last_exc_box = Some(OpRef::const_ptr(GcRef(0xA000)));
+        meta.forced_virtualizable = 0xA000;
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        assert_eq!(meta.last_exc_value, 0xB000);
+        assert_eq!(
+            meta.last_exc_box.and_then(OpRef::as_const_ptr),
+            Some(GcRef(0xB000))
+        );
+        assert_eq!(meta.forced_virtualizable, 0xB000);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_parked_last_exc_value_and_box() {
+        // `park_attempt` stashes the outer `last_exc_value` /
+        // `last_exc_box` while a nested attempt runs. A minor
+        // collection in that window must forward the parked slots so
+        // `restore_attempt` does not write a from-space pointer back.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xA000;
+        meta.last_exc_box = Some(OpRef::const_ptr(GcRef(0xA000)));
+        meta.forced_virtualizable = 0xA000;
+        meta.park_attempt();
+        assert_eq!(meta.last_exc_value, 0);
+        assert!(meta.last_exc_box.is_none());
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        meta.restore_attempt();
+        assert_eq!(meta.last_exc_value, 0xB000);
+        assert_eq!(
+            meta.last_exc_box.and_then(OpRef::as_const_ptr),
+            Some(GcRef(0xB000))
+        );
+        assert_eq!(meta.forced_virtualizable, 0xB000);
     }
 
     /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled
