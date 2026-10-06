@@ -89,8 +89,10 @@ struct EnvKeepalive {
     /// `NAME=VALUE` strings `putenv` retains. A `HashMap` is that dict.
     /// PyPy's dict is unsynchronized; `putenv_llimpl` runs under the GIL.
     /// The Mutex makes the static `Sync` and, for 3.14t, holds across
-    /// `os_putenv` / `os_unsetenv` and the map update. `Send` is the raw
-    /// `CCHARP` values, which are process-global malloc blocks.
+    /// `os_putenv` / `os_unsetenv` and the map update, and across
+    /// `envkeys_llimpl` / `envitems_llimpl` / `getenv_llimpl` while they
+    /// copy the retained strings. `Send` is the raw `CCHARP` values, which
+    /// are process-global malloc blocks.
     byname: HashMap<Vec<u8>, CCHARP>,
 }
 
@@ -111,6 +113,10 @@ fn byname() -> std::sync::MutexGuard<'static, EnvKeepalive> {
 
 /// `rposix_environ.envkeys_llimpl`.
 pub fn envkeys_llimpl() -> Vec<Vec<u8>> {
+    // The GIL covers this walk in RPython. Hold the keepalive mutex
+    // so a 3.14t `putenv_llimpl` cannot free a string this copy still
+    // reads. No null guard: `envkeys_llimpl` has none.
+    let _keepalive = byname();
     let environ = os_get_environ();
     let mut result = Vec::new();
     let mut i = 0usize;
@@ -128,6 +134,7 @@ pub fn envkeys_llimpl() -> Vec<Vec<u8>> {
 
 /// `rposix_environ.envitems_llimpl` (Unix `make_env_impls` arm).
 pub fn envitems_llimpl() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let _keepalive = byname();
     let environ = os_get_environ();
     let mut result = Vec::new();
     if environ.is_null() {
@@ -149,6 +156,7 @@ pub fn envitems_llimpl() -> Vec<(Vec<u8>, Vec<u8>)> {
 /// `rposix_environ.getenv_llimpl`.
 pub fn getenv_llimpl(name: &[u8]) -> Option<Vec<u8>> {
     let l_name = rffi::scoped_str2charp::new(Some(name));
+    let _keepalive = byname();
     let l_result = unsafe { os_getenv(l_name.buf) };
     if l_result.is_null() {
         None

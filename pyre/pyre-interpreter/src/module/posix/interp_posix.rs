@@ -8745,29 +8745,26 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ns,
             "memfd_create",
             crate::make_builtin_function("memfd_create", |args| {
-                if args.is_empty() {
-                    return Err(crate::PyError::type_error(
-                        "memfd_create() requires 1 argument",
-                    ));
-                }
-                if args.len() > 2 {
-                    return Err(crate::PyError::type_error(
-                        "memfd_create() takes at most 2 arguments",
-                    ));
-                }
                 // interp_posix.py `@unwrap_spec(name='text', flags=int)`.
-                let mut w_name = args[0];
-                let mut w_flags = if args.len() >= 2 {
-                    args[1]
-                } else {
-                    pyre_object::PY_NULL
+                let (mut w_name, mut w_flags) = {
+                    let (bound, _kwargs) = bind_path_args(
+                        args,
+                        "memfd_create",
+                        &["name", "flags"],
+                        1,
+                        &[],
+                    )?;
+                    (
+                        bound[0].expect("name is required"),
+                        bound[1].unwrap_or(pyre_object::PY_NULL),
+                    )
                 };
-                let flags = if args.len() >= 2 {
+                let flags = if w_flags.is_null() {
+                    libc::MFD_CLOEXEC as majit_rlib::rffi::UINT
+                } else {
                     pyre_object::with_roots!(w_name, w_flags => {
                         crate::baseobjspace::int_w(w_flags)
                     })? as majit_rlib::rffi::UINT
-                } else {
-                    libc::MFD_CLOEXEC as majit_rlib::rffi::UINT
                 };
                 let name = pyre_object::with_roots!(w_name, w_flags => {
                     crate::baseobjspace::text_w(w_name)
@@ -8800,37 +8797,36 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "getxattr",
                 crate::make_builtin_function("getxattr", |args| {
-                    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                    crate::builtins::kwarg_reject_unknown(
-                        kwargs,
-                        &["follow_symlinks"],
-                        "getxattr",
-                    )?;
-                    if pos.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "getxattr() requires 2 arguments",
-                        ));
-                    }
-                    if pos.len() > 2 {
-                        return Err(crate::PyError::type_error(
-                            "getxattr() takes at most 2 positional arguments",
-                        ));
-                    }
-                    let mut w_path = pos[0];
-                    let mut w_attribute = pos[1];
-                    let follow_symlinks =
-                        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                            Some(v) => pyre_object::with_roots!(w_path, w_attribute => {
-                                crate::baseobjspace::is_true(v)
-                            })?,
-                            None => true,
-                        };
-                    let path = crate::gateway::fsencode_path_or_fd_w(w_path, "getxattr", true)?;
-                    let attribute = crate::gateway::fsencode_path_named_w(
-                        w_attribute,
-                        "getxattr",
-                        "attribute",
-                    )?;
+                    let (mut w_path, mut w_attribute, follow_symlinks) = {
+                        let (bound, kwargs) = bind_path_args(
+                            args,
+                            "getxattr",
+                            &["path", "attribute"],
+                            2,
+                            &["follow_symlinks"],
+                        )?;
+                        let mut w_path = bound[0].expect("path is required");
+                        let mut w_attribute = bound[1].expect("attribute is required");
+                        drop(bound);
+                        let follow_symlinks =
+                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                                Some(v) => pyre_object::with_roots!(w_path, w_attribute => {
+                                    crate::baseobjspace::is_true(v)
+                                })?,
+                                None => true,
+                            };
+                        (w_path, w_attribute, follow_symlinks)
+                    };
+                    let path = pyre_object::with_roots!(w_path, w_attribute => {
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "getxattr", true)
+                    })?;
+                    let attribute = pyre_object::with_roots!(w_path, w_attribute => {
+                        crate::gateway::fsencode_path_named_w(
+                            w_attribute,
+                            "getxattr",
+                            "attribute",
+                        )
+                    })?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "getxattr: cannot use fd and follow_symlinks together",
@@ -8900,46 +8896,31 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "setxattr",
                 crate::make_builtin_function("setxattr", |args| {
-                    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                    crate::builtins::kwarg_reject_unknown(
-                        kwargs,
-                        &["flags", "follow_symlinks"],
-                        "setxattr",
-                    )?;
-                    if pos.len() < 3 {
-                        return Err(crate::PyError::type_error(
-                            "setxattr() requires 3 arguments",
-                        ));
-                    }
-                    if pos.len() > 4 {
-                        return Err(crate::PyError::type_error(
-                            "setxattr() takes at most 4 positional arguments",
-                        ));
-                    }
-                    if pos.len() >= 4 && crate::builtins::kwarg_get(kwargs, "flags").is_some() {
-                        return Err(crate::PyError::type_error(
-                            "setxattr() got multiple values for argument 'flags'",
-                        ));
-                    }
-                    let mut w_path = pos[0];
-                    let mut w_attribute = pos[1];
-                    let mut w_value = pos[2];
-                    let mut w_flags = if pos.len() >= 4 {
-                        pos[3]
-                    } else {
-                        crate::builtins::kwarg_get(kwargs, "flags")
-                            .unwrap_or(pyre_object::PY_NULL)
+                    let (mut w_path, mut w_attribute, mut w_value, mut w_flags, follow_symlinks) = {
+                        let (bound, kwargs) = bind_path_args(
+                            args,
+                            "setxattr",
+                            &["path", "attribute", "value", "flags"],
+                            3,
+                            &["follow_symlinks"],
+                        )?;
+                        let mut w_path = bound[0].expect("path is required");
+                        let mut w_attribute = bound[1].expect("attribute is required");
+                        let mut w_value = bound[2].expect("value is required");
+                        let mut w_flags = bound[3].unwrap_or(pyre_object::PY_NULL);
+                        drop(bound);
+                        let follow_symlinks =
+                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                                Some(v) => pyre_object::with_roots!(
+                                    w_path,
+                                    w_attribute,
+                                    w_value,
+                                    w_flags => crate::baseobjspace::is_true(v)
+                                )?,
+                                None => true,
+                            };
+                        (w_path, w_attribute, w_value, w_flags, follow_symlinks)
                     };
-                    let follow_symlinks =
-                        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                            Some(v) => pyre_object::with_roots!(
-                                w_path,
-                                w_attribute,
-                                w_value,
-                                w_flags => crate::baseobjspace::is_true(v)
-                            )?,
-                            None => true,
-                        };
                     let flags = if w_flags.is_null() {
                         0
                     } else {
@@ -8956,11 +8937,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         w_value,
                         w_flags => crate::baseobjspace::charbuf_w(w_value)
                     )?;
-                    let path = crate::gateway::fsencode_path_or_fd_w(w_path, "setxattr", true)?;
-                    let attribute = crate::gateway::fsencode_path_named_w(
+                    let path = pyre_object::with_roots!(
+                        w_path,
                         w_attribute,
-                        "setxattr",
-                        "attribute",
+                        w_value,
+                        w_flags => crate::gateway::fsencode_path_or_fd_w(w_path, "setxattr", true)
+                    )?;
+                    let attribute = pyre_object::with_roots!(
+                        w_path,
+                        w_attribute,
+                        w_value,
+                        w_flags => crate::gateway::fsencode_path_named_w(
+                            w_attribute,
+                            "setxattr",
+                            "attribute",
+                        )
                     )?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
@@ -9018,38 +9009,36 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "removexattr",
                 crate::make_builtin_function("removexattr", |args| {
-                    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                    crate::builtins::kwarg_reject_unknown(
-                        kwargs,
-                        &["follow_symlinks"],
-                        "removexattr",
-                    )?;
-                    if pos.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "removexattr() requires 2 arguments",
-                        ));
-                    }
-                    if pos.len() > 2 {
-                        return Err(crate::PyError::type_error(
-                            "removexattr() takes at most 2 positional arguments",
-                        ));
-                    }
-                    let mut w_path = pos[0];
-                    let mut w_attribute = pos[1];
-                    let follow_symlinks =
-                        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                            Some(v) => pyre_object::with_roots!(w_path, w_attribute => {
-                                crate::baseobjspace::is_true(v)
-                            })?,
-                            None => true,
-                        };
-                    let path =
-                        crate::gateway::fsencode_path_or_fd_w(w_path, "removexattr", true)?;
-                    let attribute = crate::gateway::fsencode_path_named_w(
-                        w_attribute,
-                        "removexattr",
-                        "attribute",
-                    )?;
+                    let (mut w_path, mut w_attribute, follow_symlinks) = {
+                        let (bound, kwargs) = bind_path_args(
+                            args,
+                            "removexattr",
+                            &["path", "attribute"],
+                            2,
+                            &["follow_symlinks"],
+                        )?;
+                        let mut w_path = bound[0].expect("path is required");
+                        let mut w_attribute = bound[1].expect("attribute is required");
+                        drop(bound);
+                        let follow_symlinks =
+                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                                Some(v) => pyre_object::with_roots!(w_path, w_attribute => {
+                                    crate::baseobjspace::is_true(v)
+                                })?,
+                                None => true,
+                            };
+                        (w_path, w_attribute, follow_symlinks)
+                    };
+                    let path = pyre_object::with_roots!(w_path, w_attribute => {
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "removexattr", true)
+                    })?;
+                    let attribute = pyre_object::with_roots!(w_path, w_attribute => {
+                        crate::gateway::fsencode_path_named_w(
+                            w_attribute,
+                            "removexattr",
+                            "attribute",
+                        )
+                    })?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "removexattr: cannot use fd and follow_symlinks together",
@@ -9088,31 +9077,23 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "listxattr",
                 crate::make_builtin_function("listxattr", |args| {
-                    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                    crate::builtins::kwarg_reject_unknown(
-                        kwargs,
-                        &["follow_symlinks"],
-                        "listxattr",
-                    )?;
-                    if pos.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "listxattr() requires 1 argument",
-                        ));
-                    }
-                    if pos.len() > 1 {
-                        return Err(crate::PyError::type_error(
-                            "listxattr() takes at most 1 positional argument",
-                        ));
-                    }
-                    let mut w_path = pos[0];
-                    let follow_symlinks =
-                        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                            Some(v) => pyre_object::with_roots!(w_path => {
-                                crate::baseobjspace::is_true(v)
-                            })?,
-                            None => true,
-                        };
-                    let path = crate::gateway::fsencode_path_or_fd_w(w_path, "listxattr", true)?;
+                    let (mut w_path, follow_symlinks) = {
+                        let (bound, kwargs) =
+                            bind_path_args(args, "listxattr", &["path"], 1, &["follow_symlinks"])?;
+                        let mut w_path = bound[0].expect("path is required");
+                        drop(bound);
+                        let follow_symlinks =
+                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                                Some(v) => pyre_object::with_roots!(w_path => {
+                                    crate::baseobjspace::is_true(v)
+                                })?,
+                                None => true,
+                            };
+                        (w_path, follow_symlinks)
+                    };
+                    let path = pyre_object::with_roots!(w_path => {
+                        crate::gateway::fsencode_path_or_fd_w(w_path, "listxattr", true)
+                    })?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "listxattr: cannot use fd and follow_symlinks together",
