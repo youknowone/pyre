@@ -2727,7 +2727,10 @@ impl AsmMemoryManagerInner {
         Ok(self.add_free_block(start, stop))
     }
 
-    fn allocate_block(
+    /// `asmmemmgr.py` `_allocate_block`: the whole free range, untrimmed.
+    /// `malloc` trims a remainder of at least `MIN_FRAGMENT`; `open_malloc`
+    /// keeps the range so `MachineDataBlockWrapper` can bump inside it.
+    fn detach_block(
         &mut self,
         length: usize,
         total_memory_allocated: usize,
@@ -2761,7 +2764,16 @@ impl AsmMemoryManagerInner {
         self.blocks_by_size[index].remove(position);
         self.free_blocks.remove(&start);
         self.free_blocks_end.remove(&stop);
+        let mapped = (newly_mapped.is_some()).then_some(stop - start);
+        Ok((start, stop, mapped))
+    }
 
+    fn allocate_block(
+        &mut self,
+        length: usize,
+        total_memory_allocated: usize,
+    ) -> io::Result<(usize, usize, Option<usize>)> {
+        let (start, stop, mapped) = self.detach_block(length, total_memory_allocated)?;
         let requested_stop = start + length;
         let allocated_stop = if stop - requested_stop >= ASM_MIN_FRAGMENT {
             self.add_free_block(requested_stop, stop);
@@ -2773,7 +2785,6 @@ impl AsmMemoryManagerInner {
             // maps, preventing the two neighbours from coalescing on drop.
             stop
         };
-        let mapped = (newly_mapped.is_some()).then_some(stop - start);
         Ok((start, allocated_stop, mapped))
     }
 }
@@ -2865,6 +2876,52 @@ impl AsmMemoryManager {
 
     fn free(&self, start: usize, stop: usize) {
         self.inner.lock().add_free_block(start, stop);
+    }
+
+    /// `asmmemmgr.py` `open_malloc`: at least `minsize` bytes, the whole
+    /// free range. `total_mallocs` grows by `stop - start`; `open_free`
+    /// gives the unused tail back.
+    fn open_malloc(self: &Arc<Self>, minsize: usize) -> io::Result<OpenMalloc> {
+        let length = minsize.max(1);
+        let total = PROCESS_ASM_MEMORY_STATS
+            .total_memory_allocated
+            .load(Ordering::Relaxed);
+        let (start, stop, mapped) = self.inner.lock().detach_block(length, total)?;
+        if let Some(mapped) = mapped {
+            self.stats
+                .total_memory_allocated
+                .fetch_add(mapped, Ordering::Relaxed);
+            PROCESS_ASM_MEMORY_STATS
+                .total_memory_allocated
+                .fetch_add(mapped, Ordering::Relaxed);
+        }
+        let span = stop - start;
+        self.stats.total_mallocs.fetch_add(span, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_mallocs
+            .fetch_add(span, Ordering::Relaxed);
+        Ok(OpenMalloc {
+            manager: Arc::clone(self),
+            start,
+            stop,
+            active: true,
+        })
+    }
+
+    /// `asmmemmgr.py` `open_free`: return `[middle, stop)` when the tail is
+    /// at least `MIN_FRAGMENT`. `false` leaves that tail in the live block.
+    fn open_free(&self, middle: usize, stop: usize) -> bool {
+        if stop - middle >= ASM_MIN_FRAGMENT {
+            let tail = stop - middle;
+            self.stats.total_mallocs.fetch_sub(tail, Ordering::Relaxed);
+            PROCESS_ASM_MEMORY_STATS
+                .total_mallocs
+                .fetch_sub(tail, Ordering::Relaxed);
+            self.free(middle, stop);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -2976,6 +3033,163 @@ impl Drop for AsmMemoryBlock {
         {
             manager.free(start, stop);
         }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct OpenMalloc {
+    manager: Arc<AsmMemoryManager>,
+    start: usize,
+    stop: usize,
+    /// `false` once the range has been handed to an [`AsmMemoryBlock`] or
+    /// fully returned by `open_free`. Drop of a still-active guard frees
+    /// `[start, stop)` and undoes the `open_malloc` charge.
+    active: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OpenMalloc {
+    fn stop(&self) -> usize {
+        self.stop
+    }
+
+    /// `open_free(middle, rawstop)`. A tail below `MIN_FRAGMENT` stays.
+    fn release_tail(&mut self, middle: usize) {
+        assert!(middle >= self.start && middle <= self.stop);
+        if self.manager.open_free(middle, self.stop) {
+            self.stop = middle;
+        }
+    }
+
+    /// The kept span is already charged. An empty span (`open_free` took
+    /// the whole range) must not become a block: its `Drop` would free the
+    /// range a second time.
+    fn into_block(mut self) -> Option<AsmMemoryBlock> {
+        self.active = false;
+        if self.start == self.stop {
+            return None;
+        }
+        let used = self.stop - self.start;
+        Some(AsmMemoryBlock {
+            owner: Arc::clone(&self.manager.stats),
+            used,
+            storage: AsmMemoryBlockStorage::Arena {
+                manager: Arc::clone(&self.manager),
+                start: self.start,
+                stop: self.stop,
+                pad: 0,
+            },
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for OpenMalloc {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let span = self.stop - self.start;
+        if span == 0 {
+            return;
+        }
+        self.manager
+            .stats
+            .total_mallocs
+            .fetch_sub(span, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_mallocs
+            .fetch_sub(span, Ordering::Relaxed);
+        self.manager.free(self.start, self.stop);
+    }
+}
+
+/// `asmmemmgr.py` `MachineDataBlockWrapper`. Bump-allocates inside one
+/// `open_malloc` range; `done` returns the used prefix and `open_free`s
+/// a tail of at least `MIN_FRAGMENT`.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct MachineDataBlockWrapper {
+    asmmemmgr: Arc<AsmMemoryManager>,
+    open: Option<OpenMalloc>,
+    rawposition: usize,
+    finished: Vec<AsmMemoryBlock>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn align_up_pow2(position: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two() && alignment > 0);
+    (position.wrapping_add(alignment - 1)) & 0usize.wrapping_sub(alignment)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl MachineDataBlockWrapper {
+    pub fn new(asmmemmgr: Arc<AsmMemoryManager>) -> Self {
+        Self {
+            asmmemmgr,
+            open: None,
+            rawposition: 0,
+            finished: Vec::new(),
+        }
+    }
+
+    /// `MachineDataBlockWrapper.malloc_aligned`: round `rawposition` up,
+    /// and `open_malloc(size + alignment - 1)` when the cursor does not fit.
+    pub fn malloc_aligned(&mut self, size: usize, alignment: usize) -> io::Result<usize> {
+        assert!(alignment.is_power_of_two() && alignment > 0 && size > 0);
+        let mut position = align_up_pow2(self.rawposition, alignment);
+        let fits = self.open.as_ref().is_some_and(|open| {
+            position
+                .checked_add(size)
+                .is_some_and(|end| end <= open.stop())
+        });
+        if !fits {
+            let minsize = size.checked_add(alignment - 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "JIT data block size overflow")
+            })?;
+            self.allocate_next_block(minsize)?;
+            position = align_up_pow2(self.rawposition, alignment);
+            assert!(
+                position
+                    .checked_add(size)
+                    .is_some_and(|end| end <= self.open.as_ref().unwrap().stop()),
+                "MachineDataBlockWrapper.malloc_aligned"
+            );
+        }
+        self.rawposition = position + size;
+        Ok(position)
+    }
+
+    fn allocate_next_block(&mut self, minsize: usize) -> io::Result<()> {
+        self.finish_open();
+        let open = self.asmmemmgr.open_malloc(minsize)?;
+        self.rawposition = open.start;
+        self.open = Some(open);
+        Ok(())
+    }
+
+    fn finish_open(&mut self) {
+        let Some(mut open) = self.open.take() else {
+            return;
+        };
+        open.release_tail(self.rawposition);
+        if let Some(block) = open.into_block() {
+            self.finished.push(block);
+        }
+        self.rawposition = 0;
+    }
+
+    /// `MachineDataBlockWrapper.done`. Idempotent: a second call is empty.
+    pub fn done(&mut self) -> Vec<AsmMemoryBlock> {
+        self.finish_open();
+        std::mem::take(&mut self.finished)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for MachineDataBlockWrapper {
+    fn drop(&mut self) {
+        drop(self.done());
     }
 }
 
@@ -5287,6 +5501,55 @@ mod tests {
         // starts at the same address instead of leaving a permanent gap.
         let reused = manager.allocate_aligned(128, 128, 1).unwrap();
         assert_eq!(reused.ptr(), start);
+    }
+
+    /// `MachineDataBlockWrapper.malloc_aligned` / `done`: two 8-byte
+    /// slots, the tail `open_free`d, the bits readable from the kept block.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn machine_data_block_wrapper_parks_aligned_constants() {
+        let stats = Arc::new(AsmMemoryManagerStats::default());
+        let manager = AsmMemoryManager::new_isolated(Arc::clone(&stats));
+        let mut wrapper = MachineDataBlockWrapper::new(Arc::clone(&manager));
+        let _writing = AssemblerWriting::enter();
+        let first = wrapper.malloc_aligned(8, 8).unwrap();
+        let second = wrapper.malloc_aligned(8, 8).unwrap();
+        assert_eq!(first % 8, 0);
+        assert_eq!(second - first, 8);
+        let first_bits = 1.5f64.to_bits();
+        let second_bits = 2.5f64.to_bits();
+        unsafe {
+            (first as *mut u64).write(first_bits);
+            (second as *mut u64).write(second_bits);
+        }
+        drop(_writing);
+        let blocks = wrapper.done();
+        assert!(wrapper.done().is_empty());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), 16);
+        assert_eq!(stats.get_stats().1, 16);
+        let bytes = unsafe { std::slice::from_raw_parts(blocks[0].ptr(), blocks[0].len()) };
+        assert_eq!(
+            bytes,
+            [first_bits, second_bits].map(u64::to_le_bytes).concat()
+        );
+        drop(blocks);
+        assert_eq!(stats.get_stats().1, 0);
+    }
+
+    /// Drop without `done` returns the open range (`total_mallocs` back to 0).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn machine_data_block_wrapper_drop_returns_the_open_range() {
+        let stats = Arc::new(AsmMemoryManagerStats::default());
+        let manager = AsmMemoryManager::new_isolated(Arc::clone(&stats));
+        let mut wrapper = MachineDataBlockWrapper::new(manager);
+        let _writing = AssemblerWriting::enter();
+        let slot = wrapper.malloc_aligned(8, 8).unwrap();
+        unsafe { (slot as *mut u64).write(1) };
+        drop(_writing);
+        drop(wrapper);
+        assert_eq!(stats.get_stats().1, 0);
     }
 
     #[test]
