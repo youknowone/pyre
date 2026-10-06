@@ -45,6 +45,36 @@ fn walker_recorded_builtin_raise_is_supported(
     })
 }
 
+/// `GETFIELD_GC_R(ec, sys_exc_value)` then `SETFIELD_GC(exc, active,
+/// w_context)`, plus the same write on the concrete exception so the
+/// authoritative walk observes `__context__`.
+fn walker_chain_exception_context<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ec: OpRef,
+    raised: OpRef,
+    exc: pyre_object::PyObjectRef,
+    kind: pyre_object::interp_exceptions::ExcKind,
+    user: bool,
+) {
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[raised, active],
+        crate::descr::w_exception_context_descr_for(kind, user),
+    );
+    fbw_context_chained_insert(raised);
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
+}
+
 fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     ec: OpRef,
@@ -113,27 +143,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(raised, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
     fbw_built_exc_insert(raised);
-
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[raised, active],
-        crate::descr::w_exception_context_descr_for(expected_kind, user),
-    );
-    fbw_context_chained_insert(raised);
-    // The authentic helper has published the raised exception but has not
-    // chained it yet during the authoritative walk.  Mirror the recorded
-    // field write so that iteration observes the same context as replay.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, raised, exc, expected_kind, user);
 
     fbw_count_executed_residual(false, true);
     let exc_concrete = ConcreteValue::Ref(exc);
@@ -2528,10 +2538,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     {
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
-        let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
-        walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
-        let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-        walker_guard_stamped_type_version(ctx, op_pc, w_class, w_type)?;
+        walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
 
         let dict_op = walker_record_getfield_gc_r_uncached(
             ctx,
@@ -2544,15 +2551,10 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // `MapDictStrategy`-backed, and the carrier read below is out of bounds
         // on a devolved one, so pin the strategy before dereferencing
         // `dstorage`.
-        let strategy = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            dict_op,
-            crate::descr::dict_strategy_word_descr(),
-        );
-        walker_guard_stamped_int(
+        walker_guard_stamped_dict_strategy(
             ctx,
             op_pc,
-            strategy,
+            dict_op,
             &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
         )?;
 
@@ -3064,16 +3066,12 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 
     // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
     // shadowing-slot reads below name the fields they were recorded against.
-    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
-
     // Pin the Python-level receiver class (`w_class`) exactly.  This is the
     // per-frame method namespace anchor: a subclass with the same instance
     // payload vtable side-exits instead of reusing the caller's method.
-    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
-    walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
+    walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
 
@@ -3106,10 +3104,7 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
         return Ok(None);
     };
-    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
-    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
+    walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
     // `w_value` holds, not the function that was there at record time.
@@ -3711,11 +3706,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     dst_bank: char,
     attr_cell: Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 ) -> Result<(), DispatchError> {
-    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-    walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
-
-    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
+    let w_type_const = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
     // The version-tag pin does not cover an in-place cell write.  Same
     // getfield and `guard_value` as `ExceptionInlineReceiverGuard`'s attr_cell.
     if let Some((cell, expected)) = attr_cell {
@@ -4832,16 +4823,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
@@ -7780,12 +7763,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         list_type_addr,
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
     )?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    walker_guard_fold_int(ctx, op_pc, strategy, sid)?;
+    walker_guard_fold_list_strategy(ctx, op_pc, list_op, sid)?;
 
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
@@ -10458,12 +10436,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     let strategy_ref = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64;
     let lookup_helper = crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const ();
 
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        dict_op,
-        crate::descr::dict_strategy_word_descr(),
-    );
-    walker_guard_stamped_int(ctx, op_pc, strategy, strategy_ref)?;
+    walker_guard_stamped_dict_strategy(ctx, op_pc, dict_op, strategy_ref)?;
 
     walker_guard_exact_str(ctx, op_pc, key_op)?;
 
@@ -10578,15 +10551,10 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
         canonical_dict,
     )?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        dict_op,
-        crate::descr::dict_strategy_word_descr(),
-    );
-    walker_guard_stamped_int(
+    walker_guard_stamped_dict_strategy(
         ctx,
         op_pc,
-        strategy,
+        dict_op,
         &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
     )?;
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -10705,23 +10673,7 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
     );
     fbw_built_exc_insert(raised);
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[raised, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(raised);
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(concrete, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, raised, concrete, kind, user);
     fbw_count_executed_residual(true, true);
     ctx.set_last_exc_value(raised, ConcreteValue::Ref(concrete));
     ctx.fbw_mode.class_of_last_exc_is_const = true;
@@ -14020,6 +13972,36 @@ fn walker_guard_fold_int<Sym: WalkSym>(
     Ok(())
 }
 
+/// Walker-native `guard_list_strategy`: getfield `strategy` then GuardValue.
+fn walker_guard_fold_list_strategy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    list_op: OpRef,
+    sid: i64,
+) -> Result<(), DispatchError> {
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    walker_guard_fold_int(ctx, pc, strategy, sid)
+}
+
+/// GETFIELD `version_tag` then unstamped GuardValue.
+/// Distinct from [`walker_pin_type_version_tag`] (quasiimmut + GuardNotInvalidated).
+fn walker_guard_fold_type_version<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: i64,
+) -> Result<OpRef, DispatchError> {
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let descr = crate::descr::type_version_tag_descr();
+    let vt_op = walker_record_getfield_gc_i_uncached(ctx, type_const, descr);
+    walker_guard_fold_int(ctx, pc, vt_op, version_tag)?;
+    Ok(type_const)
+}
+
 /// [`walker_guard_fold_int`] recorded through
 /// [`walker_emit_fold_guard_with_snapshot`].
 fn walker_guard_stamped_int<Sym: WalkSym>(
@@ -14034,6 +14016,19 @@ fn walker_guard_stamped_int<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
     Ok(expected)
+}
+
+/// Getfield dict `strategy` then stamped GuardValue.
+fn walker_guard_stamped_dict_strategy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dict_op: OpRef,
+    sid: i64,
+) -> Result<(), DispatchError> {
+    let descr = crate::descr::dict_strategy_word_descr();
+    let strategy = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, dict_op, descr);
+    walker_guard_stamped_int(ctx, pc, strategy, sid)?;
+    Ok(())
 }
 
 /// Pin an arraylen a fold baked in. `GuardValue` without `replace_box`:
@@ -14254,6 +14249,108 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
     let expected = walker_guard_stamped_ref(ctx, pc, op, concrete)?;
     walker_pin_type_version_tag(ctx, pc, expected)?;
     Ok(expected)
+}
+
+/// Pin payload layout, uncached `w_class`, and `version_tag`.
+fn walker_pin_stamped_instance_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
+    walker_guard_stamped_class(ctx, pc, obj, phys_type)?;
+    let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    walker_guard_stamped_type_version(ctx, pc, w_class, w_type)
+}
+
+/// `allocate_instance` stamps the realbase vtable when `w_class` is that
+/// realbase's own type, and `_getusercls` otherwise. Matches
+/// `exc_instance_pytype` so a canonical fieldless class and an exact
+/// realbase both fold.
+fn walker_exc_canonical_layout(
+    exc: pyre_object::PyObjectRef,
+    kind: pyre_object::interp_exceptions::ExcKind,
+) -> Option<(*const pyre_object::pyobject::PyType, bool)> {
+    let header =
+        unsafe { &(*(exc as *const pyre_object::interp_exceptions::W_BaseException)).ob_header };
+    let exc_type_ptr = header.ob_type;
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_instance_pytype(kind, header.w_class),
+    ) {
+        return None;
+    }
+    Some((
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr),
+    ))
+}
+
+/// Pin the authentic exception, intern `message_wtf8` as a ConstPtr, emit
+/// `NewWithVtable` plus the `__context__` SETFIELD, and route as `SubRaise`.
+/// Shared by the immutable-type and read-only-descriptor attr-raise folds
+/// after `exc_instance_pytype` has already passed.
+fn walker_emit_canonical_message_raise<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ec: OpRef,
+    err: &pyre_interpreter::PyError,
+    exc: pyre_object::PyObjectRef,
+    kind: pyre_object::interp_exceptions::ExcKind,
+    exc_type_ptr: *const pyre_object::pyobject::PyType,
+    user: bool,
+) -> DispatchOutcome {
+    // Message as a trace constant: deterministic under the caller's
+    // predicate, so one shared immutable string is exact (the same sharing
+    // a `raise TypeError("...")` gets from co_consts). Pin the fresh
+    // exception across the string allocation; the recorded ConstPtr slot
+    // is forwarded across minor collections by the op-graph walker and
+    // rooted by the compiled loop's gcref table thereafter.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
+    // The root keeps the exception alive across that allocation but does
+    // not fix its address: a minor collection moves the object and rewrites
+    // the slot, which leaves this local naming a forwarded corpse. Read the
+    // address back out of the slot the pin claimed.
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
+    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
+    let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
+    let class_const = ctx
+        .trace_ctx
+        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
+    let new_op = crate::helpers::emit_exception_new_inline(
+        ctx.trace_ctx,
+        kind,
+        class_const,
+        args_list,
+        user,
+    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.trace_ctx
+        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+    walker_chain_exception_context(ctx, ec, new_op, exc, kind, user);
+
+    // Inline-built marker: the downstream raise routing records the frame
+    // node via the virtual `record_fresh_application_traceback` instead of
+    // the forcing runtime hook (mirrors `try_walker_trace_raise_bare_class`).
+    fbw_built_exc_insert(new_op);
+    // Residual-executor Err-arm state minus the call itself: seed the
+    // standing exception for `SubRaise` (`execute_raised` analogue) and
+    // restore the blackhole cell so an aborting walk still delivers the
+    // pending raise. The `NewWithVtable` vtable pins the class.
+    fbw_count_executed_residual(true, true);
+    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
+    DispatchOutcome::SubRaise {
+        exc: new_op,
+        exc_concrete: ConcreteValue::Ref(exc),
+    }
 }
 
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
@@ -16222,14 +16319,9 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
             }
         };
         // Guard the current (Empty) strategy so a deopt re-enters the empty
-        // path (mirror of `MIFrame::guard_list_strategy`: getfield strategy +
+        // path (mirror of `guard_list_strategy`: getfield strategy +
         // GuardValue + replace_box).
-        let strategy_ref = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            self_ref,
-            crate::descr::list_strategy_descr(),
-        );
-        walker_guard_fold_int(ctx, op.pc, strategy_ref, ListStrategy::Empty as i64)?;
+        walker_guard_fold_list_strategy(ctx, op.pc, self_ref, ListStrategy::Empty as i64)?;
         // Emit the transition IR mutating the existing wrapper (helpers.rs).
         // It stages the same first 0 -> 4 RPython grow as the concrete helper,
         // leaving the append body to record the length/item stores.
@@ -17050,26 +17142,9 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
+    };
     let is_os_error_family = matches!(
         kind,
         pyre_object::interp_exceptions::ExcKind::OSError
@@ -17717,30 +17792,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         fbw_built_exc_insert(exc_op);
         return Ok(None);
     };
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[exc_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(exc_op);
-    // The full-body walk is also the authoritative execution of the
-    // tracing iteration.  Apply the same context write to its concrete,
-    // freshly-built exception that the recorded SETFIELD performs on later
-    // compiled iterations; otherwise Python code reached later in this walk
-    // observes a missing __context__ exactly once, while the trace itself is
-    // correct.  This object is private to the inline construction, so no
-    // rollback journal is needed.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, exc_op, exc, kind, user);
 
     // The normalized publish result is the same flat builtin instance;
     // forward the inline-built exc OpRef (carrying its concrete shadow)
@@ -17833,26 +17885,9 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_class {
         return Ok(None);
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
+    };
 
     let w_none = pyre_object::w_none();
     let mut w_none_slot_descrs = Vec::new();
@@ -17904,32 +17939,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         .class_now_known(new_op, exc_type_ptr as usize as i64);
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    // `__context__` chaining on the still-virtual exception, mirroring the
-    // `try_walker_trace_raise_builtin` tail: `active = GETFIELD_GC_R(ec,
-    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  `ec` came
-    // from `walker_ensure_execution_context` above, so the read shares the one
-    // seeded EC OpRef the PUSH_EXC_INFO / POP_EXCEPT lowering consumes.
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    // Apply the same context write to the concrete, freshly-built exception so
-    // Python code reached later in this authoritative walk observes the
-    // `__context__` the recorded SETFIELD performs on compiled iterations.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
+    walker_chain_exception_context(ctx, ec, new_op, exc, kind, user);
 
     // Mark the inline-built instance FBW-built so the following `raise/r`
     // records its frame node via the virtual `record_fresh_application_
@@ -18002,16 +18012,8 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         }
         None => None,
     };
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     if !pyre_interpreter::baseobjspace::type_immutable_attr_raise_is_stable(
         concrete_obj,
@@ -18055,13 +18057,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     walker_guard_fold_callable(ctx, op.pc, obj_op, concrete_obj)?;
     // Pin the metaclass `version_tag` (see above): a `GETFIELD_GC_I` +
     // `GuardValue` that side-exits on any `type`/`object` dict mutation.
-    let metaclass_const = ctx.trace_ctx.const_ref(metaclass as i64);
-    let vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        metaclass_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    walker_guard_fold_int(ctx, op.pc, vt_op, metaclass_version_tag as i64)?;
+    walker_guard_fold_type_version(ctx, op.pc, metaclass, metaclass_version_tag as i64)?;
 
     // The authoritative walk's concrete execution — the same call the
     // residual executor would have made, raising before any heap
@@ -18094,109 +18090,11 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::TypeError {
         return Ok(None);
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
-
-    // Message as a trace constant: deterministic per `(obj, name)` under
-    // the predicate, so one shared immutable string is exact (the same
-    // sharing a `raise TypeError("...")` gets from co_consts).  Pin the
-    // fresh exception across the string allocation; the recorded ConstPtr
-    // slot is forwarded across minor collections by the op-graph walker
-    // and rooted by the compiled loop's gcref table thereafter.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
-    // The root keeps the exception alive across that allocation but does not
-    // fix its address: a minor collection moves the object and rewrites the
-    // slot, which leaves this local naming a forwarded corpse.  Read the
-    // address back out of the slot the pin claimed.
-    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
-    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
-    let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
-
-    let class_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
-    let new_op = crate::helpers::emit_exception_new_inline(
-        ctx.trace_ctx,
-        kind,
-        class_const,
-        args_list,
-        user,
-    );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
-    ctx.trace_ctx
-        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    // `__context__` chaining on the still-virtual exception, the tail
-    // `try_walker_trace_raise_bare_class` carries: `active = GETFIELD_GC_R(ec,
-    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  Without it
-    // the catch-side `record_inline_exception_context` compensation finds the
-    // context unchained and passes this exception to the resolver call, which
-    // forces the very allocation this fold exists to keep virtual.
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    // Apply the same context write to the concrete exception, which the
-    // registration above stops the compensation from performing, so Python
-    // code reached later in this authoritative walk observes the
-    // `__context__` the recorded SETFIELD performs on compiled iterations.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
-
-    // Inline-built marker: the downstream raise routing records the frame
-    // node via the virtual `record_fresh_application_traceback` instead of
-    // the forcing runtime hook (mirrors `try_walker_trace_raise_bare_class`).
-    fbw_built_exc_insert(new_op);
-
-    // The residual-executor Err-arm state, minus the call itself: seed the
-    // standing exception for the `SubRaise` routing (`execute_raised`
-    // analogue) and restore the blackhole cell so an aborting walk still
-    // delivers the pending raise to the live frame.  The class IS proven
-    // constant here — the `NewWithVtable` vtable pins it.
-    fbw_count_executed_residual(true, true);
-    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
-    ctx.fbw_mode.class_of_last_exc_is_const = true;
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-
+    };
     Ok(Some((
-        DispatchOutcome::SubRaise {
-            exc: new_op,
-            exc_concrete: ConcreteValue::Ref(exc),
-        },
+        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, exc_type_ptr, user),
         op.next_pc,
     )))
 }
@@ -18225,16 +18123,8 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     };
     let concrete_value =
         walker_concrete_ref_object(ctx, value_op).unwrap_or_else(pyre_object::w_none);
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
-        }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
     };
     let Some(descr) =
         pyre_interpreter::baseobjspace::readonly_descr_attr_raise_is_stable(concrete_obj, &name)
@@ -18277,23 +18167,12 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     // `typeobject.py` promotes the version tag before an MRO lookup.
     // Pinning the receiver type covers both the named descriptor resolution
     // and the default-`__setattr__` answer.
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    let w_type_vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    walker_guard_fold_int(ctx, op.pc, w_type_vt_op, w_type_version_tag as i64)?;
+    walker_guard_fold_type_version(ctx, op.pc, w_type, w_type_version_tag as i64)?;
 
     // The descriptor type's tag pins its general `__set__` / `__delete__` MRO
     // answers (`descroperation.py:117-125`).
-    let descr_type_const = ctx.trace_ctx.const_ref(descr_type as i64);
-    let descr_type_vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        descr_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    walker_guard_fold_int(ctx, op.pc, descr_type_vt_op, descr_type_version_tag as i64)?;
+    let descr_type_const =
+        walker_guard_fold_type_version(ctx, op.pc, descr_type, descr_type_version_tag as i64)?;
 
     // `typeobject.py:1046-1058` rewrites `w_name` without mutating the class
     // dictionary or its version tag.  Pin the raw slot, including its initial
@@ -18308,7 +18187,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     // Pyre stores the Python-visible class separately from the physical class
     // GuardClass reads.  Pin that class after the mandated MRO/name guard
     // sequence; unlike GuardValue on `obj_op`, this still accepts every
-    // receiver of the same class and ties `w_type_const` to the receiver.
+    // receiver of the same class and ties `w_type` to the receiver.
     walker_guard_exact_w_class(ctx, op.pc, obj_op, w_type)?;
 
     let result = {
@@ -18333,82 +18212,11 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
         return Ok(None);
     }
-    // `allocate_instance` stamps the realbase vtable when `w_class` is that
-    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
-    // matches that typeptr, so a canonical fieldless class and an exact
-    // realbase both fold, and the emit below uses the same layout.
-    let exc_type_ptr = unsafe {
-        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-            .ob_header
-            .ob_type
-    };
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
-            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
-                .ob_header
-                .w_class
-        }),
-    ) {
+    let Some((exc_type_ptr, user)) = walker_exc_canonical_layout(exc, kind) else {
         return Ok(None);
-    }
-    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
-
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc_root = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
-    // The allocation may move the exception and leave the local pointer naming
-    // its forwarded corpse; the shadow slot contains the live address.
-    let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);
-    let msg_const = ctx.trace_ctx.const_ref(msg as i64);
-    let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[msg_const]);
-
-    let class_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
-    let new_op = crate::helpers::emit_exception_new_inline(
-        ctx.trace_ctx,
-        kind,
-        class_const,
-        args_list,
-        user,
-    );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(new_op, exc_type_ptr as usize as i64);
-    ctx.trace_ctx
-        .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
-
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr_for(kind, user),
-    );
-    fbw_context_chained_insert(new_op);
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    if !active_concrete.is_null() {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
-        }
-    }
-
-    fbw_built_exc_insert(new_op);
-    fbw_count_executed_residual(true, true);
-    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
-    ctx.fbw_mode.class_of_last_exc_is_const = true;
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-
+    };
     Ok(Some((
-        DispatchOutcome::SubRaise {
-            exc: new_op,
-            exc_concrete: ConcreteValue::Ref(exc),
-        },
+        walker_emit_canonical_message_raise(ctx, ec, &err, exc, kind, exc_type_ptr, user),
         op.next_pc,
     )))
 }
@@ -18786,13 +18594,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         list_op,
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
     )?;
-
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        list_op,
-        crate::descr::list_strategy_descr(),
-    );
-    walker_guard_fold_int(ctx, op_pc, strategy, sid)?;
+    walker_guard_fold_list_strategy(ctx, op_pc, list_op, sid)?;
 
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
@@ -19973,13 +19775,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
     for &lst_op in &[list_op, value_op] {
         walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
         walker_guard_fold_class(ctx, op_pc, lst_op, list_type_addr)?;
-
-        let strategy = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            lst_op,
-            crate::descr::list_strategy_descr(),
-        );
-        walker_guard_fold_int(ctx, op_pc, strategy, sid_const_val)?;
+        walker_guard_fold_list_strategy(ctx, op_pc, lst_op, sid_const_val)?;
     }
 
     // Bounds guard on the target: the highest written index `start + slice_len -
@@ -20144,20 +19940,12 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     // `namei` is the raw `LOAD_GLOBAL` oparg; bit 0 is the push-NULL flag,
     // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).
     let name_idx = (namei as usize) >> 1;
-    let name = unsafe {
-        // The wrapper being non-null does not make its `code_ptr` non-null:
-        // `w_code_new_with_hidden_applevel` (pycode.rs) leaves the field
-        // null for a gateway builtin or a test fixture, and every sibling
-        // name lookup screens it the same way.
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(false);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(false),
-        }
+    // The wrapper being non-null does not make its `code_ptr` non-null:
+    // `w_code_new_with_hidden_applevel` leaves the field null for a
+    // gateway builtin or a test fixture, and every sibling name lookup
+    // screens it the same way.
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(false);
     };
     if code_deletes_name_from_ptr(w_code_ptr, &name) {
         return Ok(false);
