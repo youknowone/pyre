@@ -6943,6 +6943,19 @@ fn type_descr_new_with_metaclass(
         pyre_object::gc_roots::normalize_roots(name_slot, 3 + n_args + 2);
         let name_obj = || pyre_object::gc_roots::shadow_stack_get(name_slot);
         let meta = || pyre_object::gc_roots::shadow_stack_get(meta_slot);
+        // typeobject.py `_create_new_type`: `'\x00' in name` then
+        // `_check_surrogate` before the namespace copy and
+        // `allocate_instance`.  U+0000 is a single 0x00 byte in WTF-8.
+        if unsafe { pyre_object::w_str_get_wtf8(name_obj()) }
+            .as_bytes()
+            .contains(&0)
+        {
+            return Err(crate::PyError::value_error(
+                "type name must not contain null characters",
+            ));
+        }
+        check_surrogate(name_obj())?;
+        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
         // Resolve and pin the backing immediately. Later regions dispatch
         // through user code (`lookup`, metaclass `__new__`) and would
         // otherwise leave this word unrooted.
@@ -6952,17 +6965,6 @@ fn type_descr_new_with_metaclass(
                 namespace_root,
             ))
         });
-        // typeobject.py `_check_surrogate(space, name)` — reject a lone
-        // surrogate in the name before it is read as UTF-8 below.
-        check_surrogate(name_obj())?;
-        for cp in unsafe { pyre_object::w_str_get_wtf8(name_obj()) }.code_points() {
-            if cp.to_u32() == 0 {
-                return Err(crate::PyError::value_error(
-                    "type name must not contain null characters",
-                ));
-            }
-        }
-        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
 
         // typeobject.py `_create_new_type` — direct three-argument
         // `type()` never performs PEP 560 base rewriting.  A non-type base
