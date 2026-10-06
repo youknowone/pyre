@@ -9804,6 +9804,24 @@ fn eval_with_jit_inner(
     }
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    pyre_interpreter::call::register_eval_override(eval_with_jit);
+    pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+    pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
+    pyre_interpreter::call::register_set_jit_param_enable_opts_hook(
+        set_jit_param_enable_opts_via_warmstate,
+    );
+    pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
+    pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
+    pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
+    // The backend-agnostic registrations here — notably the JIT exception
+    // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
+    // residual-call raises through — are required on every backend; the
+    // cranelift/dynasm-specific blocks inside are already `cfg`-gated, so this
+    // is safe on wasm32 (where it is the only thing that installs the raiser).
+    crate::call_jit::install_jit_call_bridge();
+    init_callbacks();
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
     let jit_shape = cached_unsupported_jit_shape(code);
     // Every declining shape runs the frame in the plain interpreter, so the
     // tracer never sees it. Record the decline in the census — keyed by the
@@ -9827,28 +9845,6 @@ fn eval_with_jit_inner(
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
-    // A declined frame never traces. `init_jit_hooks` already registered
-    // the eval override. The bridge, callbacks, and portal runners are
-    // the trace-side stand-in for translation-time hooks, so they wait
-    // until a frame is actually eligible.
-    pyre_interpreter::call::register_eval_override(eval_with_jit);
-    pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
-    pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
-    pyre_interpreter::call::register_set_jit_param_enable_opts_hook(
-        set_jit_param_enable_opts_via_warmstate,
-    );
-    pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
-    pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
-    pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
-    // The backend-agnostic registrations here — notably the JIT exception
-    // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
-    // residual-call raises through — are required on every backend; the
-    // cranelift/dynasm-specific blocks inside are already `cfg`-gated, so this
-    // is safe on wasm32 (where it is the only thing that installs the raiser).
-    crate::call_jit::install_jit_call_bridge();
-    init_callbacks();
-    #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
     // During bridge tracing, concrete force-helper calls use the plain
     // interpreter so they cannot recursively enter warmstate or corrupt the
     // bridge trace's symbolic state.
@@ -10799,9 +10795,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // per-opcode `getexecutioncontext` read is not part of the dispatch loop.
     // Re-read only after `perform_actions`, which can run signal Python.
     let mut marker_ec = pyre_interpreter::call::getexecutioncontext();
-    // `gc_enter_roots_frame` resolves the root stack once. Doing it here,
-    // before the marker, keeps the pointer off the values live across
-    // `split_before_jit_merge_point`. Later opcodes load the EC cell.
+    // One EC per activation (`interp_jit.py` `PyFrame.dispatch`). The
+    // shadow-stack cell is the `gc_enter_roots_frame` cache: resolved once
+    // here, before the marker, so the pointer is not live across
+    // `split_before_jit_merge_point`. Later opcodes load that cell.
     if !marker_ec.is_null() {
         majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*marker_ec).root_stack_slot });
     }

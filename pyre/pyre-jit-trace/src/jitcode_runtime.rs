@@ -1140,7 +1140,7 @@ fn descr_from_indexed_bytes(bytes: &[u8], size_type_id: u64) -> BhDescr {
         );
         assert_eq!(spec.type_id, size_type_id);
         let owner = if spec.headerless && spec.owner.is_empty() {
-            "__majit_headerless_size__".to_string()
+            majit_jitcode::jitcode::HEADERLESS_SIZE_OWNER_MARKER.to_string()
         } else {
             spec.owner
         };

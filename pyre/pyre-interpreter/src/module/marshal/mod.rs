@@ -1489,9 +1489,10 @@ mod tests {
 
     #[test]
     fn make_str_reads_the_marshal_buffer_without_an_owned_copy() {
+        let roots = pyre_object::gc_roots::push_roots();
         let mut pending_error = None;
         let mut name_slots = Vec::new();
-        let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
+        let bag = PyreMarshalBag::new(ErrorSink::park(&roots, &mut pending_error), &mut name_slots);
         let text = rustpython_wtf8::Wtf8Buf::from("stat_result");
         let rooted = wire::MarshalBag::make_str(&bag, &text);
         unsafe {

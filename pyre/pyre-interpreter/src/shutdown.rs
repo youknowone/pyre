@@ -255,12 +255,14 @@ fn clear_shutdown_modules(
             pyre_object::gc_roots::shadow_stack_get(roots_start + index).cast(),
         )
     };
-    // CPython v3.14.6 pylifecycle.c finalize_modules collects after detaching
-    // sys.modules and before clearing surviving module dicts, so a `__del__`
-    // can still read those globals (test_module_finalization_at_shutdown).
-    // `baseobjspace.py` `ObjSpace.finish` does not collect. With no
-    // `hasuserdel` instance, `do_collect_full` only rewalks a heap that
-    // finish leaves alone; builtin finalizers are not that instance.
+    // CPython v3.14.6 pylifecycle.c finalize_modules collects unconditionally
+    // after detaching sys.modules and before clearing surviving module dicts.
+    // A previous finalizer can release the next link in a chain even when
+    // detaching the cache itself made nothing unreachable. Collect while those
+    // finalizers can still read their globals (test_module's
+    // test_module_finalization_at_shutdown).
+    // PyPy ObjSpace.finish runs module shutdown hooks without this dict-clear
+    // phase; this collection preserves the existing CPython shutdown contract.
     // incminimark.IncrementalMiniMarkGC.deal_with_objects_with_finalizers
     // preserves dependency order across successive collections. Unlike
     // CPython's refcount/cyclic-GC finalization, one collection need not finish
@@ -272,11 +274,7 @@ fn clear_shutdown_modules(
     // PyPy ObjSpace.finish and CPython finalize_modules both have bounded
     // shutdown phases; this bound preserves the GC's dependency ordering
     // without chasing newly created generations forever.
-    let collection_limit = if crate::executioncontext::user_finalizer_was_registered() {
-        majit_gc::gc_registered_finalizer_count().saturating_add(1)
-    } else {
-        0
-    };
+    let collection_limit = majit_gc::gc_registered_finalizer_count().saturating_add(1);
     for _ in 0..collection_limit {
         if !collect_and_run_finalizers(ec_ptr) {
             break;
@@ -308,9 +306,13 @@ fn clear_shutdown_modules(
         let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
         clear_shutdown_module_dict(dict);
     }
-    // `baseobjspace.py` `ObjSpace.finish` does not collect after module
-    // shutdown. The dictionaries are already cleared, so a full mark here
-    // cannot show a finalizer the pre-clear collection missed a live global.
+    // One collection for the whole walk, not one per module. `finalize_modules`
+    // clears the module dictionaries and lets refcounting release what they
+    // held; a sweep per module buys no ordering here, because a finalizer that
+    // reads a global reaches its own already-cleared namespace either way, and
+    // it costs a full mark-and-sweep for each of the ~100 modules a bare
+    // `import unittest` loads.
+    collect_and_run_finalizers(ec_ptr);
 }
 
 /// The module dict of one of the two names finalization reaches for, or

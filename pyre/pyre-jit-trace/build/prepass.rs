@@ -1844,7 +1844,7 @@ fn real_main() {
                     vtable: *vtable,
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,
-                    headerless: owner == "__majit_headerless_size__",
+                    headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
                     all_fielddescrs: all_fielddescrs.clone(),
                 }
                 .pack_into(&mut descrs_bin);

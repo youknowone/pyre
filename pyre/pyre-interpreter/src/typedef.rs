@@ -2572,10 +2572,8 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
     // `typeobject.py` `TypeCache.build` walks the dict once. A later
     // `w_dict_getitem_str` hashes the same key. Pin the entries so a
     // qualname allocation can move them without a second lookup.
-    let pinned_base = pyre_object::gc_roots::shadow_stack_len();
-    for (_, entry) in &entries {
-        let _ = pyre_object::gc_roots::pin_root(*entry);
-    }
+    let pinned: Vec<PyObjectRef> = entries.iter().map(|(_, entry)| *entry).collect();
+    let pinned_base = pyre_object::gc_roots::pin_roots(&pinned);
     for (i, (key, _)) in entries.iter().enumerate() {
         let _ns = pyre_object::gc_roots::shadow_stack_get(save_point);
         let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
@@ -2679,25 +2677,23 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::pin_roots(&[ns, w_type]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    // `typedef.py` `TypeCache.build` writes the copied `GetSetProperty`
-    // back through the key the raw dict already holds. The slot from this
-    // walk is that assignment; `setitem_str` is only the miss path.
-    let mut entries: Vec<(usize, PyObjectRef, PyObjectRef)> = Vec::new();
+    // `typeobject.py` `TypeCache.build`: `dict_w[descrname] = space.wrap(...)`.
+    let mut entries: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     let mut from = 0usize;
     while let Some((slot, key, value)) = pyre_object::w_dict_next_item(ns, from) {
         from = slot.wrapping_add(1);
         if value.is_null() || !pyre_object::typedef::is_getset_property(value) {
             continue;
         }
-        entries.push((slot, key, value));
+        entries.push((key, value));
     }
-    let pinned_base = pyre_object::gc_roots::shadow_stack_len();
-    for (_, key, value) in &entries {
-        let _ = pyre_object::gc_roots::pin_root(*key);
-        let _ = pyre_object::gc_roots::pin_root(*value);
+    let mut pinned = Vec::with_capacity(entries.len() * 2);
+    for (key, value) in &entries {
+        pinned.push(*key);
+        pinned.push(*value);
     }
-    for (i, (slot, _, _)) in entries.iter().enumerate() {
-        let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
+    let pinned_base = pyre_object::gc_roots::pin_roots(&pinned);
+    for i in 0..entries.len() {
         let descr = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2 + 1);
         if descr.is_null() || !pyre_object::typedef::is_getset_property(descr) {
             continue;
@@ -2712,9 +2708,6 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
         }
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
-        if pyre_object::w_dict_replace_value_at(ns, *slot, key, bound) {
-            continue;
-        }
         if let Some(text) = pyre_object::w_str_get_value_opt(key) {
             let text = text.to_owned();
             pyre_object::w_dict_setitem_str_no_proxy(ns, &text, bound);
@@ -2879,7 +2872,11 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
 pub fn ensure_sre_typeobjects() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+    // `init_typeobjects`: do not wait on Once while holding the GIL; the
+    // builder drops it inside `Cache.getorbuild` and would deadlock.
+    let mut waiting = (!ONCE.is_completed()).then(crate::module::thread::before_external_block);
     ONCE.call_once(|| {
+        drop(waiting.take());
         let mut object_type = w_object();
         let mut reg: HashMap<usize, usize> = HashMap::new();
         let sre_pattern_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
@@ -2952,7 +2949,9 @@ pub fn ensure_array_typeobjects() {
     };
     let init_array_type = hooks.init_array_type;
     static ONCE: Once = Once::new();
+    let mut waiting = (!ONCE.is_completed()).then(crate::module::thread::before_external_block);
     ONCE.call_once(|| {
+        drop(waiting.take());
         let mut object_type = w_object();
         let array_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
             "array.array",
@@ -2991,7 +2990,9 @@ pub fn ensure_array_typeobjects() {
 pub fn ensure_itertools_typeobjects() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+    let mut waiting = (!ONCE.is_completed()).then(crate::module::thread::before_external_block);
     ONCE.call_once(|| {
+        drop(waiting.take());
         let mut object_type = w_object();
         let mut reg: HashMap<usize, usize> = HashMap::new();
             reg.insert(

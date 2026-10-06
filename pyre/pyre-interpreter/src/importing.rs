@@ -2363,10 +2363,10 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
         // this seed into `sys.path`. A later `init_sys_path` has already
         // cleared that seed, and `ensure_stdlib_path` does not run twice, so
         // put the same entries back before anything reads the seed again.
-        // Extend the seed in place: `add_sys_path` takes this same lock.
-        // A `._pth` list is copied verbatim, duplicates included.
+        // First startup leaves this to `ensure_stdlib_path` so a `._pth` list
+        // is not copied here and then extended again.
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        if STDLIB_PATH_SEEDED.load(Ordering::Acquire) {
             let (stdlib_paths, verbatim) = &stdlib_reseed;
             for stdlib in stdlib_paths {
                 if *verbatim || !path.contains(stdlib) {
@@ -2439,8 +2439,18 @@ fn restore_cleared_meta_path(w_dict: PyObjectRef) {
     let _ = roots.pin_root(pyre_object::w_list_new_empty());
     let flag_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_bool_from(false));
+    let hooks_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_list_new_empty());
+    let cache_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_dict_new());
     unsafe {
         pyre_object::w_dict_setitem_str(roots.get(dict_slot), "meta_path", roots.get(list_slot));
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "path_hooks", roots.get(hooks_slot));
+        pyre_object::w_dict_setitem_str(
+            roots.get(dict_slot),
+            "path_importer_cache",
+            roots.get(cache_slot),
+        );
         pyre_object::w_dict_setitem_str(
             roots.get(dict_slot),
             "_pyre_importlib_bootstrap_installed",
@@ -4356,11 +4366,13 @@ fn find_module(
     Ok(None)
 }
 
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+static STDLIB_PATH_SEEDED: AtomicBool = AtomicBool::new(false);
+
 /// Install the PyPy-shaped bootstrap path exactly once for the process.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn ensure_stdlib_path() {
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::AcqRel) {
+    if STDLIB_PATH_SEEDED.swap(true, Ordering::AcqRel) {
         return;
     }
     let config = startup_path_config();
@@ -4822,15 +4834,6 @@ pub fn appleveldef_install(
 /// `import _io` (`app_io.py`).  pyre installs app files eagerly from the
 /// module initializer, before the module object exists, so a name the source
 /// needs from its own module is bound up front instead.
-fn applevel_source_hash(source: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for &byte in source.as_bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 pub fn appleveldef_install_seeded(
     mut ns: impl AppleveldefNamespace,
     source: &str,
@@ -4845,15 +4848,10 @@ pub fn appleveldef_install_seeded(
     }
     // `gateway.py ApplevelClass` / `mixedmodule.py MixedModule._cleanup_`
     // compile the app file at translation. The source is linked into this
-    // binary, so the marshalled code is that image (`interp_imp.frozen_cache_load`,
-    // `importing.py _validate_timestamp_pyc`): binary mtime plus the source
-    // bytes. A hit does not parse.
+    // binary; the marshalled image is keyed by the full source bytes
+    // (`interp_imp.applevel_cache_load`), not a hash in the pyc mtime word.
     let cache_key = format!("applevel.{modname}.{filename}");
-    let stamp = crate::module::imp::interp_imp::FrozenSourceStamp {
-        mtime_ns: applevel_source_hash(source),
-        size: source.len() as u64,
-    };
-    let loaded = crate::module::imp::interp_imp::frozen_cache_load(&cache_key, stamp);
+    let loaded = crate::module::imp::interp_imp::applevel_cache_load(&cache_key, source);
     let _root = pyre_object::gc_roots::push_roots();
     let code_slot = pyre_object::gc_roots::shadow_stack_len();
     if let Some(w_code) = loaded {
@@ -4864,9 +4862,9 @@ pub fn appleveldef_install_seeded(
             .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
         let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
         let _ = pyre_object::gc_roots::pin_root(w_code);
-        crate::module::imp::interp_imp::frozen_cache_store(
+        crate::module::imp::interp_imp::applevel_cache_store(
             &cache_key,
-            stamp,
+            source,
             pyre_object::gc_roots::shadow_stack_get(code_slot),
         );
     }
@@ -4979,12 +4977,20 @@ fn load_source_module(
         None
     };
     // `_bootstrap_external._validate_timestamp_pyc` / `check_compiled_module`:
-    // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path.
+    // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path
+    // and `__cached__` is the `.pyc` (`importing.py` `exec_code_module`).
+    #[cfg(not(feature = "sandbox"))]
+    let mut timestamp_cpathname: Option<String> = None;
     #[cfg(not(feature = "sandbox"))]
     let cached = if cache_ok {
         cache_key
             .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname))
-            .or_else(|| crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname))
+            .or_else(|| {
+                let code = crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?;
+                timestamp_cpathname = crate::module::imp::interp_imp::timestamp_pyc_path(pathname)
+                    .map(|p| p.to_string_lossy().into_owned());
+                Some(code)
+            })
     } else {
         None
     };
@@ -5124,19 +5130,22 @@ fn load_source_module(
     }
 
     // PyPy `importing.py:300` passes `pathname`/`cpathname` to
-    // `exec_code_module`; pyre has no .pyc cache today so cpathname is
-    // always None, matching the PyPy `cpathname is None` arm at line
-    // 282-283.
+    // `exec_code_module`. A timestamp `.pyc` hit supplies that path so
+    // `__cached__` is set; a source parse leaves it None.
     //
     // On exec failure drop the pre-registered module from sys.modules
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
+    #[cfg(not(feature = "sandbox"))]
+    let cpathname = timestamp_cpathname.as_deref();
+    #[cfg(feature = "sandbox")]
+    let cpathname: Option<&str> = None;
     if let Err(e) = exec_code_module(
         roots.get(code_slot),
         roots.get(globals_slot),
         execution_context,
         Some(&path_text),
-        None,
+        cpathname,
         cache_key.is_some(),
     ) {
         remove_sys_module(modulename);
@@ -8910,8 +8919,10 @@ mod tests {
         }
     }
 
+    #[test]
     fn appleveldef_install_binds_through_the_plain_dispatch() {
         crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
         let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
         crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
         let ns = pyre_object::dictmultiobject::w_dict_new();

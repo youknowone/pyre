@@ -510,7 +510,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
 /// once into the STR payload (`rstr.mallocstr`); the caller keeps its buffer.
 pub fn w_str_from_wtf8_managed_borrowed(value: &Wtf8) -> PyObjectRef {
     if !crate::gc_interp::enabled() || lowlevel_str_gc_type_id() == 0 {
-        return w_str_from_wtf8_immortal(value.to_owned());
+        return w_str_from_wtf8_ref(value);
     }
     let byte_len = value.len();
     // `codepoints_in_utf8` equals `len` when every byte is ASCII

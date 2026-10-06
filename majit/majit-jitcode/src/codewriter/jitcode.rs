@@ -2156,11 +2156,7 @@ impl<'a> LayoutCursor<'a> {
         let bytes = &self.bytes[self.at..end];
         self.at = end;
         // `BhSizeSpec::pack_into` writes these bytes from a `&str`.
-        // `pyjitpl.py` `finish_setup_descrs` does not re-validate names it
-        // already stored.
-        debug_assert!(std::str::from_utf8(bytes).is_ok());
-        // SAFETY: `pack_into` copied these bytes out of a `&str`.
-        unsafe { std::str::from_utf8_unchecked(bytes) }
+        std::str::from_utf8(bytes).expect("layout record name is utf-8")
     }
 }
 

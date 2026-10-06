@@ -663,7 +663,7 @@ pub(crate) fn timestamp_pyc_payload(
 
 /// `cache_from_source` path for this source file at the current optimize level.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-fn timestamp_pyc_path(source: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(crate) fn timestamp_pyc_path(source: &std::path::Path) -> Option<std::path::PathBuf> {
     let name = source.file_name()?.to_str()?;
     let stem = name.strip_suffix(".py").unwrap_or(name);
     let opt = crate::importing::optimize_flag();
@@ -672,7 +672,42 @@ fn timestamp_pyc_path(source: &std::path::Path) -> Option<std::path::PathBuf> {
     } else {
         format!("{stem}.pyre314.opt-{opt}.pyc")
     };
-    Some(source.parent()?.join("__pycache__").join(file))
+    // `_bootstrap_external.cache_from_source`: `sys.pycache_prefix` is a
+    // parallel tree of the absolute source parent; otherwise adjacent
+    // `__pycache__`.
+    if let Some(prefix) = crate::importing::pycache_prefix() {
+        let parent = source.parent()?;
+        let head = if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(parent)
+        };
+        let mut rel = head.as_os_str().to_os_string();
+        #[cfg(windows)]
+        {
+            let s = rel.to_string_lossy();
+            let stripped = if s.len() >= 2 && s.as_bytes().get(1) == Some(&b':') {
+                &s[2..]
+            } else {
+                &s
+            };
+            rel = stripped
+                .trim_start_matches(['\\', '/'])
+                .to_string()
+                .into();
+        }
+        #[cfg(not(windows))]
+        {
+            let s = rel.to_string_lossy();
+            rel = s.trim_start_matches('/').to_string().into();
+        }
+        let mut path = std::path::PathBuf::from(prefix);
+        path.push(std::path::Path::new(&rel));
+        path.push(file);
+        Some(path)
+    } else {
+        Some(source.parent()?.join("__pycache__").join(file))
+    }
 }
 
 /// `read_compiled_module` when `check_compiled_module` accepts the `.pyc`.
@@ -879,6 +914,76 @@ pub(crate) fn frozen_cache_store(
     _source_size: u64,
     _code: pyre_object::PyObjectRef,
 ) {
+}
+
+/// Applevel cache keyed by the full source bytes.
+///
+/// `gateway.py` `ApplevelClass` / `build_applevel_dict` compile from source
+/// at translation. The runtime image is that source; stuffing a hash into
+/// [`FrozenSourceStamp::mtime_ns`] would accept a colliding body.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn applevel_cache_load(
+    cache_key: &str,
+    source: &str,
+) -> Option<pyre_object::PyObjectRef> {
+    let path = frozen_cache_path(cache_key)?;
+    let mtime = frozen_cache_base()?.binary_mtime;
+    let bytes = std::fs::read(&path).ok()?;
+    // Header: [u32 magic][u64 binary_mtime][u64 source_len][source bytes][marshalled code].
+    let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+    if magic != PYC_MAGIC_NUMBER_TOKEN {
+        return None;
+    }
+    let stored_mtime = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?);
+    if stored_mtime != mtime {
+        return None;
+    }
+    let src_len = u64::from_le_bytes(bytes.get(12..20)?.try_into().ok()?) as usize;
+    let src_end = 20usize.checked_add(src_len)?;
+    if bytes.get(20..src_end)? != source.as_bytes() {
+        return None;
+    }
+    let code = crate::module::marshal::loads_bytes(bytes.get(src_end..)?).ok()?;
+    unsafe { crate::is_code(code) }.then_some(code)
+}
+
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn applevel_cache_store(
+    cache_key: &str,
+    source: &str,
+    code: pyre_object::PyObjectRef,
+) {
+    let Some(path) = frozen_cache_path(cache_key) else {
+        return;
+    };
+    let Some(base) = frozen_cache_base() else {
+        return;
+    };
+    let Ok(marshalled) = crate::module::marshal::dumps_bytes(code) else {
+        return;
+    };
+    let mut buf = Vec::with_capacity(20 + source.len() + marshalled.len());
+    buf.extend_from_slice(&PYC_MAGIC_NUMBER_TOKEN.to_le_bytes());
+    buf.extend_from_slice(&base.binary_mtime.to_le_bytes());
+    buf.extend_from_slice(&(source.len() as u64).to_le_bytes());
+    buf.extend_from_slice(source.as_bytes());
+    buf.extend_from_slice(&marshalled);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &buf);
+}
+
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+pub(crate) fn applevel_cache_load(
+    _cache_key: &str,
+    _source: &str,
+) -> Option<pyre_object::PyObjectRef> {
+    None
+}
+
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+pub(crate) fn applevel_cache_store(_cache_key: &str, _source: &str, _code: pyre_object::PyObjectRef) {
 }
 
 /// The `data` element of a `withdata=True` `find_frozen` result: a read-only
