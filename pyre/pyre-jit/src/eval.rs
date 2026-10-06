@@ -1002,8 +1002,12 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     };
 }
 
-/// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
-/// `W_BytesObject` (off-GC storage).
+/// Custom trace for `W_BytearrayObject`.
+///
+/// `W_BytearrayObject` holds `_data` (the char list, `data`) and `_offset`
+/// (`logical_offset`, an integer). The GC edges are `w_class` and the
+/// leaf storage box behind `data`, the same box `W_BytesObject` uses.
+/// The `Vec` bytes themselves sit off the GC heap.
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
