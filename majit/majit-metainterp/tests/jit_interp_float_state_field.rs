@@ -537,7 +537,8 @@ mod virt_array_with_float_scalar {
         frame.ref_regs[1] = Some(identity);
 
         let close = <MixedState as JitState>::collect_jump_args_with_boxes(&sym, &boxes);
-        let portal = <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes);
+        let portal = <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes)
+            .expect("portal identity slots are populated");
         assert_eq!(close, vec![identity, e0, e1]);
         assert_eq!(portal, vec![c0, c1, identity, e0, e1]);
     }

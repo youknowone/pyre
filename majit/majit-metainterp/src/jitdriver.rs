@@ -4304,6 +4304,7 @@ impl<S: JitState> JitDriver<S> {
                         self.sym.is_some(),
                         "reached_loop_header: sym must be live on the CloseLoop arm",
                     );
+                    let mut portal_slot_missing = false;
                     let live_arg_boxes: Vec<OpRef> = match self.sym.as_ref() {
                         Some(sym) => {
                             // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
@@ -4323,11 +4324,22 @@ impl<S: JitState> JitDriver<S> {
                             let mut boxes = if let Some(typed) = stashed {
                                 typed.into_iter().map(|(o, _)| o).collect()
                             } else if let Some(root) = self.meta.framestack.frames.first() {
-                                S::collect_jump_args_from_portal(
+                                match S::collect_jump_args_from_portal(
                                     sym,
                                     root,
                                     vable_boxes.as_deref().unwrap_or(&[]),
-                                )
+                                ) {
+                                    Some(boxes) => boxes,
+                                    None => {
+                                        // A declared portal identity slot had no
+                                        // redbox. pyjitpl.py never skips those
+                                        // slots; emitting a short JUMP panics in
+                                        // x86/regalloc.py
+                                        // `assert len(arglocs) == jump_op.numargs()`.
+                                        portal_slot_missing = true;
+                                        Vec::new()
+                                    }
+                                }
                             } else {
                                 S::collect_jump_args(sym)
                             };
@@ -4376,6 +4388,14 @@ impl<S: JitState> JitDriver<S> {
                         }
                         None => Vec::new(),
                     };
+                    if portal_slot_missing {
+                        self.meta
+                            .stage_abort_reason(crate::pyjitpl::counters::ABORT_BAD_LOOP);
+                        self.meta.abort_trace(false);
+                        self.sym = None;
+                        self.meta.clear_trace_session();
+                        return;
+                    }
                     // pyjitpl.py reached_loop_header:
                     //
                     //     if not self.partial_trace:
