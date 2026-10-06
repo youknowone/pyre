@@ -21,7 +21,8 @@
 # UnicodeTranslateError names `UnicodeTranslateError.__init__`.
 # IndentationError and TabError name `SyntaxError.__init__`.
 # BlockingIOError and FileNotFoundError raise
-# `OSError does not take keyword arguments`.
+# `OSError does not take keyword arguments`. A MemoryError subclass
+# still names `BaseException.__init__`.
 def reject(fn, message):
     try:
         fn()
@@ -62,5 +63,12 @@ reject(
     lambda: FileNotFoundError(foo=1),
     "FileNotFoundError() takes no keyword arguments",
 )
+
+
+class ME(MemoryError):
+    pass
+
+
+reject(lambda: ME(foo=1), "ME() takes no keyword arguments")
 
 print("OK")
