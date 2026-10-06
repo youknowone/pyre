@@ -8085,7 +8085,13 @@ struct Lowering<'a> {
     /// `next` on pair-slice iterator local `iter`. One-shot, from the body.
     slice_next_iter: Vec<Option<usize>>,
     /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`.
+    /// Incoming edges always target this entry. A bounds fork does not
+    /// retarget it.
     block_id: Vec<BlockId>,
+    /// Graph block that currently receives operations for MIR `i`. Starts
+    /// equal to [`Self::block_id`]; a bounds fork moves it to the in-bounds
+    /// tail so later ops and the terminator stay after the guard.
+    emit_block: Vec<BlockId>,
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
@@ -9155,6 +9161,7 @@ impl<'a> Lowering<'a> {
             raw_array,
             item_addr,
             slice_next_iter,
+            emit_block: block_id.clone(),
             block_id,
             block_live_in,
             block_entry_local_var,
@@ -10460,7 +10467,7 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 if let Some(op) = op {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(result_var),
                         kind: op,
@@ -10499,7 +10506,7 @@ impl<'a> Lowering<'a> {
                         // so `value_var` is bound before the write reads
                         // it.
                         if let Some(op) = op {
-                            let bb_id = self.block_id[mir_bb];
+                            let bb_id = self.emit_bb(mir_bb);
                             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                 result: Some(value_var.clone()),
                                 kind: op,
@@ -10620,7 +10627,7 @@ impl<'a> Lowering<'a> {
             },
         );
         self.alias_dest_to_arg0_inherit(dest_local, base, arg_locals);
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10718,7 +10725,7 @@ impl<'a> Lowering<'a> {
         let Some(alias) = self.interior_field_alias.get(&(local as usize)).cloned() else {
             return Ok(None);
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let base = self.interior_header_base(bb_id, &alias)?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
         let item_ty = adt_field_read_value_type(
@@ -11055,7 +11062,7 @@ impl<'a> Lowering<'a> {
         if let Some((owner, flat_name, owner_id)) = self.flatten_list_storage_field(&inner, &elem) {
             let list_place = peel_nested_storage_place(inner);
             let base = self.resolve_place(mir_bb, list_place)?;
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
@@ -11130,7 +11137,7 @@ impl<'a> Lowering<'a> {
         // the base type; capture the type before `inner` is consumed.
         let field_base_ty = clone_tyref(&inner.ty);
         let base = self.resolve_place(mir_bb, inner)?;
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let op = match &elem {
             ProjectionElem::Atom(s) if s == "Deref" => {
                 if let Some(alias) = inner_local
@@ -11739,7 +11746,7 @@ impl<'a> Lowering<'a> {
         base: Variable,
         root: &str,
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let loaded = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -11761,7 +11768,7 @@ impl<'a> Lowering<'a> {
     /// GC reference, so the caller writes the local into the cell and passes
     /// the cell.
     fn emit_gc_mut_ref_cell(&mut self, mir_bb: usize, root: &str, value: Variable) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let cell = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12272,7 +12279,7 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: raw scalar spill address would escape through the call result"
             )));
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let mut reloads = Vec::new();
         let mut replacements = Vec::new();
         for group in groups {
@@ -13020,7 +13027,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn emit_raw_scalar_word_load(&mut self, mir_bb: usize, reload: &RawScalarReload) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let offset = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -13088,7 +13095,7 @@ impl<'a> Lowering<'a> {
                     }
                 }
             }
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::RawFree {
@@ -13443,7 +13450,7 @@ impl<'a> Lowering<'a> {
                             "lt" | "le" | "gt" | "ge" | "mod" | "floordiv" | "div"
                         ) && (lhs_raw_addr || rhs_raw_addr))
                     {
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         let lhs_v = if matches!(lhs_kind, Some(ValueType::Ref(_))) || lhs_raw_addr {
                             let orig = lhs_v.clone();
                             let v = push_cast_ptr_to_int(&mut self.graph, bb_id, lhs_v);
@@ -13487,7 +13494,7 @@ impl<'a> Lowering<'a> {
                     // `is_(a, b) == False`, the shape `Option::is_some`
                     // lowers to.
                     if op_label == "ne" {
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         let is_res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -13631,7 +13638,7 @@ impl<'a> Lowering<'a> {
                         && let Some(IntToIntCast::And(mask)) =
                             int_to_int_cast(src, dst, crate::layout::target_word_size() as u64)
                     {
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         // `and_(r_uint, r_uint)` keeps the Unsigned
                         // annotation the destination has; a signed operand
                         // is retyped first through the same `r_uint` marker
@@ -13864,7 +13871,7 @@ impl<'a> Lowering<'a> {
                     if matches!(src_kind, Some(ValueType::Ref(_)))
                         && matches!(dst_kind, ValueType::Unsigned)
                     {
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         let orig = arg.clone();
                         let (retype, result) =
                             push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
@@ -13971,7 +13978,7 @@ impl<'a> Lowering<'a> {
                     let false_var = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(false_var.clone()),
                         kind: OpKind::ConstBool(false),
@@ -14050,7 +14057,7 @@ impl<'a> Lowering<'a> {
                 // (`CodeFlags`) borrow is the word, not an address.
                 let projection = self.place_borrow_takes_address(&place)
                     && !tyref_is_string_builder(&place.ty, self.llbc);
-                let before = self.graph.block(self.block_id[mir_bb]).operations.len();
+                let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
@@ -14070,7 +14077,7 @@ impl<'a> Lowering<'a> {
                     return Ok((None, address));
                 }
                 let projection = self.place_borrow_takes_address(&place);
-                let before = self.graph.block(self.block_id[mir_bb]).operations.len();
+                let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
@@ -14411,7 +14418,7 @@ impl<'a> Lowering<'a> {
                                 "bb{mir_bb}: pair slice item of an array aggregate"
                             )));
                         }
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         // A host `0` stored into a GCREF virtualizable field is
                         // `ConstPtr(NULL)`, not an int (`coerce_gcref_null_store`).
                         for (i, arg) in arg_vars.iter_mut().enumerate() {
@@ -14680,7 +14687,7 @@ impl<'a> Lowering<'a> {
                     let false_var = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(is_none.clone()),
                         kind: OpKind::BinOp {
@@ -14714,7 +14721,7 @@ impl<'a> Lowering<'a> {
                 // the nullable-pointer Option above (`Some` = scalar != niche).
                 if let Some(niche) = tyref_option_fieldless_niche(&place.ty, self.llbc) {
                     let base = self.resolve_place(mir_bb, place)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let none = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15272,7 +15279,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
     ) -> Result<Option<(Variable, Variable)>, LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let ptr = self.resolve_place_as(mir_bb, place.clone(), true)?;
         let block = self.graph.block_mut(bb_id);
         let Some(SpaceOperation {
@@ -15335,7 +15342,7 @@ impl<'a> Lowering<'a> {
         // that ListDef (`Bookkeeper.newlist`). The helper's stub body
         // returns `null_mut`, which would otherwise bind
         // `SomeInstance(classdef=None)` and fail `union` with List.
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let dest_ty = {
             let local = self.body.locals.locals.get(dest_local).ok_or_else(|| {
                 LowerError::Unsupported(format!(
@@ -15426,7 +15433,7 @@ impl<'a> Lowering<'a> {
         args: Vec<Variable>,
         result_ty: ValueType,
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let result = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15485,7 +15492,7 @@ impl<'a> Lowering<'a> {
 
     /// `__cast_instance_intrinsic(value, root)` in the current block.
     fn cast_ref_word(&mut self, mir_bb: usize, value: Variable, root: &str) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let cast = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15509,7 +15516,7 @@ impl<'a> Lowering<'a> {
         block: Variable,
         offset_path: &[&str],
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let header = push_cast_ptr_to_int(&mut self.graph, bb_id, block);
         let offset_path: Vec<String> = offset_path.iter().map(|s| s.to_string()).collect();
         let offset_op =
@@ -15606,7 +15613,7 @@ impl<'a> Lowering<'a> {
 
     /// A `ConstUInt(value)` in `mir_bb`.
     fn emit_const_uint(&mut self, mir_bb: usize, value: u64) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15625,7 +15632,7 @@ impl<'a> Lowering<'a> {
         lhs: Variable,
         rhs: Variable,
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15679,7 +15686,7 @@ impl<'a> Lowering<'a> {
 
     /// `len - offset`, the index a `from_end` projection names.
     fn emit_index_from_end(&mut self, mir_bb: usize, len: Variable, offset: Variable) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let index = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15695,18 +15702,24 @@ impl<'a> Lowering<'a> {
         index
     }
 
+    /// Graph block that currently receives operations for `mir_bb`.
+    fn emit_bb(&self, mir_bb: usize) -> BlockId {
+        self.emit_block[mir_bb]
+    }
+
     /// Split the current block on `cond`. The true arm is in bounds and
-    /// becomes `block_id[mir_bb]`; the false arm calls
-    /// `ll_slice_bounds_panic` and raises. Locals defined in the head, and
-    /// every `carry` word, are forwarded onto the true arm. Returns `carry`
-    /// as those forwarded copies.
+    /// becomes the emit cursor for `mir_bb`; the false arm calls
+    /// `ll_slice_bounds_panic` and raises. Incoming edges still target
+    /// [`Self::block_id`]. Locals defined in the head, and every `carry`
+    /// word, are forwarded onto the true arm. Returns `carry` as those
+    /// forwarded copies.
     fn fork_in_bounds(
         &mut self,
         mir_bb: usize,
         cond: Variable,
         carry: &[Variable],
     ) -> Result<Vec<Variable>, LowerError> {
-        let head = self.block_id[mir_bb];
+        let head = self.emit_bb(mir_bb);
         for word in carry {
             if !self.graph.variable_defined_in_block(head, word) {
                 return Err(LowerError::Unsupported(format!(
@@ -15763,7 +15776,7 @@ impl<'a> Lowering<'a> {
         self.graph.set_raise_implicit(fail, "IndexError");
         self.graph
             .set_branch(head, cond, tail, forwarded, fail, Vec::new());
-        self.block_id[mir_bb] = tail;
+        self.emit_block[mir_bb] = tail;
         Ok(carry
             .iter()
             .map(|word| {
@@ -16183,7 +16196,7 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                let bb_id = self.block_id[mir_bb];
+                let bb_id = self.emit_bb(mir_bb);
                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                     result: Some(res.clone()),
                     kind: OpKind::BinOp {
@@ -16202,7 +16215,7 @@ impl<'a> Lowering<'a> {
         } else {
             LocalValue::One(result)
         });
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16293,7 +16306,7 @@ impl<'a> Lowering<'a> {
             .get(local as usize)
             .and_then(|slot| slot.as_ref())
             .and_then(|value| value.one().ok())?;
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let (retype, ptr) = push_ptr_to_unsigned_cast(&mut self.graph, bb_id, ptr);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(ptr.clone()),
@@ -16508,7 +16521,7 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: slice iterator from {name}"
                 )));
             }
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             let stop = self.retype_word(mir_bb, len.clone(), &ValueType::Unsigned, &ValueType::Int);
             let start = self
                 .graph
@@ -16686,7 +16699,7 @@ impl<'a> Lowering<'a> {
                     let ptr = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(ptr.clone()),
                         kind: OpKind::Call {
@@ -16714,7 +16727,7 @@ impl<'a> Lowering<'a> {
             let result = match name.as_str() {
                 "core::slice::<Impl>::len" => len,
                 "core::slice::<Impl>::is_empty" => {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let zero = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -16866,7 +16879,7 @@ impl<'a> Lowering<'a> {
                             let index = self
                                 .graph
                                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            let bb_id = self.block_id[mir_bb];
+                            let bb_id = self.emit_bb(mir_bb);
                             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                 result: Some(index.clone()),
                                 kind: OpKind::BinOp {
@@ -16904,7 +16917,7 @@ impl<'a> Lowering<'a> {
                 self.local_var[dest_local] = Some(LocalValue::One(result));
             }
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17129,7 +17142,7 @@ impl<'a> Lowering<'a> {
         let ptr = self.emit_uint_select(mir_bb, is_some.clone(), opt_ptr, def_ptr);
         let len = self.emit_uint_select(mir_bb, is_some, opt_len, def_len);
         self.bind_pair_local(dest_local, ptr, len);
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17260,7 +17273,7 @@ impl<'a> Lowering<'a> {
     /// `SomeString` Variable.  The builder Ref was minted at the ctor and
     /// mutated in place by the appends, so it is read (not rebound) here.
     fn resolve_builder_build(&mut self, mir_bb: usize, c: usize) -> Result<Variable, LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let builder = self.local_var[c]
             .as_ref()
             .ok_or_else(|| {
@@ -17787,7 +17800,7 @@ impl<'a> Lowering<'a> {
             let var = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: op,
@@ -17861,7 +17874,7 @@ impl<'a> Lowering<'a> {
         let var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(var.clone()),
             kind: op,
@@ -18437,7 +18450,7 @@ impl<'a> Lowering<'a> {
         };
         let base = self.resolve_place(mir_bb, clone_place(inner))?;
         if offset != 0 {
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Abort {
@@ -18523,7 +18536,7 @@ impl<'a> Lowering<'a> {
         if !projection {
             return;
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let block = self.graph.block_mut(bb_id);
         if block.operations.len() <= before {
             return;
@@ -18811,7 +18824,7 @@ impl<'a> Lowering<'a> {
                             // or the handle and the object merge.
                             return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                         }
-                        return Ok(self.emit_unit(self.block_id[mir_bb]));
+                        return Ok(self.emit_unit(self.emit_bb(mir_bb)));
                     }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
@@ -18885,7 +18898,7 @@ impl<'a> Lowering<'a> {
                         || self.tyref_is_fieldless_enum(&inner.ty)
                         || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
                     {
-                        return Ok(self.emit_unit(self.block_id[mir_bb]));
+                        return Ok(self.emit_unit(self.emit_bb(mir_bb)));
                     }
                     // Narrow a classdef-less raw-pointer-deref base to
                     // `SomeInstance(<pointee root>)` before the field read.
@@ -19016,7 +19029,7 @@ impl<'a> Lowering<'a> {
                     let owner_declared_gc =
                         container_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
                     let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
                         let narrowed = self
                             .graph
@@ -19175,7 +19188,7 @@ impl<'a> Lowering<'a> {
                         );
                     }
                     let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19272,7 +19285,7 @@ impl<'a> Lowering<'a> {
                             ))
                         })?
                         .one()?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     // Element type, not `Ref(None)`: `place_ty` is the
                     // post-projection type, the same source the genuine-Ref
                     // tuple read below uses.  A `(FieldlessEnum, bool)`
@@ -19389,7 +19402,7 @@ impl<'a> Lowering<'a> {
                             PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
                         );
                         let base = self.resolve_place(mir_bb, *inner)?;
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         let base = if base_is_deref {
                             let narrowed = self
                                 .graph
@@ -19535,7 +19548,7 @@ impl<'a> Lowering<'a> {
                     && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
                 {
                     let ptr = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let base = self
                         .narrow_value_to_instance_root(bb_id, ptr.into(), &array_type_id)
                         .as_variable()
@@ -19574,7 +19587,7 @@ impl<'a> Lowering<'a> {
                     && base_traces_to_items_block_accessor(self.body, local, self.llbc)
                 {
                     let ptr = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let index = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19607,7 +19620,7 @@ impl<'a> Lowering<'a> {
                     // `len_offset` through the same component read `Box<[T]>`
                     // uses for `.len()`.
                     let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     if let Some(meta) =
                         self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatLen)
                     {
@@ -19626,7 +19639,7 @@ impl<'a> Lowering<'a> {
                         self.raw_word_descr(&place_ty)
                 {
                     let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let offset = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19659,7 +19672,7 @@ impl<'a> Lowering<'a> {
                     // the scalar, so the load is that layout word.
                     let base_is_deref = inner.is_deref_projection();
                     let base = self.resolve_place(mir_bb, *inner)?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19706,7 +19719,7 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: const_op,
@@ -19752,7 +19765,7 @@ impl<'a> Lowering<'a> {
                         .as_deref()
                         == Some("PyObject")
                 {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let raw = self.graph.push_null_mut_ptr(bb_id);
                     let res = self
                         .graph
@@ -19807,7 +19820,7 @@ impl<'a> Lowering<'a> {
                     && let Some(root) =
                         tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
                 {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let raw = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19833,7 +19846,7 @@ impl<'a> Lowering<'a> {
                 if let Some(root) = self.refs_static_struct_root(&place_ty)
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let raw = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19864,7 +19877,7 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ConstRefAddr(JITDRIVER_NAMEDCONST_SENTINEL_ADDR),
@@ -19913,7 +19926,7 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                let bb_id = self.block_id[mir_bb];
+                let bb_id = self.emit_bb(mir_bb);
                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                     result: Some(res.clone()),
                     kind: op,
@@ -20561,7 +20574,7 @@ impl<'a> Lowering<'a> {
         let mut segments: Vec<String> = class_root.split("::").map(str::to_string).collect();
         segments.pop();
         segments.push(ROOT_SCOPE_CLOSE.to_string());
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let void = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Void);
@@ -21554,7 +21567,7 @@ impl<'a> Lowering<'a> {
     // Terminators
 
     fn lower_terminator(&mut self, mir_bb: usize, term: TermKind) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         match term {
             TermKind::Return => {
                 // A `-> ()` body materializes its implicit return as a
@@ -21809,7 +21822,7 @@ impl<'a> Lowering<'a> {
             return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
         }
         if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
-            return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
+            return Ok(self.lower_rust_vec_drop(self.emit_bb(mir_bb), place));
         }
         if glue.is_none() && self.tyref_is_trivially_dropless(&place.ty, 0) {
             return Ok(true);
@@ -21889,7 +21902,7 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: guard Drop over a projection place ({release:?})"
             )));
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         if let Some(arg) = self.local_var[local as usize]
             .as_ref()
             .and_then(|value| value.one().ok())
@@ -22097,7 +22110,7 @@ impl<'a> Lowering<'a> {
             _ => return Ok(false),
         };
         self.local_var[dest_local] = bound.map(LocalValue::One);
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -22143,7 +22156,7 @@ impl<'a> Lowering<'a> {
             })?
             .one()?;
         self.local_var[dest_local] = Some(LocalValue::One(value));
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -22162,7 +22175,7 @@ impl<'a> Lowering<'a> {
         let Some(op) = owner_root_guard::classify(call, self.llbc) else {
             return Ok(false);
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         match op {
             owner_root_guard::Op::New | owner_root_guard::Op::Get => {
                 let source = operand_local(call.args.first()).ok_or_else(|| {
@@ -22387,7 +22400,7 @@ impl<'a> Lowering<'a> {
         target: usize,
         on_unwind: usize,
     ) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let callee_pin_gcref_arg = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
                 .as_deref()
@@ -26938,7 +26951,7 @@ impl<'a> Lowering<'a> {
                 };
                 if let Some(value) = alias {
                     self.local_var[dest_local] = Some(LocalValue::One(value));
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -27032,7 +27045,7 @@ impl<'a> Lowering<'a> {
                                     let narrowed = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
                                     );
-                                    let bb_id = self.block_id[mir_bb];
+                                    let bb_id = self.emit_bb(mir_bb);
                                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                         result: Some(narrowed.clone()),
                                         kind: crate::model::cast_instance_call(root, recv),
@@ -27060,7 +27073,7 @@ impl<'a> Lowering<'a> {
                         let cast = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(cast.clone()),
                             kind: OpKind::UnaryOp {
@@ -30253,7 +30266,7 @@ impl<'a> Lowering<'a> {
                     self.write_mem_slot(mir_bb, slot0, old1)?;
                     self.write_mem_slot(mir_bb, slot1, old0)?;
                 }
-                let bb_id = self.block_id[mir_bb];
+                let bb_id = self.emit_bb(mir_bb);
                 self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
             }
             Some("take") if args.len() == 1 => {
@@ -30276,7 +30289,7 @@ impl<'a> Lowering<'a> {
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
                     );
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let fresh = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -30305,7 +30318,7 @@ impl<'a> Lowering<'a> {
             }
             _ => return Ok(false),
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -30498,7 +30511,7 @@ impl<'a> Lowering<'a> {
         {
             let base = self.defined_local(mir_bb, cell)?;
             let old = self.emit_gc_mut_ref_field_read(mir_bb, base.clone(), &root);
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::FieldWrite {
@@ -30517,7 +30530,7 @@ impl<'a> Lowering<'a> {
             return Ok(None);
         };
         let base = self.resolve_place(mir_bb, (**inner).clone())?;
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let offset = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -30649,13 +30662,13 @@ impl<'a> Lowering<'a> {
             .spans
             .first()
             .expect("enum move plan carries __discriminant");
-        let head = self.block_id[mir_bb];
+        let head = self.emit_bb(mir_bb);
         let tag = self.emit_span_read(mir_bb, src, discr);
         let join = self.graph.create_block();
         let mut links = Vec::with_capacity(plan.arms.len());
         for arm in &plan.arms {
             let arm_bb = self.graph.create_block();
-            self.block_id[mir_bb] = arm_bb;
+            self.emit_block[mir_bb] = arm_bb;
             for span in &arm.spans {
                 let part = self.emit_span_read(mir_bb, src, span);
                 self.emit_span_write(mir_bb, slot, span, part);
@@ -30675,7 +30688,7 @@ impl<'a> Lowering<'a> {
         }
         self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
         self.graph.closeblock(head, links);
-        self.block_id[mir_bb] = join;
+        self.emit_block[mir_bb] = join;
         Ok(())
     }
 
@@ -30716,7 +30729,7 @@ impl<'a> Lowering<'a> {
             .spans
             .first()
             .expect("enum move plan carries __discriminant");
-        let head = self.block_id[mir_bb];
+        let head = self.emit_bb(mir_bb);
         let slot = self.deref_base(mir_bb, place, address)?;
         let tag = self.emit_span_read(mir_bb, &slot, discr);
         let (join, vars) = self.graph.create_block_with_arg_vars(1);
@@ -30724,7 +30737,7 @@ impl<'a> Lowering<'a> {
         let mut links = Vec::with_capacity(plan.arms.len());
         for arm in &plan.arms {
             let arm_bb = self.graph.create_block();
-            self.block_id[mir_bb] = arm_bb;
+            self.emit_block[mir_bb] = arm_bb;
             let mut parts = Vec::with_capacity(1 + arm.spans.len());
             parts.push(tag.clone());
             for span in &arm.spans {
@@ -30753,7 +30766,7 @@ impl<'a> Lowering<'a> {
         }
         self.graph.block_mut(head).exitswitch = Some(ExitSwitch::Value(tag));
         self.graph.closeblock(head, links);
-        self.block_id[mir_bb] = join;
+        self.emit_block[mir_bb] = join;
         Ok(Some(phi))
     }
 
@@ -30958,7 +30971,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn emit_span_read(&mut self, mir_bb: usize, base: &Variable, span: &MoveSpan) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let result = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -30989,7 +31002,7 @@ impl<'a> Lowering<'a> {
         span: &MoveSpan,
         value: Variable,
     ) {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let SpanKind::Field {
             name,
             owner,
@@ -31028,7 +31041,7 @@ impl<'a> Lowering<'a> {
             self.gc_struct_ids,
             16,
         );
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         for (leaf, leaf_ty) in leaves {
             let read = self.graph.alloc_value_var();
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -31061,7 +31074,7 @@ impl<'a> Lowering<'a> {
         plan: &MovePlan,
         parts: &[Variable],
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let td = self
             .llbc
             .type_by_id(plan.ctor_id)
@@ -31197,7 +31210,7 @@ impl<'a> Lowering<'a> {
             ),
             MemSlot::Index(local) => self.index_elem_alias.get(local)?.item_ty.clone(),
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let kind = match vt {
             ValueType::Int => OpKind::ConstInt(0),
             ValueType::Unsigned => OpKind::ConstUInt(0),
@@ -33210,7 +33223,7 @@ impl<'a> Lowering<'a> {
         operand: crate::flowspace::model::Variable,
         to_float: bool,
     ) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let (op, result_ty) = if to_float {
             ("convert_longlong_bytes_to_float", ValueType::Float)
         } else {
@@ -33245,7 +33258,7 @@ impl<'a> Lowering<'a> {
         op: &str,
         result_ty: ValueType,
     ) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let concretetype = if op == "cast_int_to_ptr" {
             crate::model::ConcreteType::GcRef
         } else {
@@ -33290,7 +33303,7 @@ impl<'a> Lowering<'a> {
         operand: crate::flowspace::model::Variable,
         to_float: bool,
     ) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let (leaf, result_ty) = if to_float {
             ("longlong2float", ValueType::Float)
         } else {
@@ -36532,7 +36545,7 @@ impl<'a> Lowering<'a> {
     /// `Aggregate` `None` construction fold so every niche-Option null shares
     /// one repr-adaptive source.
     fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         // `Option<fn>` is a null function pointer (`SomePtr(FuncType)`),
         // not a nullable GC instance. `null_mut()` annotates as
         // classdef-less `SomeInstance` and then cannot union with the
@@ -36640,7 +36653,7 @@ impl<'a> Lowering<'a> {
             self.resolve_place(mir_bb, place)?
         };
         let rhs = rhs.clone();
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = match leaf {
             "contains" => {
                 let masked = self.emit_uint_binop(mir_bb, "bitand", lhs, rhs.clone());
@@ -36721,7 +36734,7 @@ impl<'a> Lowering<'a> {
         if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
             return Ok(false);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -36807,7 +36820,7 @@ impl<'a> Lowering<'a> {
         } else {
             "eq".to_string()
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -36958,7 +36971,7 @@ impl<'a> Lowering<'a> {
         if signed_only && !signed_word {
             return Ok(false);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let result_ty = if unsigned_receiver {
             ValueType::Unsigned
         } else {
@@ -37099,7 +37112,7 @@ impl<'a> Lowering<'a> {
         let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty) else {
             return Ok(false);
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let offset = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -37170,7 +37183,7 @@ impl<'a> Lowering<'a> {
         if !signed_word && !unsigned_word {
             return Ok(false);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -37268,7 +37281,7 @@ impl<'a> Lowering<'a> {
         };
         let count = (raw_count & 63) as i64;
         let complement = (64 - count) & 63;
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -37386,7 +37399,7 @@ impl<'a> Lowering<'a> {
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
         let arg = arg.clone();
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
 
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -37607,7 +37620,7 @@ impl<'a> Lowering<'a> {
             td.item_meta.name_path(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
 
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -37739,7 +37752,7 @@ impl<'a> Lowering<'a> {
             td.item_meta.name_path(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -37887,7 +37900,7 @@ impl<'a> Lowering<'a> {
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
         let tuple_owner = format!("Tuple{suffix}");
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -38033,7 +38046,7 @@ impl<'a> Lowering<'a> {
         );
         let arg = arg.clone();
         if src_is_signed_word {
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
                 let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -38088,7 +38101,7 @@ impl<'a> Lowering<'a> {
             // so the constant tag can't be recorded and consumers
             // can't be folded — materialize the aggregate so field
             // reads on the local stay type-consistent.
-            let bb_id = self.block_id[mir_bb];
+            let bb_id = self.emit_bb(mir_bb);
             let disc = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -38120,7 +38133,7 @@ impl<'a> Lowering<'a> {
         // (`expect_on_const_ok`) without touching the variable.
         self.const_discriminant_locals.insert(dest_local, 0);
         self.local_var[dest_local] = Some(LocalValue::One(arg));
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -38196,7 +38209,7 @@ impl<'a> Lowering<'a> {
             td.item_meta.name_path(),
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -38334,7 +38347,7 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         }
         let arg = arg.clone();
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         if src_is_bool && dest_unsigned_word {
             let res = self
                 .graph
@@ -38796,7 +38809,7 @@ impl<'a> Lowering<'a> {
         arg: Variable,
     ) -> Option<(Option<OpKind>, Variable)> {
         let action = int_cast_action(src.0, src.1, dst.0, dst.1)?;
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         Some(match action {
             IntCastAction::Alias => (None, arg),
             IntCastAction::RUint => {
@@ -39029,7 +39042,7 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
         target: usize,
     ) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let operation_index = self.graph.block(bb_id).operations.len();
         let mut owner_path = crate::model::split_qualified_path(owner);
         let ctor_name = owner_path.pop().unwrap_or_default();
@@ -39108,7 +39121,7 @@ impl<'a> Lowering<'a> {
         discr: Operand,
         targets: SwitchTargets,
     ) -> Result<(), LowerError> {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let discr_var = self.resolve_operand(mir_bb, discr)?;
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
@@ -42072,11 +42085,13 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
             },
             _ => continue,
         };
-        // A later block's Drop reads the guard word to emit the release.
-        // An unmarked guard is absent there, and the release is skipped.
+        // A later block's Drop reads the guard or Vec header word to emit
+        // the release or glue call. An unmarked word is absent there, and
+        // the destructor is skipped.
         let lowers = drop_place_is_frame_anchor(place, body, llbc)
             || drop_place_is_list_guard(place, llbc)
             || drop_place_is_set_guard(place, llbc)
+            || tyref_rust_vec_item_kind(&place.ty, llbc).is_some()
             || match glue {
                 Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
                 None => place_ty_is_root_scope(place, llbc),
