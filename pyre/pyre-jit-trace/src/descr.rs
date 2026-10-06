@@ -6,6 +6,7 @@
 //! `FieldDescr` trait for pyre's `#[repr(C)]` object layout.
 
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Weak;
@@ -916,23 +917,22 @@ fn field_display_name(simple_name: &str, field_key: &str) -> String {
     }
 }
 
-/// Same display name as [`field_display_name`], kept as the caller's
-/// `&'static` key when that key is already `STRUCT._name + '.' + fieldname`.
-/// `descr.py` `get_field_descr` stores that string. Only a missing prefix
-/// allocates, and the result is leaked for the process like the keyed mint.
-fn borrowed_field_display_name(simple_name: &str, field_key: &'static str) -> &'static str {
+/// Same display name as [`field_display_name`]. A key that already carries
+/// `STRUCT._name + '.' + fieldname` is borrowed; a missing prefix is owned
+/// on the descr (`descr.py` `get_field_descr` stores that string).
+fn borrowed_field_display_name(simple_name: &str, field_key: &'static str) -> Cow<'static, str> {
     let already_qualified = !simple_name.is_empty()
         && field_key.len() > simple_name.len()
         && field_key.as_bytes()[simple_name.len()] == b'.'
         && field_key.starts_with(simple_name);
     if simple_name.is_empty() || already_qualified {
-        field_key
+        Cow::Borrowed(field_key)
     } else {
         let mut name = String::with_capacity(simple_name.len() + 1 + field_key.len());
         name.push_str(simple_name);
         name.push('.');
         name.push_str(field_key);
-        Box::leak(name.into_boxed_str())
+        Cow::Owned(name)
     }
 }
 
@@ -11265,7 +11265,7 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
         .into_iter()
         .map(|field| majit_ir::descr::BorrowedField {
             index: field.index,
-            name: field.name,
+            name: Cow::Borrowed(field.name),
             field_key: field.field_key,
             offset: field.offset,
             field_size: field.field_size,
@@ -11277,7 +11277,7 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
             is_class_word: field.is_class_word,
         })
         .collect();
-    let _group = majit_ir::descr::publish_borrowed_struct_layout_without_field_names(
+    let _group = majit_ir::descr::publish_borrowed_struct_layout(
         u32::MAX,
         layout.size,
         layout.type_id as u32,

@@ -3161,7 +3161,7 @@ mod tests {
             &[],
             vec![majit_ir::descr::BorrowedField {
                 index: 0,
-                name: "Parentless.slot",
+                name: std::borrow::Cow::Borrowed("Parentless.slot"),
                 field_key: "slot",
                 offset: 16,
                 field_size: 8,
