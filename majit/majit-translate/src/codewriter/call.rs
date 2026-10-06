@@ -5789,20 +5789,25 @@ impl CallControl {
     /// argument in that case instead of being written on the callee.
     /// `seeded_inputs` are that callee's formals the flagged actuals
     /// bind to, so a later `hint_fresh_virtualizable` inside the body
-    /// still forwards the flag.
-    fn note_access_directly_callee(&mut self, path: &CallPath, seeded_inputs: &[u64]) {
+    /// still forwards the flag. Returns whether the seed set grew, so
+    /// BFS can scan an already-candidate graph again the way RPython
+    /// discovers the `AccessDirect` specialized graph.
+    fn note_access_directly_callee(&mut self, path: &CallPath, seeded_inputs: &[u64]) -> bool {
         let Some(graph) = self.function_graphs.get_mut(path) else {
-            return;
+            return false;
         };
         if graph.func.jit_look_inside == Some(false) {
-            return;
+            return false;
         }
+        let mut changed = !graph.access_directly;
         graph.access_directly = true;
         for &id in seeded_inputs {
             if !graph.access_directly_inputs.contains(&id) {
                 graph.access_directly_inputs.push(id);
+                changed = true;
             }
         }
+        changed
     }
 
     /// Formals of `callee` whose actual is in `hinted`.
@@ -6167,10 +6172,6 @@ impl CallControl {
                         _ => continue,
                     };
                     for callee_path in callees {
-                        // `call.py:81-82` — already discovered.
-                        if self.candidate_graphs.contains(&callee_path) {
-                            continue;
-                        }
                         // A target with no registered graph is upstream's
                         // `funcobj.graph is None` → residual (call.py:127).
                         //
@@ -6194,23 +6195,35 @@ impl CallControl {
                             }
                         };
                         // `default_specialize` writes `access_directly` on
-                        // the callee before `look_inside_graph`. `get`
-                        // clones the `Rc`, so drop it and re-read after
-                        // the write (`make_mut` would otherwise copy).
-                        let graph_ref = if passes_access_directly {
+                        // the callee before `look_inside_graph`. RPython's
+                        // `AccessDirect` cache key is a different graph, so
+                        // the already-candidate continue in `find_all_graphs`
+                        // does not skip that later call. One codewriter
+                        // graph records the later seed and is scanned
+                        // again when the set grew. `get` clones the `Rc`,
+                        // so drop it and re-read after the write
+                        // (`make_mut` would otherwise copy).
+                        let already_candidate = self.candidate_graphs.contains(&callee_path);
+                        if passes_access_directly {
                             let seeded = Self::access_directly_input_ids(
                                 &op.kind,
                                 &access_directly_vars,
                                 &graph_ref,
                             );
                             drop(graph_ref);
-                            self.note_access_directly_callee(&callee_path, &seeded);
-                            match self.function_graphs.get(&callee_path) {
-                                Some(g) => g,
-                                None => continue,
+                            let grew = self.note_access_directly_callee(&callee_path, &seeded);
+                            if already_candidate {
+                                if grew {
+                                    todo.push(callee_path);
+                                }
+                                continue;
                             }
-                        } else {
-                            graph_ref
+                        } else if already_candidate {
+                            continue;
+                        }
+                        let graph_ref = match self.function_graphs.get(&callee_path) {
+                            Some(g) => g,
+                            None => continue,
                         };
                         // RPython call.py:84,87: callee must satisfy
                         // policy.look_inside_graph(graph).
@@ -11806,7 +11819,11 @@ mod tests {
     /// forwards that formal (or `hint_fresh_virtualizable` of it) to a
     /// loopy callee. `default_specialize` keeps the flag on the formal,
     /// so the callee is stamped.
-    fn drive_parameter_access_directly(forward_fresh: bool) {
+    ///
+    /// `unflagged_first` is an earlier call that discovers the ordinary
+    /// graph. RPython still builds a separate `AccessDirect` graph for
+    /// the flagged call (`specialize.py default_specialize`).
+    fn drive_parameter_access_directly(forward_fresh: bool, unflagged_first: bool) {
         let mut cc = CallControl::new();
         let inner_path = CallPath::from_segments(["inner"]);
         cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
@@ -11843,6 +11860,17 @@ mod tests {
         let caller_path = CallPath::from_segments(["caller"]);
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
+        if unflagged_first {
+            let plain = caller.alloc_value_var();
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                    args: crate::model::call_args([plain]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        }
         let frame = caller.alloc_value_var();
         let hinted = caller.alloc_value_var();
         caller.block_mut(entry).operations.push(SpaceOperation {
@@ -11870,13 +11898,25 @@ mod tests {
     #[test]
     #[should_panic(expected = "access_directly on a function which we don't see")]
     fn parameter_keeps_access_directly_onto_a_loopy_callee() {
-        drive_parameter_access_directly(false);
+        drive_parameter_access_directly(false, false);
     }
 
     #[test]
     #[should_panic(expected = "access_directly on a function which we don't see")]
     fn fresh_virtualizable_of_a_parameter_keeps_access_directly() {
-        drive_parameter_access_directly(true);
+        drive_parameter_access_directly(true, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn unflagged_then_flagged_call_seeds_the_formal() {
+        drive_parameter_access_directly(false, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn unflagged_then_flagged_fresh_virtualizable_seeds_the_formal() {
+        drive_parameter_access_directly(true, true);
     }
 
     /// A formal that did not arrive flagged does not invent the flag
