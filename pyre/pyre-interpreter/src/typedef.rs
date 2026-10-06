@@ -12423,7 +12423,7 @@ pub(crate) fn getset_property_get(
     // decide.  Anything else — a getter carrying a receiver owner, a bound
     // signature, another arity — keeps the dispatcher.
     let result = match unsafe { crate::gateway::builtin_fixed_arity_fn(fget, 2) } {
-        Some(func) => call_getset_fget_direct(func, w_self, w_obj),
+        Some(func) => call_getset_fget_direct(func, w_self, w_obj, pyre_object::PY_NULL),
         None => {
             pyre_object::with_roots!(reqcls, w_obj, w_self => crate::call::call_function_impl_result(fget, &[w_self, w_obj]))
         }
@@ -12437,12 +12437,69 @@ pub(crate) fn getset_property_get(
     }
 }
 
-/// Invoke a getset getter's registered function with the two words
-/// `typedef.py` hands it, under the roots `call_builtin_code_positional`
-/// publishes for the same call: the getter may collect, and both words are
-/// live across it.  Pinned one at a time for the reason that function gives —
-/// the batched publish reorders the pending-callee queue around the
-/// `BuiltinCodeFn` indirect call.
+/// `typedef.py GetSetProperty.descr_property_set`'s body, reachable without
+/// the `getset_descriptor.__set__` entry that publishes it below.
+///
+/// Twin of [`getset_property_get`]: upstream `descr_property_set` is the
+/// descriptor's own interp-level method, so it reaches
+/// `self.fset(self, space, w_obj, w_value)` after a single space-level call.
+/// The `__set__` entry is a builtin function object, and a caller that
+/// resolves it through the type MRO pays a second generic call on every
+/// getset write (`C.__name__ = ...`, `f.__name__ = ...`).  Naming the body
+/// lets `baseobjspace::set` run it in place of that lookup, the licence
+/// `get` already uses for the getter.
+pub(crate) fn getset_property_set(
+    mut w_self: PyObjectRef,
+    mut w_obj: PyObjectRef,
+    mut w_value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `getset_set` runs `descr_setcheck` ahead of the missing-setter
+    // refusal, so a receiver that is wrong in both respects reports
+    // itself rather than the setter.
+    unsafe { getset_descr_check(w_self, w_obj) }?;
+    let fset = read_fset(w_self);
+    if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
+        return Err(getset_no_accessor(w_self, "writable"));
+    }
+    let mut reqcls = read_reqcls(w_self);
+    if !reqcls.is_null()
+        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
+    {
+        if e.kind == crate::PyErrorKind::DescrMismatch {
+            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
+        }
+        return Err(e);
+    }
+    // typedef.py calls the setter as `self.fset(self, space, w_obj, w_value)`
+    // — an interp-level call, not `space.call_function`.  Every
+    // `GetSetProperty` registration declares the setter with exactly this
+    // receiver/instance/value triple, so when the callee is the plain
+    // fixed-arity builtin that declaration builds, the dispatcher in
+    // between has nothing left to decide.
+    let result = match unsafe { crate::gateway::builtin_fixed_arity_fn(fset, 3) } {
+        Some(func) => call_getset_fget_direct(func, w_self, w_obj, w_value),
+        None => {
+            pyre_object::with_roots!(reqcls, w_obj, w_self, w_value => {
+                crate::call::call_function_impl_result(fset, &[w_self, w_obj, w_value])
+            })
+        }
+    };
+    match result {
+        Ok(_) => Ok(pyre_object::w_none()),
+        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
+            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Invoke a getset accessor's registered function under the roots
+/// `call_builtin_code_positional` publishes for the same call.  Two words
+/// for a getter (`w_value` is `PY_NULL`); three for a setter.
+///
+/// Pinned one at a time for the reason that function gives — the batched
+/// publish reorders the pending-callee queue around the `BuiltinCodeFn`
+/// indirect call.
 ///
 /// `dont_look_inside` for the same reason `shadow_stack_len` carries it: the
 /// body reads the thread-local root stack, which the tracer cannot type.
@@ -12451,10 +12508,16 @@ fn call_getset_fget_direct(
     func: crate::gateway::BuiltinCodeFn,
     w_self: PyObjectRef,
     w_obj: PyObjectRef,
+    w_value: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[w_self, w_obj]);
-    func(&[roots.get(base), roots.get(base + 1)])
+    if w_value.is_null() {
+        let base = roots.pin_roots(&[w_self, w_obj]);
+        func(&[roots.get(base), roots.get(base + 1)])
+    } else {
+        let base = roots.pin_roots(&[w_self, w_obj, w_value]);
+        func(&[roots.get(base), roots.get(base + 1), roots.get(base + 2)])
+    }
 }
 
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
@@ -12519,36 +12582,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
             "__set__",
             make_builtin_function_with_arity(
                 "__set__",
-                |args| {
-                    let mut w_self = args[0];
-                    let mut w_obj = args[1];
-                    let w_value = args[2];
-                    // `getset_set` runs `descr_setcheck` ahead of the
-                    // missing-setter refusal, so a receiver that is wrong in
-                    // both respects reports itself rather than the setter.
-                    unsafe { getset_descr_check(w_self, w_obj) }?;
-                    let fset = read_fset(w_self);
-                    if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
-                        return Err(getset_no_accessor(w_self, "writable"));
-                    }
-                    let mut reqcls = read_reqcls(w_self);
-                    if !reqcls.is_null()
-                        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
-                    {
-                        if e.kind == crate::PyErrorKind::DescrMismatch {
-                            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
-                        }
-                        return Err(e);
-                    }
-                    match pyre_object::with_roots!(reqcls, w_obj, w_self => crate::call::call_function_impl_result(fset, &[w_self, w_obj, w_value]))
-                    {
-                        Ok(_) => Ok(pyre_object::w_none()),
-                        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
-                            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
-                        }
-                        Err(e) => Err(e),
-                    }
-                },
+                |args| getset_property_set(args[0], args[1], args[2]),
                 3,
             ),
         )
@@ -14200,13 +14234,12 @@ fn init_type_type(ns: PyObjectRef) {
             // WTF-8 view so a lone surrogate does not panic before the
             // checks below run.
             let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
-            // typeobject.py:1055 — reject embedded null characters.
-            for cp in wtf8.code_points() {
-                if cp.to_u32() == 0 {
-                    return Err(crate::PyError::value_error(
-                        "type name must not contain null characters",
-                    ));
-                }
+            // typeobject.py descr_set__name__ `if '\x00' in name` — a byte
+            // search on the utf8/wtf8 payload, not a code-point walk.
+            if wtf8.as_bytes().contains(&0) {
+                return Err(crate::PyError::value_error(
+                    "type name must not contain null characters",
+                ));
             }
             // typeobject.py _check_surrogate.
             pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;

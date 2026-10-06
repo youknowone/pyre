@@ -12558,7 +12558,7 @@ pub unsafe fn type_set_name_would_store(w_type: PyObjectRef, w_value: PyObjectRe
         return false;
     }
     let wtf8 = pyre_object::w_str_get_wtf8(w_value);
-    if wtf8.code_points().any(|cp| cp.to_u32() == 0) {
+    if wtf8.as_bytes().contains(&0) {
         return false;
     }
     pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false).is_ok()
@@ -14116,6 +14116,18 @@ unsafe fn set(
 ) -> Result<bool, crate::PyError> {
     if descr.is_null() {
         return Ok(false);
+    }
+
+    // typedef.py GetSetProperty.descr_property_set reaches
+    // `self.fset(self, space, w_obj, w_value)` as an interp-level call, so a
+    // getset write costs one space-level call there.  The general `__set__`
+    // lookup at the end of this function reaches the same body through the
+    // `getset_descriptor.__set__` entry, which is itself a builtin function
+    // object, and so pays a second one on every `C.__name__ = ...`.  Run the
+    // body in place of the lookup, the licence the `__get__` twin cites.
+    if pyre_object::typedef::is_getset_property(descr) {
+        crate::typedef::getset_property_set(descr, obj, value)?;
+        return Ok(true);
     }
 
     // property: PyPy W_Property.set → call_function(fset, obj, value).
