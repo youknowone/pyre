@@ -493,10 +493,14 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 /// instance map. Must run before any `node_read`/`node_write`/`node_delete`.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject` (the caller guards with
-/// `is_instance`). The instance is an immortal `Box`, so the raw
-/// pointer is stable across this call.
+/// `obj` must be a live mapdict carrier. User-layout instances
+/// (`W_IntObjectUser`, …) are nursery-born (`w_int_subclass_new`).
+/// `type_terminator_or_create` allocates an immortal `Box`
+/// (`new_terminator`), so the carrier address stays put across the call.
 pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
     let mut inst = unsafe { mapdict_carrier(obj) };
     if !inst._get_mapdict_map().is_null() {
         return;
@@ -6659,7 +6663,7 @@ mod tests {
 
             // a class mutation bumps version_tag -> the entry goes stale
             // (mapdict.py `version_tag is self.version_tag`).
-            crate::baseobjspace::mutated(w_cls, None);
+            crate::baseobjspace::mutated_absent(w_cls);
             assert!(!entry.is_valid_for_map(attr, false));
             assert!(!store_entry.is_valid_for_map(attr, true));
         }

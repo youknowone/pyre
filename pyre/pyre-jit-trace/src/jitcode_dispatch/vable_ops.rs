@@ -1318,12 +1318,14 @@ fn folded_store_is_observable_local<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     slot: i64,
 ) -> bool {
-    let state = ctx.frame_state.borrow();
-    let Some(shadow) = state.callee_shadow.as_ref() else {
-        return false;
-    };
-    if !shadow.frame_materialized {
-        return false;
+    {
+        let state = ctx.frame_state.borrow();
+        let Some(shadow) = state.callee_shadow.as_ref() else {
+            return false;
+        };
+        if !shadow.frame_materialized {
+            return false;
+        }
     }
     let Some(nlocals) = active_frame_nlocals(ctx) else {
         return false;
@@ -1439,22 +1441,30 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 matches!(concrete, majit_ir::Value::Ref(_) | majit_ir::Value::Void),
                 "folded locals_cells_stack_w store must carry a Ref-compatible value"
             );
-            if matches!(concrete, majit_ir::Value::Ref(_))
-                && let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref()
-            {
-                if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
-                    fbw_arm_durable_frame_undo(frame);
-                    fbw_note_generator_stack_store(GeneratorStackStore {
-                        frame,
-                        slot: slot as usize,
-                        value,
-                    });
+            if matches!(concrete, majit_ir::Value::Ref(_)) {
+                // Drop the frame-state borrow before the store. `set_ref`
+                // can collect, and the collector walks this state.
+                let concrete_frame = ctx
+                    .frame_state
+                    .borrow()
+                    .callee_shadow
+                    .as_ref()
+                    .map(|shadow| shadow.concrete_frame);
+                if let Some(concrete_frame) = concrete_frame {
+                    if let Some(frame) = durable_resume_frame(ctx, concrete_frame) {
+                        fbw_arm_durable_frame_undo(frame);
+                        fbw_note_generator_stack_store(GeneratorStackStore {
+                            frame,
+                            slot: slot as usize,
+                            value,
+                        });
+                    }
+                    crate::state::store_live_frame_array_slot(
+                        concrete_frame,
+                        slot as usize,
+                        concrete,
+                    );
                 }
-                crate::state::store_live_frame_array_slot(
-                    shadow.concrete_frame,
-                    slot as usize,
-                    concrete,
-                );
             }
             let vable = read_ref_reg_raw(code, op, 0, ctx)?;
             // `_opimpl_setarrayitem_vable` records `SETARRAYITEM_GC` for every

@@ -521,10 +521,7 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             let cls_slot = base + 1;
             pyre_interpreter::type_dict_delete(roots.get(cls_slot), "__abc_tpflags__");
             unsafe {
-                pyre_interpreter::baseobjspace::mutated(
-                    roots.get(cls_slot),
-                    Some("__abc_tpflags__"),
-                )
+                pyre_interpreter::baseobjspace::mutated(roots.get(cls_slot), "__abc_tpflags__")
             };
             let w_flags = roots.get(flags_slot);
             // `PyLong_CheckExact` -- an `int` subclass, `bool` included, is
@@ -599,7 +596,13 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     if unsafe { is_type(cls) } {
         let flag = unsafe { typeobject::w_type_get_flag_map_or_seq(cls) };
         if flag != b'?' {
-            set_collection_flag_recursive(subclass, flag);
+            // Same livevar set as the `issubclass` / `weak_cache_add` arms
+            // above: `interp_abc.py set_collection_flag_recursive` walks
+            // `weak_subclasses`, so `subclass` is re-read from its slot
+            // before the return.
+            pyre_object::with_roots!(subclass => {
+                set_collection_flag_recursive(subclass, flag);
+            });
         }
     }
     Ok(subclass)
@@ -819,8 +822,13 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, pyre_int
                 let rcls =
                     match pyre_interpreter::baseobjspace::next(registry_roots.get(iterator_slot)) {
                         Ok(rcls) => rcls,
-                        Err(err) if err.matches_stop_iteration() => break,
-                        Err(err) => return Err(err),
+                        Err(err) => {
+                            let (stop, err) = err.matches_stop_iteration_keep();
+                            if stop {
+                                break;
+                            }
+                            return Err(err);
+                        }
                     };
                 let item_roots = pyre_object::gc_roots::push_roots();
                 let rcls_slot = item_roots.base();
@@ -852,8 +860,13 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, pyre_int
         loop {
             let scls = match pyre_interpreter::baseobjspace::next(walk_roots.get(iterator_slot)) {
                 Ok(scls) => scls,
-                Err(err) if err.matches_stop_iteration() => break,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let (stop, err) = err.matches_stop_iteration_keep();
+                    if stop {
+                        break;
+                    }
+                    return Err(err);
+                }
             };
             let item_roots = pyre_object::gc_roots::push_roots();
             let scls_slot = item_roots.base();

@@ -90,7 +90,8 @@ fn alloc_raw_utf8_payload(len: usize) -> i64 {
 /// # Safety
 /// `value` must be a live `STR` allocated by [`alloc_utf8_payload`] or
 /// [`crate::lowlevel_string::bh_alloc_lowlevel_string`].
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub unsafe fn utf8_payload_bytes(value: *const UnicodeValueStorage) -> &'static [u8] {
     if value.is_null() {
         return &[];
@@ -638,9 +639,16 @@ pub unsafe fn w_str_cut(recv: PyObjectRef, piece: &Wtf8) -> PyObjectRef {
 /// `STRING_CONSTANT_CACHE`, which is not a GC root; a collectable interned
 /// constant would be swept out from under the cache (use-after-free).  Interned
 /// constants are bounded, so keeping them immortal is the intended split.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
     let byte_len = value.len();
-    let char_len = value.code_points().count();
+    let mut char_len = 0usize;
+    let mut pos = 0usize;
+    while pos < value.len() {
+        pos = crate::rutf8::next_codepoint_pos(&value, pos);
+        char_len += 1;
+    }
     let value = alloc_utf8_payload(value.as_bytes(), false);
     crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
@@ -1335,7 +1343,8 @@ unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Ut
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 unsafe fn w_str_get_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
     unsafe {
         let cached = (*(obj as *const W_UnicodeObject)).index_storage;

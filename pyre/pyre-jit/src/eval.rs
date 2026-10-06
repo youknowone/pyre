@@ -4751,6 +4751,39 @@ fn build_gc() -> Box<MiniMarkGC> {
         "interpreter classes must end where the module classes begin"
     );
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
+    // RPython `Exception` (`HOST_ENV`). Appended after the module classes
+    // so no earlier id moves. `PYERROR_TYPE` (`OperationError`) subclasses
+    // this; Python `space.w_Exception` is a different vtable.
+    {
+        let host_exc_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::PyObject>(),
+            object_tid,
+        ));
+        debug_assert_eq!(
+            host_exc_tid,
+            pyre_interpreter::error::host_exception_gc_type_id()
+        );
+        let host_exc_pytype = &pyre_interpreter::error::HOST_EXCEPTION_TYPE as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, host_exc_pytype, host_exc_tid);
+        pytype_to_tid.insert(host_exc_pytype, host_exc_tid);
+        let pyerror_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            pyre_interpreter::error::PYERROR_OBJECT_SIZE,
+            host_exc_tid,
+            vec![
+                std::mem::offset_of!(pyre_interpreter::error::PyErrorObject, ob_header.w_class),
+                pyre_interpreter::error::PYERROR_W_TYPE_OFFSET,
+                pyre_interpreter::error::PYERROR_MESSAGE_OFFSET,
+                pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
+            ],
+        ));
+        debug_assert_eq!(pyerror_tid, pyre_interpreter::error::pyerror_gc_type_id());
+        pyre_interpreter::error::PYERROR_GC_TYPE_ID_CELL.set(pyerror_tid);
+        let pytype = &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype, pyerror_tid);
+        pytype_to_tid.insert(pytype, pyerror_tid);
+    }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
     // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
@@ -4999,9 +5032,9 @@ fn build_gc() -> Box<MiniMarkGC> {
 
     // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
     // for synthetic struct tids during translation. pyre stamps them from
-    // `publish_kind0_descrs_before_trace` via `materialize_gccache_owned_descrs`,
-    // once this collector is installed. They are not registered in this
-    // function: it runs before `gc_sync` publishes the collector.
+    // `init_gc_subsystem` via `materialize_gccache_owned_descrs`, once this
+    // collector is installed. They are not registered in this function: it
+    // runs before `gc_sync` publishes the collector.
 
     // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
@@ -8476,7 +8509,8 @@ fn drain_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyError
     let err = unsafe {
         pyre_interpreter::error::PyError::from_exc_object(exc as pyre_object::PyObjectRef)
     };
-    (!err.matches_stop_iteration()).then_some(err)
+    let (stop, err) = err.matches_stop_iteration_keep();
+    (!stop).then_some(err)
 }
 
 /// Drive one jd1 trace of `unpackiterable_portal`. The tracer executes
@@ -8723,7 +8757,8 @@ fn drive_unpack_iterable_trace(
                 crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
                     // StopIteration = drain complete; `ln` re-derives its own
                     // loop-exit StopIteration on its next `next()`.
-                    if !err.matches_stop_iteration() {
+                    let (stop, err) = err.matches_stop_iteration_keep();
+                    if !stop {
                         pending_err = Some(err);
                     }
                     break;
@@ -8750,10 +8785,11 @@ fn drive_unpack_iterable_trace(
         // parked by `park_jit_pending_error` is promoted instead of discarded;
         // an exit that already picked one keeps it, since that one is the
         // earlier failure. The prologue stack check does not write this slot.
-        if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception()
-            && !err.matches_stop_iteration()
-        {
-            pending_err.get_or_insert(err);
+        if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if !stop {
+                pending_err.get_or_insert(err);
+            }
         }
         // The backend `_store_exception` cells are a compiled-side slot too:
         // a guard exit that carried the drain's exception leaves them set even
@@ -8981,9 +9017,9 @@ fn drive_unpack_iterable_trace(
 }
 
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
-/// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
-/// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// trace. `init_jit_hooks` is that stand-in. Paths that trace without
+/// having run it (a test, the wasm driver) still call this before
+/// `force_start_tracing` / `bound_reached`. After boot it is a `Once` no-op.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -9028,11 +9064,18 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // Kind-0 Size tids are published on the first trace by
-    // `publish_kind0_descrs_before_trace` before `force_start_tracing` /
-    // `bound_reached`. The type-registry close hook runs the same `Once`
-    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` / `PYRE_NO_JIT`
-    // never reach those callers.
+    // `init_size_descr` publishes Size tids before any trace. Doing that
+    // at the first `force_start_tracing` is too late: Windows
+    // `frame_chain` then allocates about 2.2 TiB and exits 3221226505.
+    // Publish the whole kind-0 table here, before user code. `PYRE_JIT=0`
+    // / `PYRE_NO_JIT` never trace, so they skip the bincode. This stack
+    // is still the process stack: a helper thread would only add spawn
+    // and join latency. A trace that wins the race still hits the same
+    // `Once` from `publish_kind0_descrs_before_trace`, which decodes off
+    // the recursive `CALL_ASSEMBLER` stack.
+    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
+    }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
@@ -9828,14 +9871,14 @@ fn portal_activation_bracketed(
     // `OperationError` (`error.py`) is a GC object on that path; pin the
     // native carrier and write the slots back before the resume reads
     // them.
-    let operr_pin = resume.as_ref().and_then(|resume| {
-        resume.operr.as_ref().map(|err| {
+    let mut resume = resume;
+    let operr_pin = resume.as_mut().and_then(|resume| {
+        resume.operr.as_mut().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_gc_refs(&roots);
+            let slot = err.pin(&roots);
             (roots, slot)
         })
     });
-    let mut resume = resume;
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => {
             drop(operr_pin);
@@ -9846,7 +9889,7 @@ fn portal_activation_bracketed(
                 && let Some(resume) = resume.as_mut()
                 && let Some(err) = resume.operr.as_mut()
             {
-                err.reload_gc_refs(roots, *slot);
+                err.reload(roots, *slot);
             }
             drop(operr_pin);
             // `self.resume_execute_frame(w_arg_or_err)` and its
@@ -9878,14 +9921,14 @@ fn portal_activation_bracketed(
                 let roots = pyre_object::gc_roots::push_roots();
                 let exit_slot = roots.base();
                 let exit = roots.pin_root(w_exitvalue);
-                let err_slot = match &result {
-                    Err(err) => Some(err.pin_gc_refs(&roots)),
+                let err_slot = match &mut result {
+                    Err(err) => Some(err.pin(&roots)),
                     Ok(_) => None,
                 };
                 let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
                 w_exitvalue = roots.get(exit_slot);
                 if let (Err(err), Some(base)) = (&mut result, err_slot) {
-                    err.reload_gc_refs(&roots, base);
+                    err.reload(&roots, base);
                 }
                 trace
             };
@@ -9908,8 +9951,8 @@ fn portal_activation_bracketed(
     let mut outer_result = outer_result;
     let mut leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-        let err_slot = match &outer_result {
-            Err(err) => Some(err.pin_gc_refs(&roots)),
+        let err_slot = match &mut outer_result {
+            Err(err) => Some(err.pin(&roots)),
             Ok(_) => None,
         };
         let left = match leave_owner {
@@ -9925,7 +9968,7 @@ fn portal_activation_bracketed(
             },
         };
         if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
-            err.reload_gc_refs(&roots, base);
+            err.reload(&roots, base);
         }
         left
     };
@@ -9935,10 +9978,10 @@ fn portal_activation_bracketed(
     if matches!(leave_owner, PortalLeaveOwner::CompiledTrace) {
         // The escape propagation forces the caller frame, so both pending
         // results ride a collecting call here too.
-        let pinned_leave = pyre_interpreter::executioncontext::PinnedResult::pin(&leave_result);
+        let pinned_leave = pyre_interpreter::executioncontext::PinnedResult::pin(&mut leave_result);
         let pinned_outer = outer_result
             .is_err()
-            .then(|| pyre_interpreter::executioncontext::PinnedResult::pin(&outer_result));
+            .then(|| pyre_interpreter::executioncontext::PinnedResult::pin(&mut outer_result));
         crate::call_jit::propagate_portal_frame_escape(
             frame_root.frame() as *mut PyFrame,
             outer_result.is_err(),
@@ -10359,7 +10402,7 @@ fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpret
         && unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) }
             == frame as *mut PyFrame;
     if owns_head {
-        err.attach_tb = false;
+        err.set_attach_tb(false);
     }
 }
 
@@ -10686,7 +10729,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // actually consumes.
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(marker_pycode) };
         if code_ptr.is_null() {
-            return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::BytecodeCorruption,
+                "bytecode corruption",
+            ));
         }
         let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
 
@@ -10702,7 +10748,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let opcode_pc = decode_instruction_forward_pc(code, pc);
         let packed_instruction = decode_instruction_forward_packed(code, pc);
         if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
-            return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::BytecodeCorruption,
+                "bytecode corruption",
+            ));
         }
         let opcode = (packed_instruction & 0xff) as u8;
         // SAFETY: the packed opcode came from a live `CodeUnit`, whose opcode
@@ -12477,7 +12526,7 @@ fn compile_and_run_once(
                 // The flag belongs here and not in `finish_concrete_raise_error`:
                 // its other caller is the bridge-walk raise, whose frame has no
                 // node yet.
-                err.attach_tb = false;
+                err.set_attach_tb(false);
                 return Some(LoopResult::ExitFrameWithException(err));
             }
             None => {}

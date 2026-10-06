@@ -178,8 +178,20 @@ impl CodeWriter {
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
         // The carrier class is the program's `OperationError`: it subclasses
-        // `Exception` (see `Bookkeeper::set_exception_carrier`).
-        registry.set_exception_carrier(&callcontrol.error_carrier().carrier_path);
+        // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
+        // before the struct-root prologue so first mint wins the base.
+        let spec = callcontrol.error_carrier();
+        let classdef_path = if spec.carrier_class.is_empty() {
+            spec.carrier_path.as_str()
+        } else {
+            spec.carrier_class.as_str()
+        };
+        registry.set_exception_carrier(classdef_path);
+        if !spec.carrier_class.is_empty() {
+            registry.alias_exception_carrier_handle(&spec.carrier_path);
+        } else {
+            let _ = registry.bookkeeper().exception_carrier_class();
+        }
         // Enum `discriminant → variant` tables for the `__discriminant`
         // getattr's narrowing knowntypedata producer.
         registry.set_enum_variant_by_discriminant(std::rc::Rc::new(

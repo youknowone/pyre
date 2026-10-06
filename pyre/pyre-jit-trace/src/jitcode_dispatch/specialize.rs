@@ -8542,25 +8542,49 @@ fn same_layout_typedef(a: pyre_object::PyObjectRef, b: pyre_object::PyObjectRef)
 /// `alloc_instance_object` refuses: the next `getfield` of `map` after
 /// first attribute access sees the terminator in memory against a
 /// heapcache word of 0 (`_opimpl_getfield_gc_any_pureornot`).
+///
+/// `concrete` is the nursery instance the fold allocated. Store the same
+/// terminator word there: `tag_subclass_instance` already did, but a
+/// collection between that store and this emit would otherwise leave the
+/// live `map` at 0 while the heapcache holds the terminator.
 fn walker_emit_user_mapdict_empty<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     new_op: OpRef,
     map_descr: majit_ir::DescrRef,
     storage_descr: majit_ir::DescrRef,
     terminator: *const u8,
+    concrete: pyre_object::PyObjectRef,
 ) {
     let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
     let map_idx = map_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, terminator_const], map_descr);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, terminator_const],
+        map_descr.clone(),
+    );
     ctx.trace_ctx
         .heapcache_setfield_cached(new_op, map_idx, terminator_const);
     let storage = ctx.trace_ctx.const_null();
     let storage_idx = storage_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage], storage_descr);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, storage],
+        storage_descr.clone(),
+    );
     ctx.trace_ctx
         .heapcache_setfield_cached(new_op, storage_idx, storage);
+    if !concrete.is_null() {
+        ctx.trace_ctx.field_store(
+            concrete as i64,
+            &map_descr,
+            majit_ir::Value::Int(terminator as i64),
+        );
+        ctx.trace_ctx.field_store(
+            concrete as i64,
+            &storage_descr,
+            majit_ir::Value::Ref(majit_ir::GcRef(0)),
+        );
+    }
 }
 
 /// `MyFloat(x)` for a `float` subclass whose `__new__` is float's and whose
@@ -8673,6 +8697,12 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
         return Ok(None);
     }
     let concrete = pyre_interpreter::typedef::tag_subclass_instance(concrete, cls);
+    // Nursery-born (`w_float_subclass_new`). `emit_box_float_inline`
+    // records a collecting `NewWithVtable`; reload after
+    // (`shadowstack.py expand_pop_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let concrete_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(concrete);
     let new_op = crate::helpers::emit_box_float_inline(
         ctx.trace_ctx,
         raw,
@@ -8685,13 +8715,16 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
         .record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], class_descr);
     ctx.trace_ctx
         .heapcache_setfield_cached(new_op, class_idx, type_const);
+    let concrete = pyre_object::gc_roots::shadow_stack_get(concrete_slot);
     walker_emit_user_mapdict_empty(
         ctx,
         new_op,
         crate::descr::float_user_map_descr(),
         crate::descr::float_user_storage_descr(),
         terminator,
+        concrete,
     );
+    let concrete = pyre_object::gc_roots::shadow_stack_get(concrete_slot);
     ctx.trace_ctx.set_opref_concrete(
         new_op,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
@@ -9047,6 +9080,12 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
         return Ok(None);
     }
     let concrete = pyre_interpreter::typedef::tag_subclass_instance(concrete, cls);
+    // Nursery-born (`w_int_subclass_new`). `emit_box_int_inline` records
+    // a collecting `NewWithVtable`; reload after
+    // (`shadowstack.py expand_pop_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let concrete_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(concrete);
     let new_op = crate::helpers::emit_box_int_inline(
         ctx.trace_ctx,
         raw,
@@ -9059,13 +9098,16 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
         .record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], class_descr);
     ctx.trace_ctx
         .heapcache_setfield_cached(new_op, class_idx, type_const);
+    let concrete = pyre_object::gc_roots::shadow_stack_get(concrete_slot);
     walker_emit_user_mapdict_empty(
         ctx,
         new_op,
         crate::descr::int_user_map_descr(),
         crate::descr::int_user_storage_descr(),
         terminator,
+        concrete,
     );
+    let concrete = pyre_object::gc_roots::shadow_stack_get(concrete_slot);
     ctx.trace_ctx.set_opref_concrete(
         new_op,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),

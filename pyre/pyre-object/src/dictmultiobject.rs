@@ -519,7 +519,7 @@ pub unsafe fn dict_entries_value_set_at(
     index: usize,
     value: PyObjectRef,
 ) {
-    *entries.get_slot_mut(index).unwrap().1 = value;
+    entries.set_slot_value(index, value);
 }
 
 /// The owned-key store — [`dict_entries_probe_object`]'s twin, hashing `key`
@@ -567,7 +567,10 @@ pub unsafe fn dict_entries_key_obj_at(
     entries: &ObjectDictStorage,
     index: usize,
 ) -> Option<PyObjectRef> {
-    entries.get_slot(index).map(|(stored, _)| stored.obj)
+    match entries.slot_key(index) {
+        Some(stored) => Some(stored.obj),
+        None => None,
+    }
 }
 
 /// The stored key's cached digest at an entry index — `rordereddict.py:1053
@@ -580,7 +583,10 @@ pub unsafe fn dict_entries_key_obj_at(
 /// # Safety
 /// Same as [`dict_entries_value_at`].
 pub unsafe fn dict_entries_key_hash_at(entries: &ObjectDictStorage, index: usize) -> i64 {
-    entries.get_slot(index).unwrap().0.hash
+    match entries.slot_key(index) {
+        Some(stored) => stored.hash,
+        None => 0,
+    }
 }
 
 /// `d.num_ever_used_items` — the bound of a slot walk, and not the pair count
@@ -653,14 +659,18 @@ unsafe fn dict_entries_get_str(
     key: &str,
     hash: i64,
 ) -> Option<PyObjectRef> {
-    match memoized_or_hashed(key, hash) {
-        Some(hash) => {
-            // Clear any stale eq flag so a str-subclass comparison in the probe
-            // starts clean, matching `object_key_for`'s pre-probe reset (:125).
-            crate::dict_eq_hook::take_eq_error();
-            dict_entries_probe_str(entries, hash, key)
-        }
-        None => dict_entries_probe_object(entries, crate::w_str_new(key)),
+    if hash != 0 || crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = if hash != 0 {
+            hash
+        } else {
+            crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
+        };
+        // Clear any stale eq flag so a str-subclass comparison in the probe
+        // starts clean, matching `object_key_for`'s pre-probe reset (:125).
+        crate::dict_eq_hook::take_eq_error();
+        dict_entries_probe_str(entries, hash, key)
+    } else {
+        dict_entries_probe_object(entries, crate::w_str_new(key))
     }
 }
 
@@ -668,14 +678,6 @@ unsafe fn dict_entries_get_str(
 /// `key` from, or — when it holds none — a fresh hash of the borrowed bytes.
 /// `None` when no str hash hook is installed, which puts the caller on its
 /// allocating owned-key arm.
-#[inline]
-fn memoized_or_hashed(key: &str, hash: i64) -> Option<i64> {
-    if hash != 0 {
-        return Some(hash);
-    }
-    crate::dict_eq_hook::try_hash_str(key.as_bytes())
-}
-
 /// Borrow-key membership probe returning the entry index, for str-keyed
 /// `setitem_str`: a re-store to an existing name updates in place and reuses
 /// the stored key, so only a genuinely new key allocates a persistent
@@ -685,18 +687,32 @@ fn memoized_or_hashed(key: &str, hash: i64) -> Option<i64> {
 /// hash hook is installed.
 ///
 /// `hash` carries a caller-held digest, as in [`dict_entries_get_str`].
-#[inline]
+#[inline(never)]
+unsafe fn dict_entries_index_of_str_or_absent(entries: &ObjectDictStorage, key: &str) -> isize {
+    if crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes());
+        crate::dict_eq_hook::take_eq_error();
+        entries.index_or_absent(&StrLookupKey { hash, key })
+    } else {
+        entries.index_or_absent(&object_key_for(crate::w_str_new(key)))
+    }
+}
+
 unsafe fn dict_entries_index_of_str(
     entries: &ObjectDictStorage,
     key: &str,
     hash: i64,
 ) -> Option<usize> {
-    match memoized_or_hashed(key, hash) {
-        Some(hash) => {
-            crate::dict_eq_hook::take_eq_error();
-            dict_entries_index_of_str_hashed(entries, hash, key)
-        }
-        None => dict_entries_index_of_object(entries, crate::w_str_new(key)),
+    if hash != 0 || crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = if hash != 0 {
+            hash
+        } else {
+            crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
+        };
+        crate::dict_eq_hook::take_eq_error();
+        dict_entries_index_of_str_hashed(entries, hash, key)
+    } else {
+        dict_entries_index_of_object(entries, crate::w_str_new(key))
     }
 }
 
@@ -1554,18 +1570,35 @@ pub unsafe fn module_dict_strategy_force_version_qmut(
 /// W_DictObject.__init__(w_obj, space, strategy, storage)
 /// ```
 ///
-/// `EmptyDictStrategy.get_empty_storage` is `erase(None)`.  The first
-/// mutating call promotes via `switch_to_correct_strategy` and installs
-/// real storage, the same `w_dict_new_kwargs` path.
+/// The initial strategy is `EMPTY_DICT_STRATEGY`; the first
+/// mutating call (setitem / setitem_str / setdefault) promotes the
+/// dict to a concrete strategy via
+/// `EmptyDictStrategy::setitem`'s `switch_to_correct_strategy` step.
+/// Pyre keeps a non-null `dstorage` Vec at construction so legacy
+/// helpers reading the Vec directly still see an empty container;
+/// when EmptyDictStrategy is active the Vec is observationally
+/// empty (the trait readers return empty without touching the slot).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
+/// `alloc_dict_object` / `w_str_new` twin: the body builds the host
+/// `IndexMap` storage box (`gc_alloc_storage_box`) before
+/// `alloc_dict_object` runs, so the foreign `IndexMap::new` construction sits
+/// outside `alloc_dict_object`'s own residual boundary.  Tracing into it
+/// carries the unported host container op into the caller; residualising the
+/// whole constructor models it by signature — a plain `PyObjectRef` GCREF.
 #[majit_macros::dont_look_inside]
 pub fn w_dict_new() -> PyObjectRef {
+    let entries: *mut ObjectDictStorage = crate::gc_storage::gc_alloc_storage_box(
+        object_dict_storage_new(),
+        object_dict_storage_gc_type_id(),
+    );
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
                 ob_type: &DICT_TYPE as *const PyType,
                 w_class: get_instantiate(&DICT_TYPE),
             },
-            dstorage: std::ptr::null_mut(),
+            dstorage: entries as *mut u8,
             dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
             keys_version: 0,
             clear_gen: 0,
@@ -2472,15 +2505,13 @@ unsafe fn w_module_dict_setitem_str_internal(
         let _ = roots.pin_root(w_value);
         let entries = w_module_dict_object_storage_mut(obj);
         dict_write_barrier(obj);
-        match dict_entries_index_of_str(entries, key, 0) {
-            Some(idx) => {
-                dict_entries_value_set_at(entries, idx, roots.get(value_slot));
-            }
-            None => {
-                let w_key = crate::w_str_new(key);
-                dict_entries_insert_object(entries, w_key, roots.get(value_slot));
-                w_dict_bump_keys_version(obj);
-            }
+        let idx = dict_entries_index_of_str_or_absent(entries, key);
+        if idx < 0 {
+            let w_key = crate::w_str_new(key);
+            dict_entries_insert_object(entries, w_key, roots.get(value_slot));
+            w_dict_bump_keys_version(obj);
+        } else {
+            dict_entries_value_set_at(entries, idx as usize, roots.get(value_slot));
         };
         return;
     }
@@ -3916,10 +3947,10 @@ pub unsafe fn w_dict_is_regular_empty(obj: PyObjectRef) -> bool {
 ///
 /// PyPy `update1_dict_dict` performs:
 /// `w_copy = w_data.get_strategy().copy(w_data); w_dict.set_strategy(...);
-/// w_dict.dstorage = w_copy.dstorage`.  Empty dest storage is
-/// `erased(None)`; this helper installs the copy's strategy/storage
-/// and fires the explicit GC write barrier that RPython field stores
-/// would get from the GC.
+/// w_dict.dstorage = w_copy.dstorage`. Pyre keeps a regular empty dict's
+/// placeholder storage allocated, so this helper drops that placeholder,
+/// installs the copy's strategy/storage/len, and fires the explicit GC
+/// write barrier that RPython field stores would get from the GC.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -3941,7 +3972,8 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     // null storage during that same collection.
     dict_write_barrier(dst);
 
-    // Empty dest storage is `erased(None)`.  The off-GC side-table case
+    // The destination previously held a placeholder Object-shape box; now
+    // unreachable, it is reclaimed by the sweep.  The off-GC side-table case
     // is freed via the shared guarded helper.
     dealloc_offgc_object_dict_storage(old_dstorage);
 }
@@ -5356,9 +5388,13 @@ pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         roots.publish(&[w_key, *entries.get_slot(i).unwrap().1]);
         next = i + 1;
     }
-    (0..len)
-        .map(|i| (roots.get(base + 2 * i), roots.get(base + 2 * i + 1)))
-        .collect()
+    let mut items = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        items.push((roots.get(base + 2 * i), roots.get(base + 2 * i + 1)));
+        i += 1;
+    }
+    items
 }
 
 /// Internal helper: single-entry accessor for `IntDictStrategy` — the
@@ -5578,9 +5614,13 @@ pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef,
         roots.publish(&[w_key, *entries.get_slot(i).unwrap().1]);
         next = i + 1;
     }
-    (0..len)
-        .map(|i| (roots.get(base + 2 * i), roots.get(base + 2 * i + 1)))
-        .collect()
+    let mut items = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        items.push((roots.get(base + 2 * i), roots.get(base + 2 * i + 1)));
+        i += 1;
+    }
+    items
 }
 
 /// Internal helper: single-entry accessor for `BytesDictStrategy`.
@@ -5675,7 +5715,14 @@ pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef
     lock_dict_refs!(_dict_guard, obj);
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    entries.iter().map(|(k, &v)| (k.obj, v)).collect()
+    let mut items = Vec::new();
+    let mut slot = 0;
+    while let Some(i) = entries.next_valid_slot(slot) {
+        let (k, v) = entries.get_slot(i).unwrap();
+        items.push((k.obj, *v));
+        slot = i + 1;
+    }
+    items
 }
 
 /// Internal helper: single-entry accessor for `ObjectDictStrategy` /
@@ -5839,7 +5886,14 @@ pub unsafe fn w_dict_unicode_value_at_checked(
 pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_module_guard, obj);
     if let Some(entries) = w_module_dict_object_storage(obj) {
-        entries.iter().map(|(k, &v)| (k.obj, v)).collect()
+        let mut items = Vec::new();
+        let mut slot = 0;
+        while let Some(i) = entries.next_valid_slot(slot) {
+            let (k, v) = entries.get_slot(i).unwrap();
+            items.push((k.obj, *v));
+            slot = i + 1;
+        }
+        items
     } else {
         let strategy = &*w_module_dict_get_strategy(obj);
         let storage = w_module_dict_module_storage(obj);
@@ -5850,14 +5904,22 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         // left to run.
         let roots = crate::gc_roots::push_roots();
         let keys_base = roots.base();
-        for k in strategy.getiterkeys(storage) {
-            let _ = roots.pin_root(crate::celldict::_wrapkey(k));
+        let mut n = 0usize;
+        let mut slot = 0usize;
+        while let Some(i) = strategy.next_entry_slot(storage, slot) {
+            let name = strategy.nth_key(storage, i).unwrap();
+            let _ = roots.pin_root(crate::celldict::_wrapkey(name));
+            n += 1;
+            slot = i + 1;
         }
-        let mut items = Vec::new();
-        let mut i = 0usize;
-        for v in strategy.getitervalues(storage) {
-            items.push((roots.get(keys_base + i), v));
-            i += 1;
+        let mut items = Vec::with_capacity(n);
+        slot = 0;
+        let mut out = 0usize;
+        while let Some(i) = strategy.next_entry_slot(storage, slot) {
+            let value = strategy.nth_unwrapped_value(storage, i).unwrap();
+            items.push((roots.get(keys_base + out), value));
+            out += 1;
+            slot = i + 1;
         }
         items
     }
@@ -7114,9 +7176,11 @@ impl EmptyDictStrategy {
     ///     w_dict.dstorage = storage
     /// ```
     ///
-    /// Empty dest storage is `erased(None)`; overwriting `dstorage`
-    /// with the fresh `IntDictStrategy::get_empty_storage` box matches
-    /// `w_dict.dstorage = storage`.
+    /// The placeholder Object-shape box allocated by `w_dict_new` is a
+    /// GC-managed storage box; overwriting `dstorage` with the fresh
+    /// `IntDictStrategy::get_empty_storage` box leaves the old one
+    /// unreachable, and the sweep reclaims it — matching `w_dict.dstorage
+    /// = storage`, where the GC frees the previous backing.
     ///
     /// # Safety
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
@@ -7134,8 +7198,9 @@ impl EmptyDictStrategy {
     ///     w_dict.dstorage = storage
     /// ```
     ///
-    /// The field overwrite is a `setfield_gc`; same lifetime contract
-    /// as `switch_to_int_strategy`.
+    /// The field overwrite is a `setfield_gc`; the unreachable old
+    /// Object-shape placeholder box is reclaimed by the sweep — same
+    /// lifetime contract as `switch_to_int_strategy`.
     ///
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
@@ -7246,7 +7311,11 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     /// An empty kwargs dict has the `erased(None)` null `dstorage` from
     /// `w_dict_new_kwargs` and holds no entries — `setitem`/`setitem_str`
     /// switch to a concrete strategy before storing — so there is nothing
-    /// to trace.  Same walk as `EmptyDictStrategy`.
+    /// to trace.  This overrides (rather than inherits `EmptyDictStrategy`'s
+    /// trait-default) walk, which would unerase the null `dstorage` as an
+    /// `IndexMap` and dereference null. EmptyDictStrategy keeps the default
+    /// walk because its ordinary empty dicts carry a non-null placeholder
+    /// `dstorage`.
     unsafe fn walk_gc_refs(
         &self,
         _w_dict: PyObjectRef,
@@ -7338,18 +7407,12 @@ impl DictStrategy for EmptyDictStrategy {
 
     fn get_empty_storage(&self) -> *mut u8 {
         // `erased(None)` — null is the only inhabitant of "empty
-        // storage" before a switch installs a real backing.
+        // storage" before a switch installs a real backing.  Pyre's
+        // W_DictObject keeps an always-non-null `dstorage` Vec for
+        // legacy callers; the EmptyDictStrategy treats it as empty
+        // until `switch_to_correct_strategy` flips the dict to a
+        // concrete strategy and the Vec starts receiving entries.
         std::ptr::null_mut()
-    }
-
-    /// An empty dict holds `erased(None)` and no entries.  Walking it as
-    /// `ObjectDictStorage` would dereference null, the same kwargs empty
-    /// case (`EmptyKwargsDictStrategy.walk_gc_refs`).
-    unsafe fn walk_gc_refs(
-        &self,
-        _w_dict: PyObjectRef,
-        _visitor: &mut dyn FnMut(*mut PyObjectRef),
-    ) {
     }
 
     /// `dictmultiobject.py EmptyDictStrategy.switch_to_object_strategy`
@@ -7357,7 +7420,8 @@ impl DictStrategy for EmptyDictStrategy {
     /// w_dict.dstorage = storage`.  Allocates a fresh Object-shape box
     /// so subclasses whose `dstorage` is null (`w_dict_new_kwargs`)
     /// don't end up with an OBJECT_DICT_STRATEGY label over a null
-    /// pointer.  The field overwrite is a `setfield_gc`.
+    /// pointer.  The field overwrite is a `setfield_gc`; the unreachable
+    /// old placeholder box is reclaimed by the sweep.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
     }

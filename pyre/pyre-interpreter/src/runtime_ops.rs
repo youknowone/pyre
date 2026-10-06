@@ -499,12 +499,15 @@ pub enum CallableKind {
 /// (`baseobjspace.py`); handing them in as closures instead puts an
 /// `FnOnce::call_once` in front of every dispatch, and a closure has no
 /// lifted counterpart — RPython spells this as a plain conditional.
-pub fn classify_callable(callable: PyObjectRef) -> Result<CallableKind, PyError> {
+pub fn classify_callable(mut callable: PyObjectRef) -> Result<CallableKind, PyError> {
     // Re-raise an error `park_jit_pending_error` parked (`unpackiterable_driver`)
     // before dispatching.  A fresh stack check is performed only when a Python
     // frame is entered (`PyFrame.execute_frame.insert_stack_check_here`);
     // builtin dispatch itself is not a recursive frame entry.
-    crate::stack_check::drain_jit_pending_exception()?;
+    // `drain_jit_pending_exception` materialises a GC `PyError` handle
+    // (`from_exc_object` / `make_pyerror`); pin `callable` across it the way
+    // `PyFrame.execute_frame` pins `operr` across `stack_check`.
+    pyre_object::with_roots!(callable => crate::stack_check::drain_jit_pending_exception())?;
     unsafe {
         if crate::is_function_carrier(callable) {
             // All callables are Function objects. Check code type to distinguish
@@ -1580,9 +1583,24 @@ pub extern "C" fn jit_sequence_getitem(seq: PyObjectRef, index: i64) -> PyObject
     }
 }
 
-pub fn unpack_sequence_exact(
+pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
+    unpack_sequence_collected(seq, count, false)
+}
+
+/// Same collection as [`unpack_sequence_exact`], but the returned vec is in
+/// TOS order: the last element is first, so a forward push leaves the first
+/// element on top.
+pub fn unpack_sequence_exact_tos(
+    seq: PyObjectRef,
+    count: usize,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    unpack_sequence_collected(seq, count, true)
+}
+
+fn unpack_sequence_collected(
     mut seq: PyObjectRef,
     count: usize,
+    tos_order: bool,
 ) -> Result<Vec<PyObjectRef>, PyError> {
     // Fast path only for exact built-in sequence types. Subclasses and other
     // instances may define custom `__iter__` that must be honored.
@@ -1630,9 +1648,7 @@ pub fn unpack_sequence_exact(
             let _ = pyre_object::gc_roots::pin_root(sequence_getitem(seq(), idx)?);
         }
         let mut items = Vec::with_capacity(count);
-        for index in 0..count {
-            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + index));
-        }
+        push_shadow_slots(&mut items, items_base, count, tos_order);
         return Ok(items);
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
@@ -1690,9 +1706,16 @@ pub fn unpack_sequence_exact(
                 let _ = pyre_object::gc_roots::pin_root(val);
                 pulled += 1;
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    break;
+                }
+                if e.kind == PyErrorKind::TypeError {
+                    return Err(non_iterable());
+                }
+                return Err(e);
+            }
         }
     }
     if pulled < count {
@@ -1701,12 +1724,22 @@ pub fn unpack_sequence_exact(
         )));
     }
     let mut items = Vec::with_capacity(pulled);
-    for index in 0..pulled {
-        items.push(pyre_object::gc_roots::shadow_stack_get(
-            root_base + 1 + index,
-        ));
-    }
+    push_shadow_slots(&mut items, root_base + 1, pulled, tos_order);
     Ok(items)
+}
+
+fn push_shadow_slots(items: &mut Vec<PyObjectRef>, base: usize, count: usize, tos_order: bool) {
+    if tos_order {
+        let mut index = count;
+        while index > 0 {
+            index -= 1;
+            items.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+        }
+    } else {
+        for index in 0..count {
+            items.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+        }
+    }
 }
 
 /// UNPACK_EX — split `value` for `a, *b, c = value` into `before` head
@@ -2057,20 +2090,24 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
 /// dual-publish every other MayForce residual uses.
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
-    match crate::baseobjspace::next(iter) {
-        Ok(value) => value,
-        // StopIteration is not a frame-level exception for FOR_ITER; return
-        // null so the GuardNonnull (not GuardNoException) fires.
-        Err(err) if err.matches_stop_iteration() => PY_NULL,
-        Err(mut err) => {
-            let exc_obj = err.to_exc_object();
-            if exc_obj != PY_NULL {
-                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-            }
-            jit_publish_exception(exc_obj);
-            PY_NULL
-        }
+    let next_value = crate::baseobjspace::next(iter);
+    // StopIteration is not a frame-level exception for FOR_ITER; return
+    // null so the GuardNonnull (not GuardNoException) fires. Pin the handle
+    // across `matches_stop_iteration`, which can collect.
+    let mut err = match next_value {
+        Ok(value) => return value,
+        Err(err) => err,
+    };
+    let (stop, mut err) = err.matches_stop_iteration_keep();
+    if stop {
+        return PY_NULL;
     }
+    let exc_obj = err.to_exc_object();
+    if exc_obj != PY_NULL {
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    }
+    jit_publish_exception(exc_obj);
+    PY_NULL
 }
 
 /// `s.add(value)` written as a bound-method call, for the walker arm that

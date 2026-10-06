@@ -926,8 +926,13 @@ pub mod frame_locals_proxy {
             loop {
                 match crate::baseobjspace::next(roots.get(iter_slot)) {
                     Ok(key) => roots.set(key_slot, key),
-                    Err(err) if err.matches_stop_iteration() => break,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        let (stop, err) = err.matches_stop_iteration_keep();
+                        if stop {
+                            break;
+                        }
+                        return Err(err);
+                    }
                 }
                 let value =
                     crate::baseobjspace::getitem(roots.get(other_slot), roots.get(key_slot))?;
@@ -3276,19 +3281,12 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
     let cell_slot = idx - nvarnames;
     let npure = npure_cellvars(code);
     if cell_slot < npure {
-        let name = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !code.varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .nth(cell_slot)
-            .map(|c| c.as_ref())
-            .unwrap_or("");
+        let ci = nth_pure_cellvar_index(code, cell_slot);
+        let name = if ci < code.cellvars.len() {
+            code.cellvars[ci].as_ref()
+        } else {
+            ""
+        };
         (name, false)
     } else {
         let free_idx = cell_slot - npure;
@@ -5097,17 +5095,17 @@ impl PyFrame {
         // thrown `OperationError` is still the argument. `OperationError`
         // (`error.py`) is a GC object. Pin the native carrier only when this
         // entry holds one, and write the slots back before the resume reads it.
-        let operr_pin = operr.as_ref().map(|err| {
+        let mut operr = operr;
+        let operr_pin = operr.as_mut().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_gc_refs(&roots);
+            let slot = err.pin(&roots);
             (roots, slot)
         });
         crate::stack_check::stack_check()?;
-        let mut operr = operr;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = operr.as_mut()
         {
-            err.reload_gc_refs(roots, *slot);
+            err.reload(roots, *slot);
         }
         drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
@@ -5169,16 +5167,16 @@ impl PyFrame {
         crate::stack_check::drain_jit_pending_exception()?;
         // Same carrier pin as `execute_frame`: the overflow arm allocates
         // before `eval_frame_plain_with_resume` takes `operr`.
-        let operr_pin = resume.operr.as_ref().map(|err| {
+        let operr_pin = resume.operr.as_mut().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_gc_refs(&roots);
+            let slot = err.pin(&roots);
             (roots, slot)
         });
         crate::stack_check::stack_check()?;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = resume.operr.as_mut()
         {
-            err.reload_gc_refs(roots, *slot);
+            err.reload(roots, *slot);
         }
         drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(
@@ -6570,11 +6568,10 @@ impl PyFrame {
     /// field directly; pyre derives it because storage matches `f_lasti`.
     #[inline]
     pub fn next_instr(&self) -> usize {
-        if self.last_instr < 0 {
-            0
-        } else {
-            self.last_instr as usize + 1
-        }
+        let last = self.last_instr;
+        let base: isize = if last < 0 { 0 } else { last };
+        let step: usize = if last < 0 { 0 } else { 1 };
+        (base as usize).wrapping_add(step)
     }
 
     /// Inverse of `next_instr()`. Stores `next_instr - 1` so the field

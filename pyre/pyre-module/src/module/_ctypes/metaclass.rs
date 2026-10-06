@@ -1958,7 +1958,7 @@ fn own_dict_get(cls: PyObjectRef, key: &str) -> Option<PyObjectRef> {
 fn set_type_attr(cls: PyObjectRef, key: &str, value: PyObjectRef) {
     if pyre_interpreter::type_dict_store(cls, key, value) {
         pyre_object::gc_hook::try_gc_write_barrier(cls as *mut u8);
-        unsafe { pyre_interpreter::baseobjspace::mutated(cls, Some(key)) };
+        unsafe { pyre_interpreter::baseobjspace::mutated(cls, key) };
     }
 }
 

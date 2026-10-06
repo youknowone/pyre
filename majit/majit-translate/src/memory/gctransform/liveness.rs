@@ -19,11 +19,11 @@
 //! kept in the live set, and reported in a separate column so the two shapes
 //! stay distinguishable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::ullbc::{
     BasicBlock, CallFunc, CallKind, FunId, Operand, Place, PlaceKind, ProjectionElem, Rvalue,
-    StmtKind, SwitchTargets, TermKind, TyRef,
+    StmtKind, SwitchTargets, TermKind, TyRef, TypeDeclKind,
 };
 
 /// One call that can collect, with GC pointers live across it and no bracket.
@@ -312,6 +312,12 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
             }
         }
     }
+    // `PyError::pin`'s receiver names the handle, the way `pin_root` names
+    // `PyObjectRef`. `Result<_, PyError>` is a different hash-cons id per
+    // instantiation; collect those whose error slot is that handle.
+    let pyerror = pyerror_type_ids(llbc);
+    out.extend(pyerror.iter().copied());
+    out.extend(result_pyerror_type_ids(llbc, &pyerror).iter().copied());
     out
 }
 
@@ -392,6 +398,131 @@ pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64
         }
     }
     out
+}
+
+fn pyerror_def_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    llbc.iter_type_decls()
+        .filter(|td| td.item_meta.name_path().ends_with("::error::PyError"))
+        .map(|td| td.def_id)
+        .collect()
+}
+
+fn json_ty_id(v: &serde_json::Value) -> Option<u64> {
+    if let Some(id) = v.get("Deduplicated").and_then(|x| x.as_u64()) {
+        return Some(id);
+    }
+    v.get("Value")
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first())
+        .and_then(|x| x.as_u64())
+}
+
+fn adt_is_pyerror(llbc: &majit_charon_reader::Llbc, id: u64, defs: &HashSet<u64>) -> bool {
+    llbc.dedup_to_adt_def_id(id)
+        .is_some_and(|d| defs.contains(&d))
+}
+
+/// Ids of the `PyError` handle. Prefer `PyError::pin`'s receiver; if that
+/// spelling is a reference, also accept any signature that names the ADT.
+fn pyerror_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    let defs = pyerror_def_ids(llbc);
+    let mut out = HashSet::new();
+    if defs.is_empty() {
+        return out;
+    }
+    fn consider(
+        llbc: &majit_charon_reader::Llbc,
+        defs: &HashSet<u64>,
+        out: &mut HashSet<u64>,
+        ty: &TyRef,
+    ) {
+        let Some(id) = ty_id(ty) else {
+            return;
+        };
+        if adt_is_pyerror(llbc, id, defs) {
+            out.insert(id);
+        }
+    }
+    for fd in llbc.iter_fun_decls() {
+        let name = fd.item_meta.name_path();
+        if name.contains("::error::") && name.ends_with("::pin") {
+            for inp in &fd.signature.inputs {
+                consider(llbc, &defs, &mut out, inp);
+            }
+        }
+    }
+    if out.is_empty() {
+        for fd in llbc.iter_fun_decls() {
+            consider(llbc, &defs, &mut out, &fd.signature.output);
+            for inp in &fd.signature.inputs {
+                consider(llbc, &defs, &mut out, inp);
+            }
+        }
+    }
+    out
+}
+
+fn result_pyerror_type_ids(
+    llbc: &majit_charon_reader::Llbc,
+    pyerror_ids: &HashSet<u64>,
+) -> HashSet<u64> {
+    let py_defs = pyerror_def_ids(llbc);
+    let result_defs: HashSet<u64> = llbc
+        .iter_type_decls()
+        .filter(|td| td.item_meta.name_path() == "core::result::Result")
+        .map(|td| td.def_id)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut ids = HashSet::new();
+    if result_defs.is_empty() || pyerror_ids.is_empty() {
+        return ids;
+    }
+    let mut classify = |ty: &TyRef| {
+        let Some(id) = ty_id(ty) else {
+            return;
+        };
+        if !seen.insert(id) {
+            return;
+        }
+        if !llbc
+            .dedup_to_adt_def_id(id)
+            .is_some_and(|d| result_defs.contains(&d))
+        {
+            return;
+        }
+        let Some(body) = llbc.dedup_body(id) else {
+            return;
+        };
+        let Some(slot) = body
+            .get("Adt")
+            .and_then(|a| a.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.get(1))
+        else {
+            return;
+        };
+        let is_py = if let Some(err_id) = json_ty_id(slot) {
+            pyerror_ids.contains(&err_id) || adt_is_pyerror(llbc, err_id, &py_defs)
+        } else if let Some(def) = slot
+            .get("Adt")
+            .and_then(|a| a.get("id"))
+            .and_then(|i| i.as_u64())
+        {
+            py_defs.contains(&def)
+        } else {
+            false
+        };
+        if is_py {
+            ids.insert(id);
+        }
+    };
+    for fd in llbc.iter_fun_decls() {
+        classify(&fd.signature.output);
+        for ty in &fd.signature.inputs {
+            classify(ty);
+        }
+    }
+    ids
 }
 
 /// The type ids a `PyFrame` pointer is spelled with in *this* artefact.
@@ -502,6 +633,7 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
 ///
 /// Only the shapes `pin_roots(&[a, b])` lowers to are followed; anything else
 /// leaves the pinned set unread rather than guessed at.
+#[derive(Clone)]
 enum PinSrc {
     /// `_t = [a, b, c]` -- the pinned set itself.
     Aggregate(Vec<u64>),
@@ -594,6 +726,449 @@ fn reads_root_slot(name: &str) -> bool {
         || (name.contains("gc_roots::<Impl>") && name.ends_with("::get"))
 }
 
+/// `PyError::pin`. `ends_with("::pin")` does not match `pin_root`.
+///
+/// The receiver stays in the pinned set: the object is rooted for the call.
+/// It is not a pin *argument* the immediate check treats as still being read.
+/// `pin` writes the forwarded word back, and that word is fresh only until
+/// the next collecting call. `shadowstack.py expand_pop_roots` reloads every
+/// live variable after `pop_roots`; only that reloaded word is safe.
+fn is_pyerror_handle_pin(name: &str) -> bool {
+    name.contains("::error::") && name.ends_with("::pin")
+}
+
+/// `PyError::reload`. `ends_with("::reload")` does not match `reload_global`.
+fn is_pyerror_handle_reload(name: &str) -> bool {
+    name.contains("::error::") && name.ends_with("::reload")
+}
+
+/// `&mut self` methods that store the forwarded carrier back into the local.
+/// `to_exc_object` does, through its own `pin` / `reload`. `set_exc_object`
+/// writes a field and leaves the handle word as it was.
+fn is_pyerror_handle_writeback(name: &str) -> bool {
+    name.contains("::error::") && (name.ends_with("::pin") || name.ends_with("::to_exc_object"))
+}
+
+/// Drop `PyError::pin`'s receiver out of the pin-argument set.
+///
+/// Chase the `&mut` temporary (`mut_borrow_of`) and single-assignment aliases.
+/// The same local stays in the pinned set, which is what coverage reads.
+fn drop_pyerror_pin_receiver(
+    args: &[Operand],
+    mut_borrow_of: &HashMap<u64, u64>,
+    defs: &HashMap<u64, PinSrc>,
+    args_only: &mut HashSet<u64>,
+) {
+    let Some(arg0) = args.first() else {
+        return;
+    };
+    let mut seed = HashSet::new();
+    use_operand(arg0, &mut seed);
+    let mut drop_set = HashSet::new();
+    for local in seed {
+        chase_handle_local(local, mut_borrow_of, defs, &mut drop_set, 0);
+    }
+    for local in drop_set {
+        args_only.remove(&local);
+    }
+}
+
+fn chase_handle_local(
+    local: u64,
+    mut_borrow_of: &HashMap<u64, u64>,
+    defs: &HashMap<u64, PinSrc>,
+    out: &mut HashSet<u64>,
+    depth: u32,
+) {
+    if !out.insert(local) || depth > 8 {
+        return;
+    }
+    if let Some(&next) = mut_borrow_of.get(&local) {
+        chase_handle_local(next, mut_borrow_of, defs, out, depth + 1);
+    }
+    if let Some(PinSrc::Alias(next)) = defs.get(&local) {
+        chase_handle_local(*next, mut_borrow_of, defs, out, depth + 1);
+    }
+}
+
+/// Locals whose single assignment builds a reference or a raw pointer.
+///
+/// Copying one of these copies the address of the stack slot, not the GC
+/// word. `PyError::reload` is lowered as `_t = &mut err` followed by the
+/// call, and that borrow is not a read of the carrier.
+fn address_bearing_locals(blocks: &[BasicBlock]) -> HashSet<u64> {
+    let mut defined = HashSet::new();
+    let mut out = HashSet::new();
+    for blk in blocks {
+        for st in &blk.statements {
+            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+                continue;
+            };
+            let Some(dest) = bare_local(&place) else {
+                continue;
+            };
+            if !defined.insert(dest) {
+                out.remove(&dest);
+                continue;
+            }
+            if matches!(rv, Rvalue::Ref { .. } | Rvalue::RawPtr { .. }) {
+                out.insert(dest);
+            }
+        }
+    }
+    out
+}
+
+fn operand_place(op: &Operand) -> Option<&Place> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) if !is_metadata_place(place) => Some(place),
+        _ => None,
+    }
+}
+
+/// Locals a value operand names, following copy aliases and stopping at a
+/// reference. A reference is not a load of the word.
+fn operand_value_loads(
+    op: &Operand,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let Some(place) = operand_place(op) else {
+        return HashSet::new();
+    };
+    let Some(local) = place_local(place) else {
+        return HashSet::new();
+    };
+    if address_locals.contains(&local) || mut_borrow_of.contains_key(&local) {
+        return HashSet::new();
+    }
+    chase_value_local(local, address_locals, defs, mut_borrow_of)
+}
+
+fn chase_value_local(
+    local: u64,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    let mut stack = vec![local];
+    let mut depth = 0u32;
+    while let Some(local) = stack.pop() {
+        if address_locals.contains(&local) || mut_borrow_of.contains_key(&local) {
+            continue;
+        }
+        if !out.insert(local) || depth > 8 {
+            continue;
+        }
+        depth += 1;
+        if let Some(PinSrc::Alias(next)) = defs.get(&local) {
+            stack.push(*next);
+        }
+    }
+    out
+}
+
+fn rvalue_value_loads(
+    rv: &Rvalue,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    match rv {
+        Rvalue::Ref { .. }
+        | Rvalue::RawPtr { .. }
+        | Rvalue::Len(_)
+        | Rvalue::NullaryOp(_, _)
+        | Rvalue::Unknown => {}
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => {
+            out.extend(operand_value_loads(op, address_locals, defs, mut_borrow_of));
+        }
+        Rvalue::BinaryOp(_, left, right) => {
+            out.extend(operand_value_loads(
+                left,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            ));
+            out.extend(operand_value_loads(
+                right,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            ));
+        }
+        Rvalue::Aggregate(_, ops) => {
+            for op in ops {
+                out.extend(operand_value_loads(op, address_locals, defs, mut_borrow_of));
+            }
+        }
+        // The enum tag of the local itself is not the carrier word. A
+        // discriminant projected through a field dereferences that word.
+        Rvalue::Discriminant(place) => {
+            if bare_local(place).is_none()
+                && !is_metadata_place(place)
+                && let Some(local) = place_local(place)
+            {
+                out.extend(chase_value_local(
+                    local,
+                    address_locals,
+                    defs,
+                    mut_borrow_of,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Locals a call argument addresses. The borrow is not itself a load; the
+/// callee is, unless it is `PyError::reload` or a slot read into the local.
+fn operand_address_roots(
+    op: &Operand,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let Some(place) = operand_place(op) else {
+        return HashSet::new();
+    };
+    let Some(local) = place_local(place) else {
+        return HashSet::new();
+    };
+    if !address_locals.contains(&local) && !mut_borrow_of.contains_key(&local) {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    chase_handle_local(local, mut_borrow_of, defs, &mut out, 0);
+    out
+}
+
+/// `PyError` / `Result<_, PyError>` locals in `watched` that a path reads
+/// before a reload. `shadowstack.py gc_restore_root` is that reload: the
+/// word from before `push_roots` is not the word after the collecting call.
+///
+/// One collecting call flags at most once. The walk starts at the call's
+/// successors, so the call's own arguments are the pre-call word.
+fn pyerror_stale_after_collect(
+    blocks: &[BasicBlock],
+    terms: &[Option<TermKind>],
+    names: &HashMap<u64, String>,
+    mut_borrow_of: &HashMap<u64, u64>,
+    defs: &HashMap<u64, PinSrc>,
+    address_locals: &HashSet<u64>,
+    origin: usize,
+    watched: &HashSet<u64>,
+) -> HashSet<u64> {
+    let Some(term) = terms.get(origin).and_then(|term| term.as_ref()) else {
+        return HashSet::new();
+    };
+    let n = blocks.len();
+    let mut stale_in: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+    let mut queued = vec![false; n];
+    let mut queue = VecDeque::new();
+    for succ in successors(term) {
+        let succ = succ as usize;
+        if succ >= n {
+            continue;
+        }
+        stale_in[succ].clone_from(watched);
+        queued[succ] = true;
+        queue.push_back(succ);
+    }
+    let mut flagged = HashSet::new();
+    while let Some(block) = queue.pop_front() {
+        queued[block] = false;
+        let mut stale = stale_in[block].clone();
+        for st in &blocks[block].statements {
+            let Ok(kind) = st.stmt_kind() else {
+                continue;
+            };
+            note_stmt_loads(
+                &kind,
+                &mut stale,
+                &mut flagged,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            );
+        }
+        if let Some(term) = terms.get(block).and_then(|term| term.as_ref()) {
+            note_term_loads(
+                term,
+                names,
+                &mut stale,
+                &mut flagged,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            );
+            for succ in successors(term) {
+                let succ = succ as usize;
+                if succ >= n {
+                    continue;
+                }
+                let before = stale_in[succ].len();
+                stale_in[succ].extend(stale.iter().copied());
+                if stale_in[succ].len() != before && !queued[succ] {
+                    queued[succ] = true;
+                    queue.push_back(succ);
+                }
+            }
+        }
+    }
+    flagged.retain(|local| watched.contains(local));
+    flagged
+}
+
+fn note_stmt_loads(
+    kind: &StmtKind,
+    stale: &mut HashSet<u64>,
+    flagged: &mut HashSet<u64>,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) {
+    match kind {
+        // `PlaceMention` and storage markers do not load the carrier word.
+        // A dead local cannot be read later on this path.
+        StmtKind::StorageDead(local) => {
+            stale.remove(local);
+        }
+        StmtKind::PlaceMention(_)
+        | StmtKind::StorageLive(_)
+        | StmtKind::Borrowck(_)
+        | StmtKind::Unknown => {}
+        StmtKind::Assert(assert) => {
+            flag_value_loads(
+                &operand_value_loads(&assert.cond, address_locals, defs, mut_borrow_of),
+                stale,
+                flagged,
+            );
+        }
+        StmtKind::Assign(place, rv) => {
+            let loaded = rvalue_value_loads(rv, address_locals, defs, mut_borrow_of);
+            flag_value_loads(&loaded, stale, flagged);
+            // A kill that does not read the old word is the fresh value.
+            // `gc_restore_root` has that shape when the slot read is a call
+            // whose destination is the local; a plain assignment of another
+            // local is the same.
+            if let Some(dest) = bare_local(place)
+                && stale.contains(&dest)
+                && !loaded.contains(&dest)
+            {
+                stale.remove(&dest);
+            }
+        }
+    }
+}
+
+fn note_term_loads(
+    term: &TermKind,
+    names: &HashMap<u64, String>,
+    stale: &mut HashSet<u64>,
+    flagged: &mut HashSet<u64>,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) {
+    match term {
+        TermKind::Switch { discr, .. } => {
+            flag_value_loads(
+                &operand_value_loads(discr, address_locals, defs, mut_borrow_of),
+                stale,
+                flagged,
+            );
+        }
+        TermKind::Assert { assert, .. } => {
+            flag_value_loads(
+                &operand_value_loads(&assert.cond, address_locals, defs, mut_borrow_of),
+                stale,
+                flagged,
+            );
+        }
+        // User `Drop` glue would load the word. `PyError` has none, and a
+        // glue-less `Drop` is not a read. `framework.py` stops at the last
+        // real use for the same reason.
+        TermKind::Drop { .. }
+        | TermKind::Return
+        | TermKind::Goto { .. }
+        | TermKind::UnwindResume
+        | TermKind::UnwindTerminate
+        | TermKind::Abort(_)
+        | TermKind::UndefinedBehavior
+        | TermKind::Unknown => {}
+        TermKind::Call { call, .. } => {
+            let name = call_name(call, names);
+            let mut values = HashSet::new();
+            let mut addressed = HashSet::new();
+            for arg in &call.args {
+                values.extend(operand_value_loads(
+                    arg,
+                    address_locals,
+                    defs,
+                    mut_borrow_of,
+                ));
+                addressed.extend(operand_address_roots(
+                    arg,
+                    address_locals,
+                    defs,
+                    mut_borrow_of,
+                ));
+            }
+            let reload = name.is_some_and(is_pyerror_handle_reload);
+            let slot_read = name.is_some_and(reads_root_slot);
+            let writeback = name.is_some_and(is_pyerror_handle_writeback);
+            if !reload {
+                flag_value_loads(&values, stale, flagged);
+                for local in &addressed {
+                    if stale.contains(local) {
+                        flagged.insert(*local);
+                    }
+                }
+            }
+            let dest = bare_local(&call.dest);
+            for local in stale.clone() {
+                let reloaded = reload && addressed.contains(&local);
+                let from_slot = slot_read && dest == Some(local) && !values.contains(&local);
+                let written = writeback && addressed.contains(&local);
+                let killed =
+                    dest == Some(local) && !values.contains(&local) && !addressed.contains(&local);
+                if reloaded || from_slot || written || killed {
+                    stale.remove(&local);
+                }
+            }
+        }
+    }
+}
+
+fn call_name<'a>(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    names: &'a HashMap<u64, String>,
+) -> Option<&'a str> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    names.get(id).map(String::as_str)
+}
+
+fn flag_value_loads(loaded: &HashSet<u64>, stale: &HashSet<u64>, flagged: &mut HashSet<u64>) {
+    for local in loaded {
+        if stale.contains(local) {
+            flagged.insert(*local);
+        }
+    }
+}
+
 /// `CallKind::Fun(FunId::Regular)` — the only call shape [`scan`] treats as
 /// a resolved callee. `push_roots` and the pin helpers are read off these.
 fn regular_fun_id(func: &CallFunc) -> Option<u64> {
@@ -625,6 +1200,7 @@ struct PinHelperSummary {
 }
 
 /// One resolved call, reduced to the locals its arguments name.
+#[derive(Clone)]
 struct HelperCallFact {
     callee: u64,
     callee_name: String,
@@ -634,6 +1210,7 @@ struct HelperCallFact {
 
 /// What [`summarize_pin_helpers`] needs from one body. Built by
 /// [`helper_body_fact`]; tests construct it directly.
+#[derive(Clone)]
 struct HelperBodyFact {
     has_push_roots: bool,
     /// MIR parameters are locals `1..=arg_count`. Local 0 is the return place.
@@ -888,6 +1465,9 @@ fn returns_pinned_word(body: &HelperBodyFact) -> bool {
         }
         match body.defs.get(&local) {
             Some(PinSrc::Alias(next)) => local = *next,
+            // A one-field newtype of the pin word (`PyError(raw)`) is that
+            // word. A wider aggregate is a container, not the root.
+            Some(PinSrc::Aggregate(fields)) if fields.len() == 1 => local = fields[0],
             _ => break false,
         }
     };
@@ -1170,6 +1750,7 @@ fn pin_helper_summaries(
     llbc: &majit_charon_reader::Llbc,
     cg: &super::framework::CallGraph,
     push_roots: &HashSet<u64>,
+    donors: &[(&majit_charon_reader::Llbc, &super::framework::CallGraph)],
 ) -> HashMap<u64, PinHelperSummary> {
     if push_roots.is_empty() {
         return HashMap::new();
@@ -1184,6 +1765,57 @@ fn pin_helper_summaries(
             continue;
         };
         bodies.insert(id, fact);
+    }
+    // A cross-crate helper is often an opaque declaration here. Its body
+    // lives in the donor that extracted it. The callee ids inside that body
+    // stay the donor's; `summarize_pin_helpers` keys off names for `pin_root`.
+    if !donors.is_empty() {
+        let mut donor_by_name: HashMap<&str, HelperBodyFact> = HashMap::new();
+        for (dllbc, dcg) in donors {
+            let push: HashSet<u64> = dcg
+                .names
+                .iter()
+                .filter(|(_, n)| n.ends_with("gc_roots::push_roots"))
+                .map(|(&id, _)| id)
+                .collect();
+            if push.is_empty() {
+                continue;
+            }
+            for id in helper_candidate_ids(&dcg.callees, &dcg.names, &push) {
+                let Some(name) = dcg.names.get(&id) else {
+                    continue;
+                };
+                if donor_by_name.contains_key(name.as_str()) {
+                    continue;
+                }
+                let Some(fd) = dllbc.fn_by_id(id) else {
+                    continue;
+                };
+                let Some(fact) = helper_body_fact(dllbc, fd, &push, &dcg.names) else {
+                    continue;
+                };
+                // Only a helper whose return place is the pinned word. Importing
+                // an argument-only pin (`RootedItems::push`) marks every later
+                // read of that argument stale, and a pin set this artefact
+                // cannot name makes the caller unread.
+                if !returns_pinned_word(&fact) {
+                    continue;
+                }
+                donor_by_name.insert(name.as_str(), fact);
+            }
+        }
+        for (&id, name) in &cg.names {
+            if bodies.contains_key(&id) {
+                continue;
+            }
+            let readable = llbc.fn_by_id(id).and_then(|fd| fd.unstructured()).is_some();
+            if readable {
+                continue;
+            }
+            if let Some(fact) = donor_by_name.get(name.as_str()) {
+                bodies.insert(id, fact.clone());
+            }
+        }
     }
     summarize_pin_helpers(&bodies)
 }
@@ -1232,12 +1864,19 @@ pub fn scan(
     push_roots: &HashSet<u64>,
     gc_tys: &HashSet<u64>,
     movable_callees: &HashSet<u64>,
+    donors: &[(&majit_charon_reader::Llbc, &super::framework::CallGraph)],
 ) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
     let mut stats = ScanStats::default();
     // One summary for the artefact: a helper pins into the caller's open
     // scope, so which parameters it publishes is a property of the callee.
-    let pin_helpers = pin_helper_summaries(llbc, cg, push_roots);
+    let pin_helpers = pin_helper_summaries(llbc, cg, push_roots, donors);
+    // `PyError` and `Result<_, PyError>` are the words `expand_pop_roots`
+    // would reload. A pin roots the object; only a later reload freshens the
+    // local. Computed once: the ids are a property of the artefact.
+    let pyerror_ids = pyerror_type_ids(llbc);
+    let mut pyerror_word_ids = pyerror_ids.clone();
+    pyerror_word_ids.extend(result_pyerror_type_ids(llbc, &pyerror_ids));
     // Calls that read a slice's length or test a word against null.  A moved
     // object's stale address is still non-null, so neither answer changes.
     let metadata_fns: HashSet<u64> = cg
@@ -1254,6 +1893,10 @@ pub fn scan(
         })
         .map(|(id, _)| *id)
         .collect();
+    // Drop glue is a property of the type, not of the local that holds it.
+    // One answer per hash-cons id is reused across every body in the artefact.
+    let drop_owners = explicit_drop_owners(llbc);
+    let mut drop_memo: HashMap<u64, bool> = HashMap::new();
     for fd in llbc.iter_local_fns() {
         let id = fd.def_id;
         if !reach.contains(&id) {
@@ -1516,6 +2159,28 @@ pub fn scan(
             // is rooted by whatever pinned it; the index it takes is not a
             // root, so only the result is read here.
             let reads_a_slot_back = reads_root_slot(name);
+            if is_pyerror_handle_pin(name) {
+                // `PyError::pin` pins the receiver through `&mut self` and
+                // writes the forwarded word back. The helper summary does
+                // not see that: `pin_root` is handed `self.0`, a field, so
+                // `pinned_params` is empty. Name the receiver here so the
+                // open bracket covers the handle, and leave pin-args empty
+                // so the writeback is not a stale read of the pre-pin word.
+                saw_pin_call = true;
+                let mut pinned: HashSet<u64> = HashSet::new();
+                if let Some(arg0) = call.args.first() {
+                    let mut seed = HashSet::new();
+                    use_operand(arg0, &mut seed);
+                    for local in seed {
+                        chase_handle_local(local, &mut_borrow_of, &defs, &mut pinned, 0);
+                    }
+                }
+                pinned.retain(|local| gc_locals.contains_key(local));
+                term_pin_args[b] = HashSet::new();
+                term_pin_names[b] = name.clone();
+                term_pins[b] = pinned;
+                continue;
+            }
             if !is_pin_fn(name) && !reads_a_slot_back {
                 // A helper pins into this body's open scope. Its own fresh
                 // object names no local here, so an empty set is not a pin
@@ -1544,6 +2209,16 @@ pub fn scan(
                     // word handed back only when the helper returns one;
                     // either way it is not an argument still being read.
                     args_only.remove(&dest);
+                }
+                if is_pyerror_handle_pin(name) {
+                    // `PyError::pin` writes the forwarded word back through
+                    // `&mut self`. The receiver stays in `pinned` so coverage
+                    // still sees the root. It is not a pin argument: counting
+                    // it there treats the writeback as a read of the pre-pin
+                    // word. `shadowstack.py expand_pop_roots` reloads after
+                    // the collecting call; this writeback is that reload for
+                    // the one local the pin itself updated.
+                    drop_pyerror_pin_receiver(&call.args, &mut_borrow_of, &defs, &mut args_only);
                 }
                 args_only.retain(|local| gc_locals.contains_key(local));
                 term_pin_args[b] = args_only;
@@ -1590,6 +2265,20 @@ pub fn scan(
             }
             term_pins[b] = pinned;
         }
+        // Locals already reported as a pin argument stay on that counter.
+        // The post-collect walk below answers a different question: a rooted
+        // `PyError` whose word was not reloaded after a collecting call.
+        // `framework.py push_roots` / `pop_roots` reloads every live variable;
+        // the original local is not that reloaded word.
+        let pin_arg_union: HashSet<u64> = term_pin_args.iter().flatten().copied().collect();
+        let address_of_local = address_bearing_locals(&body.body);
+        let pyerror_locals: HashSet<u64> = body
+            .locals
+            .locals
+            .iter()
+            .filter(|l| ty_id(&l.ty).is_some_and(|t| pyerror_word_ids.contains(&t)))
+            .map(|l| l.index)
+            .collect();
         // A scope-closing Drop this reader cannot name retires an unknown set,
         // and a pin made where two scope stacks meet has a path-dependent
         // owner.  Either would let one guard's Drop release another's pins.
@@ -1839,7 +2528,14 @@ pub fn scan(
                         live.extend(sl.iter().copied());
                     }
                 }
-                transfer_term(t, &mut live, &metadata_fns);
+                transfer_term(
+                    t,
+                    &mut live,
+                    &metadata_fns,
+                    llbc,
+                    &drop_owners,
+                    &mut drop_memo,
+                );
                 for st in body.body[b].statements.iter().rev() {
                     if let Ok(k) = st.stmt_kind() {
                         transfer_stmt(&k, &mut live, &gc_locals);
@@ -2030,6 +2726,54 @@ pub fn scan(
                     .filter(|l| !held.contains(l))
                     .map(|l| gc_locals[l].clone())
                     .collect();
+                // Held across the call means the object is rooted. It does not
+                // mean the local still holds the forwarded word.
+                // `gc_restore_root` is the reload; a read of the pre-call
+                // local after this point is the stale word.
+                let watched: HashSet<u64> = after
+                    .iter()
+                    .copied()
+                    .filter(|l| {
+                        held.contains(l) && pyerror_locals.contains(l) && !pin_arg_union.contains(l)
+                    })
+                    .collect();
+                if !watched.is_empty() {
+                    let flagged = pyerror_stale_after_collect(
+                        &body.body,
+                        &terms,
+                        &cg.names,
+                        &mut_borrow_of,
+                        &defs,
+                        &address_of_local,
+                        b,
+                        &watched,
+                    );
+                    if !flagged.is_empty() {
+                        stats.pin_arg_read_after += 1;
+                        let mut movable: Vec<String> = flagged
+                            .iter()
+                            .filter(|l| movable_args.contains(l))
+                            .filter_map(|l| gc_locals.get(l).cloned())
+                            .collect();
+                        if !movable.is_empty() {
+                            stats.pin_arg_read_after_movable += 1;
+                        }
+                        let mut locals_named: Vec<String> = flagged
+                            .iter()
+                            .filter_map(|l| gc_locals.get(l).cloned())
+                            .collect();
+                        locals_named.sort();
+                        movable.sort();
+                        stats.stale_pin_reads.push(StalePinRead {
+                            func_name: fd.item_meta.name_path(),
+                            file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                            line: at.beg.line,
+                            pin_name: cg.names.get(callee).cloned().unwrap_or_default(),
+                            locals: locals_named,
+                            movable,
+                        });
+                    }
+                }
                 if missing.is_empty() {
                     stats.withheld_bracket_covers += 1;
                     continue;
@@ -2175,7 +2919,14 @@ fn term_span<'a>(
         .expect("span id is not in the artefact span table")
 }
 
-fn transfer_term(t: &TermKind, live: &mut HashSet<u64>, metadata_fns: &HashSet<u64>) {
+fn transfer_term(
+    t: &TermKind,
+    live: &mut HashSet<u64>,
+    metadata_fns: &HashSet<u64>,
+    llbc: &majit_charon_reader::Llbc,
+    drop_owners: &HashSet<u64>,
+    drop_memo: &mut HashMap<u64, bool>,
+) {
     match t {
         TermKind::Call { call, .. } => {
             if let Some(d) = bare_local(&call.dest) {
@@ -2197,12 +2948,297 @@ fn transfer_term(t: &TermKind, live: &mut HashSet<u64>, metadata_fns: &HashSet<u
         }
         TermKind::Switch { discr, .. } => use_operand(discr, live),
         TermKind::Assert { assert, .. } => use_operand(&assert.cond, live),
+        // A `Drop` reads the local only when its drop glue runs a user
+        // `Drop` impl. Upstream livevars stop at the last real use; glue
+        // that does not run user code is not one.
         TermKind::Drop { place, .. } => {
-            if let Some(l) = place_local(place) {
+            if let Some(l) = place_local(place)
+                && ty_may_run_user_drop(&place.ty, llbc, drop_owners, drop_memo, &[], &[], 0)
+            {
                 live.insert(l);
             }
         }
         _ => {}
+    }
+}
+
+/// Self types of `core::ops::drop::Drop` impls in this artefact.
+///
+/// An impl whose trait decl is missing counts too: that is the same
+/// "cannot prove dropless" answer as `type_decl_has_explicit_drop`.
+fn explicit_drop_owners(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    let mut owners = HashSet::new();
+    for row in llbc.trait_impls_raw() {
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        let Some(def_id) = impl_trait
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|owner| impl_self_def_id(llbc, owner))
+        else {
+            continue;
+        };
+        let drop_or_unknown = impl_trait
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|trait_id| llbc.trait_by_id(trait_id))
+            .is_none_or(|decl| decl.item_meta.name_path() == "core::ops::drop::Drop");
+        if drop_or_unknown {
+            owners.insert(def_id);
+        }
+    }
+    owners
+}
+
+/// Nominal ADT def id of an impl's first type argument.
+///
+/// `Value: [id, body]` and `Deduplicated: id` are the two spellings
+/// `resolve_tyexpr_to_adt_def_id_free` accepts. Tuple and `str` have no
+/// nominal owner; `Box` does.
+fn impl_self_def_id(llbc: &majit_charon_reader::Llbc, ty: &serde_json::Value) -> Option<u64> {
+    if let Some(pair) = ty.get("Value").and_then(serde_json::Value::as_array)
+        && let Some(body) = pair.get(1)
+    {
+        return body.get("Adt").and_then(adt_nominal_def_id);
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_to_adt_def_id(id);
+    }
+    ty.get("Adt").and_then(adt_nominal_def_id)
+}
+
+fn adt_nominal_def_id(adt: &serde_json::Value) -> Option<u64> {
+    match adt.get("builtin").and_then(serde_json::Value::as_str) {
+        None | Some("Box") => adt.get("id").and_then(serde_json::Value::as_u64),
+        Some(_) => None,
+    }
+}
+
+fn ty_body<'a>(
+    ty: &'a TyRef,
+    llbc: &'a majit_charon_reader::Llbc,
+) -> Option<&'a serde_json::Value> {
+    match ty {
+        TyRef::Inline { value: (_, body) } => Some(body),
+        TyRef::Other(body) => Some(body),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+    }
+}
+
+/// Whether dropping `ty` can run a user `Drop` impl.
+///
+/// `subst` binds type variables of `ty`; `outer` binds type variables that
+/// occur inside those arguments. A generic parameter with no binding, a
+/// trait object, a missing decl, or a walk deeper than 16 types counts.
+/// The memo is the hash-cons id of a closed type, so two instantiations of
+/// one ADT do not share an answer. It is not keyed by a local.
+fn ty_may_run_user_drop(
+    ty: &TyRef,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    subst: &[serde_json::Value],
+    outer: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    let closed = subst.is_empty() && outer.is_empty();
+    let key = if closed { ty_id(ty) } else { None };
+    if let Some(id) = key
+        && let Some(answer) = memo.get(&id)
+    {
+        return *answer;
+    }
+    if let Some(id) = key {
+        // A cycle of closed types has no user destructor of its own.
+        memo.insert(id, false);
+    }
+    let answer = match ty_body(ty, llbc) {
+        Some(body) => value_may_run_user_drop(body, llbc, owners, memo, subst, outer, depth),
+        None => true,
+    };
+    if let Some(id) = key {
+        memo.insert(id, answer);
+    }
+    answer
+}
+
+fn value_may_run_user_drop(
+    node: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    subst: &[serde_json::Value],
+    outer: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    let closed = subst.is_empty() && outer.is_empty();
+    let mut node = node;
+    let mut memo_id = None;
+    let mut peeled = false;
+    for _ in 0..24 {
+        if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            if closed {
+                if let Some(answer) = memo.get(&id).copied() {
+                    if let Some(outer_id) = memo_id {
+                        memo.insert(outer_id, answer);
+                    }
+                    return answer;
+                }
+                memo.insert(id, false);
+                memo_id = Some(id);
+            }
+            match llbc.dedup_body(id) {
+                Some(body) => node = body,
+                None => {
+                    if let Some(id) = memo_id {
+                        memo.insert(id, true);
+                    }
+                    return true;
+                }
+            }
+            continue;
+        }
+        if let Some(pair) = node.get("Value").and_then(serde_json::Value::as_array)
+            && pair.len() == 2
+        {
+            if closed
+                && memo_id.is_none()
+                && let Some(id) = pair[0].as_u64()
+            {
+                if let Some(answer) = memo.get(&id).copied() {
+                    return answer;
+                }
+                memo.insert(id, false);
+                memo_id = Some(id);
+            }
+            node = &pair[1];
+            continue;
+        }
+        peeled = true;
+        break;
+    }
+    let answer = if peeled {
+        type_node_may_run_user_drop(node, llbc, owners, memo, subst, outer, depth)
+    } else {
+        true
+    };
+    if let Some(id) = memo_id {
+        memo.insert(id, answer);
+    }
+    answer
+}
+
+fn type_node_may_run_user_drop(
+    node: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    subst: &[serde_json::Value],
+    outer: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    if node.as_str() == Some("Never")
+        || node.get("Scalar").is_some()
+        || node.get("Ref").is_some()
+        || node.get("RawPtr").is_some()
+        || node.get("FnDef").is_some()
+        || node.get("FnPtr").is_some()
+    {
+        return false;
+    }
+    if let Some(type_var) = node.get("TypeVar") {
+        let Some(index) = typevar_index(type_var) else {
+            return true;
+        };
+        let Some(arg) = subst.get(index) else {
+            return true;
+        };
+        return value_may_run_user_drop(arg, llbc, owners, memo, outer, &[], depth + 1);
+    }
+    if node.get("DynTrait").is_some() || node.get("Dynamic").is_some() {
+        return true;
+    }
+    if let Some(adt) = node.get("Adt") {
+        return adt_may_run_user_drop(adt, llbc, owners, memo, subst, depth);
+    }
+    if let Some(element) = node
+        .get("Array")
+        .or_else(|| node.get("Slice"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.first())
+    {
+        return value_may_run_user_drop(element, llbc, owners, memo, subst, outer, depth + 1);
+    }
+    true
+}
+
+/// Index of a `TypeVar` bound at the innermost binder, or `None` when the
+/// binder is not that one (the argument list in hand does not cover it).
+fn typevar_index(type_var: &serde_json::Value) -> Option<usize> {
+    let pair = type_var
+        .get("Bound")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| type_var.as_array())?;
+    let debruijn = pair.first()?.as_u64()?;
+    let index = pair.get(1)?.as_u64()?;
+    (debruijn == 0).then_some(index as usize)
+}
+
+fn adt_may_run_user_drop(
+    adt: &serde_json::Value,
+    llbc: &majit_charon_reader::Llbc,
+    owners: &HashSet<u64>,
+    memo: &mut HashMap<u64, bool>,
+    enclosing: &[serde_json::Value],
+    depth: usize,
+) -> bool {
+    let args: &[serde_json::Value] = adt
+        .get("generics")
+        .and_then(|generics| generics.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    // A tuple's elements are its type arguments. Other non-nominal builtins
+    // (`str`, and anything this reader does not model) stay uses.
+    if adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Tuple") {
+        return args.iter().any(|arg| {
+            value_may_run_user_drop(arg, llbc, owners, memo, enclosing, &[], depth + 1)
+        });
+    }
+    let Some(def_id) = adt_nominal_def_id(adt) else {
+        return true;
+    };
+    if owners.contains(&def_id) {
+        return true;
+    }
+    let Some(decl) = llbc.type_by_id(def_id) else {
+        return true;
+    };
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields.iter().any(|field| {
+            ty_may_run_user_drop(&field.ty, llbc, owners, memo, args, enclosing, depth + 1)
+        }),
+        TypeDeclKind::Enum(variants) => variants.iter().any(|variant| {
+            variant.fields.iter().any(|field| {
+                ty_may_run_user_drop(&field.ty, llbc, owners, memo, args, enclosing, depth + 1)
+            })
+        }),
+        // No field list. A destructor of this shape can still run the
+        // instantiation's type arguments; an argument that is itself
+        // dropless contributes nothing.
+        TypeDeclKind::Opaque => args
+            .iter()
+            .any(|arg| value_may_run_user_drop(arg, llbc, owners, memo, enclosing, &[], depth + 1)),
+        TypeDeclKind::Alias(body) => {
+            value_may_run_user_drop(body, llbc, owners, memo, args, enclosing, depth + 1)
+        }
+        TypeDeclKind::Unknown => true,
     }
 }
 
@@ -2496,8 +3532,9 @@ mod tests {
         );
     }
 
-    /// The return place is pinned when it aliases a pin result, and not when
-    /// the assignment is an aggregate.
+    /// The return place is pinned when it aliases a pin result or is a
+    /// one-field newtype of one, and not when the assignment packs several
+    /// fields.
     #[test]
     fn the_return_place_is_pinned_only_when_it_aliases_a_pin_result() {
         let mut aliased = helper_fact(
@@ -2514,6 +3551,13 @@ mod tests {
         );
         aggregate.pin_result_locals.insert(2);
         aggregate.defs.insert(0, PinSrc::Aggregate(vec![2]));
+        let mut wide = helper_fact(
+            0,
+            false,
+            vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![4]])],
+        );
+        wide.pin_result_locals.insert(2);
+        wide.defs.insert(0, PinSrc::Aggregate(vec![2, 5]));
         let mut slot = helper_fact(
             0,
             false,
@@ -2523,11 +3567,12 @@ mod tests {
             ],
         );
         slot.pin_result_locals.insert(0);
-        let bodies = HashMap::from([(1, aliased), (2, aggregate), (3, slot)]);
+        let bodies = HashMap::from([(1, aliased), (2, aggregate), (3, slot), (4, wide)]);
         let sums = summarize_pin_helpers(&bodies);
         assert!(sums[&1].returns_pinned);
-        assert!(!sums[&2].returns_pinned);
+        assert!(sums[&2].returns_pinned);
         assert!(sums[&3].returns_pinned);
+        assert!(!sums[&4].returns_pinned);
         assert!(sums[&2].pinned_params.is_empty());
     }
 
@@ -2575,5 +3620,349 @@ mod tests {
         assert!(!ids.contains(&4));
         assert!(!ids.contains(&5));
         assert!(!ids.contains(&9));
+    }
+
+    fn item_meta(path: &[&str]) -> serde_json::Value {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    }
+
+    fn generics(types: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    }
+
+    fn adt(id: u64, types: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {"id": id, "generics": generics(types), "builtin": null}
+        })
+    }
+
+    fn inline(id: u64, body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"Value": [id, body]})
+    }
+
+    fn raw_ptr() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [null, "Mut"]})
+    }
+
+    fn field(ty: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"name": "_0", "is_positional": true, "ty": ty})
+    }
+
+    fn struct_decl(id: u64, name: &str, fields: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": item_meta(&[name]),
+            "kind": {"Struct": fields}
+        })
+    }
+
+    fn trait_decl(id: u64, path: &[&str]) -> serde_json::Value {
+        serde_json::json!({"def_id": id, "item_meta": item_meta(path)})
+    }
+
+    fn trait_impl(trait_id: u64, adt_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "impl_trait": {
+                "id": trait_id,
+                "generics": {"types": [inline(1, adt(adt_id, serde_json::json!([])))]}
+            }
+        })
+    }
+
+    /// Locals live across the collecting call that sits between the payload's
+    /// last real use and the `Drop` of that payload.
+    fn live_across_drop(
+        type_decls: serde_json::Value,
+        trait_decls: serde_json::Value,
+        trait_impls: serde_json::Value,
+        payload_ty: serde_json::Value,
+    ) -> Vec<String> {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = inline(1, serde_json::json!({"Scalar": "Bool"}));
+        let gens = generics(serde_json::json!([]));
+        let place =
+            |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let call = |fun: u64,
+                    args: serde_json::Value,
+                    dest: u64,
+                    dest_ty: &serde_json::Value,
+                    target: u64| {
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
+                        "args": args,
+                        "dest": place(dest, dest_ty)
+                    },
+                    "target": target,
+                    "on_unwind": 3
+                }}}
+            })
+        };
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()},
+                    {"index": 1, "name": "tmp", "span": span.clone(), "ty": scalar.clone()},
+                    {"index": 2, "name": "payload", "span": span.clone(), "ty": payload_ty.clone()}
+                ]},
+                "body": [
+                    call(2, serde_json::json!([{"Copy": place(2, &payload_ty)}]), 1, &scalar, 1),
+                    call(1, serde_json::json!([]), 0, &scalar, 2),
+                    {"statements": [], "terminator": {"span": span.clone(), "kind": {"Drop": {
+                        "place": place(2, &payload_ty),
+                        "fn_ptr": {"kind": {"Fun": 1}, "generics": gens.clone()},
+                        "target": 3,
+                        "on_unwind": 3
+                    }}}},
+                    {"statements": [], "terminator": {"span": span.clone(), "kind": "Return"}}
+                ]
+            }}
+        });
+        let opaque = |id: u64, name: &str| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", name]),
+                "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [holder, opaque(1, "collect"), opaque(2, "touch")],
+                "global_decls": [],
+                "trait_decls": trait_decls,
+                "trait_impls": trait_impls
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("drop fixture parses");
+        let cg = super::super::framework::build(&llbc);
+        let mut reach = HashSet::new();
+        reach.insert(0);
+        reach.insert(1);
+        let mut gc_tys = HashSet::new();
+        gc_tys.insert(100);
+        let (findings, stats) = scan(
+            &llbc,
+            &cg,
+            &reach,
+            &HashSet::new(),
+            &gc_tys,
+            &HashSet::new(),
+            &[],
+        );
+        assert_eq!(
+            stats.unparsed_terminator_bodies, 0,
+            "the fixture's terminators must parse"
+        );
+        assert_eq!(
+            stats.bodies_scanned, 1,
+            "the payload must be a tracked local"
+        );
+        findings
+            .into_iter()
+            .flat_map(|finding| finding.live_non_arg)
+            .collect()
+    }
+
+    /// The `Drop` after the payload's last real use is not itself a use, so
+    /// the collecting call between them sees a dead local.
+    #[test]
+    fn a_drop_of_a_dropless_local_after_its_last_use_leaves_it_dead() {
+        let payload = struct_decl(
+            0,
+            "Handle",
+            serde_json::json!([field(inline(7, raw_ptr()))]),
+        );
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([payload]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert!(live.is_empty(), "dropless drop kept {live:?} live");
+    }
+
+    /// A type with a `Drop` impl is read by its destructor, so the local is
+    /// live at the collecting call that precedes that `Drop`.
+    #[test]
+    fn a_drop_of_a_type_with_a_drop_impl_keeps_it_live() {
+        let payload = struct_decl(0, "Guard", serde_json::json!([]));
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([payload]),
+            serde_json::json!([trait_decl(0, &["core", "ops", "drop", "Drop"])]),
+            serde_json::json!([trait_impl(0, 0)]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// The destructor runs for a field too, not only for the outer type's
+    /// own impl.
+    #[test]
+    fn a_drop_of_a_struct_whose_field_has_a_drop_impl_keeps_it_live() {
+        let outer = struct_decl(
+            0,
+            "Outer",
+            serde_json::json!([field(inline(8, adt(1, serde_json::json!([]))))]),
+        );
+        let inner = struct_decl(1, "Inner", serde_json::json!([]));
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([outer, inner]),
+            serde_json::json!([trait_decl(0, &["core", "ops", "drop", "Drop"])]),
+            serde_json::json!([trait_impl(0, 1)]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// `Result<RawPtr, RawPtr>`: the enum's fields are type variables, and
+    /// neither instantiation argument runs a user destructor.
+    #[test]
+    fn a_drop_of_an_instantiated_enum_of_raw_pointers_leaves_it_dead() {
+        let result = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["Result"]),
+            "kind": {"Enum": [
+                {"name": "Ok", "fields": [field(inline(5, serde_json::json!({"TypeVar": {"Bound": [0, 0]}})))]},
+                {"name": "Err", "fields": [field(inline(6, serde_json::json!({"TypeVar": {"Bound": [0, 1]}})))]}
+            ]}
+        });
+        let ty = inline(
+            100,
+            adt(
+                0,
+                serde_json::json!([inline(101, raw_ptr()), inline(102, raw_ptr())]),
+            ),
+        );
+        let live = live_across_drop(
+            serde_json::json!([result]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert!(live.is_empty(), "enum of raw pointers kept {live:?} live");
+    }
+
+    /// An unbound type variable can be anything, so the `Drop` counts.
+    #[test]
+    fn a_drop_of_a_generic_parameter_keeps_it_live() {
+        let ty = inline(100, serde_json::json!({"TypeVar": {"Bound": [0, 0]}}));
+        let live = live_across_drop(
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// No declaration means the destructor contract is unknown.
+    #[test]
+    fn a_drop_of_a_missing_decl_keeps_it_live() {
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let live = live_across_drop(
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// An opaque body has no fields. Its type arguments are what a
+    /// destructor can still run, and a raw pointer does not.
+    #[test]
+    fn a_drop_of_an_opaque_type_of_raw_pointers_leaves_it_dead() {
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["Vec"]),
+            "kind": "Opaque"
+        });
+        let ty = inline(100, adt(0, serde_json::json!([inline(101, raw_ptr())])));
+        let live = live_across_drop(
+            serde_json::json!([wrapper]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            ty,
+        );
+        assert!(
+            live.is_empty(),
+            "opaque raw-pointer wrapper kept {live:?} live"
+        );
+    }
+
+    /// The same opaque shape keeps the local live when an argument has a
+    /// `Drop` impl.
+    #[test]
+    fn a_drop_of_an_opaque_type_carrying_a_drop_type_keeps_it_live() {
+        let wrapper = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["Vec"]),
+            "kind": "Opaque"
+        });
+        let inner = struct_decl(1, "Guard", serde_json::json!([]));
+        let ty = inline(
+            100,
+            adt(
+                0,
+                serde_json::json!([inline(101, adt(1, serde_json::json!([])))]),
+            ),
+        );
+        let live = live_across_drop(
+            serde_json::json!([wrapper, inner]),
+            serde_json::json!([trait_decl(0, &["core", "ops", "drop", "Drop"])]),
+            serde_json::json!([trait_impl(0, 1)]),
+            ty,
+        );
+        assert_eq!(live, vec!["payload".to_string()]);
+    }
+
+    /// `Copy` is not `Drop`. A missing trait decl is not `Copy` either: the
+    /// impl cannot be shown to be something other than a destructor.
+    #[test]
+    fn a_copy_impl_does_not_keep_the_local_live_but_an_unresolved_impl_does() {
+        let payload = struct_decl(0, "Bits", serde_json::json!([]));
+        let ty = inline(100, adt(0, serde_json::json!([])));
+        let copy = live_across_drop(
+            serde_json::json!([payload.clone()]),
+            serde_json::json!([trait_decl(0, &["core", "marker", "Copy"])]),
+            serde_json::json!([trait_impl(0, 0)]),
+            ty.clone(),
+        );
+        assert!(copy.is_empty(), "Copy kept {copy:?} live");
+        let unresolved = live_across_drop(
+            serde_json::json!([payload]),
+            serde_json::json!([]),
+            serde_json::json!([trait_impl(9, 0)]),
+            ty,
+        );
+        assert_eq!(unresolved, vec!["payload".to_string()]);
     }
 }

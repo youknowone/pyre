@@ -128,13 +128,10 @@ fn deadline_from_timeout(timeout: Option<f64>) -> Option<Instant> {
 }
 
 fn empty_error() -> pyre_interpreter::PyError {
-    let mut err = pyre_interpreter::PyError::runtime_error("");
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_queue.Empty")
-        && let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[cls])
-    {
-        err.exc_object = exc;
-    }
-    err
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_queue.Empty") else {
+        return pyre_interpreter::PyError::runtime_error("");
+    };
+    pyre_interpreter::PyError::from_type_and_value(cls, pyre_object::PY_NULL)
 }
 
 fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {

@@ -429,11 +429,22 @@ impl W_PickleBuffer {
             // The callback is advisory cleanup; the temporary carrier still
             // has to be released if it raises, matching a try/finally around
             // the acquired Py_buffer.
-            let release_result =
-                crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp)])
-                    .map(|_| ());
-            callback_result?;
-            release_result?;
+            match callback_result {
+                Ok(()) => {
+                    crate::builtins::memoryview_release(&[
+                        pyre_object::gc_roots::shadow_stack_get(sp),
+                    ])?;
+                }
+                Err(error) => {
+                    let mut error = error;
+                    let error_slot = error.pin(&_roots);
+                    let _ = crate::builtins::memoryview_release(&[
+                        pyre_object::gc_roots::shadow_stack_get(sp),
+                    ]);
+                    error.reload(&_roots, error_slot);
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }

@@ -73,34 +73,263 @@ pub fn decode_escape(
     }
 }
 
+fn push_utf8(out: &mut Vec<u8>, cp: u32) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push((0xC0 | (cp >> 6)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else if cp < 0x10000 {
+        out.push((0xE0 | (cp >> 12)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else {
+        out.push((0xF0 | (cp >> 18)) as u8);
+        out.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    }
+}
+
+/// One WTF-8 byte of `w_object`. The view's own `len` is `__strlen`, and a
+/// bare `&Wtf8` has no class for that read; the byte stays inside this residual.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
+fn unicode_byte(w_object: pyre_object::PyObjectRef, index: usize) -> u8 {
+    unsafe { pyre_object::w_str_get_wtf8(w_object).as_bytes()[index] }
+}
+
+fn wtf8_char_len(w_object: pyre_object::PyObjectRef, nbytes: usize) -> usize {
+    let mut i = 0;
+    let mut n = 0;
+    while i < nbytes {
+        i += wtf8_seq_len(unicode_byte(w_object, i));
+        n += 1;
+    }
+    n
+}
+
+fn wtf8_seq_len(b0: u8) -> usize {
+    if b0 < 0x80 {
+        1
+    } else if b0 < 0xE0 {
+        2
+    } else if b0 < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn wtf8_code_point(w_object: pyre_object::PyObjectRef, i: usize) -> (u32, usize) {
+    let b0 = unicode_byte(w_object, i);
+    let n = wtf8_seq_len(b0);
+    let cp = match n {
+        1 => b0 as u32,
+        2 => ((b0 as u32 & 0x1F) << 6) | (unicode_byte(w_object, i + 1) as u32 & 0x3F),
+        3 => {
+            ((b0 as u32 & 0x0F) << 12)
+                | ((unicode_byte(w_object, i + 1) as u32 & 0x3F) << 6)
+                | (unicode_byte(w_object, i + 2) as u32 & 0x3F)
+        }
+        _ => {
+            ((b0 as u32 & 0x07) << 18)
+                | ((unicode_byte(w_object, i + 1) as u32 & 0x3F) << 12)
+                | ((unicode_byte(w_object, i + 2) as u32 & 0x3F) << 6)
+                | (unicode_byte(w_object, i + 3) as u32 & 0x3F)
+        }
+    };
+    (cp, n)
+}
+
+/// Encode `s` one code point at a time. `utf8_bytes` copies the WTF-8
+/// sequence for an accepted point (and rejects surrogates); otherwise an
+/// accepted point is the single byte `cp` when `cp <= limit`.
+fn encode_code_points(
+    mut w_object: pyre_object::PyObjectRef,
+    errors: &str,
+    encoding: &str,
+    reason: &str,
+    limit: u32,
+    utf8_bytes: bool,
+) -> Result<Vec<u8>, crate::PyError> {
+    let nbytes = unsafe { pyre_object::w_str_byte_len(w_object) };
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut chars = 0usize;
+    while i < nbytes {
+        let (cp, n) = wtf8_code_point(w_object, i);
+        let accepted = if utf8_bytes {
+            !(0xD800..=0xDFFF).contains(&cp)
+        } else {
+            cp <= limit
+        };
+        if accepted {
+            if utf8_bytes {
+                let end = i + n;
+                let mut k = i;
+                while k < end {
+                    out.push(unicode_byte(w_object, k));
+                    k += 1;
+                }
+            } else {
+                out.push(cp as u8);
+            }
+            i += n;
+            chars += 1;
+            continue;
+        }
+        if errors == "surrogateescape" && (0xDC80..=0xDCFF).contains(&cp) {
+            out.push((cp - 0xDC00) as u8);
+            i += n;
+            chars += 1;
+            continue;
+        }
+        let start_chars = chars;
+        let mut j = i;
+        while j < nbytes {
+            let (cp2, n2) = wtf8_code_point(w_object, j);
+            let ok2 = if utf8_bytes {
+                !(0xD800..=0xDFFF).contains(&cp2)
+            } else {
+                cp2 <= limit
+            };
+            if ok2 || (errors == "surrogateescape" && (0xDC80..=0xDCFF).contains(&cp2)) {
+                break;
+            }
+            j += n2;
+            chars += 1;
+        }
+        if errors == "ignore" {
+            i = j;
+            continue;
+        }
+        if errors == "replace" {
+            let mut c = start_chars;
+            while c < chars {
+                out.push(b'?');
+                c += 1;
+            }
+            i = j;
+            continue;
+        }
+        if errors != "strict" {
+            // The handler can collect. Rebind through `pin_root` so the
+            // word used afterwards is the one the shadow stack forwards.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            w_object = pyre_object::gc_roots::pin_root(w_object);
+            let (rep, newpos) = call_registered_encode_error_handler(
+                errors,
+                encoding,
+                w_object,
+                wtf8_char_len(w_object, nbytes),
+                start_chars,
+                chars,
+                reason,
+                EncodeErrorOwner::UnicodeObject,
+            )?;
+            w_object = pyre_object::gc_roots::shadow_stack_get(slot);
+            match rep {
+                EncodeReplacement::Str(cps) => {
+                    let mut k = 0;
+                    while k < cps.len() {
+                        let cp = cps[k];
+                        // runicode.py `unicode_encode_utf_8_impl`: a str
+                        // replacement contributes only ASCII bytes. Any other
+                        // code point re-raises the original error via the
+                        // strict handler. Other limits keep `cp <= limit`.
+                        let fits = if utf8_bytes { cp < 0x80 } else { cp <= limit };
+                        if !fits {
+                            return Err(crate::typedef::unicode_encode_error(
+                                encoding,
+                                w_object,
+                                start_chars as i64,
+                                chars as i64,
+                                reason,
+                            ));
+                        }
+                        if utf8_bytes {
+                            push_utf8(&mut out, cp);
+                        } else {
+                            out.push(cp as u8);
+                        }
+                        k += 1;
+                    }
+                }
+                EncodeReplacement::Bytes(raw) => {
+                    let mut k = 0;
+                    while k < raw.len() {
+                        out.push(raw[k]);
+                        k += 1;
+                    }
+                }
+            }
+            // The handler may move the resume index backwards
+            // (`RepeatedPosReturn` returns 0). Recompute the byte cursor
+            // from the start of the string, the same as
+            // `rutf8._pos_at_index`.
+            let mut resume = 0;
+            let mut resume_chars = 0;
+            while resume_chars < newpos && resume < nbytes {
+                let (_, n2) = wtf8_code_point(w_object, resume);
+                resume += n2;
+                resume_chars += 1;
+            }
+            i = resume;
+            chars = resume_chars;
+            continue;
+        }
+        return Err(crate::typedef::unicode_encode_error(
+            encoding,
+            w_object,
+            start_chars as i64,
+            chars as i64,
+            reason,
+        ));
+    }
+    Ok(out)
+}
+
 pub fn encode_utf8(
-    _s: &Wtf8,
+    s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let ctx = PyreEncodeContext::pinned(encodings::utf8::ENCODING_NAME, w_object);
-    encodings::utf8::encode(ctx, &PyreErrors { errors })
+    let _ = s;
+    encode_code_points(w_object, errors, "utf-8", "surrogates not allowed", 0, true)
 }
 
 pub fn encode_ascii(
-    _s: &Wtf8,
+    s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let ctx = PyreEncodeContext::pinned(encodings::ascii::ENCODING_NAME, w_object);
-    encodings::ascii::encode(ctx, &PyreErrors { errors })
+    let _ = s;
+    encode_code_points(
+        w_object,
+        errors,
+        "ascii",
+        "ordinal not in range(128)",
+        0x7F,
+        false,
+    )
 }
 
 pub fn encode_latin1(
-    _s: &Wtf8,
+    s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let ctx = PyreEncodeContext::pinned(encodings::latin_1::ENCODING_NAME, w_object);
-    encodings::latin_1::encode(ctx, &PyreErrors { errors })
+    let _ = s;
+    encode_code_points(
+        w_object,
+        errors,
+        "latin-1",
+        "ordinal not in range(256)",
+        0xFF,
+        false,
+    )
 }
 
 pub fn decode_ascii(data: Vec<u8>, errors: &str) -> Result<Wtf8Buf, crate::PyError> {

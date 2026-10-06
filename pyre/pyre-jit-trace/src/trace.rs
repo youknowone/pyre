@@ -7438,39 +7438,46 @@ mod tests {
     fn walk_end_root_area_forwards_a_quiesced_foreign_mutator() {
         let (area_tx, area_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let (roots_tx, roots_rx) = std::sync::mpsc::channel();
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
         let owner = std::thread::spawn(move || {
-            let mut err = pyre_interpreter::PyError::new(
+            // The parked value is the one-word handle. `w_name_context` and
+            // `w_obj_context` live on the object and are traced from its GC
+            // offsets once the collector follows that handle, not as separate
+            // roots of this TLS cell. The previous expected pair
+            // `(0x3000 + 0x20, 0x4000 + 0x20)` was those two fields.
+            let err = pyre_interpreter::PyError::new(
                 pyre_interpreter::PyErrorKind::RuntimeError,
                 "foreign mutator root",
             );
-            err.w_name_context = 0x3000 as pyre_object::PyObjectRef;
-            err.w_obj_context = 0x4000 as pyre_object::PyObjectRef;
+            let handle = err.as_raw() as usize;
             super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
                 *slot.borrow_mut() = Some(err);
             });
             area_tx
-                .send(super::capture_walk_end_root_area() as usize)
+                .send((super::capture_walk_end_root_area() as usize, handle))
                 .unwrap();
             resume_rx.recv().unwrap();
             super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
                 let err = slot.borrow_mut().take().unwrap();
-                roots_tx
-                    .send((err.w_name_context as usize, err.w_obj_context as usize))
-                    .unwrap();
+                handle_tx.send(err.as_raw() as usize).unwrap();
             });
         });
 
-        let area = area_rx.recv().unwrap() as *const ();
+        let (area, handle) = area_rx.recv().unwrap();
+        let area = area as *const ();
         // The owner is blocked after publishing its stable TLS addresses,
         // matching the mutator quiescence required by the STW registry.
+        // Do not shift the handle: `walk_gc_refs` then reads `exc_object`
+        // through the forwarded pointer, and `+ 0x20` is not a relocation.
+        let mut seen = Vec::new();
         unsafe {
             super::walk_walk_end_roots_area(area, &mut |root| {
-                *root = majit_ir::GcRef(root.as_usize() + 0x20);
+                seen.push(root.as_usize());
             });
         }
         resume_tx.send(()).unwrap();
-        assert_eq!(roots_rx.recv().unwrap(), (0x3020, 0x4020));
+        assert_eq!(seen, vec![handle]);
+        assert_eq!(handle_rx.recv().unwrap(), handle);
         owner.join().unwrap();
     }
 

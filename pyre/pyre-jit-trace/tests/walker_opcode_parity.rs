@@ -2,10 +2,8 @@
 //!
 //! One jitcode encoding is consumed by two independent tracers:
 //!
-//! * majit's own, `majit-metainterp/src/pyjitpl/opimpl.rs`
-//!   `OPCODE_IMPLEMENTATIONS` (plus `run_one_step`'s inline `BC_LIVE` /
-//!   `BC_JUMP` in `dispatch.rs`), which keys on the `insns::BC_*` byte
-//!   constants; and
+//! * majit's own, `majit-metainterp/src/pyjitpl/dispatch.rs`, which keys on the
+//!   `insns::BC_*` byte constants; and
 //! * pyre's full-body walker, `pyre-jit-trace/src/jitcode_dispatch/`, which
 //!   keys on the `opname/argcodes` string the same table names the byte by.
 //!
@@ -115,9 +113,14 @@ fn insns_table(root: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Collect every `insns::BC_*` name in `body` that is not inside a comment.
-fn collect_insns_bc(out: &mut BTreeSet<String>, body: &str) {
-    for line in body.lines() {
+/// The `BC_*` constants majit's tracer names outside a comment.
+fn majit_walker_bytecodes(root: &Path) -> BTreeSet<String> {
+    let src = read(root, "majit/majit-metainterp/src/pyjitpl/dispatch.rs");
+    let at = src
+        .find("        match bytecode {")
+        .expect("the dispatch match must exist");
+    let mut out = BTreeSet::new();
+    for line in braced_body(&src, at).lines() {
         let code = code_of(line);
         let mut rest = code;
         while let Some(at) = rest.find("insns::BC_") {
@@ -130,33 +133,10 @@ fn collect_insns_bc(out: &mut BTreeSet<String>, body: &str) {
             rest = &after[1..];
         }
     }
-}
-
-/// The `BC_*` constants majit's tracer names outside a comment.
-///
-/// The old source was `execute_one_instruction`'s `match bytecode`. That
-/// match split into `opimpl_*` handlers keyed by `OPCODE_IMPLEMENTATIONS`
-/// (`pyjitpl.py opcode_implementations`). `run_one_step` still handles
-/// `BC_LIVE` and `BC_JUMP` inline before the table; the old match named
-/// both, so they stay in this set even if a later edit drops the table row.
-fn majit_walker_bytecodes(root: &Path) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let src = read(root, "majit/majit-metainterp/src/pyjitpl/opimpl.rs");
-    let at = src
-        .find("const OPCODE_IMPLEMENTATIONS")
-        .expect("OPCODE_IMPLEMENTATIONS must exist");
-    collect_insns_bc(&mut out, braced_body(&src, at));
-
-    let dispatch = read(root, "majit/majit-metainterp/src/pyjitpl/dispatch.rs");
-    let at = dispatch
-        .find("pub fn run_one_step")
-        .expect("run_one_step must exist");
-    collect_insns_bc(&mut out, braced_body(&dispatch, at));
-
     assert!(
         out.len() > 100,
-        "majit's tracer named only {} opcode constants; OPCODE_IMPLEMENTATIONS \
-         no longer spells `insns::BC_*`",
+        "majit's tracer named only {} opcode constants; its dispatch no longer \
+         spells `insns::BC_*`",
         out.len(),
     );
     out
@@ -164,11 +144,10 @@ fn majit_walker_bytecodes(root: &Path) -> BTreeSet<String> {
 
 /// The text between the first `{` at or after `open` and its matching `}`.
 ///
-/// Each scan wants a construct's own body and nothing after it: the
-/// `OPCODE_IMPLEMENTATIONS` table, `run_one_step`'s inline LIVE/JUMP skip,
-/// `handle`'s `match op.key`, and the arithmetic `regular_record_table!`.
-/// Reading to end-of-file instead would admit lines that are not entries
-/// at all.
+/// Both scans below want a construct's own body and nothing after it: a
+/// `match` whose arms are the walker's keys, and a macro invocation whose
+/// entries are the arithmetic ones. Reading to end-of-file instead would
+/// admit lines that are not entries at all.
 fn braced_body(src: &str, open: usize) -> &str {
     let start = src[open..].find('{').expect("the construct opens a block") + open + 1;
     let mut depth = 1usize;

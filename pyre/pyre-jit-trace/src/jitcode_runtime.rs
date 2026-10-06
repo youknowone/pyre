@@ -1351,18 +1351,21 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 }
 
 /// Publish the GcCache-owned (non-call) opcode descrs and stamp synthetic
-/// struct collector tids before a trace walk.
+/// struct collector tids before user code.
 ///
 /// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
 /// for those ids during translation, against Size objects already in
 /// `GcCache`. pyre cannot embed the collector ids in the executable.
-/// `publish_kind0_descrs_before_trace` calls this before
-/// `force_start_tracing` / `bound_reached`. Publishing from inside the
-/// walk is too late: Windows `frame_chain` then allocates about 2.2 TiB
-/// (exit 3221226505). A process that never traces never calls this.
-/// Field minting publishes the parent Size `init_size_descr` reads.
-/// `set_type_registry_close_hook` runs this before `freeze_types`, so the
-/// registry is still open when the tids are registered. CallDescr
+/// `init_jit_hooks` publishes every kind-0 slot before user code, on the
+/// process stack. Publishing
+/// at the first `force_start_tracing` is too late: Windows `frame_chain`
+/// then allocates about 2.2 TiB (exit 3221226505). `PYRE_JIT=0` /
+/// `PYRE_NO_JIT` skip the boot call. A trace that starts without that boot
+/// still calls this before the walk. Publishing from inside the walk is the
+/// same allocation failure. Field minting publishes
+/// the parent Size `init_size_descr`
+/// reads. `set_type_registry_close_hook` runs this before `freeze_types`,
+/// so the registry is still open when the tids are registered. CallDescr
 /// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
     // The close hook and a trace that starts without `init_jit_hooks` can
@@ -1374,8 +1377,10 @@ pub fn materialize_gccache_owned_descrs() {
 /// Same publication as [`materialize_gccache_owned_descrs`], decoded on
 /// this thread.
 ///
-/// The `Once` is shared with the helper-thread path: whichever caller
-/// runs first chooses the stack, and the other call only registers tids.
+/// `init_jit_hooks` runs before user code, so the process stack is empty
+/// and a helper thread is only spawn and join latency. The `Once` is
+/// shared: whichever caller runs first chooses the stack, and the other
+/// call only registers tids.
 pub fn materialize_gccache_owned_descrs_on_caller_stack() {
     materialize_gccache_owned_descrs_with(true);
 }
@@ -1530,11 +1535,10 @@ fn register_synthetic_struct_tids() {
 /// [`crate::state::setup_indirectcalltargets`],
 /// [`crate::state::bytecode_for_address`].  An interpreter that never traces
 /// never runs it.  Kind-0 minting is not in that set:
-/// [`materialize_gccache_owned_descrs`] runs from
-/// `publish_kind0_descrs_before_trace` before the portal walk, and from the
-/// type-registry close hook. A process that never traces does not decode
-/// the table. The call below is the `Once` hitting an already-published
-/// table, then the EffectInfo and Call passes.
+/// [`materialize_gccache_owned_descrs`] runs from `init_jit_hooks` before
+/// user code when the JIT is on.  Deferring it to the first trace makes
+/// `frame_chain` allocate about 2.2 TiB.  The call below is the `Once`
+/// hitting an already-published table, then the EffectInfo and Call passes.
 ///
 /// **Its size is not currently measured, and two obvious instruments cannot
 /// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`
@@ -2390,17 +2394,103 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// `_pyre/P` adapter handlers (registered by `insns.rs`'s
 /// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
-    // `setup_insns(asm.insns)`: a dynamically numbered key takes the byte
-    // this build's assembler gave it. A backend that did not emit the key
-    // (wasm jitcodes carry no `getarrayitem_raw_i`) omits it.
-    let dynamic_keys = ["recursive_call_v/iIRFIRF", "getarrayitem_raw_i/iid>i"];
-    let dynamic: Vec<(&str, u8)> = dynamic_keys
-        .into_iter()
-        .filter_map(|key| build_emitted_insns().get(key).map(|byte| (key, *byte)))
+    install_py_container_ctors();
+    // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
+    // take the byte this build's assembler gave them.
+    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
+    // (`blackhole.py bhimpl_recursive_call_{i,r,f,v}`); only the variants
+    // this build actually emitted need a slot. `wire_bhimpl_handlers`
+    // already binds each key; without the slot, `setup_insns` never
+    // records the byte and a guard-failure resume panics here.
+    // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
+    // omits that key.
+    const DYNAMIC_INSN_KEYS: &[&str] = &[
+        "recursive_call_i/iIRFIRF>i",
+        "recursive_call_r/iIRFIRF>r",
+        "recursive_call_f/iIRFIRF>f",
+        "recursive_call_v/iIRFIRF",
+        "getarrayitem_raw_i/iid>i",
+    ];
+    let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
+        .iter()
+        .filter_map(|&key| build_emitted_insns().get(key).map(|&byte| (key, byte)))
         .collect();
-    let builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
+    let mut builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
+    // Legacy `NewList` / `NewTuple` that the rtyper did not rewrite still
+    // reach the assembler as `newlist/>r` and `newtuple/rr>r`. Their bytes
+    // are assigned by `get_opnum` while emitting jitcodes, so the slot is
+    // whatever this build recorded.
+    for key in ["newlist/>r", "newtuple/rr>r"] {
+        let Some(&byte) = build_emitted_insns().get(key) else {
+            continue;
+        };
+        let slot = &mut builder._insns[byte as usize];
+        if slot.is_empty() {
+            *slot = key.to_string();
+        }
+        let handler: majit_metainterp::blackhole::BhOpcodeHandler = match key {
+            "newlist/>r" => handler_newlist_refs,
+            "newtuple/rr>r" => handler_newtuple_refs,
+            _ => unreachable!(),
+        };
+        assert!(
+            builder.wire_handler(key, handler),
+            "emitted {key} at byte {byte} did not land in the blackhole table"
+        );
+    }
     assert_production_builder_spans_the_emitted_universe(&builder);
     builder
+}
+
+fn install_py_container_ctors() {
+    let _ = PY_LIST_CTOR.set(py_list_from_words);
+    let _ = PY_TUPLE_CTOR.set(py_tuple_from_words);
+}
+
+fn py_list_from_words(words: &[i64]) -> i64 {
+    let items = words_as_refs(words);
+    pyre_interpreter::runtime_ops::build_list_from_refs(&items) as usize as i64
+}
+
+fn py_tuple_from_words(words: &[i64]) -> i64 {
+    let items = words_as_refs(words);
+    pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as usize as i64
+}
+
+fn words_as_refs(words: &[i64]) -> Vec<pyre_object::PyObjectRef> {
+    words
+        .iter()
+        .map(|word| *word as usize as pyre_object::PyObjectRef)
+        .collect()
+}
+
+static PY_LIST_CTOR: std::sync::OnceLock<fn(&[i64]) -> i64> = std::sync::OnceLock::new();
+static PY_TUPLE_CTOR: std::sync::OnceLock<fn(&[i64]) -> i64> = std::sync::OnceLock::new();
+
+fn handler_newlist_refs(
+    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, majit_metainterp::blackhole::DispatchError> {
+    // `newlist/>r`: no item registers, one result register.
+    let dst = code[p] as usize;
+    let ctor = PY_LIST_CTOR.get().expect("list constructor");
+    bh.registers_r[dst] = ctor(&[]);
+    Ok(p + 1)
+}
+
+fn handler_newtuple_refs(
+    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, majit_metainterp::blackhole::DispatchError> {
+    // `newtuple/rr>r`: two ref inputs, then the result register.
+    let a = bh.registers_r[code[p] as usize];
+    let b = bh.registers_r[code[p + 1] as usize];
+    let dst = code[p + 2] as usize;
+    let ctor = PY_TUPLE_CTOR.get().expect("tuple constructor");
+    bh.registers_r[dst] = ctor(&[a, b]);
+    Ok(p + 3)
 }
 
 /// The two coverage properties `blackhole.py setup_insns` holds by

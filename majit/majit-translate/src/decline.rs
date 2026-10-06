@@ -135,6 +135,10 @@ pub mod gate {
     /// A lowered graph passed a pointer to `OwnerRootGuard`, or to an
     /// aggregate that contains one, into a callee that stays residual.
     pub const OWNER_ROOT_GUARD_ESCAPE: &str = "mir::owner_root_guard";
+    /// `front::iter_adapter` `map(it, f).collect()` / `from_iter` rewrite.
+    /// A structural miss leaves the residual `Range::map` FunctionPath,
+    /// which then fails phaseA as an unregistered CallRegistry path.
+    pub const ITER_ADAPTER: &str = "front::iter_adapter";
 }
 
 /// Verbosity of the decline census.  Resolved once, from the environment.

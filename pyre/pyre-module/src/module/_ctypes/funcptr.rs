@@ -1170,24 +1170,29 @@ pub(super) fn callback_result(
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let mut result = match result {
         Ok(value) => value,
-        Err(mut error) => {
-            let callable = pyre_object::with_roots!(obj => instance_get(obj, CALLABLE_KEY))
-                .unwrap_or(pyre_object::PY_NULL);
+        Err(error) => {
             let unknown = || rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string());
-            let rendered = if callable.is_null() {
-                unknown()
-            } else {
-                pyre_object::with_roots!(obj => unsafe { pyre_interpreter::display::py_repr_wtf8(callable) })
-                    .unwrap_or_else(|_| unknown())
-            };
-            pyre_object::with_roots!(obj => error.write_unraisable(
-                pyre_object::w_none(),
-                &pyre_interpreter::display::wtf8_format!(
-                    "Exception ignored while calling ctypes callback function ",
-                    rendered
-                ),
-                pyre_object::PY_NULL,
-            ));
+            pyre_object::with_roots!(obj => {
+                let roots = pyre_object::gc_roots::push_roots();
+                let mut error = error;
+                let error_slot = error.pin(&roots);
+                let callable = instance_get(obj, CALLABLE_KEY).unwrap_or(pyre_object::PY_NULL);
+                let rendered = if callable.is_null() {
+                    unknown()
+                } else {
+                    unsafe { pyre_interpreter::display::py_repr_wtf8(callable) }
+                        .unwrap_or_else(|_| unknown())
+                };
+                error.reload(&roots, error_slot);
+                error.write_unraisable(
+                    pyre_object::w_none(),
+                    &pyre_interpreter::display::wtf8_format!(
+                        "Exception ignored while calling ctypes callback function ",
+                        rendered
+                    ),
+                    pyre_object::PY_NULL,
+                );
+            });
             pyre_object::w_int_new(0)
         }
     };

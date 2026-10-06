@@ -225,7 +225,7 @@ impl ClassDictMethods {
         if !ns.is_null() {
             pyre_object::dictmultiobject::w_dict_get_strategy(ns).clear(ns);
         }
-        crate::baseobjspace::mutated(w_type, None);
+        crate::baseobjspace::mutated_absent(w_type);
     }
 
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
@@ -322,14 +322,14 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
                 // free; it would also leave the store cache answering for the
                 // old hook, which is the wrong answer this exists to remove.
                 if matches!(name.as_str(), Ok("__getattribute__" | "__setattr__")) {
-                    crate::baseobjspace::mutated(w_type, name.as_str().ok());
+                    crate::baseobjspace::mutated_wtf8(w_type, name);
                 }
                 return Ok(());
             }
             Some(stored) => w_value = stored,
         }
     }
-    crate::baseobjspace::mutated(w_type, name.as_str().ok());
+    crate::baseobjspace::mutated_wtf8(w_type, name);
     crate::type_dict_store_wtf8(w_type, name, w_value);
     Ok(())
 }
@@ -344,7 +344,7 @@ unsafe fn type_deldictvalue_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Result<boo
     }
     let removed = crate::type_dict_delete_wtf8(w_type, name);
     if removed {
-        crate::baseobjspace::mutated(w_type, name.as_str().ok());
+        crate::baseobjspace::mutated_wtf8(w_type, name);
     }
     Ok(removed)
 }
@@ -434,7 +434,7 @@ pub(crate) unsafe fn uncell_type_namespace(w_type: PyObjectRef) {
         changed = true;
     }
     if changed {
-        crate::baseobjspace::mutated(pyre_object::gc_roots::shadow_stack_get(type_slot), None);
+        crate::baseobjspace::mutated_absent(pyre_object::gc_roots::shadow_stack_get(type_slot));
     }
 }
 

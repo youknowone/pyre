@@ -444,6 +444,10 @@ pub struct ErrorCarrierSpec<'a> {
     /// Qualified ADT path of `E`, compared after peeling
     /// [`Self::carrier_wrappers`].
     pub carrier_path: &'a str,
+    /// Classdef of the raised object: the handle's `Deref::Target`.
+    /// Empty: the handle [`Self::carrier_path`] is itself the class.
+    /// Result matching still uses [`Self::carrier_path`].
+    pub carrier_class: &'a str,
     /// ADT paths to peel off `E` before that compare, each read through the
     /// wrapper's own first type argument.  Applied outermost-first and at
     /// most once per entry, so `&["alloc::boxed::Box"]` takes
@@ -475,9 +479,22 @@ impl Default for ErrorCarrierSpec<'_> {
     fn default() -> Self {
         Self {
             carrier_path: "",
+            carrier_class: "",
             carrier_wrappers: &[],
             to_exc_object: None,
             from_exc_object: None,
+        }
+    }
+}
+
+impl ErrorCarrierSpec<'_> {
+    /// Classdef key of the raised object. [`Self::carrier_class`] when
+    /// named, otherwise the handle [`Self::carrier_path`].
+    pub fn classdef_path(&self) -> &str {
+        if self.carrier_class.is_empty() {
+            self.carrier_path
+        } else {
+            self.carrier_class
         }
     }
 }
@@ -489,6 +506,7 @@ impl Default for ErrorCarrierSpec<'_> {
 #[derive(Debug, Default, Clone)]
 pub struct OwnedErrorCarrierSpec {
     pub carrier_path: String,
+    pub carrier_class: String,
     pub carrier_wrappers: Vec<String>,
     pub to_exc_object: Option<Vec<String>>,
     pub from_exc_object: Option<(String, String)>,
@@ -501,6 +519,7 @@ impl OwnedErrorCarrierSpec {
         };
         Self {
             carrier_path: spec.carrier_path.to_string(),
+            carrier_class: spec.carrier_class.to_string(),
             carrier_wrappers: own_path(spec.carrier_wrappers),
             to_exc_object: spec.to_exc_object.map(own_path),
             from_exc_object: spec
@@ -2861,6 +2880,14 @@ fn register_configured_jitdrivers(
                 spec.greens.len(),
                 numreds,
                 driver_roots,
+            );
+            let split_start = portal.startblock;
+            crate::codewriter::support::seed_split_portal_input_ops(
+                &mut portal,
+                split_start,
+                &spec.green_kinds,
+                &spec.red_kinds,
+                &spec.red_types,
             );
             // `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver`:
             // keep the copied portal as a backend-inlining boundary and let

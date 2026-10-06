@@ -40,14 +40,18 @@ pub struct W_LZMADecompressor {
 /// object is what `except LZMAError` matches on.
 fn lzma_exception(msg: impl Into<String>) -> pyre_interpreter::PyError {
     let msg = msg.into();
-    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_lzma.LZMAError") {
-        let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
-    err
+    // `lib_pypy/_lzma.py` `raise LZMAError(msg)` is `OperationError(w_type, space.newtext(msg))`.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_lzma.LZMAError") else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = w_str_new_managed(&msg);
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    )
 }
 
 /// `catch_lzma_error`, plus the three failures the filter conversion reports

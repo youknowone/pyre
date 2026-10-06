@@ -10420,8 +10420,15 @@ fn emit_walker_instance<Sym: WalkSym>(
     // `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`).
     let (typeptr, _) = pyre_object::instance_typeptr_for(w_type);
     let user = !std::ptr::eq(typeptr, &pyre_object::pyobject::INSTANCE_TYPE);
+    // Nursery-born (`alloc_instance_object`). `emit_instance_inline`
+    // records a collecting `NewWithVtable`; reload after
+    // (`shadowstack.py expand_pop_roots`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let concrete_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(concrete_instance);
     let instance =
         crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const, user);
+    let concrete_instance = pyre_object::gc_roots::shadow_stack_get(concrete_slot);
     ctx.trace_ctx.set_opref_concrete(
         instance,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),

@@ -1468,25 +1468,52 @@ impl W_TextIOWrapper {
         // is virtual, and a close failure replaces it while retaining the
         // flush exception as `__context__`.
         let flush_error = super::call_method_result(self.self_obj(), "flush", &[]).err();
-        let close_result = super::call_method_result(
-            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
-            "close",
-            &[],
-        );
-        if let Err(mut close_error) = close_result {
-            if let Some(mut flush_error) = flush_error {
+        let (close_result, flush_error) = if let Some(error) = flush_error {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
+            let close_result = super::call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+                "close",
+                &[],
+            );
+            error.reload(&_roots, error_slot);
+            (close_result, Some(error))
+        } else {
+            (
+                super::call_method_result(
+                    pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+                    "close",
+                    &[],
+                ),
+                None,
+            )
+        };
+        if let Err(close_error) = close_result {
+            if let Some(flush_error) = flush_error {
                 let _roots = pyre_object::gc_roots::push_roots();
+                let mut close_error = close_error;
+                let mut flush_error = flush_error;
+                let close_slot = close_error.pin(&_roots);
+                let flush_slot = flush_error.pin(&_roots);
                 let flush_obj = flush_error.to_exc_object();
+                flush_error.reload(&_roots, flush_slot);
                 let _ = pyre_object::gc_roots::pin_root(flush_obj);
-                let flush_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let flush_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                close_error.reload(&_roots, close_slot);
                 let close_obj = close_error.to_exc_object();
+                close_error.reload(&_roots, close_slot);
+                let _ = pyre_object::gc_roots::pin_root(close_obj);
+                let close_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 unsafe {
                     pyre_object::interp_exceptions::w_exception_set_context(
-                        close_obj,
-                        pyre_object::gc_roots::shadow_stack_get(flush_slot),
+                        pyre_object::gc_roots::shadow_stack_get(close_obj_slot),
+                        pyre_object::gc_roots::shadow_stack_get(flush_obj_slot),
                     )
                 };
-                close_error.exc_object = close_obj;
+                close_error.reload(&_roots, close_slot);
+                close_error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(close_obj_slot));
+                return Err(close_error);
             }
             return Err(close_error);
         }
@@ -1648,15 +1675,31 @@ impl W_TextIOWrapper {
             Ok(cookie.to_object())
         })();
 
-        let restore = super::call_method_result(
-            self.w_decoder,
-            "setstate",
-            &[pyre_object::gc_roots::shadow_stack_get(saved_slot)],
-        );
-        match (result, restore) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(value), Ok(_)) => Ok(value),
+        match result {
+            Err(error) => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let mut error = error;
+                let error_slot = error.pin(&_roots);
+                let _ = super::call_method_result(
+                    self.w_decoder,
+                    "setstate",
+                    &[pyre_object::gc_roots::shadow_stack_get(saved_slot)],
+                );
+                error.reload(&_roots, error_slot);
+                Err(error)
+            }
+            Ok(value) => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let value = pyre_object::gc_roots::pin_root(value);
+                match super::call_method_result(
+                    self.w_decoder,
+                    "setstate",
+                    &[pyre_object::gc_roots::shadow_stack_get(saved_slot)],
+                ) {
+                    Err(error) => Err(error),
+                    Ok(_) => Ok(value),
+                }
+            }
         }
     }
 

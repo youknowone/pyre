@@ -2880,7 +2880,7 @@ mod tests {
         assert_binop_identity(OpCode::IntSub, 1, 0, 0);
         // x - x = 0
         assert_binop_self(OpCode::IntSub, Some(0));
-        // constant fold
+        // constant fold (sub_const_canonicalize then OptPure)
         assert_binop_const_fold(OpCode::IntSub, 30, 10, 20);
     }
 
