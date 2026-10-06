@@ -18907,12 +18907,33 @@ unsafe fn list_iter_stop(obj: PyObjectRef, index: isize) -> PyObjectRef {
     PY_NULL
 }
 
+/// Acquire, read, and release as one residual. PyPy serialises this step
+/// under the GIL (`gil.py` `GILThreadLocals.gil_ready`) and has no per-list
+/// lock. Looking inside `w_list_getitem_inner` while the stripe is held
+/// records a guard that resumes at `FOR_ITER` and never releases, so a
+/// later thread unpacking a list stararg waits forever. `w_list_getitem`
+/// keeps the same opaque pairing.
+#[majit_macros::dont_look_inside]
+unsafe fn list_iter_getitem_locked(seq: PyObjectRef, index: isize) -> Option<PyObjectRef> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    let seq = pyre_object::gc_roots::pin_root(seq);
+    let lock = pyre_object::w_list_lock_acquire(seq);
+    let seq = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
+    if lock != 0 {
+        pyre_object::w_list_lock_release(lock);
+    }
+    item
+}
+
 /// Published `gil_ready`: the same step under the stripe lock.
 ///
 /// A contended stripe parks in `before_external_block`, and the inner get
 /// boxes an int or a float. Both collect. The pins stay up through that
 /// get and the iterator update; the iterator is read back after the get.
 /// `#[inline(never)]` keeps this bracket out of the unpublished arm.
+/// The stripe pairing lives in [`list_iter_getitem_locked`].
 #[inline(never)]
 unsafe fn list_iter_descr_next_locked(
     obj: PyObjectRef,
@@ -18924,12 +18945,7 @@ unsafe fn list_iter_descr_next_locked(
     pyre_object::gc_roots::publish_roots(&[obj, seq]);
     pyre_object::gc_roots::normalize_roots(root_base, 2);
     let seq = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    let lock = pyre_object::w_list_lock_acquire(seq);
-    let seq = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
-    if lock != 0 {
-        pyre_object::w_list_lock_release(lock);
-    }
+    let item = list_iter_getitem_locked(seq, index);
     let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     if let Some(item) = item {
         pyre_object::w_list_iter_set_index(obj, index + 1);

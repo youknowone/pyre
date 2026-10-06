@@ -3503,9 +3503,8 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 /// Supports negative indexing. Returns None if out of bounds.
 ///
 /// The stripe acquire and its release both finish inside this call.
-/// `w_list_getitem_inner` stays on the list-iterator path
-/// (`list_iter_descr_next_locked`), which is the graph
-/// `list_getitem_jitcode` resolves.
+/// `w_list_getitem_inner` is the lock-free body; the locked iterator arm
+/// is a separate opaque residual so a guard there cannot keep the stripe.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
