@@ -522,12 +522,28 @@ impl RootScope {
     /// Scope-local [`pin_roots`]: publish every live word, then normalize
     /// the run. Sequential [`Self::pin_root`] would query after the first
     /// write and leave later values invisible to a foreign collection.
+    ///
+    /// One cell resolution covers both halves: `publish` then
+    /// `normalize` each used to call [`shadow_stack_cell`], and the
+    /// second `_tlv_get_addr` sat on every `with_roots!` bracket.
     #[inline]
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn pin_roots(&self, roots: &[PyObjectRef]) -> usize {
-        let base = self.publish(roots);
-        self.normalize(base, roots.len());
-        base
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
+        let stack_slot = shadow_stack_cell();
+        // SAFETY: this thread's cell, alive for the bracket; `incr_stack`
+        // returns the slot it just claimed, and `publish` semantics claim
+        // every index in the run `normalize_published_run` then reads.
+        unsafe {
+            let stack = &*stack_slot;
+            let base = stack.len();
+            for &root in roots {
+                *stack.incr_stack() = root;
+            }
+            let _ = normalize_published_run(stack, base, roots.len());
+            base
+        }
     }
 
     /// One-word residual ABI for [`Self::publish`], the
@@ -590,11 +606,14 @@ impl RootScope {
         let stack_slot = shadow_stack_cell();
         // Publish the raw value before the query, for the reason [`pin_root`]
         // gives: the slot is what a walker reads, so it must name the value
-        // before anything consults the collector about it.
+        // before anything consults the collector about it. One cell
+        // resolution covers the store and the normalize.
         // SAFETY: same cell; `slot` bounds-checks `index`.
-        unsafe { *(*stack_slot).slot(index) = root };
-        // SAFETY: `stack_slot` is this thread's live root-stack cell.
-        normalize_published_slot(unsafe { &*stack_slot }, index);
+        unsafe {
+            let stack = &*stack_slot;
+            *stack.slot(index) = root;
+            normalize_published_slot(stack, index);
+        }
     }
 }
 
@@ -935,9 +954,17 @@ pub extern "C" fn reload_top_root_jit_abi(root: PyObjectRef) -> PyObjectRef {
 #[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
-    let base = publish_roots(roots);
-    normalize_roots(base, roots.len());
-    base
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    with_shadow_stack(|stack| {
+        let base = stack.len();
+        for &root in roots {
+            // SAFETY: `incr_stack` returns the slot it just claimed.
+            unsafe { *stack.incr_stack() = root };
+        }
+        let _ = normalize_published_run(stack, base, roots.len());
+        base
+    })
 }
 
 /// The write half of `push_roots(hop)`: store `roots` in fresh root-stack
@@ -1054,9 +1081,9 @@ pub fn gcarray_ref_items(arr: *const crate::object_array::GcTypedArray) -> Vec<P
 pub fn normalize_roots(base: usize, len: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
-    for index in base..base + len {
-        with_shadow_stack(|stack| normalize_published_slot(stack, index));
-    }
+    with_shadow_stack(|stack| {
+        let _ = normalize_published_run(stack, base, len);
+    });
 }
 
 /// Current length of the thread-local shadow stack. Used by
@@ -1191,8 +1218,10 @@ pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
     // wait behind another thread's collection, so the value must already be
     // visible to that collector before we enter the query safepoint.
     // SAFETY: `slot` bounds-checks `index` against the live length.
-    with_shadow_stack(|stack| unsafe { *stack.slot(index) = root });
+    // One cell resolution covers the store and the normalize, matching
+    // [`RootScope::set`].
     with_shadow_stack(|stack| {
+        unsafe { *stack.slot(index) = root };
         normalize_published_slot(stack, index);
     });
 }
