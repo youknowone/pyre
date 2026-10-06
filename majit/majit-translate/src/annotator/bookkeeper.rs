@@ -3598,6 +3598,28 @@ impl Bookkeeper {
         host
     }
 
+    /// Prebuilt singleton instance of the interned class for `qualname`.
+    ///
+    /// RPython `InstanceRepr.get_reusable_prebuilt_instance` caches one
+    /// instance per classdef on the rtyper; here the instance lives on
+    /// the interned class object (`HostObject::reusable_prebuilt_instance`)
+    /// in [`Self::struct_root_classes`]. A synthetic unit-variant path
+    /// interns through [`Self::intern_enum_variant_host`] so the instance's
+    /// `__class__` is the variant ClassDef (Continue → StepResult<..> →
+    /// StepResult). `getuniqueclassdef(value.__class__)` then returns that
+    /// ClassDef (`classdesc.py getuniqueclassdef`, `rclass.py
+    /// InstanceRepr.convert_const`). The declared discriminant is a
+    /// class-dict constant on that host (`ClassDesc.classdict`).
+    pub fn intern_unit_variant_prebuilt_instance(
+        self: &Rc<Self>,
+        qualname: &str,
+        tag: Option<i64>,
+    ) -> Option<HostObject> {
+        crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+            self, qualname, tag,
+        )
+    }
+
     /// True when `name` is a type-root key in the snapshot
     /// struct-field registry ([`Self::struct_fields`]).  Enums and
     /// structs both register under their qualified path AND bare leaf
@@ -4593,31 +4615,6 @@ impl Bookkeeper {
         }
     }
 
-    /// Classdef for a prebuilt instance.
-    ///
-    /// Ordinary instances keep `getuniqueclassdef(x.__class__)`. A folded
-    /// unit-variant constant (`StepResult<*mut PyObject>::Continue`) is
-    /// re-interned as the enum variant so it subclasses the discriminant-only
-    /// class field reads already use.
-    fn classdef_for_prebuilt_instance(
-        self: &Rc<Self>,
-        class_obj: &crate::flowspace::model::HostObject,
-    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        let qualname = class_obj.qualname();
-        if let Some((owner, variant)) = qualname.rsplit_once('.') {
-            let mut segments: Vec<String> = owner.split('.').map(str::to_string).collect();
-            segments.push(variant.to_string());
-            if crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(
-                &segments,
-            ) {
-                let enum_root = owner.replace('.', "::");
-                let host = self.intern_enum_variant_host(&enum_root, variant);
-                return self.getuniqueclassdef(&host);
-            }
-        }
-        self.getuniqueclassdef(class_obj)
-    }
-
     /// Input is a flowspace [`ConstValue`] — the Rust-side counterpart
     /// to upstream's Python constant. Primitive branches (bool / int /
     /// float / str / char / unicode / bytearray / tuple / None) are
@@ -4970,10 +4967,10 @@ impl Bookkeeper {
             // A unit-variant singleton is folded to a prebuilt instance whose
             // class host is interned through `intern_enum_variant_host`
             // (`unit_variant_fold::intern_unit_variant_prebuilt_instance`)
-            // so `value.__class__` is the variant ClassDef.  A dotted ctor
-            // host (bookkeeper-less fold) is re-interned as that variant
-            // so field reads of the discriminant-only class still union.
-            let classdef = self.classdef_for_prebuilt_instance(class_obj)?;
+            // so `value.__class__` is the variant ClassDef.
+            // `getuniqueclassdef(x.__class__)` (bookkeeper.py) then returns
+            // that ClassDef (`rclass.py` `InstanceRepr.convert_const`).
+            let classdef = self.getuniqueclassdef(class_obj)?;
             super::classdesc::ClassDef::see_instance(&classdef, obj)?;
             let mut inst = super::model::SomeInstance::new(
                 Some(classdef),
@@ -6748,11 +6745,10 @@ mod tests {
         for root in bk.struct_root_names() {
             let _ = bk.getuniqueclassdef_for_struct_root(&root);
         }
-        let instance =
-            crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+        let instance = bk
+            .intern_unit_variant_prebuilt_instance(
                 "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
                 Some(0),
-                Some(&bk),
             )
             .expect("prebuilt Continue");
         let s = bk
@@ -9164,6 +9160,70 @@ mod tests {
         assert!(matches!(entry, DescEntry::Class(_)));
         let cd = entry.as_class().unwrap();
         assert_eq!(cd.borrow().name, "pkg.Foo");
+    }
+
+    #[test]
+    fn unit_variant_prebuilt_instance_is_of_interned_class() {
+        // The prebuilt instance's `__class__` is the interned class
+        // object (`rclass.py InstanceRepr.convert_const` /
+        // `classdesc.py getuniqueclassdef`). getuniqueclassdef of that
+        // class has the Continue → StepResult<*mut PyObject> →
+        // StepResult chain.
+        use crate::annotator::classdesc::ClassDef;
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyopcode::StepResult".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
+            vec![],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let dotted = "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue";
+        let interned = bk.intern_enum_variant_host(
+            "pyre_interpreter::pyopcode::StepResult<*mut PyObject>",
+            "Continue",
+        );
+        let instance = bk
+            .intern_unit_variant_prebuilt_instance(dotted, Some(0))
+            .expect("unit-variant prebuilt instance");
+        let cls = instance.class_of().expect("instance class");
+        assert_eq!(cls, interned);
+        let cd = bk
+            .getuniqueclassdef(&cls)
+            .expect("getuniqueclassdef of the interned class");
+        let mro: Vec<String> = ClassDef::getmro(&cd)
+            .into_iter()
+            .map(|c| c.borrow().name.clone())
+            .collect();
+        assert!(
+            mro.iter().any(|n| n.contains("Continue")),
+            "MRO must include Continue, got {mro:?}"
+        );
+        assert!(
+            mro.iter().any(|n| n.contains("StepResult<*mut PyObject>")),
+            "MRO must include StepResult<*mut PyObject>, got {mro:?}"
+        );
+        let short = bk
+            .getuniqueclassdef_for_struct_root("pyopcode::StepResult")
+            .expect("field class");
+        assert!(
+            cd.borrow().issubclass(&short),
+            "Continue must subclass StepResult, MRO {mro:?}"
+        );
+        assert!(
+            mro.iter().any(|n| {
+                let leaf = n.rsplit("::").next().unwrap_or(n);
+                leaf == "StepResult"
+            }),
+            "MRO must include StepResult, got {mro:?}"
+        );
     }
 
     #[test]

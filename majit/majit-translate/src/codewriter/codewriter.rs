@@ -164,13 +164,30 @@ impl CodeWriter {
         &self,
         callcontrol: &CallControl,
     ) -> std::rc::Rc<crate::translator::rtyper::call_registry::CallRegistry> {
-        if let Some(existing) = self.real_rtyper_registry.borrow().as_ref() {
-            return existing.clone();
+        if let Some((registry, bk)) = self
+            .real_rtyper_registry
+            .borrow()
+            .as_ref()
+            .map(|existing| (existing.clone(), existing.bookkeeper().clone()))
+        {
+            callcontrol.set_bookkeeper(bk);
+            return registry;
         }
-        let registry =
-            std::rc::Rc::new(crate::translator::rtyper::call_registry::CallRegistry::new(
-                std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
-            ));
+        // One bookkeeper per translation (`rtyper.annotator.bookkeeper`).
+        // Reuse a bookkeeper already threaded onto this CallControl so
+        // `InstanceRepr.convert_const` / `getuniqueclassdef(value.__class__)`
+        // see the interned class; mint only when this session has none.
+        let bk = match callcontrol.bookkeeper() {
+            Some(existing) => existing,
+            None => {
+                let minted = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+                callcontrol.set_bookkeeper(minted.clone());
+                minted
+            }
+        };
+        let registry = std::rc::Rc::new(
+            crate::translator::rtyper::call_registry::CallRegistry::new(bk),
+        );
         // Thread the program-wide struct field shapes into the shared
         // bookkeeper so
         // `getuniqueclassdef_for_struct_root` / `project_struct_field_type`
@@ -609,14 +626,10 @@ impl CodeWriter {
         // Catches both the Match-arm and Skip-arm graphs; the
         // companion fold in `flowspace_adapter::
         // legacy_const_define_hlvalue` only reaches Match-arm graphs.
-        let bookkeeper = self
-            .real_rtyper_registry
-            .borrow()
-            .as_ref()
-            .map(|registry| registry.bookkeeper().clone());
+        let registry = self.dual_gate_registry(callcontrol);
         crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
             &mut graph_owned,
-            bookkeeper.as_ref(),
+            Some(registry.bookkeeper()),
         );
         // `resolve_types` (called upstream by the rtyper) already
         // commits each backing Variable's `concretetype` cell as it

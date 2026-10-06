@@ -2642,13 +2642,18 @@ impl<'a> Transformer<'a> {
         // `Constant(prebuilt_instance_ptr)` before jtransform runs.
         // `transform_graph_to_jitcode` runs this fold on `graph_owned`
         // already; running it again here is idempotent (no-op after
-        // the first pass) and ensures `transform_graph` /
-        // `transform_graph_with_callcontrol` entry points (test
-        // fixtures, etc.) are also covered.
-        // After rtype: leftover `Call` ops never reach
-        // `InstanceRepr.convert_const`.  Match-arm graphs interned with
-        // the bookkeeper in `flowspace_adapter` before rtype.
-        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten, None);
+        // the first pass) when the session bookkeeper is present.
+        // `InstanceRepr.convert_const` looks up `value.__class__` on
+        // `rtyper.annotator.bookkeeper`; a throwaway Bookkeeper is a
+        // second intern universe, so a CallControl without one
+        // (unit-test fixtures, `transform_graph` with no annotator)
+        // skips the fold rather than minting.
+        if let Some(fold_bk) = self.callcontrol.as_ref().and_then(|cc| cc.bookkeeper()) {
+            crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
+                &mut rewritten,
+                Some(&fold_bk),
+            );
+        }
 
         // RPython rtyper `specialize_call` rewrites a `we_are_jitted()`
         // `direct_call` to the `_we_are_jitted` symbolic constant

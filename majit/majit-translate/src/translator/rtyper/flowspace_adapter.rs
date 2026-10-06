@@ -4173,7 +4173,7 @@ fn legacy_const_define_hlvalue(
             // `is_synthetic_result_option_ctor` to handle the args=0
             // case.
             let qualname = segments.join(".");
-            // Reuse the process-wide prebuilt-instance interner so this
+            // Reuse the bookkeeper's interned-class prebuilt instance so this
             // legacy fold path produces the same `HostObject` Arc as the
             // pre-jtransform `fold_unit_variant_ctors` pass — mirrors
             // `InstanceRepr.get_reusable_prebuilt_instance` caching on
@@ -4181,11 +4181,14 @@ fn legacy_const_define_hlvalue(
             // (`rpython/rtyper/rclass.py`).  Without this, two
             // graphs that reach the same unit variant via different
             // gate arms would resolve to distinct singletons.
+            let Some(registry) = call_registry else {
+                return Ok(None);
+            };
             let instance =
                 crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                    registry.bookkeeper(),
                     &qualname,
                     *variant_tag,
-                    call_registry.map(|registry| registry.bookkeeper()),
                 );
             let Some(instance) = instance else {
                 return Ok(None);
