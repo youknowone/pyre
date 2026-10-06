@@ -39,13 +39,6 @@ lines, which are added to the environment of every runner for that script
 only. Without this a script can keep passing after the shape it exercises
 stops being reachable, i.e. cover nothing while still looking green.
 
-A script that cannot finish under the default 30s cap names
-
-    # pyre-check: timeout=SECONDS
-
-in the same header. The runner uses that budget for every backend of that
-script, including the pypy cross-check and a `regresses-under` arm.
-
 A fix that ships ON, with a switch that restores the defect, has an arm
 nothing runs: the corpus covers the fix, and the switch is exercised once by
 whoever measured it. A script names that arm with
@@ -163,7 +156,6 @@ def _scripts() -> tuple[list[Path], list[Path]]:
         # knows which runners are pyre's, and an unparseable directive there
         # would arrive as a traceback out of the middle of the table.
         _regresses_under(p)
-        _script_timeout(p)
         (out if _runs_here(p) else skipped).append(p)
     return out, skipped
 
@@ -221,31 +213,6 @@ def _regresses_under(script: Path) -> list[tuple[dict[str, str], str]]:
 
 
 TIMEOUT = 30
-TIMEOUT_PREFIX = "# pyre-check: timeout="
-
-
-def _script_timeout(script: Path) -> int:
-    """Seconds this script is allowed, or the default 30s cap.
-
-    `# pyre-check: timeout=SECONDS` in the header. A missing or empty value
-    keeps the default; a non-positive or unparseable value is an authoring
-    error rather than a silent 30s.
-    """
-    for line in script.read_text(encoding="utf-8").splitlines()[:20]:
-        if not line.startswith(TIMEOUT_PREFIX):
-            continue
-        raw = line[len(TIMEOUT_PREFIX) :].strip()
-        try:
-            seconds = int(raw)
-        except ValueError:
-            seconds = 0
-        if seconds <= 0:
-            raise RuntimeError(
-                f"{script.name}: `{TIMEOUT_PREFIX}` needs a positive integer, "
-                f"got: {line.strip()}"
-            )
-        return seconds
-    return TIMEOUT
 
 
 class Failure(NamedTuple):
@@ -261,10 +228,7 @@ class Failure(NamedTuple):
 
 
 def _run(
-    cmd: list[str],
-    script: Path,
-    env: dict[str, str] | None,
-    timeout: int = TIMEOUT,
+    cmd: list[str], script: Path, env: dict[str, str] | None
 ) -> tuple[bool, str, str]:
     """Whether the script passed, why it did not, and the child's stderr.
 
@@ -279,7 +243,7 @@ def _run(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
+            timeout=TIMEOUT,
             env=None if env is None else {**os.environ, **env},
         )
     except subprocess.TimeoutExpired as expired:
@@ -291,7 +255,7 @@ def _run(
         partial = expired.stderr or ""
         if isinstance(partial, bytes):
             partial = partial.decode("utf-8", "replace")
-        return False, f"timed out after {timeout}s", partial
+        return False, f"timed out after {TIMEOUT}s", partial
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     last = lines[-1] if lines else ""
     if proc.returncode == 0 and last == "OK":
@@ -518,12 +482,11 @@ def main() -> int:
     for script in scripts:
         name = script.name
         pinned = _script_env(script)
-        budget = _script_timeout(script)
         row: list[str] = [f"  {name:<36s}"]
         reasons: list[str] = []
         for runner in runners:
             merged = {**(runner.env or {}), **pinned}
-            ok, reason, err = _run(runner.cmd, script, merged or None, budget)
+            ok, reason, err = _run(runner.cmd, script, merged or None)
             row.append(f"{runner.name}={'OK' if ok else 'FAIL'}")
             if not ok:
                 failures.append(Failure(name, runner.name, reason, err))
@@ -537,7 +500,6 @@ def main() -> int:
                     runner.cmd,
                     script,
                     {**(runner.env or {}), **pinned, **settings},
-                    budget,
                 )[0]
                 if not ok:
                     row.append(f"{runner.name}:regresses=xfail")
@@ -555,7 +517,7 @@ def main() -> int:
                 reasons.append(f"      {runner.name} [{spelled}]: {stale}")
         if pypy is not None:
             declared = _pypy_divergence(script)
-            ok, reason, err = _run([pypy], script, pinned or None, budget)
+            ok, reason, err = _run([pypy], script, pinned or None)
             if declared is None:
                 row.append(f"pypy={'OK' if ok else 'FAIL'}")
                 if not ok:
