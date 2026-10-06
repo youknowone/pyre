@@ -2191,6 +2191,56 @@ impl GcCache {
         }
     }
 
+    /// `cpu.fielddescrof` intern for `W_ListObject.int_items.block` /
+    /// `float_items.block`. Returns the `W_LIST_DESCR_GROUP` entry when
+    /// that group has published into `_cache_field`.
+    fn canonical_list_items_block(
+        &self,
+        field_name: &str,
+        display_name: Option<&str>,
+    ) -> Option<Arc<SimpleFieldDescr>> {
+        let name = display_name.unwrap_or(field_name);
+        let key = if field_name == "int_items.block"
+            || field_name.ends_with(".int_items.block")
+            || name == "int_items.block"
+            || name.ends_with(".int_items.block")
+        {
+            "int_items.block"
+        } else if field_name == "float_items.block"
+            || field_name.ends_with(".float_items.block")
+            || name == "float_items.block"
+            || name.ends_with(".float_items.block")
+        {
+            "float_items.block"
+        } else {
+            return None;
+        };
+        const OWNERS: &[&str] = &[
+            "W_ListObject",
+            "listobject::W_ListObject",
+            "pyre_object::listobject::W_ListObject",
+        ];
+        for owner in OWNERS {
+            if let Some(sid) = struct_id_for_name(owner)
+                && let Some(inner) = self._cache_field.get(&LLType::Struct(sid.as_u64()))
+                && let Some(fd) = inner
+                    .get(key)
+                    .or_else(|| inner.get(&format!("W_ListObject.{key}")))
+            {
+                return Some(fd.clone());
+            }
+        }
+        let sid = StructId::from_canonical("W_ListObject");
+        self._cache_field
+            .get(&LLType::Struct(sid.as_u64()))
+            .and_then(|inner| {
+                inner
+                    .get(key)
+                    .or_else(|| inner.get(&format!("W_ListObject.{key}")))
+                    .cloned()
+            })
+    }
+
     /// descr.py get_field_descr(gccache, STRUCT, fieldname).
     ///
     /// `struct_key`: LLType::Struct — the owning type identity.
@@ -2211,10 +2261,7 @@ impl GcCache {
     /// Callers that know the owning struct's source name pass the full
     /// `Owner.field` spelling; `None` falls back to the `T<type_id>.` stand-in
     /// for the mint sites that only carry the numeric struct identity.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
-    )]
+    ///
     /// The name-inferring entry point, for producers that have no spec to
     /// declare on — chiefly the `BhDescr` path, which rebuilds a descr from a
     /// serialized field name.  A producer that knows its own layout should
@@ -2279,6 +2326,16 @@ impl GcCache {
         // word.  `None` falls back to the display name.
         declared_class_word: Option<bool>,
     ) -> Arc<SimpleFieldDescr> {
+        // descr.py `cpu.fielddescrof(T, fieldname)`: one descr object
+        // per `(STRUCT, fieldname)`. `list.int_set_items` /
+        // GETFIELD of `l.items` share `int_items.block` on
+        // `W_ListObject` (`rlist.py` `_ll_list_resize_hint_really`
+        // assigns `l.items`). Walkers that mint against a nested
+        // `IntArray` type_id would otherwise get a second Arc, and
+        // `force_from_effectinfo` would miss the GETFIELD cache.
+        if let Some(fd) = self.canonical_list_items_block(field_name, display_name) {
+            return fd;
+        }
         // descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
         // descr.py:220-221: cache[STRUCT][fieldname]
