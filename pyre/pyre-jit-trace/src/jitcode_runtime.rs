@@ -1672,9 +1672,9 @@ fn packed_layout_type_ids() -> &'static [u64] {
     })
 }
 
-/// Install the one opcode `BhDescr::Field` EffectInfo named and the packed
-/// parent omitted. Appending that field onto the size keeps
-/// `index_in_parent` inside `all_fielddescrs`, which `force_box` indexes.
+/// `descr.py` `get_field_descr`: mint the opcode Field into
+/// `_cache_field[STRUCT][fieldname]` with `parent_descr = get_size_descr`.
+/// Packed parent `all_fielddescrs` already holds `heaptracker.all_fielddescrs`.
 fn publish_kind0_field(struct_id: u64, field_name: &str) {
     let layouts = packed_layout_type_ids();
     let index = descrs_index();
@@ -1686,7 +1686,16 @@ fn publish_kind0_field(struct_id: u64, field_name: &str) {
             continue;
         }
         let bh = load_descr_with_parent(slot, descr_layout_at);
-        crate::descr::attach_unlisted_opcode_field(struct_id, field_name, &bh);
+        let field_key = match &bh {
+            majit_jitcode::jitcode::BhDescr::Field { owner, name, .. } => {
+                crate::descr::bh_field_cache_key(owner, name)
+            }
+            _ => continue,
+        };
+        if field_key != field_name {
+            continue;
+        }
+        let _ = crate::descr::make_descr_from_bh(&bh);
     }
 }
 

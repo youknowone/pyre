@@ -998,12 +998,10 @@ fn build_object_descr_group_with_field_indices(
 }
 
 /// `build_object_descr_group_with_def_path` plus GC edges that the
-/// positional `fields` census does not name.  `extra_gc_edges` join the
-/// `PyObject.w_class` edge every group already carries: they land in
-/// `gc_fielddescrs` — which is what `rewrite.py clear_gc_fields`
-/// walks to zero a fresh object's GC-pointer slots — while staying out of
-/// the positional `all_fielddescrs` list that `field_descr_from_group`
-/// indexes.
+/// positional `fields` census does not name. `PyObject.w_class` is the
+/// nested header leaf `heaptracker.py all_fielddescrs` puts at
+/// `all_fielddescrs[0]`. Other extra edges (`vable_token`) stay
+/// gc-only: `rewrite.py clear_gc_fields` walks `gc_fielddescrs`.
 fn build_object_descr_group_with_extra_gc_edges(
     obj_size: usize,
     type_id: u32,
@@ -11435,7 +11433,7 @@ fn heapcache_index_for_field_access(
     }
 }
 
-fn bh_field_cache_key<'a>(owner: &str, name: &'a str) -> &'a str {
+pub(crate) fn bh_field_cache_key<'a>(owner: &str, name: &'a str) -> &'a str {
     // `descr.py` keys `cache[STRUCT][fieldname]` by the field name the
     // STRUCT already stores. The owner prefix is only a printable
     // qualification on the wire, so strip it in place instead of
@@ -13032,106 +13030,6 @@ pub(crate) fn ambiguous_field_struct(
         },
         _ => None,
     }
-}
-
-/// Put one opcode field onto the published size at the next positional slot.
-///
-/// `make_descr_from_bh` would mint it with the opcode's `index_in_parent`,
-/// which is past `all_fielddescrs` for a trailing tail. `force_box` then
-/// indexes off the end. Append instead, so the index is the new slot.
-pub(crate) fn attach_unlisted_opcode_field(
-    struct_id: u64,
-    field_name: &str,
-    bh: &majit_jitcode::jitcode::BhDescr,
-) {
-    use majit_jitcode::jitcode::BhDescr;
-    let BhDescr::Field {
-        offset,
-        field_size,
-        field_type,
-        field_flag,
-        is_field_signed,
-        is_immutable,
-        is_quasi_immutable,
-        name,
-        owner,
-        ..
-    } = bh
-    else {
-        return;
-    };
-    if bh_field_cache_key(owner, name) != field_name {
-        return;
-    }
-    let key = majit_ir::descr::LLType::Struct(struct_id);
-    let mut gc = majit_ir::descr::gc_cache().lock();
-    let Some(size_ref) = gc._cache_size.shift_remove(&key) else {
-        return;
-    };
-    let needle = format!(".{field_name}");
-    let already = size_ref.as_size_descr().is_some_and(|sd| {
-        sd.all_fielddescrs()
-            .iter()
-            .any(|field| field.field_key() == field_name || field.field_name().ends_with(&needle))
-    });
-    if already {
-        gc._cache_size.insert(key, size_ref);
-        return;
-    }
-    let mut simple =
-        match majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleSizeDescr>(size_ref) {
-            Ok(simple) => simple,
-            Err(size_ref) => {
-                gc._cache_size.insert(key, size_ref);
-                return;
-            }
-        };
-    // `make_mut` clones when another `Arc` or `Weak` exists. Existing
-    // fields already hold a parent `Weak`, so this yields a unique size.
-    // Push before `set_parent_descr`: `get_mut` refuses an allocation that
-    // already has a `Weak`.
-    let _ = std::sync::Arc::make_mut(&mut simple);
-    let index = simple.all_fielddescrs().len();
-    let display = if name.is_empty() {
-        format!("{owner}.{field_name}")
-    } else {
-        (*name).to_string()
-    };
-    let mut field = majit_ir::descr::SimpleFieldDescr::new_with_name(
-        index as u32,
-        *offset,
-        *field_size,
-        *field_type,
-        *is_immutable,
-        *field_flag,
-        display,
-        field_name,
-    );
-    if *is_field_signed {
-        field = field.with_signed(true);
-    }
-    field = field
-        .with_quasi_immutable(*is_quasi_immutable)
-        .with_index_in_parent(index);
-    let field = std::sync::Arc::new(field);
-    std::sync::Arc::get_mut(&mut simple)
-        .expect("make_mut left a unique size")
-        .push_unlisted_field(field.clone());
-    gc._cache_field
-        .entry(key.clone())
-        .or_default()
-        .entry(field_name.to_string())
-        .or_insert_with(|| field);
-    let size_back: majit_ir::descr::DescrRef = simple;
-    // `Arc::make_mut` cloned when existing fields held a parent Weak.
-    // Rebind every cached field onto the replacement (`descr.py` one
-    // SizeDescr per STRUCT).
-    if let Some(fields) = gc._cache_field.get(&key) {
-        for existing in fields.values() {
-            existing.set_parent_descr(&size_back);
-        }
-    }
-    gc._cache_size.insert(key, size_back);
 }
 
 pub(crate) fn stamp_effect_info_descr(

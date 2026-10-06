@@ -6720,16 +6720,6 @@ impl SimpleSizeDescr {
         self
     }
 
-    /// Append one field the packed parent omitted.
-    ///
-    /// The caller sets `index_in_parent` to this list's current length.
-    /// `force_box` indexes `all_fielddescrs()[index_in_parent]`. A field
-    /// whose offset is at or past `size` is the variable tail
-    /// (`with_all_fielddescrs`), so it stays out of `gc_fielddescrs`.
-    pub fn push_unlisted_field(&mut self, fd: Arc<dyn FieldDescr>) {
-        self.all_fielddescrs.push(fd);
-    }
-
     /// gc.py:541: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
     /// Takes `&self` because the runtime layoutbuilder step stamps the
     /// collector id after the baked descriptor table has shared the Arc.
@@ -7138,6 +7128,21 @@ fn publish_borrowed_struct_layout_inner(
             return None;
         }
     }
+    // `heaptracker.py all_fielddescrs` recurses into the inlined header
+    // STRUCT, so the class-word leaf is `all_fielddescrs[0]`. Other extra
+    // edges stay gc-only (`vable_token`). Declaration-order indices on
+    // the borrowed specs start at 0; shift them by the leading leaf the
+    // same way `make_simple_descr_group_keyed_with_headerless` does.
+    let mut leading: Vec<Arc<dyn FieldDescr>> = Vec::new();
+    let mut gc_only: Vec<Arc<dyn FieldDescr>> = Vec::new();
+    for fd in extra_gc_fielddescrs {
+        if !headerless && fd.is_w_class() {
+            leading.push(fd.clone());
+        } else {
+            gc_only.push(fd.clone());
+        }
+    }
+    let leading_len = leading.len();
     let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
     let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {
         let parent_descr: Weak<dyn Descr> = weak_size.clone();
@@ -7169,7 +7174,7 @@ fn publish_borrowed_struct_layout_inner(
                     flag: spec.flag,
                     virtualizable: false,
                     class_word: AtomicU8::new(class_word),
-                    index_in_parent: spec.index_in_parent,
+                    index_in_parent: spec.index_in_parent + leading_len,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: None,
                 })
@@ -7177,18 +7182,20 @@ fn publish_borrowed_struct_layout_inner(
             .collect();
         // The size owns one fat `Arc` per field. The group keeps these
         // concrete Arcs. `get_field_descr` does not clone the list again.
-        let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = built
-            .iter()
-            .cloned()
-            .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
-            .collect();
+        let mut all_fielddescrs = leading;
+        all_fielddescrs.extend(
+            built
+                .iter()
+                .cloned()
+                .map(|field_descr| field_descr as Arc<dyn FieldDescr>),
+        );
         *field_descrs_cell.borrow_mut() = built;
         let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
         sd.set_cache_key(cache_key);
         sd.set_gc_managed(is_gc_managed);
         sd.set_headerless(headerless);
         let mut sd = sd.with_all_fielddescrs(all_fielddescrs);
-        for fd in extra_gc_fielddescrs {
+        for fd in gc_only {
             sd = sd.with_extra_gc_fielddescr(fd.clone());
         }
         sd
