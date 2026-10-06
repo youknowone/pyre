@@ -2068,7 +2068,17 @@ impl UnrollOptimizer {
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
-            let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
+            let body_jump_arity = body_terminal_op
+                .as_ref()
+                .map(|j| j.num_args())
+                .or_else(|| {
+                    body_ops
+                        .iter()
+                        .rev()
+                        .find(|op| op.opcode == OpCode::Jump)
+                        .map(|op| op.num_args())
+                })
+                .unwrap_or(0);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
@@ -2096,12 +2106,13 @@ impl UnrollOptimizer {
             // reads a raw integer as a Ref — measured as EXC_BAD_ACCESS on the
             // loop counter inside GuardClass.
             //
-            // Give up, which is `unroll.py:242`'s own escape (it lets
-            // `send_extra_operation` raise `InvalidLoop`) and lands on
-            // `compile.py:368-371`'s cancel. Scoped to the retrace: a
-            // `compile_loop` unroll keeps its start label in the SAME artifact,
-            // so its preamble target is local and this mismatch cannot arise.
-            if !self.emit_start_label && body_jump_arity != preamble_arity {
+            // A compile_loop JUMP that is still short of
+            // `exported_renamed_inputargs` is the same unsound construction:
+            // padding the missing slot with the entry box can close a loop
+            // that never fails its guard. Give up, which is
+            // `send_extra_operation` InvalidLoop, for retrace and
+            // compile_loop alike.
+            if body_jump_arity != preamble_arity {
                 crate::mc_diag_bump(57);
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -2115,12 +2126,6 @@ impl UnrollOptimizer {
             }
             if let Some(mut end_jump) = body_terminal_op {
                 end_jump.setdescr(preamble_target.as_jump_target_descr());
-                // Retrace mismatches already gave up above. A compile_loop
-                // close onto the same-artifact start LABEL may still be one
-                // box short of `exported_renamed_inputargs` (an entry-only
-                // invariant). Pad/truncate here so consider_jump /
-                // the assembler remap never sees JUMP 33 vs LABEL 34.
-                apply_preamble_shape_to_jump(&mut end_jump, &exported_renamed_inputargs);
                 if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                     // unroll.py parity: jump_to_preamble retargets
                     // the live end_jump and routes it through
