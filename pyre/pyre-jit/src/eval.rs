@@ -936,6 +936,14 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
+    // Cached rstr of the payload. Null after a mutation; the block is
+    // collectable once this slot no longer names it.
+    if !ba.cached_rstr.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(ba.cached_rstr as *mut u8)
+    {
+        let cached_slot = std::ptr::addr_of_mut!(ba.cached_rstr);
+        f(cached_slot as *mut majit_ir::GcRef);
+    }
 }
 
 unsafe fn bytearray_user_object_custom_trace(

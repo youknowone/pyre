@@ -9524,8 +9524,17 @@ fn decode_tagged_for_kind(
     )
 }
 
+fn forwarded_virtual_addr(cache: &BridgeVirtualCache<'_>, vidx: usize, fallback: i64) -> i64 {
+    cache
+        .get_concrete_ptr(vidx)
+        .map(|gcref| gcref.0 as i64)
+        .filter(|&addr| addr != 0)
+        .unwrap_or(fallback)
+}
+
 fn setfield_concrete_from_tagged(
     backend: &dyn majit_backend::Backend,
+    vidx: usize,
     struct_ptr: i64,
     fd: &majit_ir::FieldDescrInfo,
     fieldnum: i16,
@@ -9550,6 +9559,7 @@ fn setfield_concrete_from_tagged(
                 callinfocollection,
                 cache,
             );
+            let struct_ptr = forwarded_virtual_addr(cache, vidx, struct_ptr);
             backend.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
         }
         Type::Float => {
@@ -9564,6 +9574,7 @@ fn setfield_concrete_from_tagged(
                 callinfocollection,
                 cache,
             );
+            let struct_ptr = forwarded_virtual_addr(cache, vidx, struct_ptr);
             backend.bh_setfield_gc_f(struct_ptr, f64::from_bits(value as u64), &descr);
         }
         _ => {
@@ -9578,6 +9589,7 @@ fn setfield_concrete_from_tagged(
                 callinfocollection,
                 cache,
             );
+            let struct_ptr = forwarded_virtual_addr(cache, vidx, struct_ptr);
             backend.bh_setfield_gc_i(struct_ptr, value, &descr);
         }
     }
@@ -9585,6 +9597,7 @@ fn setfield_concrete_from_tagged(
 
 fn setarrayitem_concrete_from_tagged(
     backend: &dyn majit_backend::Backend,
+    vidx: usize,
     array_ptr: i64,
     index: usize,
     arraydescr: &dyn majit_ir::descr::ArrayDescr,
@@ -9609,6 +9622,7 @@ fn setarrayitem_concrete_from_tagged(
             callinfocollection,
             cache,
         );
+        let array_ptr = forwarded_virtual_addr(cache, vidx, array_ptr);
         backend.bh_setarrayitem_gc_r(
             array_ptr,
             index as i64,
@@ -9627,6 +9641,7 @@ fn setarrayitem_concrete_from_tagged(
             callinfocollection,
             cache,
         );
+        let array_ptr = forwarded_virtual_addr(cache, vidx, array_ptr);
         backend.bh_setarrayitem_gc_f(
             array_ptr,
             index as i64,
@@ -9645,6 +9660,7 @@ fn setarrayitem_concrete_from_tagged(
             callinfocollection,
             cache,
         );
+        let array_ptr = forwarded_virtual_addr(cache, vidx, array_ptr);
         backend.bh_setarrayitem_gc_i(array_ptr, index as i64, value, bh_descr);
     }
 }
@@ -9654,6 +9670,7 @@ fn setarrayitem_concrete_from_tagged(
 /// `cpu.bh_setinteriorfield_gc_{i,r,f}`.
 fn setinteriorfield_concrete_from_tagged(
     backend: &dyn majit_backend::Backend,
+    vidx: usize,
     array_ptr: i64,
     index: usize,
     interior_descr: &dyn majit_ir::descr::Descr,
@@ -9682,6 +9699,7 @@ fn setinteriorfield_concrete_from_tagged(
                 callinfocollection,
                 cache,
             );
+            let array_ptr = forwarded_virtual_addr(cache, vidx, array_ptr);
             backend.bh_setinteriorfield_gc_r(
                 array_ptr,
                 index as i64,
@@ -9701,6 +9719,7 @@ fn setinteriorfield_concrete_from_tagged(
                 callinfocollection,
                 cache,
             );
+            let array_ptr = forwarded_virtual_addr(cache, vidx, array_ptr);
             backend.bh_setinteriorfield_gc_f(
                 array_ptr,
                 index as i64,
@@ -9720,6 +9739,7 @@ fn setinteriorfield_concrete_from_tagged(
                 callinfocollection,
                 cache,
             );
+            let array_ptr = forwarded_virtual_addr(cache, vidx, array_ptr);
             backend.bh_setinteriorfield_gc_i(array_ptr, index as i64, value, &bh);
         }
     }
@@ -9821,7 +9841,8 @@ fn materialize_concrete_virtual_ptr(
                 }
                 setfield_concrete_from_tagged(
                     backend,
-                    ptr,
+                    vidx,
+                    forwarded_virtual_addr(cache, vidx, ptr),
                     fd,
                     fnum,
                     rd_virtuals,
@@ -9832,7 +9853,7 @@ fn materialize_concrete_virtual_ptr(
                     cache,
                 );
             }
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VStructInfo.allocate — no vtable
         majit_ir::RdVirtualInfo::VStructInfo {
@@ -9863,7 +9884,8 @@ fn materialize_concrete_virtual_ptr(
                 }
                 setfield_concrete_from_tagged(
                     backend,
-                    ptr,
+                    vidx,
+                    forwarded_virtual_addr(cache, vidx, ptr),
                     fd,
                     fnum,
                     rd_virtuals,
@@ -9874,7 +9896,7 @@ fn materialize_concrete_virtual_ptr(
                     cache,
                 );
             }
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VArrayInfo.allocate
         majit_ir::RdVirtualInfo::VArrayInfoClear {
@@ -9916,7 +9938,8 @@ fn materialize_concrete_virtual_ptr(
                 }
                 setarrayitem_concrete_from_tagged(
                     backend,
-                    ptr,
+                    vidx,
+                    forwarded_virtual_addr(cache, vidx, ptr),
                     i,
                     ad,
                     &bh_descr,
@@ -9929,7 +9952,7 @@ fn materialize_concrete_virtual_ptr(
                     cache,
                 );
             }
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
@@ -9977,7 +10000,8 @@ fn materialize_concrete_virtual_ptr(
                     }
                     setinteriorfield_concrete_from_tagged(
                         backend,
-                        ptr,
+                        vidx,
+                        forwarded_virtual_addr(cache, vidx, ptr),
                         i,
                         fielddescrs[j].as_ref(),
                         fnum,
@@ -9990,7 +10014,7 @@ fn materialize_concrete_virtual_ptr(
                     );
                 }
             }
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VStrPlainInfo.allocate
         majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
@@ -10018,9 +10042,10 @@ fn materialize_concrete_virtual_ptr(
                     callinfocollection,
                     cache,
                 );
+                let ptr = forwarded_virtual_addr(cache, vidx, ptr);
                 backend.bh_strsetitem(ptr, i as i64, value);
             }
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VUniPlainInfo.allocate
         majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
@@ -10048,9 +10073,10 @@ fn materialize_concrete_virtual_ptr(
                     callinfocollection,
                     cache,
                 );
+                let ptr = forwarded_virtual_addr(cache, vidx, ptr);
                 backend.bh_unicodesetitem(ptr, i as i64, value);
             }
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VStrConcatInfo / VUniConcatInfo
         majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
@@ -10096,7 +10122,7 @@ fn materialize_concrete_virtual_ptr(
                 Some(&[str1, str2]),
             );
             cache.set_concrete_ptr(vidx, gcref);
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // resume.py VStrSliceInfo / VUniSliceInfo
         majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
@@ -10154,7 +10180,7 @@ fn materialize_concrete_virtual_ptr(
                 Some(&[strbox]),
             );
             cache.set_concrete_ptr(vidx, gcref);
-            gcref
+            majit_ir::GcRef(forwarded_virtual_addr(cache, vidx, gcref.0 as i64) as usize)
         }
         // Raw virtuals are INT-kind — should not appear in getvirtual_ptr
         majit_ir::RdVirtualInfo::VRawBufferInfo { .. }
