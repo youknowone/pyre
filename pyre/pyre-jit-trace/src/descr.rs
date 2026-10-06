@@ -11233,15 +11233,17 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // same GETFIELD slot (`list_int_items_block_descr`). Analyzer
             // fielddescrof of `_ll_list_resize_hint_really` may intern the
             // nested STRUCT leaf; the trace GETFIELD uses the dotted name.
+            // Opcode GETFIELD stores descr.py display `"STRUCT.field"`;
+            // `list.int_set_items` intern key is the bare `int_items.block`.
             if name.as_str() == "int_items.block"
-                || (name.as_str() == "block"
-                    && (owner.ends_with("IntArray") || owner.contains("int_array")))
+                || name.as_str() == "W_ListObject.int_items.block"
+                || name.ends_with(".int_items.block")
             {
                 return list_int_items_block_descr();
             }
             if name.as_str() == "float_items.block"
-                || (name.as_str() == "block"
-                    && (owner.ends_with("FloatArray") || owner.contains("float_array")))
+                || name.as_str() == "W_ListObject.float_items.block"
+                || name.ends_with(".float_items.block")
             {
                 return list_float_items_block_descr();
             }

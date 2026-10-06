@@ -3970,7 +3970,9 @@ impl CallControl {
         }
         *self.field_footprint.borrow_mut() = FieldDescrofMemoEntry::default();
         *self.struct_size_log.borrow_mut() = Some(Vec::new());
-        let result = self.fielddescrof_concrete(idx, owner_root, owner_id, field_name);
+        let result = self
+            .fielddescrof_concrete(idx, owner_root, owner_id, field_name)
+            .or_else(|| self.fielddescrof_list_items_block_member(idx, owner_root, field_name));
         let sized = self.struct_size_log.borrow_mut().take().unwrap_or_default();
         let mut entry = std::mem::take(&mut *self.field_footprint.borrow_mut());
         entry.sized_structs = sized;
@@ -3988,6 +3990,52 @@ impl CallControl {
             .or_default()
             .insert(field_name.to_string(), std::sync::Arc::new(entry));
         result
+    }
+
+    /// jtransform `_handle_list_call` intern key for `list.int_set_items`
+    /// / `list.float_set_items`. Layout walk can miss `W_ListObject`
+    /// (owner spelled as a hash / crate path); still emit the
+    /// `descr_set_keys` member so runtime `descr_from_set_member`
+    /// maps onto `list_int_items_block_descr`.
+    fn fielddescrof_list_items_block_member(
+        &self,
+        idx: u32,
+        owner_root: &str,
+        field_name: &str,
+    ) -> Option<(
+        majit_ir::descr::DescrRef,
+        majit_ir::effectinfo::DescrSetMember,
+    )> {
+        if field_name != "int_items.block" && field_name != "float_items.block" {
+            return None;
+        }
+        let leaf = owner_root.rsplit("::").next().unwrap_or(owner_root);
+        if leaf != "W_ListObject" {
+            return None;
+        }
+        let struct_id = majit_ir::descr::struct_id_for_name("W_ListObject")
+            .or_else(|| majit_ir::descr::struct_id_for_name("listobject::W_ListObject"))
+            .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical("W_ListObject"))
+            .as_u64();
+        let name = format!("W_ListObject.{field_name}");
+        let descr: majit_ir::descr::DescrRef =
+            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                idx,
+                0,
+                8,
+                majit_ir::value::Type::Ref,
+                false,
+                majit_ir::descr::ArrayFlag::Pointer,
+                name.clone(),
+                name,
+            ));
+        Some((
+            descr,
+            majit_ir::effectinfo::DescrSetMember::Field {
+                struct_id,
+                field_name: field_name.to_string(),
+            },
+        ))
     }
 
     /// Trait-object sibling of [`Self::fielddescrof`] returning the
@@ -17241,6 +17289,23 @@ mod tests {
             "int_set_items must not make resize writeanalyze top"
         );
         assert_eq!(write_fields(&effects), vec![0]);
+    }
+
+    /// `list.int_set_items` intern key must land in `descr_set_keys`
+    /// even when `W_ListObject` has no analyzer layout, so runtime
+    /// `descr_from_set_member` can map onto `list_int_items_block_descr`.
+    #[test]
+    fn fielddescrof_list_items_block_emits_member_without_layout() {
+        let cc = CallControl::new();
+        let (_descr, member) = cc
+            .fielddescrof_keyed(0, "W_ListObject", None, "int_items.block")
+            .expect("dotted list items.block must emit a descr_set_keys member");
+        match member {
+            majit_ir::effectinfo::DescrSetMember::Field { field_name, .. } => {
+                assert_eq!(field_name, "int_items.block");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Nested `IntArray.block` is `l.items` (`rlist.py`
