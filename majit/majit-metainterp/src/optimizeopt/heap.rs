@@ -2116,15 +2116,33 @@ impl OptHeap {
                 // [can_cache=True].
                 self.force_lazy_set_field_at(i, true, ctx);
             }
-            // `heap.py` `check_write_descr_field(descr)` is a bitcheck of
-            // `descr.ei_index` after `compute_bitstrings` stamps that
-            // index on the same Arc the GETFIELD uses. pyre's GETFIELD
-            // intern (`list_int_items_block_descr`) and analyzer
-            // `fielddescrof` can mint two Arcs for one field; the
-            // rehydrated `_write_descrs_fields` still names the GETFIELD
-            // Arc by identity (`writes_field_descr_by_identity`).
+            // Raw-set fallback for the macro / `JitDriver` path where
+            // `compute_bitstrings` never runs (so `effect_idx` is the unset
+            // u32::MAX sentinel and the bitstring lookup always misses):
+            // invalidate when the call's concrete `_write_descrs_fields` names
+            // this exact field descr by pointer identity.  Gated on
+            // `!compute_bitstrings_has_run()` so the translated interpreter's
+            // bitstring path is unchanged.
+            //
+            // A descr whose `ei_index` is still the sentinel is NOT special-
+            // cased here, matching `heap.py` `force_from_effectinfo`. Upstream leaves the
+            // sentinel on any descr that no EffectInfo's raw set names —
+            // `effectinfo.py` stamps `sys.maxint` on every descr in
+            // `all_descrs` and only `:524-526` renumbers the ones that appear
+            // in some `_readonly_descrs_*` / `_write_descrs_*`, which
+            // `test_effectinfo.py` pins with `f3descr`. A sentinel
+            // descr therefore bitchecks false upstream too. That is sound
+            // because of the OTHER half of the contract: a call whose write
+            // set was never computed is `EF_RANDOM_EFFECTS`
+            // (`graphanalyze.py top_result()` →
+            // `effectinfo.py`) and never reaches this function at all
+            // — `heap.py` routes it to `clean_caches`. pyre upholds the
+            // same contract at `call_descr.rs default_effect_info()`; keeping
+            // a descr-side guard here instead would be papering over any call
+            // that still asserts an empty write set it did not earn.
             let writes_field = ei.check_write_descr_field(effect_idx)
-                || ei.writes_field_descr_by_identity(&self.cached_fields[i].1);
+                || (!majit_ir::effectinfo::compute_bitstrings_has_run()
+                    && ei.writes_field_descr_by_identity(&self.cached_fields[i].1));
             if writes_field {
                 // heap.py cf.force_lazy_set(self, fielddescr,
                 //                                   can_cache=False).

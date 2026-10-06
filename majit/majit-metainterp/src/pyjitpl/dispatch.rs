@@ -223,29 +223,6 @@ fn heapcache_field_key(fielddescr: &majit_ir::DescrRef) -> Option<u32> {
 }
 
 pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
-    // `cpu.fielddescrof(T, fieldname)`: GETFIELD of `l.items` and
-    // `list.int_set_items` share `W_ListObject.int_items.block`
-    // (`rlist.py` `_ll_list_resize_hint_really` assigns `l.items`).
-    // The parent-`all_fielddescrs` arm below mints a nested `IntArray`
-    // descr and would miss `force_from_effectinfo`.
-    if let crate::blackhole::BhDescr::Field { name, offset, .. } = descr
-        && (name.ends_with("int_items.block")
-            || name.ends_with("float_items.block")
-            || name == "int_items.block"
-            || name == "float_items.block")
-    {
-        let key = if name.ends_with("int_items.block") {
-            "int_items.block"
-        } else {
-            "float_items.block"
-        };
-        let gc = majit_ir::descr::gc_cache().lock();
-        for inner in gc._cache_field.values() {
-            if let Some(fd) = inner.get(key) {
-                return (*offset, fd.clone() as majit_ir::DescrRef);
-            }
-        }
-    }
     match descr {
         crate::blackhole::BhDescr::Field {
             offset,

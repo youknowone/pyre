@@ -11104,8 +11104,6 @@ impl Descr for PyreVtableMethodDescr {
 ///   fail-descr placeholder.
 pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
     use majit_jitcode::jitcode::BhDescr;
-    // Publish `W_LIST_DESCR_GROUP` into gccache before any Field intern.
-    let _ = &*W_LIST_DESCR_GROUP;
     match bh {
         BhDescr::Field {
             offset,
@@ -11230,24 +11228,6 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 {
                     return canonical;
                 }
-            }
-            // Nested `IntArray.block` / dotted `int_items.block` is the
-            // same GETFIELD slot (`list_int_items_block_descr`). Analyzer
-            // fielddescrof of `_ll_list_resize_hint_really` may intern the
-            // nested STRUCT leaf; the trace GETFIELD uses the dotted name.
-            // Opcode GETFIELD stores descr.py display `"STRUCT.field"`;
-            // `list.int_set_items` intern key is the bare `int_items.block`.
-            if name.as_str() == "int_items.block"
-                || name.as_str() == "W_ListObject.int_items.block"
-                || name.ends_with(".int_items.block")
-            {
-                return list_int_items_block_descr();
-            }
-            if name.as_str() == "float_items.block"
-                || name.as_str() == "W_ListObject.float_items.block"
-                || name.ends_with(".float_items.block")
-            {
-                return list_float_items_block_descr();
             }
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
@@ -12168,18 +12148,6 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             field_name,
             ..
         } => {
-            // Nested `IntArray.block` / dotted `int_items.block` is the
-            // GETFIELD slot `list_int_items_block_descr`. Analyzer
-            // fielddescrof of `_ll_list_resize_hint_really` interned the
-            // nested STRUCT leaf; the trace GETFIELD uses the dotted name
-            // on `W_ListObject`. Same Arc so `force_from_effectinfo` can
-            // invalidate the cached block across residual COND_CALL.
-            if field_name == "int_items.block" {
-                return SetMemberLookup::Resolved(list_int_items_block_descr());
-            }
-            if field_name == "float_items.block" {
-                return SetMemberLookup::Resolved(list_float_items_block_descr());
-            }
             let struct_key = LLType::Struct(*struct_id);
             let gc = gc_cache().lock();
             match gc._cache_field.get(&struct_key) {
