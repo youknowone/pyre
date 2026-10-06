@@ -2215,30 +2215,36 @@ impl GcCache {
         } else {
             return None;
         };
+        // `W_LIST_DESCR_GROUP` publishes under `path_hash(def_path)`
+        // (`listobject::W_ListObject`), not the bare leaf. Look up both
+        // the name registry and `StructId::from_canonical` of each
+        // spelling, then any STRUCT map that already holds the field key.
         const OWNERS: &[&str] = &[
-            "W_ListObject",
             "listobject::W_ListObject",
+            "W_ListObject",
             "pyre_object::listobject::W_ListObject",
         ];
         for owner in OWNERS {
-            if let Some(sid) = struct_id_for_name(owner)
-                && let Some(inner) = self._cache_field.get(&LLType::Struct(sid.as_u64()))
-                && let Some(fd) = inner
-                    .get(key)
-                    .or_else(|| inner.get(&format!("W_ListObject.{key}")))
-            {
+            let sids = [
+                struct_id_for_name(owner),
+                Some(StructId::from_canonical(owner)),
+            ];
+            for sid in sids.into_iter().flatten() {
+                if let Some(inner) = self._cache_field.get(&LLType::Struct(sid.as_u64()))
+                    && let Some(fd) = inner
+                        .get(key)
+                        .or_else(|| inner.get(&format!("W_ListObject.{key}")))
+                {
+                    return Some(fd.clone());
+                }
+            }
+        }
+        for inner in self._cache_field.values() {
+            if let Some(fd) = inner.get(key) {
                 return Some(fd.clone());
             }
         }
-        let sid = StructId::from_canonical("W_ListObject");
-        self._cache_field
-            .get(&LLType::Struct(sid.as_u64()))
-            .and_then(|inner| {
-                inner
-                    .get(key)
-                    .or_else(|| inner.get(&format!("W_ListObject.{key}")))
-                    .cloned()
-            })
+        None
     }
 
     /// descr.py get_field_descr(gccache, STRUCT, fieldname).

@@ -11104,6 +11104,8 @@ impl Descr for PyreVtableMethodDescr {
 ///   fail-descr placeholder.
 pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
     use majit_jitcode::jitcode::BhDescr;
+    // Publish `W_LIST_DESCR_GROUP` into gccache before any Field intern.
+    let _ = &*W_LIST_DESCR_GROUP;
     match bh {
         BhDescr::Field {
             offset,
