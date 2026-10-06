@@ -506,7 +506,7 @@ fn jitframe_is_gc_managed() -> bool {
 /// dynasm trampolines. Shared by `install_gc_box` (thread-confined heap: also
 /// stores a box in TLS) and `install_gc_standalone` (shared heap: hooks only,
 /// no box; the trampolines then route to the `gc_sync` singleton).
-fn register_active_hooks(supports_guard_gc_type: bool) {
+fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(dynasm_check_is_object),
         is_tagged_immediate: Some(dynasm_is_tagged_immediate),
@@ -579,7 +579,18 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_shrink_array(Some(dynasm_gc_shrink_array));
     majit_gc::set_active_gc_varsize_layout(Some(dynasm_gc_varsize_layout));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
-    majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
+    // Assumption: the active GC does not move objects.
+    // `has_gcrootmap() == false` is the predicate available
+    // (`GcLLDescr_boehm.gcrootmap is None`; CelGc answers false because
+    // `collect_nursery` / `collect_full` are no-ops). `minimark.py
+    // id_or_identityhash` is then the object's address. Leaving the hook
+    // unset makes `hash_whatever` of a Ref green that address, so
+    // `JitCell.get_uhash` of a constant green does not trampoline.
+    if has_gcrootmap {
+        majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
+    } else {
+        majit_gc::set_active_gc_id_or_identityhash(None);
+    }
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
     majit_gc::set_active_write_barrier_before_move(Some(dynasm_gc_write_barrier_before_move));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
@@ -599,11 +610,12 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     // nursery is not the singleton's, so the process-wide published range can
     // no longer stand in for `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
+    let has_gcrootmap = gc.has_gcrootmap();
+    majit_gc::note_gc_box_installed(has_gcrootmap);
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     check_jitframe_descr(gc.as_ref());
     gc_box::store(gc);
-    register_active_hooks(supports_guard_gc_type);
+    register_active_hooks(supports_guard_gc_type, has_gcrootmap);
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
@@ -618,7 +630,8 @@ pub fn install_gc_standalone() {
         check_jitframe_descr(gc);
     });
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
-    register_active_hooks(supports_guard_gc_type);
+    let has_gcrootmap = majit_gc::gc_sync::gc_query(|gc| gc.has_gcrootmap());
+    register_active_hooks(supports_guard_gc_type, has_gcrootmap);
 }
 
 /// Drop the active dynasm GC box. Callers must go through this helper rather
@@ -3775,7 +3788,7 @@ impl Backend for DynasmBackend {
         }
         let (jf_ptr, tip, num_slots, descr_raw) = Self::run_done_raw_entry(token, args);
         if self.finish_is_done_int(descr_raw) {
-            let value = done_int_slot0(unsafe { JitFrame::resolve(tip) });
+            let value = done_int_slot0(unsafe { JitFrame::resolve_forward(tip) });
             release_done_int_frame(token, jf_ptr, tip);
             return Ok(value);
         }
@@ -3807,7 +3820,10 @@ impl Backend for DynasmBackend {
         }
         let (jf_ptr, tip, num_slots, descr_raw) = Self::run_done_raw_entry(token, args);
         if self.finish_is_done_ref(descr_raw) {
-            let value = done_ref_slot0(unsafe { JitFrame::resolve(tip) });
+            // Host frames are off-GC: `jitframe.py jitframe_resolve` walks
+            // `jf_forward` only. `JitFrame::resolve` also chases a nursery
+            // stub via `gc_current_object_address`, which this path does not.
+            let value = done_ref_slot0(unsafe { JitFrame::resolve_forward(tip) });
             release_done_int_frame(token, jf_ptr, tip);
             return Ok(value);
         }
