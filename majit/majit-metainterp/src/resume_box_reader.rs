@@ -1723,8 +1723,8 @@ mod tests {
     #[test]
     fn seed_bridge_virtualizable_boxes_resets_assembler_token() {
         let info = std::sync::Arc::new(crate::virtualizable::VirtualizableInfo::new(0));
-        let mut obj = vec![0u8; 16];
-        let obj_ptr = obj.as_mut_ptr();
+        let mut obj = Box::new([0u64; 2]);
+        let obj_ptr = obj.as_mut_ptr().cast::<u8>();
         unsafe {
             *(obj_ptr as *mut u64) = 0xDEAD_BEEF;
             assert!(info.is_token_nonnull_gcref(obj_ptr as *const u8));

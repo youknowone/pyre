@@ -568,3 +568,154 @@ fn a_pc_only_virt_guard_failure_ends_in_continue_running_normally() {
         );
     }
 }
+
+/// A mutating residual after a mid-opcode guard, then a deterministic
+/// bridge abort (`request_walk_abort` after the residual has already run).
+///
+/// `bridge_from_guard_resume_position`'s no-handoff `None` used to rebuild
+/// the guard deadframe and `resume_in_blackhole` from there
+/// (`ResumeGuardDescr.handle_fail` else-arm). The walk had already executed
+/// the residual and `start_bridge_tracing(..., true)` had applied pending
+/// fields, so that restart popped the chain twice.
+/// `MetaInterp.aborted_tracing` / `convert_and_run_from_pyjitpl` convert
+/// the live framestack instead.
+const ABORT_AFTER_RESIDUAL_CAP: usize = 8;
+
+#[repr(C)]
+struct AbortAfterResidualChain {
+    size: i64,
+}
+
+extern "C" fn abort_after_residual_push(chain: usize, value: i64) {
+    let chain = unsafe { &mut *(chain as *mut AbortAfterResidualChain) };
+    chain.size += 1;
+    let _ = value;
+    majit_metainterp::note_residual_committed();
+}
+
+extern "C" fn abort_after_residual_abort(chain: usize) {
+    let _ = chain;
+    majit_metainterp::request_walk_abort();
+}
+
+struct AbortAfterResidualState {
+    top: i64,
+    sp: usize,
+    counter: i64,
+    chain: usize,
+}
+
+#[majit_macros::jit_interp(
+    state = AbortAfterResidualState,
+    env = Bytecode,
+    greens = [pc, program],
+    state_fields = {
+        top: int,
+        sp: int(usize),
+        counter: int,
+        chain: ref(AbortAfterResidualChain),
+    },
+    calls = {
+        abort_after_residual_push => residual_void,
+        abort_after_residual_abort => residual_void,
+    },
+)]
+#[allow(unused_assignments, unused_variables)]
+fn dispatch_abort_after_residual(
+    program: &Bytecode,
+    iterations: i64,
+    threshold: u32,
+    chain: usize,
+) -> i64 {
+    let mut driver: JitDriver<AbortAfterResidualState> = JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_, _, _, _| {
+        COMPILES.fetch_add(1, Ordering::Relaxed);
+    });
+    let mut pc: usize = 0;
+    let mut state = AbortAfterResidualState {
+        top: 0,
+        sp: 0,
+        counter: iterations,
+        chain,
+    };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+    while pc < program.len() {
+        jit_merge_point!(driver, program, pc; state);
+        let opcode = program[pc];
+        pc += 1;
+        match opcode {
+            OP_ADD => {
+                let value = state.counter;
+                state.sp = state.sp + 1;
+                if state.sp > ABORT_AFTER_RESIDUAL_CAP {
+                    abort_after_residual_push(state.chain, state.top);
+                    abort_after_residual_abort(state.chain);
+                }
+                state.top = value;
+            }
+            OP_DEC => {
+                state.counter = state.counter - 1;
+                if state.counter != 0 {
+                    can_enter_jit!(driver, 0usize, &mut state, program, || {});
+                    pc = 0;
+                    continue;
+                }
+            }
+            _ => break,
+        }
+    }
+    state.sp as i64
+}
+
+fn run_abort_after_residual(iterations: i64, threshold: u32) -> (i64, i64, usize) {
+    let _ = majit_metainterp::take_walk_abort();
+    let _ = majit_metainterp::take_residual_committed();
+    COMPILES.store(0, Ordering::Relaxed);
+    let mut chain = AbortAfterResidualChain { size: 0 };
+    let height = dispatch_abort_after_residual(
+        &[OP_ADD, OP_DEC, OP_END],
+        iterations,
+        threshold,
+        &mut chain as *mut AbortAfterResidualChain as usize,
+    );
+    (height, chain.size, COMPILES.load(Ordering::Relaxed))
+}
+
+#[test]
+fn a_mutating_residual_then_deterministic_bridge_abort_is_not_replayed() {
+    let _guard = PROBE_LOCK.lock();
+    const ITERATIONS: i64 = 2000;
+    let expected = ITERATIONS - ABORT_AFTER_RESIDUAL_CAP as i64;
+
+    let cold = run_abort_after_residual(ITERATIONS, u32::MAX);
+    assert_eq!(cold.2, 0, "the cold run must not have compiled anything");
+    assert_eq!(
+        cold.1, expected,
+        "cold run: every push past the first {ABORT_AFTER_RESIDUAL_CAP} \
+         displaces one word"
+    );
+
+    let aborts_before = majit_metainterp::symbolic_residual_trace_aborts();
+    let warm = run_abort_after_residual(ITERATIONS, 3);
+    assert!(
+        warm.2 >= 1,
+        "the loop did not compile, so the guard-resume walk never ran"
+    );
+    assert!(
+        majit_metainterp::symbolic_residual_trace_aborts() > aborts_before,
+        "the guard-resume walk never consumed request_walk_abort, so the \
+         deterministic-bridge-abort handoff was not reached"
+    );
+    assert_eq!(
+        warm.1, cold.1,
+        "a mutating residual followed by a deterministic bridge abort ran \
+         a different NUMBER of times compiled than interpreted; the no-handoff \
+         None restarted from the guard deadframe and replayed the residual"
+    );
+    assert_eq!(warm.0, cold.0, "compiled height");
+}
