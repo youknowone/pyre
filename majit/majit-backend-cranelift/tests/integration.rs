@@ -1674,6 +1674,80 @@ fn test_raw_store_load_float_roundtrip() {
     );
 }
 
+// Test: RawStore + RawLoadI at an odd byte offset
+//
+// Mirrors RawMemTests.test_raw_storage_int: store and load a Signed at
+// offset 3, which is not naturally aligned for an 8-byte item.
+
+#[test]
+fn test_raw_store_load_int_odd_offset() {
+    let ad = raw_descr_int(8);
+    let const_offset = OpRef::const_int(3);
+
+    let mut rec = Trace::new();
+    let r0 = rec.record_input_arg(Type::Ref);
+    let i0 = rec.record_input_arg(Type::Int);
+
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, const_offset, i0], ad.clone());
+    let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, const_offset], ad.clone());
+    rec.finish(&[loaded], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+
+    let token = JitCellToken::new(606);
+    backend
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
+        .expect("raw int odd-offset roundtrip compilation should succeed");
+
+    let mut buf = vec![0u8; 16];
+    let ptr = buf.as_mut_ptr() as usize;
+
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Int(24)]);
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        24,
+        "raw_store then raw_load_i at offset 3 should roundtrip the integer value"
+    );
+}
+
+// Test: RawStore + RawLoadF at an odd byte offset
+//
+// Mirrors RawMemTests.test_raw_storage_float (offset 4 there). Offset 3
+// is the same unaligned contract for an 8-byte float.
+
+#[test]
+fn test_raw_store_load_float_odd_offset() {
+    let ad = raw_descr_float();
+    let const_offset = OpRef::const_int(3);
+
+    let mut rec = Trace::new();
+    let r0 = rec.record_input_arg(Type::Ref);
+    let f0 = rec.record_input_arg(Type::Float);
+
+    rec.record_op_with_descr(OpCode::RawStore, &[r0, const_offset, f0], ad.clone());
+    let loaded = rec.record_op_with_descr(OpCode::RawLoadF, &[r0, const_offset], ad.clone());
+    rec.finish(&[loaded], make_descr(0));
+    let trace = rec.get_trace();
+
+    let mut backend = CraneliftBackend::new();
+
+    let token = JitCellToken::new(607);
+    backend
+        .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
+        .expect("raw float odd-offset roundtrip compilation should succeed");
+
+    let mut buf = vec![0u8; 16];
+    let ptr = buf.as_mut_ptr() as usize;
+
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Float(2.4e15)]);
+    assert_eq!(
+        backend.get_float_value(&frame, 0),
+        2.4e15,
+        "raw_store then raw_load_f at offset 3 should roundtrip the float value"
+    );
+}
+
 // Test: Raw ops at different offsets don't interfere
 //
 // Store two different integers at different offsets, then load both back.

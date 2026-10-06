@@ -6700,6 +6700,11 @@ impl PyPyJitDriver {
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
     ) -> bool {
+        // `warmstate.py maybe_compile_and_run`: `increment_threshold == 0`
+        // returns before hashing greens. `PYRE_NO_JIT` is that off switch.
+        if jit_is_off() {
+            return false;
+        }
         // The translated marker signature retains the red `frame` name; the
         // untranslated warm-state path reloads it through the shadow-stack
         // root below after possible collection points.
@@ -6726,6 +6731,15 @@ impl PyPyJitDriver {
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
         portal_diag_bump(0);
+        // A cell that has already hit the abort ceiling must not pay the
+        // HashMap probes `maybe_compile_and_run` used to run on every
+        // refused tick (`graph_jit_shapes`, `liveness_for`). PyPy's door
+        // already holds the `JitCell` and returns; the u64 lookup above is
+        // that same cell.
+        if driver.cell_is_abort_ceiling_banned(green_key) {
+            majit_metainterp::mc_diag_bump(81);
+            return false;
+        }
         if portal_metatrace_enabled()
             && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 >= portal_metatrace_skip()
@@ -11127,6 +11141,15 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     true
 }
 
+/// `PYRE_NO_JIT` off switch, resolved once. `warmstate.py
+/// maybe_compile_and_run` returns before hashing when
+/// `increment_threshold == 0`; this is that same first test.
+#[inline]
+fn jit_is_off() -> bool {
+    static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_JIT.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some())
+}
+
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -11149,8 +11172,7 @@ fn maybe_compile_and_run(
     // pyre-local extension: PYRE_NO_JIT disables JIT entirely.
     // No RPython counterpart — kept for development debugging only.
     // TODO: remove when JIT is stable enough to not need a kill switch.
-    static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_JIT.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) {
+    if jit_is_off() {
         return None;
     }
 

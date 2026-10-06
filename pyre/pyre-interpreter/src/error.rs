@@ -5329,14 +5329,28 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     if w_type.is_null() {
         return PyError::runtime_error(message);
     }
-    // The class outlives the text malloc only as a root: a collection
-    // rewrites the slot, not this frame's copy of the pointer.
+    // `OpErrFmt` stores the formatted text on the carrier and builds the
+    // application `str` in `get_w_value`. Minting `space.newtext` here
+    // paid a Python string on every raise, including an `except TypeError`
+    // that never reads `e`. The class still has to outlive the carrier
+    // malloc, so it is pinned across it.
+    let kind = pyre_object::interp_exceptions::kind_of_canonical_exc_class(w_type)
+        .map(PyError::kind_from_exc)
+        .unwrap_or(PyErrorKind::RuntimeError);
     let _roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_type);
-    let w_message = pyre_object::w_str_from_wtf8_managed(message);
-    let w_type = _roots.get(type_slot);
-    PyError::from_type_and_value(w_type, w_message)
+    make_pyerror(
+        kind,
+        DisplayMessage::Text(message),
+        std::ptr::null_mut(),
+        true,
+        false,
+        -1,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        _roots.get(type_slot),
+    )
 }
 
 /// pypy/interpreter/error.py `oefmt`.
@@ -5507,7 +5521,11 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> Operat
     // the message verbatim, `%` sequences and all.  Nothing on the way to the
     // error runs application-level code, so the class needs no root here.
     if args.is_empty() {
-        return operation_error_from_class(w_type, Wtf8Buf::from_string(valuefmt.to_string()));
+        // The format string is the message verbatim. `from_string(to_string())`
+        // copied it into a `String` only to copy it again.
+        let mut message = Wtf8Buf::new();
+        message.push_str(valuefmt);
+        return operation_error_from_class(w_type, message);
     }
     // `OpErrFmt, strings = get_operr_class(valuefmt)`, then the walk
     // `_compute_value` makes over them: a literal part, the argument

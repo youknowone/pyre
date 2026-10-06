@@ -4633,6 +4633,283 @@ impl TraceCtx {
         );
     }
 
+    /// Load dest-frame virtualizable fields as recorded IR boxes.
+    ///
+    /// When the merge-point JUMP is about a virtualizable other than the
+    /// one `virtualizable_boxes` was seeded from, or whose array is
+    /// longer, the cached boxes do not describe dest. Upstream fills that
+    /// gap with `initialize_virtualizable` (`virtualizable.py read_boxes`
+    /// / `get_array_length`) at trace start and with the nonstandard
+    /// `getfield_gc_*` / `getarrayitem_gc_*` path at a later frame;
+    /// `compile.py patch_new_loop_to_load_virtualizable_fields` emits the
+    /// same loads at loop entry. This is that load sequence against
+    /// `vbox`, installing the results as `virtualizable_boxes` ending in
+    /// `vbox`.
+    ///
+    /// Same-object length growth keeps the live prefix and only records
+    /// extra `GETARRAYITEM_GC` slots, so a crossed JUMP matches dest
+    /// LABEL arity without replacing loop-carried boxes.
+    pub fn gen_load_from_other_virtualizable(&mut self, vbox: OpRef) {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return;
+        };
+        let dest_ptr = match self.concrete_of_opref(vbox) {
+            Some(Value::Ref(gcref)) if gcref.as_usize() != 0 => gcref.as_usize(),
+            _ => 0,
+        };
+        let dest_lengths = if dest_ptr != 0 && info.can_read_all_array_lengths_from_heap() {
+            unsafe { info.read_array_lengths_from_heap(dest_ptr as *const u8) }
+        } else {
+            return;
+        };
+        self.gen_load_from_other_virtualizable_with_lengths(vbox, dest_ptr, &dest_lengths);
+    }
+
+    fn gen_load_from_other_virtualizable_with_lengths(
+        &mut self,
+        vbox: OpRef,
+        dest_ptr: usize,
+        dest_lengths: &[usize],
+    ) {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return;
+        };
+        let dest_array: usize = dest_lengths.iter().copied().sum();
+        let cached_array: usize = self
+            .virtualizable_array_lengths()
+            .map(|lengths| lengths.iter().copied().sum())
+            .unwrap_or(0);
+        let same_object = match (self.standard_virtualizable_ptr(), dest_ptr) {
+            (Some(ptr), dest) if dest != 0 => ptr == dest,
+            _ => self.standard_virtualizable_box() == Some(vbox),
+        };
+        if same_object && dest_array == cached_array {
+            return;
+        }
+        if same_object && dest_array > cached_array && info.array_fields.len() == 1 {
+            self.extend_vable_array_from_frame(
+                vbox,
+                dest_ptr,
+                &info,
+                cached_array,
+                dest_array,
+                dest_lengths,
+            );
+            return;
+        }
+        if same_object && dest_array < cached_array && info.array_fields.len() == 1 {
+            self.truncate_vable_array_to(dest_array, dest_lengths);
+            return;
+        }
+        let (mut boxes, mut values) =
+            self.record_vable_field_reads(vbox, dest_ptr, &info, dest_lengths);
+        boxes.push(vbox);
+        values.push(Value::Ref(majit_ir::GcRef(dest_ptr)));
+        self.set_virtualizable_boxes_with_info(boxes, values, &info, dest_lengths);
+        if dest_ptr != 0 {
+            self.set_virtualizable_heap_ptr(dest_ptr as *const u8);
+        }
+    }
+
+    fn placeholder_value(ty: Type) -> Value {
+        match ty {
+            Type::Int => Value::Int(0),
+            Type::Float => Value::Float(0.0),
+            Type::Ref => Value::Ref(majit_ir::GcRef::NULL),
+            Type::Void => Value::Void,
+        }
+    }
+
+    fn record_getfield_stamped(
+        &mut self,
+        opcode: OpCode,
+        vbox: OpRef,
+        dest_ptr: usize,
+        descr: DescrRef,
+        kind: Type,
+    ) -> (OpRef, Value) {
+        let live = (dest_ptr != 0)
+            .then(|| self.field_sanity_load(dest_ptr as i64, &descr, kind))
+            .flatten();
+        let op = self.execute_and_record(None, opcode, Some(descr), &[vbox], None, 0);
+        if let Some(live) = live {
+            self.set_opref_concrete(op, live);
+        }
+        (op, live.unwrap_or_else(|| Self::placeholder_value(kind)))
+    }
+
+    fn record_getarrayitem_stamped(
+        &mut self,
+        opcode: OpCode,
+        array_op: OpRef,
+        index: i64,
+        array_descr: DescrRef,
+        item_type: Type,
+    ) -> (OpRef, Value) {
+        let const_idx = self.const_int(index);
+        let op = self.execute_and_record(
+            None,
+            opcode,
+            Some(array_descr.clone()),
+            &[array_op, const_idx],
+            None,
+            0,
+        );
+        let live = self.stamp_vable_array_item(op, array_op, index, &array_descr, item_type);
+        (
+            op,
+            live.unwrap_or_else(|| Self::placeholder_value(item_type)),
+        )
+    }
+
+    fn record_vable_field_reads(
+        &mut self,
+        vbox: OpRef,
+        dest_ptr: usize,
+        vinfo: &VirtualizableInfo,
+        array_lengths: &[usize],
+    ) -> (Vec<OpRef>, Vec<Value>) {
+        let mut boxes = Vec::with_capacity(
+            vinfo.static_fields.len() + array_lengths.iter().copied().sum::<usize>(),
+        );
+        let mut values = Vec::with_capacity(boxes.capacity());
+        let static_descrs = vinfo.static_field_descrs();
+        for (fi, field) in vinfo.static_fields.iter().enumerate() {
+            let opcode = match field.field_type {
+                Type::Int => OpCode::GetfieldGcI,
+                Type::Ref => OpCode::GetfieldGcR,
+                Type::Float => OpCode::GetfieldGcF,
+                Type::Void => continue,
+            };
+            let (op, value) = self.record_getfield_stamped(
+                opcode,
+                vbox,
+                dest_ptr,
+                static_descrs[fi].clone(),
+                field.field_type,
+            );
+            boxes.push(op);
+            values.push(value);
+        }
+        let array_field_descrs = vinfo.array_field_descrs();
+        for (ai, array_field_descr) in array_field_descrs.iter().enumerate() {
+            let array_len = array_lengths.get(ai).copied().unwrap_or(0);
+            let (array_op, _) = self.record_getfield_stamped(
+                OpCode::GetfieldGcR,
+                vbox,
+                dest_ptr,
+                array_field_descr.clone(),
+                Type::Ref,
+            );
+            let array_descr = vinfo.array_descrs[ai].clone();
+            let item_type = vinfo.array_fields[ai].item_type;
+            let item_opcode = match item_type {
+                Type::Int => OpCode::GetarrayitemGcI,
+                Type::Ref => OpCode::GetarrayitemGcR,
+                Type::Float => OpCode::GetarrayitemGcF,
+                Type::Void => {
+                    panic!("gen_load_from_other_virtualizable: array {ai} has Void item_type")
+                }
+            };
+            for index in 0..array_len {
+                let (op, value) = self.record_getarrayitem_stamped(
+                    item_opcode,
+                    array_op,
+                    index as i64,
+                    array_descr.clone(),
+                    item_type,
+                );
+                boxes.push(op);
+                values.push(value);
+            }
+        }
+        (boxes, values)
+    }
+
+    fn extend_vable_array_from_frame(
+        &mut self,
+        vbox: OpRef,
+        dest_ptr: usize,
+        info: &VirtualizableInfo,
+        cached_array: usize,
+        dest_array: usize,
+        dest_lengths: &[usize],
+    ) {
+        let Some(mut boxes) = self.virtualizable_boxes.clone() else {
+            return;
+        };
+        if boxes.is_empty() {
+            return;
+        }
+        let field_descr = info.array_pointer_field_descr(0);
+        let array_descr = info.array_item_descr(0);
+        let item_type = info.array_fields[0].item_type;
+        let item_opcode = match item_type {
+            Type::Int => OpCode::GetarrayitemGcI,
+            Type::Ref => OpCode::GetarrayitemGcR,
+            Type::Float => OpCode::GetarrayitemGcF,
+            Type::Void => return,
+        };
+        let (array_op, _) = self.record_getfield_stamped(
+            OpCode::GetfieldGcR,
+            vbox,
+            dest_ptr,
+            field_descr,
+            Type::Ref,
+        );
+        let mut values = self.virtualizable_values.clone().unwrap_or_default();
+        let identity = boxes.pop().unwrap();
+        if values.len() == boxes.len() + 1 {
+            values.pop();
+        }
+        let keep_values = values.len() == boxes.len();
+        for index in cached_array..dest_array {
+            let (op, value) = self.record_getarrayitem_stamped(
+                item_opcode,
+                array_op,
+                index as i64,
+                array_descr.clone(),
+                item_type,
+            );
+            boxes.push(op);
+            if keep_values {
+                values.push(value);
+            }
+        }
+        boxes.push(identity);
+        if keep_values {
+            values.push(Value::Ref(majit_ir::GcRef(dest_ptr)));
+        } else {
+            values.clear();
+        }
+        self.set_virtualizable_boxes_with_info(boxes, values, info, dest_lengths);
+    }
+
+    fn truncate_vable_array_to(&mut self, dest_array: usize, dest_lengths: &[usize]) {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return;
+        };
+        let nstatic = info.num_static_extra_boxes;
+        let Some(mut boxes) = self.virtualizable_boxes.clone() else {
+            return;
+        };
+        if boxes.len() < nstatic + dest_array + 1 {
+            return;
+        }
+        let identity = boxes[boxes.len() - 1];
+        boxes.truncate(nstatic + dest_array);
+        boxes.push(identity);
+        let mut values = self.virtualizable_values.clone().unwrap_or_default();
+        if values.len() >= nstatic + dest_array + 1 {
+            let identity_val = values[values.len() - 1];
+            values.truncate(nstatic + dest_array);
+            values.push(identity_val);
+        } else {
+            values.clear();
+        }
+        self.set_virtualizable_boxes_with_info(boxes, values, &info, dest_lengths);
+    }
+
     /// `compile.py patch_new_loop_to_load_virtualizable_fields`
     /// mirrored at the call site instead of the callee preamble.
     ///
@@ -8711,6 +8988,101 @@ mod tests {
                 Some(info.array_item_descr(0).index())
             );
         }
+    }
+
+    #[test]
+    fn gen_load_from_other_virtualizable_reloads_a_different_frame() {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "locals",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+
+        let mut recorder = Trace::new();
+        let origin = recorder.record_input_arg(Type::Ref);
+        let dest = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            origin,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+
+        ctx.gen_load_from_other_virtualizable_with_lengths(dest, 0, &[2]);
+
+        let boxes = ctx.collect_virtualizable_boxes().unwrap();
+        assert_eq!(boxes.len(), 4, "pc + 2 array items + dest identity");
+        assert_eq!(*boxes.last().unwrap(), dest);
+        assert_eq!(ctx.virtualizable_array_lengths(), Some(&[2][..]));
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[2].opcode, OpCode::GetarrayitemGcI);
+        assert_eq!(ops[3].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    #[test]
+    fn gen_load_from_other_virtualizable_extends_same_object_array() {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "locals",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+
+        ctx.gen_load_from_other_virtualizable_with_lengths(vable, 0, &[2]);
+
+        let boxes = ctx.collect_virtualizable_boxes().unwrap();
+        assert_eq!(boxes.len(), 4, "pc + 2 array items + identity");
+        assert_eq!(boxes[0], box_pc, "live static prefix is kept");
+        assert_eq!(boxes[1], box_arr0, "live array prefix is kept");
+        assert_eq!(*boxes.last().unwrap(), vable);
+        assert_ne!(boxes[2], box_arr0);
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
     }
 
     /// `vable_snapshot_buildable` is the precondition the walker checks

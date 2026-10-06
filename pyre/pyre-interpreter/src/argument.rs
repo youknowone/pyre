@@ -968,13 +968,20 @@ impl Arguments {
     /// PyPy returns a Python interpreter-level dict (RPython `{}`),
     /// whose semantics are: keys overwrite on duplicate (last-write-
     /// wins), no insertion-order guarantee.  Pyre returns a
-    /// `HashMap<String, PyObjectRef>` to preserve the overwrite
+    /// `HashMap<Wtf8Buf, PyObjectRef>` to preserve the overwrite
     /// behaviour exactly — abnormal/hand-built duplicate keyword
     /// names collapse to the last value as PyPy does.  `arguments_w`
     /// is cloned because the storage is owned (PyPy returns the list
     /// reference; Rust's borrow checker forbids returning `&Vec`
     /// alongside a freshly-built second value without lifetime
     /// gymnastics, and `unpack` is documented as "slowish").
+    ///
+    /// `space.text_w` / `W_UnicodeObject.text_w` returns `self._utf8`,
+    /// so a lone surrogate stays in the buffer.  Routing the name
+    /// through `str_utf8_w` would raise `UnicodeEncodeError` before
+    /// any caller that unpacks then ignores `kwds_w`
+    /// (`descr_new_base_exception`) or only tests emptiness
+    /// (`W_OSError.descr_new`) could run.
     ///
     /// Returns `Err(PyError(TypeError))` if any keyword name is not a
     /// string — PyPy's `space.text_w(w_name)` raises TypeError in that
@@ -986,7 +993,7 @@ impl Arguments {
     ) -> Result<
         (
             Vec<PyObjectRef>,
-            std::collections::HashMap<String, PyObjectRef>,
+            std::collections::HashMap<Wtf8Buf, PyObjectRef>,
         ),
         crate::PyError,
     > {
@@ -1010,7 +1017,7 @@ impl Arguments {
             pyre_object::gc_roots::normalize_roots(names_base, names_n);
             pyre_object::gc_roots::normalize_roots(values_base, names_n);
         }
-        let mut kwds_w: std::collections::HashMap<String, PyObjectRef> =
+        let mut kwds_w: std::collections::HashMap<Wtf8Buf, PyObjectRef> =
             std::collections::HashMap::new();
         if let (Some(names_base), Some(values_base)) = (names_base, values_base) {
             for i in 0..names_n {
@@ -1018,7 +1025,9 @@ impl Arguments {
                 let w_value = pyre_object::gc_roots::shadow_stack_get(values_base + i);
                 let key = unsafe {
                     if pyre_object::is_str(w_name) {
-                        crate::baseobjspace::str_utf8_w(w_name)?.to_string()
+                        // argument.py `unpack` — `space.text_w(...)`.
+                        // `W_UnicodeObject.text_w` returns `self._utf8`.
+                        pyre_object::w_str_get_wtf8(w_name).to_owned()
                     } else {
                         // argument.py `unpack` — `space.text_w(...)`. PyPy's
                         // `_typed_unwrap_error` (baseobjspace.py)
@@ -2626,7 +2635,7 @@ mod tests {
             assert_eq!(pyre_object::w_int_get_value(args_w[0]), 10);
         }
         assert_eq!(kwds_w.len(), 1);
-        let v = kwds_w.get("k").expect("key 'k' present");
+        let v = kwds_w.get(&Wtf8Buf::from("k")).expect("key 'k' present");
         unsafe {
             assert_eq!(pyre_object::w_int_get_value(*v), 99);
         }
@@ -2644,7 +2653,9 @@ mod tests {
         let arguments = Arguments::with_kw(&pos, &names, &values);
         let (_, kwds_w) = arguments.unpack().expect("string keys are valid");
         assert_eq!(kwds_w.len(), 1, "duplicate keys must collapse");
-        let v = kwds_w.get("dup").expect("key 'dup' present");
+        let v = kwds_w
+            .get(&Wtf8Buf::from("dup"))
+            .expect("key 'dup' present");
         unsafe {
             // last-write-wins → expected value 2 (not 1).
             assert_eq!(pyre_object::w_int_get_value(*v), 2);
@@ -2668,6 +2679,24 @@ mod tests {
                 // `expected str, got <T> object`.
                 assert!(err.message_text().contains("expected str"));
             }
+        }
+    }
+
+    /// `unpack` keeps a lone-surrogate keyword name as WTF-8
+    /// (`W_UnicodeObject.text_w` returns `self._utf8`).
+    #[test]
+    fn unpack_keeps_surrogate_keyword_name() {
+        let mut name = Wtf8Buf::new();
+        name.push(rustpython_wtf8::CodePoint::from_u32(0xD800).unwrap());
+        let pos: [PyObjectRef; 0] = [];
+        let names = [pyre_object::w_str_from_wtf8(name.clone())];
+        let values = [pyre_object::w_int_new(2)];
+        let arguments = Arguments::with_kw(&pos, &names, &values);
+        let (_, kwds_w) = arguments.unpack().expect("surrogate names stay WTF-8");
+        assert_eq!(kwds_w.len(), 1);
+        let v = kwds_w.get(&name).expect("surrogate key present");
+        unsafe {
+            assert_eq!(pyre_object::w_int_get_value(*v), 2);
         }
     }
 

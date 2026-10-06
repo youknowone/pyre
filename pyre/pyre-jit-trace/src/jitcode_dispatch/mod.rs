@@ -15729,6 +15729,19 @@ fn handle<Sym: WalkSym>(
                     }
                 }
             }
+            // A crossed `compile_trace` walk keeps the origin frame's
+            // `virtualizable_boxes`. Dest LABEL arity is dest's
+            // `locals_cells_stack_w` length (`virtualizable.py
+            // get_array_length`). Re-derive dest boxes with recorded
+            // GETFIELD_GC / GETARRAYITEM_GC (`initialize_virtualizable`
+            // `read_boxes` as IR, `patch_new_loop_to_load_virtualizable_fields`)
+            // so the JUMP args are boxes, not constants, and match dest.
+            if let Some(&frame) = live_args.first() {
+                ctx.trace_ctx.gen_load_from_other_virtualizable(frame);
+                // Re-sync replaces the cache, including last_instr. Pin
+                // dest's slot to merge_pc-1 after that write.
+                sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
+            }
             live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
 
             // pyjitpl.py remove_consts_and_duplicates over the

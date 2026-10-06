@@ -68,6 +68,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -82,6 +84,11 @@ EXE = ".exe" if sys.platform == "win32" else ""
 BIN_NAME = {"dynasm": "pyre-dynasm", "cranelift": "pyre-cranelift"}
 
 STATUSES = ("PASS", "FAIL", "CRASH", "TIMEOUT", "IMPORTERROR", "SKIP")
+
+# A live module is named once at this age so a cancelled log still identifies
+# it. Progress marks wait for a result, so without this a module that hangs
+# until the job is killed leaves only unmarked dots.
+STILL_RUNNING_AFTER = 120
 
 # Modules deliberately not run, ported from PyPy's lib-python/conftest.py
 # `testmap` skip reasons. These are CPython implementation-detail or
@@ -1295,12 +1302,25 @@ def main() -> int:
 
     results: dict[str, tuple[str, str]] = {}
     done = 0
+    progress_on_line = 0
+    running: dict[str, float] = {}
+    announced_running: set[str] = set()
+    io_lock = threading.Lock()
+    stop_watch = threading.Event()
+
+    def end_progress_line(with_counter: bool = False) -> None:
+        """Close the current mark line. Callers hold `io_lock`."""
+        nonlocal progress_on_line
+        if with_counter:
+            sys.stdout.write(f" {done}/{len(to_run)}\n")
+            progress_on_line = 0
+        elif progress_on_line:
+            sys.stdout.write("\n")
+            progress_on_line = 0
 
     def record_result(module: str, result: tuple[str, str]) -> None:
-        nonlocal done
+        nonlocal done, progress_on_line
         status, detail = result
-        results[module] = (status, detail)
-        done += 1
         # Every member of STATUSES needs a mark, SKIP included: a module
         # that runs and bails with SkipTest is classified SKIP (:229),
         # which is a different event from a module deselected before the
@@ -1308,23 +1328,79 @@ def main() -> int:
         # reserved for a status this table does not know.
         mark = {"PASS": "·", "FAIL": "F", "CRASH": "C", "TIMEOUT": "T",
                 "IMPORTERROR": "i", "SKIP": "s"}.get(status, "?")
-        sys.stdout.write(mark)
-        sys.stdout.flush()
-        if done % 80 == 0:
-            sys.stdout.write(f" {done}/{len(to_run)}\n")
+        # Name FAIL/CRASH/TIMEOUT/IMPORTERROR as soon as they are recorded so
+        # a cancelled job log still identifies the module. End the current
+        # mark line first, then continue marks on a fresh line. The
+        # `done/total` counter stays on every 80th result, independent of
+        # those breaks.
+        named = status not in ("PASS", "SKIP")
+        with io_lock:
+            results[module] = (status, detail)
+            done += 1
+            sys.stdout.write(mark)
+            progress_on_line += 1
+            if done % 80 == 0:
+                end_progress_line(with_counter=True)
+            elif named:
+                end_progress_line()
+            if named:
+                preview = detail.splitlines()[0].strip()[:200] if detail else ""
+                sys.stdout.write(f"  {module}: {status}")
+                if preview:
+                    sys.stdout.write(f" {preview}")
+                sys.stdout.write("\n")
+            sys.stdout.flush()
 
-    parallel_modules = [m for m in to_run if m not in SERIAL_MODULES]
-    serial_modules = [m for m in to_run if m in SERIAL_MODULES]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = {
-            pool.submit(run_module, binary, m, args.mode, args.timeout, env): m
-            for m in parallel_modules
-        }
-        for fut in concurrent.futures.as_completed(futs):
-            m = futs[fut]
-            record_result(m, fut.result())
-    for m in serial_modules:
-        record_result(m, run_module(binary, m, args.mode, args.timeout, env))
+    def run_tracked(module: str) -> tuple[str, str]:
+        with io_lock:
+            running[module] = time.monotonic()
+        try:
+            return run_module(binary, module, args.mode, args.timeout, env)
+        finally:
+            with io_lock:
+                running.pop(module, None)
+
+    def watch_still_running() -> None:
+        while not stop_watch.wait(1.0):
+            now = time.monotonic()
+            with io_lock:
+                overdue: list[tuple[str, int]] = []
+                for module, started in running.items():
+                    if module in announced_running:
+                        continue
+                    elapsed = now - started
+                    if elapsed >= STILL_RUNNING_AFTER:
+                        announced_running.add(module)
+                        overdue.append((module, int(elapsed)))
+                if not overdue:
+                    continue
+                end_progress_line()
+                for module, elapsed in overdue:
+                    sys.stdout.write(
+                        f"  still running after {elapsed}s: {module}\n"
+                    )
+                sys.stdout.flush()
+
+    watcher = threading.Thread(
+        target=watch_still_running, name="still-running", daemon=True,
+    )
+    watcher.start()
+    try:
+        parallel_modules = [m for m in to_run if m not in SERIAL_MODULES]
+        serial_modules = [m for m in to_run if m in SERIAL_MODULES]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futs = {
+                pool.submit(run_tracked, m): m
+                for m in parallel_modules
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                m = futs[fut]
+                record_result(m, fut.result())
+        for m in serial_modules:
+            record_result(m, run_tracked(m))
+    finally:
+        stop_watch.set()
+        watcher.join(timeout=2)
     print()
 
     # Summary by status.
