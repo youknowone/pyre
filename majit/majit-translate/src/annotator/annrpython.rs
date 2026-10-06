@@ -2321,23 +2321,14 @@ impl RPythonAnnotator {
             } else {
                 // Same `flowin` rule as `follow_link`: an unbound arg
                 // means this raise-link was not followed.
+                // `follow_raise_link` (annrpython.py) uses
+                // `annotation(v_out)` for the handler input. The
+                // carrier (`OperationError` / `error::PyErrorObject`)
+                // subclasses `Exception`; it is never a `W_Root`.
                 let Some(s_out) = self.annotation(v_out) else {
                     return;
                 };
                 let s_out = self.apply_renaming(s_out, &renaming);
-                // Only the target block input moves. The extravar
-                // binding stays the flowspace exception so the
-                // `v_out == v_last_exc_type` arm above still computes
-                // `typeof` from that binding.
-                let is_exc_value = match (v_out, v_last_exc_value_opt.as_ref()) {
-                    (Hlvalue::Variable(v), Some(ev)) => v == ev.as_ref(),
-                    _ => false,
-                };
-                let s_out = if is_exc_value {
-                    self.retype_bare_exception_input(s_out)
-                } else {
-                    s_out
-                };
                 inputs_s.push(s_out);
             }
         }
@@ -2346,124 +2337,6 @@ impl RPythonAnnotator {
         self.links_followed.borrow_mut().insert(lkey, link.clone());
         let inputs_s_opt: Vec<Option<SomeValue>> = inputs_s.into_iter().map(Some).collect();
         self.addpendingblock(graph, &target_rc, &inputs_s_opt);
-    }
-
-    /// Flowspace `Exception` classdef (`HOST_ENV`, then
-    /// `Bookkeeper::getuniqueclassdef`). `ClassDesc::new` clears that
-    /// class's baselist, so it is a root.
-    fn flowspace_exception_classdef(&self) -> Option<Rc<RefCell<super::classdesc::ClassDef>>> {
-        use crate::flowspace::model::HOST_ENV;
-        let host = HOST_ENV.lookup_exception_class("Exception")?;
-        self.bookkeeper.getuniqueclassdef(&host).ok()
-    }
-
-    /// Classdef of `s` after `SomeException::as_some_instance`'s union.
-    /// A union that does not yield one instance (no common base) stays
-    /// unresolved so the caller keeps the original annotation.
-    fn collapsed_classdef(s: &SomeValue) -> Option<Rc<RefCell<super::classdesc::ClassDef>>> {
-        use super::model::{SomeInstance, unionof};
-        match s {
-            SomeValue::Instance(inst) => inst.classdef.clone(),
-            SomeValue::Exception(exc) => {
-                let instances: Vec<SomeValue> = exc
-                    .classdefs
-                    .iter()
-                    .cloned()
-                    .map(|classdef| {
-                        SomeValue::Instance(SomeInstance::new(
-                            Some(classdef),
-                            false,
-                            std::collections::BTreeMap::new(),
-                        ))
-                    })
-                    .collect();
-                match unionof(&instances) {
-                    Ok(SomeValue::Instance(inst)) => inst.classdef,
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// `pyobject::PyObject` struct root, the class
-    /// `project_struct_field_type("PyObjectRef")` publishes. Absent
-    /// until that struct is in the field registry, so a session that
-    /// has not registered it keeps the flowspace annotation.
-    fn host_struct_instance(
-        &self,
-        can_be_none: bool,
-        flags: std::collections::BTreeMap<String, bool>,
-    ) -> Option<SomeValue> {
-        use super::model::SomeInstance;
-        const ROOT: &str = "pyobject::PyObject";
-        let canonical = majit_ir::descr::canonical_struct_name(ROOT);
-        let already_projected = self
-            .bookkeeper
-            .projected_struct_rows
-            .borrow()
-            .contains(&canonical);
-        let classdef = if already_projected {
-            let host = self.bookkeeper.intern_class_by_qualname(ROOT);
-            self.bookkeeper.getuniqueclassdef(&host).ok()?
-        } else {
-            let registered = self
-                .bookkeeper
-                .struct_fields
-                .borrow()
-                .as_ref()
-                .is_some_and(|reg| reg.fields.contains_key(ROOT));
-            if !registered {
-                return None;
-            }
-            self.bookkeeper
-                .getuniqueclassdef_for_struct_root(ROOT)
-                .ok()?
-        };
-        Some(SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            can_be_none,
-            flags,
-        )))
-    }
-
-    /// Handler-block input for `link.last_exc_value`.
-    ///
-    /// The trace-level exception object is a `PyObject`
-    /// (`W_BaseException` embeds `ob_header`). `get_exception` still
-    /// yields the flowspace `Exception` class. Upstream
-    /// `OperationError` subclasses `Exception`, so one classdef is
-    /// both the extravar and the handler input; here
-    /// `ClassDef::commonbase` of that class and `pyobject::PyObject`
-    /// is `None`.
-    ///
-    /// Retype the block input only when the binding is exactly that
-    /// root: a `SomeInstance` of it, or a `SomeException` whose
-    /// `as_some_instance` union is it (a catch-all set such as
-    /// `IndexError` ∪ `KeyError` ∪ `Exception`). A narrower exit
-    /// (`OverflowError`, a lone `IndexError`) is unchanged. The
-    /// extravar binding is not written: `follow_raise_link` recomputes
-    /// `typeof([last_exc_value])` onto `last_exception` from it.
-    ///
-    /// An `ErrorCarrier` handler input is already `SomeInstance` of the
-    /// object class (`error::PyErrorObject`, base `Exception`); it is
-    /// not retyped.
-    fn retype_bare_exception_input(&self, s_out: SomeValue) -> SomeValue {
-        let Some(exception_cd) = self.flowspace_exception_classdef() else {
-            return s_out;
-        };
-        let Some(collapsed) = Self::collapsed_classdef(&s_out) else {
-            return s_out;
-        };
-        let (can_be_none, flags) = match &s_out {
-            SomeValue::Instance(inst) => (inst.can_be_none, inst.flags.clone()),
-            _ => (false, std::collections::BTreeMap::new()),
-        };
-        if !Rc::ptr_eq(&collapsed, &exception_cd) {
-            return s_out;
-        }
-        self.host_struct_instance(can_be_none, flags)
-            .unwrap_or(s_out)
     }
 
     /// RPython `reflowfromposition(self, position_key)`
@@ -4865,12 +4738,6 @@ mod tests {
         )
     }
 
-    fn host_classdef(ann: &RPythonAnnotator) -> Rc<RefCell<super::super::classdesc::ClassDef>> {
-        ann.bookkeeper
-            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
-            .expect("PyObject struct root")
-    }
-
     fn assert_class_ptr_eq(
         s: &SomeValue,
         expected: &Rc<RefCell<super::super::classdesc::ClassDef>>,
@@ -4889,7 +4756,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_exception_block_input_is_struct_root() {
+    fn bare_exception_block_input_stays_exception() {
         use super::super::model::SomeException;
         use crate::front::StructFieldRegistry;
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -4916,7 +4783,6 @@ mod tests {
 
         let (extravar, type_extravar, also, value) =
             follow_one_raise(&ann, exception_instance(&ann, "Exception"));
-        let host_class = host_classdef(&ann);
         assert_class_ptr_eq(&extravar, &exception, "bare extravar");
         assert!(
             matches!(type_extravar, SomeValue::TypeOf(_)),
@@ -4924,7 +4790,10 @@ mod tests {
             classdef_name(&type_extravar)
         );
         assert_class_ptr_eq(&also, &exception, "non-value Exception arg");
-        assert_class_ptr_eq(&value, &host_class, "bare Exception block input");
+        // `follow_raise_link` (annrpython.py) binds the handler input
+        // from `annotation(v_out)`. OperationError subclasses Exception
+        // and is never a W_Root, so the input stays Exception.
+        assert_class_ptr_eq(&value, &exception, "bare Exception block input");
 
         let (extravar, _, _, value) =
             follow_one_raise(&ann, exception_instance(&ann, "IndexError"));
@@ -4960,7 +4829,11 @@ mod tests {
             "catch-all extravar stays SomeException, got {}",
             classdef_name(&extravar)
         );
-        assert_class_ptr_eq(&value, &host_class, "catch-all block input");
+        assert!(
+            matches!(value, SomeValue::Exception(_)),
+            "catch-all block input stays SomeException, got {}",
+            classdef_name(&value)
+        );
 
         let lone = SomeValue::Exception(SomeException::new(vec![Rc::clone(&index)]));
         let (extravar, _, _, value) = follow_one_raise(&ann, lone);

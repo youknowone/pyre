@@ -33,7 +33,7 @@ use crate::pyobject::*;
 /// young box.
 #[repr(C)]
 pub struct Utf8Str {
-    pub hash: usize,
+    pub hash: isize,
     pub length: usize,
     chars: [u8; 0],
 }
