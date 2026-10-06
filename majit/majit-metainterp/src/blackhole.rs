@@ -7796,7 +7796,20 @@ impl StateFieldLayout {
     /// argument immediately before the ref-scalar identity prefix.
     /// `None` when the state has no virtualizable.
     pub fn vable_identity_ref_slot(&self) -> Option<usize> {
-        (self.num_vable_identity_slots != 0).then(|| self.ref_scalar_base.saturating_sub(1))
+        if self.num_vable_identity_slots == 0 {
+            return None;
+        }
+        // The identity is the portal ref argument immediately before the
+        // ref-scalar prefix. `program` occupies r0, so the identity is r1
+        // and `ref_scalar_base` is at least 2. `saturating_sub(1)` on an
+        // unset base 0 would alias r0.
+        assert!(
+            self.ref_scalar_base >= 2,
+            "vable identity requires ref_scalar_base >= 2 (program at r0); \
+             got {}",
+            self.ref_scalar_base
+        );
+        Some(self.ref_scalar_base - 1)
     }
 
     /// Former int-bank identity slot. Always `None`: the identity is a Ref.

@@ -2647,7 +2647,7 @@ impl Trace {
     }
 
     /// Visit each recorded op in `_ops`[`_start`, `_pos`).
-    pub(crate) fn for_each_encoded_op(&self, mut f: impl FnMut(EncodedOp)) {
+    pub(crate) fn for_each_encoded_op(&self, mut f: impl FnMut(EncodedOp) -> bool) {
         let mut pos = self._start as usize;
         let end = self._pos;
         let mut index = self._start;
@@ -2676,13 +2676,15 @@ impl Trace {
             } else {
                 0
             };
-            f(EncodedOp {
+            if !f(EncodedOp {
                 opcode,
                 args_pos,
                 arity,
                 descr_index,
                 box_index: index,
-            });
+            }) {
+                return;
+            }
             if opcode.result_type() != Type::Void {
                 index += 1;
             }

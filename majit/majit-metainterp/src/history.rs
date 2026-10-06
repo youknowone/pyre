@@ -537,7 +537,9 @@ pub struct TreeLoop {
     /// the shared identity.
     pub ops: Vec<OpRc>,
     /// opencoder.py parity: per-guard snapshots captured during tracing.
-    /// Indexed by the guard op's `rd_resume_position`.
+    /// Looked up by the guard op's `rd_resume_position` (snapshot byte
+    /// offset), which is `Snapshot.resume_position`. Capture order is
+    /// increasing offset, so `Snapshot::by_resume_position` binary-searches.
     pub snapshots: Vec<crate::recorder::Snapshot>,
 }
 
@@ -1074,7 +1076,9 @@ impl TreeLoop {
             if snapshot_id < 0 {
                 continue;
             }
-            let Some(snap) = self.snapshots.get(snapshot_id as usize) else {
+            let Some(snap) =
+                crate::recorder::Snapshot::by_resume_position(&self.snapshots, snapshot_id)
+            else {
                 continue;
             };
             let tagged = snap
@@ -2295,7 +2299,7 @@ mod tests {
         boxes: Vec<crate::recorder::SnapshotTagged>,
     ) -> crate::recorder::Snapshot {
         crate::recorder::Snapshot {
-            resume_position: -1,
+            resume_position: 0,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 0,
@@ -2344,6 +2348,56 @@ mod tests {
         // The add is re-emitted as a prefix op, and the snapshot slot names it.
         assert_eq!(cut.ops[0].opcode, OpCode::IntAdd);
         let slot = cut.snapshots[0].frames[0].boxes[0];
+        let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+            panic!("snapshot slot lost its box: {slot:?}");
+        };
+        assert!(!r.is_none(), "snapshot slot mapped to NONE: {slot:?}");
+        assert_eq!(r, cut.ops[0].pos().get());
+    }
+
+    #[test]
+    fn test_cut_trace_from_looks_up_snapshot_by_resume_position() {
+        // `rd_resume_position` is the `_snapshot_data` byte offset
+        // (`create_top_snapshot`). Decode stores snapshots densely with
+        // `resume_position: offset`, so `snapshots.get(offset)` misses
+        // after the first snapshot. A pre-cut value named only by the
+        // second guard's snapshot must still be replayed.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
+        add.pos().set(iop(2));
+        let mut g0 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        g0.pos().set(vop(3));
+        g0.set_rd_resume_position(0);
+        let mut g1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        g1.pos().set(vop(4));
+        g1.set_rd_resume_position(7);
+        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        jump.pos().set(vop(5));
+        let mut snap0 = snapshot_with_frame_boxes(vec![crate::recorder::SnapshotTagged::Box(
+            iarg(0),
+            Type::Int,
+        )]);
+        snap0.resume_position = 0;
+        let mut snap1 = snapshot_with_frame_boxes(vec![crate::recorder::SnapshotTagged::Box(
+            iop(2),
+            Type::Int,
+        )]);
+        snap1.resume_position = 7;
+        let trace =
+            TreeLoop::with_snapshots(inputargs, vec![add, g0, g1, jump], vec![snap0, snap1]);
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![
+            crate::trace_ctx::GreenBox::new(iarg(0), Type::Int),
+            crate::trace_ctx::GreenBox::new(iarg(1), Type::Int),
+        ];
+        let cut = trace
+            .cut_trace_from_with_consts(start, &original_boxes, &[], false)
+            .expect("cut declined unexpectedly");
+        assert_eq!(cut.ops[0].opcode, OpCode::IntAdd);
+        let slot = crate::recorder::Snapshot::by_resume_position(&cut.snapshots, 7)
+            .expect("second snapshot looked up by offset")
+            .frames[0]
+            .boxes[0];
         let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
             panic!("snapshot slot lost its box: {slot:?}");
         };
@@ -3021,13 +3075,9 @@ impl TraceCtx {
         id
     }
 
-    /// Look up a captured snapshot by id.
+    /// Look up a captured snapshot by `rd_resume_position` (byte offset).
     pub fn get_snapshot(&self, id: i32) -> Option<&crate::recorder::Snapshot> {
-        if id >= 0 {
-            self.snapshots.get(id as usize)
-        } else {
-            None
-        }
+        crate::recorder::Snapshot::by_resume_position(&self.snapshots, id)
     }
 
     /// Decode `_snapshot_data` into `self.snapshots` when the live

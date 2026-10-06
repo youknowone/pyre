@@ -442,9 +442,10 @@ where
         let (opref, value) = self.read_int_reg(src);
         // `handler_store_state_array_dii` writes
         // `registers_i[StateFieldLayout::array_elem_slot]`.
-        if let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) {
-            self.set_int_identity_slot(slot, Some(opref), Some(value));
-        }
+        let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
+            return TraceAction::Abort;
+        };
+        self.set_int_identity_slot(slot, Some(opref), Some(value));
         TraceAction::Continue
     }
 

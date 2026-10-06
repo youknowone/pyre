@@ -4293,13 +4293,20 @@ impl<S: JitState> JitDriver<S> {
                                 ),
                                 None => (None, None),
                             };
+                            // `reached_loop_header` / `compile_trace` build
+                            // JUMP from the live portal boxes
+                            // (`original_boxes`-shaped), never the vable-only
+                            // subset `collect_jump_args_with_boxes` emits.
                             let mut boxes = if let Some(typed) = stashed {
                                 typed.into_iter().map(|(o, _)| o).collect()
+                            } else if let Some(root) = self.meta.framestack.frames.first() {
+                                S::collect_jump_args_from_portal(
+                                    sym,
+                                    root,
+                                    vable_boxes.as_deref().unwrap_or(&[]),
+                                )
                             } else {
-                                match vable_boxes {
-                                    Some(ref b) => S::collect_jump_args_with_boxes(sym, b),
-                                    None => S::collect_jump_args(sym),
-                                }
+                                S::collect_jump_args(sym)
                             };
                             if let Some(ctx) = self.meta.trace_ctx() {
                                 ctx.remove_consts_and_duplicates_untyped(&mut boxes);
@@ -4308,7 +4315,8 @@ impl<S: JitState> JitDriver<S> {
                                 // the mutated list, so the rewrite reaches every
                                 // later reader. The element block is a strict
                                 // SUFFIX of the loop-carried list
-                                // (`collect_jump_args_with_boxes`), so its tail is
+                                // (`collect_jump_args_from_portal` /
+                                // `loop_carried_boxes_from_portal`), so its tail is
                                 // what goes back.
                                 if let Some(n) =
                                     vable_boxes.as_ref().map(|b| b.len().saturating_sub(1))
@@ -4323,7 +4331,7 @@ impl<S: JitState> JitDriver<S> {
                                     // the other side.
                                     //
                                     // It holds by construction:
-                                    // `collect_jump_args_with_boxes` appends the
+                                    // `collect_jump_args_from_portal` appends the
                                     // element block, and
                                     // `remove_consts_and_duplicates_untyped` takes
                                     // `&mut [OpRef]`, so it substitutes SameAs ops
