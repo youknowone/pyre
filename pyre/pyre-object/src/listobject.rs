@@ -11,8 +11,9 @@
 use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
     alloc_typed_items_block_nursery, dealloc_list_items_block, gc_float_array_gc_type_id,
-    gc_int_array_gc_type_id, grow_list_items_block_gc, grow_typed_items_block, items_block_capacity,
-    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
+    gc_int_array_gc_type_id, grow_list_items_block_gc, grow_typed_items_block,
+    items_block_capacity, items_block_items_base, items_block_set_ref, jit_ll_arraycopy,
+    typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
