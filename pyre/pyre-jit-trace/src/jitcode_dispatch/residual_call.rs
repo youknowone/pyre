@@ -8505,16 +8505,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::MathFrexp, || {
-            try_walker_specialize_math_frexp(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
     // `divmod(a, b)` descends `space.divmod` instead of the opaque
     // `bh_call_fn(divmod, NULL, a, b)` residual. `SubRaise` from that
     // body (a zero divisor) propagates; any other shape falls through
