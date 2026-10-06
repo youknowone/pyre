@@ -5002,7 +5002,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         crate::host_seam::ops::isatty(fd).unwrap_or(false),
                     ));
                 }
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                {
+                    // `rposix.isatty`: `c_isatty(fd) != 0` (`save_err` is `RFFI_ERR_NONE`).
+                    let mut w_fd = args[0];
+                    let res = pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_isatty(fd)
+                    });
+                    Ok(pyre_object::w_bool_from(res != 0))
+                }
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,
@@ -5161,11 +5170,37 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Some(w) => crate::baseobjspace::c_int_w(w)?,
                 None => 1,
             };
-            #[cfg(all(unix, feature = "host_env"))]
+            #[cfg(unix)]
             {
-                let (columns, lines) = rustpython_host_env::posix::get_terminal_size(fd)
-                    .map_err(|e| errno_err(e.raw_os_error().unwrap_or(0), ""))?;
-                Ok(make_terminal_size(columns as i64, lines as i64))
+                // `interp_posix._get_terminal_size`: Unix arm is
+                // `rposix.c_ioctl_voidp(fd, rposix.TIOCGWINSZ, winsize)`;
+                // nonzero is `exception_from_saved_errno`. Columns/lines are
+                // `ws_col`/`ws_row`.
+                let mut winsize: libc::winsize = unsafe { core::mem::zeroed() };
+                let failed = if let Some(mut w_fd) = bound[0] {
+                    pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_ioctl_voidp(
+                            fd,
+                            majit_rlib::rposix::TIOCGWINSZ as majit_rlib::rffi::UINT,
+                            &mut winsize as *mut libc::winsize as majit_rlib::rffi::VOIDP,
+                        )
+                    })
+                } else {
+                    unsafe {
+                        majit_rlib::rposix::c_ioctl_voidp(
+                            fd,
+                            majit_rlib::rposix::TIOCGWINSZ as majit_rlib::rffi::UINT,
+                            &mut winsize as *mut libc::winsize as majit_rlib::rffi::VOIDP,
+                        )
+                    }
+                };
+                if failed != 0 {
+                    return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
+                }
+                Ok(make_terminal_size(
+                    winsize.ws_col as i64,
+                    winsize.ws_row as i64,
+                ))
             }
             #[cfg(all(windows, feature = "host_env"))]
             {
@@ -5175,7 +5210,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(make_terminal_size(columns as i64, lines as i64))
             }
             // A target with neither call has no terminal to measure.
-            #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
+            #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
             {
                 let _ = fd;
                 Ok(make_terminal_size(80, 24))
@@ -7348,6 +7383,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // stat_result type — structseq (tuple subclass). Exported so that
     // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
     crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    // `interp_posix.getcwdb` is `os.getcwd()` bytes; Unix `getcwd` is
+    // `space.fsdecode(getcwdb(space))`. `rposix.getcwd` returns those bytes.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn getcwdb_bytes() -> Result<Vec<u8>, crate::PyError> {
+        match majit_rlib::rposix::getcwd() {
+            Ok(cwd) => Ok(cwd),
+            Err(_) => Err(errno_err(majit_rlib::rposix::get_saved_errno(), "")),
+        }
+    }
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::module_ns_store(
         ns,
@@ -7367,7 +7411,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
                 }
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                {
+                    let cwd = getcwdb_bytes()?;
+                    Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
+                }
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 {
                     #[cfg(feature = "host_env")]
                     {
@@ -7394,7 +7443,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     Ok(pyre_object::w_bytes_from_bytes(&cwd))
                 }
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                {
+                    let cwd = getcwdb_bytes()?;
+                    Ok(pyre_object::w_bytes_from_bytes(&cwd))
+                }
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 {
                     #[cfg(feature = "host_env")]
                     {

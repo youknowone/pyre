@@ -133,6 +133,14 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+/// `rposix.TIOCGWINSZ` (`CConfig`).
+#[cfg(unix)]
+pub const TIOCGWINSZ: crate::rffi::UINT = libc::TIOCGWINSZ as crate::rffi::UINT;
+
+/// `rposix.WINSIZE` (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`).
+#[cfg(unix)]
+pub type WINSIZE = libc::winsize;
+
 // `rposix.external` for the fd and path calls below. `c_open` on darwin is
 // variadic (`natural_arity=2`, mode is `rffi.INT`); everywhere else the mode
 // is `rffi.MODE_T`. `c_close` is `releasegil=False`. `c_lseek` is
@@ -356,6 +364,29 @@ crate::rffi::llexternal!(
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
+
+/// `rposix.getcwd`. Start `bufsize` 256, `c_getcwd`, on null if
+/// `get_saved_errno() != ERANGE` return that errno, else `bufsize *= 4`
+/// until `bufsize > 1024*1024`. Returns the C-string bytes.
+#[cfg(unix)]
+pub fn getcwd() -> Result<Vec<u8>, i32> {
+    let mut bufsize = 256usize;
+    loop {
+        let mut buf = vec![0u8; bufsize];
+        let res = unsafe { c_getcwd(buf.as_mut_ptr().cast(), bufsize) };
+        if !res.is_null() {
+            return Ok(unsafe { crate::rffi::charp2str(res.cast()) });
+        }
+        let error = get_saved_errno();
+        if error != libc::ERANGE {
+            return Err(error);
+        }
+        bufsize *= 4;
+        if bufsize > 1024 * 1024 {
+            return Err(error);
+        }
+    }
+}
 
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -2664,6 +2695,29 @@ mod tests {
         assert!(!res.is_null());
         let bytes = unsafe { std::ffi::CStr::from_ptr(res) }.to_bytes();
         assert!(!bytes.is_empty());
+
+        let cwd = getcwd().expect("rposix.getcwd");
+        assert!(!cwd.is_empty());
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let mut winsize: WINSIZE = unsafe { std::mem::zeroed() };
+        let failed = unsafe {
+            c_ioctl_voidp(
+                fds[0],
+                TIOCGWINSZ,
+                &mut winsize as *mut WINSIZE as crate::rffi::VOIDP,
+            )
+        };
+        assert_ne!(failed, 0);
+        assert_ne!(get_saved_errno(), 0);
+        assert_eq!(unsafe { c_close(fds[0]) }, 0);
+        assert_eq!(unsafe { c_close(fds[1]) }, 0);
     }
 
     #[cfg(unix)]
