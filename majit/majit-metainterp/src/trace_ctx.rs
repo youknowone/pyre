@@ -3930,6 +3930,60 @@ impl TraceCtx {
         unreachable!("write_virtualizable_back_at: index {index} fell out of the flat layout");
     }
 
+    /// Write `value` into flat slot `index` of the live virtualizable without
+    /// stamping a box (`virtualizable.py write_box_at` over a value that is
+    /// not a box result). Used when SWAP rearranges unstamped slots: the
+    /// boxes stay unstamped and the virtualizable holds the swapped
+    /// contents, so a later `read_boxes` / `virtualizable_entry_at` heap
+    /// fallback sees the new arrangement.
+    pub fn write_virtualizable_heap_value_at(&self, index: usize, value: Value) {
+        self.write_virtualizable_heap_bits_at(index, value_to_raw_bits(value), true);
+    }
+
+    fn write_virtualizable_heap_bits_at(
+        &self,
+        index: usize,
+        bits: i64,
+        skip_when_outer_owned: bool,
+    ) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
+            return;
+        };
+        if skip_when_outer_owned && info.outer_executor_owns_state {
+            return;
+        }
+        let static_count = info.num_static_extra_boxes;
+        let mut needed = static_count;
+        for &len in lengths {
+            needed = needed.saturating_add(len);
+        }
+        if index >= needed {
+            return;
+        }
+        let mut i = index;
+        unsafe {
+            let dst = heap_ptr as *mut u8;
+            if i < static_count {
+                info.write_field(dst, i, bits);
+                return;
+            }
+            i -= static_count;
+            for (array_index, &len) in lengths.iter().enumerate() {
+                if i < len {
+                    info.write_array_item(dst, array_index, i, bits);
+                    return;
+                }
+                i -= len;
+            }
+        }
+    }
+
     /// pyjitpl.py `check_synchronized_virtualizable()`, whose body is
     /// `virtualizable.py check_boxes`.
     ///
@@ -4058,6 +4112,29 @@ impl TraceCtx {
         }
         let value = self.virtualizable_heap_value_at(index)?;
         Some((opref, value))
+    }
+
+    /// `_opimpl_getfield_vable` / `_opimpl_getarrayitem_vable`: the box in
+    /// `virtualizable_boxes[index]`, and that box's own result.
+    ///
+    /// A recorded op that carries no runtime concrete (lazy wrapint
+    /// `NewWithVtable` before allocation) must not claim the live
+    /// virtualizable's W_Root as `_make_op`'s result. An `InputArg` the
+    /// trace never replaced still reads the slot from the virtualizable
+    /// (`read_boxes`).
+    fn vable_box_result_at(&self, index: usize) -> Option<(OpRef, Option<Value>)> {
+        let opref = self.virtualizable_box_at(index)?;
+        if let Some(value) = self.box_runtime_concrete(opref) {
+            return Some((opref, Some(value)));
+        }
+        if opref.is_input_arg() {
+            return Some((
+                opref,
+                self.virtualizable_heap_value_at(index)
+                    .and_then(concrete_shadow_value),
+            ));
+        }
+        Some((opref, None))
     }
 
     /// Slot `index` of the live virtualizable, `virtualizable.py read_boxes`
@@ -5634,9 +5711,9 @@ impl TraceCtx {
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index
-            && let Some((op, value)) = self.virtualizable_entry_at(idx)
+            && let Some((op, value)) = self.vable_box_result_at(idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         // Fallback for tests/missing layout.  No live load reached this leg,
         // so the funnel's `resvalue` is `None` and it records unconditionally.
@@ -5989,9 +6066,9 @@ impl TraceCtx {
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index
-            && let Some((op, value)) = self.virtualizable_entry_at(idx)
+            && let Some((op, value)) = self.vable_box_result_at(idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         let op = self.execute_and_record(
             Some(cpu),
@@ -6108,9 +6185,9 @@ impl TraceCtx {
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
         if let Some(idx) = index
-            && let Some((op, value)) = self.virtualizable_entry_at(idx)
+            && let Some((op, value)) = self.vable_box_result_at(idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         let op = self.execute_and_record(
             Some(cpu),
@@ -6134,9 +6211,9 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
-            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+            && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         let index = self.const_int(item_index as i64);
         // pyjitpl.py:1218-1230 vable fallback uses standard array access.
@@ -6270,9 +6347,9 @@ impl TraceCtx {
         // return self.metainterp.virtualizable_boxes[index]
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
-            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+            && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         // Fallback: vable layout missing — go through getfield + arrayitem.
         // `stamp_vable_array_base` supplies the concrete after the record, so
@@ -6404,9 +6481,9 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
-            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+            && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         let index = self.const_int(item_index as i64);
         // The element is stamped afterwards by `stamp_vable_array_item`, so
@@ -6511,16 +6588,16 @@ impl TraceCtx {
             return (item, None);
         }
         let flat_idx = self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr);
-        let entry = flat_idx.and_then(|flat_idx| self.virtualizable_entry_at(flat_idx));
+        let entry = flat_idx.and_then(|flat_idx| self.vable_box_result_at(flat_idx));
         if crate::vable_read_probe_enabled() {
             eprintln!(
                 "[vable-read-probe] exit=standard flat_idx={flat_idx:?} entry={} concrete={}",
                 entry.is_some(),
-                entry.is_some_and(|(_, value)| concrete_shadow_value(value).is_some()),
+                entry.is_some_and(|(_, value)| value.is_some()),
             );
         }
         if let Some((op, value)) = entry {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         // `stamp_vable_array_base` supplies the concrete after the record, so
         // the funnel sees no `resvalue` and cannot fold.
@@ -6561,9 +6638,9 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
-            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+            && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         let index = self.const_int(item_index as i64);
         // The element is stamped afterwards by `stamp_vable_array_item`, so
@@ -6611,9 +6688,9 @@ impl TraceCtx {
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
-            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+            && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
-            return (op, concrete_shadow_value(value));
+            return (op, value);
         }
         // `stamp_vable_array_base` supplies the concrete after the record, so
         // the funnel sees no `resvalue` and cannot fold.

@@ -735,17 +735,14 @@ pub(crate) fn swap_stack_slots(
             ctx.virtualizable_entry_at(flat_top),
             ctx.virtualizable_entry_at(flat_other),
         ) {
-            if ctx.box_carries_runtime_concrete(op_top)
-                && ctx.box_carries_runtime_concrete(op_other)
-            {
-                ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
-                ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
-            } else {
-                // An unstamped box's current concrete is the live virtualizable,
-                // not a value that box may claim. Swap only the OpRef halves.
-                ctx.set_virtualizable_box_at(flat_top, op_other);
-                ctx.set_virtualizable_box_at(flat_other, op_top);
-            }
+            // Swap the boxes. A box keeps only its own result; an unstamped
+            // slot's current concrete lives on the virtualizable, so write
+            // the swapped values there (`write_box_at` over the slot, not
+            // `_make_op` on the box).
+            ctx.set_virtualizable_box_at(flat_top, op_other);
+            ctx.set_virtualizable_box_at(flat_other, op_top);
+            ctx.write_virtualizable_heap_value_at(flat_top, val_other);
+            ctx.write_virtualizable_heap_value_at(flat_other, val_top);
         } else if let (Some(op_top), Some(op_other)) = (
             ctx.virtualizable_box_at(flat_top),
             ctx.virtualizable_box_at(flat_other),
