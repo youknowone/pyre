@@ -449,10 +449,10 @@ fn faulthandler_get_fileno_and_file(
 }
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
-        ns,
-        "enable",
-        pyre_interpreter::make_builtin_function_with_signature(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+        { let __pyre_stored = pyre_interpreter::make_builtin_function_with_signature(
             "enable",
             |args| {
                 // `handler.py enable` — file=None, all_threads=True.
@@ -542,12 +542,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 0,
                 0,
             ),
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "disable",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); crate::module_ns_store_slot(ns_slot, "enable", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "disable",
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -569,12 +565,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "is_enabled",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); crate::module_ns_store_slot(ns_slot, "disable", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "is_enabled",
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -587,12 +579,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_bool_from(false))
             },
             0,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "dump_traceback",
-        pyre_interpreter::make_builtin_function("dump_traceback", |_| {
+        ); crate::module_ns_store_slot(ns_slot, "is_enabled", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function("dump_traceback", |_| {
             // No Python-level traceback machinery — emit a placeholder
             // so callers that want a forensic dump at least see *something*
             // instead of silent success.  Through the stderr seam, so it
@@ -602,24 +590,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 b"<faulthandler: pyre has no Python-level traceback yet>\n",
             );
             Ok(pyre_object::w_none())
-        }),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "dump_traceback_later",
-        pyre_interpreter::make_builtin_function("dump_traceback_later", |_| {
+        }); crate::module_ns_store_slot(ns_slot, "dump_traceback", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function("dump_traceback_later", |_| {
             Ok(pyre_object::w_none())
-        }),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "cancel_dump_traceback_later",
-        pyre_interpreter::make_builtin_function_with_arity(
+        }); crate::module_ns_store_slot(ns_slot, "dump_traceback_later", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "cancel_dump_traceback_later",
             |_| Ok(pyre_object::w_none()),
             0,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "cancel_dump_traceback_later", __pyre_stored) };
     // register/unregister user signals: host_env supports the full API,
     // but it needs the user-signal handler to be a fixed extern "C" fn.
     // Provide a "registered → no-op" pattern: install the handler when
@@ -632,10 +611,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // A name that is there but answers every call with an error is worse than
     // no name: `hasattr(faulthandler, "register")` is how its callers ask.
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "register",
-        pyre_interpreter::make_builtin_function_with_signature(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_signature(
             "register",
             |args| {
                 let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
@@ -725,13 +701,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 0,
                 0,
             ),
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "register", __pyre_stored) };
     #[cfg(unix)]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "unregister",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "unregister",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
@@ -756,18 +728,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "unregister", __pyre_stored) };
 
     // `handler.py:225-245` test-only crash helpers from
     // `moduledef.py:14-22`.  Each unconditionally takes down the
     // process — only ever called from test_faulthandler.py in a
     // subprocess.  Pyre cannot construct an OperationError here
     // because the abort/segfault leaves no caller to catch it.
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_read_null",
-        pyre_interpreter::make_builtin_function("_read_null", |args| {
+    { let __pyre_stored = pyre_interpreter::make_builtin_function("_read_null", |args| {
             if args.len() > 1 {
                 return Err(pyre_interpreter::PyError::type_error(format!(
                     "_read_null() takes at most 1 argument ({} given)",
@@ -782,12 +750,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             let p: *const u8 = std::ptr::null();
             let _ = unsafe { p.read_volatile() };
             Ok(pyre_object::w_none())
-        }),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_sigsegv",
-        pyre_interpreter::make_builtin_function("_sigsegv", |args| {
+        }); crate::module_ns_store_slot(ns_slot, "_read_null", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function("_sigsegv", |args| {
             if args.len() > 1 {
                 return Err(pyre_interpreter::PyError::type_error(format!(
                     "_sigsegv() takes at most 1 argument ({} given)",
@@ -806,12 +770,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 libc::raise(libc::SIGSEGV);
             }
             Ok(pyre_object::w_none())
-        }),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_sigfpe",
-        pyre_interpreter::make_builtin_function_with_arity(
+        }); crate::module_ns_store_slot(ns_slot, "_sigsegv", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "_sigfpe",
             |_| {
                 suppress_crash_report();
@@ -832,12 +792,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_sigabrt",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); crate::module_ns_store_slot(ns_slot, "_sigfpe", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "_sigabrt",
             |_| {
                 suppress_crash_report();
@@ -849,19 +805,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "_sigabrt", __pyre_stored) };
     // `faulthandler.c:1416-1436` publishes the statuses and `_raise_exception`
     // only where structured exceptions exist.
     #[cfg(windows)]
     {
         for (name, code) in WINDOWS_EXCEPTIONS {
-            pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(code)));
+            { let __pyre_stored = pyre_object::w_int_new(i64::from(code)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, name, __pyre_stored) };
         }
-        pyre_interpreter::module_ns_store(
-            ns,
-            "_raise_exception",
-            pyre_interpreter::make_builtin_function("_raise_exception", |args| {
+        { let __pyre_stored = pyre_interpreter::make_builtin_function("_raise_exception", |args| {
                 // `_raise_exception(code, flags=0)`.
                 let Some(&w_code) = args.first() else {
                     return Err(pyre_interpreter::PyError::type_error(
@@ -890,13 +842,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     rustpython_host_env::faulthandler::raise_exception(code, flags);
                 }
                 Ok(pyre_object::w_none())
-            }),
-        );
+            }); crate::module_ns_store_slot(ns_slot, "_raise_exception", __pyre_stored) };
     }
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_stack_overflow",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "_stack_overflow",
             |_| {
                 suppress_crash_report();
@@ -911,8 +859,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "_stack_overflow", __pyre_stored) };
     Ok(())
 }
 

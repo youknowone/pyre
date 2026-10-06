@@ -64,6 +64,12 @@ pub struct FunDecl {
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
     #[serde(skip)]
     promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
+    /// Set on a body-less foreign declaration whose signature, span, and
+    /// impl owner match one constructor a defining crate analysed as
+    /// returning an owned root-bracket guard. Read only when
+    /// [`FunDecl::unstructured`] is `None`.
+    #[serde(skip)]
+    pub returns_owned_scope: std::sync::atomic::AtomicBool,
 }
 
 impl FunDecl {
@@ -93,10 +99,6 @@ impl FunDecl {
 
     /// Return the `Unstructured` (basic-block CFG) body if present.
     ///
-    /// Cleanup blocks are reachable only through `on_unwind`, which the
-    /// flow graph does not carry, so they are left out. Every `on_unwind`
-    /// edge points at one terminal `UnwindResume` block.
-    ///
     /// Charon 0.1.281 emits promoted constants as their own global items.
     /// When this declaration was loaded with the artefact table, each read
     /// of an inlinable promoted constant is replaced by the initializer's
@@ -110,7 +112,7 @@ impl FunDecl {
         let body = self.body.as_ref()?;
         let mut u = serde_json::from_str::<Proj>(body.get())
             .ok()
-            .map(|p| strip_cleanup_blocks(p.unstructured))?;
+            .map(|p| p.unstructured)?;
         if let Some(table) = &self.promoted_inits
             && table.iter().any(Option::is_some)
             && body.get().contains("\"Global\"")
@@ -262,6 +264,12 @@ pub struct TypeDecl {
     /// unmodelled origin cannot fail the load.
     #[serde(default)]
     pub src: Option<Value>,
+    /// Set when a defining crate's struct fields were copied onto this
+    /// import. Field projection reads those fields. Call routing,
+    /// construction, spill, and metadata still treat the decl as the
+    /// opaque import: the copy is not a second definition of the class.
+    #[serde(skip)]
+    pub published_struct_copy: bool,
 }
 
 /// One `{key, value}` entry of [`TypeDecl::layout`].
@@ -1297,56 +1305,6 @@ impl BasicBlock {
     }
 }
 
-/// Cleanup blocks are reachable only through `on_unwind`, which the flow
-/// graph does not carry, so they are left out. Every `on_unwind` edge
-/// points at one terminal `UnwindResume` block.
-fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
-    if !body.body.iter().any(|bb| bb.is_cleanup) {
-        return body;
-    }
-    // bb0 is the entry; a cleanup there would move another block to 0.
-    if body.body.first().is_some_and(|bb| bb.is_cleanup)
-        || kept_block_normal_successor_is_cleanup(&body.body)
-    {
-        return body;
-    }
-
-    let blocks = std::mem::take(&mut body.body);
-    let mut old_to_new = vec![None; blocks.len()];
-    let mut kept = Vec::with_capacity(blocks.len());
-    let mut first_cleanup_span = None;
-    for (i, bb) in blocks.into_iter().enumerate() {
-        if bb.is_cleanup {
-            if first_cleanup_span.is_none() {
-                first_cleanup_span = bb.terminator.span.clone();
-            }
-            continue;
-        }
-        old_to_new[i] = Some(kept.len() as u64);
-        kept.push(bb);
-    }
-
-    let resume = kept.len() as u64;
-    for bb in &mut kept {
-        let mut kind = bb.terminator.kind_value().clone();
-        remap_term_kind_block_indices(&mut kind, &old_to_new, resume);
-        bb.set_terminator_kind(kind);
-    }
-    kept.push(BasicBlock {
-        statements: Vec::new(),
-        terminator: Terminator {
-            kind: serde_json::value::to_raw_value(&Value::String("UnwindResume".into()))
-                .expect("a JSON value serializes"),
-            span: first_cleanup_span,
-            value_cache: OnceLock::new(),
-        },
-        is_cleanup: false,
-        term_cache: OnceLock::new(),
-    });
-    body.body = kept;
-    body
-}
-
 /// Inlinable promoted-constant initializer, keyed by global decl id.
 ///
 /// Charon 0.1.281 emits each promoted constant as its own `AnonConst`
@@ -1678,154 +1636,6 @@ fn remap_local_indices(v: &mut Value, remap: &[Option<u64>]) {
             }
         }
         _ => {}
-    }
-}
-
-fn kept_block_normal_successor_is_cleanup(blocks: &[BasicBlock]) -> bool {
-    blocks.iter().any(|bb| {
-        !bb.is_cleanup && term_normal_successor_is_cleanup(bb.terminator.kind_value(), blocks)
-    })
-}
-
-fn is_cleanup_index(blocks: &[BasicBlock], idx: u64) -> bool {
-    blocks.get(idx as usize).is_some_and(|bb| bb.is_cleanup)
-}
-
-fn term_normal_successor_is_cleanup(kind: &Value, blocks: &[BasicBlock]) -> bool {
-    let Some(obj) = kind.as_object() else {
-        return false;
-    };
-    if let Some(goto) = obj.get("Goto") {
-        return goto
-            .get("target")
-            .and_then(Value::as_u64)
-            .is_some_and(|idx| is_cleanup_index(blocks, idx));
-    }
-    if let Some(payload) = obj
-        .get("Call")
-        .or_else(|| obj.get("Drop"))
-        .or_else(|| obj.get("Assert"))
-    {
-        return payload
-            .get("target")
-            .and_then(Value::as_u64)
-            .is_some_and(|idx| is_cleanup_index(blocks, idx));
-    }
-    if let Some(switch) = obj.get("Switch") {
-        return switch_normal_successor_is_cleanup(switch, blocks);
-    }
-    false
-}
-
-fn switch_normal_successor_is_cleanup(switch: &Value, blocks: &[BasicBlock]) -> bool {
-    if let Some(branches) = switch.get("branches").and_then(Value::as_array)
-        && branches
-            .iter()
-            .any(|v| v.as_u64().is_some_and(|idx| is_cleanup_index(blocks, idx)))
-    {
-        return true;
-    }
-    let Some(targets) = switch.get("targets") else {
-        return false;
-    };
-    if let Some(if_arr) = targets.get("If").and_then(Value::as_array)
-        && if_arr
-            .iter()
-            .any(|v| v.as_u64().is_some_and(|idx| is_cleanup_index(blocks, idx)))
-    {
-        return true;
-    }
-    let Some(swint) = targets.get("SwitchInt").and_then(Value::as_array) else {
-        return false;
-    };
-    if let Some(arms) = swint.get(1).and_then(Value::as_array)
-        && arms.iter().any(|arm| {
-            arm.as_array()
-                .and_then(|pair| pair.get(1))
-                .and_then(Value::as_u64)
-                .is_some_and(|idx| is_cleanup_index(blocks, idx))
-        })
-    {
-        return true;
-    }
-    swint
-        .get(2)
-        .and_then(Value::as_u64)
-        .is_some_and(|idx| is_cleanup_index(blocks, idx))
-}
-
-fn remap_block_index(old: u64, old_to_new: &[Option<u64>], resume: u64) -> u64 {
-    old_to_new
-        .get(old as usize)
-        .copied()
-        .flatten()
-        .unwrap_or(resume)
-}
-
-fn remap_u64_slot(slot: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
-    let Some(old) = slot.as_u64() else {
-        return;
-    };
-    *slot = Value::from(remap_block_index(old, old_to_new, resume));
-}
-
-fn remap_u64_field(value: &mut Value, field: &str, old_to_new: &[Option<u64>], resume: u64) {
-    if let Some(slot) = value.get_mut(field) {
-        remap_u64_slot(slot, old_to_new, resume);
-    }
-}
-
-fn remap_u64_array(value: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
-    let Some(arr) = value.as_array_mut() else {
-        return;
-    };
-    for slot in arr {
-        remap_u64_slot(slot, old_to_new, resume);
-    }
-}
-
-fn remap_term_kind_block_indices(kind: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
-    let Some(obj) = kind.as_object_mut() else {
-        return;
-    };
-    if let Some(goto) = obj.get_mut("Goto") {
-        remap_u64_field(goto, "target", old_to_new, resume);
-        return;
-    }
-    for key in ["Call", "Drop", "Assert"] {
-        if let Some(payload) = obj.get_mut(key) {
-            remap_u64_field(payload, "target", old_to_new, resume);
-            remap_u64_field(payload, "on_unwind", old_to_new, resume);
-            return;
-        }
-    }
-    if let Some(switch) = obj.get_mut("Switch") {
-        remap_switch_block_indices(switch, old_to_new, resume);
-    }
-}
-
-fn remap_switch_block_indices(switch: &mut Value, old_to_new: &[Option<u64>], resume: u64) {
-    if let Some(branches) = switch.get_mut("branches") {
-        remap_u64_array(branches, old_to_new, resume);
-    }
-    let Some(targets) = switch.get_mut("targets") else {
-        return;
-    };
-    if let Some(if_arr) = targets.get_mut("If") {
-        remap_u64_array(if_arr, old_to_new, resume);
-    }
-    let Some(swint) = targets.get_mut("SwitchInt").and_then(Value::as_array_mut) else {
-        return;
-    };
-    if let Some(arms) = swint.get_mut(1).and_then(Value::as_array_mut) {
-        for arm in arms {
-            if let Some(slot) = arm.as_array_mut().and_then(|pair| pair.get_mut(1)) {
-                remap_u64_slot(slot, old_to_new, resume);
-            }
-        }
-    }
-    if let Some(default) = swint.get_mut(2) {
-        remap_u64_slot(default, old_to_new, resume);
     }
 }
 
@@ -2812,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn unstructured_drops_cleanup_blocks_and_rewrites_unwind_edges() {
+    fn unstructured_keeps_cleanup_blocks_and_edges() {
         let decl = fun_decl_from_blocks(vec![
             bb(call_term(1, 3), false, 0),
             bb(drop_term(2, 4), false, 0),
@@ -2823,23 +2633,29 @@ mod tests {
             bb(serde_json::json!("UnwindTerminate"), true, 0),
         ]);
         let body = decl.unstructured().expect("Unstructured body");
-        assert_eq!(body.body.len(), 4);
+        assert_eq!(body.body.len(), 7);
         assert_eq!(call_edges(&body.body[0]), (1, 3));
-        assert_eq!(drop_edges(&body.body[1]), (2, 3));
+        assert_eq!(drop_edges(&body.body[1]), (2, 4));
         assert_eq!(
             body.body[2].terminator.kind_value(),
             &serde_json::json!("Return")
         );
-        assert_eq!(
-            body.body[3].terminator.kind_value(),
-            &serde_json::json!("UnwindResume")
-        );
-        assert!(body.body[3].statements.is_empty());
-        assert!(!body.body[3].is_cleanup);
+        assert!(body.body[3].is_cleanup);
+        assert_eq!(drop_edges(&body.body[3]), (5, 6));
         assert!(matches!(
             body.body[3].terminator.span,
             Some(SpanRef::Deduplicated(7))
         ));
+        assert!(body.body[4].is_cleanup);
+        assert_eq!(
+            body.body[4].terminator.kind_value(),
+            &serde_json::json!("UnwindResume")
+        );
+        assert!(body.body[5].is_cleanup);
+        assert_eq!(
+            body.body[6].terminator.kind_value(),
+            &serde_json::json!("UnwindTerminate")
+        );
     }
 
     #[test]

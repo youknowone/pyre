@@ -1340,13 +1340,20 @@ pyre_interpreter::py_module! {
             pyre_interpreter::builtins::lookup_exc_class("Exception")
                 .expect("Exception must be installed before _csv init"),
         ));
-        pyre_interpreter::module_ns_store(ns, "Error", w_error);
+        ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_interpreter::__pyre_store!(ns, "Error", w_error);
         // `app_csv._dialects = {}` — the registry mapping.  It is stored in
         // the module namespace under the name PyPy gives it and published to
         // the state the accelerator reads, which is what keeps it reachable
         // once the module is not.
         let dialects = pyre_object::w_dict_new();
-        pyre_interpreter::module_ns_store(ns, "_dialects", dialects);
-        publish_csv_dialects(dialects);
+        let dialects_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dialects);
+        pyre_interpreter::__pyre_store!(
+            ns,
+            "_dialects",
+            pyre_object::gc_roots::shadow_stack_get(dialects_slot)
+        );
+        publish_csv_dialects(pyre_object::gc_roots::shadow_stack_get(dialects_slot));
     },
 }

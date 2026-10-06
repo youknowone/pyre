@@ -845,6 +845,9 @@ impl CodeWriter {
         // can leave a GcRef source feeding a Signed inputarg; cast the
         // link argument so the copy stays inside one bank.
         super::type_state::coerce_cross_bank_links(rewritten_graph);
+        // A fused `int_*` guard reads the int bank. An operand whose cell
+        // is now `GcRef` is cast before the guard (`cast_ptr_to_int`).
+        super::type_state::reint_fused_int_ref_operands(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),

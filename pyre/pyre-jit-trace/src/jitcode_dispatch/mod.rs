@@ -9683,6 +9683,12 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     {
         return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
     }
+    // `opimpl_loop_header` (`pyjitpl.py`) only stamps
+    // `seen_loop_header_for_jdindex`. The close is `opimpl_jit_merge_point`
+    // on the `jit_merge_point` emitted at the loop-header block
+    // (`handle_jit_marker__jit_merge_point`, `jtransform.py`). This
+    // synthesized boundary records `DEBUG_MERGE_POINT` and the segmenting
+    // check above.
     Ok(None)
 }
 

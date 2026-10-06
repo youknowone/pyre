@@ -1055,14 +1055,14 @@ impl TraceCtx {
         })
     }
 
-    /// pyjitpl.py `executor.execute(cpu, mi, opnum, fielddescr, box)`
-    /// line-by-line dispatch for the GETFIELD_GC_{I,R,F} subset.
+    /// `executor.execute` for `GETFIELD_GC_{I,R,F}`.
     ///
-    /// Returns `Some(value)` when `self.cpu` is wired and the descr
-    /// resolves to a `BhDescr::Field`; `None` otherwise (sanity check
-    /// skipped — RPython `translate_support_code=True` analog).
-    /// Mismatch handling is the caller's responsibility (`assert
-    /// resvalue == upd.currfieldbox.*` at pyjitpl.py/939/944).
+    /// `do_getfield_gc_i` / `do_getfield_gc_r` / `do_getfield_gc_f` are
+    /// selected by the opnum alone. `kind` is that opnum. Returns
+    /// `Some(value)` when `self.cpu` is wired and the descr resolves to a
+    /// `BhDescr::Field`; `None` when the cpu is unwired, the descr is not
+    /// a field, or `kind` is `Type::Void`. The caller compares the loaded
+    /// value with the heapcache box (`_do_getfield_gc_any`).
     pub fn field_sanity_load(
         &self,
         struct_ptr: i64,
@@ -1074,9 +1074,6 @@ impl TraceCtx {
         // backend that outlives this TraceCtx.
         let cpu = unsafe { &*cpu_ptr };
         let bh_descr = descr_to_bh_field_descr(descr)?;
-        // RPython's `executor.execute` dispatches on opnum; pyre's
-        // `kind` selects between the 3 GETFIELD_GC_* `do_*` functions
-        // ported line-by-line from executor.py:188-198.
         match kind {
             Type::Int => Some(Value::Int(crate::executor::do_getfield_gc_i(
                 cpu,
@@ -1109,8 +1106,9 @@ impl TraceCtx {
     ///
     /// Returns `false` when `self.cpu` is unwired, the descr does not
     /// resolve to a `BhDescr::Field`, or the value's bank disagrees with the
-    /// field's type — the same conditions under which `field_sanity_load`
-    /// returns `None`.
+    /// field's type. `do_setfield_gc` is one opnum and branches on
+    /// `is_pointer_field` / `is_float_field`; a load's opnum is `kind`
+    /// (`do_getfield_gc_*`) and does not consult the descr bank.
     pub fn field_store(&self, struct_ptr: i64, descr: &DescrRef, value: Value) -> bool {
         let Some(cpu_ptr) = self.cpu else {
             return false;
@@ -1362,6 +1360,8 @@ impl TraceCtx {
         // backend that outlives this TraceCtx.
         let cpu = unsafe { &*cpu_ptr };
         let bh_descr = descr_to_bh_array_descr(descr)?;
+        // `do_getarrayitem_gc_i` / `_r` / `_f` are selected by the opnum
+        // (`kind`) alone, the same way `do_getfield_gc_*` is.
         match kind {
             Type::Int => Some(Value::Int(crate::executor::do_getarrayitem_gc_i(
                 cpu,
@@ -7140,6 +7140,8 @@ mod tests {
             ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Int),
             Some(Value::Int(0x1234))
         );
+        // The opnum selects `do_getfield_gc_*`. The descr's bank is not a
+        // second channel, so a different `kind` still reads that executor.
         assert_eq!(
             ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Ref),
             Some(Value::Ref(majit_ir::GcRef(0x5678)))
@@ -7149,6 +7151,53 @@ mod tests {
             Some(Value::Float(2.5))
         );
         assert_eq!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Void), None);
+        let ref_descr = majit_ir::make_field_descr_full(1, 0, 8, Type::Ref, false);
+        assert_eq!(
+            ctx.field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Ref),
+            Some(Value::Ref(majit_ir::GcRef(0x5678)))
+        );
+        assert_eq!(
+            ctx.field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Int),
+            Some(Value::Int(0x1234))
+        );
+    }
+
+    /// `do_getarrayitem_gc_i` / `_r` / `_f` are chosen by the opnum. The
+    /// descr's `item_type` does not refuse the load.
+    #[test]
+    fn array_sanity_load_dispatches_by_opnum() {
+        let cpu = SanityTestCpu {
+            int_value: 0x1111,
+            ref_value: majit_ir::GcRef(0x2222),
+            float_value: 1.25,
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        let mut words = [0x1111u64, 1.25f64.to_bits()];
+        let base = words.as_mut_ptr() as i64;
+        let int_items = majit_ir::descr::make_array_descr_full(1, 0, 8, 8, Type::Int);
+        assert_eq!(
+            int_items.as_array_descr().map(|a| a.item_type()),
+            Some(Type::Int)
+        );
+        assert_eq!(
+            ctx.array_sanity_load(base, 0, &int_items, Type::Int),
+            Some(Value::Int(0x1111))
+        );
+        assert_eq!(
+            ctx.array_sanity_load(base, 0, &int_items, Type::Ref),
+            Some(Value::Ref(majit_ir::GcRef(0x1111)))
+        );
+        assert_eq!(
+            ctx.array_sanity_load(base, 1, &int_items, Type::Float),
+            Some(Value::Float(1.25))
+        );
+        assert_eq!(ctx.array_sanity_load(base, 0, &int_items, Type::Void), None);
+        let ref_items = majit_ir::descr::make_array_descr_full(1, 0, 8, 8, Type::Ref);
+        assert_eq!(
+            ctx.array_sanity_load(base, 0, &ref_items, Type::Int),
+            Some(Value::Int(0x1111))
+        );
     }
 
     /// An array descr with no `lendescr` describes an array that

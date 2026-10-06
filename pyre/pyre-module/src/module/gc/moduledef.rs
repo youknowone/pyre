@@ -83,7 +83,8 @@ pyre_interpreter::py_module! {
                     name, func, arity, sig,
                 ),
             ));
-            pyre_interpreter::module_ns_store(ns, name, value);
+            ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_interpreter::__pyre_store!(ns, name, value);
             ns
         }
         ns = install(

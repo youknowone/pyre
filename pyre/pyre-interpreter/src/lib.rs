@@ -305,6 +305,44 @@ pub mod test_hooks {
 /// The `name:` slot is currently informational — `importing.rs` still
 /// owns the module-name -> init-fn map.  A follow-up may use it to drive
 /// an inventory-style auto-registration.
+/// Pin `ns`, build the value, then store it from the shadow-stack slot.
+#[macro_export]
+macro_rules! __pyre_store {
+    ($ns:ident, $name:expr, $value:ident) => {{
+        let __pyre_slot = ::pyre_object::gc_roots::shadow_stack_len();
+        let _ = ::pyre_object::gc_roots::pin_root($ns);
+        $ns = ::pyre_object::gc_roots::shadow_stack_get(__pyre_slot);
+        let __pyre_value_slot = ::pyre_object::gc_roots::shadow_stack_len();
+        let _ = ::pyre_object::gc_roots::pin_root($value);
+        $crate::module_ns_store_slot(
+            __pyre_slot,
+            $name,
+            ::pyre_object::gc_roots::shadow_stack_get(__pyre_value_slot),
+        );
+        $ns = ::pyre_object::gc_roots::shadow_stack_get(__pyre_slot);
+        let $value = ::pyre_object::gc_roots::shadow_stack_get(__pyre_value_slot);
+    }};
+    ($ns:ident, $name:expr, $value:expr) => {{
+        // Stay on the caller's `push_roots` guard. A nested guard makes the
+        // scope stack path-dependent, so later pins in that body do not attach.
+        // `pin_root` returns the same pointer it was given; write that word
+        // back from the slot instead of assigning the call, so the local is
+        // not still live across the pin.
+        let __pyre_slot = ::pyre_object::gc_roots::shadow_stack_len();
+        let _ = ::pyre_object::gc_roots::pin_root($ns);
+        $ns = ::pyre_object::gc_roots::shadow_stack_get(__pyre_slot);
+        let __pyre_stored_value = $value;
+        let __pyre_value_slot = ::pyre_object::gc_roots::shadow_stack_len();
+        let _ = ::pyre_object::gc_roots::pin_root(__pyre_stored_value);
+        $crate::module_ns_store_slot(
+            __pyre_slot,
+            $name,
+            ::pyre_object::gc_roots::shadow_stack_get(__pyre_value_slot),
+        );
+        $ns = ::pyre_object::gc_roots::shadow_stack_get(__pyre_slot);
+    }};
+}
+
 #[macro_export]
 macro_rules! py_module {
     (
@@ -329,19 +367,23 @@ macro_rules! py_module {
             mut ns: ::pyre_object::PyObjectRef,
         ) -> ::std::result::Result<(), $crate::PyError> {
             let _name = $name;
+            let _root_scope = ::pyre_object::gc_roots::push_roots();
+            let ns_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let mut ns = ::pyre_object::gc_roots::pin_root(ns);
             $($(
-                let __w_value = ::pyre_object::with_roots!(ns => $value);
-                $crate::module_ns_store(ns, $key, __w_value);
+                let __w_value = $value;
+                let __w_value = ::pyre_object::gc_roots::pin_root(__w_value);
+                $crate::module_ns_store_slot(ns_slot, $key, __w_value);
             )*)?
             // int_constants: integer module constants — PyPy MixedModule
             // `interpleveldefs = {'NAME': 'space.wrap(value)'}` for the
             // common int case (errno/fcntl/select flags).  Each `$int_value`
             // is an `i64`-valued expression wrapped via `w_int_new`, saving
-            // the per-entry `module_ns_store(ns, k, w_int_new(v))`.
+            // the per-entry `{ let __pyre_stored = w_int_new(v); module_ns_store_slot(ns_slot, k, __pyre_stored) }`.
             $($(
-                let __w_value =
-                    ::pyre_object::with_roots!(ns => ::pyre_object::w_int_new($int_value as i64));
-                $crate::module_ns_store(ns, $int_key, __w_value);
+                let __w_value = ::pyre_object::w_int_new($int_value as i64);
+                let __w_value = ::pyre_object::gc_roots::pin_root(__w_value);
+                $crate::module_ns_store_slot(ns_slot, $int_key, __w_value);
             )*)?
             // exceptions: module-local exception classes — PyPy
             // `new_exception_class("<mod>.Name", base)` (error.py).
@@ -352,12 +394,13 @@ macro_rules! py_module {
             // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
             $($(
                 {
-                    let w_exc = ::pyre_object::with_roots!(ns => $crate::builtins::new_exception_class(
+                    let w_exc = $crate::builtins::new_exception_class(
                         ::std::concat!($name, ".", $exc_key),
                         $crate::builtins::exc_exception_new,
                         $exc_base,
-                    ));
-                    $crate::module_ns_store(ns, $exc_key, w_exc);
+                    );
+                    let w_exc = ::pyre_object::gc_roots::pin_root(w_exc);
+                    $crate::module_ns_store_slot(ns_slot, $exc_key, w_exc);
                 }
             )*)?
             // appleveldefs: bundle Python source via `include_str!` at
@@ -374,6 +417,7 @@ macro_rules! py_module {
                     $name,
                     &[ $( $appname ),* ],
                 ))?;
+                let mut ns = ::pyre_object::gc_roots::pin_root(ns);
             )*)?
             // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —
             // embed a Python snippet inline; the runtime executes it the
@@ -389,6 +433,7 @@ macro_rules! py_module {
                     $name,
                     &[ $( $inline_name ),* ],
                 ))?;
+                let mut ns = ::pyre_object::gc_roots::pin_root(ns);
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
             // arity are derived from the signature.  Replaces the
@@ -397,7 +442,7 @@ macro_rules! py_module {
                 {
                     #[$crate::pyre_function]
                     fn $ifn_name ( $($ifn_args)* ) $(-> $ifn_ret)? $ifn_body
-                    let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                    let __w_value = $crate::gateway::with_module(
                         $name,
                         $crate::make_module_builtin_function_with_arity_and_maybe_sig(
                             stringify!($ifn_name),
@@ -405,27 +450,32 @@ macro_rules! py_module {
                             ::paste::paste! { [<$ifn_name _pyre_arity>]() },
                             ::paste::paste! { [<$ifn_name _pyre_sig>]() },
                         ),
-                    ));
-                    $crate::module_ns_store(ns, stringify!($ifn_name), __w_value);
+                    );
+                    let __w_value = ::pyre_object::gc_roots::pin_root(__w_value);
+                    $crate::module_ns_store_slot(ns_slot, stringify!($ifn_name), __w_value);
                 }
             )*)?
             $($(
-                let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                let __w_value = $crate::gateway::with_module(
                     $name,
                     $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
-                ));
-                $crate::module_ns_store(ns, $fn_key, __w_value);
+                );
+                let __w_value = ::pyre_object::gc_roots::pin_root(__w_value);
+                $crate::module_ns_store_slot(ns_slot, $fn_key, __w_value);
             )*)?
             $($(
-                let __w_value = ::pyre_object::with_roots!(ns => $crate::gateway::with_module(
+                let __w_value = $crate::gateway::with_module(
                     $name,
                     $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
-                ));
-                $crate::module_ns_store(ns, $mfn_key, __w_value);
+                );
+                let __w_value = ::pyre_object::gc_roots::pin_root(__w_value);
+                $crate::module_ns_store_slot(ns_slot, $mfn_key, __w_value);
             )*)?
             $(
                 {
-                    let $ns: ::pyre_object::PyObjectRef = ns;
+                    let mut $ns = ::pyre_object::gc_roots::pin_root(
+                        ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    );
                     $body
                 }
             )?
@@ -499,7 +549,9 @@ macro_rules! py_class {
             static CELL: ::pyre_object::gc_roots::RootedOnceRef =
                 ::pyre_object::gc_roots::RootedOnceRef::new();
             CELL.get_or_init(|| {
-                let tp = $crate::typedef::make_builtin_type($name, |ns| {
+                let tp = $crate::typedef::make_builtin_type($name, |mut ns| {
+                    let _root_scope = ::pyre_object::gc_roots::push_roots();
+                    let mut ns = ::pyre_object::gc_roots::pin_root(ns);
                     // `make_builtin_function` (varargs, no arity check) is
                     // used here rather than `_with_arity` because methods
                     // with `Option<T>` parameters need to accept calls with
@@ -511,7 +563,7 @@ macro_rules! py_class {
                         {
                             #[$crate::pyre_function]
                             fn $mname ( $($margs)* ) $(-> $mret)? $mbody
-                            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                            $crate::__pyre_store!(
                                 ns,
                                 stringify!($mname),
                                 $crate::make_builtin_function_with_opt_doc(
@@ -521,8 +573,8 @@ macro_rules! py_class {
                                         $(.or(::core::option::Option::Some(
                                             ::core::concat!($mdoc $(, "\n", $mdoc_cont)*),
                                         )))?,
-                                ),
-                            ) };
+                                )
+                            );
                         }
                     )*)?
                     // `properties:` — each fn registered as a
@@ -533,14 +585,14 @@ macro_rules! py_class {
                         {
                             #[$crate::pyre_function]
                             fn $pname ( $($pargs)* ) $(-> $pret)? $pbody
-                            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                            $crate::__pyre_store!(
                                 ns,
                                 stringify!($pname),
                                 $crate::typedef::make_getset_descriptor_named(
                                     $crate::make_builtin_function(stringify!($pname), $pname),
                                     stringify!($pname),
-                                ),
-                            ) };
+                                )
+                            );
                         }
                     )*)?
                 });

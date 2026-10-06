@@ -415,7 +415,13 @@ pub unsafe fn is_exact_builtin_instance_nonnull(obj: PyObjectRef) -> bool {
 /// `obj` must be a valid non-null, untagged `PyObjectRef`.
 #[inline]
 pub unsafe fn typeptr_is_exact_builtin(obj: PyObjectRef) -> bool {
-    unsafe { !(*(*obj).ob_type).user_subclass.is_null() }
+    let ob_type = unsafe { (*obj).ob_type };
+    // A concrete the tracer still holds can observe a header whose typeptr
+    // has not been published. That is not a user-subclass stamp.
+    if ob_type.is_null() {
+        return false;
+    }
+    unsafe { !(*ob_type).user_subclass.is_null() }
 }
 
 /// The tail of [`is_exact_builtin_instance`] for a non-null `obj` whose
@@ -433,6 +439,9 @@ pub unsafe fn class_word_is_exact_builtin(obj: PyObjectRef, w_class: PyObjectRef
     }
     unsafe {
         let ob_type = (*obj).ob_type;
+        if ob_type.is_null() {
+            return false;
+        }
         use crate::specialisedtupleobject::{
             SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
         };

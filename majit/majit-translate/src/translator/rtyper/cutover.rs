@@ -3201,6 +3201,19 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self"],
         LowLevelType::Float,
     ),
+    // Fractional part. `complex_richcompare` uses it to test that a
+    // float lane is integral before the integer compare. Same opaque
+    // float residual as `floor` / `ceil`; the defining path is `core`.
+    (
+        &["std", "f64", "<Impl>", "fract"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+    (
+        &["core", "f64", "<Impl>", "fract"],
+        &["self"],
+        LowLevelType::Float,
+    ),
     (
         &["std", "f64", "<Impl>", "powf"],
         &["self", "n"],

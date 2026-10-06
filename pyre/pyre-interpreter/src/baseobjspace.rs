@@ -2379,15 +2379,26 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         if is_dict(obj) {
             // `pypy/objspace/std/dictmultiobject.py W_DictMultiObject
-            // .descr_getitem` → `space.getitem(self, w_key)` → strategy
-            return match pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) {
+            // .descr_getitem` → `space.getitem(self, w_key)` → strategy.
+            // The probe can collect; reload both operands after it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+            return match pyre_object::dictmultiobject::w_dict_lookup_checked(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ) {
                 Ok(Some(val)) => Ok(val),
                 Ok(None) => {
                     // dictmultiobject.py:166-170 — dict subclass
                     // __missing__ dispatch before KeyError
-                    dict_missing_or_key_error(obj, index)
+                    dict_missing_or_key_error(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    )
                 }
-                Err(_) => Err(take_pending_dict_key_error(index)),
+                Err(_) => Err(take_pending_dict_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                )),
             };
         }
         if is_str(obj) {
@@ -4969,8 +4980,17 @@ fn is_shortcut_dict(obj: PyObjectRef) -> bool {
 /// the receiver gate already excluded — can reach through `__missing__`.
 pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
-        return unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) }
-            .map_err(|_| take_pending_dict_key_error(index));
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+        return unsafe {
+            pyre_object::dictmultiobject::w_dict_lookup_checked(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )
+        }
+        .map_err(|_| {
+            take_pending_dict_key_error(pyre_object::gc_roots::shadow_stack_get(base + 1))
+        });
     }
     match getitem(obj, index) {
         Ok(value) if value.is_null() => Ok(None),
@@ -5672,9 +5692,19 @@ pub(crate) fn finditem_str_shortcut_interp(
     pycode: PyObjectRef,
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let pycode = pyre_object::gc_roots::pin_root(pycode);
     let hash = named_key_hash(key, pycode, nameindex);
-    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash) }
-        .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)))
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            key,
+            hash,
+        )
+    }
+    .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)))
 }
 
 /// `objspace.py StdObjSpace.finditem_str` generic arm: wrap the key and
@@ -6098,7 +6128,7 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
         return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
     }
     // interp_iobase.py W_IOBase.getdict
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+    if crate::module::_io::iobase_read_dict(obj).is_some() {
         return Ok(unsafe { crate::module::_io::iobase_getdict(obj) });
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -6254,7 +6284,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     }
     // W_Root.setdict — typed IO payloads have no setdict override
     // (interp_iobase.py W_IOBase uses descr_set_dict → this method).
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+    if crate::module::_io::iobase_read_dict(obj).is_some() {
         return Err(PyError::type_error(format!(
             "attribute '__dict__' of {} objects is not writable",
             object_functionstr_type_name(obj),
@@ -6413,7 +6443,7 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
     // interp_iobase.py W_IOBase.getdictvalue — a typed IO payload owns
     // `w_dict` (`typedef.hasdict`), so `_getusercls` does not mix in
     // `MapdictDictSupport`. A null `w_dict` is a miss and does not allocate.
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+    if crate::module::_io::iobase_read_dict(obj).is_some() {
         return unsafe { crate::module::_io::iobase_getdictvalue(obj, name) };
     }
     // mapdict.py `MapdictDictSupport.getdictvalue` overrides the
@@ -6440,8 +6470,7 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
 /// `Some(PY_NULL)` is a typed IO payload whose dictionary has not been
 /// created; `None` is every other layout.
 fn iobase_peek_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let slot = unsafe { crate::module::_io::iobase_payload_dict_slot(obj) }?;
-    Some(unsafe { *slot })
+    crate::module::_io::iobase_read_dict(obj)
 }
 
 /// `W_BaseException.w_dict` without allocating it.
@@ -6551,14 +6580,17 @@ pub fn delweakref(obj: PyObjectRef) {
 /// `W_Root.clear_all_weakrefs` — detach the lifeline before clearing it so a
 /// resurrected object can create a fresh set rather than reuse dead refs.
 pub fn clear_all_weakrefs(obj: PyObjectRef) {
-    let Some(lifeline) = getweakref(obj) else {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let Some(lifeline) = getweakref(pyre_object::gc_roots::shadow_stack_get(obj_slot)) else {
         return;
     };
-    let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[obj, lifeline]);
-    delweakref(pyre_object::gc_roots::shadow_stack_get(base));
+    let life_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lifeline);
+    delweakref(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     crate::module::_weakref::interp__weakref::clear_all_weakrefs(
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        pyre_object::gc_roots::shadow_stack_get(life_slot),
     );
 }
 
@@ -6598,8 +6630,8 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
 /// AttributeError, so a terminal module miss skips the `__spec__` shadowing
 /// diagnosis that exists only to phrase the surfaced message.
-/// The caller must have an active `push_roots()` scope. This function pins
-/// `obj` into that scope and does not open or close it.
+/// The caller must have an active `push_roots()` scope. This function opens
+/// one scope of its own and pins `obj` there; later name guards nest inside it.
 pub fn getattr_str_impl(
     obj: PyObjectRef,
     name: &str,
@@ -6623,8 +6655,9 @@ pub fn getattr_str_impl(
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. The
-    // entry opened the bracket; pin into that stack.
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. Pin into a
+    // scope this body opened so the owner is not path-dependent.
+    let _obj_roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     // Reload at each use: a live `obj` local across collecting helpers is an
@@ -7917,14 +7950,24 @@ pub(crate) unsafe fn object_delattr_surrogate(
                     w_type_get_name(obj)
                 )));
             }
-            if crate::type_dict_delete_wtf8(obj, name) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            if crate::type_dict_delete_wtf8(pyre_object::gc_roots::shadow_stack_get(obj_slot), name)
+            {
                 // A lone surrogate has no `&str` form, so `mutated` falls
                 // back to the conservative whole-cache reset (correct: a
                 // surrogate can never name `__eq__`/`__hash__`).
-                mutated(obj, name.as_str().ok());
+                mutated(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    name.as_str().ok(),
+                );
                 return Ok(w_none());
             }
-            return Err(attr_error_wtf8(obj, name));
+            return Err(attr_error_wtf8(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                name,
+            ));
         }
         let w_dict = pyre_object::with_roots!(obj, w_name => getdict_backing(obj))?;
         if !w_dict.is_null() && pyre_object::w_dict_delitem(w_dict, w_name) {
@@ -8007,6 +8050,8 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
             // Read a user instance's mapdict node directly (getdictvalue,
             // mapdict.py); a type receiver uses only its canonical
             // dictionary, which is the corresponding `getdictvalue` result.
+            let mut obj = pyre_object::gc_roots::pin_root(obj);
+            let mut w_type = pyre_object::gc_roots::pin_root(w_type);
             let value = if instance {
                 crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
                     obj,
@@ -11969,8 +12014,14 @@ pub unsafe fn load_method_cell_fast_path(
     if !pyre_object::typeobject::w_type_get_flag_method_descriptor(w_descr_type.as_ptr()) {
         return None;
     }
-    instance_dict_does_not_shadow(w_obj, name)?;
-    Some((w_type, version_tag, stored))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_obj, stored, w_type]);
+    instance_dict_does_not_shadow(pyre_object::gc_roots::shadow_stack_get(base), name)?;
+    Some((
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        version_tag,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ))
 }
 
 /// Value half of `lookup_where_with_method_cache`: unwrap a `MutableCell`,
@@ -12297,8 +12348,14 @@ pub unsafe fn load_method_fast_path(
     }
     // callmethod.py `w_value = w_obj.getdictvalue(space, name)`: a shadowing
     // instance attribute means the method is not bound.
-    instance_dict_does_not_shadow(w_obj, name)?;
-    Some((w_type, version_tag, w_descr))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_descr, w_type]);
+    instance_dict_does_not_shadow(pyre_object::gc_roots::shadow_stack_get(base), name)?;
+    Some((
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        version_tag,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ))
 }
 
 /// `Type.name(...)` classmethod method-load fast path: when `w_obj` is a class
@@ -12686,15 +12743,21 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
     // instance attributes where no such guard reaches, so a receiver with no
     // dictionary at all is the only remaining admission.
     let owes_shadow_guard = is_instance(w_obj) || pyre_object::is_exception(w_obj);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_type]);
     if owes_shadow_guard {
-        unsafe { instance_dict_does_not_shadow_wtf8(w_obj, name)? };
-    } else if iobase_peek_dict(w_obj).is_some() {
+        unsafe {
+            instance_dict_does_not_shadow_wtf8(pyre_object::gc_roots::shadow_stack_get(base), name)?
+        };
+    } else if iobase_peek_dict(pyre_object::gc_roots::shadow_stack_get(base)).is_some() {
         // interp_iobase.py W_IOBase.getdictvalue leaves a null w_dict
         // untouched. No tracer guard covers the slot, so the fold declines.
         return None;
-    } else if !pyre_object::with_roots!(w_type => getdict_backing_native(w_obj)).is_null() {
+    } else if !getdict_backing_native(pyre_object::gc_roots::shadow_stack_get(base)).is_null() {
         return None;
     }
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+    w_type = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if type_attr_stored_is_cell(w_type, name) {
         return None;
     }
@@ -13922,21 +13985,34 @@ pub(crate) unsafe fn get(
         }
         // typedef.py:511: w_result = w_obj.getslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let found = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
-            crate::objspace::std::mapdict::getslotvalue(obj, index)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, descr]);
+        let found = if unsafe {
+            crate::objspace::std::mapdict::has_mapdict_layout(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            )
+        } {
+            crate::objspace::std::mapdict::getslotvalue(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                index,
+            )
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
-            pyre_object::with_roots!(descr, obj => native_slot_get(
-                obj,
-                pyre_object::w_member_get_name(descr),
-                pyre_object::w_member_get_index(descr),
-            ))?
+            native_slot_get(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::w_member_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1)),
+                pyre_object::w_member_get_index(pyre_object::gc_roots::shadow_stack_get(base + 1)),
+            )?
         };
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
-            let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(member_missing_error(obj, slot_name));
+            let slot_name =
+                pyre_object::w_member_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1));
+            return Err(member_missing_error(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                slot_name,
+            ));
         }
         return Ok(found);
     }
@@ -14079,18 +14155,28 @@ unsafe fn delete(mut descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::
         }
         // typedef.py:527-531: success = w_obj.delslotvalue(self.index)
         let index = pyre_object::w_member_get_index(descr);
-        let removed = if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
-            crate::objspace::std::mapdict::delslotvalue(obj, index)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, descr]);
+        let removed = if unsafe {
+            crate::objspace::std::mapdict::has_mapdict_layout(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            )
+        } {
+            crate::objspace::std::mapdict::delslotvalue(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                index,
+            )
         } else {
             // Native-layout subclass instance — slot backed by __dict__.
-            pyre_object::with_roots!(descr => native_slot_del(
-                obj,
-                pyre_object::w_member_get_name(descr),
-                pyre_object::w_member_get_index(descr),
-            ))?
+            native_slot_del(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::w_member_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1)),
+                pyre_object::w_member_get_index(pyre_object::gc_roots::shadow_stack_get(base + 1)),
+            )?
         };
         if !removed {
-            let slot_name = pyre_object::w_member_get_name(descr);
+            let slot_name =
+                pyre_object::w_member_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1));
             return Err(crate::PyError::new(
                 crate::PyErrorKind::AttributeError,
                 slot_name.to_string(),
@@ -14192,8 +14278,15 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // mapdict.py BaseUserClassMapdict.setclass re-roots every physical
         // mapdict layout, including a slots-only subclass whose class has
         // no instance dict (`has_mapdict_storage` is false there).
-        if crate::objspace::std::mapdict::has_mapdict_layout(w_obj) {
-            crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_newcls]);
+        if crate::objspace::std::mapdict::has_mapdict_layout(
+            pyre_object::gc_roots::shadow_stack_get(base),
+        ) {
+            crate::objspace::std::mapdict::instance_setclass(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            );
         }
         // Unlink and store under one lock so a tracer cannot install a
         // fresh watcher against the old class between the two.
@@ -14203,6 +14296,8 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // `INSTANCE_USER_TYPE` and the header tid does not change. Other
         // layouts keep the typeptr their own allocator stamped.
         pyre_object::notify_w_class_mutated_then(|| {
+            let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+            let w_newcls = pyre_object::gc_roots::shadow_stack_get(base + 1);
             if pyre_object::is_instance(w_obj) {
                 let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
                 (*w_obj).ob_type = typeptr;
@@ -17314,7 +17409,13 @@ pub fn pick_builtin_obj_checked(
                 if unsafe { pyre_object::is_module(w_builtin) } {
                     return Ok(w_builtin);
                 }
-                let backing = crate::type_methods::resolve_dict_backing(w_builtin);
+                let _roots = pyre_object::gc_roots::push_roots();
+                let builtin_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_builtin);
+                let backing = crate::type_methods::resolve_dict_backing(
+                    pyre_object::gc_roots::shadow_stack_get(builtin_slot),
+                );
+                let w_builtin = pyre_object::gc_roots::shadow_stack_get(builtin_slot);
                 if !backing.is_null() {
                     return Ok(pyre_object::w_module_new_aliasing_dict("", w_builtin));
                 }
@@ -17723,7 +17824,9 @@ fn object_functionstr_prefix(w_module: PyObjectRef) -> Result<Wtf8Buf, crate::Py
             && pyre_object::is_str(w_module)
     };
     let differs = if exact_str {
-        unsafe { pyre_object::w_str_get_wtf8(w_module) }.as_str() != Ok("builtins")
+        // Exact strs compare by WTF-8 value (`W_UnicodeObject.eq_w`).
+        // A lone surrogate differs from the module name `builtins`.
+        (unsafe { pyre_object::w_str_get_wtf8(w_module) }) != "builtins"
     } else {
         let w_builtins = unsafe { pyre_object::w_str_new("builtins") };
         let w_module = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -24436,10 +24539,19 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
 /// `w_dict_delitem_object_strategy` / `w_module_dict_delitem_inner`.
 fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
     unsafe {
-        match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, key]);
+        match pyre_object::dictmultiobject::w_dict_delitem_checked(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        ) {
             Ok(true) => Ok(()),
-            Ok(false) => Err(PyError::key_error_with_key(key)),
-            Err(_) => Err(take_pending_dict_key_error(key)),
+            Ok(false) => Err(PyError::key_error_with_key(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )),
+            Err(_) => Err(take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )),
         }
     }
 }
@@ -24452,9 +24564,17 @@ pub fn dict_delitem_if_value_is(
     value: PyObjectRef,
 ) -> Result<bool, PyError> {
     unsafe {
-        match pyre_object::dictmultiobject::w_dict_delitem_if_value_is_checked(obj, key, value) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, key, value]);
+        match pyre_object::dictmultiobject::w_dict_delitem_if_value_is_checked(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        ) {
             Ok(removed) => Ok(removed),
-            Err(_) => Err(take_pending_dict_key_error(key)),
+            Err(_) => Err(take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )),
         }
     }
 }
@@ -24464,9 +24584,17 @@ pub fn dict_delitem_if_value_is(
 /// `Ok(false)` means the key was absent (the caller raises `KeyError`).
 pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Result<bool, PyError> {
     unsafe {
-        match pyre_object::dictmultiobject::w_dict_move_to_end_checked(obj, key, last) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, key]);
+        match pyre_object::dictmultiobject::w_dict_move_to_end_checked(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            last,
+        ) {
             Ok(found) => Ok(found),
-            Err(_) => Err(take_pending_dict_key_error(key)),
+            Err(_) => Err(take_pending_dict_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )),
         }
     }
 }
@@ -25153,9 +25281,12 @@ mod tests {
     fn test_issubclass_pseudo_class_via_bases() {
         crate::typedef::init_typeobjects();
         let inner_type = crate::typedef::make_builtin_type("PseudoInner", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
             unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+                pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                    ns_slot,
                     "__bases__",
                     w_tuple_new(vec![]),
                 )

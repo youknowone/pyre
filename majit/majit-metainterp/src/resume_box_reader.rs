@@ -118,7 +118,12 @@ impl<'a> BridgeVirtualCache<'a> {
             bool,
         ) -> majit_ir::DescrRef,
     ) -> Self {
-        Self {
+        // Recording-only still allocates concrete shadows
+        // (`materialize_concrete_virtual_ptr`). resume.py keeps each virtual
+        // in `virtuals_cache` before filling its fields, because the next
+        // allocation can collect. Register the same fixed slice the applying
+        // reader uses; `Drop` unregisters it.
+        let mut cache = Self {
             virtuals_ptr_cache: vec![None; size],
             virtuals_int_cache: vec![None; size],
             concrete_ptr_cache: vec![None; size],
@@ -127,9 +132,15 @@ impl<'a> BridgeVirtualCache<'a> {
             executing: None,
             fail_values: &[],
             fail_ref_roots: Vec::new(),
-            concrete_roots: Vec::new(),
+            concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+        };
+        if size > 0 {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
         }
+        cache
     }
 
     /// `ResumeDataBoxReader`: the same walk, applying each write through
@@ -256,6 +267,8 @@ impl<'a> BridgeVirtualCache<'a> {
     /// read through the root the collector maintains. Only a recording-only
     /// reader answers from the address a later decode parked.
     pub fn get_concrete_ptr(&self, i: usize) -> Option<majit_ir::GcRef> {
+        // The collector writes the forwarded address into `concrete_roots`.
+        // A zero slot is unpublished; read the allocation-time cache.
         match self.concrete_roots.get(i) {
             Some(0) | None => self.concrete_ptr_cache.get(i).copied().flatten(),
             Some(address) => Some(majit_ir::GcRef(*address as usize)),
@@ -266,6 +279,7 @@ impl<'a> BridgeVirtualCache<'a> {
         if i < self.concrete_ptr_cache.len() {
             self.concrete_ptr_cache[i] = Some(v);
         }
+        self.set_concrete_root(i, v.0 as i64);
     }
 
     pub fn get_concrete_int(&self, i: usize) -> Option<i64> {
@@ -1694,6 +1708,25 @@ mod tests {
         let (buffer, ops) = materialize_raw_slice(tag_box(0), vec![Type::Int]);
         assert!(!buffer.is_constant());
         assert!(ops.contains(&OpCode::IntAdd));
+    }
+
+    /// resume.py fills `virtuals_cache` before the next `allocate`, and the
+    /// collector updates that cache. A recording-only cache has the same
+    /// window: `materialize_concrete_virtual_ptr` allocates, then a later
+    /// virtual's allocation collects.
+    #[test]
+    fn recording_cache_forwards_a_concrete_virtual_across_collection() {
+        let mut cache = BridgeVirtualCache::new(2, default_bridge_array_descr);
+        cache.set_concrete_ptr(0, majit_ir::GcRef(0x1000));
+        cache.set_concrete_ptr(1, majit_ir::GcRef(0x2000));
+        majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+            if root.0 == 0x1000 || root.0 == 0x2000 {
+                root.0 += 0x80;
+            }
+        });
+        assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1080)));
+        assert_eq!(cache.get_concrete_ptr(1), Some(majit_ir::GcRef(0x2080)));
+        assert_eq!(cache.get_concrete_int(0), None);
     }
 
     /// The funnel folds through the executor row, so the concrete this helper

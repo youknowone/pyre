@@ -657,11 +657,14 @@ pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bytes_like_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
-        if is_bytes(obj) {
-            w_bytes_data(obj)
+        // Both arms are an rstr (`W_BytesObject._value`, or `''.join` of
+        // the bytearray's char list). The slice is that rstr's `chars`.
+        let block = if is_bytes(obj) {
+            w_bytes_block(obj)
         } else {
-            crate::bytearrayobject::w_bytearray_data(obj)
-        }
+            crate::bytearrayobject::bytearray_cached_rstr(obj)
+        };
+        bytes_block_chars(block)
     }
 }
 

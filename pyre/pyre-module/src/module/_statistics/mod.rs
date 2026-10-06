@@ -118,10 +118,11 @@ fn _normal_dist_inv_cdf(p: f64, mu: f64, sigma: f64) -> Result<f64, pyre_interpr
 }
 
 pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_normal_dist_inv_cdf",
-        pyre_interpreter::gateway::with_module(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored = pyre_interpreter::gateway::with_module(
             "_statistics",
             pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                 "_normal_dist_inv_cdf",
@@ -129,7 +130,8 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
                 _normal_dist_inv_cdf_pyre_arity(),
                 _normal_dist_inv_cdf_pyre_sig(),
             ),
-        ),
-    );
+        );
+        pyre_interpreter::module_ns_store_slot(ns_slot, "_normal_dist_inv_cdf", __pyre_stored)
+    };
     Ok(())
 }

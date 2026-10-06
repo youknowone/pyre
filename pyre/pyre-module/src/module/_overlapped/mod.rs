@@ -880,9 +880,12 @@ fn overlapped_wsa_send_to(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 fn property(ns: PyObjectRef, name: &'static str, getter: pyre_interpreter::BuiltinCodeFn) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             name,
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(name, getter, 2),
@@ -893,9 +896,12 @@ fn property(ns: PyObjectRef, name: &'static str, getter: pyre_interpreter::Built
 }
 
 fn init_overlapped_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__new__",
             pyre_interpreter::typedef::make_new_descr(overlapped_new),
         )
@@ -922,34 +928,50 @@ fn init_overlapped_type(ns: PyObjectRef) {
         ("WSASendTo", overlapped_wsa_send_to),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 name,
                 pyre_interpreter::make_builtin_function(name, function),
             )
         };
     }
-    property(ns, "address", |args| {
-        let state = native(arg(args, 1, "address")?)?.lock();
-        Ok(pyre_object::w_int_new(
-            &state.overlapped as *const _ as usize as i64,
-        ))
-    });
-    property(ns, "pending", |args| {
-        let state = native(arg(args, 1, "pending")?)?.lock();
-        Ok(pyre_object::w_bool_from(
-            !host_overlapped::has_overlapped_io_completed(&state.overlapped)
-                && state.kind != OverlappedType::NotStarted,
-        ))
-    });
-    property(ns, "error", |args| {
-        let state = native(arg(args, 1, "error")?)?.lock();
-        Ok(pyre_object::w_int_new(state.error as i64))
-    });
-    property(ns, "event", |args| {
-        let state = native(arg(args, 1, "event")?)?.lock();
-        Ok(w_uintptr(state.overlapped.hEvent as usize))
-    });
+    property(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "address",
+        |args| {
+            let state = native(arg(args, 1, "address")?)?.lock();
+            Ok(pyre_object::w_int_new(
+                &state.overlapped as *const _ as usize as i64,
+            ))
+        },
+    );
+    property(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "pending",
+        |args| {
+            let state = native(arg(args, 1, "pending")?)?.lock();
+            Ok(pyre_object::w_bool_from(
+                !host_overlapped::has_overlapped_io_completed(&state.overlapped)
+                    && state.kind != OverlappedType::NotStarted,
+            ))
+        },
+    );
+    property(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "error",
+        |args| {
+            let state = native(arg(args, 1, "error")?)?.lock();
+            Ok(pyre_object::w_int_new(state.error as i64))
+        },
+    );
+    property(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "event",
+        |args| {
+            let state = native(arg(args, 1, "event")?)?.lock();
+            Ok(w_uintptr(state.overlapped.hEvent as usize))
+        },
+    );
 }
 
 static OVERLAPPED_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =
@@ -1150,6 +1172,9 @@ fn reset_event(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // PyPy imports `_socket` before resolving the extension-function GUIDs.
     // The host layer exposes the same process-global WSAStartup owner, so the
     // builtin can establish that prerequisite without creating a second
@@ -1192,15 +1217,23 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
         ("INFINITE", host_winapi::INFINITE_TIMEOUT as i64),
         ("NULL", 0),
     ] {
-        pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(value));
+        {
+            let __pyre_stored = pyre_object::w_int_new(value);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            pyre_interpreter::module_ns_store_slot(ns_slot, name, __pyre_stored)
+        };
     }
     // The handle sentinel is `(HANDLE)-1`, which prints as the unsigned value.
-    pyre_interpreter::module_ns_store(
-        ns,
-        "INVALID_HANDLE_VALUE",
-        w_uintptr(host_overlapped::INVALID_HANDLE_VALUE_ISIZE as usize),
-    );
-    pyre_interpreter::module_ns_store(ns, "Overlapped", overlapped_type());
+    {
+        let __pyre_stored = w_uintptr(host_overlapped::INVALID_HANDLE_VALUE_ISIZE as usize);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "INVALID_HANDLE_VALUE", __pyre_stored)
+    };
+    {
+        let __pyre_stored = overlapped_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "Overlapped", __pyre_stored)
+    };
     for (name, arity, function) in [
         (
             "ConnectPipe",
@@ -1224,14 +1257,13 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
         ("SetEvent", 1, set_event),
         ("ResetEvent", 1, reset_event),
     ] {
-        pyre_interpreter::module_ns_store(
-            ns,
-            name,
-            pyre_interpreter::gateway::with_module(
+        {
+            let __pyre_stored = pyre_interpreter::gateway::with_module(
                 "_overlapped",
                 pyre_interpreter::make_module_builtin_function_with_arity(name, function, arity),
-            ),
-        );
+            );
+            pyre_interpreter::module_ns_store_slot(ns_slot, name, __pyre_stored)
+        };
     }
     Ok(())
 }

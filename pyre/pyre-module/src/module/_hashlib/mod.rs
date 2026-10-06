@@ -341,8 +341,11 @@ fn hash_xof_type() -> PyObjectRef {
         let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_hashlib.HASHXOF",
             |ns| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+                let _root_scope = pyre_object::gc_roots::push_roots();
+                let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+                let ns = pyre_object::gc_roots::pin_root(ns);
+                pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                    ns_slot,
                     "__new__",
                     pyre_interpreter::typedef::make_new_descr(|_| {
                         Err(pyre_interpreter::PyError::type_error(

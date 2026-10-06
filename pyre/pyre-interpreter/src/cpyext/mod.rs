@@ -163,10 +163,11 @@ static EXTENSION_LOAD_LOCK: ForkExtensionLoadLock = ForkExtensionLoadLock::new()
 static DLOPEN_FLAGS: AtomicIsize = AtomicIsize::new((libc::RTLD_NOW | libc::RTLD_LOCAL) as isize);
 
 pub fn register_sys_dlopenflags(ns: PyObjectRef) {
-    crate::module_ns_store(
-        ns,
-        "getdlopenflags",
-        crate::make_builtin_function_with_arity(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getdlopenflags",
             |_| {
                 Ok(pyre_object::w_int_new(
@@ -174,12 +175,11 @@ pub fn register_sys_dlopenflags(ns: PyObjectRef) {
                 ))
             },
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "setdlopenflags",
-        crate::make_builtin_function_with_arity(
+        );
+        crate::module_ns_store_slot(ns_slot, "getdlopenflags", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "setdlopenflags",
             |args| {
                 DLOPEN_FLAGS.store(
@@ -189,8 +189,9 @@ pub fn register_sys_dlopenflags(ns: PyObjectRef) {
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "setdlopenflags", __pyre_stored)
+    };
 }
 
 type ExtensionLoadGuard = parking_lot::lock_api::ReentrantMutexGuard<

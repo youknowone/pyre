@@ -84,57 +84,86 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
 }
 
 fn init_cfuncptr_type(ns: PyObjectRef) {
-    type_ns_store(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(cfuncptr_new),
+        pyre_interpreter::typedef::make_new_descr(cfuncptr_new)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__call__",
-        pyre_interpreter::make_builtin_function("__call__", cfuncptr_call),
+        pyre_interpreter::make_builtin_function("__call__", cfuncptr_call)
     );
     // `restype` / `argtypes` — settable data descriptors with class-attr
     // fallback to `_restype_` / `_argtypes_`.
-    type_ns_store(
+    let restype_get =
+        pyre_interpreter::make_builtin_function_with_arity("restype", restype_getter, 2);
+    let restype_get = pyre_object::gc_roots::pin_root(restype_get);
+    let restype_set =
+        pyre_interpreter::make_builtin_function_with_arity("restype", restype_setter, 3);
+    let restype_set = pyre_object::gc_roots::pin_root(restype_set);
+    let restype_del =
+        pyre_interpreter::make_builtin_function_with_arity("restype", restype_deleter, 2);
+    let restype_del = pyre_object::gc_roots::pin_root(restype_del);
+    pyre_interpreter::__pyre_store!(
         ns,
         "restype",
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("restype", restype_getter, 2),
-            pyre_interpreter::make_builtin_function_with_arity("restype", restype_setter, 3),
-            pyre_interpreter::make_builtin_function_with_arity("restype", restype_deleter, 2),
-            "restype",
-        ),
+            restype_get,
+            restype_set,
+            restype_del,
+            "restype"
+        )
     );
-    type_ns_store(
+    let argtypes_get =
+        pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_getter, 2);
+    let argtypes_get = pyre_object::gc_roots::pin_root(argtypes_get);
+    let argtypes_set =
+        pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_setter, 3);
+    let argtypes_set = pyre_object::gc_roots::pin_root(argtypes_set);
+    let argtypes_del =
+        pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_deleter, 2);
+    let argtypes_del = pyre_object::gc_roots::pin_root(argtypes_del);
+    pyre_interpreter::__pyre_store!(
         ns,
         "argtypes",
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_getter, 2),
-            pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_setter, 3),
-            pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_deleter, 2),
-            "argtypes",
-        ),
+            argtypes_get,
+            argtypes_set,
+            argtypes_del,
+            "argtypes"
+        )
     );
-    type_ns_store(
+    let errcheck_get =
+        pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_getter, 2);
+    let errcheck_get = pyre_object::gc_roots::pin_root(errcheck_get);
+    let errcheck_set =
+        pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_setter, 3);
+    let errcheck_set = pyre_object::gc_roots::pin_root(errcheck_set);
+    let errcheck_del =
+        pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_deleter, 2);
+    let errcheck_del = pyre_object::gc_roots::pin_root(errcheck_del);
+    pyre_interpreter::__pyre_store!(
         ns,
         "errcheck",
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_getter, 2),
-            pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_setter, 3),
-            pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_deleter, 2),
-            "errcheck",
-        ),
+            errcheck_get,
+            errcheck_set,
+            errcheck_del,
+            "errcheck"
+        )
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__repr__",
-        pyre_interpreter::make_builtin_function("__repr__", cfuncptr_repr),
+        pyre_interpreter::make_builtin_function("__repr__", cfuncptr_repr)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__bool__",
-        pyre_interpreter::make_builtin_function("__bool__", cfuncptr_bool),
+        pyre_interpreter::make_builtin_function("__bool__", cfuncptr_bool)
     );
 }
 

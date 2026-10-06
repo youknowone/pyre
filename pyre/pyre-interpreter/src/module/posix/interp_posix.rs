@@ -1653,12 +1653,23 @@ fn create_environ() -> pyre_object::PyObjectRef {
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(ns, "environ", create_environ());
-    crate::module_ns_store(
-        ns,
-        "_create_environ",
-        crate::make_builtin_function_with_arity("_create_environ", |_args| Ok(create_environ()), 0),
-    );
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored = create_environ();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "environ", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
+            "_create_environ",
+            |_args| Ok(create_environ()),
+            0,
+        );
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "_create_environ", __pyre_stored)
+    };
 
     // ── posix.putenv(name, value) / posix.unsetenv(name) ──
     // `os.environ.__setitem__` calls `putenv` before updating its own dict, so
@@ -1725,10 +1736,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             }
             Ok(())
         }
-        crate::module_ns_store(
-            ns,
-            "putenv",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "putenv",
                 |args| {
                     // interp_posix.py putenv_impl rejects the name itself...
@@ -1752,12 +1761,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "unsetenv",
-            crate::make_builtin_function_with_arity(
+            );
+            crate::module_ns_store_slot(ns_slot, "putenv", __pyre_stored)
+        };
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "unsetenv",
                 |args| {
                     let name = env_bytes(args[0])?;
@@ -1782,8 +1790,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "unsetenv", __pyre_stored)
+        };
     }
 
     // _have_functions — list of HAVE_* macro names that were defined at
@@ -1870,14 +1879,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // it keeps that position here too.
         ("MS_WINDOWS", MS_WINDOWS),
     ];
-    let w_have_functions = pyre_object::with_roots!(ns => pyre_object::w_list_new(
-        have_functions
-            .iter()
-            .filter(|&&(_, have)| have)
-            .map(|&(n, _)| pyre_object::w_str_new(n))
-            .collect(),
-    ));
-    crate::module_ns_store(ns, "_have_functions", w_have_functions);
+    let w_have_functions = {
+        // Stay on the function guard. `with_roots!(ns => ...)` assigns `ns`
+        // and drops that guard's pin for every later store.
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for &(n, have) in have_functions {
+            if have {
+                items.push(pyre_object::w_str_new(n));
+            }
+        }
+        pyre_object::w_list_new(items.take())
+    };
+    {
+        let __pyre_stored = w_have_functions;
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "_have_functions", __pyre_stored)
+    };
     // POSIX constants — real libc values (cross-platform subset).
     for (name, val) in [
         #[cfg(feature = "host_env")]
@@ -1987,7 +2004,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // Neither `posix` nor `nt` carries them; the other SEEK_* values are
         // the module's to publish.
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        {
+            let __pyre_stored = pyre_object::w_int_new(val);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+        };
     }
     // Windows-only open() mode flags (fcntl.h). os.py exposes these off `nt`,
     // and stdlib callers reach for them behind `hasattr(os, 'O_BINARY')`
@@ -2011,14 +2032,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ("O_RANDOM", libc::O_RANDOM as i64),
         ("O_SEQUENTIAL", libc::O_SEQUENTIAL as i64),
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        {
+            let __pyre_stored = pyre_object::w_int_new(val);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+        };
     }
     // Placeholders the POSIX blocks further down overwrite with the real libc
     // values — the wait options beside the `W*` predicates, the `PRIO_*` trio
     // beside `getpriority`. A build that reaches neither keeps the zero.
     fn install_zero_constants(ns: PyObjectRef, names: &[&str]) {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ns = pyre_object::gc_roots::pin_root(ns);
         for &name in names {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(0));
+            {
+                let __pyre_stored = pyre_object::w_int_new(0);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
     }
 
@@ -2080,7 +2112,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 host_nt::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS as i64,
             ),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
     }
     #[cfg(all(windows, not(feature = "host_env")))]
@@ -2098,7 +2134,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ("_LOAD_LIBRARY_SEARCH_SYSTEM32", 0x800),
         ("_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS", 0x1000),
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        {
+            let __pyre_stored = pyre_object::w_int_new(val);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+        };
     }
     #[cfg(unix)]
     {
@@ -2139,7 +2179,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("EX_NOPERM", rustpython_host_env::posix::EX_NOPERM as i64),
             ("EX_CONFIG", rustpython_host_env::posix::EX_CONFIG as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         #[cfg(not(feature = "host_env"))]
         for (name, val) in [
@@ -2160,7 +2204,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("EX_NOPERM", 77),
             ("EX_CONFIG", 78),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // The `f_flag` bits `statvfs` answers with, which is the only reader
         // there is for them.
@@ -2168,7 +2216,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("ST_RDONLY", libc::ST_RDONLY as i64),
             ("ST_NOSUID", libc::ST_NOSUID as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // `<dlfcn.h>` — `rdynload.py:50-82` reads the same set, and
         // `sys.setdlopenflags` and `ctypes` hand them straight back to
@@ -2185,7 +2237,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
             ("RTLD_DEEPBIND", libc::RTLD_DEEPBIND as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // `<sched.h>`, read as `rposix.py` reads it: present where the
         // header defines it, and with the host's own numbering rather than a
@@ -2218,7 +2274,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             #[cfg(any(target_os = "linux", target_os = "android"))]
             ("SCHED_RESET_ON_FORK", libc::SCHED_RESET_ON_FORK as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
@@ -2240,7 +2300,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("F_TLOCK", rustpython_host_env::fcntl::F_TLOCK as i64),
             ("F_TEST", rustpython_host_env::fcntl::F_TEST as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         #[cfg(not(all(
             feature = "host_env",
@@ -2260,7 +2324,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("F_TLOCK", libc::F_TLOCK as i64),
             ("F_TEST", libc::F_TEST as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // The two `whence` values beyond the three os.py fixes itself: they
         // seek to the next hole or the next data in a sparse file. A host that
@@ -2283,7 +2351,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("SEEK_HOLE", libc::SEEK_HOLE as i64),
             ("SEEK_DATA", libc::SEEK_DATA as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // Darwin-only names. `NGROUPS_MAX` (`<sys/syslimits.h>`) and `TMP_MAX`
         // (`<stdio.h>`) exist on linux too but with the glibc numbering, so
@@ -2304,18 +2376,26 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("_COPYFILE_STAT", libc::COPYFILE_STAT as i64),
             ("_COPYFILE_XATTR", libc::COPYFILE_XATTR as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
     }
     // Remaining noop stubs — functions os.py references at module level.
     // Functions with real implementations are registered individually below.
     fn install_noop_stubs(ns: PyObjectRef, names: &[&'static str]) {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ns = pyre_object::gc_roots::pin_root(ns);
         for &name in names {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
-            );
+            {
+                let __pyre_stored =
+                    crate::make_builtin_function(name, |_| Ok(pyre_object::w_none()));
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
     }
 
@@ -2455,11 +2535,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // There is no fork to register against on Windows, and `os.py` reaches for
     // the name to decide whether it has one.
     #[cfg(not(windows))]
-    crate::module_ns_store(
-        ns,
-        "register_at_fork",
-        crate::make_builtin_function("register_at_fork", register_at_fork),
-    );
+    {
+        let __pyre_stored = crate::make_builtin_function("register_at_fork", register_at_fork);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "register_at_fork", __pyre_stored)
+    };
 
     // os.major(device) / os.minor(device) / os.makedev(major, minor)
     // (`interp_posix.py`) — how a device number is taken apart and
@@ -2555,36 +2635,32 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             }
             Ok(value as libc::dev_t)
         }
-        crate::module_ns_store(
-            ns,
-            "major",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "major",
                 |args| {
-                    Ok(major_minor_result(unsafe {
-                        majit_rlib::rposix::c_major(device_w(args)?)
-                    } as i64))
+                    Ok(major_minor_result(
+                        unsafe { majit_rlib::rposix::c_major(device_w(args)?) } as i64,
+                    ))
                 },
                 1,
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "minor",
-            crate::make_builtin_function_with_arity(
+            );
+            crate::module_ns_store_slot(ns_slot, "major", __pyre_stored)
+        };
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "minor",
                 |args| {
-                    Ok(major_minor_result(unsafe {
-                        majit_rlib::rposix::c_minor(device_w(args)?)
-                    } as i64))
+                    Ok(major_minor_result(
+                        unsafe { majit_rlib::rposix::c_minor(device_w(args)?) } as i64,
+                    ))
                 },
                 1,
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "makedev",
-            crate::make_builtin_function_with_arity(
+            );
+            crate::module_ns_store_slot(ns_slot, "minor", __pyre_stored)
+        };
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "makedev",
                 |args| {
                     let (major, mut minor) = match args {
@@ -2598,8 +2674,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     } as i64))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "makedev", __pyre_stored)
+        };
     }
 
     // PyPy `interp_posix.get_blocking/set_blocking` → rposix
@@ -2780,16 +2857,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
     }
 
-    crate::module_ns_store(
-        ns,
-        "get_blocking",
-        crate::make_builtin_function("get_blocking", get_blocking),
-    );
-    crate::module_ns_store(
-        ns,
-        "set_blocking",
-        crate::make_builtin_function("set_blocking", set_blocking),
-    );
+    {
+        let __pyre_stored = crate::make_builtin_function("get_blocking", get_blocking);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "get_blocking", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::make_builtin_function("set_blocking", set_blocking);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "set_blocking", __pyre_stored)
+    };
 
     // `baseobjspace.py fsencode_w` returns filesystem bytes; syscall
     // boundaries must not pass through a Rust `String`.
@@ -3156,10 +3233,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     }
 
     // ── posix.open(path, flags, mode=0o777, *, dir_fd=None) → fd ──
-    crate::module_ns_store(
-        ns,
-        "open",
-        crate::make_builtin_function("open", |args| {
+    {
+        let __pyre_stored = crate::make_builtin_function("open", |args| {
             let (bound, mut kwargs) =
                 bind_path_args(args, "open", &["path", "flags", "mode"], 2, &["dir_fd"])?;
             let roots = pyre_object::gc_roots::push_roots();
@@ -3254,9 +3329,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             (fd, errno)
                         };
                         #[cfg(not(unix))]
-                        let (fd, errno) = crate::module::thread::call_external_function(|| unsafe {
-                            libc::open(c_path.as_ptr(), flags, mode as libc::c_uint)
-                        });
+                        let (fd, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::open(c_path.as_ptr(), flags, mode as libc::c_uint)
+                            });
                         if fd >= 0 {
                             break (fd, errno);
                         }
@@ -3280,14 +3356,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let fd = crate::host_seam::ops::open(&path.as_bytes, flags, mode)
                 .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
             Ok(pyre_object::w_int_new(fd as i64))
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "open", __pyre_stored)
+    };
 
     // ── posix.close(fd) ──
-    crate::module_ns_store(
-        ns,
-        "close",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "close",
             |args| {
                 if args.is_empty() {
@@ -3327,8 +3402,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "close", __pyre_stored)
+    };
 
     // ── posix.closerange(fd_low, fd_high) ──
     // Half-open, and every failure is dropped: the point of the call is to shut
@@ -3337,10 +3413,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // the process does not have is the ordinary case, not an error. Unix uses
     // `rposix.c_close`; Windows goes through `crt_call!` so the C runtime's
     // invalid-parameter handler does not abort the process.
-    crate::module_ns_store(
-        ns,
-        "closerange",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "closerange",
             |args| {
                 if args.len() != 2 {
@@ -3365,16 +3439,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_none())
             },
             2,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "closerange", __pyre_stored)
+    };
 
     // ── posix.strerror(code) ──
     // The C runtime's message table, which is the one `OSError.strerror`
     // already reports from — the two answer alike for the same errno.
-    crate::module_ns_store(
-        ns,
-        "strerror",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "strerror",
             |args| {
                 if args.len() != 1 {
@@ -3389,14 +3462,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ))
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "strerror", __pyre_stored)
+    };
 
     // ── posix.read(fd, n) → bytes ──
-    crate::module_ns_store(
-        ns,
-        "read",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "read",
             |args| {
                 if args.len() < 2 {
@@ -3477,17 +3549,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_bytes_from_bytes(&buf))
             },
             2,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "read", __pyre_stored)
+    };
 
     // Python 3.14 `os.readinto`: acquire one writable buffer export for the
     // complete `_Py_read(fd, buffer->buf, buffer->len)` call and return the
     // number of bytes transferred without allocating an intermediate bytes
     // object on the real-host path.
-    crate::module_ns_store(
-        ns,
-        "readinto",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "readinto",
             |args| {
                 let w_fd = args[0];
@@ -3555,14 +3626,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(result))
             },
             2,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "readinto", __pyre_stored)
+    };
 
     // ── posix.write(fd, data) → nbytes ──
-    crate::module_ns_store(
-        ns,
-        "write",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "write",
             |args| {
                 if args.len() < 2 {
@@ -3619,14 +3689,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(ret))
             },
             2,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "write", __pyre_stored)
+    };
 
     // ── posix.lseek(fd, offset, whence) → position ──
-    crate::module_ns_store(
-        ns,
-        "lseek",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "lseek",
             |args| {
                 if args.len() < 3 {
@@ -3675,8 +3744,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(ret))
             },
             3,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "lseek", __pyre_stored)
+    };
 
     // ── posix.unlink(path, *, dir_fd=None) / posix.remove(path, *, dir_fd=None) ──
     // `remove` is `unlink` written out a second time under its own name
@@ -3710,9 +3780,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             #[cfg(unix)]
             let (ret, err) = match _dir_fd {
                 Some(dir_fd) => {
-                    let ret = unsafe {
-                        majit_rlib::rposix::c_unlinkat(dir_fd, c_path.as_ptr(), 0)
-                    };
+                    let ret = unsafe { majit_rlib::rposix::c_unlinkat(dir_fd, c_path.as_ptr(), 0) };
                     (
                         ret,
                         std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
@@ -3740,16 +3808,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
         Ok(pyre_object::w_none())
     }
-    crate::module_ns_store(
-        ns,
-        "unlink",
-        crate::make_builtin_function("unlink", |args| posix_unlink(args, "unlink")),
-    );
-    crate::module_ns_store(
-        ns,
-        "remove",
-        crate::make_builtin_function("remove", |args| posix_unlink(args, "remove")),
-    );
+    {
+        let __pyre_stored =
+            crate::make_builtin_function("unlink", |args| posix_unlink(args, "unlink"));
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "unlink", __pyre_stored)
+    };
+    {
+        let __pyre_stored =
+            crate::make_builtin_function("remove", |args| posix_unlink(args, "remove"));
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "remove", __pyre_stored)
+    };
 
     // ── posix.readlink(path, *, dir_fd=None) ──
     // Returns the symlink target; a non-symlink raises OSError(EINVAL), which
@@ -3758,10 +3828,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // readlink handler); the stub override loop registers a raising stub, so
     // keep the real body out of the sandbox build.
     #[cfg(not(feature = "sandbox"))]
-    crate::module_ns_store(
-        ns,
-        "readlink",
-        crate::make_builtin_function("readlink", |args| {
+    {
+        let __pyre_stored = crate::make_builtin_function("readlink", |args| {
             let (bound, kwargs) = bind_path_args(args, "readlink", &["path"], 1, &["dir_fd"])?;
             // `readlink` types `dir_fd` as `DirFD(rposix.HAVE_READLINKAT)`.
             let _dir_fd = dir_fd_kwarg(kwargs, HAVE_READLINKAT)?;
@@ -3847,14 +3915,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 Err(e) => Err(fs_err_with_filename(e, path.w_path())),
             }
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "readlink", __pyre_stored)
+    };
 
     // ── posix.mkdir(path, mode=0o777, *, dir_fd=None) ──
-    crate::module_ns_store(
-        ns,
-        "mkdir",
-        crate::make_builtin_function("mkdir", |args| {
+    {
+        let __pyre_stored = crate::make_builtin_function("mkdir", |args| {
             let (bound, mut kwargs) =
                 bind_path_args(args, "mkdir", &["path", "mode"], 1, &["dir_fd"])?;
             let roots = pyre_object::gc_roots::push_roots();
@@ -3906,9 +3973,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         };
                         (
                             ret,
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                         )
                     }
                     None => {
@@ -3934,17 +3999,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::host_seam::ops::mkdir(&path.as_bytes, _mode)
                 .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path.w_path()))?;
             Ok(pyre_object::w_none())
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "mkdir", __pyre_stored)
+    };
 
     // ── posix.rmdir(path, *, dir_fd=None) ──
     // Mutates the host filesystem; stubbed under sandbox, so the real body
     // (and its libc call) is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::module_ns_store(
-        ns,
-        "rmdir",
-        crate::make_builtin_function("rmdir", |args| {
+    {
+        let __pyre_stored = crate::make_builtin_function("rmdir", |args| {
             let (bound, mut kwargs) = bind_path_args(args, "rmdir", &["path"], 1, &["dir_fd"])?;
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
@@ -3984,18 +4048,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         };
                         (
                             ret,
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                         )
                     }
                     None => {
                         let ret = unsafe { majit_rlib::rposix::c_rmdir(c_path.as_ptr()) };
                         (
                             ret,
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                         )
                     }
                 };
@@ -4004,8 +4064,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             }
             Ok(pyre_object::w_none())
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "rmdir", __pyre_stored)
+    };
 
     // ── posix.rename / posix.replace(src, dst, *, src_dir_fd=None,
     //    dst_dir_fd=None) ──
@@ -4113,16 +4174,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             Ok(pyre_object::w_none())
         }
     }
-    crate::module_ns_store(
-        ns,
-        "rename",
-        crate::make_builtin_function("rename", |args| rename_impl(args, "rename")),
-    );
-    crate::module_ns_store(
-        ns,
-        "replace",
-        crate::make_builtin_function("replace", |args| rename_impl(args, "replace")),
-    );
+    {
+        let __pyre_stored =
+            crate::make_builtin_function("rename", |args| rename_impl(args, "rename"));
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "rename", __pyre_stored)
+    };
+    {
+        let __pyre_stored =
+            crate::make_builtin_function("replace", |args| rename_impl(args, "replace"));
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "replace", __pyre_stored)
+    };
 
     // os.utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True)
     /// One of the two times `utime` writes, kept the way `rposix.futimens` and
@@ -4540,20 +4603,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ))
         }
     }
-    crate::module_ns_store(
-        ns,
-        "utime",
-        crate::make_builtin_function("utime", utime_impl),
-    );
+    {
+        let __pyre_stored = crate::make_builtin_function("utime", utime_impl);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "utime", __pyre_stored)
+    };
 
     // ── posix._path_splitroot(path) → (root, tail) ──
     // Registered only where `sys.platform` is `win32`, the same condition
     // `_bootstrap_external` gates its use on.
     #[cfg(windows)]
-    crate::module_ns_store(
-        ns,
-        "_path_splitroot",
-        path_helper_fn(
+    {
+        let __pyre_stored = path_helper_fn(
             "_path_splitroot",
             |args| {
                 let (bound, _) = bind_path_args(args, "_path_splitroot", &["path"], 1, &[])?;
@@ -4575,18 +4636,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             },
             "($module, /, path)",
             "Removes everything after the root on Win32.",
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "_path_splitroot", __pyre_stored)
+    };
 
     // ── posix._path_splitroot_ex(p) → (drive, root, tail) ──
     // `_Py_skiproot` measures the two prefixes and the three pieces are slices
     // of the one name. This is `ntpath.splitroot` and `posixpath.splitroot`
     // themselves: both import it and fall back to their own Python split only
     // where a build does not carry it.
-    crate::module_ns_store(
-        ns,
-        "_path_splitroot_ex",
-        path_helper_fn(
+    {
+        let __pyre_stored = path_helper_fn(
             "_path_splitroot_ex",
             |args| {
                 let (bound, _) = bind_path_args(args, "_path_splitroot_ex", &["p"], 1, &[])?;
@@ -4603,16 +4663,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "($module, /, p)",
             "Split a pathname into drive, root and tail.\n\nThe tail contains \
              anything after the root.",
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "_path_splitroot_ex", __pyre_stored)
+    };
 
     // ── posix._path_normpath(path) → path ──
     // `ntpath.normpath` and `posixpath.normpath` themselves, on the same
     // import-or-fall-back terms as `_path_splitroot_ex` above.
-    crate::module_ns_store(
-        ns,
-        "_path_normpath",
-        path_helper_fn(
+    {
+        let __pyre_stored = path_helper_fn(
             "_path_normpath",
             |args| {
                 let (bound, _) = bind_path_args(args, "_path_normpath", &["path"], 1, &[])?;
@@ -4628,8 +4687,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             },
             "($module, /, path)",
             "Normalize path, eliminating double slashes, etc.",
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "_path_normpath", __pyre_stored)
+    };
 
     // ── nt._path_isdir / _path_isfile / _path_islink / _path_isjunction /
     //    _path_exists / _path_lexists ──
@@ -4640,10 +4700,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // one `try`, in place of the `genericpath` predicates that would stat.
     #[cfg(all(windows, feature = "host_env"))]
     {
-        crate::module_ns_store(
-            ns,
-            "_path_isdir",
-            path_helper_fn(
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_isdir",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_isdir", &["s"], 1, &[])?;
@@ -4655,12 +4713,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, s)",
                 "Return true if the pathname refers to an existing directory.",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_path_isfile",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_isdir", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_isfile",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_isfile", &["path"], 1, &[])?;
@@ -4672,12 +4729,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "Test whether a path is a regular file",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_path_islink",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_isfile", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_islink",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_islink", &["path"], 1, &[])?;
@@ -4689,12 +4745,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "Test whether a path is a symbolic link",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_path_isjunction",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_islink", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_isjunction",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_isjunction", &["path"], 1, &[])?;
@@ -4706,12 +4761,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "Test whether a path is a junction",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_path_exists",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_isjunction", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_exists",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_exists", &["path"], 1, &[])?;
@@ -4723,12 +4777,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "Test whether a path exists.  Returns False for broken symbolic links.",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_getvolumepathname",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_exists", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_getvolumepathname",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_getvolumepathname", &["path"], 1, &[])?;
@@ -4736,12 +4789,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "A helper function for ismount on Win32.",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_path_isdevdrive",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_getvolumepathname", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_isdevdrive",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_isdevdrive", &["path"], 1, &[])?;
@@ -4749,12 +4801,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "Determines whether the specified path is on a Windows Dev Drive.",
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "_path_lexists",
-            path_helper_fn(
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_isdevdrive", __pyre_stored)
+        };
+        {
+            let __pyre_stored = path_helper_fn(
                 "_path_lexists",
                 |args| {
                     let (bound, _) = bind_path_args(args, "_path_lexists", &["path"], 1, &[])?;
@@ -4766,8 +4817,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 },
                 "($module, /, path)",
                 "Test whether a path exists.  Returns True for broken symbolic links.",
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "_path_lexists", __pyre_stored)
+        };
     }
 
     // ── Windows-only nt calls — moduledef.py `if os.name == 'nt'` block ──
@@ -4790,21 +4842,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("_add_dll_directory", win_nt::_add_dll_directory, 1),
             ("_remove_dll_directory", win_nt::_remove_dll_directory, 1),
         ] {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function_with_arity(name, func, arity),
-            );
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(name, func, arity);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
-        crate::module_ns_store(
-            ns,
-            "_supports_virtual_terminal",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "_supports_virtual_terminal",
                 win_nt::_supports_virtual_terminal,
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "_supports_virtual_terminal", __pyre_stored)
+        };
     }
 
     /// Drive an open `DIR*` to its end, handing each real entry (`.` and `..`
@@ -4882,10 +4933,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     }
 
     // ── posix.listdir(path=".") → list of str ──
-    crate::module_ns_store(
-        ns,
-        "listdir",
-        crate::make_builtin_function("listdir", |args| {
+    {
+        let __pyre_stored = crate::make_builtin_function("listdir", |args| {
             let (bound, _kwargs) = bind_path_args(args, "listdir", &["path"], 0, &[])?;
             // One resolution yields both the path and its bytes-ness, so
             // `__fspath__` runs exactly once. The omitted argument is the same
@@ -4935,14 +4984,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 Ok(pyre_object::w_list_new(items.take()))
             }
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "listdir", __pyre_stored)
+    };
 
     // ── posix.isatty(fd) → bool ──
-    crate::module_ns_store(
-        ns,
-        "isatty",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "isatty",
             |args| {
                 if args.is_empty() {
@@ -4959,8 +5007,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "isatty", __pyre_stored)
+    };
 
     // ── posix._inputhook() / posix._is_inputhook_installed() ──
     // `PyOS_InputHook` is the seam a C extension (readline, Tk) installs a
@@ -4974,26 +5023,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // Nothing in pyre publishes that seam, so the answers are the ones the
     // calls give with no hook installed: `False`, and the 0 the absent hook
     // would have returned.
-    crate::module_ns_store(
-        ns,
-        "_inputhook",
-        crate::make_builtin_function_with_arity("_inputhook", |_| Ok(pyre_object::w_int_new(0)), 0),
-    );
-    crate::module_ns_store(
-        ns,
-        "_is_inputhook_installed",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
+            "_inputhook",
+            |_| Ok(pyre_object::w_int_new(0)),
+            0,
+        );
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "_inputhook", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "_is_inputhook_installed",
             |_| Ok(pyre_object::w_bool_from(false)),
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "_is_inputhook_installed", __pyre_stored)
+    };
 
     // ── posix.urandom(n) → bytes ──
-    crate::module_ns_store(
-        ns,
-        "urandom",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "urandom",
             |args| {
                 crate::gateway::check_declared_arity("urandom", 1, args.len())?;
@@ -5033,8 +5083,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::bytesobject::w_bytes_from_block(block))
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "urandom", __pyre_stored)
+    };
     // os.terminal_size — structseq (columns, lines).
     fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -5042,20 +5093,34 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         fields.push(pyre_object::w_int_new(lines));
         crate::_structseq::new_instance(super::terminal_size_seq_type(), fields.take())
     }
-    crate::module_ns_store(ns, "terminal_size", super::terminal_size_seq_type());
-    crate::module_ns_store(ns, "statvfs_result", super::statvfs_result_seq_type());
-    crate::module_ns_store(ns, "times_result", super::times_result_seq_type());
-    crate::module_ns_store(ns, "uname_result", super::uname_result_seq_type());
+    {
+        let __pyre_stored = super::terminal_size_seq_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "terminal_size", __pyre_stored)
+    };
+    {
+        let __pyre_stored = super::statvfs_result_seq_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "statvfs_result", __pyre_stored)
+    };
+    {
+        let __pyre_stored = super::times_result_seq_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "times_result", __pyre_stored)
+    };
+    {
+        let __pyre_stored = super::uname_result_seq_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "uname_result", __pyre_stored)
+    };
 
     // `interp_posix.device_encoding`: only a terminal has one. UTF-8 mode
     // answers "utf-8"; otherwise the active locale's `nl_langinfo(CODESET)`,
     // or None when that is empty. The Windows arm (console code pages) is
     // registered in the `host_env` block below.
     #[cfg(all(not(windows), not(feature = "sandbox")))]
-    crate::module_ns_store(
-        ns,
-        "device_encoding",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "device_encoding",
             |args| {
                 if args.is_empty() {
@@ -5083,8 +5148,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "device_encoding", __pyre_stored)
+    };
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
     // The size belongs to the terminal the descriptor names, read through
@@ -5094,10 +5160,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // it is reached by catching this.  Stubbed under sandbox, so the real body
     // is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::module_ns_store(
-        ns,
-        "get_terminal_size",
-        crate::make_builtin_function("get_terminal_size", |args| {
+    {
+        let __pyre_stored = crate::make_builtin_function("get_terminal_size", |args| {
             // `($module, fd=<unrepresentable>, /)` — the descriptor is
             // positional-only, so `fd=1` is a keyword this entry point does
             // not take rather than a binding.
@@ -5133,18 +5197,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let _ = fd;
                 Ok(make_terminal_size(80, 24))
             }
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "get_terminal_size", __pyre_stored)
+    };
     // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.
-    crate::module_ns_store(
-        ns,
-        "fspath",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "fspath",
             |args| super::fspath(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "fspath", __pyre_stored)
+    };
     // os.stat / os.lstat / os.fstat — return stat_result structseq.
     // PyPy: posixmodule.c posix_do_stat → build_stat_result.
     //
@@ -6620,23 +6684,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             // `makedict`).
             let tp = crate::typedef::make_builtin_type_with_layout(
                 "posix.DirEntry",
-                |ns| {
+                |mut ns| {
+                    let _root_scope = pyre_object::gc_roots::push_roots();
+                    let mut ns = pyre_object::gc_roots::pin_root(ns);
                     for (name, getter) in [
                         ("name", dir_entry_get_name as crate::gateway::BuiltinCodeFn),
                         ("path", dir_entry_get_path),
                     ] {
-                        unsafe {
-                            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                                ns,
+                        crate::__pyre_store!(
+                            ns,
+                            name,
+                            crate::typedef::make_getset_descriptor_named(
+                                crate::gateway::make_builtin_function_with_arity(name, getter, 2),
                                 name,
-                                crate::typedef::make_getset_descriptor_named(
-                                    crate::gateway::make_builtin_function_with_arity(
-                                        name, getter, 2,
-                                    ),
-                                    name,
-                                ),
                             )
-                        };
+                        );
                     }
                     for (name, f) in [
                         ("is_dir", dir_entry_is_dir as crate::gateway::BuiltinCodeFn),
@@ -6649,26 +6711,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         ("__repr__", dir_entry_repr),
                         ("__reduce_ex__", dir_entry_reduce_ex),
                     ] {
-                        unsafe {
-                            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                                ns,
-                                name,
-                                crate::make_builtin_function(name, f),
-                            )
-                        };
+                        crate::__pyre_store!(ns, name, crate::make_builtin_function(name, f));
                     }
                     // CPython 3.14 Modules/posixmodule.c DirEntry_methods —
                     // Py_GenericAlias with METH_CLASS.
-                    unsafe {
-                        pyre_object::w_dict_setitem_str(
-                            ns,
+                    crate::__pyre_store!(
+                        ns,
+                        "__class_getitem__",
+                        pyre_object::function::w_classmethod_new(crate::make_builtin_function(
                             "__class_getitem__",
-                            pyre_object::function::w_classmethod_new(crate::make_builtin_function(
-                                "__class_getitem__",
-                                crate::_pypy_generic_alias::generic_alias_class_getitem,
-                            )),
-                        )
-                    };
+                            crate::_pypy_generic_alias::generic_alias_class_getitem,
+                        ))
+                    );
                 },
                 crate::typedef::w_object(),
                 <W_DirEntry as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
@@ -6859,6 +6913,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let tp = crate::typedef::make_builtin_type_with_layout(
                 "posix.ScandirIterator",
                 |ns| {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(ns);
                     for (name, f) in [
                         (
                             "__iter__",
@@ -6883,7 +6940,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         };
                         unsafe {
                             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                                ns, name, function,
+                                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                                name,
+                                function,
                             )
                         };
                     }
@@ -7117,12 +7176,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         drop(_list_scope);
         Ok(it)
     }
-    crate::module_ns_store(
-        ns,
-        "scandir",
-        crate::make_builtin_function("scandir", scandir_fn),
-    );
-    crate::module_ns_store(ns, "DirEntry", dir_entry_type());
+    {
+        let __pyre_stored = crate::make_builtin_function("scandir", scandir_fn);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "scandir", __pyre_stored)
+    };
+    {
+        let __pyre_stored = dir_entry_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "DirEntry", __pyre_stored)
+    };
 
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
     // `rposix.c_uname` fills `struct utsname`. POSIX only, the way
@@ -7131,10 +7194,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // `sys.platform` on AttributeError, and `sysconfig.get_platform` tests
     // `hasattr(os, 'uname')` directly.
     #[cfg(unix)]
-    crate::module_ns_store(
-        ns,
-        "uname",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "uname",
             |_| {
                 // `rposix.c_uname` releases the GIL and saves errno.
@@ -7142,18 +7203,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let ret = unsafe { majit_rlib::rposix::c_uname(uts.as_mut_ptr()) };
                 if ret < 0 {
                     return Err(io_err(
-                        std::io::Error::from_raw_os_error(
-                            majit_rlib::rposix::get_saved_errno(),
-                        ),
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                         "",
                     ));
                 }
                 let uts = unsafe { uts.assume_init() };
                 let field = |bytes: &[libc::c_char]| {
                     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    let raw = unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), end)
-                    };
+                    let raw =
+                        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), end) };
                     String::from_utf8_lossy(raw).into_owned()
                 };
                 let sysname = field(&uts.sysname);
@@ -7173,22 +7231,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ))
             },
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "stat",
-        crate::gateway::make_builtin_function_with_text_signature(
+        );
+        crate::module_ns_store_slot(ns_slot, "uname", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::gateway::make_builtin_function_with_text_signature(
             "stat",
             |args| stat_entry(args, true),
             "(path, *, dir_fd=None, follow_symlinks=True)",
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "lstat",
-        crate::make_builtin_function("lstat", |args| stat_entry(args, false)),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "stat", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::make_builtin_function("lstat", |args| stat_entry(args, false));
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "lstat", __pyre_stored)
+    };
     /// `rposix_stat.py fstat`: the descriptor form both `os.fstat` and
     /// `os.stat` with a descriptor answer through, so the two cannot drift.
     fn fstat_fd(fd: i32) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -7278,10 +7336,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ))
     }
 
-    crate::module_ns_store(
-        ns,
-        "fstat",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "fstat",
             |args| {
                 if args.is_empty() {
@@ -7290,16 +7346,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 fstat_fd(crate::baseobjspace::c_int_w(args[0])?)
             },
             1,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "fstat", __pyre_stored)
+    };
     // stat_result type — structseq (tuple subclass). Exported so that
     // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
-    crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    {
+        let __pyre_stored = super::stat_result_seq_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "stat_result", __pyre_stored)
+    };
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
-    crate::module_ns_store(
-        ns,
-        "getcwd",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getcwd",
             |_| {
                 // `interp_posix.py` is `space.fsdecode(getcwdb(space))`,
@@ -7326,13 +7385,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getcwd", __pyre_stored)
+    };
     // os.getcwdb() — bytes form of getcwd.
-    crate::module_ns_store(
-        ns,
-        "getcwdb",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getcwdb",
             |_| {
                 #[cfg(feature = "sandbox")]
@@ -7357,8 +7415,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getcwdb", __pyre_stored)
+    };
     // os.getuid / geteuid / getgid / getegid — `rposix.c_getuid` and the three
     // siblings. Each builtin's `#[cfg(feature = "sandbox")]` arm routes
     // through `host_seam::ops` instead.
@@ -7366,10 +7425,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // reads `hasattr(os, 'geteuid')` to decide whether an ownership check is
     // meaningful at all.
     #[cfg(not(windows))]
-    crate::module_ns_store(
-        ns,
-        "getuid",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getuid",
             |_| {
                 #[cfg(feature = "sandbox")]
@@ -7381,21 +7438,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
                     // `rposix.c_getuid` releases the GIL. It does not save errno.
-                    Ok(pyre_object::w_int_new(
-                        majit_rlib::rposix::c_getuid() as i64
-                    ))
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::c_getuid() as i64))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getuid", __pyre_stored)
+    };
     #[cfg(not(windows))]
-    crate::module_ns_store(
-        ns,
-        "geteuid",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "geteuid",
             |_| {
                 #[cfg(feature = "sandbox")]
@@ -7414,13 +7468,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(0))
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "geteuid", __pyre_stored)
+    };
     #[cfg(not(windows))]
-    crate::module_ns_store(
-        ns,
-        "getgid",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getgid",
             |_| {
                 #[cfg(feature = "sandbox")]
@@ -7437,13 +7490,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(0))
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getgid", __pyre_stored)
+    };
     #[cfg(not(windows))]
-    crate::module_ns_store(
-        ns,
-        "getegid",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getegid",
             |_| {
                 #[cfg(feature = "sandbox")]
@@ -7462,15 +7514,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(0))
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getegid", __pyre_stored)
+    };
     // os.getpid — `rposix.c_getpid` (`releasegil=False`, saves errno).
     // `rposix.getpid` reports a negative result through `handle_posix_error`.
     // Windows keeps `host_os::process_id`.
-    crate::module_ns_store(
-        ns,
-        "getpid",
-        crate::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = crate::make_builtin_function_with_arity(
             "getpid",
             |_| {
                 #[cfg(unix)]
@@ -7478,9 +7529,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let pid = unsafe { majit_rlib::rposix::c_getpid() };
                     if pid < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -7490,8 +7539,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(host_os::process_id() as i64))
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getpid", __pyre_stored)
+    };
     // `getenv` is not bound here. `os.py` writes it against `environ`
     // — the dict this module publishes and that os.py's `_Environ` wrapper
     // writes back into — and names it in its own `__all__`, so a binding is
@@ -7554,10 +7604,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // PyPy interp_posix.execv: this call replaces the current process and
         // returns only to translate the host errno into OSError.
-        crate::module_ns_store(
-            ns,
-            "execv",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "execv",
                 |args| {
                     // The path names itself; the argv entries below do not,
@@ -7584,15 +7632,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Err(errno_err(errno, ""))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "execv", __pyre_stored)
+        };
 
         // PyPy interp_posix.execve/_env2interp: accept a mapping, fsencode
         // names and values, reject illegal names, then replace the process.
-        crate::module_ns_store(
-            ns,
-            "execve",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
                     let w_path = args[0];
@@ -7634,14 +7681,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Err(errno_err(errno, ""))
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "execve", __pyre_stored)
+        };
 
         // os.strerror(code) -> str
-        crate::module_ns_store(
-            ns,
-            "strerror",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "strerror",
                 |args| {
                     let code = match args.first() {
@@ -7667,14 +7713,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "strerror", __pyre_stored)
+        };
 
         // os.pipe() -> (r_fd, w_fd)
-        crate::module_ns_store(
-            ns,
-            "pipe",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "pipe",
                 |_| {
                     // `rposix.c_pipe` releases the GIL and saves errno.
@@ -7682,9 +7727,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut fds = [0; 2];
                     if unsafe { majit_rlib::rposix::c_pipe(fds.as_mut_ptr()) } < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -7705,8 +7748,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "pipe", __pyre_stored)
+        };
 
         // os.pipe2(flags) -> (r_fd, w_fd)
         //
@@ -7721,10 +7765,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             target_os = "netbsd",
             target_os = "openbsd"
         ))]
-        crate::module_ns_store(
-            ns,
-            "pipe2",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "pipe2",
                 |args| {
                     if args.is_empty() {
@@ -7737,9 +7779,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut fds = [0; 2];
                     if unsafe { majit_rlib::rposix::c_pipe2(fds.as_mut_ptr(), flags) } < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -7749,14 +7789,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "pipe2", __pyre_stored)
+        };
 
         // interp_posix.py `pread`: `rposix.pread` plus `eintr_retry=True`.
-        crate::module_ns_store(
-            ns,
-            "pread",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "pread",
                 |args| {
                     if args.len() < 3 {
@@ -7806,14 +7845,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_bytes_from_bytes(&buf))
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "pread", __pyre_stored)
+        };
 
         // interp_posix.py `pwrite`: `space.bufferstr_w` plus `eintr_retry=True`.
-        crate::module_ns_store(
-            ns,
-            "pwrite",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "pwrite",
                 |args| {
                     if args.len() < 3 {
@@ -7851,14 +7889,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(written as i64))
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "pwrite", __pyre_stored)
+        };
 
         // os.sched_yield()
-        crate::module_ns_store(
-            ns,
-            "sched_yield",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "sched_yield",
                 |_| {
                     // interp_posix.py `sched_yield`: retry on EINTR.
@@ -7869,23 +7906,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             break;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err(e, ""),
                         )?;
                     }
                     Ok(pyre_object::w_none())
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "sched_yield", __pyre_stored)
+        };
 
         // os.nice(increment) -> new niceness
-        crate::module_ns_store(
-            ns,
-            "nice",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "nice",
                 |args| {
                     if args.is_empty() {
@@ -7906,14 +7940,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "nice", __pyre_stored)
+        };
 
         // os.umask(mask) -> previous mask
-        crate::module_ns_store(
-            ns,
-            "umask",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "umask",
                 |args| {
                     if args.is_empty() {
@@ -7927,14 +7960,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(prev as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "umask", __pyre_stored)
+        };
 
         // os.getlogin() -> str
-        crate::module_ns_store(
-            ns,
-            "getlogin",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getlogin",
                 |_| {
                     // `rposix.c_getlogin` is `releasegil=False` and saves
@@ -7952,8 +7984,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(crate::gateway::fsdecode_filename_bytes(bytes))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getlogin", __pyre_stored)
+        };
 
         // `getgroups(2)` reports at most `NGROUPS_MAX` entries, so a process in
         // more groups than that gets a truncated list. `<unistd.h>` aliases the
@@ -7998,10 +8031,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
 
         // os.getgroups() -> list[int]
-        crate::module_ns_store(
-            ns,
-            "getgroups",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getgroups",
                 |_| {
                     let gs = host_getgroups().map_err(|e| io_err(e, ""))?;
@@ -8012,14 +8043,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_list_new(items.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getgroups", __pyre_stored)
+        };
 
         // os.setgroups(list) -> None
-        crate::module_ns_store(
-            ns,
-            "setgroups",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setgroups",
                 |args| {
                     let Some(&w_list) = args.first() else {
@@ -8047,14 +8077,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setgroups", __pyre_stored)
+        };
 
         // os.getgrouplist(user, group) -> list of groups
-        crate::module_ns_store(
-            ns,
-            "getgrouplist",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getgrouplist",
                 |args| {
                     if args.len() < 2 {
@@ -8110,9 +8139,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -8130,14 +8157,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         pyre_object::w_list_new(items.take())))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getgrouplist", __pyre_stored)
+        };
 
         // os.sched_get_priority_max(policy) -> int
-        crate::module_ns_store(
-            ns,
-            "sched_get_priority_max",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "sched_get_priority_max",
                 |args| {
                     if args.is_empty() {
@@ -8156,23 +8182,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             break m;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err(e, ""),
                         )?;
                     };
                     Ok(pyre_object::w_int_new(m as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "sched_get_priority_max", __pyre_stored)
+        };
 
         // os.sched_get_priority_min(policy) -> int
-        crate::module_ns_store(
-            ns,
-            "sched_get_priority_min",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "sched_get_priority_min",
                 |args| {
                     if args.is_empty() {
@@ -8191,17 +8214,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             break m;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err(e, ""),
                         )?;
                     };
                     Ok(pyre_object::w_int_new(m as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "sched_get_priority_min", __pyre_stored)
+        };
 
         // The scheduling-policy group `moduledef.py:168-174` publishes as one —
         // the two getters, the two setters and the `sched_param` type they
@@ -8215,7 +8237,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             target_os = "netbsd"
         ))]
         {
-            crate::module_ns_store(ns, "sched_param", sched_param_seq_type());
+            {
+                let __pyre_stored = sched_param_seq_type();
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "sched_param", __pyre_stored)
+            };
 
             // os.sched_rr_get_interval(pid) -> seconds
             //
@@ -8224,10 +8250,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             // re-exports no syscall function, and the name is served there by
             // the raising stub registered at the end of this module instead.
             #[cfg(not(feature = "sandbox"))]
-            crate::module_ns_store(
-                ns,
-                "sched_rr_get_interval",
-                crate::make_builtin_function_with_arity(
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(
                     "sched_rr_get_interval",
                     |args| {
                         if args.is_empty() {
@@ -8263,14 +8287,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         ))
                     },
                     1,
-                ),
-            );
+                );
+                crate::module_ns_store_slot(ns_slot, "sched_rr_get_interval", __pyre_stored)
+            };
 
             // os.sched_getscheduler(pid) -> policy
-            crate::module_ns_store(
-                ns,
-                "sched_getscheduler",
-                crate::make_builtin_function_with_arity(
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(
                     "sched_getscheduler",
                     |args| {
                         if args.is_empty() {
@@ -8284,8 +8307,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         // `rposix.c_sched_getscheduler` uses
                         // `RFFI_FULL_ERRNO_ZERO` and releases the GIL.
                         let policy = loop {
-                            let policy =
-                                unsafe { majit_rlib::rposix::c_sched_getscheduler(pid) };
+                            let policy = unsafe { majit_rlib::rposix::c_sched_getscheduler(pid) };
                             if policy >= 0 {
                                 break policy;
                             }
@@ -8299,14 +8321,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         Ok(pyre_object::w_int_new(policy as i64))
                     },
                     1,
-                ),
-            );
+                );
+                crate::module_ns_store_slot(ns_slot, "sched_getscheduler", __pyre_stored)
+            };
 
             // os.sched_getparam(pid) -> sched_param
-            crate::module_ns_store(
-                ns,
-                "sched_getparam",
-                crate::make_builtin_function_with_arity(
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(
                     "sched_getparam",
                     |args| {
                         if args.is_empty() {
@@ -8341,8 +8362,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         ))
                     },
                     1,
-                ),
-            );
+                );
+                crate::module_ns_store_slot(ns_slot, "sched_getparam", __pyre_stored)
+            };
 
             // Both setters answer None. `interp_posix.py:3097`/`:3131` hand
             // back the raw `handle_posix_error` result instead, which is 0 on
@@ -8350,10 +8372,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             #[cfg(not(target_env = "musl"))]
             {
                 // os.sched_setscheduler(pid, policy, param)
-                crate::module_ns_store(
-                    ns,
-                    "sched_setscheduler",
-                    crate::make_builtin_function_with_arity(
+                {
+                    let __pyre_stored = crate::make_builtin_function_with_arity(
                         "sched_setscheduler",
                         |args| {
                             if args.len() < 3 {
@@ -8395,14 +8415,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             Ok(pyre_object::w_none())
                         },
                         3,
-                    ),
-                );
+                    );
+                    crate::module_ns_store_slot(ns_slot, "sched_setscheduler", __pyre_stored)
+                };
 
                 // os.sched_setparam(pid, param)
-                crate::module_ns_store(
-                    ns,
-                    "sched_setparam",
-                    crate::make_builtin_function_with_arity(
+                {
+                    let __pyre_stored = crate::make_builtin_function_with_arity(
                         "sched_setparam",
                         |args| {
                             if args.len() < 2 {
@@ -8439,8 +8458,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             Ok(pyre_object::w_none())
                         },
                         2,
-                    ),
-                );
+                    );
+                    crate::module_ns_store_slot(ns_slot, "sched_setparam", __pyre_stored)
+                };
             }
         }
 
@@ -8462,10 +8482,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             any(target_os = "linux", target_os = "android")
         ))]
         {
-            crate::module_ns_store(
-                ns,
-                "sched_getaffinity",
-                crate::make_builtin_function_with_arity(
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(
                     "sched_getaffinity",
                     |args| {
                         if args.is_empty() {
@@ -8496,13 +8514,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         Ok(pyre_object::w_set_from_items(&items.take()))
                     },
                     1,
-                ),
-            );
+                );
+                crate::module_ns_store_slot(ns_slot, "sched_getaffinity", __pyre_stored)
+            };
 
-            crate::module_ns_store(
-                ns,
-                "sched_setaffinity",
-                crate::make_builtin_function_with_arity(
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(
                     "sched_setaffinity",
                     |args| {
                         if args.len() < 2 {
@@ -8560,16 +8577,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         Ok(pyre_object::w_none())
                     },
                     2,
-                ),
-            );
+                );
+                crate::module_ns_store_slot(ns_slot, "sched_setaffinity", __pyre_stored)
+            };
         }
 
         // os.sync()
         #[cfg(not(any(target_os = "redox", target_os = "android")))]
-        crate::module_ns_store(
-            ns,
-            "sync",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "sync",
                 |_| {
                     // `rposix.c_sync` releases the GIL and does not save errno.
@@ -8577,14 +8593,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "sync", __pyre_stored)
+        };
 
         // os.chdir(path)
-        crate::module_ns_store(
-            ns,
-            "chdir",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "chdir",
                 |args| {
                     if args.is_empty() {
@@ -8621,14 +8636,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "chdir", __pyre_stored)
+        };
 
         // os.fchdir(fd)
-        crate::module_ns_store(
-            ns,
-            "fchdir",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fchdir",
                 |args| {
                     if args.is_empty() {
@@ -8653,8 +8667,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fchdir", __pyre_stored)
+        };
 
         // PyPy's `_run_forking_function` enters the callback lifecycle
         // immediately. CPython 3.14 checks finalization first, so a refused
@@ -8669,10 +8684,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
 
         // os.fork() -> child pid in parent, 0 in child
-        crate::module_ns_store(
-            ns,
-            "fork",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fork",
                 |_| {
                     crate::module::thread::ensure_thread_atfork();
@@ -8749,18 +8762,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fork", __pyre_stored)
+        };
 
         // PyPy `interp_posix.forkpty` delegates to `_run_forking_function`
         // with kind `"P"`, so forkpty uses the same before/parent/child hook
         // and thread-reinitialization lifecycle as fork above while returning
         // the master descriptor as its second item.
         #[cfg(not(any(feature = "sandbox", target_os = "redox")))]
-        crate::module_ns_store(
-            ns,
-            "forkpty",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "forkpty",
                 |_| {
                     crate::module::thread::ensure_thread_atfork();
@@ -8827,17 +8839,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "forkpty", __pyre_stored)
+        };
 
         // os.getppid() -> int. `rposix.c_getppid` does not release the GIL and
         // saves errno. `rposix.getppid` reports a negative result through
         // `handle_posix_error`.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "getppid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getppid",
                 |_| {
                     let ppid = unsafe { majit_rlib::rposix::c_getppid() };
@@ -8850,15 +8861,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(ppid as i64))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getppid", __pyre_stored)
+        };
 
         // `interp_posix.getsid` -> `rposix.getsid`. `rposix.c_getsid` saves errno.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "getsid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getsid",
                 |args| {
                     let pid = match args.first() {
@@ -8878,17 +8888,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(sid as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getsid", __pyre_stored)
+        };
 
         // `rposix.getpgrp`. `GETPGRP_HAVE_ARG` is false, so `rposix.c_getpgrp`
         // takes no argument. It saves errno, and `handle_posix_error` reports
         // a negative result.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "getpgrp",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getpgrp",
                 |_| {
                     let pgrp = unsafe { majit_rlib::rposix::c_getpgrp() };
@@ -8901,16 +8910,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(pgrp as i64))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getpgrp", __pyre_stored)
+        };
 
         // `interp_posix.getpgid` — another process's group, which can be one
         // this process may not ask about. `rposix.c_getpgid` saves errno.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "getpgid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getpgid",
                 |args| {
                     let pid = match args.first() {
@@ -8932,23 +8940,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(pgid as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getpgid", __pyre_stored)
+        };
 
         // `interp_posix.setpgid` -> `rposix.setpgid`, which discards
         // `handle_posix_error`'s result and returns None. `rposix.c_setpgid`
         // releases the GIL and saves errno.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "setpgid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setpgid",
                 |args| {
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "setpgid() requires 2 arguments",
-                        ));
+                        return Err(crate::PyError::type_error("setpgid() requires 2 arguments"));
                     }
                     // interp_posix.py `@unwrap_spec(pid=c_int, pgrp=c_int)`.
                     let w_pid = args[0];
@@ -8967,17 +8972,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setpgid", __pyre_stored)
+        };
 
         // `interp_posix.setpgrp` -> `rposix.setpgrp`. `SETPGRP_HAVE_ARG` is
         // false, so `rposix.c_setpgrp` takes no argument. The wrapper returns
         // None.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "setpgrp",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setpgrp",
                 |_| {
                     let ret = unsafe { majit_rlib::rposix::c_setpgrp() };
@@ -8990,17 +8994,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setpgrp", __pyre_stored)
+        };
 
         // `interp_posix.setsid` -> `rposix.setsid`. The session id
         // `handle_posix_error` returns is dropped; the builtin answers None.
         // `rposix.c_setsid` releases the GIL and saves errno.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "setsid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setsid",
                 |_| {
                     let sid = unsafe { majit_rlib::rposix::c_setsid() };
@@ -9013,8 +9016,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setsid", __pyre_stored)
+        };
 
         // The six user/group ID setters share the `c_uid_t` conversion.
         // `rposix.c_setuid` and its siblings save errno. `handle_posix_error`
@@ -9118,11 +9122,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("setreuid", setreuid as crate::gateway::BuiltinCodeFn, 2),
             ("setregid", setregid as crate::gateway::BuiltinCodeFn, 2),
         ] {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function_with_arity(name, function, arity),
-            );
+            {
+                let __pyre_stored = crate::make_builtin_function_with_arity(name, function, arity);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
 
         // `interp_posix.ctermid` -> `rposix.ctermid`. The call is handed a
@@ -9131,10 +9135,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // from the host is. `rposix.c_ctermid` releases the GIL and does not
         // save errno.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "ctermid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "ctermid",
                 |_| {
                     let name = unsafe { majit_rlib::rposix::c_ctermid(std::ptr::null_mut()) };
@@ -9145,14 +9147,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(crate::gateway::fsdecode_filename_bytes(bytes.to_bytes()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "ctermid", __pyre_stored)
+        };
 
         // os.waitpid(pid, options) -> (pid, status)
-        crate::module_ns_store(
-            ns,
-            "waitpid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "waitpid",
                 |args| {
                     if args.len() < 2 {
@@ -9170,16 +9171,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // `rposix.c_waitpid` releases the GIL and saves errno.
                     // `0` is a successful `WNOHANG` answer.
                     let res = loop {
-                        let res = unsafe {
-                            majit_rlib::rposix::c_waitpid(pid, &mut status, options)
-                        };
+                        let res =
+                            unsafe { majit_rlib::rposix::c_waitpid(pid, &mut status, options) };
                         if res >= 0 {
                             break res;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err(e, ""),
                         )?;
                     };
@@ -9189,14 +9187,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "waitpid", __pyre_stored)
+        };
 
         // os.wait() -> (pid, status)
-        crate::module_ns_store(
-            ns,
-            "wait",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "wait",
                 |_| {
                     let mut status: i32 = 0;
@@ -9205,15 +9202,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interruption of its own.
                     // `rposix.c_waitpid` releases the GIL and saves errno.
                     let res = loop {
-                        let res =
-                            unsafe { majit_rlib::rposix::c_waitpid(-1, &mut status, 0) };
+                        let res = unsafe { majit_rlib::rposix::c_waitpid(-1, &mut status, 0) };
                         if res >= 0 {
                             break res;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err(e, ""),
                         )?;
                     };
@@ -9223,8 +9217,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "wait", __pyre_stored)
+        };
 
         // `app_posix.wait3` / `app_posix.wait4` import `_pypy_wait`, which
         // retries EINTR and wraps the rusage as `resource.struct_rusage`.
@@ -9290,10 +9285,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             }
         }
 
-        crate::module_ns_store(
-            ns,
-            "wait3",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "wait3",
                 |args| {
                     if args.is_empty() {
@@ -9303,13 +9296,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     wait_with_rusage(|| host_posix::wait3(options))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "wait3", __pyre_stored)
+        };
 
-        crate::module_ns_store(
-            ns,
-            "wait4",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "wait4",
                 |args| {
                     if args.len() < 2 {
@@ -9324,14 +9316,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     wait_with_rusage(|| host_posix::wait4(pid, options))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "wait4", __pyre_stored)
+        };
 
         // os._exit(code) — immediate process exit, no cleanup.
-        crate::module_ns_store(
-            ns,
-            "_exit",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "_exit",
                 |args| {
                     let code = match args.first() {
@@ -9346,36 +9337,34 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     unreachable!()
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "_exit", __pyre_stored)
+        };
 
         // Wait-status decoding macros (WIFEXITED/WEXITSTATUS/...): override
         // the noop stubs registered above with the libc bit-math.
         macro_rules! reg_wstatus {
-            ($name:literal, |$s:ident| $body:expr) => {
-                crate::module_ns_store(
-                    ns,
+            ($name:literal, |$s:ident| $body:expr) => {{
+                let __pyre_stored = crate::make_builtin_function_with_arity(
                     $name,
-                    crate::make_builtin_function_with_arity(
-                        $name,
-                        |args| {
-                            let $s = match args.first() {
-                                // interp_posix.py `declare_new_w_star`
-                                // types every wait macro `@unwrap_spec(status=c_int)`.
-                                Some(&o) => crate::baseobjspace::c_int_w(o)?,
-                                None => {
-                                    return Err(crate::PyError::type_error(concat!(
-                                        $name,
-                                        "() requires 1 argument"
-                                    )));
-                                }
-                            };
-                            Ok($body)
-                        },
-                        1,
-                    ),
+                    |args| {
+                        let $s = match args.first() {
+                            // interp_posix.py `declare_new_w_star`
+                            // types every wait macro `@unwrap_spec(status=c_int)`.
+                            Some(&o) => crate::baseobjspace::c_int_w(o)?,
+                            None => {
+                                return Err(crate::PyError::type_error(concat!(
+                                    $name,
+                                    "() requires 1 argument"
+                                )));
+                            }
+                        };
+                        Ok($body)
+                    },
+                    1,
                 );
-            };
+                crate::module_ns_store_slot(ns_slot, $name, __pyre_stored)
+            };};
         }
         reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(libc::WIFEXITED(
             s
@@ -9399,17 +9388,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // Wait option flags — override the `0` placeholders registered above
         // with their real libc values (os.WNOHANG must be non-zero for
         // subprocess.poll()).
-        crate::module_ns_store(ns, "WNOHANG", pyre_object::w_int_new(libc::WNOHANG as i64));
-        crate::module_ns_store(
-            ns,
-            "WUNTRACED",
-            pyre_object::w_int_new(libc::WUNTRACED as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "WCONTINUED",
-            pyre_object::w_int_new(libc::WCONTINUED as i64),
-        );
+        {
+            let __pyre_stored = pyre_object::w_int_new(libc::WNOHANG as i64);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "WNOHANG", __pyre_stored)
+        };
+        {
+            let __pyre_stored = pyre_object::w_int_new(libc::WUNTRACED as i64);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "WUNTRACED", __pyre_stored)
+        };
+        {
+            let __pyre_stored = pyre_object::w_int_new(libc::WCONTINUED as i64);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "WCONTINUED", __pyre_stored)
+        };
         // The states `waitid` is asked to report on. They were registered above
         // as calls answering `None`, which is neither the number nor a name a
         // caller can tell apart from one.
@@ -9418,7 +9411,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("WSTOPPED", libc::WSTOPPED as i64),
             ("WNOWAIT", libc::WNOWAIT as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // Which process `waitid` is asked about, and what `si_code` says
         // happened to it once it answers.
@@ -9433,7 +9430,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("CLD_STOPPED", libc::CLD_STOPPED as i64),
             ("CLD_CONTINUED", libc::CLD_CONTINUED as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            {
+                let __pyre_stored = pyre_object::w_int_new(val);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
 
         // os.waitid(idtype, id, options) -> waitid_result | None
@@ -9444,12 +9445,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // child is in (WNOHANG with nothing to report), and that is `None`
         // rather than a result whose every field is zero.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(ns, "waitid_result", waitid_result_seq_type());
+        {
+            let __pyre_stored = waitid_result_seq_type();
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "waitid_result", __pyre_stored)
+        };
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "waitid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "waitid",
                 |args| {
                     if args.len() != 3 {
@@ -9509,15 +9512,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ))
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "waitid", __pyre_stored)
+        };
 
         // os.dup(fd) -> new_fd
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "dup",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "dup",
                 |args| {
                     if args.is_empty() {
@@ -9534,8 +9536,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "dup", __pyre_stored)
+        };
 
         // os.dup2(fd, fd2, inheritable=True) -> fd2
         //
@@ -9612,23 +9615,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
 
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "dup2",
-            crate::make_builtin_function_with_arity_and_maybe_sig(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity_and_maybe_sig(
                 "dup2",
                 dup2,
                 dup2_pyre_arity(),
                 dup2_pyre_sig(),
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "dup2", __pyre_stored)
+        };
 
         // os.fsync(fd)
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "fsync",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fsync",
                 |args| {
                     if args.is_empty() {
@@ -9653,15 +9653,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fsync", __pyre_stored)
+        };
 
         // os.fdatasync(fd). `rposix.c_fdatasync` is `external('fdatasync')`.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "fdatasync",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fdatasync",
                 |args| {
                     if args.is_empty() {
@@ -9688,8 +9687,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fdatasync", __pyre_stored)
+        };
 
         // interp_posix.py:407-412: retry EINTR, propagate every other OSError.
         // The retry is `eintr_retry=True`, which runs the pending Python signal
@@ -9727,10 +9727,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // only the one it opened itself. The descriptor form is what
         // HAVE_FTRUNCATE advertises through `os.py:149`.
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-        crate::module_ns_store(
-            ns,
-            "truncate",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "truncate",
                 |args| {
                     if args.len() != 2 {
@@ -9795,8 +9793,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // The truncation's own failure is the one reported when
                     // both fail, which is the order the `finally` gives them.
                     let closed = unsafe { majit_rlib::rposix::c_close(fd) };
-                    let close_errno =
-                        (closed < 0).then(majit_rlib::rposix::get_saved_errno);
+                    let close_errno = (closed < 0).then(majit_rlib::rposix::get_saved_errno);
                     truncated?;
                     if let Some(errno) = close_errno {
                         return Err(errno_err_with_filename(errno, path.w_path()));
@@ -9804,18 +9801,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "truncate", __pyre_stored)
+        };
 
         // rpython/rlib/rposix.py `ftruncate(fd, length)` — this must be a
         // real fd mutation whenever HAVE_FTRUNCATE is advertised.  Shared
         // memory sizes its newly-created object through this call before
         // mapping it.
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-        crate::module_ns_store(
-            ns,
-            "ftruncate",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "ftruncate",
                 |args| {
                     // interp_posix.py `@unwrap_spec(fd=c_int, length=r_longlong)`.
@@ -9850,8 +9846,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "ftruncate", __pyre_stored)
+        };
 
         // os.lockf(fd, cmd, len) -> None
         //
@@ -9861,10 +9858,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // `InterruptedError`. F_LOCK blocks, so it is put through the call
         // gate the way every other waiting call here is.
         #[cfg(all(unix, not(feature = "sandbox")))]
-        crate::module_ns_store(
-            ns,
-            "lockf",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "lockf",
                 |args| {
                     if args.len() != 3 {
@@ -9902,15 +9897,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "lockf", __pyre_stored)
+        };
 
         // os.mkfifo(path, mode=0o666, *, dir_fd=None) -> None
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "mkfifo",
-            crate::make_builtin_function("mkfifo", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("mkfifo", |args| {
                 let (bound, mut kwargs) =
                     bind_path_args(args, "mkfifo", &["path", "mode"], 1, &["dir_fd"])?;
                 let roots = pyre_object::gc_roots::push_roots();
@@ -9967,8 +9961,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     )?;
                 }
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "mkfifo", __pyre_stored)
+        };
 
         // os.mknod(path, mode=0o600, device=0, *, dir_fd=None) -> None
         // The node's kind is carried in `mode` alongside its permissions, so
@@ -9976,10 +9971,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // call is the one a non-root process cannot make. `moduledef.py:160`
         // registers this only where the host has `mknod` at all.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "mknod",
-            crate::make_builtin_function("mknod", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("mknod", |args| {
                 let (bound, mut kwargs) =
                     bind_path_args(args, "mknod", &["path", "mode", "device"], 1, &["dir_fd"])?;
                 let roots = pyre_object::gc_roots::push_roots();
@@ -10035,12 +10028,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let (r, errno) = match dir_fd {
                         Some(dir_fd) => {
                             let r = unsafe {
-                                majit_rlib::rposix::c_mknodat(
-                                    dir_fd,
-                                    c_path.as_ptr(),
-                                    mode,
-                                    device,
-                                )
+                                majit_rlib::rposix::c_mknodat(dir_fd, c_path.as_ptr(), mode, device)
                             };
                             (r, majit_rlib::rposix::get_saved_errno())
                         }
@@ -10064,8 +10052,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     )?;
                 }
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "mknod", __pyre_stored)
+        };
 
         // os.chflags(path, flags, follow_symlinks=True) -> None
         // os.lchflags(path, flags) -> None
@@ -10142,20 +10131,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 Ok(pyre_object::w_none())
             }
-            crate::module_ns_store(
-                ns,
-                "chflags",
-                crate::make_builtin_function("chflags", |args| {
+            {
+                let __pyre_stored = crate::make_builtin_function("chflags", |args| {
                     chflags_entry(args, "chflags", true)
-                }),
-            );
-            crate::module_ns_store(
-                ns,
-                "lchflags",
-                crate::make_builtin_function("lchflags", |args| {
+                });
+                crate::module_ns_store_slot(ns_slot, "chflags", __pyre_stored)
+            };
+            {
+                let __pyre_stored = crate::make_builtin_function("lchflags", |args| {
                     chflags_entry(args, "lchflags", false)
-                }),
-            );
+                });
+                crate::module_ns_store_slot(ns_slot, "lchflags", __pyre_stored)
+            };
         }
 
         // [3.14-spec] interp_posix.py `abort` sends SIGABRT with
@@ -10165,18 +10152,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // disposition is restored and re-raised if a handler does return.
         // `os.abort` is documented as terminating, so follow that contract.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "abort",
-            crate::make_builtin_function_with_arity("abort", |_| unsafe { libc::abort() }, 0),
-        );
+        {
+            let __pyre_stored =
+                crate::make_builtin_function_with_arity("abort", |_| unsafe { libc::abort() }, 0);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "abort", __pyre_stored)
+        };
 
         // os.kill(pid, sig) / os.killpg(pgid, sig)
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "kill",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "kill",
                 |args| {
                     if args.len() < 2 {
@@ -10205,13 +10191,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "kill", __pyre_stored)
+        };
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "killpg",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "killpg",
                 |args| {
                     if args.len() < 2 {
@@ -10237,12 +10222,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "killpg", __pyre_stored)
+        };
 
         // os.statvfs(path) / os.fstatvfs(fd) -> statvfs_result
         #[cfg(not(target_os = "redox"))]
-        crate::module_ns_store(ns, "statvfs_result", super::statvfs_result_seq_type());
+        {
+            let __pyre_stored = super::statvfs_result_seq_type();
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "statvfs_result", __pyre_stored)
+        };
 
         #[cfg(not(target_os = "redox"))]
         fn statvfs_to_obj(
@@ -10269,10 +10259,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             )
         }
         #[cfg(not(target_os = "redox"))]
-        crate::module_ns_store(
-            ns,
-            "statvfs",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "statvfs",
                 |args| {
                     if args.is_empty() {
@@ -10293,13 +10281,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(statvfs_to_obj(info))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "statvfs", __pyre_stored)
+        };
         #[cfg(not(target_os = "redox"))]
-        crate::module_ns_store(
-            ns,
-            "fstatvfs",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fstatvfs",
                 |args| {
                     if args.is_empty() {
@@ -10317,18 +10304,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(statvfs_to_obj(info))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fstatvfs", __pyre_stored)
+        };
 
         // os.cpu_count() -> int | None — `interp_posix.py`, which
         // answers None for a count of 0 or less. Both names read the processor
         // count through `host_cpu_count`; the syscalls it makes are the reason
         // the pair is left to the sandbox stubs below.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "cpu_count",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "cpu_count",
                 |_| {
                     let n = host_cpu_count();
@@ -10339,14 +10325,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "cpu_count", __pyre_stored)
+        };
         // _cpu_count alias — newer CPython exposes both.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "_cpu_count",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "_cpu_count",
                 |_| {
                     let n = host_cpu_count();
@@ -10357,15 +10342,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "_cpu_count", __pyre_stored)
+        };
 
         // os.symlink(src, dst, target_is_directory=False) -> None
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "symlink",
-            crate::make_builtin_function("symlink", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("symlink", |args| {
                 let (bound, mut kwargs) = bind_path_args(
                     args,
                     "symlink",
@@ -10411,7 +10395,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Some(dir_fd) => unsafe {
                         majit_rlib::rposix::c_symlinkat(c_src.as_ptr(), dir_fd, c_dst.as_ptr())
                     },
-                    None => unsafe { majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr()) },
+                    None => unsafe {
+                        majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr())
+                    },
                 };
                 if ret < 0 {
                     // `os_symlink_impl` reports through `path_error2`, so the
@@ -10425,16 +10411,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ));
                 }
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "symlink", __pyre_stored)
+        };
 
         // os.link(src, dst) -> None — a second name for the file `src` names,
         // both of which the failure reports.
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "link",
-            crate::make_builtin_function("link", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("link", |args| {
                 let (args, mut kwargs) = crate::builtins::split_builtin_kwargs(args);
                 crate::builtins::kwarg_reject_unknown(
                     kwargs,
@@ -10495,12 +10480,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // `interp_posix.link` calls `rposix.link` when both directory
                 // descriptors are absent and `follow_symlinks` stays true.
                 // Anything else is `rposix.linkat`.
-                let plain = follow
-                    && src_dir_fd == libc::AT_FDCWD
-                    && dst_dir_fd == libc::AT_FDCWD;
+                let plain = follow && src_dir_fd == libc::AT_FDCWD && dst_dir_fd == libc::AT_FDCWD;
                 let (ret, err) = if plain {
-                    let ret =
-                        unsafe { majit_rlib::rposix::c_link(c_src.as_ptr(), c_dst.as_ptr()) };
+                    let ret = unsafe { majit_rlib::rposix::c_link(c_src.as_ptr(), c_dst.as_ptr()) };
                     (
                         ret,
                         std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
@@ -10525,8 +10507,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     return Err(fs_err_with_filename2(err, 0, src.w_path(), dst.w_path()));
                 }
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "link", __pyre_stored)
+        };
 
         // os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True) -> None
         #[cfg(not(feature = "sandbox"))]
@@ -10611,9 +10594,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // `os.chmod(fd, …)` means.
                 // `rposix.c_fchmod` releases the GIL and saves errno.
                 loop {
-                    let ret = unsafe {
-                        majit_rlib::rposix::c_fchmod(path.as_fd, mode as libc::mode_t)
-                    };
+                    let ret =
+                        unsafe { majit_rlib::rposix::c_fchmod(path.as_fd, mode as libc::mode_t) };
                     if ret >= 0 {
                         break;
                     }
@@ -10655,8 +10637,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if ret >= 0 {
                     break;
                 }
-                let err =
-                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno());
+                let err = std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno());
                 // A host can accept `AT_SYMLINK_NOFOLLOW` and not implement it,
                 // reporting so by refusing the call rather than by lacking
                 // `fchmodat` — which is why `HAVE_LCHMOD` is a narrower bit than
@@ -10675,11 +10656,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             Ok(pyre_object::w_none())
         }
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "chmod",
-            crate::make_builtin_function("chmod", |args| chmod_entry(args, "chmod", true)),
-        );
+        {
+            let __pyre_stored =
+                crate::make_builtin_function("chmod", |args| chmod_entry(args, "chmod", true));
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "chmod", __pyre_stored)
+        };
         // `os.lchmod` exists only where the host has a working one — os.py:159
         // records that some platforms carry a stub returning ENOTSUP, and that
         // `fchmodat`'s `AT_SYMLINK_NOFOLLOW` does not work either where that is
@@ -10695,17 +10677,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 target_os = "dragonfly",
             )
         ))]
-        crate::module_ns_store(
-            ns,
-            "lchmod",
-            crate::make_builtin_function("lchmod", |args| chmod_entry(args, "lchmod", false)),
-        );
+        {
+            let __pyre_stored =
+                crate::make_builtin_function("lchmod", |args| chmod_entry(args, "lchmod", false));
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "lchmod", __pyre_stored)
+        };
 
         // os.fchmod(fd, mode) -> None
-        crate::module_ns_store(
-            ns,
-            "fchmod",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fchmod",
                 |args| {
                     if args.len() < 2 {
@@ -10720,8 +10701,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // `rposix.c_fchmod` releases the GIL and saves errno.
                     // interp_posix.py `fchmod`: retry on EINTR.
                     loop {
-                        let ret =
-                            unsafe { majit_rlib::rposix::c_fchmod(fd, mode as libc::mode_t) };
+                        let ret = unsafe { majit_rlib::rposix::c_fchmod(fd, mode as libc::mode_t) };
                         if ret >= 0 {
                             break;
                         }
@@ -10733,8 +10713,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fchmod", __pyre_stored)
+        };
 
         // os.chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True) -> None
         // os.lchown(path, uid, gid) -> None
@@ -10924,9 +10905,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             break;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err_with_filename(e, path.w_path()),
                         )?;
                     }
@@ -10934,9 +10913,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // `interp_posix.lchown` does not retry EINTR.
                     if invoke() < 0 {
                         return Err(io_err_with_filename(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             path.w_path(),
                         ));
                     }
@@ -10973,22 +10950,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             }
             Ok(pyre_object::w_none())
         }
-        crate::module_ns_store(
-            ns,
-            "chown",
-            crate::make_builtin_function("chown", |args| chown_entry(args, "chown", true)),
-        );
-        crate::module_ns_store(
-            ns,
-            "lchown",
-            crate::make_builtin_function("lchown", |args| chown_entry(args, "lchown", false)),
-        );
+        {
+            let __pyre_stored =
+                crate::make_builtin_function("chown", |args| chown_entry(args, "chown", true));
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "chown", __pyre_stored)
+        };
+        {
+            let __pyre_stored =
+                crate::make_builtin_function("lchown", |args| chown_entry(args, "lchown", false));
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "lchown", __pyre_stored)
+        };
 
         // os.fchown(fd, uid, gid) -> None  (uid/gid of -1 means "leave unchanged")
-        crate::module_ns_store(
-            ns,
-            "fchown",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fchown",
                 |args| {
                     if args.len() < 3 {
@@ -11027,15 +11004,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fchown", __pyre_stored)
+        };
 
         // os.get_inheritable(fd) -> bool.  `_Py_get_inheritable`: a descriptor
         // is inheritable exactly when its close-on-exec flag is clear.
-        crate::module_ns_store(
-            ns,
-            "get_inheritable",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "get_inheritable",
                 |args| {
                     if args.is_empty() {
@@ -11051,14 +11027,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_bool_from(inheritable))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "get_inheritable", __pyre_stored)
+        };
 
         // os.set_inheritable(fd, inheritable) -> None
-        crate::module_ns_store(
-            ns,
-            "set_inheritable",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "set_inheritable",
                 |args| {
                     use std::os::fd::BorrowedFd;
@@ -11078,15 +11053,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "set_inheritable", __pyre_stored)
+        };
 
         // os.access(path, mode, *, dir_fd=None, effective_ids=False,
         //           follow_symlinks=True) -> bool
-        crate::module_ns_store(
-            ns,
-            "access",
-            crate::make_builtin_function("access", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("access", |args| {
                 // `access` names three keyword-only modifiers, so a third
                 // positional is an error rather than a `dir_fd`.
                 let (bound, mut kwargs) = bind_path_args(
@@ -11200,14 +11174,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // a mode outside `R_OK | W_OK | X_OK` can draw.
                     Ok(pyre_object::w_bool_from(ret == 0))
                 }
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "access", __pyre_stored)
+        };
 
         // os.chroot(path) -> None
-        crate::module_ns_store(
-            ns,
-            "chroot",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "chroot",
                 |args| {
                     if args.is_empty() {
@@ -11220,23 +11193,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let ret = unsafe { majit_rlib::rposix::c_chroot(c_path.as_ptr()) };
                     if ret < 0 {
                         return Err(io_err_with_filename(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             path.w_path(),
                         ));
                     }
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "chroot", __pyre_stored)
+        };
 
         // os.getloadavg() -> (1m, 5m, 15m)
-        crate::module_ns_store(
-            ns,
-            "getloadavg",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getloadavg",
                 |_| {
                     // `rposix.c_getloadavg` does not save errno.
@@ -11248,9 +11218,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         let mut loads = [0.0f64; 3];
                         let n = unsafe { majit_rlib::rposix::c_getloadavg(loads.as_mut_ptr(), 3) };
                         if n != 3 {
-                            return Err(crate::PyError::os_error(
-                                "Load averages are unobtainable",
-                            ));
+                            return Err(crate::PyError::os_error("Load averages are unobtainable"));
                         }
                         loads
                     };
@@ -11264,15 +11232,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getloadavg", __pyre_stored)
+        };
 
         // os.times() -> posix.times_result(user, system, children_user,
         //                                  children_system, elapsed)
-        crate::module_ns_store(
-            ns,
-            "times",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "times",
                 |_| {
                     // `rposix.c_times` uses `RFFI_FULL_ERRNO_ZERO` because a
@@ -11289,9 +11256,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let clk = unsafe { majit_rlib::rposix::c_sysconf(libc::_SC_CLK_TCK) } as f64;
                     if clk <= 0.0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -11307,14 +11272,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "times", __pyre_stored)
+        };
 
         // os.waitstatus_to_exitcode(status) -> int
-        crate::module_ns_store(
-            ns,
-            "waitstatus_to_exitcode",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "waitstatus_to_exitcode",
                 |args| {
                     if args.is_empty() {
@@ -11334,14 +11298,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "waitstatus_to_exitcode", __pyre_stored)
+        };
 
         // os.system(command) -> exit_status
-        crate::module_ns_store(
-            ns,
-            "system",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "system",
                 |args| {
                     if args.is_empty() {
@@ -11362,8 +11325,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(rc as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "system", __pyre_stored)
+        };
 
         // os.sendfile(out_fd, in_fd, offset, count) -> bytes_sent
         //
@@ -11396,10 +11360,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             any(target_os = "linux", target_os = "macos"),
             not(feature = "sandbox")
         ))]
-        crate::module_ns_store(
-            ns,
-            "sendfile",
-            crate::make_builtin_function("sendfile", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("sendfile", |args| {
                 #[cfg(target_os = "macos")]
                 use std::os::fd::BorrowedFd;
                 // Every parameter is positional-or-keyword. `headers`,
@@ -11486,9 +11448,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             return Ok(pyre_object::w_int_new(res as i64));
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err(e, ""),
                         )?;
                     }
@@ -11615,8 +11575,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         }
                     }
                 }
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "sendfile", __pyre_stored)
+        };
 
         // os.posix_spawn(path, argv, env, *, file_actions=None, setpgroup=None,
         // resetids=False, setsid=False, setsigmask=(), setsigdef=(),
@@ -12031,26 +11992,40 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             }
 
-            crate::module_ns_store(
-                ns,
-                "posix_spawn",
-                crate::make_builtin_function("posix_spawn", |args| build_posix_spawn(args, false)),
-            );
-            crate::module_ns_store(
-                ns,
-                "posix_spawnp",
-                crate::make_builtin_function("posix_spawnp", |args| build_posix_spawn(args, true)),
-            );
-            crate::module_ns_store(ns, "POSIX_SPAWN_OPEN", pyre_object::w_int_new(0));
-            crate::module_ns_store(ns, "POSIX_SPAWN_CLOSE", pyre_object::w_int_new(1));
-            crate::module_ns_store(ns, "POSIX_SPAWN_DUP2", pyre_object::w_int_new(2));
+            {
+                let __pyre_stored = crate::make_builtin_function("posix_spawn", |args| {
+                    build_posix_spawn(args, false)
+                });
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "posix_spawn", __pyre_stored)
+            };
+            {
+                let __pyre_stored = crate::make_builtin_function("posix_spawnp", |args| {
+                    build_posix_spawn(args, true)
+                });
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "posix_spawnp", __pyre_stored)
+            };
+            {
+                let __pyre_stored = pyre_object::w_int_new(0);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "POSIX_SPAWN_OPEN", __pyre_stored)
+            };
+            {
+                let __pyre_stored = pyre_object::w_int_new(1);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "POSIX_SPAWN_CLOSE", __pyre_stored)
+            };
+            {
+                let __pyre_stored = pyre_object::w_int_new(2);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "POSIX_SPAWN_DUP2", __pyre_stored)
+            };
         }
 
         // os.ttyname(fd) -> str
-        crate::module_ns_store(
-            ns,
-            "ttyname",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "ttyname",
                 |args| {
                     if args.is_empty() {
@@ -12064,9 +12039,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let name = unsafe { majit_rlib::rposix::c_ttyname(fd) };
                     if name.is_null() {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -12074,15 +12047,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(crate::gateway::fsdecode_filename_bytes(bytes))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "ttyname", __pyre_stored)
+        };
 
         // os.tcgetpgrp(fd) -> pgid. `rposix.c_tcgetpgrp` releases the GIL and
         // saves errno.
-        crate::module_ns_store(
-            ns,
-            "tcgetpgrp",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "tcgetpgrp",
                 |args| {
                     if args.is_empty() {
@@ -12100,16 +12072,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(pgid as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "tcgetpgrp", __pyre_stored)
+        };
 
         // os.tcsetpgrp(fd, pgid) -> None. `rposix.c_tcsetpgrp` releases the
         // GIL and saves errno. `rposix.tcsetpgrp` discards
         // `handle_posix_error`'s result.
-        crate::module_ns_store(
-            ns,
-            "tcsetpgrp",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "tcsetpgrp",
                 |args| {
                     if args.len() < 2 {
@@ -12131,14 +12102,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "tcsetpgrp", __pyre_stored)
+        };
 
         // os.getpriority(which, who) -> int
-        crate::module_ns_store(
-            ns,
-            "getpriority",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getpriority",
                 |args| {
                     if args.len() < 2 {
@@ -12166,14 +12136,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(prio as i64))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getpriority", __pyre_stored)
+        };
 
         // os.setpriority(which, who, priority) -> None
-        crate::module_ns_store(
-            ns,
-            "setpriority",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setpriority",
                 |args| {
                     if args.len() < 3 {
@@ -12191,41 +12160,39 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         as host_posix::PriorityWhichType
                         as libc::c_int;
                     let who = pyre_object::with_roots!(w_prio => crate::baseobjspace::int_w(w_who))?
-                        as host_posix::PriorityWhoType
-                        as libc::id_t;
+                        as host_posix::PriorityWhoType as libc::id_t;
                     let prio = crate::baseobjspace::int_w(w_prio)? as i32;
                     // `rposix.c_setpriority` releases the GIL and saves errno.
                     // `-1` is the failure.
                     let ret = unsafe { majit_rlib::rposix::c_setpriority(which, who, prio) };
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setpriority", __pyre_stored)
+        };
 
-        crate::module_ns_store(
-            ns,
-            "PRIO_PROCESS",
-            pyre_object::w_int_new(libc::PRIO_PROCESS as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "PRIO_PGRP",
-            pyre_object::w_int_new(libc::PRIO_PGRP as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "PRIO_USER",
-            pyre_object::w_int_new(libc::PRIO_USER as i64),
-        );
+        {
+            let __pyre_stored = pyre_object::w_int_new(libc::PRIO_PROCESS as i64);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "PRIO_PROCESS", __pyre_stored)
+        };
+        {
+            let __pyre_stored = pyre_object::w_int_new(libc::PRIO_PGRP as i64);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "PRIO_PGRP", __pyre_stored)
+        };
+        {
+            let __pyre_stored = pyre_object::w_int_new(libc::PRIO_USER as i64);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "PRIO_USER", __pyre_stored)
+        };
 
         // `posixmodule.c` `pathconf_names` — the `_PC_*` table
         // `conv_path_confname` resolves a string `name` argument through.
@@ -12283,6 +12250,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         /// The dict a `conv_confname` table is published as — `pathconf_names`
         /// for `pathconf`, `confstr_names` for `confstr`.
         fn store_names_dict(ns: PyObjectRef, key: &str, table: &[(&str, i32)]) {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ns = pyre_object::gc_roots::pin_root(ns);
             let _names_roots = pyre_object::gc_roots::push_roots();
             let names_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
@@ -12299,7 +12269,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     )
                 };
             }
-            crate::module_ns_store(ns, key, pyre_object::gc_roots::shadow_stack_get(names_slot));
+            {
+                let __pyre_stored = pyre_object::gc_roots::shadow_stack_get(names_slot);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, key, __pyre_stored)
+            };
         }
         store_names_dict(ns, "pathconf_names", PATHCONF_NAMES);
 
@@ -12368,10 +12342,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
 
         // os.pathconf(path, name) -> int | None
-        crate::module_ns_store(
-            ns,
-            "pathconf",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "pathconf",
                 |args| {
                     if args.len() < 2 {
@@ -12405,14 +12377,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(indeterminate_limit(limit)))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "pathconf", __pyre_stored)
+        };
 
         // os.fpathconf(fd, name) -> int | None
-        crate::module_ns_store(
-            ns,
-            "fpathconf",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fpathconf",
                 |args| {
                     if args.len() < 2 {
@@ -12431,14 +12402,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(indeterminate_limit(limit)))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fpathconf", __pyre_stored)
+        };
 
         // os.sysconf(name) -> int
-        crate::module_ns_store(
-            ns,
-            "sysconf",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "sysconf",
                 |args| {
                     if args.is_empty() {
@@ -12457,8 +12427,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(v as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "sysconf", __pyre_stored)
+        };
         let w_sysconf_names = pyre_object::w_dict_new();
         let _sysconf_names_root = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_sysconf_names);
@@ -12477,11 +12448,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 );
             }
         }
-        crate::module_ns_store(
-            ns,
-            "sysconf_names",
-            pyre_object::gc_roots::shadow_stack_get(names_slot),
-        );
+        {
+            let __pyre_stored = pyre_object::gc_roots::shadow_stack_get(names_slot);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "sysconf_names", __pyre_stored)
+        };
 
         // `posixmodule.c` `posix_constants_confstr` — the `_CS_*` table
         // `conv_confstr_confname` resolves a string `name` argument through,
@@ -12553,10 +12524,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // os.confstr(name) -> str | None
         #[cfg(not(feature = "sandbox"))]
-        crate::module_ns_store(
-            ns,
-            "confstr",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "confstr",
                 |args| {
                     if args.is_empty() {
@@ -12598,8 +12567,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(crate::gateway::fsdecode_filename_bytes(&buf))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "confstr", __pyre_stored)
+        };
 
         // os.initgroups(username, gid) -> None
         #[cfg(any(
@@ -12609,10 +12579,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             target_os = "macos",
             target_os = "ios"
         ))]
-        crate::module_ns_store(
-            ns,
-            "initgroups",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "initgroups",
                 |args| {
                     if args.len() < 2 {
@@ -12649,23 +12617,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     });
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "initgroups", __pyre_stored)
+        };
 
         // os.openpty() -> (master_fd, slave_fd)
-        crate::module_ns_store(
-            ns,
-            "openpty",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "openpty",
                 |_| {
                     // `rposix.c_openpty` releases the GIL and saves errno.
@@ -12684,9 +12649,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     };
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -12707,15 +12670,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "openpty", __pyre_stored)
+        };
 
         // os.getresuid() -> (ruid, euid, suid)
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
-        crate::module_ns_store(
-            ns,
-            "getresuid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getresuid",
                 |_| {
                     // `rposix.c_getresuid` releases the GIL and saves errno.
@@ -12725,9 +12687,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let ret = unsafe { majit_rlib::rposix::c_getresuid(&mut r, &mut e, &mut s) };
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -12738,15 +12698,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getresuid", __pyre_stored)
+        };
 
         // os.getresgid() -> (rgid, egid, sgid)
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
-        crate::module_ns_store(
-            ns,
-            "getresgid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getresgid",
                 |_| {
                     // `rposix.c_getresgid` releases the GIL and saves errno.
@@ -12756,9 +12715,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let ret = unsafe { majit_rlib::rposix::c_getresgid(&mut r, &mut e, &mut s) };
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
@@ -12769,8 +12726,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getresgid", __pyre_stored)
+        };
 
         // os.setresuid(ruid, euid, suid) -> None
         #[cfg(any(
@@ -12779,10 +12737,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             target_os = "linux",
             target_os = "openbsd"
         ))]
-        crate::module_ns_store(
-            ns,
-            "setresuid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setresuid",
                 |args| {
                     if args.len() < 3 {
@@ -12811,24 +12767,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     };
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setresuid", __pyre_stored)
+        };
 
         // os.setresgid(rgid, egid, sgid) -> None
         #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
-        crate::module_ns_store(
-            ns,
-            "setresgid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "setresgid",
                 |args| {
                     if args.len() < 3 {
@@ -12857,17 +12810,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     };
                     if ret < 0 {
                         return Err(io_err(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             "",
                         ));
                     }
                     Ok(pyre_object::w_none())
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "setresgid", __pyre_stored)
+        };
     }
 
     // ── the descriptor calls Windows serves through the C runtime (the same
@@ -12926,10 +12878,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // os.dup(fd) -> new_fd.  `_Py_dup` makes the copy non-inheritable, so
         // it does not leak into a child the way the CRT's own copy would.
-        crate::module_ns_store(
-            ns,
-            "dup",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "dup",
                 |args| {
                     if args.is_empty() {
@@ -12947,8 +12897,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "dup", __pyre_stored)
+        };
 
         // os.dup2(fd, fd2, inheritable=True) -> fd2 — the `Signature`-bearing
         // twin of the unix registration, and defective in the same way while
@@ -12976,22 +12927,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             }
         }
 
-        crate::module_ns_store(
-            ns,
-            "dup2",
-            crate::make_builtin_function_with_arity_and_maybe_sig(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity_and_maybe_sig(
                 "dup2",
                 dup2,
                 dup2_pyre_arity(),
                 dup2_pyre_sig(),
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "dup2", __pyre_stored)
+        };
 
         // os.fsync(fd) — `_commit`, the runtime's flush-to-disk.
-        crate::module_ns_store(
-            ns,
-            "fsync",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fsync",
                 |args| {
                     if args.is_empty() {
@@ -13005,14 +12953,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     crt_result(crt_fd::fsync(borrow_raw_fd(fd)?))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fsync", __pyre_stored)
+        };
 
         // os.ftruncate(fd, length) — `_chsize_s`.
-        crate::module_ns_store(
-            ns,
-            "ftruncate",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "ftruncate",
                 |args| {
                     if args.len() < 2 {
@@ -13024,17 +12971,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     crt_result(crt_fd::ftruncate(borrowed_fd(args[0])?, length))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "ftruncate", __pyre_stored)
+        };
 
         // os.truncate(path, length) — `_wopen` then the same `_chsize_s`
         // (`os_truncate_impl`).  Its path is `path_t(allow_fd=…)`, so an
         // integer names an open descriptor and the call is `ftruncate` on it,
         // with no name to report the failure with.
-        crate::module_ns_store(
-            ns,
-            "truncate",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "truncate",
                 |args| {
                     if args.len() < 2 {
@@ -13060,8 +13006,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "truncate", __pyre_stored)
+        };
 
         /// `win32_wchdir` -- `SetCurrentDirectoryW`, then the directory read
         /// back and published for the drive it is on.
@@ -13070,10 +13017,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
 
         // os.chdir(path)
-        crate::module_ns_store(
-            ns,
-            "chdir",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "chdir",
                 |args| {
                     if args.is_empty() {
@@ -13088,8 +13033,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "chdir", __pyre_stored)
+        };
 
         // os.access(path, mode, *, dir_fd=None, effective_ids=False,
         //           follow_symlinks=True) -> bool
@@ -13101,10 +13047,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // and the other two are the pair `os_access_impl` turns away without
         // `faccessat`, so each is refused rather than answered as though it
         // had been applied.
-        crate::module_ns_store(
-            ns,
-            "access",
-            crate::make_builtin_function("access", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("access", |args| {
                 // The three modifiers are keyword-only, so a third positional
                 // is an error rather than a `dir_fd`.
                 let (bound, kwargs) = bind_path_args(
@@ -13143,8 +13087,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     host_nt::access(path_from_bytes(&path.as_bytes).as_ref(), mode)
                 };
                 Ok(pyre_object::w_bool_from(allowed))
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "access", __pyre_stored)
+        };
 
         // os.execv(path, argv) / os.execve(path, argv, env)
         //
@@ -13199,10 +13144,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             pointers
         }
 
-        crate::module_ns_store(
-            ns,
-            "execv",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "execv",
                 |args| {
                     // The path names itself; the argv entries do not, because
@@ -13229,13 +13172,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ))
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "execv", __pyre_stored)
+        };
 
-        crate::module_ns_store(
-            ns,
-            "execve",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
                     let path = crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?;
@@ -13267,8 +13209,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ))
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "execve", __pyre_stored)
+        };
 
         // os.spawnv(mode, path, argv) / os.spawnve(mode, path, argv, env)
         //
@@ -13339,10 +13282,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             values.iter().map(|value| value.as_ucstr()).collect()
         }
 
-        crate::module_ns_store(
-            ns,
-            "spawnv",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "spawnv",
                 |args| {
                     let mode = crate::baseobjspace::c_int_w(args[0])?;
@@ -13362,13 +13303,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 3,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "spawnv", __pyre_stored)
+        };
 
-        crate::module_ns_store(
-            ns,
-            "spawnve",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "spawnve",
                 |args| {
                     let mode = crate::baseobjspace::c_int_w(args[0])?;
@@ -13407,8 +13347,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 4,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "spawnve", __pyre_stored)
+        };
 
         // os.kill(pid, sig)
         //
@@ -13416,10 +13357,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // are delivered to the process group with `GenerateConsoleCtrlEvent`,
         // and any other number is the exit code `TerminateProcess` stamps on
         // the process it ends — there are no signals to send one.
-        crate::module_ns_store(
-            ns,
-            "kill",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "kill",
                 |args| {
                     let pid = crate::baseobjspace::c_int_w(args[0])?;
@@ -13432,8 +13371,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "kill", __pyre_stored)
+        };
 
         /// The mode bit Windows keeps: with the owner's write bit the
         /// read-only attribute comes off, without it goes on.
@@ -13448,10 +13388,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // through the link's own attributes.  `dir_fd` is the one modifier
         // Windows cannot honour — `chmod` types it as
         // `dir_fd(requires='fchmodat')`, which is `_DirFD_Unavailable`.
-        crate::module_ns_store(
-            ns,
-            "chmod",
-            crate::make_builtin_function("chmod", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("chmod", |args| {
                 let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
                 crate::builtins::kwarg_reject_unknown(
                     kwargs,
@@ -13519,18 +13457,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 };
                 result.map_err(|e| fs_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "chmod", __pyre_stored)
+        };
 
         // `os.lchmod` is the named `follow_symlinks=False` operation.  Windows
         // implements that distinction with the reparse point's own file
         // attributes (`rustpython_host_env::nt::win32_lchmod`), so publishing
         // the function is truthful here rather than the unsupported POSIX
         // `lchmod(2)` stub some Unix hosts carry.
-        crate::module_ns_store(
-            ns,
-            "lchmod",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "lchmod",
                 |args| {
                     let path = crate::gateway::fsencode_path_or_fd_w(args[0], "lchmod", false)?;
@@ -13546,14 +13483,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_none())
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "lchmod", __pyre_stored)
+        };
 
         // os.fchmod(fd, mode) -> None
-        crate::module_ns_store(
-            ns,
-            "fchmod",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "fchmod",
                 |args| {
                     if args.len() < 2 {
@@ -13577,15 +13513,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "fchmod", __pyre_stored)
+        };
 
         // os.link(src, dst) -> None.  `CreateHardLinkW` names the new link
         // first and the file it points at second.
-        crate::module_ns_store(
-            ns,
-            "link",
-            crate::make_builtin_function("link", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("link", |args| {
                 let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
                 crate::builtins::kwarg_reject_unknown(
                     kwargs,
@@ -13622,18 +13557,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 rustpython_host_env::winapi::create_hard_link(&wide_dst, &wide_src)
                     .map_err(|error| fs_err_with_filename2(error, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "link", __pyre_stored)
+        };
 
         // os.symlink(src, dst, target_is_directory=False) -> None.
         // `CreateSymbolicLinkW` names the link first and its target second,
         // and a link to a directory is a different kind of reparse point from
         // a link to a file. `os_symlink_impl` picks the kind from the explicit
         // argument or `host_nt::symlink`'s bounded existing-target probe.
-        crate::module_ns_store(
-            ns,
-            "symlink",
-            crate::make_builtin_function("symlink", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("symlink", |args| {
                 let (bound, kwargs) = bind_path_args(
                     args,
                     "symlink",
@@ -13672,14 +13606,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 )
                 .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "symlink", __pyre_stored)
+        };
 
         // os.umask(mask) -> previous mask
-        crate::module_ns_store(
-            ns,
-            "umask",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "umask",
                 |args| {
                     if args.is_empty() {
@@ -13692,14 +13625,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "umask", __pyre_stored)
+        };
 
         // os.pipe() -> (read_fd, write_fd), both non-inheritable.
-        crate::module_ns_store(
-            ns,
-            "pipe",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "pipe",
                 |_| match host_nt::pipe() {
                     Ok((read_fd, write_fd)) => {
@@ -13711,20 +13643,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Err(e) => Err(errno_err(crt_errno_of(&e), "")),
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "pipe", __pyre_stored)
+        };
 
         // os.getppid() — the parent recorded in the process's own entry, which
         // Windows only offers through a snapshot of the process list.
-        crate::module_ns_store(
-            ns,
-            "getppid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getppid",
                 |_| Ok(pyre_object::w_int_new(host_nt::getppid() as i64)),
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getppid", __pyre_stored)
+        };
 
         // os._exit(code) — immediate process exit, no cleanup.  `install_noop_stubs`
         // binds the name for every host so os.py finds it, and only the POSIX
@@ -13733,10 +13665,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // do.  `os__exit_impl` spells it `_exit(status)`, the C runtime's
         // no-cleanup exit rather than `exit`, so a child sharing an inherited
         // stdio buffer with its parent does not flush it a second time.
-        crate::module_ns_store(
-            ns,
-            "_exit",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "_exit",
                 |args| {
                     let code = match args.first() {
@@ -13749,23 +13679,23 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     unsafe { libc::_exit(code) }
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "_exit", __pyre_stored)
+        };
 
         // os.abort() — `os_abort_impl` calls `abort()`, whose contract is that it
         // never returns.  Windows kept the noop placeholder here for the same
         // reason `_exit` did.
-        crate::module_ns_store(
-            ns,
-            "abort",
-            crate::make_builtin_function_with_arity("abort", |_| unsafe { libc::abort() }, 0),
-        );
+        {
+            let __pyre_stored =
+                crate::make_builtin_function_with_arity("abort", |_| unsafe { libc::abort() }, 0);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "abort", __pyre_stored)
+        };
 
         // os.getlogin() -> str
-        crate::module_ns_store(
-            ns,
-            "getlogin",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "getlogin",
                 |_| match host_nt::getlogin() {
                     Ok(name) => Ok(pyre_object::w_str_new_managed(&name)),
@@ -13777,17 +13707,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     )),
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "getlogin", __pyre_stored)
+        };
 
         // os.startfile(path, operation=None, arguments=None, cwd=None,
         // show_cmd=None) -> None.  `ShellExecuteW` hands the file to whatever
         // program is registered for it, and reports failure by returning 32 or
         // less rather than through a flag.
-        crate::module_ns_store(
-            ns,
-            "startfile",
-            crate::make_builtin_function("startfile", |args| {
+        {
+            let __pyre_stored = crate::make_builtin_function("startfile", |args| {
                 // Every optional argument is positional-or-keyword, so the
                 // four of them are looked up either way round.
                 //
@@ -13847,8 +13776,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 )
                 .map_err(|error| fs_err_with_filename(error, path.w_path()))?;
                 Ok(pyre_object::w_none())
-            }),
-        );
+            });
+            crate::module_ns_store_slot(ns_slot, "startfile", __pyre_stored)
+        };
 
         // os.cpu_count() -> int | None
         //
@@ -13858,18 +13788,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // the two part company on a host that has restricted one. Left as it is
         // because no Windows oracle is reachable from this host to measure
         // which the surface should report — see the follow-up task.
-        crate::module_ns_store(
-            ns,
-            "cpu_count",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "cpu_count",
                 |_| match std::thread::available_parallelism() {
                     Ok(n) => Ok(pyre_object::w_int_new(n.get() as i64)),
                     Err(_) => Ok(pyre_object::w_none()),
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "cpu_count", __pyre_stored)
+        };
 
         // os.system(command) -> the command interpreter's exit status.  The
         // wide entry point is the one that can spell every command; the narrow
@@ -13882,10 +13811,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // rather than a path, so the message it should report is a different
         // shape entirely and is unmeasured here; it keeps the same conversion
         // meanwhile. See the follow-up task.
-        crate::module_ns_store(
-            ns,
-            "system",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "system",
                 |args| {
                     unsafe extern "C" {
@@ -13900,17 +13827,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(status as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "system", __pyre_stored)
+        };
 
         // os.waitpid(pid, options) -> (pid, status).  `_cwait` waits for one
         // process by handle; the status it reports is the exit code, which
         // `os_waitpid_impl` shifts into the byte a POSIX wait status keeps it
         // in.
-        crate::module_ns_store(
-            ns,
-            "waitpid",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "waitpid",
                 |args| {
                     if args.len() < 2 {
@@ -13939,8 +13865,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "waitpid", __pyre_stored)
+        };
 
         // os.waitstatus_to_exitcode(status) -> int
         //
@@ -13972,10 +13899,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             Err(crate::PyError::type_error("an integer is required"))
         }
 
-        crate::module_ns_store(
-            ns,
-            "waitstatus_to_exitcode",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "waitstatus_to_exitcode",
                 |args| {
                     let exitcode = unsigned_long_long_w(args[0])? >> 8;
@@ -13989,16 +13914,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Ok(pyre_object::w_int_new(exitcode as i64))
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "waitstatus_to_exitcode", __pyre_stored)
+        };
 
         // os.times() -> posix.times_result.  Windows keeps the process's own
         // user and kernel time and nothing else, so the three fields that
         // count a child's are zero (`os_times_impl`).
-        crate::module_ns_store(
-            ns,
-            "times",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "times",
                 |_| {
                     let times =
@@ -14022,8 +13946,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ))
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "times", __pyre_stored)
+        };
 
         // os.listdrives() / os.listvolumes() / os.listmounts(volume) — the
         // names Windows mounts its filesystems under.
@@ -14039,10 +13964,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             }
             Ok(pyre_object::w_list_new(items.take()))
         }
-        crate::module_ns_store(
-            ns,
-            "listdrives",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "listdrives",
                 // `os_listdrives_impl` leaves the interpreter for
                 // `GetLogicalDriveStringsW`, as the two volume calls below do
@@ -14054,12 +13977,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     })
                 },
                 0,
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "listvolumes",
-            crate::make_builtin_function_with_arity(
+            );
+            crate::module_ns_store_slot(ns_slot, "listdrives", __pyre_stored)
+        };
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "listvolumes",
                 |_| {
                     name_list({
@@ -14068,15 +13990,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     })
                 },
                 0,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "listvolumes", __pyre_stored)
+        };
         // `volume` converts through the caller-less form: 3.14 added this entry
         // point on Windows alone, so what it names itself with is unmeasured on
         // this host. See the follow-up task.
-        crate::module_ns_store(
-            ns,
-            "listmounts",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "listmounts",
                 |args| {
                     if args.is_empty() {
@@ -14092,16 +14013,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     })
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "listmounts", __pyre_stored)
+        };
 
         // os.device_encoding(fd) -> str | None.  `_Py_device_encoding`: only a
         // terminal has one, and a process with no console attached has no code
         // page to name it with.
-        crate::module_ns_store(
-            ns,
-            "device_encoding",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "device_encoding",
                 |args| {
                     if args.is_empty() {
@@ -14120,15 +14040,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 1,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "device_encoding", __pyre_stored)
+        };
 
         // os.get_inheritable(fd) / os.set_inheritable(fd, inheritable) — the
         // flag lives on the descriptor's handle (`HANDLE_FLAG_INHERIT`).
-        crate::module_ns_store(
-            ns,
-            "get_inheritable",
-            crate::make_builtin_function_with_arity(
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "get_inheritable",
                 |args| {
                     if args.is_empty() {
@@ -14144,12 +14063,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 1,
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "set_inheritable",
-            crate::make_builtin_function_with_arity(
+            );
+            crate::module_ns_store_slot(ns_slot, "get_inheritable", __pyre_stored)
+        };
+        {
+            let __pyre_stored = crate::make_builtin_function_with_arity(
                 "set_inheritable",
                 |args| {
                     if args.len() < 2 {
@@ -14166,8 +14084,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                 },
                 2,
-            ),
-        );
+            );
+            crate::module_ns_store_slot(ns_slot, "set_inheritable", __pyre_stored)
+        };
     }
 
     // The trampoline only mediates the curated ll_os/ll_time surface, so the
@@ -14303,11 +14222,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "ttyname",
             "ctermid",
         ] {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function(name, sandbox_unavailable),
-            );
+            {
+                let __pyre_stored = crate::make_builtin_function(name, sandbox_unavailable);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
 
         // The same, for the names only some hosts have. Listing them above
@@ -14322,11 +14241,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             target_os = "netbsd",
             target_os = "openbsd"
         ))]
-        crate::module_ns_store(
-            ns,
-            "pipe2",
-            crate::make_builtin_function("pipe2", sandbox_unavailable),
-        );
+        {
+            let __pyre_stored = crate::make_builtin_function("pipe2", sandbox_unavailable);
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "pipe2", __pyre_stored)
+        };
         // The policy calls reach the host scheduler; only the setters mutate,
         // but a policy read is a host-process leak in the same way `getpriority`
         // above is. `sched_param` is left alone — it carries no host access.
@@ -14341,21 +14260,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "sched_getparam",
             "sched_rr_get_interval",
         ] {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function(name, sandbox_unavailable),
-            );
+            {
+                let __pyre_stored = crate::make_builtin_function(name, sandbox_unavailable);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // The affinity mask is the same kind of host-process leak, and carries
         // the narrower gate the pair is published under.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         for name in ["sched_getaffinity", "sched_setaffinity"] {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function(name, sandbox_unavailable),
-            );
+            {
+                let __pyre_stored = crate::make_builtin_function(name, sandbox_unavailable);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         #[cfg(all(
             not(target_env = "musl"),
@@ -14367,15 +14286,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             )
         ))]
         for name in ["sched_setscheduler", "sched_setparam"] {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function(name, sandbox_unavailable),
-            );
+            {
+                let __pyre_stored = crate::make_builtin_function(name, sandbox_unavailable);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
     }
 
-    crate::module_ns_store(ns, "error", crate::typedef::w_object());
+    {
+        let __pyre_stored = crate::typedef::w_object();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "error", __pyre_stored)
+    };
     Ok(())
 }
 

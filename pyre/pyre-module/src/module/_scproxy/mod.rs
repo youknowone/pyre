@@ -7,15 +7,16 @@ use pyre_object::gc_roots;
 use pyre_object::*;
 
 pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_get_proxies",
-        pyre_interpreter::make_builtin_function("_get_proxies", |_| Ok(w_dict_new())),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "_get_proxy_settings",
-        pyre_interpreter::make_builtin_function("_get_proxy_settings", |_| {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored =
+            pyre_interpreter::make_builtin_function("_get_proxies", |_| Ok(w_dict_new()));
+        pyre_interpreter::module_ns_store_slot(ns_slot, "_get_proxies", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function("_get_proxy_settings", |_| {
             // The `dict` moves across the allocations each store makes.
             let roots = gc_roots::push_roots();
             let d_slot = roots.base();
@@ -30,7 +31,8 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
                 w_dict_store(roots.get(d_slot), roots.get(key_slot), w_value);
             }
             Ok(roots.get(d_slot))
-        }),
-    );
+        });
+        pyre_interpreter::module_ns_store_slot(ns_slot, "_get_proxy_settings", __pyre_stored)
+    };
     Ok(())
 }

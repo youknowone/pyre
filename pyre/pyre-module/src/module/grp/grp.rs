@@ -28,6 +28,9 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
 /// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
         // Each `w_str_new_managed` is collectable.  A plain Vec is not a
@@ -52,11 +55,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 
     // `lib_pypy/grp.py class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
-    pyre_interpreter::module_ns_store(ns, "struct_group", struct_group_type());
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getgrgid",
-        pyre_interpreter::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = struct_group_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "struct_group", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getgrgid",
             |args| {
                 if args.is_empty() {
@@ -94,12 +99,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getgrnam",
-        pyre_interpreter::make_builtin_function_with_arity(
+        );
+        pyre_interpreter::module_ns_store_slot(ns_slot, "getgrgid", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getgrnam",
             |args| {
                 if args.is_empty() {
@@ -133,12 +137,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getgrall",
-        pyre_interpreter::make_builtin_function_with_arity(
+        );
+        pyre_interpreter::module_ns_store_slot(ns_slot, "getgrnam", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getgrall",
             |_| {
                 // Each struct_group is freshly allocated and building the
@@ -152,7 +155,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_list_new(items.take()))
             },
             0,
-        ),
-    );
+        );
+        pyre_interpreter::module_ns_store_slot(ns_slot, "getgrall", __pyre_stored)
+    };
     Ok(())
 }

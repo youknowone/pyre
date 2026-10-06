@@ -878,6 +878,7 @@ pub fn builtin_bool(
             // default `True`.
             ConstValue::HostObject(_)
             | ConstValue::Opaque(_)
+            | ConstValue::Repr(_)
             | ConstValue::Function(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
@@ -1625,10 +1626,10 @@ fn cast_instance_intrinsic(
         crate::translator::rtyper::llannotation::lltype_to_annotation(
             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
         )
-    } else if majit_ir::descr::is_shaped_tuple_name(&root) {
-        bk.project_shaped_tuple(&root)
     } else {
-        bk.project_struct_field_type(&root)
+        // One projection per position (`Bookkeeper.getlistdef`,
+        // bookkeeper.py). Reflow setbinding then sees the same ListDefs.
+        bk.stable_projected_root(&root)
     };
     // Nullability travels with the value, not with the target spelling: a
     // downcast of a nullable pointer is itself nullable, and a null operand
@@ -1718,6 +1719,22 @@ fn cast_instance_intrinsic(
             | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for tuple root {root:?}: {other:?}"
+            ))),
+        };
+    }
+    // `RDict<K, V, S>` projects to `SomeDict` (`OrderedDictRepr`). An
+    // operand that already is that dict passes through; a pointer-shaped
+    // operand is the dict the `insert` / `get` call is about to use.
+    // `SomeDict` carries no `can_be_None`, same as the list arm.
+    if matches!(&projected, SomeValue::Dict(_)) {
+        return match operand {
+            SomeValue::Dict(_) => Ok(operand.clone()),
+            SomeValue::Instance(_)
+            | SomeValue::Ptr(_)
+            | SomeValue::Address(_)
+            | SomeValue::None_(_) => Ok(projected),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-pointer operand for dict root {root:?}: {other:?}"
             ))),
         };
     }
@@ -3074,6 +3091,32 @@ mod tests {
         )
         .expect("a SomeTuple operand passes through");
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn cast_instance_reflow_reuses_one_listdef() {
+        // Reflow of the same root must hand `setbinding` the same ListDefs.
+        // `Bookkeeper.getlistdef` (`bookkeeper.py`) is that cache.
+        let bk = bk();
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("Tuple<Vec<i64>,Vec<bool>>"))
+            .expect("tuple root constant");
+        let first = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr.clone()), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("first projection");
+        let second = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("reflow projection");
+        assert_eq!(first, second);
     }
 
     #[test]

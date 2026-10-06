@@ -1480,241 +1480,121 @@ fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef,
 }
 
 pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `os._create_environ_mapping` binds this dict itself rather than copying
     // it, so `os.environ._data` is this object and `os.environ` is a live view
     // of it.  The guest is started with no environment — the runner hands the
     // interpreter the few variables it forwards, rather than an environment
     // block — so this begins empty and holds whatever the program puts in it.
-    crate::module_ns_store(ns, "environ", environ_snapshot());
+    { let __pyre_stored = environ_snapshot(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "environ", __pyre_stored) };
     // `os.py` builds `supports_dir_fd` and friends only when this exists, and
     // then reads `stat` out of its own namespace to seed `supports_fd`.  Empty:
     // no call here takes a directory or a descriptor argument.
-    crate::module_ns_store(ns, "_have_functions", pyre_object::w_list_new(vec![]));
-    crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    { let __pyre_stored = pyre_object::w_list_new(vec![]); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "_have_functions", __pyre_stored) };
+    { let __pyre_stored = super::stat_result_seq_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "stat_result", __pyre_stored) };
     // `posixmodule_exec` publishes this type on every platform, and only the
     // `get_terminal_size` that fills one is guarded: `shutil.get_terminal_size`
     // catches the AttributeError from the missing call and builds its fallback
     // out of the type, so a target with neither raises from the handler.
-    crate::module_ns_store(ns, "terminal_size", super::terminal_size_seq_type());
+    { let __pyre_stored = super::terminal_size_seq_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "terminal_size", __pyre_stored) };
     // `moduledef.py` lists these three as appleveldefs with no platform test,
     // and `posixmodule_exec` creates them unconditionally too: the types exist
     // wherever `posix` does, even where the call that fills one is absent.
-    crate::module_ns_store(ns, "statvfs_result", super::statvfs_result_seq_type());
-    crate::module_ns_store(ns, "times_result", super::times_result_seq_type());
-    crate::module_ns_store(ns, "uname_result", super::uname_result_seq_type());
+    { let __pyre_stored = super::statvfs_result_seq_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "statvfs_result", __pyre_stored) };
+    { let __pyre_stored = super::times_result_seq_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "times_result", __pyre_stored) };
+    { let __pyre_stored = super::uname_result_seq_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "uname_result", __pyre_stored) };
     // `follow_symlinks` and `dir_fd` are keyword-only, so neither entry point
     // can take the fixed-arity carrier that rejects keywords.
-    crate::module_ns_store(
-        ns,
-        "stat",
-        crate::make_builtin_function("stat", |args| stat(args, true)),
-    );
-    crate::module_ns_store(
-        ns,
-        "lstat",
-        crate::make_builtin_function("lstat", |args| stat(args, false)),
-    );
-    crate::module_ns_store(
-        ns,
-        "listdir",
-        crate::make_builtin_function("listdir", listdir),
-    );
-    crate::module_ns_store(
-        ns,
-        "scandir",
-        crate::make_builtin_function("scandir", scandir),
-    );
-    crate::module_ns_store(ns, "chdir", crate::make_builtin_function("chdir", chdir));
+    { let __pyre_stored = crate::make_builtin_function("stat", |args| stat(args, true)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "stat", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("lstat", |args| stat(args, false)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "lstat", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("listdir", listdir); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "listdir", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("scandir", scandir); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "scandir", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("chdir", chdir); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "chdir", __pyre_stored) };
     // `os.environ.__setitem__` calls `putenv` by name, so a target without it
     // cannot set a variable at all.
-    crate::module_ns_store(ns, "putenv", crate::make_builtin_function("putenv", putenv));
+    { let __pyre_stored = crate::make_builtin_function("putenv", putenv); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "putenv", __pyre_stored) };
     // `os.reload_environ` exists only where this does, and it is the one reader
     // that can see what a bare `putenv` wrote.
-    crate::module_ns_store(
-        ns,
-        "_create_environ",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "_create_environ",
             |_args| Ok(environ_snapshot()),
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "unsetenv",
-        crate::make_builtin_function_with_arity("unsetenv", unsetenv, 1),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "_create_environ", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("unsetenv", unsetenv, 1); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "unsetenv", __pyre_stored) };
     // One wasm instance, one process, and it is not one the embedder named.
-    crate::module_ns_store(
-        ns,
-        "getpid",
-        crate::make_builtin_function_with_arity("getpid", |_args| Ok(pyre_object::w_int_new(1)), 0),
-    );
+    { let __pyre_stored = crate::make_builtin_function_with_arity("getpid", |_args| Ok(pyre_object::w_int_new(1)), 0); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "getpid", __pyre_stored) };
     // No terminal is reachable through the seam, so no descriptor is one.  The
     // answer is False rather than an error for the same reason it is on every
     // other platform: `isatty` reports, it does not validate.
-    crate::module_ns_store(
-        ns,
-        "isatty",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "isatty",
             |_args| Ok(pyre_object::w_bool_from(false)),
             1,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "isatty", __pyre_stored) };
     // `os.walk` catches `OSError` from the iterator and `shutil` calls
     // `isinstance(entry, os.DirEntry)`, so both the type and the entries it
     // stamps are published.
-    crate::module_ns_store(ns, "DirEntry", dir_entry_type());
+    { let __pyre_stored = dir_entry_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "DirEntry", __pyre_stored) };
     // `_bootstrap_external` reads `_os.fspath`, not `os.fspath`, so the
     // pure-Python fallback `os.py` installs when `posix` lacks it does not
     // stand in for the import machinery.  The protocol itself touches no
     // filesystem, so both arms publish the one implementation.
-    crate::module_ns_store(
-        ns,
-        "fspath",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "fspath",
             |args| super::fspath(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "fspath", __pyre_stored) };
     // `os.process_cpu_count` is an alias for this one, and reads it at module
     // level, so its absence would stop `import os` outright.  One: the guest is
     // a single wasm instance.
-    crate::module_ns_store(
-        ns,
-        "cpu_count",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "cpu_count",
             |_args| Ok(pyre_object::w_int_new(1)),
             0,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "cpu_count", __pyre_stored) };
     // The seam reports the embedder's working directory; without one there is
     // no directory to name, and `""` is what the syscall arm returns when the
     // host refuses too.  `posixpath.abspath` is this call, so every relative
     // path the stdlib resolves goes through it.
-    crate::module_ns_store(
-        ns,
-        "getcwd",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "getcwd",
             |_args| Ok(crate::gateway::fsdecode_filename_bytes(&cwd_bytes())),
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "getcwdb",
-        crate::make_builtin_function_with_arity(
+        ); crate::module_ns_store_slot(ns_slot, "getcwd", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "getcwdb",
             |_args| Ok(pyre_object::w_bytes_from_bytes(&cwd_bytes())),
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "urandom",
-        crate::make_builtin_function_with_arity("urandom", urandom, 1),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "getcwdb", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("urandom", urandom, 1); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "urandom", __pyre_stored) };
     // ── the descriptor half ──
-    crate::module_ns_store(
-        ns,
-        "open",
-        crate::make_builtin_function("open", open_file),
-    );
-    crate::module_ns_store(
-        ns,
-        "close",
-        crate::make_builtin_function_with_arity("close", close_file, 1),
-    );
-    crate::module_ns_store(
-        ns,
-        "read",
-        crate::make_builtin_function_with_arity("read", read_file, 2),
-    );
-    crate::module_ns_store(
-        ns,
-        "lseek",
-        crate::make_builtin_function_with_arity("lseek", lseek_file, 3),
-    );
-    crate::module_ns_store(
-        ns,
-        "fstat",
-        crate::make_builtin_function_with_arity("fstat", fstat_file, 1),
-    );
-    crate::module_ns_store(
-        ns,
-        "readlink",
-        crate::make_builtin_function("readlink", readlink),
-    );
-    crate::module_ns_store(
-        ns,
-        "unlink",
-        crate::make_builtin_function("unlink", |args| refuse_write(args, "unlink")),
-    );
+    { let __pyre_stored = crate::make_builtin_function("open", open_file); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "open", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("close", close_file, 1); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "close", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("read", read_file, 2); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "read", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("lseek", lseek_file, 3); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "lseek", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("fstat", fstat_file, 1); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "fstat", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("readlink", readlink); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "readlink", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("unlink", |args| refuse_write(args, "unlink")); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "unlink", __pyre_stored) };
     // `os.remove` is the same call under its other name on every platform.
-    crate::module_ns_store(
-        ns,
-        "remove",
-        crate::make_builtin_function("remove", |args| refuse_write(args, "remove")),
-    );
-    crate::module_ns_store(
-        ns,
-        "rmdir",
-        crate::make_builtin_function("rmdir", |args| refuse_write(args, "rmdir")),
-    );
+    { let __pyre_stored = crate::make_builtin_function("remove", |args| refuse_write(args, "remove")); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "remove", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("rmdir", |args| refuse_write(args, "rmdir")); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "rmdir", __pyre_stored) };
     // The rest of wasi's writing surface, published so that a program can ask
     // for it and refused because the mount is read-only.  `mkdir` and `chmod`
     // take a mode after the path, `utime` a pair of times, `truncate` a
     // length: each is converted before the mount's EROFS is reported, just as
     // the syscall-backed entry points convert them before making their call.
-    crate::module_ns_store(
-        ns,
-        "mkdir",
-        crate::make_builtin_function("mkdir", |args| refuse_write_path(args, "mkdir", &MKDIR_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "chmod",
-        crate::make_builtin_function("chmod", |args| refuse_write_path(args, "chmod", &CHMOD_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "utime",
-        crate::make_builtin_function("utime", |args| refuse_write_path(args, "utime", &UTIME_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "truncate",
-        crate::make_builtin_function("truncate", |args| refuse_write_path(args, "truncate", &TRUNCATE_SIG)),
-    );
+    { let __pyre_stored = crate::make_builtin_function("mkdir", |args| refuse_write_path(args, "mkdir", &MKDIR_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "mkdir", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("chmod", |args| refuse_write_path(args, "chmod", &CHMOD_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "chmod", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("utime", |args| refuse_write_path(args, "utime", &UTIME_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "utime", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("truncate", |args| refuse_write_path(args, "truncate", &TRUNCATE_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "truncate", __pyre_stored) };
     // The two-path calls, named by their source the way `rename` reports it.
-    crate::module_ns_store(
-        ns,
-        "rename",
-        crate::make_builtin_function("rename", |args| refuse_write_path(args, "rename", &RENAME_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "replace",
-        crate::make_builtin_function("replace", |args| refuse_write_path(args, "replace", &RENAME_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "link",
-        crate::make_builtin_function("link", |args| refuse_write_path(args, "link", &LINK_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "symlink",
-        crate::make_builtin_function("symlink", |args| refuse_write_path(args, "symlink", &SYMLINK_SIG)),
-    );
-    crate::module_ns_store(
-        ns,
-        "ftruncate",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function("rename", |args| refuse_write_path(args, "rename", &RENAME_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "rename", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("replace", |args| refuse_write_path(args, "replace", &RENAME_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "replace", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("link", |args| refuse_write_path(args, "link", &LINK_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "link", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("symlink", |args| refuse_write_path(args, "symlink", &SYMLINK_SIG)); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "symlink", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "ftruncate",
             |args| {
                 // `interp_posix.ftruncate` unwraps `fd=c_int,
@@ -1731,35 +1611,15 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 ))
             },
             2,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "fsync",
-        crate::make_builtin_function_with_arity("fsync", |args| sync_fd(args, "fsync"), 1),
-    );
-    crate::module_ns_store(
-        ns,
-        "fdatasync",
-        crate::make_builtin_function_with_arity("fdatasync", |args| sync_fd(args, "fdatasync"), 1),
-    );
-    crate::module_ns_store(ns, "access", crate::make_builtin_function("access", access));
-    crate::module_ns_store(
-        ns,
-        "write",
-        crate::make_builtin_function("write", write),
-    );
-    crate::module_ns_store(
-        ns,
-        "uname",
-        crate::make_builtin_function_with_arity("uname", uname, 0),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "ftruncate", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("fsync", |args| sync_fd(args, "fsync"), 1); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "fsync", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("fdatasync", |args| sync_fd(args, "fdatasync"), 1); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "fdatasync", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("access", access); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "access", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function("write", write); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "write", __pyre_stored) };
+    { let __pyre_stored = crate::make_builtin_function_with_arity("uname", uname, 0); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, "uname", __pyre_stored) };
     // `_io` asks this of every descriptor it wraps; no terminal is reachable,
     // and a descriptor that is not one has no encoding of its own.
-    crate::module_ns_store(
-        ns,
-        "device_encoding",
-        crate::make_builtin_function_with_arity(
+    { let __pyre_stored = crate::make_builtin_function_with_arity(
             "device_encoding",
             |args| {
                 // `interp_posix.device_encoding` takes `fd=c_int` even on a
@@ -1768,8 +1628,7 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
-    );
+        ); crate::module_ns_store_slot(ns_slot, "device_encoding", __pyre_stored) };
     // ── the constants those entry points are called with ──
     let constants: &[(&str, i64)] = &[
         ("O_RDONLY", oflag::RDONLY),
@@ -1794,7 +1653,7 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ("SEEK_END", 2),
     ];
     for (name, value) in constants {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        { let __pyre_stored = pyre_object::w_int_new(*value); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, name, __pyre_stored) };
     }
     Ok(())
 }

@@ -1993,9 +1993,21 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
                 }
             }
         }
-        let start_key = pyre_object::unicodeobject::intern_str_value("start");
-        let start =
-            unsafe { pyre_object::w_dict_lookup(kwargs, start_key) }.unwrap_or(w_int_new(1));
+        let start = {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let kw_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(kwargs);
+            let args_base = pyre_object::gc_roots::pin_roots(args);
+            let _ = args_base;
+            let start_key = pyre_object::unicodeobject::intern_str_value("start");
+            unsafe {
+                pyre_object::w_dict_lookup(
+                    pyre_object::gc_roots::shadow_stack_get(kw_slot),
+                    start_key,
+                )
+            }
+            .unwrap_or(w_int_new(1))
+        };
         (&args[..args.len() - 1], start)
     } else if args.len() >= 2 {
         return Err(pyre_interpreter::PyError::type_error(

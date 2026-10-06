@@ -16,7 +16,7 @@ pub static BYTEARRAY_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
 
 /// Python bytearray object.
 ///
-/// Layout: `[ob_header | data | length | alloc | logical_offset | exports]`
+/// Layout: `[ob_header | data | length | alloc | logical_offset | exports | cached_rstr]`
 #[repr(C)]
 pub struct W_BytearrayObject {
     pub ob_header: PyObject,
@@ -58,6 +58,13 @@ pub struct W_BytearrayObject {
     /// `_exports` — count of active buffer exports.  Size-changing mutators
     /// are refused while this is positive (`_check_exports`).
     pub exports: i64,
+    /// Cached rstr of the current payload.
+    ///
+    /// `''.join` materialises a list of chars into an rstr before a later
+    /// read can see both shapes. The `Vec` is not that rstr, so the copy
+    /// lives here until a mutator clears the slot. The collector reclaims
+    /// the block once the slot is null.
+    pub cached_rstr: *mut crate::bytesobject::BytesBlock,
 }
 
 /// The translated user-subclass layout selected by `typedef.py _getusercls`.
@@ -168,6 +175,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         alloc,
         logical_offset: 0,
         exports: 0,
+        cached_rstr: std::ptr::null_mut(),
     };
     if !raw.is_null() {
         unsafe {
@@ -250,6 +258,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
             alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
             logical_offset: 0,
             exports: 0,
+            cached_rstr: std::ptr::null_mut(),
         },
         map: 0,
         storage: std::ptr::null_mut(),
@@ -309,6 +318,7 @@ pub unsafe fn w_bytearray_capacity(obj: PyObjectRef) -> usize {
 pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
+        bytearray_invalidate_cached_rstr(ba);
         let size = (*ba.data).len();
         // Above the early return: `length` tracks every change, while `alloc`
         // only moves when the resize policy says it should.
@@ -341,7 +351,11 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_advance_logical_start(obj: PyObjectRef, amount: usize) {
-    unsafe { (*(obj as *mut W_BytearrayObject)).logical_offset += amount }
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        bytearray_invalidate_cached_rstr(ba);
+        ba.logical_offset += amount;
+    }
 }
 
 /// # Safety
@@ -360,6 +374,7 @@ pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
 pub unsafe fn w_bytearray_setitem(obj: PyObjectRef, index: usize, value: u8) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
+        bytearray_invalidate_cached_rstr(ba);
         (&mut *ba.data)[index] = value;
     }
 }
@@ -408,6 +423,7 @@ pub extern "C" fn bh_w_bytearray_find(obj: PyObjectRef, value: i64, start: i64) 
 pub unsafe fn w_bytearray_extend(obj: PyObjectRef, other: &[u8]) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
+        bytearray_invalidate_cached_rstr(ba);
         let old_size = (*ba.data).len();
         (*ba.data).extend_from_slice(other);
         w_bytearray_sync_alloc(obj, old_size);
@@ -425,6 +441,41 @@ pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
     }
 }
 
+/// The payload as an rstr (`''.join` of the char list).
+///
+/// A hit returns the stored block. A miss copies the current `Vec` into
+/// a fresh block and stores it. The copy is residual: the `Vec` layout is
+/// not the rstr header. A mutator clears the slot before it changes the
+/// buffer; the collector reclaims the old block on the next major GC.
+///
+/// # Safety
+/// `obj` must be a live bytearray.
+#[majit_macros::dont_look_inside]
+pub unsafe fn bytearray_cached_rstr(obj: PyObjectRef) -> *const crate::bytesobject::BytesBlock {
+    unsafe {
+        let ba = &*(obj as *const W_BytearrayObject);
+        let len = (*ba.data).len();
+        if !ba.cached_rstr.is_null() && (*ba.cached_rstr).length == len {
+            return ba.cached_rstr;
+        }
+        // `alloc_bytes_block` can collect before it reads `bytes`. Snapshot
+        // the payload first, and pin the bytearray so the store lands on
+        // the object the collector may have moved.
+        let snapshot = (*ba.data).clone();
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let block = crate::bytesobject::alloc_bytes_block(&snapshot);
+        let ba = &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_BytearrayObject);
+        ba.cached_rstr = block;
+        block
+    }
+}
+
+fn bytearray_invalidate_cached_rstr(ba: &mut W_BytearrayObject) {
+    ba.cached_rstr = std::ptr::null_mut();
+}
+
 /// Get a mutable reference to the internal data. Caller must ensure
 /// the bytearray is not aliased while the returned slice is live.
 /// # Safety
@@ -432,7 +483,8 @@ pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
     unsafe {
-        let ba = &*(obj as *const W_BytearrayObject);
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        bytearray_invalidate_cached_rstr(ba);
         &mut *ba.data
     }
 }
@@ -448,7 +500,8 @@ pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     unsafe {
-        let ba = &*(obj as *const W_BytearrayObject);
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        bytearray_invalidate_cached_rstr(ba);
         &mut *ba.data
     }
 }
@@ -506,6 +559,7 @@ mod tests {
                 + std::mem::size_of::<std::sync::atomic::AtomicUsize>()
                 + std::mem::size_of::<usize>() * 2
                 + std::mem::size_of::<i64>()
+                + std::mem::size_of::<*mut crate::bytesobject::BytesBlock>()
         );
         let obj = w_bytearray_subclass_from_bytes(b"ab", get_instantiate(&BYTEARRAY_TYPE));
         unsafe {
