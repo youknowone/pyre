@@ -264,6 +264,8 @@ fn build_semantic_program_via_active_frontend(
             // Paths are in dependency order, so a crate's callees from
             // earlier artefacts are already classified when it is.
             let mut stack_sensitive: Vec<String> = Vec::new();
+            let mut scope_owning_identities: Vec<String> = Vec::new();
+            let mut published_structs: Vec<front::mir::PublishedStructBody> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
@@ -272,7 +274,17 @@ fn build_semantic_program_via_active_frontend(
                 stack_sensitive.extend(front::mir::discover_stack_sensitive_fns(&llbc));
                 crate_names.push(llbc.crate_name().to_string());
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
+                // Earlier crates' answers are on the foreign decls before
+                // this crate's bodies are walked, so a call into one of
+                // them reads the defining crate's constructor.
+                front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
                 root_stack_touching.extend(front::mir::harvest_root_stack_touching_paths(&llbc));
+                for identity in front::mir::harvest_scope_owning_identities(&llbc) {
+                    if let Err(index) = scope_owning_identities.binary_search(&identity) {
+                        scope_owning_identities.insert(index, identity);
+                    }
+                }
+                published_structs.extend(front::mir::harvest_published_structs(&llbc));
                 root_stack_crates.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
                 duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
@@ -319,9 +331,13 @@ fn build_semantic_program_via_active_frontend(
             let mut seen_struct_names = std::collections::HashSet::new();
             let mut seen_trait_names = std::collections::HashSet::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
+            published_structs.sort_by(|a, b| a.path.cmp(&b.path));
+            published_structs.dedup_by(|a, b| a.path == b.path);
             for (ord, p) in paths.iter().enumerate() {
-                let llbc = majit_charon_reader::Llbc::load(p)
+                let mut llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
+                front::mir::apply_published_structs(&mut llbc, &published_structs);
                 declared_gc.absorb(front::mir::harvest_declared_gc_facts(&llbc));
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());

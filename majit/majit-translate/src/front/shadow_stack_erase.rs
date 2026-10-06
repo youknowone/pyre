@@ -233,7 +233,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
+    let forward_blocks = super::forward_reachable_mask(llbc, &body);
     for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && let Some(class) = classify_call(call, llbc)
         {
@@ -246,7 +250,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     if !llbc.stack_sensitive_fns_complete() {
         return Err("callee-stack-effects-unknown");
     }
-    for block in &body.body {
+    let forward_blocks = super::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             // A classified leaf is this body's own bracket; `stack_sensitivity`
             // models it the same way and only consults the sensitive set for
@@ -629,7 +637,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     for local in plan.specials.keys() {
         watched.insert(*local);
     }
+    let forward_blocks = super::forward_reachable_mask(llbc, &body);
     for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
         if !visited[bb] {
             continue;
         }
@@ -1211,7 +1223,11 @@ pub fn discover_stack_sensitive_fns(llbc: &Llbc) -> Vec<String> {
             continue;
         };
         if first_pass {
-            for block in &body.body {
+            let forward_blocks = super::forward_reachable_mask(llbc, &body);
+            for (bb_idx, block) in body.body.iter().enumerate() {
+                if !forward_blocks[bb_idx] {
+                    continue;
+                }
                 if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
                     && let Some(path) = callee_path(call, llbc)
                 {
