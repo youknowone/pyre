@@ -1131,6 +1131,16 @@ fn real_main() {
                     "runtime_ops",
                     "binary_slice_values_inner",
                 ]),
+                // `w_list_getitem` is `dont_look_inside`. The getitem
+                // descent looks this lock-free body up by name
+                // (`jitcode_runtime.rs list_getitem_jitcode`). The portal
+                // closure does not reach the split, so seed it like
+                // `binary_slice_values_inner`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_getitem_inner",
+                ]),
                 // `W_FastListIterObject.descr_next` is residual `jit_next`.
                 // The portal never calls this split, so the descent looks the
                 // body up by this one graph key.
