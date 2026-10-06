@@ -6126,6 +6126,19 @@ fn type_for_opref(
     Ok(Type::Int)
 }
 
+fn heap_mem_flags(opcode: OpCode) -> MemFlagsData {
+    // Non-trusted, no notrap: Cranelift must not hoist the access past
+    // a guard. `_genop_gc_load` / `load_from_mem` address a naturally
+    // aligned GC field or array item; `with_aligned` matches that MOV.
+    // `RawLoadI` / `RawLoadF` / `RawStore` take a byte offset
+    // (`RawMemTests.test_raw_storage_int` / `test_raw_storage_float`
+    // use 3 and 4) and stay unaligned.
+    match opcode {
+        OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore => MemFlagsData::new(),
+        _ => MemFlagsData::new().with_aligned(),
+    }
+}
+
 fn emit_load_from_addr(
     builder: &mut FunctionBuilder,
     addr: CValue,
@@ -6135,16 +6148,9 @@ fn emit_load_from_addr(
     signed: bool,
     opcode: OpCode,
 ) -> Result<CValue, BackendError> {
-    // Use non-trusted MemFlagsData so Cranelift does NOT speculate loads
-    // past guards. With trusted(), Cranelift can hoist a load before
-    // a GuardNonnull branch, causing SEGFAULT on null pointers.
-    // RPython's x86 backend emits in IR order (no scheduling), so
-    // loads after guards are safe. Cranelift needs this annotation.
     // `offset` is `assembler.py` `mem` / `_genop_gc_load`: AddressLoc
     // with a displacement, not a separate ADD then a zero-disp load.
-    // `with_aligned` does not set notrap, so the load still cannot pass
-    // a guard; it only matches the aligned `load_from_mem` MOV.
-    let heap_flags = MemFlagsData::new().with_aligned();
+    let heap_flags = heap_mem_flags(opcode);
     match value_type {
         Type::Float => {
             match size {
@@ -6216,20 +6222,17 @@ fn emit_store_to_addr(
     size: usize,
     opcode: OpCode,
 ) -> Result<(), BackendError> {
+    let heap_flags = heap_mem_flags(opcode);
     match value_type {
         Type::Float => {
             let fval = coerce_ty(builder, value, cl_types::F64);
             match size {
                 4 => {
                     let f32val = builder.ins().fdemote(cl_types::F32, fval);
-                    builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), f32val, addr, offset);
+                    builder.ins().store(heap_flags, f32val, addr, offset);
                 }
                 8 => {
-                    builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), fval, addr, offset);
+                    builder.ins().store(heap_flags, fval, addr, offset);
                 }
                 _ => {
                     return Err(unsupported_semantics(
@@ -6257,9 +6260,7 @@ fn emit_store_to_addr(
             } else {
                 builder.ins().ireduce(mem_ty, value)
             };
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), store_val, addr, offset);
+            builder.ins().store(heap_flags, store_val, addr, offset);
         }
         Type::Void => {
             return Err(unsupported_semantics(
