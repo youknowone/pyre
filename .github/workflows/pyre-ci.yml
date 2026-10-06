@@ -1410,7 +1410,6 @@ jobs:
       if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
       shell: bash
       env:
-        PYTHONUNBUFFERED: "1"
         CPYTHON_SUITE_PARTIAL: cpython-suite-partial.jsonl
       run: |
         sudo sysctl -w vm.overcommit_memory=1 || echo "note: could not relax overcommit; fork-heavy modules may report ENOMEM"
