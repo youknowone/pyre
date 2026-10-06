@@ -7956,7 +7956,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // BINARY_SLICE walks `runtime_ops::binary_slice_values_inner` so
     // `is_list` / `is_str` / `is_tuple` are recorded guards and a custom
-    // `__index__` is the body's `eval_slice_index`. Not a spec-fold row.
+    // `__index__` is the body's `eval_slice_index`. Bytes / bytearray /
+    // user `__getitem__` stay in `binary_slice_getitem_fallback`. Not a
+    // spec-fold row.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 3

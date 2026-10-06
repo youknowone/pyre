@@ -3948,14 +3948,10 @@ pub unsafe fn ll_listslice_ints(obj: PyObjectRef, start: usize, n: usize) -> PyO
 }
 
 pub unsafe fn ll_listslice_floats(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
-    let list = &*(obj as *const W_ListObject);
-    let _len = list.float_items.as_slice().len();
     ll_listslice_new_float_list(obj, start, n)
 }
 
 pub unsafe fn ll_listslice_objects(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
-    let list = &*(obj as *const W_ListObject);
-    let _len = list.object_items_as_slice().len();
     ll_listslice_new_object_list(obj, start, n)
 }
 

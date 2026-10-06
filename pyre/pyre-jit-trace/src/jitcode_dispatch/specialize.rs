@@ -6843,7 +6843,10 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
 /// with no jitcode of its own. The wrapper holds `push_roots`; this inner
 /// body's `is_list` / `is_str` / `is_tuple` tests are the guards; a custom
 /// `__index__` is the body's `eval_slice_index` (`sliceobject.py`
-/// `_eval_slice_index`). Not a spec-fold row.
+/// `_eval_slice_index`). Bytes / bytearray / user `__getitem__` stay in
+/// `binary_slice_getitem_fallback` (`dont_look_inside`): `w_slice_new`'s
+/// `push_roots` is a RAII `RootScope` and cannot be residualised inside
+/// this walk. Not a spec-fold row.
 const BINARY_SLICE_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::runtime_ops::binary_slice_values_inner",
     commit_label: "binary_slice_commit",

@@ -259,6 +259,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_getslice_advance
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_getslice_step1_block
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_iter_descr_next
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_ll_listslice_startstop
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_slice_startstop
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_attr_stored
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_attr_stored_is_cell
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_del_annotations
@@ -1527,6 +1528,8 @@ two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_unary_negative
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_unary_not
 two-phase-never-a-subject	pyre_interpreter::pytraceback::record_application_traceback
 two-phase-never-a-subject	pyre_interpreter::pytraceback::w_pytraceback_new
+two-phase-never-a-subject	pyre_interpreter::runtime_ops::binary_slice_values
+two-phase-never-a-subject	pyre_interpreter::runtime_ops::binary_slice_values_inner
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::build_list_from_refs
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::build_map_from_refs
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::build_tuple_from_args
@@ -2268,6 +2271,7 @@ two-phase-never-a-subject	pyre_object::listobject::<Impl>::ascii_grow
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::install_ascii_items
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::live_len
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_grow
+two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_items_as_slice
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_push
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_remove
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_resize_capacity
@@ -2290,10 +2294,15 @@ two-phase-never-a-subject	pyre_object::listobject::ll_list_int_resize_ge
 two-phase-never-a-subject	pyre_object::listobject::ll_list_int_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::ll_list_obj_resize_ge
 two-phase-never-a-subject	pyre_object::listobject::ll_list_obj_resize_hint_really
+two-phase-never-a-subject	pyre_object::listobject::ll_listslice_inner
+two-phase-never-a-subject	pyre_object::listobject::ll_listslice_ints
+two-phase-never-a-subject	pyre_object::listobject::ll_listslice_new_int_list
+two-phase-never-a-subject	pyre_object::listobject::ll_listslice_objects
 two-phase-never-a-subject	pyre_object::listobject::range_list_item_unchecked
 two-phase-never-a-subject	pyre_object::listobject::range_list_length
 two-phase-never-a-subject	pyre_object::listobject::range_list_start_step
 two-phase-never-a-subject	pyre_object::listobject::switch_to_correct_strategy
+two-phase-never-a-subject	pyre_object::listobject::w_list_adopt_int_items
 two-phase-never-a-subject	pyre_object::listobject::w_list_append
 two-phase-never-a-subject	pyre_object::listobject::w_list_append_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_from_storage_and_strategy
@@ -2353,6 +2362,8 @@ two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::set
 two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::with_capacity
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_storage
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_managed_collecting
+two-phase-never-a-subject	pyre_object::unicodeobject::w_str_get_index_storage
+two-phase-never-a-subject	pyre_object::unicodeobject::w_str_index_to_byte
 two-phase-never-a-subject	pyre_object::weakref::w_weakref_new
 two-phase-never-a-subject	rordereddict::RDict::clone__spec_BytesKey_PyObject_Fnv1aHasher__ca5e60150879ec51
 two-phase-never-a-subject	rordereddict::RDict::clone__spec_IdentityKey_PyObject_RandomState_5378d02acc232104

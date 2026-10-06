@@ -962,7 +962,7 @@ pub(crate) fn binary_slice_values_inner(
         // receiver included, since its type says nothing about whether it moves.
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let obj = pyre_object::gc_roots::pin_root(obj);
-        let _start_slot = pyre_object::gc_roots::shadow_stack_len();
+        let start_slot = pyre_object::gc_roots::shadow_stack_len();
         let start = pyre_object::gc_roots::pin_root(start);
         let stop_slot = pyre_object::gc_roots::shadow_stack_len();
         let stop = pyre_object::gc_roots::pin_root(stop);
@@ -1076,12 +1076,38 @@ pub(crate) fn binary_slice_values_inner(
         }
         // Fall back to slice(start, stop) → getitem dispatch.
         // Handles bytes, bytearray, instances with __getitem__, etc.
-        let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
-        // The receiver is live across that allocation, and the fresh slice has
-        // no heap edge until `getitem` stores it.
-        let slice_obj = pyre_object::gc_roots::pin_root(slice_obj);
-        crate::baseobjspace::getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), slice_obj)
+        binary_slice_getitem_fallback(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(start_slot),
+            pyre_object::gc_roots::shadow_stack_get(stop_slot),
+        )
     }
+}
+
+/// [`binary_slice_values_inner`] for every type the list / str / tuple
+/// arms do not slice. `space.getitem` over `space.newslice`.
+///
+/// `w_slice_new` brackets its malloc with `push_roots`
+/// (`gct_fv_gc_malloc`). Residualising that RAII `RootScope` inside a
+/// look-inside walk drops the shadow stack at the residual return, and
+/// the inlined write of `W_SliceObject` then reads `start` / `stop` /
+/// `step` from the wrong slots. Keep the whole fallback opaque, matching
+/// `convert_value_slow`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn binary_slice_getitem_fallback(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let start = pyre_object::gc_roots::pin_root(start);
+    let stop = pyre_object::gc_roots::pin_root(stop);
+    let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
+    let slice_obj = pyre_object::gc_roots::pin_root(slice_obj);
+    crate::baseobjspace::getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), slice_obj)
 }
 
 fn build_list_from_args(args: &[PyObjectRef]) -> PyObjectRef {
