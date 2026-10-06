@@ -2289,17 +2289,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // `locals_cells_stack_w` is the virtualizable array `f_locals` reads,
         // so its descr carries the active vinfo (`vinfo is fielddescr.get_vinfo()`).
         let fielddescr = info.array_pointer_field_descr(0);
-        let guards_before = ctx.trace_ctx.num_guards();
         let nonstandard = vable_ops::with_replace_frames(ctx, |ctx| {
-            ctx.trace_ctx
-                .nonstandard_virtualizable(op_pc, obj, &fielddescr)
-        });
-        resume_snapshot::walker_capture_inline_nonstandard_vable_guard(
-            ctx,
-            op_pc,
-            guards_before,
-            None,
-        )?;
+            vable_ops::walker_nonstandard_virtualizable(ctx, op_pc, obj, &fielddescr)
+        })?;
         if !nonstandard && let Some(standard) = ctx.trace_ctx.standard_virtualizable_box() {
             obj = standard;
         }
@@ -12248,15 +12240,18 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         let index_const = ctx.trace_ctx.const_int(i as i64);
         index_consts.push(index_const);
         let (slot_op, _) = vable_ops::with_replace_frames(ctx, |ctx| {
-            ctx.trace_ctx.vable_getarrayitem_ref_indexed(
+            let nonstandard =
+                vable_ops::walker_nonstandard_virtualizable(ctx, op.pc, vable_op, &fdescr)?;
+            Ok(ctx.trace_ctx.vable_getarrayitem_ref_checked(
+                nonstandard,
                 op.pc,
                 vable_op,
                 index_const,
                 i as i64,
                 fdescr.clone(),
                 adescr.clone(),
-            )
-        });
+            ))
+        })?;
         // `pyframe.py:566-571` branches on the slot being bound; pin the
         // direction so a slot that changes bound-ness side-exits instead of
         // publishing a mapping with the wrong key set.  A slot the trace

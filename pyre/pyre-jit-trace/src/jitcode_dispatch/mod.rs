@@ -1707,23 +1707,25 @@ fn emit_traceback_node<Sym: WalkSym>(
         .ok_or_else(unavailable)?;
     let last_instr_descr = vinfo.static_field_descr(last_instr_index);
     // A traceback node names an inlined callee's frame as often as the walk's
-    // own, and a frame that is not `virtualizable_boxes[-1]` sends
-    // `vable_setfield` down the `_nonstandard_virtualizable` path, which mints
-    // a PTR_EQ promote `GuardValue` internally with no resume snapshot.  Every
-    // other vable emit site pairs the call with this capture for that reason;
-    // without it the promote reaches the decoder holding
-    // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
-    let guards_before = ctx.trace_ctx.num_guards();
+    // own. Promote the `_nonstandard_virtualizable` `isstandard` PTR_EQ
+    // through the walker `implement_guard_value` so the snapshot is complete
+    // when recorded.
     let write = vable_ops::with_replace_frames(ctx, |ctx| {
-        ctx.trace_ctx.vable_setfield(
+        let nonstandard = vable_ops::walker_nonstandard_virtualizable(
+            ctx,
             opcode_position,
             site.frame,
-            last_instr_descr,
+            &last_instr_descr,
+        )?;
+        Ok(ctx.trace_ctx.vable_setfield_checked(
+            nonstandard,
+            site.frame,
+            last_instr_descr.clone(),
             last_instr_value,
             Some(Value::Int(i64::from(site.last_instruction))),
-        )
-    });
-    walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
+        ))
+    })?;
+    let _ = write;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr_for(kind, user);
     ctx.trace_ctx.record_op_with_descr(
@@ -3116,7 +3118,7 @@ pub enum DispatchError {
     /// virtualizable frame box. Pyre's walker initializes Ref register
     /// slots to `OpRef::None`; an inlined callee frame may leave the vable
     /// register unseeded (documented walker arg-seeding gap). Both vable
-    /// accessors route through `is_nonstandard_virtualizable` →
+    /// accessors route through `begin_nonstandard_virtualizable` →
     /// `heapcache.nonstandard_virtualizables_now_known(box)`, which would
     /// feed `OpRef::None` (`raw() == u32::MAX`) into the dense heapcache
     /// flag `Vec<u32>`, resizing it to `u32::MAX + 1` (16 GiB). Surface as

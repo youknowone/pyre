@@ -321,9 +321,7 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
 /// are *different* constants and cannot be equal at runtime either — the
 /// `PTR_EQ` folds to `ConstInt(0)` and `implement_guard_value`'s Const arm then
 /// declines the promote, leaving neither the comparison nor a `GUARD_VALUE` in
-/// the trace. `capture_vable_promote_guard` derives its stamp count from
-/// `ctx.num_guards()` rather than assuming one, so minting none is a case it
-/// already handles.
+/// the trace.
 #[test]
 fn a_constant_vable_folds_the_step_four_ptr_eq_away() {
     for arm in [Arm::Get, Arm::Set] {

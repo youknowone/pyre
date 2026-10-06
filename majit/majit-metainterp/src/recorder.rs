@@ -180,39 +180,10 @@ impl Snapshot {
     }
 }
 
-/// `jitcode_index` for a frame the recorder minted with no real coordinate.
-///
-/// `crate::history::TraceCtx::record_guard_with_snapshot` attaches a
-/// one-frame snapshot to the interpreter-side promotes purely to satisfy
-/// `resume.py`'s `assert resume_position >= 0`.  That layer is the
-/// recorder-side trace buffer and holds no `MIFrameStack`, so it has no
-/// position to put in the frame; the dispatch layer re-stamps it with the
-/// walker's real coordinate before the guard is finalized.
-///
-/// The value has to be one no jitcode table can hold. `0` — what this frame
-/// carried before — is a live slot, so a *missed* re-stamp reads as a
-/// legitimate frame: the decoder sizes the frame from that entry's liveness
-/// and then reads that many tagged words, none of which the placeholder wrote.
-/// Out of range, `frame_value_count` answers `0` instead, which is what the
-/// frame actually holds, and pyre's `frame_value_count_at` reports the missed
-/// re-stamp by name rather than as an opaque `jitcode_index=0`.
-///
-/// The choice of `-2` is forced from both ends. The frame crosses into the
-/// `i32`-typed `resume::SnapshotFrame` / `resumedata::RebuiltFrame` as
-/// `x as i32` and is then written to `rd_numb` through
-/// `resumecode::Writer::append_int`, which asserts the value round-trips
-/// through `i16` — so nothing above `32767` survives. Below zero, `-1` is
-/// taken: `create_empty_top_snapshot` (`opencoder.rs`) writes it for the
-/// snapshot that precedes any entered frame. `-2` is the first free value,
-/// and `x as usize` puts it past the end of every jitcode table.
-pub const UNSTAMPED_JITCODE_INDEX: u32 = -2i32 as u32;
-
 /// One frame in a snapshot — corresponds to one MIFrame/JitCode position.
 #[derive(Clone, Debug)]
 pub struct SnapshotFrame {
-    /// Index of the jitcode (or 0 for the root portal), or
-    /// [`UNSTAMPED_JITCODE_INDEX`] for a frame awaiting the dispatch layer's
-    /// re-stamp.
+    /// Index of the jitcode (or 0 for the root portal).
     pub jitcode_index: u32,
     /// Program counter within the jitcode: the JitCode byte offset, as the
     /// MIFrame's `pc` field is upstream (`pyjitpl.py setposition`). Both
@@ -281,8 +252,7 @@ pub struct Trace {
     /// `record_guard*` entry points (the only producers — `record_op` /
     /// `record_op_with_descr` assert the opcode is not a guard) and
     /// restored by [`Self::cut`] from `TracePosition::guard_count`.
-    /// `num_guards` is consulted once per traced vable op
-    /// (`walker_capture_inline_nonstandard_vable_guard`), so counting by
+    /// `num_guards` is consulted once per traced vable op, so counting by
     /// scanning `ops` made tracing quadratic in trace length.
     guard_count: usize,
     /// opencoder.py parity: count of box-yielding positions
@@ -599,19 +569,11 @@ impl Trace {
     }
 
     fn encode_jitcode_index(idx: u32) -> i64 {
-        if idx == UNSTAMPED_JITCODE_INDEX {
-            -2
-        } else {
-            i64::from(idx)
-        }
+        i64::from(idx)
     }
 
     pub(crate) fn decode_jitcode_index(idx: i64) -> u32 {
-        if idx == -2 {
-            UNSTAMPED_JITCODE_INDEX
-        } else {
-            idx as u32
-        }
+        idx as u32
     }
 
     fn snapshot_tagged_to_box(&self, tagged: SnapshotTagged) -> OcBox {
@@ -2037,25 +1999,6 @@ mod tests {
     use super::*;
     use majit_ir::{Descr, DescrRef, FailDescr, Type};
     use std::sync::Arc;
-
-    /// The three constraints that pick [`UNSTAMPED_JITCODE_INDEX`], asserted
-    /// together so a future edit to the value fails here instead of silently
-    /// re-aliasing a coordinate the decoder accepts.
-    #[test]
-    fn unstamped_jitcode_index_is_reserved_and_encodable() {
-        let idx = UNSTAMPED_JITCODE_INDEX as i32;
-        // Written to `rd_numb` through `resumecode::Writer::append_int`, which
-        // asserts the value round-trips through `i16`.
-        assert_eq!(idx as i16 as i32, idx, "must survive the rd_numb i16 write");
-        // `-1` is `create_empty_top_snapshot`'s own frame index.
-        assert_ne!(idx, -1, "collides with the empty-top-snapshot index");
-        // Every `frame_value_count` decoder resolves the frame with
-        // `jitcodes.get(jitcode_index as usize)`; the reserved value must miss.
-        assert!(
-            (idx as usize) > u32::MAX as usize,
-            "must be out of range for any jitcode table"
-        );
-    }
 
     fn iarg(pos: u32) -> OpRef {
         OpRef::input_arg_int(pos)

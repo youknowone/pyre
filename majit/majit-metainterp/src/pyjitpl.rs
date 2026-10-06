@@ -2,6 +2,7 @@ pub mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
+pub use dispatch::implement_guard_value_on_frames;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     MergePointBanks, RecycleFramestackOnDrop, StandaloneFrameStack, decode_jit_merge_point_banks,
@@ -7264,15 +7265,10 @@ impl<M: Clone> MetaInterp<M> {
 
     //
     // pyjitpl.py `_nonstandard_virtualizable(pc, box, fielddescr)`
-    // is implemented in `TraceCtx::is_nonstandard_virtualizable` with the
-    // full Step 1..5b shape; the opimpl_*_vable thin wrappers below forward
-    // to `TraceCtx::vable_*` which are the line-by-line port of RPython's
-    // `opimpl_*_vable` opcode handlers. The earlier `MetaInterp` duplicate
-    // (with its own `is_standard_virtualizable` / `nonstandard_virtualizable`
-    // / `virtualizable_field_index` / `get_arrayitem_vable_index` /
-    // `check_synchronized_virtualizable` helpers) was a pyre-introduced
-    // duplication of the same logic and has been removed in favour of the
-    // single TraceCtx implementation.
+    // is `begin_nonstandard_virtualizable` + `implement_guard_value` +
+    // `commit_nonstandard_virtualizable` on the live framestack
+    // (`nonstandard_on_frames`); the opimpl_*_vable thin wrappers below
+    // take that decision then call `TraceCtx::vable_*_checked`.
 
     /// pyjitpl.py `MetaInterp.replace_box(oldbox, newbox)`.
     ///
@@ -7384,17 +7380,51 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    fn with_tracing_vable<R>(&mut self, f: impl FnOnce(&mut TraceCtx) -> R) -> R {
-        let frames = &mut self.framestack as *mut crate::pyjitpl::MIFrameStack;
+    /// Split `tracing` and `framestack` so a vable op can record
+    /// `implement_guard_value` against the live frames
+    /// (`pyjitpl.py generate_guard` / `capture_resumedata`).
+    fn with_ctx_and_frames<R>(
+        &mut self,
+        f: impl FnOnce(&mut TraceCtx, &mut crate::pyjitpl::MIFrameStack) -> R,
+    ) -> R {
+        let frames_ptr = &mut self.framestack as *mut crate::pyjitpl::MIFrameStack;
         let ctx = self
             .tracing
             .as_mut()
             .expect("vable op requires active tracing");
-        unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
+        unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames_ptr.cast()) };
         // SAFETY: the guard is a local of this call and `ctx` is borrowed for
         // longer, so it is dropped while the `TraceCtx` it names is alive.
         let _clear = unsafe { ClearReplaceFrames::new(ctx) };
-        f(ctx)
+        f(ctx, unsafe { &mut *frames_ptr })
+    }
+
+    /// `pyjitpl.py MIFrame._nonstandard_virtualizable`: `begin` +
+    /// `implement_guard_value` + `commit` on the live framestack.
+    fn nonstandard_on_frames(
+        ctx: &mut TraceCtx,
+        frames: &mut crate::pyjitpl::MIFrameStack,
+        pc: usize,
+        vable_opref: OpRef,
+        fielddescr: &DescrRef,
+    ) -> bool {
+        match ctx.begin_nonstandard_virtualizable(pc, vable_opref, fielddescr) {
+            crate::NonstandardVable::Decided(nonstandard) => nonstandard,
+            crate::NonstandardVable::PendingEq {
+                eqbox,
+                isstandard,
+                vable_opref,
+                standard_box,
+            } => {
+                let promoted = implement_guard_value_on_frames(ctx, frames, eqbox, isstandard, pc);
+                ctx.commit_nonstandard_virtualizable(
+                    promoted,
+                    vable_opref,
+                    standard_box,
+                    fielddescr,
+                )
+            }
+        }
     }
 
     /// `vable_struct_ptr` is the live struct pointer for the
@@ -7408,8 +7438,16 @@ impl<M: Clone> MetaInterp<M> {
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let cpu = self.cpu.clone();
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_getfield_int(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard =
+                Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
+            ctx.vable_getfield_int_checked(
+                nonstandard,
+                cpu.as_ref(),
+                vable_opref,
+                vable_struct_ptr,
+                fielddescr,
+            )
         })
     }
 
@@ -7422,8 +7460,16 @@ impl<M: Clone> MetaInterp<M> {
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let cpu = self.cpu.clone();
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_getfield_ref(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard =
+                Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
+            ctx.vable_getfield_ref_checked(
+                nonstandard,
+                cpu.as_ref(),
+                vable_opref,
+                vable_struct_ptr,
+                fielddescr,
+            )
         })
     }
 
@@ -7436,8 +7482,16 @@ impl<M: Clone> MetaInterp<M> {
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let cpu = self.cpu.clone();
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_getfield_float(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard =
+                Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
+            ctx.vable_getfield_float_checked(
+                nonstandard,
+                cpu.as_ref(),
+                vable_opref,
+                vable_struct_ptr,
+                fielddescr,
+            )
         })
     }
 
@@ -7450,8 +7504,10 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
     ) {
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard =
+                Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
+            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, Some(concrete));
         });
     }
 
@@ -7464,8 +7520,10 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
     ) {
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard =
+                Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
+            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, Some(concrete));
         });
     }
 
@@ -7478,8 +7536,10 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
     ) {
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard =
+                Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
+            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, Some(concrete));
         });
     }
 
@@ -7493,8 +7553,15 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_getarrayitem_int_indexed(
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            let index = if nonstandard {
+                index
+            } else {
+                implement_guard_value_on_frames(ctx, frames, index, index_runtime_value, pc)
+            };
+            ctx.vable_getarrayitem_int_checked(
+                nonstandard,
                 pc,
                 vable_opref,
                 index,
@@ -7515,8 +7582,15 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_getarrayitem_ref_indexed(
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            let index = if nonstandard {
+                index
+            } else {
+                implement_guard_value_on_frames(ctx, frames, index, index_runtime_value, pc)
+            };
+            ctx.vable_getarrayitem_ref_checked(
+                nonstandard,
                 pc,
                 vable_opref,
                 index,
@@ -7537,8 +7611,15 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_getarrayitem_float_indexed(
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            let index = if nonstandard {
+                index
+            } else {
+                implement_guard_value_on_frames(ctx, frames, index, index_runtime_value, pc)
+            };
+            ctx.vable_getarrayitem_float_checked(
+                nonstandard,
                 pc,
                 vable_opref,
                 index,
@@ -7561,8 +7642,15 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let stored = self.with_tracing_vable(|ctx| {
-            ctx.vable_setarrayitem_indexed(
+        let stored = self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            let index = if nonstandard {
+                index
+            } else {
+                implement_guard_value_on_frames(ctx, frames, index, index_runtime_value, pc)
+            };
+            ctx.vable_setarrayitem_checked(
+                nonstandard,
                 pc,
                 vable_opref,
                 index,
@@ -7592,8 +7680,15 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let stored = self.with_tracing_vable(|ctx| {
-            ctx.vable_setarrayitem_indexed(
+        let stored = self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            let index = if nonstandard {
+                index
+            } else {
+                implement_guard_value_on_frames(ctx, frames, index, index_runtime_value, pc)
+            };
+            ctx.vable_setarrayitem_checked(
+                nonstandard,
                 pc,
                 vable_opref,
                 index,
@@ -7623,8 +7718,15 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let stored = self.with_tracing_vable(|ctx| {
-            ctx.vable_setarrayitem_indexed(
+        let stored = self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            let index = if nonstandard {
+                index
+            } else {
+                implement_guard_value_on_frames(ctx, frames, index, index_runtime_value, pc)
+            };
+            ctx.vable_setarrayitem_checked(
+                nonstandard,
                 pc,
                 vable_opref,
                 index,
@@ -7652,10 +7754,11 @@ impl<M: Clone> MetaInterp<M> {
         adescr: DescrRef,
     ) -> OpRef {
         let cpu = self.cpu.clone();
-        self.with_tracing_vable(|ctx| {
-            ctx.vable_arraylen_vable(
+        self.with_ctx_and_frames(|ctx, frames| {
+            let nonstandard = Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fdescr);
+            ctx.vable_arraylen_vable_checked(
+                nonstandard,
                 cpu.as_ref(),
-                pc,
                 vable_opref,
                 vable_struct_ptr,
                 fdescr,
@@ -21162,9 +21265,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         // Two distinct `ConstPtr`s cannot be equal at runtime either, so the
         // funnel's fold is sound here and collapses the pair to `ConstInt(0)`;
-        // `promote_int` then short-circuits on it and no GUARD_VALUE is
-        // recorded. `PTR_EQ` reads no memory, so the fold does not depend on
-        // which backend `self.cpu` is.
+        // `implement_guard_value` then short-circuits on it and no GUARD_VALUE
+        // is recorded. `PTR_EQ` reads no memory, so the fold does not depend
+        // on which backend `self.cpu` is.
         let cpu = self.cpu.clone();
         let last_exc_value = self.last_exc_value;
         let eqbox_opref = {
@@ -21178,13 +21281,20 @@ impl<M: Clone> MetaInterp<M> {
                 last_exc_value,
             )
         };
-        // pyjitpl.py: eqbox = self.implement_guard_value(eqbox, pc)
-        // — pyre's `promote_int` records GUARD_VALUE on the result and
-        // returns the const ref the optimizer can constant-fold against.
-        let _ = pc;
+        // pyjitpl.py `MIFrame._do_jit_force_virtual`:
+        // `eqbox = self.implement_guard_value(eqbox, pc)`.
         let _eqbox_const = {
+            let frames_ptr = &mut self.framestack as *mut crate::pyjitpl::MIFrameStack;
             let ctx = self.tracing.as_mut()?;
-            ctx.promote_int(eqbox_opref, isstandard_int, 0)
+            unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames_ptr.cast()) };
+            let _clear = unsafe { ClearReplaceFrames::new(ctx) };
+            implement_guard_value_on_frames(
+                ctx,
+                unsafe { &mut *frames_ptr },
+                eqbox_opref,
+                isstandard_int,
+                pc,
+            )
         };
         // pyjitpl.py:2167-2171: isstandard branch.
         if isstandard_int != 0 {
@@ -30253,12 +30363,25 @@ mod tests {
     fn do_jit_force_virtual_preserves_standard_concrete_value() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
+        let mut asm = crate::Assembler::new();
+        let mut builder = crate::JitCodeBuilder::new();
+        builder.live(&mut asm, &[], &[], &[]);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        jitcode.set_index(0);
+        {
+            let sd = std::sync::Arc::get_mut(&mut meta.staticdata)
+                .expect("unique staticdata before tracing");
+            sd.op_live = crate::jitcode::insns::BC_LIVE as i32;
+            sd.liveness_info.set(asm.all_liveness().to_vec());
+        }
         let mut vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
+        meta.framestack
+            .push(crate::pyjitpl::MIFrame::new(jitcode, 0));
         let vable_addr = (&mut *vable as *mut ResidualCallVableObj) as usize as i64;
         let vref_box = {
             let ctx = meta.trace_ctx().unwrap();
@@ -30274,7 +30397,7 @@ mod tests {
             ._do_jit_force_virtual(
                 &allboxes,
                 descr.as_ref().as_call_descr().expect("call descr"),
-                0,
+                majit_jitcode::liveness::OFFSET_SIZE + 1,
             )
             .expect("should resolve to standard virtualizable");
 

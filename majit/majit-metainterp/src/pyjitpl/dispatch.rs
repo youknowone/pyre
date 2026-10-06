@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
-use crate::trace_ctx::{ClearReplaceFrames, VableArrayStore, VableEntryWrite};
+use crate::trace_ctx::{ClearReplaceFrames, NonstandardVable, VableArrayStore};
 use crate::{TraceAction, TraceCtx};
 
 /// Residual-call argument lists. Eight slots cover the common helper arity
@@ -54,7 +54,9 @@ enum GuardStampTarget {
     /// the case for every guard the dispatcher records itself.
     LastOp,
     /// A guard op counted back from the most recent one (`0` == the most
-    /// recent), for guards a `TraceCtx` helper emitted before returning.
+    /// recent), for a guard that is no longer last (`emit_force_virtualizable`
+    /// records GETFIELD_GC / PTR_NE / COND_CALL after a promote).
+    #[allow(dead_code)]
     GuardFromEnd(usize),
 }
 
@@ -1894,74 +1896,34 @@ where
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
     }
 
-    /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
-    /// internally, if it emitted one.
-    ///
-    /// The vable opcodes promote before they load: `get_arrayitem_vable_index`
-    /// promotes the array index, and `_nonstandard_virtualizable`
-    /// (`pyjitpl.py`) promotes the `isstandard` PTR_EQ for a frame that is
-    /// not the standard virtualizable. Both go through
-    /// `TraceCtx::record_guard_with_snapshot`, which has no `MIFrameStack` to
-    /// walk and so leaves the guard holding a frame marked
-    /// `recorder::UNSTAMPED_JITCODE_INDEX`. The dispatcher does hold the
-    /// framestack, so the real position is stamped here — upstream captures it
-    /// in `implement_guard_value` (`pyjitpl.py`) →
-    /// `generate_guard(GUARD_VALUE, resumepc=orgpc)` (`:2582`) →
-    /// `capture_resumedata` (`:2610`), all at the promote itself.
-    ///
-    /// `guards_before` is `ctx.num_guards()` read before the `vable_*` call:
-    /// the promotes are conditional (an already-constant index, or the
-    /// standard virtualizable short-circuiting at step 1) and emit nothing in
-    /// the common case, so an unchanged count means there is nothing to stamp.
-    /// One call can emit TWO: a vable array access whose symbolic frame box
-    /// differs from the standard box but shares its pointer promotes the
-    /// `isstandard` PTR_EQ and then the index, so every guard the call added is
-    /// stamped, not just the last. Framestack rewrite happens inside
-    /// `_nonstandard_virtualizable`. The loop runs in emission
-    /// order because each capture leaves the root frame's in-flight result slot
-    /// cleared.
-    ///
-    /// `write` is the shadow slot a `vable_set*` overwrote. Upstream reaches
-    /// `virtualizable_boxes[index] = valuebox` only after both promotes have
-    /// captured their resume data, so the slot is put back for the duration of
-    /// the capture — otherwise the guard's resume data carries the very write
-    /// its resume pc re-executes (see [`VableEntryWrite`]).
-    ///
-    /// `opcode_pc` is the vable op's own JitCode position. The lowering emits
-    /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
-    /// `jtransform.py:764/798/814/845/926`), so `opcode_pc - SIZE_LIVE_OP`
-    /// resolves the liveness the snapshot needs.
-    ///
-    /// Framestack rewrite now happens inside `_nonstandard_virtualizable`
-    /// via `set_replace_frames`, so this no longer drains a mailbox.
-    fn capture_vable_promote_guard(
+    /// `pyjitpl.py MIFrame._nonstandard_virtualizable`: record the
+    /// `isstandard` `PTR_EQ` and promote it through [`Self::implement_guard_value`]
+    /// so the `GUARD_VALUE` captures the live framestack at record time
+    /// (`generate_guard` → `capture_resumedata`).
+    fn nonstandard_virtualizable(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        opcode_pc: usize,
-        guards_before: usize,
-        write: Option<VableEntryWrite>,
-    ) {
-        let minted = ctx.num_guards().saturating_sub(guards_before);
-        if minted == 0 {
-            return;
-        }
-        let restored = write.and_then(|w| {
-            ctx.swap_virtualizable_entry(w.index, w.prev_box, w.prev_value)
-                .map(|current| (w.index, current))
-        });
-        for from_end in (0..minted).rev() {
-            self.publish_last_guard_resume_snapshot(
-                ctx,
-                sym,
-                opcode_pc,
-                false,
-                GuardStampTarget::GuardFromEnd(from_end),
-                None,
-            );
-        }
-        if let Some((index, (op, value))) = restored {
-            ctx.swap_virtualizable_entry(index, op, value);
+        pc: usize,
+        vable_opref: OpRef,
+        fielddescr: &majit_ir::DescrRef,
+    ) -> bool {
+        match ctx.begin_nonstandard_virtualizable(pc, vable_opref, fielddescr) {
+            NonstandardVable::Decided(nonstandard) => nonstandard,
+            NonstandardVable::PendingEq {
+                eqbox,
+                isstandard,
+                vable_opref,
+                standard_box,
+            } => {
+                let promoted = self.implement_guard_value(ctx, sym, eqbox, isstandard, pc);
+                ctx.commit_nonstandard_virtualizable(
+                    promoted,
+                    vable_opref,
+                    standard_box,
+                    fielddescr,
+                )
+            }
         }
     }
 
@@ -6003,6 +5965,58 @@ pub fn build_state_field_snapshot(
     }
 }
 
+/// `pyjitpl.py MIFrame.implement_guard_value` for a caller that owns
+/// the live `MIFrameStack`. `generate_guard` captures resume data at
+/// record time (`capture_resumedata`). An empty stack is a missing
+/// owner, not a snapshot-less guard.
+pub fn implement_guard_value_on_frames(
+    ctx: &mut TraceCtx,
+    frames: &mut MIFrameStack,
+    box_: OpRef,
+    runtime_value: i64,
+    resume_pc: usize,
+) -> OpRef {
+    if box_.is_constant() {
+        return box_;
+    }
+    if frames.frames.is_empty() {
+        panic!(
+            "implement_guard_value_on_frames: missing framestack \
+             (pyjitpl.py generate_guard / capture_resumedata)"
+        );
+    }
+    let promoted_box = ctx.const_int(runtime_value);
+    ctx.record_guard(OpCode::GuardValue, &[box_, promoted_box], 0);
+    let top_idx = frames.frames.len() - 1;
+    let saved_top_pc = frames.frames[top_idx].pc;
+    frames.frames[top_idx].pc = resume_pc;
+    let snapshot_id = if ctx.recorder.has_byte_buffer() {
+        ctx.capture_resumedata_from_framestack(&mut frames.frames, false)
+    } else {
+        let op_live = ctx.metainterp_sd().op_live as u8;
+        let all_liveness = ctx.metainterp_sd().liveness_info.snapshot_arc();
+        let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
+        let virtualref_snapshot = ctx.virtualref_boxes.clone();
+        let snapshot = build_state_field_snapshot(
+            frames,
+            op_live,
+            &all_liveness,
+            false,
+            &virtualizable_snapshot,
+            &virtualref_snapshot,
+            None,
+        );
+        ctx.capture_resumedata(snapshot)
+    };
+    frames.frames[top_idx].pc = saved_top_pc;
+    ctx.set_last_guard_resume_position(snapshot_id);
+    for frame in frames.frames.iter_mut() {
+        frame.replace_active_box_in_frame(box_, promoted_box, Type::Int);
+    }
+    ctx.replace_box(box_, promoted_box);
+    promoted_box
+}
+
 /// `opencoder.py _list_of_boxes_virtualizable` parity: identity-front
 /// reorder for the virtualizable box list.  `virtualizable_boxes[-1]` is the
 /// virtualizable identity (placed there by
@@ -7665,6 +7679,7 @@ mod tests {
         builder.live(&mut asm, &[0, 1], &[0], &[]);
         builder.vable_setarrayitem_int_with_base(0, 0, 0, 1);
         let jitcode = builder.finish();
+        jitcode.set_index(3);
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
@@ -7728,11 +7743,10 @@ mod tests {
              twice; got {:?}",
             guards.iter().map(|op| op.opcode).collect::<Vec<_>>(),
         );
-        // A guard `TraceCtx` minted internally already points at the one-frame
-        // placeholder `record_guard_with_snapshot` publishes, so a resume
-        // position alone proves nothing: the frame it names carries
-        // `UNSTAMPED_JITCODE_INDEX` until the dispatch layer re-stamps it, and
-        // resume decoding sizes the frame from that coordinate.
+        // Each promote captures through `implement_guard_value` →
+        // `record_state_guard` → `build_state_field_snapshot`, so the
+        // snapshot is complete at record time: a real `jitcode_index` and
+        // the live boxes from the `-live-` marker.
         for (i, guard) in guards.iter().enumerate() {
             let resume = guard.rd_resume_position();
             assert!(
@@ -7740,27 +7754,37 @@ mod tests {
                 "guard {i} ({:?}) was left without a resume position",
                 guard.opcode,
             );
-            let frames = &crate::recorder::Snapshot::by_resume_position(&snapshots, resume)
-                .expect("guard snapshot looked up by resume_position")
-                .frames;
-            assert!(
-                frames
-                    .iter()
-                    .all(|f| f.jitcode_index != crate::recorder::UNSTAMPED_JITCODE_INDEX),
-                "guard {i} ({:?}) still points at an unstamped frame",
+            let snap = crate::recorder::Snapshot::by_resume_position(&snapshots, resume)
+                .expect("guard snapshot looked up by resume_position");
+            let top = snap
+                .frames
+                .last()
+                .expect("generate_guard captures the live framestack");
+            assert_eq!(
+                top.jitcode_index, 3,
+                "guard {i} ({:?}) top frame jitcode_index",
                 guard.opcode,
+            );
+            assert!(
+                !top.boxes.is_empty(),
+                "guard {i} ({:?}) top frame must carry the live boxes; got {:?}",
+                guard.opcode,
+                top.boxes,
+            );
+            assert!(
+                !snap.vable_boxes.is_empty(),
+                "guard {i} ({:?}) must capture the virtualizable boxes; got {:?}",
+                guard.opcode,
+                snap.vable_boxes,
             );
         }
     }
 
     #[test]
     fn every_guard_one_vable_opcode_emits_gets_a_resume_position() {
-        // `set_guard_op_resume_position_from_end` is what lets a caller stamp
-        // more than the last guard: one vable array access can emit the
-        // `isstandard` PTR_EQ promote (`_nonstandard_virtualizable`,
-        // pyjitpl.py) and then the index promote (:1201-1216).
-        // Walking back over them leaves none holding the
-        // `UNSTAMPED_JITCODE_INDEX` frame the recorder mints.
+        // `set_guard_op_resume_position_from_end` stamps a guard that is no
+        // longer last: `emit_force_virtualizable` records GETFIELD_GC /
+        // PTR_NE / COND_CALL on top of a promote that captured later.
         let mut recorder = crate::recorder::Trace::new();
         let a = recorder.record_input_arg(majit_ir::Type::Int);
         recorder.record_guard(OpCode::GuardValue, &[a, OpRef::const_int(0)], None);

@@ -4488,7 +4488,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // post-merge LOOP-INPUT register (the merge-point reds), NOT from r0; that
     // register is left `OpRef::NONE` because the probe enters past the merge
     // point and never binds the reds.  `concrete_of_opref(NONE)` returns the
-    // `GcRef(usize::MAX)` sentinel → `is_nonstandard_virtualizable` takes the
+    // `GcRef(usize::MAX)` sentinel → `begin_nonstandard_virtualizable` takes the
     // nonstandard leg → `getarrayitem_vable` returns `Value::Void` even though
     // the virtualizable SHADOW entry is correct.  Closing that needs the live
     // loop-input registers seeded at walk entry, not just r0.

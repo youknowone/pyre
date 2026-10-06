@@ -303,7 +303,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // identity: the OpRef of `virtualizable_boxes[-1]` must reach ref reg 1
     // so the `getarrayitem_vable_*` dispatch ops resolve the same box that
     // `init_virtualizable_boxes` minted (identity-equal per
-    // `is_nonstandard_virtualizable` Step 3). Push the identity argbox for
+    // `begin_nonstandard_virtualizable` Step 3). Push the identity argbox for
     // both the PyFrame-style declaration and the state-field virt-array case.
     let state_has_virt_array = config
         .state_fields

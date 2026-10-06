@@ -1699,23 +1699,6 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
 /// value count = `len_i + len_r + len_f`. [`jitcode_payload_at`] materializes
 /// a build-time index into that list before the decode.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
-    // `record_guard_with_snapshot` (`history.rs`) mints the interpreter-side
-    // vable promotes' resume frame with no coordinate of its own, marked
-    // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps it with
-    // the real position (`walker_capture_inline_nonstandard_vable_guard`).
-    // Arriving here still carrying the mark means that re-stamp was missed
-    // and the guard was compiled against a resume coordinate that names no
-    // frame. The frame holds no boxes, so `0` is the arithmetically right
-    // answer and the decode would survive it — but the guard it belongs to
-    // cannot resume, so say so instead of continuing.
-    if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 {
-        panic!(
-            "frame_value_count_at: guard resume frame is still \
-             unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
-             pc={pc}) — the `record_guard_with_snapshot` placeholder \
-             reached the decoder without the walker's real position"
-        )
-    }
     // Materialize before borrowing `op_live` / `liveness_info`. A published
     // coordinate the single list cannot name is a capture bug.
     let Some(payload) = jitcode_payload_at(jitcode_index) else {

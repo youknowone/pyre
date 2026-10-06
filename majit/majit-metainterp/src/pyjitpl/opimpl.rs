@@ -483,15 +483,15 @@ where
         // cache-hit sanity check (plumbing;
         // wires the check itself).
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
-        let guards_before = ctx.num_guards();
-        let (opref, value) = ctx.vable_getfield_int(
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+        let (opref, value) = ctx.vable_getfield_int_checked(
+            nonstandard,
             self.cpu.as_ref(),
-            opcode_pc,
             vable_opref,
             vable_struct_ptr,
             fielddescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         self.set_int_reg(ctx, dest, Some(opref), value.map(value_as_int_bits));
         TraceAction::Continue
     }
@@ -516,15 +516,15 @@ where
             return TraceAction::Abort;
         };
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
-        let guards_before = ctx.num_guards();
-        let (opref, value) = ctx.vable_getfield_ref(
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+        let (opref, value) = ctx.vable_getfield_ref_checked(
+            nonstandard,
             self.cpu.as_ref(),
-            opcode_pc,
             vable_opref,
             vable_struct_ptr,
             fielddescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         self.set_ref_reg(ctx, dest, Some(opref), value.map(value_as_ref_bits));
         TraceAction::Continue
     }
@@ -549,15 +549,15 @@ where
             return TraceAction::Abort;
         };
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
-        let guards_before = ctx.num_guards();
-        let (opref, value) = ctx.vable_getfield_float(
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+        let (opref, value) = ctx.vable_getfield_float_checked(
+            nonstandard,
             self.cpu.as_ref(),
-            opcode_pc,
             vable_opref,
             vable_struct_ptr,
             fielddescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         self.set_float_reg(ctx, dest, Some(opref), value.map(value_as_float_bits));
         TraceAction::Continue
     }
@@ -1308,16 +1308,16 @@ where
         else {
             return TraceAction::Abort;
         };
-        let guards_before = ctx.num_guards();
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
         let imm_box = ctx.const_int(imm);
-        let write = ctx.vable_setfield(
-            opcode_pc,
+        let _write = ctx.vable_setfield_checked(
+            nonstandard,
             vable_opref,
             fielddescr,
             imm_box,
             Some(Value::Int(imm)),
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
         TraceAction::Continue
     }
 
@@ -1341,15 +1341,15 @@ where
             return TraceAction::Abort;
         };
         let (value, concrete) = self.read_int_reg(ctx, src);
-        let guards_before = ctx.num_guards();
-        let write = ctx.vable_setfield(
-            opcode_pc,
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+        let _write = ctx.vable_setfield_checked(
+            nonstandard,
             vable_opref,
             fielddescr,
             value,
             Some(Value::Int(concrete)),
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
         TraceAction::Continue
     }
 
@@ -1373,15 +1373,15 @@ where
             return TraceAction::Abort;
         };
         let (value, concrete) = self.read_ref_reg(ctx, src);
-        let guards_before = ctx.num_guards();
-        let write = ctx.vable_setfield(
-            opcode_pc,
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+        let _write = ctx.vable_setfield_checked(
+            nonstandard,
             vable_opref,
             fielddescr,
             value,
             Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
         TraceAction::Continue
     }
 
@@ -1405,15 +1405,15 @@ where
             return TraceAction::Abort;
         };
         let (value, concrete) = self.read_float_reg(ctx, src);
-        let guards_before = ctx.num_guards();
-        let write = ctx.vable_setfield(
-            opcode_pc,
+        let nonstandard =
+            self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fielddescr);
+        let _write = ctx.vable_setfield_checked(
+            nonstandard,
             vable_opref,
             fielddescr,
             value,
             Some(Value::Float(f64::from_bits(concrete as u64))),
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
         TraceAction::Continue
     }
 
@@ -2065,15 +2065,12 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let check_guards_before = ctx.num_guards();
-        let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
-        let guards_before = ctx.num_guards();
         let (opref, value) = ctx.vable_getarrayitem_int_checked(
             nonstandard,
             opcode_pc,
@@ -2083,7 +2080,6 @@ where
             fdescr,
             adescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         self.set_int_reg(ctx, dest, Some(opref), value.map(value_as_int_bits));
         TraceAction::Continue
     }
@@ -2146,15 +2142,12 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let check_guards_before = ctx.num_guards();
-        let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
-        let guards_before = ctx.num_guards();
         let (opref, value) = ctx.vable_getarrayitem_ref_checked(
             nonstandard,
             opcode_pc,
@@ -2164,7 +2157,6 @@ where
             fdescr,
             adescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         self.set_ref_reg(ctx, dest, Some(opref), value.map(value_as_ref_bits));
         TraceAction::Continue
     }
@@ -2208,15 +2200,12 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let check_guards_before = ctx.num_guards();
-        let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
-        let guards_before = ctx.num_guards();
         let (opref, value) = ctx.vable_getarrayitem_float_checked(
             nonstandard,
             opcode_pc,
@@ -2226,7 +2215,6 @@ where
             fdescr,
             adescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         self.set_float_reg(ctx, dest, Some(opref), value.map(value_as_float_bits));
         TraceAction::Continue
     }
@@ -2270,17 +2258,14 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let check_guards_before = ctx.num_guards();
-        let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
         let (value, concrete) = self.read_int_reg(ctx, src);
-        let guards_before = ctx.num_guards();
-        let write = match ctx.vable_setarrayitem_checked(
+        match ctx.vable_setarrayitem_checked(
             nonstandard,
             opcode_pc,
             vable_opref,
@@ -2296,9 +2281,8 @@ where
             // array (e.g. a transient out-of-bounds state-field index);
             // this slot cannot be virtualized, so abort the trace.
             VableArrayStore::OutOfVable => return TraceAction::Abort,
-            VableArrayStore::Stored(write) => write,
-        };
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
+            VableArrayStore::Stored(_) => {}
+        }
         TraceAction::Continue
     }
 
@@ -2341,17 +2325,14 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let check_guards_before = ctx.num_guards();
-        let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
         let (value, concrete) = self.read_ref_reg(ctx, src);
-        let guards_before = ctx.num_guards();
-        let write = match ctx.vable_setarrayitem_checked(
+        match ctx.vable_setarrayitem_checked(
             nonstandard,
             opcode_pc,
             vable_opref,
@@ -2364,9 +2345,8 @@ where
             false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
-            VableArrayStore::Stored(write) => write,
-        };
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
+            VableArrayStore::Stored(_) => {}
+        }
         TraceAction::Continue
     }
 
@@ -2409,17 +2389,14 @@ where
         // and handed to the `*_checked` leg, and a non-standard access
         // with a non-constant index no longer mints a GUARD_VALUE that
         // over-specializes an ordinary heap read.
-        let check_guards_before = ctx.num_guards();
-        let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
         let index = if nonstandard {
             index
         } else {
             self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
         };
         let (value, concrete) = self.read_float_reg(ctx, src);
-        let guards_before = ctx.num_guards();
-        let write = match ctx.vable_setarrayitem_checked(
+        match ctx.vable_setarrayitem_checked(
             nonstandard,
             opcode_pc,
             vable_opref,
@@ -2432,9 +2409,8 @@ where
             false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
-            VableArrayStore::Stored(write) => write,
-        };
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
+            VableArrayStore::Stored(_) => {}
+        }
         TraceAction::Continue
     }
 
@@ -2459,16 +2435,15 @@ where
             return TraceAction::Abort;
         };
         let vable_struct_ptr = self.read_ref_reg(ctx, vable_reg).1;
-        let guards_before = ctx.num_guards();
-        let result = ctx.vable_arraylen_vable(
+        let nonstandard = self.nonstandard_virtualizable(ctx, sym, opcode_pc, vable_opref, &fdescr);
+        let result = ctx.vable_arraylen_vable_checked(
+            nonstandard,
             self.cpu.as_ref(),
-            opcode_pc,
             vable_opref,
             vable_struct_ptr,
             fdescr,
             adescr,
         );
-        self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
         // pyjitpl.py:1262-1263 `result =
         // vinfo.get_array_length(virtualizable, arrayindex);
         // return ConstInt(result)`.  RPython reads from the live

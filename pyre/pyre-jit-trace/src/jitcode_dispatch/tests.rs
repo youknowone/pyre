@@ -1,7 +1,9 @@
 use super::*;
 use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
-use majit_metainterp::{JitCodeSym, TraceAction, VableArrayStore, make_fail_descr};
+use majit_metainterp::{
+    JitCodeSym, NonstandardVable, TraceAction, VableArrayStore, make_fail_descr,
+};
 
 static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1082,7 +1084,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     };
 
     assert_eq!(
-        super::resume_snapshot::walker_capture_inline_nonstandard_vable_guard(&mut wc, 0, 0, None,),
+        super::resume_snapshot::walker_capture_snapshot_for_last_guard(&mut wc, 0),
         Err(DispatchError::GuardResumeCoordinateUnavailable { pc: 0 }),
         "a callee-only image would make frames[0] disagree between the two resume decoders",
     );
@@ -1932,8 +1934,15 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let index0 = tc.const_int(0);
     let const_null = tc.const_null();
     let ops_before = tc.num_ops();
+    let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
+        NonstandardVable::Decided(n) => n,
+        NonstandardVable::PendingEq { .. } => {
+            panic!("standard identity must take Step 3 Decided(false)")
+        }
+    };
     assert!(matches!(
-        tc.vable_setarrayitem_indexed(
+        tc.vable_setarrayitem_checked(
+            nonstandard,
             0,
             vable,
             index0,
@@ -1963,8 +1972,15 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
         "the side-table marker records no op"
     );
 
+    let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
+        NonstandardVable::Decided(n) => n,
+        NonstandardVable::PendingEq { .. } => {
+            panic!("standard identity must take Step 3 Decided(false)")
+        }
+    };
     assert!(matches!(
-        tc.vable_setarrayitem_indexed(
+        tc.vable_setarrayitem_checked(
+            nonstandard,
             0,
             vable,
             index0,
@@ -1981,8 +1997,15 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
 
     let index1 = tc.const_int(1);
     let non_null = tc.const_ref(2);
+    let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
+        NonstandardVable::Decided(n) => n,
+        NonstandardVable::PendingEq { .. } => {
+            panic!("standard identity must take Step 3 Decided(false)")
+        }
+    };
     assert!(matches!(
-        tc.vable_setarrayitem_indexed(
+        tc.vable_setarrayitem_checked(
+            nonstandard,
             0,
             vable,
             index1,
@@ -1997,8 +2020,25 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     ));
     assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
 
+    let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
+        NonstandardVable::Decided(n) => n,
+        NonstandardVable::PendingEq { .. } => {
+            panic!("standard identity must take Step 3 Decided(false)")
+        }
+    };
     assert!(matches!(
-        tc.vable_setarrayitem_indexed(0, vable, index0, 0, fdescr, adescr, const_null, null, true,),
+        tc.vable_setarrayitem_checked(
+            nonstandard,
+            0,
+            vable,
+            index0,
+            0,
+            fdescr,
+            adescr,
+            const_null,
+            null,
+            true,
+        ),
         VableArrayStore::Stored(Some(_))
     ));
     assert!(tc.virtualizable_slot_stored_live_null(flat_base));
@@ -14887,14 +14927,14 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
 #[test]
 fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     // T2 sanity: `getfield_vable_i/rd>i` delegates to
-    // `TraceCtx::vable_getfield_int`.  With no `virtualizable_info`
-    // bound on the trace context, `is_nonstandard_virtualizable`
-    // returns true and the fallback emits a `GetfieldGcI` op +
+    // `walker_nonstandard_virtualizable` + `vable_getfield_int_checked`.
+    // With no `virtualizable_info` bound on the trace context, begin
+    // returns Decided(true) and the fallback emits a `GetfieldGcI` op +
     // writes the recorder OpRef into `registers_i[dst]` — the same
     // shape `getfield_gc_via_heapcache` produces on a cache miss.
     // The handler itself stays orthodox to RPython
     // `pyjitpl.py opimpl_getfield_vable_i`; the
-    // GETFIELD_GC fallback is `vable_getfield_int`'s decision, not
+    // GETFIELD_GC fallback is the checked body's decision, not
     // the walker's, so this test exercises the walker→trace_ctx
     // boundary without depending on a `virtualizable_info` fixture.
     let byte = *insns_opname_to_byte()
@@ -14990,9 +15030,9 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
 #[test]
 fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
     // T2a sanity: `setfield_vable_i/rid` delegates to
-    // `TraceCtx::vable_setfield`.  With no `virtualizable_info`
-    // bound on the trace context, `is_nonstandard_virtualizable`
-    // returns true and the fallback records a `SetfieldGc` op
+    // `walker_nonstandard_virtualizable` + `vable_setfield_checked`.
+    // With no `virtualizable_info` bound on the trace context, begin
+    // returns Decided(true) and the fallback records a `SetfieldGc` op
     // with `[obj, value]` + the field descr — same shape
     // `setfield_gc_via_heapcache` produces.  Exercises the
     // walker -> trace_ctx boundary for the int-bank variant
