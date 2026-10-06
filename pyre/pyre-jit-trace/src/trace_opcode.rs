@@ -735,16 +735,21 @@ pub(crate) fn swap_stack_slots(
             ctx.virtualizable_entry_at(flat_top),
             ctx.virtualizable_entry_at(flat_other),
         ) {
-            ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
-            ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
+            if ctx.box_carries_runtime_concrete(op_top)
+                && ctx.box_carries_runtime_concrete(op_other)
+            {
+                ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
+                ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
+            } else {
+                // An unstamped box's current concrete is the live virtualizable,
+                // not a value that box may claim. Swap only the OpRef halves.
+                ctx.set_virtualizable_box_at(flat_top, op_other);
+                ctx.set_virtualizable_box_at(flat_other, op_top);
+            }
         } else if let (Some(op_top), Some(op_other)) = (
             ctx.virtualizable_box_at(flat_top),
             ctx.virtualizable_box_at(flat_other),
         ) {
-            // Unstamped owner (seeded with no live values): `virtualizable_entry_at`
-            // returns None because the InputArg/`*FrontendOp` has no `_res*`,
-            // so the pair-read above fails even though the boxes exist. Swap
-            // only the OpRef halves; Const* boxes already carry their payload.
             ctx.set_virtualizable_box_at(flat_top, op_other);
             ctx.set_virtualizable_box_at(flat_other, op_top);
         } else {
@@ -2517,7 +2522,7 @@ impl MIFrame {
                     break;
                 };
                 if let Some((shadow_opref, value)) = ctx.virtualizable_entry_at(i) {
-                    if shadow_opref == opref {
+                    if shadow_opref == opref && ctx.box_carries_runtime_concrete(opref) {
                         record(ctx, opref, value);
                     }
                 }
@@ -2534,7 +2539,9 @@ impl MIFrame {
                     let vable_idx = nvs + i;
                     if let Some((slot_op, value)) = ctx.virtualizable_entry_at(vable_idx) {
                         if slot_op == opref {
-                            record(ctx, opref, value);
+                            if ctx.box_carries_runtime_concrete(opref) {
+                                record(ctx, opref, value);
+                            }
                             continue;
                         }
                     }
@@ -2549,7 +2556,9 @@ impl MIFrame {
                     let vable_idx = nvs + nlocals + j;
                     if let Some((slot_op, value)) = ctx.virtualizable_entry_at(vable_idx) {
                         if slot_op == opref {
-                            record(ctx, opref, value);
+                            if ctx.box_carries_runtime_concrete(opref) {
+                                record(ctx, opref, value);
+                            }
                             continue;
                         }
                     }
