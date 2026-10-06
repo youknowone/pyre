@@ -2732,6 +2732,11 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
         let src = crate::gc_roots::shadow_stack_get(src_slot);
         let _guard = w_list_lock(src);
         let src = crate::gc_roots::shadow_stack_get(src_slot);
+        if w_list_len(src) != n || (*(src as *const W_ListObject)).strategy != ListStrategy::Object
+        {
+            drop(_guard);
+            return w_list_repeat_unwrapped(src, times);
+        }
         let item = (*(src as *const W_ListObject)).object_items_as_slice()[0];
         let item_slot = publish_slot(item);
         // rgc.py `ll_arrayfill`: one write barrier on the items array, then
@@ -2749,6 +2754,11 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
         let src = crate::gc_roots::shadow_stack_get(src_slot);
         let _guard = w_list_lock(src);
         let src = crate::gc_roots::shadow_stack_get(src_slot);
+        if w_list_len(src) != n || (*(src as *const W_ListObject)).strategy != ListStrategy::Object
+        {
+            drop(_guard);
+            return w_list_repeat_unwrapped(src, times);
+        }
         let src_items_slot = publish_slot((*(src as *const W_ListObject)).items as PyObjectRef);
         let dest_items_slot = publish_slot(
             (*(crate::gc_roots::shadow_stack_get(dest_slot) as *const W_ListObject)).items
