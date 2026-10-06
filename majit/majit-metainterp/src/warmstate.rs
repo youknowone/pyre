@@ -640,6 +640,10 @@ pub struct WarmEnterState {
     /// counter.py JitCounter parity: single timetable shared by loop
     /// entry, guard failure, and function entry — each caller passes
     /// a different pre-computed increment to tick(hash, increment).
+    ///
+    /// `warmspot.py` `WarmRunnerDesc.jitcounter` is one object on the
+    /// runner; extra `jd.warmstate` slots clone this handle
+    /// (`warmstate.py` `_compute_threshold`).
     pub counter: JitCounter,
     /// counter.py `self.celltable = [None] * size` — the table of
     /// already-compiled loops: `counter.size()` slots, each holding the HEAD of
@@ -731,8 +735,11 @@ pub struct WarmEnterState {
     /// warmstate.py: set_param_pureop_historylength — size of the
     /// pure operation history cache.
     pureop_historylength: u32,
-    /// warmspot.py:110: memory_manager — generation-based loop aging.
-    /// pyjitpl.py: try_to_free_some_loops calls next_generation().
+    /// warmspot.py `WarmRunnerDesc.__init__` `self.memory_manager =
+    /// memmgr.MemoryManager()`: one manager on the runner, which every
+    /// `WarmEnterState` reads as `self.warmrunnerdesc.memory_manager`. The
+    /// handle is `Clone`; `MetaInterp::make_enter_function` hands each
+    /// extra slot the runner's.
     pub memory_manager: crate::memmgr::MemoryManager,
     /// Bumped by every mutation that can change what
     /// [`Self::maybe_compile_decision`] answers for a key it already refused
@@ -871,6 +878,17 @@ impl WarmEnterState {
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         // rlib/jit.py PARAMETERS default decay=40.
         counter.set_decay(40);
+        Self::with_jitlog_counter(threshold, jitlog, counter)
+    }
+
+    /// Extra `jd.warmstate` slots reuse the runner's timetable.
+    /// `warmstate.py` `_compute_threshold` / `set_param_decay` read
+    /// `self.warmrunnerdesc.jitcounter`.
+    pub fn with_jitlog_counter(
+        threshold: u32,
+        jitlog: Option<Logger>,
+        counter: JitCounter,
+    ) -> Self {
         let increment_threshold = counter.compute_threshold(threshold);
         let increment_trace_eagerness = counter.compute_threshold(DEFAULT_TRACE_EAGERNESS);
         let increment_function_threshold = counter.compute_threshold(DEFAULT_FUNCTION_THRESHOLD);
@@ -905,8 +923,8 @@ impl WarmEnterState {
             pureop_historylength: 16,
             memory_manager: {
                 let mut m = crate::memmgr::MemoryManager::new(0);
-                m.retrace_limit = DEFAULT_RETRACE_LIMIT;
-                m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
+                m.set_retrace_limit(DEFAULT_RETRACE_LIMIT);
+                m.set_max_unroll_loops(DEFAULT_MAX_UNROLL_LOOPS);
                 m
             },
             cell_generation: 0,
@@ -2154,7 +2172,7 @@ impl WarmEnterState {
     /// warmstate.py set_param_max_unroll_recursion — delegates
     /// to memory_manager.max_unroll_recursion.
     pub fn set_param_max_unroll_recursion(&mut self, value: u32) {
-        self.memory_manager.max_unroll_recursion = value;
+        self.memory_manager.set_max_unroll_recursion(value);
     }
 
     /// RPython-compatible wrapper: set_param_max_inline_depth.
@@ -2165,19 +2183,19 @@ impl WarmEnterState {
     /// warmstate.py set_param_retrace_limit — delegates to
     /// memory_manager.retrace_limit.
     pub fn set_param_retrace_limit(&mut self, value: u32) {
-        self.memory_manager.retrace_limit = value;
+        self.memory_manager.set_retrace_limit(value);
     }
 
     /// warmstate.py set_param_max_retrace_guards — delegates to
     /// memory_manager.max_retrace_guards.
     pub fn set_param_max_retrace_guards(&mut self, value: u32) {
-        self.memory_manager.max_retrace_guards = value;
+        self.memory_manager.set_max_retrace_guards(value);
     }
 
     /// warmstate.py set_param_max_unroll_loops — delegates to
     /// memory_manager.max_unroll_loops.
     pub fn set_param_max_unroll_loops(&mut self, value: u32) {
-        self.memory_manager.max_unroll_loops = value;
+        self.memory_manager.set_max_unroll_loops(value);
     }
 
     /// warmstate.py set_param_loop_longevity — delegates to the
@@ -2287,10 +2305,11 @@ impl WarmEnterState {
         self.disable_unrolling_threshold = DEFAULT_DISABLE_UNROLLING;
         self.pureop_historylength = 16;
         self.counter.set_decay(40);
-        self.memory_manager.max_retrace_guards = 15;
-        self.memory_manager.max_unroll_loops = 0;
-        self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT;
-        self.memory_manager.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION;
+        self.memory_manager.set_max_retrace_guards(15);
+        self.memory_manager.set_max_unroll_loops(0);
+        self.memory_manager.set_retrace_limit(DEFAULT_RETRACE_LIMIT);
+        self.memory_manager
+            .set_max_unroll_recursion(DEFAULT_MAX_UNROLL_RECURSION);
         self.memory_manager.set_max_age(1000, 0);
         self.vec_cost = 0;
         self.vectorize = false;
@@ -2798,10 +2817,10 @@ impl WarmEnterState {
             "trace_eagerness" => self.set_param_trace_eagerness(as_u32),
             "function_threshold" => self.set_function_threshold(as_u32),
             "max_inline_depth" => self.max_inline_depth = as_u32,
-            "retrace_limit" => self.memory_manager.retrace_limit = as_u32,
-            "max_retrace_guards" => self.memory_manager.max_retrace_guards = as_u32,
-            "max_unroll_loops" => self.memory_manager.max_unroll_loops = as_u32,
-            "max_unroll_recursion" => self.memory_manager.max_unroll_recursion = as_u32,
+            "retrace_limit" => self.memory_manager.set_retrace_limit(as_u32),
+            "max_retrace_guards" => self.memory_manager.set_max_retrace_guards(as_u32),
+            "max_unroll_loops" => self.memory_manager.set_max_unroll_loops(as_u32),
+            "max_unroll_recursion" => self.memory_manager.set_max_unroll_recursion(as_u32),
             "loop_longevity" => self.memory_manager.set_max_age(as_u32 as i64, 0),
             // warmstate.py set_param_vec — vec, vec_all, vec_cost are separate fields
             "vec" | "vectorize" => self.vectorize = value != 0,
@@ -2813,33 +2832,6 @@ impl WarmEnterState {
             "decay" => self.counter.set_decay(value as i32),
             "enable_opts" => {} // string param, handled by set_param_enable_opts
             _ => {}
-        }
-    }
-
-    /// Copy every `set_param` field onto a freshly constructed extra
-    /// `jitdriver_sd.warmstate`. Cells and compiled tokens stay empty.
-    pub fn copy_jit_params_from(&mut self, src: &Self) {
-        self.set_param_threshold(src.threshold());
-        self.set_param_trace_limit(src.trace_limit());
-        self.set_param_trace_eagerness(src.trace_eagerness());
-        self.set_param_function_threshold(src.function_threshold());
-        self.set_param_max_inline_depth(src.max_inline_depth());
-        self.set_param_retrace_limit(src.retrace_limit());
-        self.set_param_max_retrace_guards(src.max_retrace_guards());
-        self.set_param_max_unroll_loops(src.max_unroll_loops());
-        self.set_param_max_unroll_recursion(src.max_unroll_recursion());
-        self.set_param_loop_longevity(src.memory_manager.loop_longevity_param() as u32);
-        self.set_param_vec(src.vectorize());
-        self.set_param_vec_all(src.vec_all());
-        self.set_param_vec_cost(src.vec_cost());
-        self.set_param_inlining(src.inlining());
-        self.set_param_disable_unrolling(src.disable_unrolling_threshold());
-        self.set_param_pureop_historylength(src.pureop_historylength());
-        self.set_param_decay(src.counter.decay() as u32);
-        if src.get_enable_opts().is_empty() {
-            self.set_param_enable_opts("");
-        } else {
-            self.set_param_enable_opts(&src.get_enable_opts().join(":"));
         }
     }
 
@@ -2964,10 +2956,10 @@ impl WarmEnterState {
             "trace_eagerness" => Some(self.trace_eagerness as i64),
             "function_threshold" => Some(self.function_threshold as i64),
             "max_inline_depth" => Some(self.max_inline_depth as i64),
-            "retrace_limit" => Some(self.memory_manager.retrace_limit as i64),
-            "max_retrace_guards" => Some(self.memory_manager.max_retrace_guards as i64),
-            "max_unroll_loops" => Some(self.memory_manager.max_unroll_loops as i64),
-            "max_unroll_recursion" => Some(self.memory_manager.max_unroll_recursion as i64),
+            "retrace_limit" => Some(self.memory_manager.retrace_limit() as i64),
+            "max_retrace_guards" => Some(self.memory_manager.max_retrace_guards() as i64),
+            "max_unroll_loops" => Some(self.memory_manager.max_unroll_loops() as i64),
+            "max_unroll_recursion" => Some(self.memory_manager.max_unroll_recursion() as i64),
             "loop_longevity" => Some(self.memory_manager.loop_longevity_param()),
             "vectorize" => Some(if self.vectorize { 1 } else { 0 }),
             "vec_cost" => Some(self.vec_cost as i64),
@@ -2991,11 +2983,12 @@ impl WarmEnterState {
             "trace_eagerness" => self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS),
             "function_threshold" => self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD),
             "max_inline_depth" => self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH),
-            "retrace_limit" => self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT,
-            "max_retrace_guards" => self.memory_manager.max_retrace_guards = 15,
-            "max_unroll_loops" => self.memory_manager.max_unroll_loops = 0,
+            "retrace_limit" => self.memory_manager.set_retrace_limit(DEFAULT_RETRACE_LIMIT),
+            "max_retrace_guards" => self.memory_manager.set_max_retrace_guards(15),
+            "max_unroll_loops" => self.memory_manager.set_max_unroll_loops(0),
             "max_unroll_recursion" => {
-                self.memory_manager.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION;
+                self.memory_manager
+                    .set_max_unroll_recursion(DEFAULT_MAX_UNROLL_RECURSION);
             }
             "loop_longevity" => self.memory_manager.set_max_age(1000, 0),
             "vectorize" => self.vectorize = false,
@@ -3032,16 +3025,16 @@ impl WarmEnterState {
     // ── RPython warmstate.py getter methods ──
 
     pub fn retrace_limit(&self) -> u32 {
-        self.memory_manager.retrace_limit
+        self.memory_manager.retrace_limit()
     }
     pub fn max_retrace_guards(&self) -> u32 {
-        self.memory_manager.max_retrace_guards
+        self.memory_manager.max_retrace_guards()
     }
     pub fn max_unroll_loops(&self) -> u32 {
-        self.memory_manager.max_unroll_loops
+        self.memory_manager.max_unroll_loops()
     }
     pub fn max_unroll_recursion(&self) -> u32 {
-        self.memory_manager.max_unroll_recursion
+        self.memory_manager.max_unroll_recursion()
     }
     pub fn vectorize(&self) -> bool {
         self.vectorize
@@ -4522,7 +4515,8 @@ mod tests {
     fn production_warmstate_ships_loop_eviction_disabled() {
         let ws = WarmEnterState::new(3);
         assert_eq!(
-            ws.memory_manager.next_check, -1,
+            ws.memory_manager.next_check(),
+            -1,
             "next_check must be -1 (eviction disabled) — memmgr.py:43-44",
         );
         assert_eq!(

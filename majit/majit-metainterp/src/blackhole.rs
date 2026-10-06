@@ -7034,9 +7034,26 @@ mod tests {
                 .collect();
             unwired.sort();
 
+            // blackhole.py has no `bhimpl_call_assembler` and no leftover
+            // `cond_call_*_ext` / `record_known_result_*_ext`. Those
+            // `extension_insns()` bytes stay reserved for tracing
+            // `opimpl_call_assembler_*` / `opimpl_cond_call_void`.
+            let expected = [
+                "call_assembler_float_ext/P",
+                "call_assembler_int_ext/P",
+                "call_assembler_ref_ext/P",
+                "call_assembler_void_ext/P",
+                "cond_call_value_int_ext/P",
+                "cond_call_value_ref_ext/P",
+                "cond_call_void_ext/P",
+                "record_known_result_int_ext/P",
+                "record_known_result_ref_ext/P",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
             assert_eq!(
-                unwired,
-                Vec::<String>::new(),
+                unwired, expected,
                 "the canonical and extension opname tables must not acquire a handler gap; \
                  fix the emitting kind shape instead of wiring a non-orthodox alias",
             );

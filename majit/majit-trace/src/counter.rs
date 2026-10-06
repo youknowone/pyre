@@ -1,4 +1,6 @@
 use majit_ir::IndexMapExt;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// counter.py: JitCounter — float-based 5-way associative timetable.
@@ -52,8 +54,8 @@ impl Default for Entry {
     }
 }
 
-/// counter.py JitCounter
-pub struct JitCounter {
+/// Timetable body of `counter.py JitCounter`.
+struct JitCounterInner {
     /// counter.py:86 size
     size: usize,
     /// counter.py:87 shift
@@ -69,16 +71,26 @@ pub struct JitCounter {
     last_decay_generation: usize,
 }
 
-impl JitCounter {
+/// counter.py JitCounter
+///
+/// `Clone` is another handle to the same timetable: `warmspot.py`
+/// `WarmRunnerDesc.jitcounter` is one object on the runner, and every
+/// `WarmEnterState` reads it (`warmstate.py` `_compute_threshold`).
+#[derive(Clone)]
+pub struct JitCounter {
+    inner: Rc<RefCell<JitCounterInner>>,
+}
+
+impl JitCounterInner {
     /// counter.py __init__(self, size=DEFAULT_SIZE, translator=None)
-    pub fn new(size: usize) -> Self {
+    fn new(size: usize) -> Self {
         majit_gc::register_after_minor_collection_hook(invoke_after_minor_collection);
         let mut shift = 16u32;
         while (UINT32MAX >> shift) != (size as u64 - 1) {
             shift += 1;
             assert!(shift < 999, "size is not a power of two <= 2**16");
         }
-        JitCounter {
+        JitCounterInner {
             size,
             shift,
             timetable: vec![Entry::default(); size],
@@ -328,6 +340,94 @@ impl JitCounter {
     }
 }
 
+impl JitCounter {
+    /// counter.py __init__(self, size=DEFAULT_SIZE, translator=None)
+    pub fn new(size: usize) -> Self {
+        JitCounter {
+            inner: Rc::new(RefCell::new(JitCounterInner::new(size))),
+        }
+    }
+
+    /// True when `other` is the same timetable object.
+    /// `warmspot.py` `WarmRunnerDesc.jitcounter` is one object on the runner.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// counter.py compute_threshold
+    pub fn compute_threshold(&self, threshold: u32) -> f64 {
+        self.inner.borrow().compute_threshold(threshold)
+    }
+
+    /// counter.py `self.size = size`
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.inner.borrow().size()
+    }
+
+    /// counter.py _get_index
+    #[inline(always)]
+    pub fn _get_index(&self, hash: u64) -> usize {
+        self.inner.borrow()._get_index(hash)
+    }
+
+    /// counter.py fetch_next_hash
+    pub fn fetch_next_hash(&mut self) -> u64 {
+        self.inner.borrow_mut().fetch_next_hash()
+    }
+
+    /// counter.py _swap
+    #[inline(always)]
+    fn _swap(entry: &mut Entry, n: usize) -> usize {
+        JitCounterInner::_swap(entry, n)
+    }
+
+    /// TODO: no RPython counterpart. Read-only peek
+    /// used by warmstate's cold fast path to avoid GreenKey allocation.
+    pub fn would_tick_fire(&self, hash: u64, increment: f64) -> bool {
+        self.inner.borrow().would_tick_fire(hash, increment)
+    }
+
+    /// counter.py tick(self, hash, increment)
+    #[inline(always)]
+    pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
+        self.inner.borrow_mut().tick(hash, increment)
+    }
+
+    /// counter.py change_current_fraction(hash, new_fraction)
+    pub fn change_current_fraction(&mut self, hash: u64, new_fraction: f64) {
+        self.inner
+            .borrow_mut()
+            .change_current_fraction(hash, new_fraction)
+    }
+
+    /// counter.py reset(hash)
+    pub fn reset(&mut self, hash: u64) {
+        self.inner.borrow_mut().reset(hash)
+    }
+
+    /// TODO: no RPython equivalent.
+    /// Zero all timetable entries.
+    pub fn reset_all(&mut self) {
+        self.inner.borrow_mut().reset_all()
+    }
+
+    /// counter.py set_decay(decay)
+    pub fn set_decay(&mut self, decay: i32) {
+        self.inner.borrow_mut().set_decay(decay)
+    }
+
+    /// Inverse of [`Self::set_decay`] for `set_param(None)` inherit.
+    pub fn decay(&self) -> i32 {
+        self.inner.borrow().decay()
+    }
+
+    /// counter.py decay_all_counters()
+    pub fn decay_all_counters(&mut self) {
+        self.inner.borrow_mut().decay_all_counters()
+    }
+}
+
 /// counter.py DeterministicJitCounter — test-only, NOT_RPYTHON.
 ///
 /// RPython: subclasses JitCounter, overrides _get_index to return the
@@ -441,9 +541,10 @@ mod tests {
     }
 
     fn counter_time(counter: &JitCounter, hash: u64) -> f32 {
-        let index = counter._get_index(hash);
-        let subhash = JitCounter::_get_subhash(hash);
-        let entry = &counter.timetable[index];
+        let inner = counter.inner.borrow();
+        let index = inner._get_index(hash);
+        let subhash = JitCounterInner::_get_subhash(hash);
+        let entry = &inner.timetable[index];
         for i in 0..ASSOCIATIVITY {
             if entry.subhashes[i] == subhash {
                 return entry.times[i];
@@ -465,7 +566,7 @@ mod tests {
     fn test_different_hashes() {
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         let increment = counter.compute_threshold(3);
-        let shift = counter.shift;
+        let shift = counter.inner.borrow().shift;
         let h1 = 1u64 << shift;
         let h2 = 2u64 << shift;
         assert!(!counter.tick(h1, increment));
@@ -479,7 +580,7 @@ mod tests {
     fn test_reset() {
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         let increment = counter.compute_threshold(3);
-        let h = 1u64 << counter.shift;
+        let h = 1u64 << counter.inner.borrow().shift;
         counter.tick(h, increment);
         counter.tick(h, increment);
         counter.reset(h);
@@ -492,7 +593,7 @@ mod tests {
     fn test_decay() {
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         let increment = counter.compute_threshold(10);
-        let h = 1u64 << counter.shift;
+        let h = 1u64 << counter.inner.borrow().shift;
         for _ in 0..8 {
             counter.tick(h, increment);
         }
@@ -501,9 +602,10 @@ mod tests {
         // time ≈ 8 * (1/10) = 0.8, decay by 0.96 → 0.768
         counter.decay_all_counters();
         // Verify via a tick that doesn't fire (need ~0.232 more to reach 1.0)
-        let index = counter._get_index(h);
-        let subhash = JitCounter::_get_subhash(h);
-        let entry = &counter.timetable[index];
+        let inner = counter.inner.borrow();
+        let index = inner._get_index(h);
+        let subhash = JitCounterInner::_get_subhash(h);
+        let entry = &inner.timetable[index];
         let mut time = 0.0f32;
         for i in 0..ASSOCIATIVITY {
             if entry.subhashes[i] == subhash {
@@ -519,7 +621,7 @@ mod tests {
         let _generation_guard = DECAY_GENERATION_TEST_LOCK.lock();
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         counter.set_decay(40);
-        let h = 3u64 << counter.shift;
+        let h = 3u64 << counter.inner.borrow().shift;
         counter.change_current_fraction(h, 0.5);
 
         advance_decay_generation(2);
@@ -539,7 +641,7 @@ mod tests {
         let _generation_guard = DECAY_GENERATION_TEST_LOCK.lock();
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         counter.set_decay(40);
-        let h = 4u64 << counter.shift;
+        let h = 4u64 << counter.inner.borrow().shift;
         counter.change_current_fraction(h, 0.5);
 
         advance_decay_generation(1);
@@ -556,7 +658,7 @@ mod tests {
     fn test_auto_reset_on_fire() {
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         let increment = counter.compute_threshold(3);
-        let h = 1u64 << counter.shift;
+        let h = 1u64 << counter.inner.borrow().shift;
         assert!(!counter.tick(h, increment));
         assert!(!counter.tick(h, increment));
         assert!(counter.tick(h, increment));
@@ -578,7 +680,7 @@ mod tests {
     fn test_change_current_fraction() {
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         let increment = counter.compute_threshold(100);
-        let h = 1u64 << counter.shift;
+        let h = 1u64 << counter.inner.borrow().shift;
         counter.change_current_fraction(h, 0.98);
         // 0.98 + ~0.01 = ~0.99, not enough; two more ticks → ~1.0
         assert!(!counter.tick(h, increment));
@@ -588,8 +690,23 @@ mod tests {
     #[test]
     fn test_size_parameter() {
         let counter = JitCounter::new(1024);
-        assert_eq!(counter.size, 1024);
+        assert_eq!(counter.size(), 1024);
         // 0xFFFFFFFF >> shift = 1023 → shift = 22
-        assert_eq!(counter.shift, 22);
+        assert_eq!(counter.inner.borrow().shift, 22);
+    }
+
+    #[test]
+    fn clone_shares_the_timetable() {
+        // warmspot.py WarmRunnerDesc.jitcounter is one object; Clone is
+        // another handle, not a second table.
+        let mut a = JitCounter::new(DEFAULT_SIZE);
+        let mut b = a.clone();
+        assert!(a.ptr_eq(&b));
+        a.set_decay(77);
+        assert_eq!(b.decay(), 77);
+        assert!(!a.tick(42, 0.5));
+        assert!(b.would_tick_fire(42, 0.5));
+        b.set_decay(40);
+        assert_eq!(a.decay(), 40);
     }
 }

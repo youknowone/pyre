@@ -4113,9 +4113,20 @@ mod tests {
             .map(|(key, _)| key.clone())
             .collect();
         gap.sort();
+        // blackhole.py has no `bhimpl_call_assembler` and no leftover
+        // `cond_call_*_ext` / `record_known_result_*_ext`. Those
+        // `extension_insns()` bytes stay reserved for tracing
+        // `opimpl_call_assembler_*` / `opimpl_cond_call_void`.
         let expected = [
             "assert_not_none/r",
+            "call_assembler_float_ext/P",
+            "call_assembler_int_ext/P",
+            "call_assembler_ref_ext/P",
+            "call_assembler_void_ext/P",
             "check_neg_index/rid>i",
+            "cond_call_value_int_ext/P",
+            "cond_call_value_ref_ext/P",
+            "cond_call_void_ext/P",
             "gc_load_indexed_f/riiii>f",
             "gc_load_indexed_i/riiii>i",
             "getlistitem_gc_f/ridd>f",
@@ -4126,6 +4137,8 @@ mod tests {
             "newlist_clear/idddd>r",
             "newlist_hint/idddd>r",
             "record_exact_class/ri",
+            "record_known_result_int_ext/P",
+            "record_known_result_ref_ext/P",
             "rvmprof_code/ii",
         ];
         assert_eq!(
@@ -4145,16 +4158,24 @@ mod tests {
         // `*_ir>i` alias.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        // The generated insns table is fully covered by
-        // `wire_bhimpl_handlers` — every opname has a `bhimpl_*` handler,
-        // so the unwired set is empty.  The `OpKind::Input` class-root
-        // retyping in the MIR frontend collapses Ref operands to their
-        // canonical all-int shapes at emission (e.g. `Lt` operands stay in
-        // the Int bank, and a residual call does not return Int with a Ref
-        // argument), so the codewriter does not produce keys like
-        // `int_lt/ir>i`, `int_lt/rr>i`, or `residual_call_r_i/iRd` that no
-        // RPython blackhole handler has.
-        let expected: Vec<String> = vec![];
+        // blackhole.py has no `bhimpl_call_assembler` and no leftover
+        // `cond_call_*_ext` / `record_known_result_*_ext`. Those
+        // `extension_insns()` bytes stay reserved for tracing
+        // `opimpl_call_assembler_*` / `opimpl_cond_call_void`.
+        let expected = [
+            "call_assembler_float_ext/P",
+            "call_assembler_int_ext/P",
+            "call_assembler_ref_ext/P",
+            "call_assembler_void_ext/P",
+            "cond_call_value_int_ext/P",
+            "cond_call_value_ref_ext/P",
+            "cond_call_void_ext/P",
+            "record_known_result_int_ext/P",
+            "record_known_result_ref_ext/P",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
         assert_eq!(
             unwired, expected,
             "Unwired-opname snapshot drifted. If a new entry \

@@ -8736,68 +8736,6 @@ pub fn read_frame_liveness_reg_indices(
     FrameLivenessRegIndices { int, ref_, float }
 }
 
-/// `resume.py` `rebuild_from_resumedata` walks every encoded section:
-/// `read_jitcode_pos_pc` then `newframe(jitcode)` then `consume_boxes`
-/// with that frame's `get_current_position_info`. Each section has its
-/// own jitcode + pc and its own live set; output length equals `frames.len()`.
-pub fn read_resume_sections_liveness(
-    frames: &[majit_ir::resumedata::RebuiltFrame],
-    resolve_jitcode: impl Fn(usize) -> Option<std::sync::Arc<crate::jitcode::JitCode>>,
-    fallback_jitcode: Option<&std::sync::Arc<crate::jitcode::JitCode>>,
-    op_live: u8,
-    all_liveness: &[u8],
-) -> Vec<FrameLivenessRegIndices> {
-    let mut out = Vec::with_capacity(frames.len());
-    for frame in frames {
-        let Ok(pc) = usize::try_from(frame.pc) else {
-            out.push(FrameLivenessRegIndices::default());
-            continue;
-        };
-        let jc = usize::try_from(frame.jitcode_index)
-            .ok()
-            .and_then(&resolve_jitcode)
-            .or_else(|| fallback_jitcode.cloned());
-        match jc {
-            Some(jc) => {
-                out.push(read_frame_liveness_reg_indices(
-                    &jc,
-                    pc,
-                    op_live,
-                    all_liveness,
-                ));
-            }
-            None => out.push(FrameLivenessRegIndices::default()),
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod resume_sections_liveness_tests {
-    use super::*;
-    use majit_ir::resumedata::RebuiltFrame;
-
-    #[test]
-    fn read_resume_sections_liveness_walks_every_section() {
-        let frames = [
-            RebuiltFrame {
-                jitcode_index: 0,
-                pc: -1,
-                values: vec![],
-            },
-            RebuiltFrame {
-                jitcode_index: 0,
-                pc: -2,
-                values: vec![],
-            },
-        ];
-        let live = read_resume_sections_liveness(&frames, |_| None, None, 0, &[]);
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[0].total_len(), 0);
-        assert_eq!(live[1].total_len(), 0);
-    }
-}
-
 /// One `resume.py` `ResumeDataBoxReader` callback result: the box to store
 /// in the live register, and the concrete bits `_copy_data_from_miframe`
 /// reads back. `Virtual` has no box yet: `consume_boxes` allocates it

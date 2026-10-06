@@ -23,7 +23,7 @@ use crate::heapcache::{HeapCache, HeapCacheView, HeapCacheViewMut};
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use indexmap::IndexMap;
-use majit_ir::{DescrRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
 
@@ -789,11 +789,6 @@ pub struct TraceCtx {
     /// metainterp access) can map each decoded frame value to its
     /// sym slot via `reg_idx - identity_base`.
     pub(crate) bridge_reg_indices: Option<crate::resume::FrameLivenessRegIndices>,
-    /// `resume.py` `rebuild_from_resumedata` / `consume_boxes`: one live
-    /// set per encoded resume section, same order as `RebuiltFrame`s.
-    /// Section 0 is also copied into `bridge_reg_indices` for generated
-    /// `setup_bridge_sym`.
-    pub(crate) bridge_section_reg_indices: Vec<crate::resume::FrameLivenessRegIndices>,
     /// `resume.py` `VirtualCache`, shared by the split readers that
     /// upstream keeps on one `ResumeDataBoxReader`: `setup_bridge_sym`
     /// and `ResumeDataBoxReader.consume_boxes`. Indexed by virtual
@@ -805,11 +800,11 @@ pub struct TraceCtx {
     /// `_prepare_virtuals` and reused by `_prepare_pendingfields` and
     /// `consume_boxes`. Taken off this ctx for each call so the cache
     /// and `TraceCtx` are not borrowed together.
-    bridge_virtuals_cache: Option<crate::resume_box_reader::BridgeVirtualCache>,
-    /// `AbstractResumeDataReader._prepare` already ran for this bridge.
-    /// `setup_bridge_sym` must not `_prepare_pendingfields` again after
-    /// `consume_boxes` allocated the same virtuals.
-    bridge_prepare_done: bool,
+    bridge_virtuals_cache: Option<crate::resume_box_reader::BridgeVirtualCache<'static>>,
+    /// Objects `ResumeDataDirectReader.getvirtual_ptr` already allocated
+    /// for this guard. BoxReader `virtuals_cache` stores the Box; a
+    /// recording-only hit must return this object, not `Value::Void`.
+    bridge_direct_virtual_concretes: Vec<Option<GcRef>>,
     /// `resume.py` `rebuild_from_resumedata` storage, parked so
     /// `consume_boxes` can `getvirtual_ptr` (`create_history` already
     /// made tracing live). `None` outside a bridge.
@@ -2240,10 +2235,9 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
-            bridge_section_reg_indices: Vec::new(),
             bridge_virtual_ops: Vec::new(),
             bridge_virtuals_cache: None,
-            bridge_prepare_done: false,
+            bridge_direct_virtual_concretes: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
@@ -2335,10 +2329,9 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
-            bridge_section_reg_indices: Vec::new(),
             bridge_virtual_ops: Vec::new(),
             bridge_virtuals_cache: None,
-            bridge_prepare_done: false,
+            bridge_direct_virtual_concretes: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
@@ -2375,20 +2368,6 @@ impl TraceCtx {
         self.bridge_reg_indices.as_ref()
     }
 
-    /// Stash one live-register bank set per resume section (`rebuild_from_resumedata`
-    /// then `consume_boxes` / `get_current_position_info`).
-    pub fn set_bridge_section_reg_indices(
-        &mut self,
-        indices: Vec<crate::resume::FrameLivenessRegIndices>,
-    ) {
-        self.bridge_section_reg_indices = indices;
-    }
-
-    /// Live-register bank sets for every encoded resume section, root first.
-    pub fn bridge_section_reg_indices(&self) -> &[crate::resume::FrameLivenessRegIndices] {
-        &self.bridge_section_reg_indices
-    }
-
     /// Box already allocated for virtual `vidx` by an earlier reader of
     /// this bridge (`resume.py` `virtuals_cache.get_ptr`).
     pub fn bridge_virtual_op(&self, vidx: usize) -> Option<OpRef> {
@@ -2397,17 +2376,6 @@ impl TraceCtx {
 
     /// Remember `getvirtual_ptr`'s box so the next reader stores that
     /// same `OpRef` (`resume.py` `virtuals_cache.set_ptr` / `set_int`).
-    /// `resume.py` `AbstractResumeDataReader._prepare` finished for this
-    /// bridge. A later `setup_bridge_sym` must not apply pending fields
-    /// again.
-    pub fn mark_bridge_prepare_done(&mut self) {
-        self.bridge_prepare_done = true;
-    }
-
-    pub fn bridge_prepare_done(&self) -> bool {
-        self.bridge_prepare_done
-    }
-
     pub fn remember_bridge_virtual_op(&mut self, vidx: usize, op: OpRef) {
         if op.is_none() {
             return;
@@ -2422,7 +2390,7 @@ impl TraceCtx {
     /// or `consume_boxes`. The caller parks it again when the walk returns.
     pub fn take_bridge_virtuals_cache(
         &mut self,
-    ) -> Option<crate::resume_box_reader::BridgeVirtualCache> {
+    ) -> Option<crate::resume_box_reader::BridgeVirtualCache<'static>> {
         self.bridge_virtuals_cache.take()
     }
 
@@ -2430,10 +2398,41 @@ impl TraceCtx {
     /// so a later TAGVIRTUAL `getvirtual_ptr` is a cache hit.
     pub fn park_bridge_virtuals_cache(
         &mut self,
-        mut cache: crate::resume_box_reader::BridgeVirtualCache,
+        cache: crate::resume_box_reader::BridgeVirtualCache<'_>,
     ) {
-        cache.detach_executing();
-        self.bridge_virtuals_cache = Some(cache);
+        self.bridge_virtuals_cache = Some(cache.detach_executing());
+    }
+
+    /// Seed objects `ResumeDataDirectReader.allocate` already published.
+    /// `getvirtual_ptr` on the BoxReader cache returns this Box.
+    pub fn seed_direct_virtual_concretes(&mut self, slots: Vec<Option<GcRef>>) {
+        self.bridge_direct_virtual_concretes = slots;
+    }
+
+    /// `resume.py virtuals_cache` slots copied onto the recording reader.
+    pub(crate) fn bridge_direct_virtual_concretes_mut(&mut self) -> &mut [Option<GcRef>] {
+        &mut self.bridge_direct_virtual_concretes
+    }
+
+    /// The DirectReader object for virtual `vidx`, if that reader ran.
+    pub fn direct_virtual_concrete(&self, vidx: usize) -> Option<GcRef> {
+        self.bridge_direct_virtual_concretes
+            .get(vidx)
+            .copied()
+            .flatten()
+    }
+
+    /// Copy DirectReader objects into `virtuals_cache` so a recording-only
+    /// `getvirtual_ptr` hit returns the Box, not `Value::Void`.
+    pub fn seed_cache_from_direct_virtuals(
+        &self,
+        cache: &mut crate::resume_box_reader::BridgeVirtualCache<'_>,
+    ) {
+        for (vidx, slot) in self.bridge_direct_virtual_concretes.iter().enumerate() {
+            if let Some(gcref) = *slot {
+                cache.set_concrete_ptr(vidx, gcref);
+            }
+        }
     }
 
     /// Guard resume storage for `consume_boxes`'s `getvirtual_ptr`.
@@ -7936,6 +7935,26 @@ mod tests {
         // A genuine descriptor identity still supports forwarding.
         ctx.heapcache_getfield_now_known(obj, 1, value);
         assert_eq!(ctx.heapcache_getfield_cached(obj, 1), Some(value));
+    }
+
+    /// `pyjitpl.py do_residual_call` step 5 invalidates on CALL_MAY_FORCE,
+    /// the opcode executed in step 2, after CALL_ASSEMBLER is recorded.
+    /// `clear_caches_not_necessary` does not list CALL_MAY_FORCE and
+    /// `is_plain_call` excludes it, so `clear_caches_varargs` takes
+    /// `reset_keep_likely_virtuals` and a seeded GETFIELD (int) cache is gone.
+    /// `invalidate_caches_for_escaped` would keep an unescaped object's field,
+    /// which is the leftover that failed
+    /// `synth/frame_chain_survives_a_recursive_call_assembler`.
+    #[test]
+    fn call_assembler_invalidate_caches_varargs_drops_getfield_cache() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let obj = OpRef::input_arg_ref(0);
+        let field = 1u32;
+        let cached = ctx.const_int(0);
+        ctx.heapcache_getfield_now_known(obj, field, cached);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, field), Some(cached));
+        ctx.heapcache_invalidate_caches_varargs(OpCode::CallMayForceR, None, &[obj]);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, field), None);
     }
 
     /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream

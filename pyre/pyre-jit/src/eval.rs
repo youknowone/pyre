@@ -12621,12 +12621,9 @@ fn bound_reached(
             locals,
         );
     }
-    // warmstate.py bound_reached: jitcounter.decay_all_counters() runs
-    // once, inside MetaInterp::bound_reached when StartTracing fires.
-    // compile_and_run_once → JitDriver::bound_reached takes that path.
-    if stack_almost_full() {
-        return None;
-    }
+    // warmstate.py bound_reached: `jitcounter.decay_all_counters()` and
+    // then `rstack.stack_almost_full()` run inside `MetaInterp::bound_reached`
+    // (compile_and_run_once → JitDriver::bound_reached), in that order.
     // warmstate.py:437-444: MetaInterp.compile_and_run_once
     frame_root
         .frame()
@@ -14258,6 +14255,24 @@ fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) ->
         .collect()
 }
 
+/// Copy DirectReader `virtuals_cache` objects onto the metainterp so
+/// BoxReader `getvirtual_ptr` returns the same Box (`resume.py`).
+/// An empty cache still parks, so a later applying-reader resume does
+/// not inherit the previous guard's objects.
+fn park_direct_virtual_concretes(cache: &HashMap<usize, Value>) {
+    let n = cache.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut slots = vec![None; n];
+    for (&vidx, value) in cache {
+        if let Value::Ref(gcref) = *value {
+            slots[vidx] = Some(gcref);
+        }
+    }
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .park_direct_virtual_concretes(slots);
+}
+
 /// Phase A: decode rd_numb + materialize virtuals + restore frame state.
 /// RPython: this corresponds to rebuild_from_resumedata (resume.py)
 /// which decodes the deadframe into typed values and writes them to the
@@ -14371,6 +14386,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             &mut pending_virtuals_cache,
         )
     };
+    park_direct_virtual_concretes(&pending_virtuals_cache);
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -14464,6 +14480,8 @@ pub(crate) fn decode_and_restore_guard_failure(
             .collect();
         Some((typed, resume_pc, resumed_frames.len(), coords))
     } else {
+        let (driver, _) = driver_pair();
+        driver.meta_interp_mut().clear_direct_virtual_concretes();
         None
     }
 }

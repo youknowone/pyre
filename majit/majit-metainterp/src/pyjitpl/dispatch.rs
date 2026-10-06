@@ -3877,6 +3877,37 @@ where
                 ctx.call_assembler_void_arc_typed(token_arc, &args, &arg_types);
             }
         }
+        // `pyjitpl.py do_residual_call` step 5: "invalidate the heapcache
+        // based on the CALL_MAY_FORCE operation executed above in step 2",
+        // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`.
+        // `opnum1` is `CALL_MAY_FORCE_*` for the result kind, `descr` is
+        // `targetjitdriver_sd.portal_calldescr` and `allboxes` is
+        // `[funcbox] + greenboxes + redboxes` (`_opimpl_recursive_call`, with
+        // `funcbox = ConstInt(adr2int(targetjitdriver_sd.portal_runner_ptr))`).
+        let opnum1 = majit_ir::OpCode::call_may_force_for_type(match result_kind {
+            Some(JitArgKind::Int) => majit_ir::Type::Int,
+            Some(JitArgKind::Ref) => majit_ir::Type::Ref,
+            Some(JitArgKind::Float) => majit_ir::Type::Float,
+            None => majit_ir::Type::Void,
+        });
+        let (portal_runner_adr, portal_calldescr) = {
+            let jd = ctx.metainterp_sd().jitdrivers_sd.get(jd_index);
+            (
+                jd.map_or(0, |jd| jd.portal_runner_adr),
+                jd.and_then(|jd| jd.portal_calldescr.clone()),
+            )
+        };
+        let effectinfo = portal_calldescr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .map(|calldescr| calldescr.get_extra_info());
+        let mut allboxes = Vec::with_capacity(1 + green_values.len() + args.len());
+        allboxes.push(OpRef::const_int(portal_runner_adr));
+        // The greens are constants whichever kind they carry; the heapcache
+        // only asks a box whether it is unescaped, which no constant is.
+        allboxes.extend(green_values.iter().map(|&green| OpRef::const_int(green)));
+        allboxes.extend_from_slice(&args);
+        ctx.heapcache_invalidate_caches_varargs(opnum1, effectinfo, &allboxes);
         // Free each fresh allocation after the call: the compiled loop's
         // residual `CallN`.  Recorded after CALL_ASSEMBLER so the callee has
         // the state for the duration of its run; the trace-time owner box is

@@ -3084,10 +3084,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         }
     };
 
-    // pyjitpl.py: heapcache invalidation for the escaped frame.
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .invalidate_caches_for_escaped();
+    // `pyjitpl.py do_residual_call` step 5: invalidate on the
+    // CALL_MAY_FORCE executed above, not the recorded CALL_ASSEMBLER.
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        OpCode::CallMayForceR,
+        Some(call_descr.get_extra_info()),
+        &allboxes,
+    );
 
     // pyjitpl.py `make_result_of_lastop`: the result lands in
     // `registers_*[reg_index]` BEFORE GUARD_NOT_FORCED (2079) and
@@ -3562,6 +3565,9 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // starts with the funcbox, so the descr is the portal call descr and the
     // list is not passed through `call_may_force_ref_typed` (that prepends
     // the funcbox again).
+    // `do_residual_call` step 5 needs the CALL_MAY_FORCE extra_info after
+    // `record_op_with_descr` takes `portal_descr`.
+    let ei = portal_view.get_extra_info().clone();
     let ca_result = if let Some(token) = token {
         ctx.trace_ctx.call_assembler_red_only_ref_arc(
             token,
@@ -3586,9 +3592,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         }
     };
 
+    // `pyjitpl.py do_residual_call` step 5: invalidate on the
+    // CALL_MAY_FORCE executed above, not the recorded CALL_ASSEMBLER.
     ctx.trace_ctx
-        .heap_cache_mut()
-        .invalidate_caches_for_escaped();
+        .heapcache_invalidate_caches_varargs(OpCode::CallMayForceR, Some(&ei), &allboxes);
     if let Some((dst_bank, dst)) = dst {
         write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)?;
     }
@@ -10343,6 +10350,27 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `can_inline_callable` never found, the same callee was re-inlined on
         // the next attempt, and the root took neither the disable nor
         // `prepare_trace_segmenting`'s permanent stamp.
+        // pyjitpl.py `perform_call` → `newframe` then `ChangeFrame`, then
+        // `_interpret` runs `blackhole_if_trace_too_long` after that step.
+        // The log entry must exist before the abort: a too-long check that
+        // ran first left `portal_trace_positions` empty, so
+        // `find_biggest_function` named no callee and
+        // `prepare_trace_segmenting` wrote `JC_DONT_TRACE_HERE` on the portal.
+        let subwalk_jd_no = crate::state::note_inline_subwalk_start(
+            (
+                callee_green_key.get_uhash(),
+                // The callee's greens are in scope here, so the log carries
+                // them: `disable_noninlinable_function` applies to this key,
+                // and it reaches a cell.
+                Some(crate::driver::make_green_key_typed(
+                    w_code,
+                    0,
+                    is_being_profiled,
+                )),
+            ),
+            sub_wc.trace_ctx.get_trace_position(),
+            None,
+        );
         // `_interpret` checks `blackhole_if_trace_too_long` after the
         // `run_one_step` that `newframe`s, before the callee's first
         // instruction. A zero-size just-opened frame does not win
@@ -10384,21 +10412,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 return Err(DispatchError::TraceTooLong { pc: op.pc, ops });
             }
         }
-        let subwalk_jd_no = crate::state::note_inline_subwalk_start(
-            (
-                callee_green_key.get_uhash(),
-                // The callee's greens are in scope here, so the log carries
-                // them: `disable_noninlinable_function` applies to this key,
-                // and it reaches a cell.
-                Some(crate::driver::make_green_key_typed(
-                    w_code,
-                    0,
-                    is_being_profiled,
-                )),
-            ),
-            sub_wc.trace_ctx.get_trace_position(),
-            None,
-        );
         let result = {
             // #704 root-bridge self-recursive inline: exempt this callee body
             // sub-walk's nested recursive residual from the self-recursive
@@ -15588,9 +15601,13 @@ fn descend_generatorentry<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
         );
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .invalidate_caches_for_escaped();
+    // `pyjitpl.py do_residual_call` step 5: invalidate on the
+    // CALL_MAY_FORCE executed above, not the recorded CALL_ASSEMBLER.
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        OpCode::CallMayForceR,
+        Some(call_descr.get_extra_info()),
+        &[funcptr, iter_op],
+    );
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;

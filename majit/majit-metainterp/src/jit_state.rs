@@ -484,8 +484,10 @@ pub trait JitState: Sized {
     /// writes.
     /// resume.py `AbstractResumeDataReader._prepare` (`_prepare_virtuals`
     /// then `_prepare_pendingfields`). Runs before `newframe` /
-    /// `consume_boxes`. The default is a no-op; production fills virtuals
-    /// so `getvirtual_ptr` during consume stores the same box.
+    /// `consume_boxes`, once per reader; `setup_bridge_sym` never applies
+    /// the pending fields again. The default is a no-op like
+    /// `setup_bridge_sym`'s; production fills virtuals so `getvirtual_ptr`
+    /// during consume stores the same box.
     fn prepare_bridge_resume(
         _sym: &mut Self::Sym,
         _ctx: &mut crate::trace_ctx::TraceCtx,

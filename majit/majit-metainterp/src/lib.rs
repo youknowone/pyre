@@ -261,9 +261,10 @@ pub use pyjitpl::{
     trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
-    BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
-    force_all_bridge_virtuals, materialize_bridge_virtual, rebuilt_value_to_opref,
-    replay_pending_fields, seed_bridge_virtualizable_boxes, take_or_new_virtuals_cache,
+    BridgeVirtualCache, PendingRefArrayWrite, decode_fieldnum, default_bridge_array_descr,
+    emit_pending_field_op, force_all_bridge_virtuals, materialize_bridge_virtual,
+    rebuilt_value_to_opref, replay_pending_fields, seed_bridge_virtualizable_boxes,
+    take_or_new_virtuals_cache,
 };
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::ClearReplaceFrames;
@@ -1548,12 +1549,12 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// entered, 1 = retired (terminal-decline short-circuit removed; index kept), 2 = descr_addr==0 skip,
 /// 3 = status-busy skip, 4 = jitcounter FIRED (true), 5 = stack_almost_full
 /// returned true, 6 = start_retrace_from_guard entered, 7 = start_retrace bailed
-/// (source loop evicted: compiled_loops miss), 8 = compile_bridge entered (trace
+/// (rd_loop_token.loop_token_wref() dead), 8 = compile_bridge entered (trace
 /// closed → backend request path), 9 = compile_bridge InvalidLoop discard, 10 =
 /// compile_bridge retrace_requested return, 11 = retired (compile.py
 /// compile_trace has no JUMP/LABEL arity giveup), 12 = start_bridge_tracing entered,
-/// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = sbt
-/// early: no compiled_meta, 16 = sbt early: !can_trace, 17 = sbt early:
+/// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = retired
+/// (compiled_loops meta is not the loop_token_wref gate), 16 = sbt early: !can_trace, 17 = sbt early:
 /// fail_values too short, 18 = compile_and_run_once entered from a back edge,
 /// 19 = compile_and_run_once entered from a function entry, 20 =
 /// compile_and_run_once early-out: portal jitcode unavailable, 21 =

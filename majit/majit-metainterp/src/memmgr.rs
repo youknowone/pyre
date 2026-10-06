@@ -29,31 +29,33 @@
 //! (`compile_tmp_callback`) are the two places upstream discharges it.
 
 use indexmap::IndexMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use majit_backend::JitCellToken;
 
-/// `memmgr.py` `class MemoryManager`. Pyre also pins the
+/// Body of `memmgr.py` `class MemoryManager`. Pyre also pins the
 /// retrace/unroll parameters here, mirroring RPython's lazy attribute
 /// writes via `warmstate.py set_param_retrace_limit set_param_*`. RPython treats them
 /// as Python `int` attributes; pyre declares them as typed fields and
 /// initializes them to the `rlib/jit.py PARAMETERS` defaults.
-pub struct MemoryManager {
+struct MemoryManagerInner {
     /// `memmgr.py` `self.current_generation = r_int64(1)`.
-    pub current_generation: i64,
+    current_generation: i64,
     /// `memmgr.py` `self.max_age = max_age` — set by
     /// `set_max_age` (`memmgr.py`).  `<= 0` disables eviction.
-    pub max_age: i64,
+    max_age: i64,
     /// `memmgr.py:39` `self.next_check = r_int64(-1)`.  Generation
     /// at which `_kill_old_loops_now` next fires; `-1` means
     /// "eviction disabled" (`memmgr.py`).
-    pub next_check: i64,
+    next_check: i64,
     /// `memmgr.py` `self.check_frequency = -1`.  Number of
     /// generations between successive `_kill_old_loops_now` sweeps.
     /// `-1` is "uninitialized"; `set_max_age` derives a real value
     /// (`int(sqrt(max_age))` by default per `memmgr.py`).
-    pub check_frequency: i64,
+    check_frequency: i64,
     /// How many times this manager has let go of loops: each
     /// `_kill_old_loops_now` that evicted something, and each
     /// `release_all_loops`. A strong handle dropped here can be a cell's last,
@@ -74,30 +76,42 @@ pub struct MemoryManager {
     /// as an associative-container key**. The Arc value held alongside guarantees the
     /// pointee is alive for the lifetime of the entry, so pointer
     /// identity is stable until removal.
-    pub alive_loops: indexmap::IndexMap<*const JitCellToken, Arc<JitCellToken>>,
+    alive_loops: indexmap::IndexMap<*const JitCellToken, Arc<JitCellToken>>,
 
     /// `warmstate.py` `set_param_retrace_limit` writes here.
     /// `unroll.py:215` reader.
-    pub retrace_limit: u32,
+    retrace_limit: u32,
     /// `warmstate.py` `set_param_max_retrace_guards`.
     /// `unroll.py:265` reader.
-    pub max_retrace_guards: u32,
+    max_retrace_guards: u32,
     /// `warmstate.py` `set_param_max_unroll_loops`.
     /// `pyjitpl.py:2946` reader.
-    pub max_unroll_loops: u32,
+    max_unroll_loops: u32,
     /// `warmstate.py` `set_param_max_unroll_recursion`.
     /// `pyjitpl.py:1404` reader.
-    pub max_unroll_recursion: u32,
+    max_unroll_recursion: u32,
 }
 
-impl MemoryManager {
+/// `memmgr.py` `class MemoryManager`.
+///
+/// `Clone` is another handle to the same manager: `warmspot.py`
+/// `WarmRunnerDesc.__init__` creates one `memmgr.MemoryManager()` on the
+/// runner, and every `WarmEnterState` reaches it as
+/// `self.warmrunnerdesc.memory_manager` (`set_param_loop_longevity`,
+/// `get_assembler_token`, `execute_assembler`).
+#[derive(Clone)]
+pub struct MemoryManager {
+    inner: Rc<RefCell<MemoryManagerInner>>,
+}
+
+impl MemoryManagerInner {
     /// `memmgr.py` `MemoryManager.__init__`. Note RPython splits
     /// init from `set_max_age`; pyre takes `max_age` upfront for
     /// ergonomics — `set_max_age` later overwrites it just like the
     /// upstream call sequence at `warmspot.py` /
     /// `set_user_param('loop_longevity=...')`.
-    pub fn new(max_age: i64) -> Self {
-        let mut mgr = MemoryManager {
+    fn new(max_age: i64) -> Self {
+        let mut mgr = MemoryManagerInner {
             // memmgr.py:38 current_generation = r_int64(1)
             current_generation: 1,
             // memmgr.py:39 next_check = r_int64(-1)
@@ -417,7 +431,7 @@ impl MemoryManager {
         self.alive_loops.len()
     }
 
-    /// `memmgr.py:38` `current_generation` read accessor.  Test/debug
+    /// `memmgr.py` `MemoryManager.current_generation` read accessor.  Test/debug
     /// only; production code reads the field directly.
     pub fn current_generation(&self) -> i64 {
         self.current_generation
@@ -426,6 +440,115 @@ impl MemoryManager {
     /// Test/debug accessor — `looptoken in self.alive_loops` upstream.
     pub fn contains(&self, looptoken: &Arc<JitCellToken>) -> bool {
         self.alive_loops.contains_key(&Arc::as_ptr(looptoken))
+    }
+}
+
+impl MemoryManager {
+    /// `memmgr.py` `MemoryManager.__init__` + `set_max_age(max_age)`.
+    pub fn new(max_age: i64) -> Self {
+        MemoryManager {
+            inner: Rc::new(RefCell::new(MemoryManagerInner::new(max_age))),
+        }
+    }
+
+    /// True when `other` is the same manager object
+    /// (`warmrunnerdesc.memory_manager` is one object on the runner).
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// `memmgr.py` `set_max_age(max_age, check_frequency=0)`.
+    pub fn set_max_age(&mut self, max_age: i64, check_frequency: i64) {
+        self.inner
+            .borrow_mut()
+            .set_max_age(max_age, check_frequency)
+    }
+
+    /// `memmgr.py` `self.max_age`.
+    pub fn max_age(&self) -> i64 {
+        self.inner.borrow().max_age()
+    }
+
+    /// Pyre-only readback for `get_param("loop_longevity")`.
+    pub fn loop_longevity_param(&self) -> i64 {
+        self.inner.borrow().loop_longevity_param()
+    }
+
+    /// `memmgr.py` `keep_loop_alive(looptoken)`.
+    pub fn keep_loop_alive(&mut self, looptoken: &Arc<JitCellToken>) {
+        self.inner.borrow_mut().keep_loop_alive(looptoken)
+    }
+
+    /// `memmgr.py` `next_generation`; returns the evicted tokens (see
+    /// [`MemoryManagerInner::next_generation`]).
+    pub fn next_generation(&mut self) -> Vec<Arc<JitCellToken>> {
+        self.inner.borrow_mut().next_generation()
+    }
+
+    /// `memmgr.py` `release_all_loops`.
+    pub fn release_all_loops(&mut self) {
+        self.inner.borrow_mut().release_all_loops()
+    }
+
+    /// The counter `MemoryManagerInner::evictions` documents.
+    pub fn eviction_generation(&self) -> u64 {
+        self.inner.borrow().eviction_generation()
+    }
+
+    /// `len(self.alive_loops)`.
+    pub fn alive_count(&self) -> usize {
+        self.inner.borrow().alive_count()
+    }
+
+    /// `memmgr.py` `MemoryManager.current_generation`.
+    pub fn current_generation(&self) -> i64 {
+        self.inner.borrow().current_generation()
+    }
+
+    /// `memmgr.py` `MemoryManager.next_check`.
+    pub fn next_check(&self) -> i64 {
+        self.inner.borrow().next_check
+    }
+
+    /// `looptoken in self.alive_loops`.
+    pub fn contains(&self, looptoken: &Arc<JitCellToken>) -> bool {
+        self.inner.borrow().contains(looptoken)
+    }
+
+    /// `warmstate.py` `set_param_retrace_limit` target.
+    pub fn retrace_limit(&self) -> u32 {
+        self.inner.borrow().retrace_limit
+    }
+
+    pub fn set_retrace_limit(&mut self, value: u32) {
+        self.inner.borrow_mut().retrace_limit = value;
+    }
+
+    /// `warmstate.py` `set_param_max_retrace_guards` target.
+    pub fn max_retrace_guards(&self) -> u32 {
+        self.inner.borrow().max_retrace_guards
+    }
+
+    pub fn set_max_retrace_guards(&mut self, value: u32) {
+        self.inner.borrow_mut().max_retrace_guards = value;
+    }
+
+    /// `warmstate.py` `set_param_max_unroll_loops` target.
+    pub fn max_unroll_loops(&self) -> u32 {
+        self.inner.borrow().max_unroll_loops
+    }
+
+    pub fn set_max_unroll_loops(&mut self, value: u32) {
+        self.inner.borrow_mut().max_unroll_loops = value;
+    }
+
+    /// `warmstate.py` `set_param_max_unroll_recursion` target.
+    pub fn max_unroll_recursion(&self) -> u32 {
+        self.inner.borrow().max_unroll_recursion
+    }
+
+    pub fn set_max_unroll_recursion(&mut self, value: u32) {
+        self.inner.borrow_mut().max_unroll_recursion = value;
     }
 }
 

@@ -4235,6 +4235,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         }
         _ => unreachable!("dst_bank matched above"),
     };
+    // `pyjitpl.py do_residual_call` step 5: invalidate on the
+    // CALL_MAY_FORCE executed in step 2, not the recorded CALL_ASSEMBLER.
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        call_opcode,
+        Some(call_descr.get_extra_info()),
+        &allboxes,
+    );
     // `make_result_of_lastop(resbox)`: the executed result is the op's
     // value whatever its bits (zero, +0.0 and null included).
     if recorded != OpRef::NONE && raised == 0 {
