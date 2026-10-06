@@ -76046,6 +76046,29 @@ mod tests {
             "the opener's own unwind edge must not keep the bracket"
         );
 
+        // A call inside the bracket unwinds to that same `UnwindResume`
+        // once cleanup blocks are stripped. Visiting it must not refuse
+        // a bracket whose normal path is still balanced.
+        let mut inner_unwinding = body_of(blocks(second_pin(), vec![]));
+        let resume = inner_unwinding.body.len();
+        inner_unwinding.body.push(
+            serde_json::from_value(block(vec![], serde_json::json!("UnwindResume"))).unwrap(),
+        );
+        let mut kind = inner_unwinding.body[4].terminator.kind_value().clone();
+        kind["Call"]["on_unwind"] = serde_json::json!(resume);
+        inner_unwinding.body[4].set_terminator_kind(kind);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &inner_unwinding,
+            &super::MovedOutLocals::with_set(&inner_unwinding, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a call's stripped unwind must not keep the bracket"
+        );
+
         // With one pin, `base + 1` names a slot nothing in this bracket
         // filled.
         let one_pin = body_of(blocks(

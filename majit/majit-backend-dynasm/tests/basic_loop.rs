@@ -392,6 +392,96 @@ fn test_guard_and_loop() {
     assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
 }
 
+/// `reshape_jump_args_for_preamble` pads a short body JUMP with the
+/// preamble LABEL's extra entry box. The assembler remap then sees
+/// equal arity (`x86/regalloc.py` `_compute_hint_locations_from_descr`)
+/// and identity-moves the invariant slot.
+#[test]
+fn a_jump_that_carries_a_label_invariant_slot_compiles() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(11);
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let counter = inputargs[0].opref();
+    let invariant = inputargs[1].opref();
+    let loop_descr = make_loop_target_descr(token.number, false);
+
+    let label_op = Op::new(OpCode::Label, &[rb(counter), rb(invariant)]);
+    label_op.pos().set(OpRef::void_op(100));
+    label_op.setdescr(loop_descr.clone());
+
+    let add_op = Op::new(OpCode::IntAdd, &[rb(counter), rb(OpRef::const_int(1))]);
+    add_op.pos().set(OpRef::int_op(1));
+
+    let lt_op = Op::new(
+        OpCode::IntLt,
+        &[rb(OpRef::int_op(1)), rb(OpRef::const_int(5))],
+    );
+    lt_op.pos().set(OpRef::int_op(2));
+
+    let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+    guard_op.pos().set(OpRef::void_op(3));
+    guard_op.set_fail_arg_types(vec![Type::Int, Type::Int]);
+    guard_op.setfailargs(vec![rb(OpRef::int_op(1)), rb(invariant)].into());
+
+    let jump_op = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(invariant)]);
+    jump_op.pos().set(OpRef::void_op(4));
+    jump_op.setdescr(loop_descr);
+
+    let ops_rc: Vec<OpRc> = vec![
+        OpRc::new(label_op),
+        OpRc::new(add_op),
+        OpRc::new(lt_op),
+        OpRc::new(guard_op),
+        OpRc::new(jump_op),
+    ];
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(99)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert!(!descr.is_finish(), "should be guard failure, not finish");
+    assert_eq!(backend.get_int_value(&frame, 0), 5);
+    assert_eq!(backend.get_int_value(&frame, 1), 99);
+}
+
+/// The assembler remap is `x86/regalloc.py` `consider_jump`'s 1:1 walk;
+/// a JUMP shorter than its compiled LABEL is the arity bug, not a
+/// silent truncate.
+#[test]
+#[should_panic(expected = "JUMP args (1)")]
+fn a_jump_shorter_than_its_label_is_rejected() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(12);
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let counter = inputargs[0].opref();
+    let invariant = inputargs[1].opref();
+    let loop_descr = make_loop_target_descr(token.number, false);
+
+    let label_op = Op::new(OpCode::Label, &[rb(counter), rb(invariant)]);
+    label_op.pos().set(OpRef::void_op(100));
+    label_op.setdescr(loop_descr.clone());
+
+    let add_op = Op::new(OpCode::IntAdd, &[rb(counter), rb(OpRef::const_int(1))]);
+    add_op.pos().set(OpRef::int_op(1));
+
+    let jump_op = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
+    jump_op.pos().set(OpRef::void_op(2));
+    jump_op.setdescr(loop_descr);
+
+    let ops_rc: Vec<OpRc> = vec![OpRc::new(label_op), OpRc::new(add_op), OpRc::new(jump_op)];
+    let _ = backend.compile_loop(&inputargs, &ops_rc, &token);
+}
+
 /// `regalloc.py consider_guard_value`: the counter index names the
 /// guard operand's deadframe slot, independent of the guard's fail arguments.
 #[test]

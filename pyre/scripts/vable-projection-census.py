@@ -121,7 +121,16 @@ BARE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 # `panic(const "assertion failed: … self.field")`. That is a string, not a
 # projection; matching it attributes a non-deref to the function that only
 # reads `(*self).field`.
+# Charon pretty-print embeds `assert!(index < self.valuestackdepth)` as
+# `panic(const "assertion failed: index < self.valuestackdepth")`.  The
+# field name inside that string is not a projection; 10.04 started
+# spelling the message this way and the census must not count it.
 STRING_LIT = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def blank_string_lits(line: str) -> str:
+    """Replace double-quoted literals with spaces, keeping columns."""
+    return STRING_LIT.sub(lambda m: " " * len(m.group(0)), line)
 
 
 def base_of(line: str, close: int) -> str | None:
@@ -170,7 +179,9 @@ def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
     """Per-function count of projections whose base is not a deref.
 
     `frame_1.f` / `(frame_1).f` is non-deref; anything reaching through a `*`
-    is a deref.  A base of neither shape is returned as unclassified rather
+    is a deref.  Quoted string literals are not projections — Charon 10.04
+    pretty-print puts `assert!(self.field)` into a `panic(const "...")`
+    message.  A base of neither shape is returned as unclassified rather
     than assumed harmless — a silently miscounting tripwire is worse than none.
     """
     alt = "|".join(re.escape(f) for f in fields)
@@ -186,12 +197,12 @@ def census(dump: str, fields: list[str]) -> tuple[dict[str, int], list[str]]:
             continue
         if raw.lstrip().startswith("//"):
             continue
-        line = STRING_LIT.sub('""', raw)
-        cut = line.find("//")
+        scan = blank_string_lits(raw)
+        cut = scan.find("//")
         if cut != -1:
-            line = line[:cut]
-        for hit in any_proj.finditer(line):
-            found = projection_base(line, hit.start())
+            scan = scan[:cut]
+        for hit in any_proj.finditer(scan):
+            found = projection_base(scan, hit.start())
             if found is None:
                 unclassified.append(f"{fn}: {raw.strip()}")
                 continue

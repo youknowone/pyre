@@ -2045,9 +2045,17 @@ impl<'a> RegAlloc<'a> {
             return;
         };
         let target_arglocs = descr.target_arglocs();
-        if target_arglocs.len() != jump_args.len() {
-            return;
-        }
+        // x86/regalloc.py `_compute_hint_locations_from_descr`:
+        // `assert len(arglocs) == jump_op.numargs()`. The assembler remap
+        // is the same 1:1 walk; a length mismatch here is the JUMP vs
+        // LABEL arity bug, not a hint to skip.
+        assert_eq!(
+            jump_args.len(),
+            target_arglocs.len(),
+            "JUMP args ({}) != target LABEL args ({})",
+            jump_args.len(),
+            target_arglocs.len(),
+        );
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let position = self.final_jump_op_position;
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
