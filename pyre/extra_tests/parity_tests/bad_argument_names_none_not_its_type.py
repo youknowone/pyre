@@ -60,6 +60,10 @@ def a_rejected_value_that_is_not_none_names_its_type():
          "open() argument 'mode' must be str, not int"),
         (lambda: 'a'.encode(1),
          "encode() argument 'encoding' must be str, not int"),
+        (lambda: ValueError().add_note(b"n"),
+         'add_note() argument must be str, not bytes'),
+        (lambda: ValueError().add_note(1),
+         'add_note() argument must be str, not int'),
     ]
     for fn, expected in cases:
         got = show(fn)
