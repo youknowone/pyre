@@ -6012,6 +6012,104 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, mut frame: usize) -> 
     true
 }
 
+/// Write every static field then every array item `0..len(lst)` onto `frame`.
+///
+/// `virtualizable.py VirtualizableInfo.write_boxes` walks `unroll_static_fields`
+/// then each array's items `for j in range(len(lst))`. `pyjitpl.py
+/// MetaInterp.synchronize_virtualizable` is the caller of that write. pyre's
+/// `synchronize_virtualizable` targets `virtualizable_heap_ptr` (the
+/// `snapshot_for_tracing` copy; `TraceCtx::standard_virtualizable_ptr` is the
+/// live identity), so the interpreter frame lags until this write.
+/// `setarrayitem_vable` already mirrors array items onto the live frame
+/// (`own_frame_array_store_target` → `store_live_frame_array_slot`); this
+/// write still covers every slot, including those above `valuestackdepth`
+/// (`pyframe.py popvalue` stores None there). `write_boxes` unwraps every
+/// box: `Void` / `NO_CONCRETE` / a missing entry never reached this helper
+/// (556 residual flushes across 80 synth fixtures). A `debug_assert!` names
+/// that invariant; release still skips so boxing cannot store `PY_NULL`.
+pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    let Some(info) = ctx.virtualizable_info() else {
+        return;
+    };
+    let static_count = info.num_static_extra_boxes;
+    for index in 0..static_count {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(index) else {
+            debug_assert!(
+                false,
+                "write_boxes: static slot {index} must have a virtualizable box"
+            );
+            continue;
+        };
+        let bits = known_vable_bits(&value);
+        debug_assert!(
+            bits.is_some(),
+            "write_boxes: static slot {index} must carry a runtime concrete (not Void/NO_CONCRETE)"
+        );
+        let Some(bits) = bits else {
+            continue;
+        };
+        match info.static_fields.get(index).map(|field| field.field_type) {
+            Some(Type::Int) => store_live_frame_static_int(frame, index, bits),
+            _ => unsafe {
+                info.write_field(frame as *mut u8, index, bits);
+            },
+        }
+        frame = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        if frame == 0 {
+            return;
+        }
+    }
+    let Some(len) = concrete_frame_array_len(frame) else {
+        return;
+    };
+    let base = static_count;
+    for j in 0..len {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + j) else {
+            debug_assert!(
+                false,
+                "write_boxes: array item {j} must have a virtualizable box"
+            );
+            continue;
+        };
+        debug_assert!(
+            known_vable_bits(&value).is_some(),
+            "write_boxes: array item {j} must carry a runtime concrete (not Void/NO_CONCRETE)"
+        );
+        let Some(_) = known_vable_bits(&value) else {
+            continue;
+        };
+        frame = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        if frame == 0 {
+            return;
+        }
+        // GCREF array items (`write_boxes` unwrap + setarrayitem) are
+        // already boxed; `store_live_frame_array_slot` is the same
+        // store `setarrayitem_vable` uses. Int/Float still box, and
+        // boxing can move a nursery frame — take the returned address.
+        match &value {
+            Value::Ref(_) => store_live_frame_array_slot(frame, j, value),
+            _ => {
+                if let Some(frame_now) = store_boxed_frame_local(frame, j, &value) {
+                    frame = frame_now;
+                }
+            }
+        }
+    }
+}
+
+fn known_vable_bits(value: &Value) -> Option<i64> {
+    match value {
+        Value::Void => None,
+        Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE => None,
+        Value::Int(v) => Some(*v),
+        Value::Float(f) => Some(f.to_bits() as i64),
+        Value::Ref(r) => Some(r.as_usize() as i64),
+    }
+}
+
 /// Write one local when its concrete value is a real object.
 ///
 /// `Value::Void` and `Ref(NO_CONCRETE)` are skipped: boxing either would
