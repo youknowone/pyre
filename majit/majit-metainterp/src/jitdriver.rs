@@ -4343,48 +4343,52 @@ impl<S: JitState> JitDriver<S> {
                             } else {
                                 S::collect_jump_args(sym)
                             };
-                            if let Some(ctx) = self.meta.trace_ctx() {
-                                ctx.remove_consts_and_duplicates_untyped(&mut boxes);
-                                // pyjitpl.py:2985-2988 normalizes
-                                // `self.virtualizable_boxes` IN PLACE and appends
-                                // the mutated list, so the rewrite reaches every
-                                // later reader. The element block is a strict
-                                // SUFFIX of the loop-carried list
-                                // (`collect_jump_args_from_portal` /
-                                // `loop_carried_boxes_from_portal`), so its tail is
-                                // what goes back.
-                                if let Some(n) =
-                                    vable_boxes.as_ref().map(|b| b.len().saturating_sub(1))
-                                {
-                                    // Asserted, not filtered. Upstream has no
-                                    // partial state to fall back to — it rewrites
-                                    // the list in place — and skipping here would
-                                    // leave the ctx copy unnormalized, so a later
-                                    // cut mints a LABEL with the collapsed slots
-                                    // missing. `adopt_normalized_virtualizable_
-                                    // elements` asserts the same invariant from
-                                    // the other side.
-                                    //
-                                    // It holds by construction:
-                                    // `collect_jump_args_from_portal` appends the
-                                    // element block, and
-                                    // `remove_consts_and_duplicates_untyped` takes
-                                    // `&mut [OpRef]`, so it substitutes SameAs ops
-                                    // in place and cannot shorten the list
-                                    // (pyjitpl.py remove_consts_and_duplicates assigns `boxes[i]`).
-                                    assert!(
-                                        n <= boxes.len(),
-                                        "virtualizable element block ({n}) is not a suffix \
-                                         of live_arg_boxes ({})",
-                                        boxes.len(),
-                                    );
-                                    if n > 0 {
-                                        let tail = boxes[boxes.len() - n..].to_vec();
-                                        ctx.adopt_normalized_virtualizable_elements(&tail);
+                            if portal_slot_missing {
+                                Vec::new()
+                            } else {
+                                if let Some(ctx) = self.meta.trace_ctx() {
+                                    ctx.remove_consts_and_duplicates_untyped(&mut boxes);
+                                    // pyjitpl.py:2985-2988 normalizes
+                                    // `self.virtualizable_boxes` IN PLACE and appends
+                                    // the mutated list, so the rewrite reaches every
+                                    // later reader. The element block is a strict
+                                    // SUFFIX of the loop-carried list
+                                    // (`collect_jump_args_from_portal` /
+                                    // `loop_carried_boxes_from_portal`), so its tail is
+                                    // what goes back.
+                                    if let Some(n) =
+                                        vable_boxes.as_ref().map(|b| b.len().saturating_sub(1))
+                                    {
+                                        // Asserted, not filtered. Upstream has no
+                                        // partial state to fall back to — it rewrites
+                                        // the list in place — and skipping here would
+                                        // leave the ctx copy unnormalized, so a later
+                                        // cut mints a LABEL with the collapsed slots
+                                        // missing. `adopt_normalized_virtualizable_
+                                        // elements` asserts the same invariant from
+                                        // the other side.
+                                        //
+                                        // It holds by construction:
+                                        // `collect_jump_args_from_portal` appends the
+                                        // element block, and
+                                        // `remove_consts_and_duplicates_untyped` takes
+                                        // `&mut [OpRef]`, so it substitutes SameAs ops
+                                        // in place and cannot shorten the list
+                                        // (pyjitpl.py remove_consts_and_duplicates assigns `boxes[i]`).
+                                        assert!(
+                                            n <= boxes.len(),
+                                            "virtualizable element block ({n}) is not a suffix \
+                                             of live_arg_boxes ({})",
+                                            boxes.len(),
+                                        );
+                                        if n > 0 {
+                                            let tail = boxes[boxes.len() - n..].to_vec();
+                                            ctx.adopt_normalized_virtualizable_elements(&tail);
+                                        }
                                     }
                                 }
+                                boxes
                             }
-                            boxes
                         }
                         None => Vec::new(),
                     };

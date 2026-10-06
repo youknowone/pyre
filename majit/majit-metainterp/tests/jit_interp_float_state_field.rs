@@ -543,6 +543,46 @@ mod virt_array_with_float_scalar {
         assert_eq!(portal, vec![c0, c1, identity, e0, e1]);
     }
 
+    #[test]
+    fn missing_portal_slot_with_vable_elements_is_none() {
+        // CloseLoop must see None before it normalizes live_arg_boxes and
+        // asserts that the virtualizable element block is a suffix. An empty
+        // JUMP list with a nonempty vable_boxes would panic there.
+        let state = MixedState {
+            sp: 0,
+            cells: vec![0; 2],
+            acc: 0.0,
+            stack: VirtArray::filled(0, 2),
+        };
+        let program: &Bytecode = &[OP_NOP, OP_STEP];
+        let meta = state.build_meta(0, program);
+        let sym = <MixedState as JitState>::create_sym(&meta, 0);
+
+        let c0 = majit_ir::OpRef::input_arg_typed(11, majit_ir::Type::Int);
+        let e0 = majit_ir::OpRef::input_arg_typed(90, majit_ir::Type::Int);
+        let e1 = majit_ir::OpRef::input_arg_typed(91, majit_ir::Type::Int);
+        let identity = majit_ir::OpRef::input_arg_typed(92, majit_ir::Type::Ref);
+        let boxes = [
+            (e0, majit_ir::Type::Int),
+            (e1, majit_ir::Type::Int),
+            (identity, majit_ir::Type::Ref),
+        ];
+
+        let mut builder = majit_metainterp::JitCodeBuilder::new();
+        builder.load_const_i_value(2, 0);
+        builder.load_const_r_value(1, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = majit_metainterp::MIFrame::new(jitcode, 0);
+        frame.int_regs[1] = Some(c0);
+        // cells[1] (int_regs[2]) left empty; vable identity and elements stay.
+        frame.ref_regs[1] = Some(identity);
+
+        assert!(
+            <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes).is_none(),
+            "a missing declared identity slot must not emit a short JUMP"
+        );
+    }
+
     /// The entry contract this suffix has to match: `live_value_types` is the
     /// reds only, and `JitDriver::extend_compiled_live_values` appends the
     /// elements after all of them.
