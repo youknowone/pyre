@@ -14492,19 +14492,21 @@ pub fn __majit_wrap_type_descr_set_name(
             "'"
         )));
     }
-    // typeobject.py descr_set__name__ text_w — read through the surrogate-aware
-    // WTF-8 view so a lone surrogate does not panic before the
-    // checks below run.
+    // Mixed NUL+surrogate is UnicodeEncodeError: `type_set_name`
+    // encodes with `PyUnicode_AsUTF8AndSize` before the `strlen` NUL
+    // test (Objects/typeobject.c type_set_name, read at v3.14.6 in
+    // ~/Projects/cpython-3146). `descr_set__name__` does `'\x00' in
+    // name` then `_check_surrogate` and answers ValueError. The
+    // exception type is observable, so `_check_surrogate` runs first;
+    // both checks stay before `w_type.name = name`. U+0000 is a
+    // single 0x00 byte in WTF-8.
+    pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
-    // typeobject.py descr_set__name__ `if '\x00' in name` — a byte
-    // search on the utf8/wtf8 payload, not a code-point walk.
     if wtf8.as_bytes().contains(&0) {
         return Err(crate::PyError::value_error(
             "type name must not contain null characters",
         ));
     }
-    // typeobject.py _check_surrogate.
-    pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;
     // typeobject.py `w_type.name = name` — surrogate-free, so
     // the str view is valid UTF-8.
     unsafe { pyre_object::w_type_set_name(w_type, w_value) };
