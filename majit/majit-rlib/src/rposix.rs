@@ -1869,10 +1869,26 @@ mod inheritable_c {
                 return 0;
             }
             let errno = _get_errno();
-            if errno != libc::ENOTTY && errno != libc::EACCES {
-                return -1;
+            // O_PATH descriptors fail ioctl(FIOCLEX/FIONCLEX) with EBADF.
+            // `rposix.rpy_set_inheritable` returns -1 unless errno is ENOTTY
+            // or EACCES. `set_inheritable` (fileutils.c, bpo-44849) falls
+            // through to fcntl and leaves ioctl_works set. Observable:
+            // lib-python/3/test/test_os.py
+            // FDInheritanceTests.test_get_set_inheritable_o_path. No @jit /
+            // _immutable_ / dont_look_inside on `rpy_set_inheritable` or
+            // `_c_set_inheritable`.
+            let o_path_ioctl_ebadf = cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "fuchsia",
+            )) && errno == libc::EBADF;
+            if !o_path_ioctl_ebadf {
+                if errno != libc::ENOTTY && errno != libc::EACCES {
+                    return -1;
+                }
+                IOCTL_WORKS.store(0, Ordering::Relaxed);
             }
-            IOCTL_WORKS.store(0, Ordering::Relaxed);
         }
 
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -3785,6 +3801,41 @@ mod tests {
         unsafe {
             assert_eq!(c_close(fds[0]), 0);
             assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    #[test]
+    fn inheritable_round_trip_on_o_path() {
+        let path = c"/";
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH) };
+        if fd < 0 {
+            return;
+        }
+        let set = |inh: i32| {
+            let res = unsafe { _c_set_inheritable(fd, inh) };
+            if res < 0 {
+                let err = get_saved_errno();
+                if skip_enotsup(err) {
+                    return Err(err);
+                }
+                panic!("_c_set_inheritable({inh}) on O_PATH errno {err}");
+            }
+            Ok(())
+        };
+        if set(0).is_err() {
+            unsafe {
+                let _ = c_close(fd);
+            }
+            return;
+        }
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        set(1).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 1);
+        set(0).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        unsafe {
+            assert_eq!(c_close(fd), 0);
         }
     }
 

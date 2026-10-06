@@ -8810,9 +8810,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         drop(bound);
                         let follow_symlinks =
                             match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => pyre_object::with_roots!(w_path, w_attribute => {
-                                    crate::baseobjspace::is_true(v)
-                                })?,
+                                Some(v) => {
+                                    let mut v = v;
+                                    pyre_object::with_roots!(w_path, w_attribute, v => {
+                                        crate::baseobjspace::is_true(v)
+                                    })?
+                                }
                                 None => true,
                             };
                         (w_path, w_attribute, follow_symlinks)
@@ -8911,12 +8914,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         drop(bound);
                         let follow_symlinks =
                             match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => pyre_object::with_roots!(
-                                    w_path,
-                                    w_attribute,
-                                    w_value,
-                                    w_flags => crate::baseobjspace::is_true(v)
-                                )?,
+                                Some(v) => {
+                                    let mut v = v;
+                                    pyre_object::with_roots!(
+                                        w_path,
+                                        w_attribute,
+                                        w_value,
+                                        w_flags,
+                                        v => crate::baseobjspace::is_true(v)
+                                    )?
+                                }
                                 None => true,
                             };
                         (w_path, w_attribute, w_value, w_flags, follow_symlinks)
@@ -9022,9 +9029,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         drop(bound);
                         let follow_symlinks =
                             match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => pyre_object::with_roots!(w_path, w_attribute => {
-                                    crate::baseobjspace::is_true(v)
-                                })?,
+                                Some(v) => {
+                                    let mut v = v;
+                                    pyre_object::with_roots!(w_path, w_attribute, v => {
+                                        crate::baseobjspace::is_true(v)
+                                    })?
+                                }
                                 None => true,
                             };
                         (w_path, w_attribute, follow_symlinks)
@@ -9084,9 +9094,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         drop(bound);
                         let follow_symlinks =
                             match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => pyre_object::with_roots!(w_path => {
-                                    crate::baseobjspace::is_true(v)
-                                })?,
+                                Some(v) => {
+                                    let mut v = v;
+                                    pyre_object::with_roots!(w_path, v => {
+                                        crate::baseobjspace::is_true(v)
+                                    })?
+                                }
                                 None => true,
                             };
                         (w_path, follow_symlinks)
@@ -10903,11 +10916,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // with `eintr_retry=False`. `rposix_stat.c_statvfs` /
                     // `c_fstatvfs` release the GIL and save errno.
                     let mut w_path = args[0];
-                    let path = crate::gateway::fsencode_path_or_fd_w(
-                        w_path,
-                        "statvfs",
-                        HAVE_FSTATVFS,
-                    )?;
+                    let path = pyre_object::with_roots!(w_path => {
+                        crate::gateway::fsencode_path_or_fd_w(
+                            w_path,
+                            "statvfs",
+                            HAVE_FSTATVFS,
+                        )
+                    })?;
                     if path.is_fd {
                         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
                         let ret = pyre_object::with_roots!(w_path => unsafe {
@@ -10921,7 +10936,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 "",
                             ));
                         }
-                        return Ok(statvfs_to_obj(statvfs_info_from_raw(st)));
+                        return Ok(pyre_object::with_roots!(w_path => {
+                            statvfs_to_obj(statvfs_info_from_raw(st))
+                        }));
                     }
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
@@ -10937,7 +10954,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             path.w_path(),
                         ));
                     }
-                    Ok(statvfs_to_obj(statvfs_info_from_raw(st)))
+                    Ok(pyre_object::with_roots!(w_path => {
+                        statvfs_to_obj(statvfs_info_from_raw(st))
+                    }))
                 },
                 1,
             ),
@@ -10965,14 +10984,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         if ret == 0 {
                             break statvfs_info_from_raw(st);
                         }
-                        crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(
-                                majit_rlib::rposix::get_saved_errno(),
-                            ),
-                            |e| io_err(e, ""),
-                        )?;
+                        pyre_object::with_roots!(w_fd => {
+                            crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(
+                                    majit_rlib::rposix::get_saved_errno(),
+                                ),
+                                |e| io_err(e, ""),
+                            )
+                        })?;
                     };
-                    Ok(statvfs_to_obj(info))
+                    Ok(pyre_object::with_roots!(w_fd => statvfs_to_obj(info)))
                 },
                 1,
             ),
