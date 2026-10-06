@@ -1979,22 +1979,26 @@ pub unsafe fn get_and_call_function(
         ))
     {
         // `DescrOperation.get_and_call_function`'s fast path spells this
-        // `w_descr.funccall(w_obj, *args_w)`.  Build the receiver-prepended
-        // positionals as one dynamic list, the shape
-        // `call::call_function_impl_result` itself builds: `Vec::with_capacity`
-        // lowers to `newlist` (`is_vec_ctor_segments`), `push` to the resized
-        // `ListRepr`'s `append`, and `extend_from_slice` to its own method
-        // arm, so the meta-tracer can virtualize it on the fixed-arity paths.
-        // A fixed `[PY_NULL; N]` with a trailing `&full[..len]` is the shape
-        // that dispatcher records as having ended in the opaque
-        // `<[T; N]>::index(&array, ..len)` and kept the whole call dispatcher
-        // out of two-phase translation — which would wall off exactly the
-        // `__instancecheck__` / `__getattr__` dunder dispatch this arm exists
-        // to expose.
-        let mut full = Vec::with_capacity(args_w.len() + 1);
-        full.push(w_obj);
-        full.extend_from_slice(args_w);
-        return crate::call::call_function_impl_result(w_descr, full.as_slice());
+        // `w_descr.funccall(w_obj, *args_w)`.  Arity 0..=4 is unrolled the
+        // way `function.py funccall` specialises `BuiltinCodeN.fastcall_N`
+        // — a stack array, not a `Vec`, so the interpreter does not
+        // allocate per dunder and the tracer sees a constant-length call.
+        // Longer calls still build the dynamic list `call_function` uses:
+        // `with_capacity`/`push` lower to `newlist`/`append`.
+        return match args_w.len() {
+            0 => crate::function::funccall_result(w_descr, &[w_obj]),
+            1 => crate::function::funccall_result(w_descr, &[w_obj, args_w[0]]),
+            2 => crate::function::funccall_result(w_descr, &[w_obj, args_w[0], args_w[1]]),
+            3 => {
+                crate::function::funccall_result(w_descr, &[w_obj, args_w[0], args_w[1], args_w[2]])
+            }
+            _ => {
+                let mut full = Vec::with_capacity(args_w.len() + 1);
+                full.push(w_obj);
+                full.extend_from_slice(args_w);
+                crate::function::funccall_result(w_descr, full.as_slice())
+            }
+        };
     }
     // `get` dispatches `__get__`: a `property` getter and a user descriptor are
     // application-level Python, so a collection can land between the descriptor
@@ -14118,18 +14122,6 @@ unsafe fn set(
         return Ok(false);
     }
 
-    // typedef.py GetSetProperty.descr_property_set reaches
-    // `self.fset(self, space, w_obj, w_value)` as an interp-level call, so a
-    // getset write costs one space-level call there.  The general `__set__`
-    // lookup at the end of this function reaches the same body through the
-    // `getset_descriptor.__set__` entry, which is itself a builtin function
-    // object, and so pays a second one on every `C.__name__ = ...`.  Run the
-    // body in place of the lookup, the licence the `__get__` twin cites.
-    if pyre_object::typedef::is_getset_property(descr) {
-        crate::typedef::getset_property_set(descr, obj, value)?;
-        return Ok(true);
-    }
-
     // property: PyPy W_Property.set → call_function(fset, obj, value).
     // Read-only properties (no `fset` / `@x.setter` never registered)
     // raise AttributeError ("can't set attribute") rather than falling
@@ -14188,12 +14180,17 @@ unsafe fn set(
     // The narrower `is_getset_property` / `is_instance` pair this replaces left
     // a native-layout subclass instance (a `property` subclass, say) with a
     // null type and so no MRO lookup at all.
+    //
+    // descroperation.py `set` / `descr__setattr__` then
+    // `get_and_call_function(w_set, w_descr, w_obj, w_value)`.  interp2app
+    // of `descr_property_set` is `FunctionWithFixedCode`, so that call
+    // looks inside `funccall` / `BuiltinCode3.fastcall_3`.
     let descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if !descr_type.is_null()
         && let Some(set_fn) = lookup_in_type_where(descr_type, "__set__")
         && !set_fn.is_null()
     {
-        crate::call::call_function_impl_result(set_fn, &[descr, obj, value])?;
+        get_and_call_function(set_fn, descr, descr_type, &[obj, value])?;
         return Ok(true);
     }
     Ok(false)
