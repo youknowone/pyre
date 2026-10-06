@@ -2424,16 +2424,17 @@ fn restore_cleared_meta_path(w_dict: PyObjectRef) {
     if w_dict.is_null() {
         return;
     }
-    let still_a_list = match unsafe { pyre_object::w_dict_getitem_str(w_dict, "meta_path") } {
-        Some(live) if unsafe { pyre_object::is_list(live) } => true,
-        _ => false,
-    };
-    if still_a_list {
-        return;
-    }
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_dict);
+    let still_a_list =
+        match unsafe { pyre_object::w_dict_getitem_str(roots.get(dict_slot), "meta_path") } {
+            Some(live) if unsafe { pyre_object::is_list(live) } => true,
+            _ => false,
+        };
+    if still_a_list {
+        return;
+    }
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_list_new_empty());
     let flag_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4680,7 +4681,9 @@ fn exec_code_module(
     if let Some(p) = pathname {
         // importing.py:284 setitem('__file__', w_pathname).
         // `importing.py` `space.newfilename` / `newutf8` copies the path once.
-        let w_pathname = pyre_object::w_str_from_wtf8_managed_borrowed(p);
+        let w_pathname = pyre_object::with_roots!(w_code, w_globals => {
+            pyre_object::w_str_from_wtf8_managed_borrowed(p)
+        });
         unsafe {
             pyre_object::w_dict_setitem_str(w_globals, "__file__", w_pathname);
         }
@@ -5369,8 +5372,17 @@ pub fn init_importlib_bootstrap(
         err.reload(&_roots, slot);
         return Err(err);
     }
-    crate::module::sys::vm::init_stream_codecs()
-        .and(crate::module::_codecs::reimport_encodings_if_needed())
+    // Both inits run; a stream error is pinned across encodings and wins.
+    match crate::module::sys::vm::init_stream_codecs() {
+        Ok(()) => crate::module::_codecs::reimport_encodings_if_needed(),
+        Err(mut err) => {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = err.pin(&_roots);
+            let _encodings = crate::module::_codecs::reimport_encodings_if_needed();
+            err.reload(&_roots, slot);
+            Err(err)
+        }
+    }
 }
 
 /// Off-`host_env` builds reach no bootstrap sources, so the native importer is
