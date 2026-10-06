@@ -12017,7 +12017,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             snapshot_maps_from_ctx(&mut ctx, &mut constants)
         };
-        let recorder = ctx.recorder;
+        let mut recorder = ctx.recorder;
         // `snapshot_recorder` stays put until the optimizer has numbered
         // every guard; the feed holds a pointer to it.
         let (trace, snapshot_recorder) = if number_from_recorder {
@@ -12562,7 +12562,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             snapshot_maps_from_ctx(&mut ctx, &mut constants)
         };
-        let recorder = ctx.recorder;
+        let mut recorder = ctx.recorder;
         let (trace, snapshot_recorder) = if number_from_recorder {
             (recorder.to_tree_loop(), Some(recorder))
         } else {

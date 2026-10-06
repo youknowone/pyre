@@ -1565,12 +1565,12 @@ impl Trace {
         (self.live_inputargs_cloned(), self.ops.clone())
     }
 
-    pub fn into_parts(self) -> (Vec<InputArgRc>, Vec<OpRc>) {
-        let ops = if self.trb.is_some() && self.ops.is_empty() {
-            self.materialize_ops()
-        } else {
-            self.ops
-        };
+    pub fn into_parts(mut self) -> (Vec<InputArgRc>, Vec<OpRc>) {
+        // `opencoder.py Trace.get_iter`: compile walks the live byte
+        // stream, not a `Vec<Op>` that an earlier `materialize_into_ops`
+        // may have filled before `close_loop` recorded JUMP.
+        self.materialize_into_ops();
+        let ops = self.ops;
         let inputargs = self
             .inputargs
             .into_iter()
@@ -1610,14 +1610,16 @@ impl Trace {
     /// `compile.py compile_loop` hands `metainterp.history.trace` to the
     /// optimizer and keeps the opencoder buffer alive for
     /// `ResumeDataLoopMemo.number`, which walks `trace.get_snapshot_iter`
-    /// per surviving guard.
-    pub fn to_tree_loop(&self) -> crate::history::TreeLoop {
-        let ops = if self.trb.is_some() && self.ops.is_empty() {
-            self.materialize_ops()
-        } else {
-            self.ops.clone()
-        };
-        crate::history::TreeLoop::from_oprc(self.live_inputargs_cloned(), ops, Vec::new())
+    /// per surviving guard. `unroll.py optimize_preamble` then does
+    /// `trace.get_iter()` (`ByteTraceIter`); re-walk when `slots` has
+    /// grown since the last fill so JUMP from `close_loop` is included.
+    pub fn to_tree_loop(&mut self) -> crate::history::TreeLoop {
+        self.materialize_into_ops();
+        crate::history::TreeLoop::from_oprc(
+            self.live_inputargs_cloned(),
+            self.ops.clone(),
+            Vec::new(),
+        )
     }
 
     /// opencoder.py `cut_point()` — the recorder's local slice of
@@ -2603,6 +2605,23 @@ mod tests {
         let first = rec.ops()[0].clone();
         let (_, ops) = rec.into_parts();
         assert!(OpRc::ptr_eq(&first, &ops[0]));
+    }
+
+    #[test]
+    fn to_tree_loop_rewalks_byte_stream_after_close_loop() {
+        // `unroll.py optimize_preamble` `trace.get_iter()` walks the live
+        // buffer. An earlier `materialize_into_ops` (`set_op_fail_args`)
+        // must not hide JUMP recorded by `close_loop`.
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_guard(OpCode::GuardTrue, &[i0], None);
+        rec.materialize_into_ops();
+        assert_eq!(rec.ops().len(), 1);
+        rec.close_loop(&[i0]);
+        let loop_ = rec.to_tree_loop();
+        assert_eq!(loop_.ops.last().map(|op| op.opcode), Some(OpCode::Jump));
+        assert_eq!(loop_.ops.len(), 2);
     }
 
     #[test]
