@@ -125,6 +125,7 @@ pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path
         (quote! { ::core::mem::size_of::<i64>() }, quote! { true })
     };
     let type_id = struct_type_id_tokens(header, true);
+    let gc_type_id = quote! { majit_metainterp::__majit_struct_gc_type_id::<#header>() };
     quote! {
         __builder.add_gc_varsize_array_descr(
             ::core::mem::offset_of!(#header, items),
@@ -133,6 +134,7 @@ pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path
             #pointers,
             #is_signed,
             #type_id,
+            #gc_type_id,
         )
     }
 }
@@ -153,11 +155,13 @@ fn float_array_descr_tokens(
         varsize_length_field_name(config, header).unwrap_or_else(|| "capacity".to_string());
     let len_ident = syn::Ident::new(&len_name, proc_macro2::Span::call_site());
     let type_id = struct_type_id_tokens(header, true);
+    let gc_type_id = quote! { majit_metainterp::__majit_struct_gc_type_id::<#header>() };
     quote! {
         __builder.add_gc_varsize_float_array_descr(
             ::core::mem::offset_of!(#header, items),
             ::core::mem::offset_of!(#header, #len_ident),
             #type_id,
+            #gc_type_id,
         )
     }
 }
