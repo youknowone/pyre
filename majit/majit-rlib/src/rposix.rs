@@ -330,6 +330,24 @@ crate::rffi::llexternal!(
     macro = libc::lstat
 );
 
+// `rposix_stat.c_fstatvfs` / `c_statvfs` save errno and are not `macro=True`.
+#[cfg(all(unix, not(target_os = "redox")))]
+crate::rffi::llexternal!(
+    pub c_fstatvfs = "fstatvfs",
+    [crate::rffi::INT, *mut libc::statvfs],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(all(unix, not(target_os = "redox")))]
+crate::rffi::llexternal!(
+    pub c_statvfs = "statvfs",
+    [*const libc::c_char, *mut libc::statvfs],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_getcwd = "getcwd",
@@ -462,6 +480,27 @@ crate::rffi::llexternal!(
         libc::off_t
     ],
     crate::rffi::SSIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_posix_fallocate` and `rposix.c_posix_fadvise` save errno.
+// `HAVE_FALLOCATE` / `HAVE_FADVISE` are linux here. `rposix.posix_fadvise`
+// uses the C return value as the errno.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_posix_fallocate = "posix_fallocate",
+    [crate::rffi::INT, libc::off_t, libc::off_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_posix_fadvise = "posix_fadvise",
+    [crate::rffi::INT, libc::off_t, libc::off_t, crate::rffi::INT],
+    crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
@@ -1635,6 +1674,36 @@ crate::rffi::llexternal!(
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
+// `rposix.c_unshare`, `c_sched_getaffinity`, and `c_sched_setaffinity`
+// save errno. `sys.platform.startswith('linux')`. The affinity mask is a
+// `c_ulong` word array (`rposix.CPU_MASK_P`), not `cpu_set_t`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_unshare = "unshare",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_sched_getaffinity = "sched_getaffinity",
+    [libc::pid_t, crate::rffi::SIZE_T, crate::rffi::VOIDP],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_sched_setaffinity = "sched_setaffinity",
+    [libc::pid_t, crate::rffi::SIZE_T, crate::rffi::VOIDP],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_getpriority` uses `RFFI_FULL_ERRNO_ZERO` because `-1` is a
 // successful priority. `rposix.c_setpriority` saves errno. `who` is `id_t`.
 #[cfg(unix)]
@@ -1767,6 +1836,317 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.rpy_set_inheritable` / `rpy_get_inheritable` /
+// `rpy_dup_noninheritable` / `rpy_dup2_noninheritable`. The C bodies are
+// generated `separate_module_sources` and are not libc symbols, so the
+// `llexternal` wrappers (`_c_set_inheritable`, `_c_get_inheritable`,
+// `c_dup_noninheritable`, `c_dup2_noninheritable`) call these private
+// functions under the same GIL+errno sequence `releasegil=True` +
+// `save_err=RFFI_SAVE_ERRNO` expands to. Inner calls use `libc::ioctl` /
+// `libc::fcntl` / `libc::dup` / `libc::dup2` / `libc::dup3` / `libc::close`
+// rather than the saving `c_*` wrappers.
+#[cfg(unix)]
+mod inheritable_c {
+    use super::_get_errno;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// `rposix.rpy_set_inheritable`. `ioctl_works` is `-1` unknown, `0` no,
+    /// `1` yes.
+    pub(super) unsafe fn rpy_set_inheritable(
+        fd: libc::c_int,
+        inheritable: libc::c_int,
+    ) -> libc::c_int {
+        static IOCTL_WORKS: AtomicI32 = AtomicI32::new(-1);
+        if IOCTL_WORKS.load(Ordering::Relaxed) != 0 {
+            let request = if inheritable != 0 {
+                libc::FIONCLEX
+            } else {
+                libc::FIOCLEX
+            };
+            let err = unsafe { libc::ioctl(fd, request, std::ptr::null_mut::<libc::c_void>()) };
+            if err == 0 {
+                IOCTL_WORKS.store(1, Ordering::Relaxed);
+                return 0;
+            }
+            let errno = _get_errno();
+            // O_PATH descriptors fail ioctl(FIOCLEX/FIONCLEX) with EBADF.
+            // `rposix.rpy_set_inheritable` returns -1 unless errno is ENOTTY
+            // or EACCES. `set_inheritable` (fileutils.c, bpo-44849) falls
+            // through to fcntl and leaves ioctl_works set. Observable:
+            // lib-python/3/test/test_os.py
+            // FDInheritanceTests.test_get_set_inheritable_o_path. No @jit /
+            // _immutable_ / dont_look_inside on `rpy_set_inheritable` or
+            // `_c_set_inheritable`.
+            let o_path_ioctl_ebadf = cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "fuchsia",
+            )) && errno == libc::EBADF;
+            if !o_path_ioctl_ebadf {
+                if errno != libc::ENOTTY && errno != libc::EACCES {
+                    return -1;
+                }
+                IOCTL_WORKS.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return -1;
+        }
+        let flags = if inheritable != 0 {
+            flags & !libc::FD_CLOEXEC
+        } else {
+            flags | libc::FD_CLOEXEC
+        };
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags) }
+    }
+
+    /// `rposix.rpy_get_inheritable`.
+    pub(super) unsafe fn rpy_get_inheritable(fd: libc::c_int) -> libc::c_int {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+        if flags == -1 {
+            return -1;
+        }
+        libc::c_int::from(flags & libc::FD_CLOEXEC == 0)
+    }
+
+    /// `rposix.rpy_dup_noninheritable`. `#ifdef F_DUPFD_CLOEXEC`.
+    pub(super) unsafe fn rpy_dup_noninheritable(fd: libc::c_int) -> libc::c_int {
+        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+    }
+
+    /// `rposix.rpy_dup2_noninheritable`. `#ifdef F_DUP2FD_CLOEXEC` first;
+    /// else `HAVE_DUP3` then `dup2` + `rpy_set_inheritable`. The HAVE_DUP3
+    /// arm returns 0 on success.
+    pub(super) unsafe fn rpy_dup2_noninheritable(fd: libc::c_int, fd2: libc::c_int) -> libc::c_int {
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        {
+            return unsafe { libc::fcntl(fd, libc::F_DUP2FD_CLOEXEC, fd2) };
+        }
+        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+        {
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            {
+                static DUP3_WORKS: AtomicI32 = AtomicI32::new(-1);
+                if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
+                    if unsafe { libc::dup3(fd, fd2, libc::O_CLOEXEC) } >= 0 {
+                        return 0;
+                    }
+                    if DUP3_WORKS.load(Ordering::Relaxed) == -1 {
+                        DUP3_WORKS
+                            .store(i32::from(_get_errno() != libc::ENOSYS), Ordering::Relaxed);
+                    }
+                    if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
+                        return -1;
+                    }
+                }
+            }
+            if unsafe { libc::dup2(fd, fd2) } < 0 {
+                return -1;
+            }
+            if unsafe { rpy_set_inheritable(fd2, 0) } != 0 {
+                unsafe {
+                    libc::close(fd2);
+                }
+                return -1;
+            }
+            0
+        }
+    }
+}
+
+/// `rposix._c_set_inheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn _c_set_inheritable(
+    fd: crate::rffi::INT,
+    inheritable: crate::rffi::INT,
+) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_set_inheritable(fd, inheritable) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix._c_get_inheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn _c_get_inheritable(fd: crate::rffi::INT) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_get_inheritable(fd) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.c_dup_noninheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_dup_noninheritable(fd: crate::rffi::INT) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_dup_noninheritable(fd) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.c_dup2_noninheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_dup2_noninheritable(
+    fd: crate::rffi::INT,
+    fd2: crate::rffi::INT,
+) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_dup2_noninheritable(fd, fd2) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.SetNonInheritableCache`. `cached_inheritable` is `-1` unknown,
+/// `0` off, `1` on.
+#[cfg(unix)]
+pub struct SetNonInheritableCache {
+    cached_inheritable: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(unix)]
+impl SetNonInheritableCache {
+    pub const fn new() -> Self {
+        Self {
+            cached_inheritable: std::sync::atomic::AtomicI32::new(-1),
+        }
+    }
+
+    /// `SetNonInheritableCache.set_non_inheritable`.
+    pub fn set_non_inheritable(&self, fd: crate::rffi::INT) -> crate::rffi::INT {
+        use std::sync::atomic::Ordering;
+        if self.cached_inheritable.load(Ordering::Relaxed) == -1 {
+            let res = unsafe { _c_get_inheritable(fd) };
+            if res < 0 {
+                return res;
+            }
+            self.cached_inheritable
+                .store(i32::from(res != 0), Ordering::Relaxed);
+        }
+        if self.cached_inheritable.load(Ordering::Relaxed) == 1 {
+            unsafe { _c_set_inheritable(fd, 0) }
+        } else {
+            0
+        }
+    }
+}
+
+// `rposix.rpy_cpu_count` / `_cpu_count`. `save_err` stays `RFFI_ERR_NONE`.
+// linux/android: `sysconf(_SC_NPROCESSORS_ONLN)`; dragonfly/openbsd/freebsd/
+// netbsd/macos/ios (`__APPLE__`): `sysctl(CTL_HW, HW_NCPU)`; elsewhere 0.
+#[cfg(unix)]
+unsafe fn rpy_cpu_count() -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as libc::c_int };
+    }
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        let mut ncpu: libc::c_int = 0;
+        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_NCPU];
+        let mut len = core::mem::size_of::<libc::c_int>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut ncpu as *mut libc::c_int).cast(),
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 { 0 } else { ncpu }
+    }
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        0
+    }
+}
+
+/// `rposix._cpu_count`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn _cpu_count() -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    let __res = unsafe { rpy_cpu_count() };
+    drop(__guard);
+    __res
+}
+
+// `rposix.rpy_get_status_flags` / `rpy_set_status_flags`. The wrappers
+// `c_get_status_flags` / `c_set_status_flags` save errno.
+#[cfg(unix)]
+unsafe fn rpy_get_status_flags(fd: libc::c_int) -> libc::c_int {
+    unsafe { libc::fcntl(fd, libc::F_GETFL, 0) }
+}
+
+#[cfg(unix)]
+unsafe fn rpy_set_status_flags(fd: libc::c_int, flags: libc::c_int) -> libc::c_int {
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }
+}
+
+/// `rposix.c_get_status_flags`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_get_status_flags(fd: crate::rffi::INT) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { rpy_get_status_flags(fd) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.c_set_status_flags`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_set_status_flags(
+    fd: crate::rffi::INT,
+    flags: crate::rffi::INT,
+) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { rpy_set_status_flags(fd, flags) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
 // `rposix.c_pipe2` saves errno where `pipe2` exists. macOS has no `pipe2`.
 #[cfg(any(
     target_os = "android",
@@ -1879,14 +2259,14 @@ crate::rffi::llexternal!(
 
 // `rposix.c_sendfile` on linux takes an optional offset pointer and saves
 // errno. A null offset is `rposix.sendfile_no_offset`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::external_compilation_info! {
     const SENDFILE_ECI = {
         includes: ["sys/sendfile.h"],
     };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 crate::rffi::llexternal!(
     pub c_sendfile = "sendfile",
     [
@@ -1897,6 +2277,209 @@ crate::rffi::llexternal!(
     ],
     crate::rffi::SSIZE_T,
     compilation_info = SENDFILE_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_sendfile` on BSD/Darwin (`elif not _WIN32`). Argument order is
+// `in_fd, out_fd, offset, p_len, NULL, 0`. The VOIDP is `struct sf_hdtr`;
+// PyPy passes null and does not implement headers/trailers.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+crate::rffi::external_compilation_info! {
+    const SENDFILE_ECI = {
+        includes: ["sys/socket.h"],
+    };
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+crate::rffi::llexternal!(
+    pub c_sendfile = "sendfile",
+    [
+        crate::rffi::INT,
+        crate::rffi::INT,
+        libc::off_t,
+        *mut libc::off_t,
+        crate::rffi::VOIDP,
+        crate::rffi::INT
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = SENDFILE_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+/// `rposix.sendfile` on BSD/Darwin. `c_sendfile(in_fd, out_fd, offset, p_len,
+/// NULL, 0)`. EAGAIN/EBUSY with nonzero sbytes returns sbytes.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+pub fn sendfile(
+    out_fd: crate::rffi::INT,
+    in_fd: crate::rffi::INT,
+    offset: libc::off_t,
+    count: libc::off_t,
+) -> Result<libc::off_t, i32> {
+    let mut len = count;
+    let res = unsafe { c_sendfile(in_fd, out_fd, offset, &mut len, core::ptr::null_mut(), 0) };
+    if res != 0 {
+        let errno = get_saved_errno();
+        if matches!(errno, libc::EAGAIN | libc::EBUSY) && len != 0 {
+            return Ok(len);
+        }
+        return Err(errno);
+    }
+    Ok(len)
+}
+
+// `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::external_compilation_info! {
+    const MMAN_ECI = {
+        includes: ["sys/mman.h"],
+    };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_memfd_create = "memfd_create",
+    [*const libc::c_char, crate::rffi::UINT],
+    crate::rffi::INT,
+    compilation_info = MMAN_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.py` xattr family under `sys.platform.startswith('linux')`.
+// `XATTR_ECI` is `sys/xattr.h` and `linux/limits.h`. Every `c_*` saves errno.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::external_compilation_info! {
+    const XATTR_ECI = {
+        includes: ["sys/xattr.h", "linux/limits.h"],
+    };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_fgetxattr = "fgetxattr",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_getxattr = "getxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_lgetxattr = "lgetxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_fsetxattr = "fsetxattr",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::SIZE_T,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_setxattr = "setxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::SIZE_T,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_lsetxattr = "lsetxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::SIZE_T,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_fremovexattr = "fremovexattr",
+    [crate::rffi::INT, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_removexattr = "removexattr",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_lremovexattr = "lremovexattr",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_flistxattr = "flistxattr",
+    [crate::rffi::INT, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_listxattr = "listxattr",
+    [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+crate::rffi::llexternal!(
+    pub c_llistxattr = "llistxattr",
+    [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
 
@@ -2995,11 +3578,22 @@ mod tests {
             assert!(!bytes.is_empty());
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let sent = unsafe { c_sendfile(-1, -1, std::ptr::null_mut(), 0) };
             assert!(sent < 0);
             assert_ne!(get_saved_errno(), 0);
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        {
+            let mut len: libc::off_t = 0;
+            let sent = unsafe { c_sendfile(-1, -1, 0, &mut len, std::ptr::null_mut(), 0) };
+            if sent < 0 {
+                let err = get_saved_errno();
+                if err != libc::EOPNOTSUPP && err != libc::ENOTSUP {
+                    assert_ne!(err, 0);
+                }
+            }
         }
         let _ = unsafe { c_system(std::ptr::null()) };
 
@@ -3009,5 +3603,356 @@ mod tests {
         assert_eq!(unsafe { c_close(fd) }, 0);
 
         assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn c_sched_getaffinity_reads_a_c_ulong_mask() {
+        let mut mask = [0 as libc::c_ulong; 16];
+        let size = mask.len() * core::mem::size_of::<libc::c_ulong>();
+        let res = unsafe { c_sched_getaffinity(0, size, mask.as_mut_ptr() as crate::rffi::VOIDP) };
+        if res < 0 {
+            assert_eq!(get_saved_errno(), libc::EINVAL);
+        }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn c_sendfile_on_bad_fds_saves_errno() {
+        let mut len: libc::off_t = 0;
+        let sent = unsafe { c_sendfile(-1, -1, 0, &mut len, std::ptr::null_mut(), 0) };
+        if sent < 0 {
+            let err = get_saved_errno();
+            if err == libc::EOPNOTSUPP || err == libc::ENOTSUP {
+                return;
+            }
+            assert_ne!(err, 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn c_memfd_create_opens_or_saves_errno() {
+        let fd = unsafe {
+            c_memfd_create(
+                c"pyre-rffi-memfd".as_ptr(),
+                libc::MFD_CLOEXEC as crate::rffi::UINT,
+            )
+        };
+        if fd >= 0 {
+            assert_eq!(
+                unsafe { c_close(fd) },
+                0,
+                "c_close errno {}",
+                get_saved_errno()
+            );
+        } else {
+            assert_ne!(get_saved_errno(), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn c_posix_fadvise_and_fallocate_reject_bad_fd() {
+        let advice = libc::POSIX_FADV_NORMAL as crate::rffi::INT;
+        let err = unsafe { c_posix_fadvise(-1, 0, 0, advice) };
+        assert_ne!(err, 0, "c_posix_fadvise(-1) succeeded");
+        let ret = unsafe { c_posix_fallocate(-1, 0, 0) };
+        assert_ne!(ret, 0, "c_posix_fallocate(-1) succeeded");
+        if ret < 0 {
+            assert_ne!(get_saved_errno(), 0, "c_posix_fallocate errno");
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn c_statvfs_and_fstatvfs_on_cwd() {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { c_statvfs(c".".as_ptr(), &mut st) },
+            0,
+            "c_statvfs errno {}",
+            get_saved_errno()
+        );
+        assert!(st.f_frsize > 0, "c_statvfs f_frsize");
+        let fd = unsafe { c_open(c".".as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        let mut fst: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { c_fstatvfs(fd, &mut fst) },
+            0,
+            "c_fstatvfs errno {}",
+            get_saved_errno()
+        );
+        assert!(fst.f_frsize > 0, "c_fstatvfs f_frsize");
+        assert_eq!(unsafe { c_close(fd) }, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn c_xattr_round_trip_on_temp_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::env::temp_dir().join(format!("pyre-rffi-xattr-{}", std::process::id()));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        assert_eq!(unsafe { c_close(fd) }, 0);
+        let name = c"user.test";
+        let value = b"foo";
+        let ret = unsafe {
+            c_setxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr() as *const libc::c_char,
+                value.len(),
+                libc::XATTR_CREATE as crate::rffi::INT,
+            )
+        };
+        if ret < 0 {
+            let err = get_saved_errno();
+            let _ = std::fs::remove_file(&path);
+            if err == libc::EOPNOTSUPP || err == libc::ENOTSUP || err == libc::EPERM {
+                return;
+            }
+            panic!("c_setxattr errno {err}");
+        }
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            c_getxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as crate::rffi::VOIDP,
+                buf.len(),
+            )
+        };
+        assert!(n >= 0, "c_getxattr errno {}", get_saved_errno());
+        assert_eq!(&buf[..n as usize], b"foo");
+        let mut listed = [0u8; 256];
+        let n = unsafe {
+            c_listxattr(
+                c_path.as_ptr(),
+                listed.as_mut_ptr() as *mut libc::c_char,
+                listed.len(),
+            )
+        };
+        assert!(n >= 0, "c_listxattr errno {}", get_saved_errno());
+        let names: Vec<&[u8]> = listed[..n as usize]
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            names.iter().any(|n| *n == b"user.test"),
+            "c_listxattr missing user.test: {names:?}"
+        );
+        assert_eq!(
+            unsafe { c_removexattr(c_path.as_ptr(), name.as_ptr()) },
+            0,
+            "c_removexattr errno {}",
+            get_saved_errno()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    fn skip_enotsup(err: i32) -> bool {
+        err == libc::EOPNOTSUPP || err == libc::ENOTSUP
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inheritable_round_trip_on_a_pipe() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let fd = fds[0];
+        let set = |inh: i32| {
+            let res = unsafe { _c_set_inheritable(fd, inh) };
+            if res < 0 {
+                let err = get_saved_errno();
+                if skip_enotsup(err) {
+                    return Err(err);
+                }
+                panic!("_c_set_inheritable({inh}) errno {err}");
+            }
+            Ok(())
+        };
+        if set(0).is_err() {
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            return;
+        }
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        set(1).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 1);
+        set(0).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        unsafe {
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    #[test]
+    fn inheritable_round_trip_on_o_path() {
+        let path = c"/";
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH) };
+        if fd < 0 {
+            return;
+        }
+        let set = |inh: i32| {
+            let res = unsafe { _c_set_inheritable(fd, inh) };
+            if res < 0 {
+                let err = get_saved_errno();
+                if skip_enotsup(err) {
+                    return Err(err);
+                }
+                panic!("_c_set_inheritable({inh}) on O_PATH errno {err}");
+            }
+            Ok(())
+        };
+        if set(0).is_err() {
+            unsafe {
+                let _ = c_close(fd);
+            }
+            return;
+        }
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        set(1).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 1);
+        set(0).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        unsafe {
+            assert_eq!(c_close(fd), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_dup_noninheritable_result_is_non_inheritable() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let duped = unsafe { c_dup_noninheritable(fds[0]) };
+        if duped < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_dup_noninheritable errno {err}");
+        }
+        assert_eq!(unsafe { _c_get_inheritable(duped) }, 0);
+        unsafe {
+            assert_eq!(c_close(duped), 0);
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_dup2_noninheritable_success_is_zero_and_dest_is_non_inheritable() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let dest = unsafe { c_dup(fds[1]) };
+        assert!(dest >= 0, "c_dup errno {}", get_saved_errno());
+        let res = unsafe { c_dup2_noninheritable(fds[0], dest) };
+        if res < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(dest);
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_dup2_noninheritable errno {err}");
+        }
+        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+        assert_eq!(res, 0);
+        assert_eq!(unsafe { _c_get_inheritable(dest) }, 0);
+        unsafe {
+            assert_eq!(c_close(dest), 0);
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpu_count_is_positive() {
+        let n = unsafe { _cpu_count() };
+        assert!(n > 0, "_cpu_count() = {n}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_flags_o_nonblock_round_trip() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let fd = fds[0];
+        let flags = unsafe { c_get_status_flags(fd) };
+        if flags < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_get_status_flags errno {err}");
+        }
+        let set = unsafe { c_set_status_flags(fd, flags | libc::O_NONBLOCK) };
+        if set < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_set_status_flags errno {err}");
+        }
+        let got = unsafe { c_get_status_flags(fd) };
+        assert!(got >= 0, "c_get_status_flags errno {}", get_saved_errno());
+        assert_ne!(got & libc::O_NONBLOCK, 0);
+        assert!(unsafe { c_set_status_flags(fd, flags) } >= 0);
+        unsafe {
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
     }
 }

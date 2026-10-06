@@ -1158,6 +1158,15 @@ fn real_main() {
                     "functional",
                     "w_range_iter_step_one_next",
                 ]),
+                // `w_list_getitem` and `list_iter_getitem_locked` are both
+                // `dont_look_inside`, so the portal never reaches
+                // `w_list_getitem_inner`. The BINARY_SUBSCR walker descends
+                // that body by name (`list_getitem_jitcode`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_getitem_inner",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
