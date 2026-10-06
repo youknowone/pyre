@@ -1,7 +1,7 @@
 # CPython-suite gap: `test_exceptions` constructs UnicodeError subclasses
 # with five (or four) positionals and never keyword-only field names.
 # `ValueError(foo=1)` is also absent from the suite, as are keyword
-# calls on MemoryError, KeyError, IndentationError, and OSError
+# calls on MemoryError, KeyError, IndentationError, Warning, and OSError
 # subclasses.
 #
 # parity-tests reason: `_PyArg_NoKeywords` inside `BaseException_init`
@@ -12,7 +12,8 @@
 # names `BaseException.__init__`. `W_SyntaxError.descr_init` names
 # `SyntaxError.__init__` for IndentationError and TabError.
 # `W_OSError.descr_new` says `OSError does not take keyword arguments`
-# for every OSError subclass.
+# for every OSError subclass. `W_SystemExit.descr_init` and
+# `W_StopIteration.descr_init` name their own `.__init__`.
 #
 # pyre-check: pypy-diverges: pypy3 constructs UnicodeDecodeError and
 # UnicodeEncodeError from keyword field names successfully.
@@ -22,7 +23,8 @@
 # IndentationError and TabError name `SyntaxError.__init__`.
 # BlockingIOError and FileNotFoundError raise
 # `OSError does not take keyword arguments`. A MemoryError subclass
-# still names `BaseException.__init__`.
+# still names `BaseException.__init__`. SystemExit and StopIteration
+# name `SystemExit.__init__` / `StopIteration.__init__`.
 def reject(fn, message):
     try:
         fn()
@@ -70,5 +72,72 @@ class ME(MemoryError):
 
 
 reject(lambda: ME(foo=1), "ME() takes no keyword arguments")
+
+for T in (
+    BaseException,
+    Exception,
+    GeneratorExit,
+    SystemExit,
+    StopIteration,
+    OverflowError,
+    ZeroDivisionError,
+    AssertionError,
+    EOFError,
+    RuntimeError,
+    RecursionError,
+    NotImplementedError,
+    TypeError,
+    LookupError,
+    IndexError,
+    ArithmeticError,
+    BufferError,
+    ReferenceError,
+    FloatingPointError,
+    Warning,
+    UserWarning,
+    DeprecationWarning,
+    PendingDeprecationWarning,
+    RuntimeWarning,
+    SyntaxWarning,
+    FutureWarning,
+    ImportWarning,
+    UnicodeWarning,
+    BytesWarning,
+    ResourceWarning,
+    EncodingWarning,
+    SyntaxError,
+    OSError,
+    PermissionError,
+    TimeoutError,
+    ConnectionError,
+    BrokenPipeError,
+    ChildProcessError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    IsADirectoryError,
+    NotADirectoryError,
+    InterruptedError,
+    ProcessLookupError,
+    FileExistsError,
+):
+    reject(lambda T=T: T(foo=1), f"{T.__name__}() takes no keyword arguments")
+
+
+class KI(KeyboardInterrupt):
+    pass
+
+
+class RE(RecursionError):
+    pass
+
+
+class PE(PermissionError):
+    pass
+
+
+reject(lambda: KI(foo=1), "KI() takes no keyword arguments")
+reject(lambda: RE(foo=1), "RE() takes no keyword arguments")
+reject(lambda: PE(foo=1), "PE() takes no keyword arguments")
 
 print("OK")
