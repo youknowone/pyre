@@ -202,6 +202,19 @@ pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: P
     unsafe { *items_block_items_base(block).add(index) = value };
 }
 
+unsafe fn arraycopy_store_item(
+    block: *mut ItemsBlock,
+    index: usize,
+    value: PyObjectRef,
+    dest_managed: bool,
+) {
+    if dest_managed {
+        unsafe { items_block_set_ref(block, index, value) };
+    } else {
+        unsafe { *items_block_items_base(block).add(index) = value };
+    }
+}
+
 /// `rgc.ll_arraymove(array, source_start, dest_start, length)` — runtime
 /// target for the `list.ll_arraymove` oopspec (OS_ARRAYMOVE / 9).
 ///
@@ -278,13 +291,11 @@ pub extern "C" fn jit_ll_arraymove(
 /// `rgc.ll_arraycopy(source, dest, source_start, dest_start, length)` —
 /// runtime target for the `list.ll_arraycopy` oopspec (OS_ARRAYCOPY / 1).
 ///
-/// rgc.py `ll_arraycopy`: `writebarrier_before_copy` when the item
-/// contains GC pointers, then `raw_memcopy`. The residual ABI keeps
-/// those five arguments. A dest write-barrier stands in for the 5-arg
-/// `writebarrier_before_copy` hook (not yet published through gc_hook);
-/// remembering dest is the safe side of that barrier.
-/// `rgc.py ll_arraycopy`'s `@jit.oopspec`: a call from an interpreter body
-/// is the `OS_ARRAYCOPY` residual, never a look-inside.
+/// rgc.py `ll_arraycopy`: `copy_item` when `length <= 1`; otherwise
+/// `writebarrier_before_copy` when the item contains GC pointers, then
+/// `raw_memcopy`. `false` from the barrier is the per-item `copy_item`
+/// slow path. `rgc.py ll_arraycopy`'s `@jit.oopspec`: a call from an
+/// interpreter body is the `OS_ARRAYCOPY` residual, never a look-inside.
 #[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub extern "C" fn jit_ll_arraycopy(
     source: crate::PyObjectRef,
@@ -329,11 +340,14 @@ pub extern "C" fn jit_ll_arraycopy(
     };
     // An unmanaged typed block has no registry entry. If only one
     // endpoint is registered, reuse that layout for both; the fallback
-    // is only for two unknown addresses.
-    let (source_layout, dest_layout) = match (
-        majit_gc::gc_varsize_layout(source_address),
-        majit_gc::gc_varsize_layout(dest_address),
-    ) {
+    // is only for two unknown addresses. Mixed ownership still copies
+    // with that layout, but the GC barrier/setter only run on a
+    // registered dest (and the 5-arg copy barrier needs both headers).
+    let source_layout_opt = majit_gc::gc_varsize_layout(source_address);
+    let dest_layout_opt = majit_gc::gc_varsize_layout(dest_address);
+    let dest_managed = dest_layout_opt.is_some();
+    let source_managed = source_layout_opt.is_some();
+    let (source_layout, dest_layout) = match (source_layout_opt, dest_layout_opt) {
         (Some(source), Some(dest)) => (source, dest),
         (Some(known), None) | (None, Some(known)) => (known, known),
         (None, None) => (fallback, fallback),
@@ -356,8 +370,61 @@ pub extern "C" fn jit_ll_arraycopy(
         .checked_mul(dest_layout.item_size)
         .expect("ll_arraycopy byte length overflow");
 
-    if dest_layout.items_have_gc_ptrs {
-        crate::gc_hook::try_gc_write_barrier(follow(dest_slot) as *mut u8);
+    // rgc.py `ll_arraycopy`: length <= 1 is `copy_item` (a GC-pointer
+    // store), not the bulk barrier-plus-memcpy body. Unmanaged dests
+    // have no GC header; `items_block_set_ref` would `header_of` them.
+    if dest_layout.items_have_gc_ptrs && length == 1 {
+        let dest_address = follow(dest_slot);
+        let source_address = follow(source_slot);
+        let value = unsafe {
+            *((source_address as *const u8).add(source_offset) as *const crate::PyObjectRef)
+        };
+        unsafe {
+            arraycopy_store_item(
+                dest_address as *mut ItemsBlock,
+                dest_start as usize,
+                value,
+                dest_managed,
+            );
+        }
+        return;
+    }
+
+    let mut slowpath = false;
+    if dest_layout.items_have_gc_ptrs && dest_managed {
+        if source_managed {
+            slowpath = !majit_gc::gc_writebarrier_before_copy(
+                majit_ir::GcRef(follow(source_slot)),
+                majit_ir::GcRef(follow(dest_slot)),
+                source_start as usize,
+                dest_start as usize,
+                length as usize,
+            );
+        } else {
+            slowpath = true;
+        }
+    }
+    if slowpath {
+        let mut i = 0i64;
+        while i < length {
+            let dest_address = follow(dest_slot);
+            let source_address = follow(source_slot);
+            let value = unsafe {
+                *((source_address as *const u8)
+                    .add(source_offset + (i as usize) * source_layout.item_size)
+                    as *const crate::PyObjectRef)
+            };
+            unsafe {
+                arraycopy_store_item(
+                    dest_address as *mut ItemsBlock,
+                    dest_start as usize + i as usize,
+                    value,
+                    dest_managed,
+                );
+            }
+            i += 1;
+        }
+        return;
     }
     let dest_address = follow(dest_slot);
     let source_address = follow(source_slot);
@@ -1995,6 +2062,29 @@ mod tests {
                 4usize as PyObjectRef,
                 0usize as PyObjectRef,
             ]
+        );
+        unsafe {
+            dealloc_list_items_block(src);
+            dealloc_list_items_block(dst);
+        }
+    }
+
+    #[test]
+    fn jit_ll_arraycopy_length_one_is_copy_item() {
+        let src =
+            unsafe { alloc_list_items_block(&[1usize as PyObjectRef, 2usize as PyObjectRef]) };
+        let dst =
+            unsafe { alloc_list_items_block(&[0usize as PyObjectRef, 0usize as PyObjectRef]) };
+        jit_ll_arraycopy(
+            src as crate::PyObjectRef,
+            dst as crate::PyObjectRef,
+            1,
+            0,
+            1,
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(dst), 2) },
+            &[2usize as PyObjectRef, 0usize as PyObjectRef]
         );
         unsafe {
             dealloc_list_items_block(src);

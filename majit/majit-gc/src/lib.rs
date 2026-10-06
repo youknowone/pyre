@@ -4345,12 +4345,38 @@ pub fn gc_write_barrier_managed(obj: GcRef) {
 /// initialized has no remembered set, so the store is unbarriered.
 pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
     if !gc_sync::is_initialized() {
+        // Cranelift/wasm keep the collector in the backend TLS box.
+        gc_write_barrier(obj);
         return;
     }
     gc_sync::gc_op(|gc| {
         let shift = gc.card_page_shift();
         gc.do_write_barrier_card(obj, index, shift);
     });
+}
+
+/// incminimark.py `writebarrier_before_copy`.
+///
+/// `rgc.py ll_arraycopy` calls this before `raw_memcopy`. `false` means the
+/// bulk form cannot express the copy and the caller owes per-item
+/// `setarrayitem_gc`. A collector that is not yet initialized has no
+/// remembered set, so the copy is unbarriered.
+pub fn gc_writebarrier_before_copy(
+    source: GcRef,
+    dest: GcRef,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) -> bool {
+    if !gc_sync::is_initialized() {
+        // Cranelift/wasm keep the collector in the backend TLS box, not
+        // `gc_sync`. Remember dest the same way `gc_write_barrier` does.
+        gc_write_barrier(dest);
+        return true;
+    }
+    gc_sync::gc_op(|gc| {
+        gc.writebarrier_before_copy(source.0, dest.0, source_start, dest_start, length)
+    })
 }
 
 // ── TEMPORARY DIAGNOSTIC: blackhole-materialized object registry ──

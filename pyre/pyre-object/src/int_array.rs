@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::object_array::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock, alloc_typed_items_block,
     dealloc_typed_items_block, gc_int_array_gc_type_id, grow_typed_items_block,
-    typed_items_block_capacity,
+    try_alloc_typed_items_block, typed_items_block_capacity,
 };
 
 /// Small-buffer capacity constant retained for the append/pop inline-capacity
@@ -104,6 +104,32 @@ impl IntArray {
             std::ptr::copy_nonoverlapping(values.as_ptr(), arr.base(), len);
         }
         arr
+    }
+
+    /// `AbstractUnwrappedStrategy.mul`: `erase(l * times)` into one items array.
+    pub fn from_repeated(src: &[i64], times: usize) -> Option<Self> {
+        let len = src.len().checked_mul(times)?;
+        if len == 0 {
+            return Some(Self::empty());
+        }
+        let arr = Self {
+            block: unsafe { try_alloc_typed_items_block(len, gc_int_array_gc_type_id())? },
+            len: crate::object_array::length_cell(len),
+        };
+        unsafe {
+            if src.len() == 1 {
+                std::slice::from_raw_parts_mut(arr.base(), len).fill(src[0]);
+            } else {
+                for t in 0..times {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr(),
+                        arr.base().add(t * src.len()),
+                        src.len(),
+                    );
+                }
+            }
+        }
+        Some(arr)
     }
 
     /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)`: allocate the
