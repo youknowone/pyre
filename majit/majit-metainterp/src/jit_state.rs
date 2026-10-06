@@ -111,8 +111,9 @@ pub struct ResumeDataResult {
     /// resume.py:1057: per-frame decoded values from rd_numb.
     /// Each RebuiltValue::Box(i, kind) → `liveboxes[i]` in RPython.
     pub frames: Vec<majit_ir::resumedata::RebuiltFrame>,
-    /// resume.py:1045: virtualizable boxes (decoded from vable section).
-    pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
+    /// `rebuild_from_resumedata` virtualizable boxes (decoded from the vable
+    /// section). Each `RebuiltValue` is a box (`Box` / `Const` / `Virtual`).
+    pub virtualizable_boxes: Vec<majit_ir::resumedata::RebuiltValue>,
     /// resume.py:1045: virtualref box pairs (decoded from vref section).
     pub virtualref_values: Vec<majit_ir::resumedata::RebuiltValue>,
     /// compile.py `ResumeGuardDescr` storage handle — the shared

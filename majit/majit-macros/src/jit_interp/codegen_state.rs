@@ -1705,7 +1705,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     eprintln!(
                         "[bridgeB] vable seed={} stream={}",
                         __seeded,
-                        resume_data.virtualizable_values.len(),
+                        resume_data.virtualizable_boxes.len(),
                     );
                 }
                 // A declined seed is not recoverable here and must not pass
@@ -1722,7 +1722,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         "[jit][bridgeB] virtualizable seed declined \
                          (vable stream {} entries) — bridge will abort and \
                          the guard deopts through the blackhole",
-                        resume_data.virtualizable_values.len(),
+                        resume_data.virtualizable_boxes.len(),
                     );
                 }
             }
@@ -2498,7 +2498,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
                 Some(majit_metainterp::ResumeDataResult {
                     frames,
-                    virtualizable_values: vable_values,
+                    virtualizable_boxes: vable_values,
                     virtualref_values: vref_values,
                     storage: Some(storage.clone()),
                     num_failargs,

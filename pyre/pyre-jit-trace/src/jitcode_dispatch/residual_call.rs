@@ -5244,7 +5244,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // i.e. the FORCED frame.  A ladder leg that needs PRE-walk shadow
             // state after a cancelled commit has to re-read it after the
             // walk-end restore, not here.
-            ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            ctx.trace_ctx.reload_virtualizable_boxes_from_heap();
             // Read the pre-call image back out of the root slots: a collection
             // inside the residual forwarded them alongside the frame's array,
             // so these words and `locals_w!` name the same objects.

@@ -10880,11 +10880,11 @@ impl<S: JitState> JitDriver<S> {
         //     `pyre-jit-trace::state::setup_bridge_sym` — matches the
         //     `consume_virtualref_info` half of `consume_vref_and_vable`
         //     (resume.py).
-        //   * `ResumeDataResult.virtualizable_values` (vable scalar +
+        //   * `ResumeDataResult.virtualizable_boxes` (vable scalar +
         //     array stream) is restored into `sym` via
         //     `seed_virtualizable_boxes`, populating
-        //     `ctx.virtualizable_boxes` / `virtualizable_values` /
-        //     `virtualizable_array_lengths` from resume-decoded values.
+        //     `ctx.virtualizable_boxes` / `virtualizable_array_lengths`
+        //     from resume-decoded boxes (each box carries its concrete).
         //
         //   * `pyjitpl.py self.synchronize_virtualizable()`, the
         //     routine's closing line, writes those same vable boxes back
@@ -13551,7 +13551,7 @@ mod tests {
                 assert!(fail_arg_types.is_empty());
                 Some(crate::ResumeDataResult {
                     frames: vec![],
-                    virtualizable_values: vec![],
+                    virtualizable_boxes: vec![],
                     virtualref_values: vec![],
                     storage: storage.cloned(),
                     num_failargs: 0,

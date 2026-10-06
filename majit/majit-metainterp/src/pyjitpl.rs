@@ -3777,10 +3777,10 @@ impl<M: Clone> MetaInterp<M> {
         for snapshot in trace_ctx.snapshots.iter_mut() {
             snapshot.walk_const_ptr_refs(&mut visitor);
         }
-        // pyjitpl.py initialize_state_from_start `self.virtualizable_boxes` stores ordinary
-        // BoxPtr objects whose concrete refs are traced by RPython's object
-        // graph.  Pyre keeps their concrete half in `virtualizable_values`;
-        // forward those refs in place as the same Box-attached state.
+        // `initialize_state_from_start` `self.virtualizable_boxes` stores
+        // ordinary BoxPtr objects whose concrete refs the GC traces through
+        // the object graph. Forward ConstPtr gcrefs in the box list and the
+        // sync-target cell; InputArg/`*FrontendOp` refs are walked above.
         trace_ctx.walk_virtualizable_value_refs(&mut visitor);
         // heapcache.py CacheEntry — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
@@ -5087,10 +5087,10 @@ impl<M: Clone> MetaInterp<M> {
     /// the identity box, not the host heap pointer: `virtualizable_heap_ptr`
     /// can name a `snapshot_for_tracing` copy and is not the unwrap source.
     ///
-    /// Prefers the identity box's own concrete, then the
-    /// `virtualizable_values` shadow via `TraceCtx::standard_virtualizable_ptr`,
-    /// then `self.pending_vable_ptr` — the host seed `set_vable_ptr` writes
-    /// for off-trace / pre-`TraceCtx` readers.
+    /// Prefers the identity box's own concrete via
+    /// `TraceCtx::standard_virtualizable_ptr`, then `self.pending_vable_ptr`
+    /// — the host seed `set_vable_ptr` writes for off-trace / pre-`TraceCtx`
+    /// readers.
     pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
         self.tracing
             .as_ref()
@@ -5419,7 +5419,7 @@ impl<M: Clone> MetaInterp<M> {
         // inputargs are numbered flat across banks — `OpRef::input_arg_ref(1)`
         // is inputarg #1, which for the state-field front-end is an int, not
         // the `&state` identity.  The alias is invisible while the identity is
-        // only read through `virtualizable_values[-1]`, but it is what
+        // only read through `virtualizable_boxes[-1].getref_base()`, but it is what
         // `capture_resumedata` writes into every guard's vable section, so a
         // bridge decoding that section resolves the identity to the wrong
         // deadframe slot.  `pyjitpl.py virtualizable_box =
@@ -7337,9 +7337,9 @@ impl<M: Clone> MetaInterp<M> {
     ///     vinfo.write_boxes(virtualizable, self.virtualizable_boxes)
     /// ```
     ///
-    /// Delegates to `TraceCtx::synchronize_virtualizable`, which owns the
-    /// `virtualizable_values` shadow and the mirrored `vable_ptr`. Keeping
-    /// this thin wrapper preserves the RPython call-site spelling
+    /// Delegates to `TraceCtx::synchronize_virtualizable`, which writes each
+    /// box's concrete back through the mirrored `vable_ptr`. Keeping
+    /// this thin wrapper preserves the call-site spelling
     /// (`self.metainterp.synchronize_virtualizable()`) at setfield_vable /
     /// setarrayitem_vable sites that route through MetaInterp.
     pub fn synchronize_virtualizable(&mut self, _vable_opref: OpRef) {

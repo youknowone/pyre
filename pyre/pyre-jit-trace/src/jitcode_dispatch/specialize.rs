@@ -12021,9 +12021,8 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // traced-in `fast2locals` reads (`getarrayitem_vable_r` answered from
         // `virtualizable_boxes`).
         //
-        // Prefer the OpRef's own concrete over the `virtualizable_values` copy:
-        // the op table is the GC-forwarded channel, so a Ref that moved across
-        // an earlier residual is current there.
+        // Prefer the OpRef's own concrete: the box is the GC-forwarded
+        // channel, so a Ref that moved across an earlier residual is current.
         let held = match ctx
             .trace_ctx
             .concrete_of_opref(slot_op)

@@ -1836,11 +1836,10 @@ pub(crate) fn seed_virtualizable_boxes(
         }
     }
     let array_lengths = vec![array_len];
-    // virtualizable.py load_list_of_boxes parity: the concrete half of
-    // virtualizable_boxes is sourced from the caller (heap read for portal
-    // entry / resume-data stream for bridge entry), never synthesized here.
-    // Callers pass an empty slice to disable the concrete shadow
-    // (unit-test / init-before-run path).
+    // `virtualizable.py load_list_of_boxes`: each box carries its concrete
+    // (heap read for portal entry / resume-data stream for bridge entry).
+    // Callers pass an empty slice to leave InputArg/`*FrontendOp` boxes
+    // unstamped (unit-test / init-before-run path).
     ctx.init_virtualizable_boxes(
         &info,
         vable_ref,
@@ -7674,7 +7673,7 @@ impl PyreJitState {
         sym
     }
 
-    fn restore_expanded_virtualizable_values_with_extra_reds(
+    fn restore_expanded_virtualizable_with_extra_reds(
         &mut self,
         meta: &PyreMeta,
         values: &[Value],
@@ -10556,26 +10555,42 @@ impl JitState for PyreJitState {
             values.push(value);
         }
 
+        // Array slots are `virtualizable_boxes` (`box.getref_base()`). The
+        // pyre `concrete_locals` / `concrete_stack` mirror is filled at seed
+        // and is not updated by `setarrayitem_vable`, so it lags the traced
+        // body (e.g. `i` still the header value after `i = i + 1`).
         let array_slots = live_arg_boxes.len().saturating_sub(num_scalars);
         for slot in 0..array_slots {
-            let concrete = if slot < sym.nlocals {
-                sym.concrete_locals
-                    .get(slot)
-                    .copied()
-                    .unwrap_or(ConcreteValue::Ref(PY_NULL))
-            } else {
-                let stack_idx = slot - sym.nlocals;
-                let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
-                if stack_idx < live_stack {
-                    sym.concrete_stack
-                        .get(stack_idx)
-                        .copied()
-                        .unwrap_or(ConcreteValue::Ref(PY_NULL))
-                } else {
-                    ConcreteValue::Ref(PY_NULL)
-                }
-            };
-            values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+            let vable_idx = num_vable_scalars + slot;
+            let value = ctx
+                .virtualizable_entry_at(vable_idx)
+                .map(|(_, value)| value)
+                .or_else(|| {
+                    live_arg_boxes
+                        .get(num_scalars + slot)
+                        .and_then(|opref| ctx.box_value(*opref))
+                })
+                .unwrap_or_else(|| {
+                    let concrete = if slot < sym.nlocals {
+                        sym.concrete_locals
+                            .get(slot)
+                            .copied()
+                            .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                    } else {
+                        let stack_idx = slot - sym.nlocals;
+                        let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
+                        if stack_idx < live_stack {
+                            sym.concrete_stack
+                                .get(stack_idx)
+                                .copied()
+                                .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                        } else {
+                            ConcreteValue::Ref(PY_NULL)
+                        }
+                    };
+                    Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize))
+                });
+            values.push(value);
         }
 
         Some(values)
@@ -10753,7 +10768,7 @@ impl JitState for PyreJitState {
         // virtualref boxes when the framestack stays empty. Return only
         // when those streams are empty too.
         let no_frame = resume_data.frames.is_empty();
-        let no_vable = resume_data.virtualizable_values.is_empty();
+        let no_vable = resume_data.virtualizable_boxes.is_empty();
         let no_vref = resume_data.virtualref_values.is_empty();
         let no_pending = resume_data
             .storage
@@ -10825,7 +10840,7 @@ impl JitState for PyreJitState {
         //                                        f.registers_i/_r/_f)
         //   virtualref_boxes     ← consume_virtualref_boxes
         // The majit decoder already splits rd_numb into the same three
-        // streams (`resume_data.virtualizable_values`,
+        // streams (`resume_data.virtualizable_boxes`,
         // `resume_data.frames[*].values`, `resume_data.virtualref_values`).
         // This function consumes them in the same order and purpose.
         //
@@ -10835,7 +10850,7 @@ impl JitState for PyreJitState {
         // virtualizable.py `read_boxes` layout
         //   [vable_ptr, static_fields..., array_items...].
         if !(no_frame && no_vable) {
-            let vvals = &resume_data.virtualizable_values;
+            let vvals = &resume_data.virtualizable_boxes;
             // Resume virtualizable payload mirrors RPython
             // opencoder.py _list_of_boxes_virtualizable + virtualizable.py load_list_of_boxes:
             //   [vable, vable_static_fields..., array_items...]
@@ -10904,7 +10919,7 @@ impl JitState for PyreJitState {
                 .copied()
                 .collect();
             let bridge_valuestackdepth = concrete_values
-                // virtualizable_values has no ec red: [vable, last_instr,
+                // virtualizable_boxes has no ec red: [vable, last_instr,
                 // pycode, valuestackdepth, debugdata, ...].
                 .get(first_vable_scalar_idx + 2)
                 .map(value_to_usize)
@@ -11963,7 +11978,7 @@ impl JitState for PyreJitState {
         // then keeps tracing with that empty framestack.
         Some(majit_metainterp::ResumeDataResult {
             frames,
-            virtualizable_values: vable_values,
+            virtualizable_boxes: vable_values,
             virtualref_values: vref_values,
             storage: Some(storage.clone()),
             // resume.py rebuild_from_resumedata num_failargs from rd_numb header. Used by
@@ -12096,11 +12111,7 @@ impl JitState for PyreJitState {
                 arg0, meta.valuestackdepth, meta.has_virtualizable, values
             );
         }
-        self.restore_expanded_virtualizable_values_with_extra_reds(
-            meta,
-            values,
-            meta.trace_extra_reds,
-        );
+        self.restore_expanded_virtualizable_with_extra_reds(meta, values, meta.trace_extra_reds);
         if majit_metainterp::majit_log_enabled() {
             let arg0 = self.local_at(0).and_then(|value| {
                 if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
@@ -13456,7 +13467,7 @@ mod tests {
         let result = PyreJitState::rebuild_from_resumedata(&mut meta, &[], Some(&storage))
             .expect("empty frame section still returns resume data");
         assert!(result.frames.is_empty());
-        assert!(result.virtualizable_values.is_empty());
+        assert!(result.virtualizable_boxes.is_empty());
         assert!(result.virtualref_values.is_empty());
         assert_eq!(result.num_failargs, 0);
         assert_eq!(meta.trace_extra_reds, 1);
@@ -14029,7 +14040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_expanded_virtualizable_values_with_extra_reds_skips_ec_slot() {
+    fn test_restore_expanded_virtualizable_with_extra_reds_skips_ec_slot() {
         use majit_ir::GcRef;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_interpreter::{ConstantData, compile_exec};
@@ -14081,7 +14092,7 @@ mod tests {
             Value::Int(7),                            // local i
         ];
 
-        state.restore_expanded_virtualizable_values_with_extra_reds(&meta, &values, 1);
+        state.restore_expanded_virtualizable_with_extra_reds(&meta, &values, 1);
 
         assert_eq!(state.valuestackdepth(), 4);
         let restored_i = state.local_at(3).expect("local i should be restored");
@@ -14810,7 +14821,7 @@ mod tests {
             // stale non-null object; both vable entries are live.  Conversely,
             // the stack entry in the vable image is stale while the frame
             // register contains the after-call result.
-            virtualizable_values: vec![
+            virtualizable_boxes: vec![
                 RebuiltValue::Box(0, Type::Ref),
                 RebuiltValue::Box(2, Type::Int),
                 RebuiltValue::Box(3, Type::Ref),
@@ -14927,7 +14938,7 @@ mod tests {
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
             frames: Vec::new(),
-            virtualizable_values: vec![
+            virtualizable_boxes: vec![
                 RebuiltValue::Box(0, Type::Ref),
                 RebuiltValue::Box(2, Type::Int),
                 RebuiltValue::Box(3, Type::Ref),
@@ -15130,7 +15141,7 @@ mod tests {
         // Seed ctx.virtualizable_array_lengths with the full root array
         // capacity so close_loop_args' target_array_capacity equals the
         // concrete array length (the nlocals+stack_only fallback would only
-        // yield 1). Empty input_values disables the concrete shadow; the
+        // yield 1). Empty input_values leaves InputArg boxes unstamped; the
         // non-owner path then reads local0 from registers_r and PY_NULLs the
         // dead stack tail (trace_opcode.rs).
         seed_virtualizable_boxes(

@@ -449,16 +449,13 @@ where
         TraceAction::Continue
     }
 
-    // -- First-class virtualizable access (RPython getfield_vable_*) --
-    // pyjitpl.py `_opimpl_getarrayitem_vable` (and the
-    // getfield/setfield siblings).  RPython returns
-    // `virtualizable_boxes[index]`, a Box carrying both the traced
-    // reference AND its concrete value; pyre threads the concrete
-    // through the parallel `virtualizable_values` shadow seeded at
-    // `initialize_virtualizable` and updated on every
-    // `vable_setfield` / `vable_setarrayitem_indexed`.  Do NOT peek
-    // the live frame here — stale/shadow divergence caused the
-    // issue #1 from 2026-04-18.
+    // -- First-class virtualizable access (getfield_vable_*) --
+    // `_opimpl_getarrayitem_vable` (and the getfield/setfield siblings)
+    // returns `virtualizable_boxes[index]`, a Box carrying both the traced
+    // reference AND its concrete value (`getint` / `getref_base` /
+    // `getfloatstorage`). Seeded at `initialize_virtualizable` and updated
+    // on every `vable_setfield` / `vable_setarrayitem_indexed`. Do NOT peek
+    // the live frame here.
     #[inline(never)]
     #[allow(unused_variables)]
     fn opimpl_getfield_vable_i(

@@ -156,9 +156,9 @@ fn concrete_ptrs_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
     }
 }
 
-/// Reinterpret a `virtualizable_values` shadow slot as an optional concrete.
-/// The shadow stores `Value::Void` in slots whose runtime concrete is not
-/// recorded; surface those as `None` so the vable-field read channel carries
+/// Reinterpret a virtualizable box's concrete as an optional value.
+/// A box may carry `Value::Void` when no runtime concrete is recorded;
+/// surface those as `None` so the vable-field read channel carries
 /// the "unknown" marker explicitly rather than a synthesized `Void`.
 fn concrete_shadow_value(value: Value) -> Option<Value> {
     match value {
@@ -317,17 +317,11 @@ pub struct TraceCtx {
     /// (RPython parity: `virtualizable_boxes[-1]`). Used by gen_store_back_in_vable
     /// to distinguish standard vs nonstandard virtualizable.
     pub(crate) virtualizable_boxes: Option<Vec<OpRef>>,
-    /// Concrete shadow of `virtualizable_boxes`. Same layout, each slot carries
-    /// the current runtime `Value` (RPython Box ≡ OpRef + concrete value).
-    /// Seeded from `original_boxes` in `initialize_virtualizable` and kept in
-    /// sync on every standard vable write (`vable_setfield`,
-    /// `vable_setarrayitem_indexed`, `store_local_value` mirror).
-    virtualizable_values: Option<Vec<Value>>,
-    /// Per-slot provenance for the virtualizable shadow: the last executed store
+    /// Per-slot provenance for the virtualizable boxes: the last executed store
     /// into this flat slot wrote a live NULL Ref (the NULL companion an operand
     /// stack push leaves behind), as opposed to a slot no store has touched. Same
-    /// layout as `virtualizable_values`; `None` whenever the concrete shadow is
-    /// disabled.
+    /// layout as `virtualizable_boxes`; `None` when the boxes were seeded without
+    /// concretes (bridge-entry rebuild / init-before-run).
     virtualizable_live_null_slots: Option<Vec<bool>>,
     /// VirtualizableInfo for the standard virtualizable (if any).
     virtualizable_info: Option<std::sync::Arc<VirtualizableInfo>>,
@@ -340,9 +334,9 @@ pub struct TraceCtx {
     /// not stay put for the session: a compiled entry moves it to the frame
     /// that entry runs and the exits put it back, and a residual call restores
     /// it on return.  Used by
-    /// `synchronize_virtualizable` to write `virtualizable_values` back to
+    /// `synchronize_virtualizable` to write each box's concrete back to
     /// the live PyFrame after every standard vable setfield / setarrayitem
-    /// (virtualizable.py write_boxes parity). `None` disables the
+    /// (`virtualizable.py write_boxes`). `None` disables the
     /// write — unit-test or init-before-run path.
     virtualizable_heap_ptr: Option<*const u8>,
     /// Set when the current residual call receives a virtualizable array's raw
@@ -946,7 +940,7 @@ pub struct BridgeInlineCarrier {
 /// promoted slot and then write it again at the real index.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VableEntryWrite {
-    /// Flat index into `virtualizable_boxes` / `virtualizable_values`.
+    /// Flat index into `virtualizable_boxes`.
     pub index: usize,
     pub prev_box: OpRef,
     pub prev_value: Value,
@@ -2087,7 +2081,6 @@ impl TraceCtx {
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
-            virtualizable_values: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
@@ -2180,7 +2173,6 @@ impl TraceCtx {
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
-            virtualizable_values: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
             virtualizable_array_lengths: None,
@@ -2523,16 +2515,6 @@ impl TraceCtx {
         self.recorder.concrete_at(opref.raw())
     }
 
-    /// `Box.value` read — composes the resolution chain that
-    /// `concrete_of_opref` uses (Const pool + standard-virtualizable
-    /// shadow + the frontend object's `value` field) but returns
-    /// `Option<Value>` instead of the `Ref(usize::MAX)` sentinel.
-    /// history.py `AbstractValue.getint()/getref_base()/
-    /// getfloat_storage()` analog: `Const.getint()` for constants,
-    /// `*FrontendOp.getint()` for the `_resint/_resfloat/_resref`
-    /// fields (history.py:680,696). The standard-virtualizable shadow
-    /// restores the value of the portal's red-virtualizable inputarg
-    /// whose Box identity is recycled across loop iterations.
     /// Canonical `Operand` (box object) for a value `OpRef`. The trace-record
     /// analogue of the box objects RPython holds in `MIFrame.registers_r`
     /// (`pyjitpl.py`): it surfaces the recorder's real per-op `Rc<Op>` /
@@ -2557,16 +2539,15 @@ impl TraceCtx {
         self.bridge_replay_incomplete
     }
 
+    /// `AbstractValue.getint()` / `getref_base()` / `getfloatstorage()`:
+    /// constants carry the payload inline; `*FrontendOp` / `InputArg*`
+    /// read `_resint` / `_resref` / `_resfloat` off the recorded box.
     pub fn box_value(&self, opref: OpRef) -> Option<Value> {
         if let Some(v) = opref.inline_const_to_value() {
-            return Some(v);
+            Some(v)
+        } else {
+            self.lookup_opref_concrete(opref)
         }
-        if Some(opref) == self.standard_virtualizable_box()
-            && let Some(v) = self.standard_virtualizable_concrete()
-        {
-            return Some(v);
-        }
-        self.lookup_opref_concrete(opref)
     }
 
     /// `IntOp.getint` / `RefOp.getref_base` / `FloatOp.getfloat_storage`
@@ -3100,7 +3081,25 @@ impl TraceCtx {
     /// the green fields is the whole virtualizable box list.
     pub fn set_greenfield_virtualizable_box(&mut self, box_ref: OpRef, value: Value) {
         self.virtualizable_boxes = Some(vec![box_ref]);
-        self.virtualizable_values = Some(vec![value]);
+        self.virtualizable_live_null_slots = Some(vec![false]);
+        let _ = self.try_set_opref_concrete(box_ref, value);
+    }
+
+    /// Stamp each box with the matching concrete (`*FrontendOp(pos, value)` /
+    /// `Const*` inline payload). Empty `values` leaves boxes unstamped
+    /// (bridge-entry rebuild / init-before-run).
+    fn stamp_virtualizable_boxes(&mut self, boxes: &[OpRef], values: &[Value]) {
+        if values.is_empty() {
+            return;
+        }
+        assert_eq!(
+            boxes.len(),
+            values.len(),
+            "stamp_virtualizable_boxes: OpRef and Value slices must match",
+        );
+        for (&opref, &value) in boxes.iter().zip(values) {
+            let _ = self.try_set_opref_concrete(opref, value);
+        }
     }
 
     /// Initialize standard virtualizable boxes from input args.
@@ -3111,7 +3110,9 @@ impl TraceCtx {
     /// `VirtualizableInfo::get_index_in_array`. `vable_ref` / `vable_ref_value`
     /// are the OpRef and concrete of the virtualizable object (frame pointer).
     /// Boxes layout: `[field0, ..., fieldN, arr[0], ..., arr[M], vable_ref]`
-    /// where `boxes[-1]` is the standard virtualizable identity (RPython parity).
+    /// where `boxes[-1]` is the standard virtualizable identity.
+    /// Each box carries its concrete (`InputArg*` `_res*` / `Const*` inline);
+    /// empty `input_values` leaves the boxes unstamped.
     pub fn init_virtualizable_boxes(
         &mut self,
         info: &VirtualizableInfo,
@@ -3122,15 +3123,13 @@ impl TraceCtx {
         array_lengths: &[usize],
     ) {
         let mut boxes = input_oprefs.to_vec();
-        boxes.push(vable_ref); // RPython: virtualizable_boxes[-1] = vable identity
-        self.virtualizable_boxes = Some(boxes);
+        boxes.push(vable_ref); // virtualizable_boxes[-1] = vable identity
         if input_values.is_empty() {
             // Caller has no live concrete values (e.g. bridge-entry rebuild
             // helper in pyre-jit-trace::state::seed_virtualizable_boxes).
-            // Disable the concrete shadow; `virtualizable_entry_at` will
-            // return None and readers fall back to the zero placeholder,
-            // same as the pre-concrete-shadow state.
-            self.virtualizable_values = None;
+            // Leave boxes unstamped; `virtualizable_entry_at` returns None
+            // for an InputArg/`*FrontendOp` with no `_res*` and readers fall
+            // back to the zero placeholder.
             self.virtualizable_live_null_slots = None;
         } else {
             assert_eq!(
@@ -3140,9 +3139,10 @@ impl TraceCtx {
             );
             let mut values = input_values.to_vec();
             values.push(vable_ref_value);
-            self.virtualizable_live_null_slots = Some(vec![false; values.len()]);
-            self.virtualizable_values = Some(values);
+            self.virtualizable_live_null_slots = Some(vec![false; boxes.len()]);
+            self.stamp_virtualizable_boxes(&boxes, &values);
         }
+        self.virtualizable_boxes = Some(boxes);
         self.retain_or_store_vinfo(info);
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
@@ -3195,19 +3195,9 @@ impl TraceCtx {
     /// `record1`'s third argument is the value, so the wrapper carries the
     /// source box's observed value; the closing JUMP's `runtime_boxes` deliver
     /// it to `_jump_to_existing_trace`'s runtime fallbacks.
-    /// A virtualizable payload's concrete half lives in `virtualizable_values`,
-    /// which is why the recorder lookup has a fallback here.
     pub fn record_same_as(&mut self, opref: OpRef, tp: majit_ir::Type) -> OpRef {
-        let value = self
-            .concrete_of_opref(opref)
-            .or_else(|| self.virtualizable_payload_concrete(opref));
+        let value = self.concrete_of_opref(opref);
         self.record_op_with_value(majit_ir::OpCode::same_as_for_type(tp), &[opref], value)
-    }
-
-    fn virtualizable_payload_concrete(&self, opref: OpRef) -> Option<Value> {
-        let boxes = self.virtualizable_boxes.as_ref()?;
-        let index = boxes.iter().position(|&candidate| candidate == opref)?;
-        self.virtualizable_entry_at(index).map(|(_, value)| value)
     }
 
     /// pyjitpl.py `remove_consts_and_duplicates`:
@@ -3309,10 +3299,11 @@ impl TraceCtx {
     /// identity sits outside the `endindex = len - 1` window and is never
     /// rewritten.
     pub fn adopt_normalized_virtualizable_elements(&mut self, elements: &[OpRef]) {
-        let Some(boxes) = self.virtualizable_boxes.as_mut() else {
-            return;
-        };
-        let Some(end) = boxes.len().checked_sub(1) else {
+        let Some(end) = self
+            .virtualizable_boxes
+            .as_ref()
+            .and_then(|boxes| boxes.len().checked_sub(1))
+        else {
             return;
         };
         assert_eq!(
@@ -3321,6 +3312,9 @@ impl TraceCtx {
             "adopt_normalized_virtualizable_elements: element block is \
              virtualizable_boxes[..len-1]",
         );
+        let Some(boxes) = self.virtualizable_boxes.as_mut() else {
+            return;
+        };
         boxes[..end].copy_from_slice(elements);
     }
 
@@ -3346,26 +3340,25 @@ impl TraceCtx {
 
     /// The walk-final concrete values of the virtualizable's array elements, in
     /// the flat `[arr0_elem0.., arr1_elem0.., ..]` layout — the array portion of
-    /// `virtualizable_values`, excluding the `num_static_extra_boxes` leading
+    /// `virtualizable_boxes`, excluding the `num_static_extra_boxes` leading
     /// static-field slots and the trailing identity slot
-    /// (`virtualizable_boxes[-1]`). `None` when no standard virtualizable is
-    /// active or its concrete shadow was disabled. Used by the single-pass close
+    /// (`virtualizable_boxes[-1]`). Each slot's bits come from the box itself
+    /// (`box.getint` / `getref_base` / `getfloatstorage`). `None` when no
+    /// standard virtualizable is active. Used by the single-pass close
     /// to transfer walk-mutated loop-carried array state into native `state`
-    /// before re-entering the compiled loop (pyjitpl.py:2982-2989
-    /// `live_arg_boxes += virtualizable_boxes`).
+    /// before re-entering the compiled loop (`live_arg_boxes += virtualizable_boxes`).
     pub fn collect_virtualizable_element_values(&self) -> Option<Vec<i64>> {
-        let values = self.virtualizable_values.as_ref()?;
+        let boxes = self.virtualizable_boxes.as_ref()?;
         let static_count = self
             .virtualizable_info
             .as_ref()
             .map_or(0, |info| info.num_static_extra_boxes);
-        let end = values.len().saturating_sub(1); // drop the trailing identity slot
+        let end = boxes.len().saturating_sub(1); // drop the trailing identity slot
         let start = static_count.min(end);
         Some(
-            values[start..end]
+            boxes[start..end]
                 .iter()
-                .copied()
-                .map(value_to_raw_bits)
+                .map(|&opref| self.box_value(opref).map(value_to_raw_bits).unwrap_or(0))
                 .collect(),
         )
     }
@@ -3374,8 +3367,8 @@ impl TraceCtx {
 
     /// Mirror of the host seed / `virtualizable_heap_ptr` used by `synchronize_virtualizable`.
     /// Callers set this at trace/bridge-entry so writes to
-    /// `virtualizable_values` can propagate to the live PyFrame without
-    /// routing back through MetaInterp (pyjitpl.py write_boxes target).
+    /// `virtualizable_boxes` can propagate to the live PyFrame without
+    /// routing back through MetaInterp (`virtualizable.py write_boxes` target).
     /// The object `refresh_virtualizable_shadow_from_heap` and
     /// `synchronize_virtualizable` read and write.  Diagnostic only: a caller
     /// that needs to know whether the frame it just mutated is the one the
@@ -3389,69 +3382,81 @@ impl TraceCtx {
     }
 
     /// Inverse of `synchronize_virtualizable`: pull current heap virtualizable
-    /// field values into the JIT-tracked shadow (`virtualizable_values`).
+    /// field values onto the JIT-tracked boxes.
     ///
     /// pyre-only sync hook.  RPython's metainterp IS the execution loop —
     /// every opcode flows through `_opimpl_*` which mutates
     /// `metainterp.virtualizable_boxes` in lockstep with the implicit heap
-    /// write, so the shadow never drifts.  Pyre's tracer dispatches some
+    /// write, so the boxes never drift.  Pyre's tracer dispatches some
     /// opcodes through the walker (which mirrors via
     /// `vable_setfield → synchronize_virtualizable`) and others through
     /// `execute_opcode_step` (which mutates the heap PyFrame directly
-    /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the shadow).
-    /// Between any pair of those dispatch paths the shadow can lag heap.
+    /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the boxes).
+    /// Between any pair of those dispatch paths the boxes can lag heap.
     ///
     /// Calling this at each walker step entry — *before* the walker
-    /// arm body reads any shadow slot or `synchronize_virtualizable` writes
-    /// stale shadow back to heap — restores the RPython invariant that
-    /// shadow == heap at every opcode boundary.  When dispatch unification
-    /// retires `execute_opcode_step`, this hook becomes a no-op (every
-    /// mutation already lands in shadow) and can be deleted.
+    /// arm body reads any vable box or `synchronize_virtualizable` writes
+    /// a stale box back to heap — restores the invariant that
+    /// each box's concrete equals the heap at every opcode boundary.  When
+    /// dispatch unification retires `execute_opcode_step`, this hook becomes
+    /// a no-op (every mutation already lands on the box) and can be deleted.
+    ///
+    /// A box that already carries `_res*` keeps it: that payload is the
+    /// trace's observed value (`*FrontendOp(pos, value)` / `InputArg*`).
+    /// Overwriting it with the live heap makes the next recorded use of the
+    /// box (unbox for `i = i + 1`) see a store the walker is about to record,
+    /// and apply it a second time. Unstamped boxes (bridge rebuild, empty
+    /// seed) still take the heap. A residual that mutated the frame without
+    /// going through `vable_setarrayitem` uses
+    /// [`Self::reload_virtualizable_boxes_from_heap`].
     pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
+        self.refresh_virtualizable_from_heap(false);
+    }
+
+    /// Restamp every virtualizable box from the live heap, including boxes
+    /// that already carry a trace concrete. Used after a residual call whose
+    /// body wrote the frame without going through `vable_setarrayitem`.
+    pub fn reload_virtualizable_boxes_from_heap(&mut self) {
+        self.refresh_virtualizable_from_heap(true);
+    }
+
+    fn refresh_virtualizable_from_heap(&mut self, overwrite_stamped: bool) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
-        let Some(info) = self.virtualizable_info.as_ref() else {
+        let Some(info) = self.virtualizable_info.clone() else {
             return;
         };
-        if self.virtualizable_values.is_none() {
-            return;
-        }
-        let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
+        let Some(boxes) = self.virtualizable_boxes.clone() else {
             return;
         };
-        // Clone `lengths` (small — one entry per vable array; one entry total
-        // for PyFrame) to release the immutable borrow before reborrowing
-        // `virtualizable_values` mutably.  The decode loop below reads
-        // statics + array items field-by-field straight into the shadow,
-        // avoiding the `Vec<i64>` allocation that `read_boxes` would
-        // materialise on every hot-path call.
-        let array_lengths = lengths.clone();
+        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
+            return;
+        };
         let static_count = info.num_static_extra_boxes;
-        let info = info.clone();
-        let Some(values) = self.virtualizable_values.as_mut() else {
-            return;
-        };
-        // `virtualizable_values`'s last slot stores the standard-vable identity
-        // (`virtualizable_boxes[-1]` in RPython terms, see comment at
-        // `virtualizable_box_at`).  `synchronize_virtualizable` already stops
-        // at `static_count + sum(lengths)`; mirror that here so a
-        // short/misaligned shadow (only the identity slot present, or fewer
-        // data slots than expected) can never overwrite the identity.
-        let shadow_data_len = values.len().saturating_sub(1);
-        for (i, (field, slot)) in info
+        // Last slot is the standard-vable identity (`virtualizable_boxes[-1]`).
+        // `synchronize_virtualizable` already stops at `static_count + sum(lengths)`;
+        // mirror that here so a short/misaligned list (only the identity slot
+        // present, or fewer data slots than expected) can never overwrite it.
+        let shadow_data_len = boxes.len().saturating_sub(1);
+        let mut replacements = Vec::new();
+        for (i, field) in info
             .static_fields
             .iter()
-            .zip(values.iter_mut())
             .take(static_count.min(shadow_data_len))
             .enumerate()
         {
             let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
-            *slot = crate::pyjitpl::heap_value_for_pub(ty, bits);
+            let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
+            if let Some(new_box) =
+                self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
+            {
+                replacements.push((i, new_box));
+            }
         }
         let mut cursor = static_count;
-        for (a_idx, &length) in array_lengths.iter().enumerate() {
+        for (a_idx, &length) in lengths.iter().enumerate() {
             if a_idx >= info.array_fields.len() {
                 break;
             }
@@ -3461,21 +3466,79 @@ impl TraceCtx {
                     break;
                 }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
-                values[cursor] = crate::pyjitpl::heap_value_for_pub(ty, bits);
+                let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
+                if let Some(new_box) =
+                    self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
+                {
+                    replacements.push((cursor, new_box));
+                }
                 cursor += 1;
+            }
+        }
+        if !replacements.is_empty()
+            && let Some(boxes) = self.virtualizable_boxes.as_mut()
+        {
+            for (index, new_box) in replacements {
+                if let Some(slot) = boxes.get_mut(index) {
+                    *slot = new_box;
+                }
             }
         }
     }
 
-    /// pyjitpl.py `synchronize_virtualizable()`.
+    /// Stamp `opref` with `concrete`. A `Const*` cannot be restamped, so a
+    /// heap value that disagrees with the inline payload is wrapped as a
+    /// fresh `Const*` (`cpu.tsosvgcref_to_box` / `wrap(..., in_const_box)`).
+    /// A non-const box that already carries `_res*` keeps it unless
+    /// `overwrite_stamped` (residual reload).
+    fn refresh_vable_slot(
+        &mut self,
+        opref: OpRef,
+        ty: Type,
+        bits: i64,
+        concrete: Value,
+        overwrite_stamped: bool,
+    ) -> Option<OpRef> {
+        if opref.is_constant() {
+            let current = opref.inline_const_to_value();
+            if current == Some(concrete) {
+                return None;
+            }
+            return Some(match ty {
+                Type::Int => self.const_int(bits),
+                Type::Ref => self.const_ref(bits),
+                Type::Float => self.const_float(bits),
+                Type::Void => opref,
+            });
+        }
+        if !overwrite_stamped && self.box_carries_runtime_concrete(opref) {
+            return None;
+        }
+        let _ = self.try_set_opref_concrete(opref, concrete);
+        None
+    }
+
+    /// True when `opref` already carries a runtime payload (`InputArg*` /
+    /// `*FrontendOp._res*` / `Const*` inline) that is not the "no concrete"
+    /// sentinel. Void and `GcRef::NO_CONCRETE` are the unstamped markers a
+    /// heap refresh is still allowed to fill.
+    fn box_carries_runtime_concrete(&self, opref: OpRef) -> bool {
+        match self.box_value(opref) {
+            None | Some(Value::Void) => false,
+            Some(Value::Ref(r)) if r == majit_ir::GcRef::NO_CONCRETE => false,
+            Some(_) => true,
+        }
+    }
+
+    /// `MetaInterp.synchronize_virtualizable()`.
     ///
-    /// Writes the concrete half of `virtualizable_boxes` (the
-    /// `virtualizable_values` shadow) back to the live virtualizable via
+    /// Writes each box's concrete (`box.getint` / `getref_base` /
+    /// `getfloatstorage`) back to the live virtualizable via
     /// `write_field` / `write_array_item`. The trailing identity slot
-    /// (`virtualizable_boxes[-1]`) is excluded — RPython's `write_boxes`
+    /// (`virtualizable_boxes[-1]`) is excluded — `write_boxes`
     /// stops at `self.num_arrays + self.static_fields.len()` and leaves the
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
-    /// or `virtualizable_values` is unavailable.
+    /// or `virtualizable_boxes` is unavailable.
     pub fn synchronize_virtualizable(&self) {
         self.write_virtualizable_back(true);
     }
@@ -3679,7 +3742,7 @@ impl TraceCtx {
         self.set_virtualizable_boxes_with_info(boxes, values, &info, &lengths);
     }
 
-    /// `virtualizable.py write_boxes` over the whole shadow.
+    /// `virtualizable.py write_boxes` over the whole box list.
     ///
     /// `skip_when_outer_owned` names the merge-point form whose write-back
     /// is not this function's to make; see the carve-out below.
@@ -3690,7 +3753,7 @@ impl TraceCtx {
         let Some(info) = self.virtualizable_info.as_ref() else {
             return;
         };
-        let Some(values) = self.virtualizable_values.as_ref() else {
+        let Some(boxes) = self.virtualizable_boxes.as_ref() else {
             return;
         };
         let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
@@ -3699,31 +3762,33 @@ impl TraceCtx {
         // When the merge point is the bare observer/replay form
         // (`jit_merge_point!()`), an outer executor (the macro-generated
         // mainloop) owns the live struct and writes it on every opcode. The
-        // trace's shadow is seeded from that heap and tracked for IR
-        // purposes only; flushing the shadow back here would clobber the
+        // trace's boxes are seeded from that heap and tracked for IR
+        // purposes only; flushing them back here would clobber the
         // outer executor's writes. The live struct is authoritative, so
         // skip the write-back during tracing — the resume path performs its
         // own field-aware flush on guard failure. The `; state`
         // single-executor close keeps the walk executing, so the flush is
         // required there: it is the only thing that keeps the live struct
-        // and the shadow equal. `pyjitpl.py synchronize_virtualizable`
+        // and the boxes equal. `synchronize_virtualizable`
         // always writes because upstream's metainterp IS the interpreter.
         if skip_when_outer_owned && info.outer_executor_owns_state {
             return;
         }
         let static_count = info.num_static_extra_boxes;
-        if values.len() < static_count {
+        if boxes.len() < static_count {
             return;
         }
         let mut needed = static_count;
         for &len in lengths {
             needed = needed.saturating_add(len);
-            if needed > values.len() {
+            if needed > boxes.len() {
                 return;
             }
         }
         // virtualizable.py write_boxes: setattr each static field, then each
-        // array item, with no intermediate collection.
+        // array item, with no intermediate collection. Each box's concrete is
+        // `box.getint` / `getref_base` / `getfloatstorage`; an unstamped box
+        // is skipped so a value-only seed cannot clobber the heap with zeros.
         // Safety: `heap_ptr` comes from `virtualizable_heap_ptr`, which names
         // a frame kept alive for as long as the trace reads it.  The cell is
         // not pinned for the session — see its declaration for the writers that
@@ -3732,18 +3797,18 @@ impl TraceCtx {
         // VirtualizableInfo used at the matching heap read.
         unsafe {
             let dst = heap_ptr as *mut u8;
-            for (i, v) in values[..static_count].iter().enumerate() {
-                info.write_field(dst, i, value_to_raw_bits(*v));
+            for (i, &opref) in boxes[..static_count].iter().enumerate() {
+                let Some(v) = self.box_value(opref) else {
+                    continue;
+                };
+                info.write_field(dst, i, value_to_raw_bits(v));
             }
             let mut cursor = static_count;
             for (array_index, &len) in lengths.iter().enumerate() {
                 for item_index in 0..len {
-                    info.write_array_item(
-                        dst,
-                        array_index,
-                        item_index,
-                        value_to_raw_bits(values[cursor]),
-                    );
+                    if let Some(v) = self.box_value(boxes[cursor]) {
+                        info.write_array_item(dst, array_index, item_index, value_to_raw_bits(v));
+                    }
                     cursor += 1;
                 }
             }
@@ -3768,7 +3833,7 @@ impl TraceCtx {
         let Some(info) = self.virtualizable_info.as_ref() else {
             return;
         };
-        let Some(values) = self.virtualizable_values.as_ref() else {
+        let Some(boxes) = self.virtualizable_boxes.as_ref() else {
             return;
         };
         let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
@@ -3778,13 +3843,13 @@ impl TraceCtx {
             return;
         }
         let static_count = info.num_static_extra_boxes;
-        if values.len() < static_count {
+        if boxes.len() < static_count {
             return;
         }
         let mut needed = static_count;
         for &len in lengths {
             needed = needed.saturating_add(len);
-            if needed > values.len() {
+            if needed > boxes.len() {
                 return;
             }
         }
@@ -3792,6 +3857,10 @@ impl TraceCtx {
             index < needed,
             "write_virtualizable_back_at: index {index} is outside the {needed} flat slots"
         );
+        let Some(v) = self.box_value(boxes[index]) else {
+            return;
+        };
+        let bits = value_to_raw_bits(v);
         // virtualizable.py write_box_at: walk static fields with a running
         // index, then subtract each array's length until the index falls
         // inside one. The trailing identity slot is not a field.
@@ -3802,13 +3871,13 @@ impl TraceCtx {
         unsafe {
             let dst = heap_ptr as *mut u8;
             if i < static_count {
-                info.write_field(dst, i, value_to_raw_bits(values[index]));
+                info.write_field(dst, i, bits);
                 return;
             }
             i -= static_count;
             for (array_index, &len) in lengths.iter().enumerate() {
                 if i < len {
-                    info.write_array_item(dst, array_index, i, value_to_raw_bits(values[index]));
+                    info.write_array_item(dst, array_index, i, bits);
                     return;
                 }
                 i -= len;
@@ -3843,39 +3912,36 @@ impl TraceCtx {
         if !cfg!(debug_assertions) {
             return;
         }
-        let (Some(heap_ptr), Some(info), Some(values), Some(lengths)) = (
+        let (Some(heap_ptr), Some(info), Some(boxes), Some(lengths)) = (
             self.virtualizable_heap_ptr,
             self.virtualizable_info.as_ref(),
-            self.virtualizable_values.as_ref(),
+            self.virtualizable_boxes.as_ref(),
             self.virtualizable_array_lengths.as_ref(),
         ) else {
             return;
         };
         // Observer/replay merge points leave an outer executor owning the
-        // live struct, so the shadow is deliberately not kept equal to it
+        // live struct, so the boxes are deliberately not kept equal to it
         // — the same carve-out `synchronize_virtualizable` makes before
         // writing back.
         if info.outer_executor_owns_state {
             return;
         }
         let static_count = info.num_static_extra_boxes;
-        let shadow_data_len = values.len().saturating_sub(1);
+        let shadow_data_len = boxes.len().saturating_sub(1);
         if shadow_data_len < static_count {
             return;
         }
-        for (i, (field, value)) in info
-            .static_fields
-            .iter()
-            .zip(values.iter())
-            .take(static_count)
-            .enumerate()
-        {
+        for (i, field) in info.static_fields.iter().take(static_count).enumerate() {
+            let Some(value) = self.box_value(boxes[i]) else {
+                continue;
+            };
             let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
             debug_assert_eq!(
-                *value, heap,
-                "virtualizable static field {} ({:?}) diverged from the shadow: \
+                value, heap,
+                "virtualizable static field {} ({:?}) diverged from the box: \
                  a vable write did not update virtualizable_boxes",
                 i, field.name,
             );
@@ -3890,12 +3956,16 @@ impl TraceCtx {
                 if cursor >= shadow_data_len {
                     return;
                 }
+                let Some(value) = self.box_value(boxes[cursor]) else {
+                    cursor += 1;
+                    continue;
+                };
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 debug_assert_eq!(
-                    values[cursor], heap,
+                    value, heap,
                     "virtualizable array {a_idx} item {item_idx} diverged from the \
-                     shadow: a vable write did not update virtualizable_boxes",
+                     box: a vable write did not update virtualizable_boxes",
                 );
                 cursor += 1;
             }
@@ -3926,16 +3996,14 @@ impl TraceCtx {
             .and_then(|boxes| boxes.last().copied())
     }
 
-    /// Read a standard virtualizable slot as (OpRef, concrete Value) — RPython
-    /// `virtualizable_boxes[index]` parity: a Box carries both the traced
+    /// Read a standard virtualizable slot as (OpRef, concrete Value) —
+    /// `virtualizable_boxes[index]`: a Box carries both the traced
     /// reference and its concrete value. Callers that need to seed a register
     /// with both halves of the Box (e.g. `BC_GETARRAYITEM_VABLE_R` →
     /// `set_ref_reg`) MUST use this instead of `virtualizable_box_at`.
     pub fn virtualizable_entry_at(&self, index: usize) -> Option<(OpRef, Value)> {
-        let boxes = self.virtualizable_boxes.as_ref()?;
-        let values = self.virtualizable_values.as_ref()?;
-        let opref = *boxes.get(index)?;
-        let value = *values.get(index)?;
+        let opref = self.virtualizable_box_at(index)?;
+        let value = self.box_value(opref)?;
         Some((opref, value))
     }
 
@@ -3979,48 +4047,62 @@ impl TraceCtx {
     /// do NOT change the concrete value carried by the slot. For updates that
     /// also change concrete (vable set{field,arrayitem}), use
     /// `set_virtualizable_entry_at`.
+    ///
+    /// history.py `record_same_as` stamps the wrapper with `box.getint` /
+    /// `getref_base` / `getfloatstorage`. If `value` is still unstamped
+    /// (wrapint `NewWithVtable` before the caller stamps, SameAs of an
+    /// unstamped source), copy the previous box's payload onto it so the
+    /// slot's box carries the value.
     pub fn set_virtualizable_box_at(&mut self, index: usize, value: OpRef) -> bool {
-        if let Some(boxes) = &mut self.virtualizable_boxes
-            && let Some(slot) = boxes.get_mut(index)
+        let Some(old) = self.virtualizable_box_at(index) else {
+            return false;
+        };
+        let old_concrete = self
+            .box_value(old)
+            .filter(|_| self.box_carries_runtime_concrete(old));
+        let new_stamped = self.box_carries_runtime_concrete(value);
         {
+            let Some(boxes) = self.virtualizable_boxes.as_mut() else {
+                return false;
+            };
+            let Some(slot) = boxes.get_mut(index) else {
+                return false;
+            };
             *slot = value;
-            return true;
         }
-        false
+        if !new_stamped {
+            if let Some(concrete) = old_concrete {
+                let _ = self.try_set_opref_concrete(value, concrete);
+            }
+        }
+        true
     }
 
-    /// Update both halves of a standard virtualizable slot (OpRef + concrete).
+    /// Update a standard virtualizable slot: store `valuebox` and stamp it
+    /// with `value` (`*FrontendOp(pos, value)` / `Const*` inline).
     ///
-    /// pyjitpl.py _opimpl_setarrayitem_vable parity:
+    /// `_opimpl_setarrayitem_vable`:
     ///
     /// ```text
     ///     self.metainterp.virtualizable_boxes[index] = valuebox
     ///     self.metainterp.synchronize_virtualizable_at(index)
     /// ```
     ///
-    /// Writes the entire Box (SSA identity + concrete value) atomically so
-    /// the (OpRef, concrete) pair never diverges.  Callers must ensure
-    /// `value.get_type()` matches the slot's declared type
-    /// (`virtualizable_slot_type(index)`); RPython guarantees this at the
-    /// source level by emitting `NEW_W_INT` / `NEW_W_FLOAT` before any
-    /// STORE into a Ref-typed `locals_cells_stack_w` slot
-    /// (pypy/interpreter/pyframe.py:84 `list[W_Object]`).  Pyre's codewriter
-    /// does not yet mirror that boxing at STORE_FAST → vable (Phase 4-5 of
-    /// the portal-locals lowering plan); until it does, non-Phase-D paths
-    /// like the retired pyre trace-side local-store path may write a pyre-unboxed
-    /// `Value::Int`/`Value::Float` into a Ref slot and a later
-    /// `BC_GETARRAYITEM_VABLE_R` read will decode 0 via `value_as_ref_bits`.
-    /// That null is a pyre-upstream parity gap, not a shadow bug — the
-    /// shadow faithfully reflects the caller's Box.
+    /// Callers must ensure `value.get_type()` matches the slot's declared type
+    /// (`virtualizable_slot_type(index)`); the source emits `NEW_W_INT` /
+    /// `NEW_W_FLOAT` before any STORE into a Ref-typed `locals_cells_stack_w`
+    /// slot (`list[W_Object]`). Until the codewriter mirrors that boxing at
+    /// STORE_FAST → vable, a pyre-unboxed `Value::Int`/`Value::Float` in a Ref
+    /// slot decodes 0 via `value_as_ref_bits`.
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) {
         // The precondition above, checked rather than only stated.  A
         // `Value::Int` in a Ref slot is not a wrong number — it is a pointer
-        // the shadow will hand to `value_as_ref_bits`, which decodes it as 0,
-        // so a later `BC_GETARRAYITEM_VABLE_R` reads NULL out of a slot that
-        // holds a live object.  `Value::Void` is the absence of a live
-        // concrete and is legal in every slot; a slot whose type is not
-        // declared (no `virtualizable_info`, or an index past the layout)
-        // yields `None` and is left to the range assert below.
+        // `value_as_ref_bits` decodes as 0, so a later
+        // `BC_GETARRAYITEM_VABLE_R` reads NULL out of a slot that holds a live
+        // object.  `Value::Void` is the absence of a live concrete and is
+        // legal in every slot; a slot whose type is not declared (no
+        // `virtualizable_info`, or an index past the layout) yields `None`
+        // and is left to the range assert below.
         debug_assert!(
             matches!(value, Value::Void)
                 || self
@@ -4031,21 +4113,10 @@ impl TraceCtx {
             self.virtualizable_slot_type(index),
             value.get_type(),
         );
-        let (boxes_opt, values_opt) = (
-            &mut self.virtualizable_boxes,
-            &mut self.virtualizable_values,
-        );
-        let boxes = boxes_opt
+        let boxes = self
+            .virtualizable_boxes
             .as_mut()
             .expect("set_virtualizable_entry_at: virtualizable_boxes missing");
-        let values = values_opt
-            .as_mut()
-            .expect("set_virtualizable_entry_at: virtualizable_values missing");
-        assert_eq!(
-            boxes.len(),
-            values.len(),
-            "set_virtualizable_entry_at: boxes/values length mismatch",
-        );
         // `boxes.len() - 1` is the virtualizable identity
         // (`virtualizable_boxes[-1]`, appended once by
         // `init_virtualizable_boxes`), not a state slot: it is the box every
@@ -4061,10 +4132,10 @@ impl TraceCtx {
             boxes.len() - 1,
         );
         boxes[index] = opref;
-        values[index] = value;
         if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
             live_null_slots[index] = false;
         }
+        let _ = self.try_set_opref_concrete(opref, value);
     }
 
     /// Put `opref`/`value` into flat slot `index` and hand back what it held.
@@ -4086,8 +4157,7 @@ impl TraceCtx {
         let prev = self.virtualizable_entry_at(index)?;
         let boxes = self.virtualizable_boxes.as_mut()?;
         *boxes.get_mut(index)? = opref;
-        let values = self.virtualizable_values.as_mut()?;
-        *values.get_mut(index)? = value;
+        let _ = self.try_set_opref_concrete(opref, value);
         Some(prev)
     }
 
@@ -4115,7 +4185,7 @@ impl TraceCtx {
     /// the live frame the compiled loop runs on.  Readers that need "which
     /// object do these boxes describe" — `compile.py:510` — want the identity.
     pub fn standard_virtualizable_ptr(&self) -> Option<usize> {
-        match self.virtualizable_values.as_ref()?.last()? {
+        match self.standard_virtualizable_concrete()? {
             Value::Ref(gcref) if gcref.as_usize() != 0 => Some(gcref.as_usize()),
             _ => None,
         }
@@ -4175,37 +4245,41 @@ impl TraceCtx {
         (vable_boxes, vref_boxes)
     }
 
-    /// Concrete shadow of the standard virtualizable — the raw heap pointer
-    /// `standard_virtualizable_box` refers to. Parallels
-    /// `MetaInterp.virtualizable_boxes[-1].getref_base()` at runtime; pyre
-    /// keeps the shadow in `virtualizable_values[-1]` because `OpRef` alone
-    /// cannot carry the concrete ptr through the tracer.  Used by
-    /// `is_nonstandard_virtualizable` Step 4 to realize the runtime
-    /// `isstandard = concrete_eq(box, standard_box)` compare that upstream
-    /// pyjitpl.py performs via `rop.PTR_EQ` +
+    /// Concrete of the standard virtualizable — `virtualizable_boxes[-1].getref_base()`.
+    /// Used by `is_nonstandard_virtualizable` Step 4 to realize the runtime
+    /// `isstandard = concrete_eq(box, standard_box)` compare that
+    /// `_nonstandard_virtualizable` performs via `rop.PTR_EQ` +
     /// `implement_guard_value`.
     pub fn standard_virtualizable_concrete(&self) -> Option<Value> {
-        self.virtualizable_values
-            .as_ref()
-            .and_then(|values| values.last().copied())
+        self.standard_virtualizable_box()
+            .and_then(|opref| self.box_value(opref))
     }
 
     /// Trace every concrete Ref carried by `virtualizable_boxes`.
     ///
-    /// RPython stores these values directly on `BoxPtr` instances, so the GC
-    /// forwards them through the ordinary object graph.  Pyre's parallel
-    /// `virtualizable_values` vector is the concrete half of those same boxes
-    /// and therefore needs the identical in-place walk.  In particular, the
-    /// trailing identity is `virtualizable_boxes[-1]`; a bridge must keep that
-    /// rebuilt frame identity live instead of falling back to an older cached
+    /// Each box is an `InputArg*` / `*FrontendOp` / `Const*` that carries its
+    /// own value. `InputArg*` and `*FrontendOp` refs are forwarded by the
+    /// recorder walk (`walk_active_trace_refs` visits `inputargs` and
+    /// `value_slots`); this walk rewrites `ConstPtr` gcrefs that live in the
+    /// box list itself, then forwards `virtualizable_heap_ptr`. The trailing
+    /// identity is `virtualizable_boxes[-1]`; a bridge must keep that rebuilt
+    /// frame identity live instead of falling back to an older cached
     /// portal-frame pointer.
     pub(crate) fn walk_virtualizable_value_refs(
         &mut self,
         mut visitor: impl FnMut(&mut majit_ir::GcRef),
     ) {
-        let Some(values) = self.virtualizable_values.as_mut() else {
-            return;
+        let identity_before = match self.standard_virtualizable_concrete() {
+            Some(Value::Ref(identity)) => Some(identity.as_usize()),
+            _ => None,
         };
+        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
+            for slot in boxes.iter_mut() {
+                if let OpRef::ConstPtr(gcref) = slot {
+                    visitor(gcref);
+                }
+            }
+        }
         // The cell names either the identity or a different object: a frontend
         // that traces against a GC-owned snapshot copy seeds it with the
         // snapshot while the identity box names the live frame.  Forward the
@@ -4213,15 +4287,6 @@ impl TraceCtx {
         // the synchronization target onto the live frame at whichever
         // collection happens to fire.
         let cell = self.virtualizable_heap_ptr;
-        let identity_before = match values.last() {
-            Some(Value::Ref(identity)) => Some(identity.as_usize()),
-            _ => None,
-        };
-        for value in values.iter_mut() {
-            if let Value::Ref(gcref) = value {
-                visitor(gcref);
-            }
-        }
         match cell {
             Some(ptr) if !ptr.is_null() && Some(ptr as usize) != identity_before => {
                 let mut target = majit_ir::GcRef(ptr as usize);
@@ -4229,7 +4294,7 @@ impl TraceCtx {
                 self.virtualizable_heap_ptr = Some(target.as_usize() as *const u8);
             }
             _ => {
-                if let Some(Value::Ref(identity)) = values.last() {
+                if let Some(Value::Ref(identity)) = self.standard_virtualizable_concrete() {
                     self.virtualizable_heap_ptr = if identity.is_null() {
                         None
                     } else {
@@ -4317,11 +4382,6 @@ impl TraceCtx {
                 return Some(value);
             }
         }
-        if Some(opref) == self.standard_virtualizable_box()
-            && let Some(v) = self.standard_virtualizable_concrete()
-        {
-            return Some(v);
-        }
         self.lookup_opref_concrete(opref)
     }
 
@@ -4330,17 +4390,12 @@ impl TraceCtx {
         self.virtualizable_boxes.is_some()
     }
 
-    /// Whether BOTH halves of the standard virtualizable shadow are active.
-    ///
-    /// `init_virtualizable_boxes` seeds the OpRef half alone when the caller
-    /// has no live concrete values (the bridge-entry rebuild in
-    /// `seed_virtualizable_boxes`, test fixtures), leaving
-    /// `virtualizable_values` disabled so readers fall back to the zero
-    /// placeholder. `set_virtualizable_entry_at` writes both halves and
-    /// panics without the concrete one, so its callers must gate on this
-    /// rather than on `has_virtualizable_boxes`.
+    /// Whether `init_virtualizable_boxes` / `set_virtualizable_boxes_with_info`
+    /// stamped field concretes (`live_null_slots` is allocated in that arm).
+    /// Empty `input_values` leaves InputArg/`*FrontendOp` boxes unstamped and
+    /// this is false, even when a `Const*` identity already carries a payload.
     pub fn has_virtualizable_shadow(&self) -> bool {
-        self.virtualizable_boxes.is_some() && self.virtualizable_values.is_some()
+        self.virtualizable_live_null_slots.is_some()
     }
 
     /// Drop the tracing-time virtualizable_boxes mirror.
@@ -4364,17 +4419,17 @@ impl TraceCtx {
     /// resume data before the bridge replays any vable op.
     pub fn clear_virtualizable_boxes(&mut self) {
         self.virtualizable_boxes = None;
+        self.virtualizable_live_null_slots = None;
     }
 
     /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
     /// Used by bridge tracing where the boxes are reconstructed from
-    /// resume data (pyjitpl.py rebuild_state_after_failure parity).
+    /// resume data (`rebuild_state_after_failure`).
     ///
-    /// `values` carries the concrete shadow that parallels `boxes`. Callers
-    /// must pass the matching live values recovered from the guard's fail
-    /// args; an empty `values` slice disables the concrete shadow for the
-    /// duration of the bridge (only safe when the bridge does not execute
-    /// any `BC_GET*_VABLE_*` opcodes that feed `set_*_reg`).
+    /// `values` is stamped onto `boxes` (`*FrontendOp(pos, value)` /
+    /// `Const*` inline). An empty `values` slice leaves the boxes unstamped
+    /// (only safe when the bridge does not execute any `BC_GET*_VABLE_*`
+    /// opcodes that feed `set_*_reg`).
     pub fn set_virtualizable_boxes_with_info(
         &mut self,
         boxes: Vec<OpRef>,
@@ -4383,15 +4438,9 @@ impl TraceCtx {
         array_lengths: &[usize],
     ) {
         if !values.is_empty() {
-            assert_eq!(
-                boxes.len(),
-                values.len(),
-                "set_virtualizable_boxes_with_info: boxes/values length mismatch",
-            );
-            self.virtualizable_live_null_slots = Some(vec![false; values.len()]);
-            self.virtualizable_values = Some(values);
+            self.stamp_virtualizable_boxes(&boxes, &values);
+            self.virtualizable_live_null_slots = Some(vec![false; boxes.len()]);
         } else {
-            self.virtualizable_values = None;
             self.virtualizable_live_null_slots = None;
         }
         self.virtualizable_boxes = Some(boxes);
@@ -4729,22 +4778,36 @@ impl TraceCtx {
             self.truncate_vable_array_to(dest_array, dest_lengths);
             return;
         }
-        let (mut boxes, mut values) =
-            self.record_vable_field_reads(vbox, dest_ptr, &info, dest_lengths);
+        let mut boxes = self.record_vable_field_reads(vbox, dest_ptr, &info, dest_lengths);
         boxes.push(vbox);
-        values.push(Value::Ref(majit_ir::GcRef(dest_ptr)));
-        self.set_virtualizable_boxes_with_info(boxes, values, &info, dest_lengths);
+        self.replace_loaded_virtualizable_boxes(boxes, &info, dest_lengths);
         if dest_ptr != 0 {
             self.set_virtualizable_heap_ptr(dest_ptr as *const u8);
         }
     }
 
-    fn placeholder_value(ty: Type) -> Value {
-        match ty {
-            Type::Int => Value::Int(0),
-            Type::Float => Value::Float(0.0),
-            Type::Ref => Value::Ref(majit_ir::GcRef::NULL),
-            Type::Void => Value::Void,
+    /// Install `boxes` as `virtualizable_boxes`. Each box already carries
+    /// its recorded result (`history.py _make_op` / `execute_and_record`);
+    /// an empty `values` slice to `set_virtualizable_boxes_with_info` does
+    /// not restamp. A previously-seeded shadow keeps
+    /// `virtualizable_live_null_slots` allocated at the new length so
+    /// `has_virtualizable_shadow` stays true for later vable stores.
+    fn replace_loaded_virtualizable_boxes(
+        &mut self,
+        boxes: Vec<OpRef>,
+        info: &VirtualizableInfo,
+        dest_lengths: &[usize],
+    ) {
+        let keep_shadow = self.has_virtualizable_shadow();
+        let n = boxes.len();
+        let values = boxes
+            .iter()
+            .map(|&b| self.box_value(b))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        self.set_virtualizable_boxes_with_info(boxes, values, info, dest_lengths);
+        if keep_shadow && self.virtualizable_live_null_slots.is_none() {
+            self.virtualizable_live_null_slots = Some(vec![false; n]);
         }
     }
 
@@ -4755,15 +4818,14 @@ impl TraceCtx {
         dest_ptr: usize,
         descr: DescrRef,
         kind: Type,
-    ) -> (OpRef, Value) {
+    ) -> OpRef {
+        // pyjitpl.py `MetaInterp.execute_and_record`: execute then
+        // `_record_helper(opnum, resvalue, descr, *argboxes)`. The box
+        // carries the result (`*FrontendOp(pos, value)`).
         let live = (dest_ptr != 0)
             .then(|| self.field_sanity_load(dest_ptr as i64, &descr, kind))
             .flatten();
-        let op = self.execute_and_record(None, opcode, Some(descr), &[vbox], None, 0);
-        if let Some(live) = live {
-            self.set_opref_concrete(op, live);
-        }
-        (op, live.unwrap_or_else(|| Self::placeholder_value(kind)))
+        self.execute_and_record(None, opcode, Some(descr), &[vbox], live, 0)
     }
 
     fn record_getarrayitem_stamped(
@@ -4773,7 +4835,7 @@ impl TraceCtx {
         index: i64,
         array_descr: DescrRef,
         item_type: Type,
-    ) -> (OpRef, Value) {
+    ) -> OpRef {
         let const_idx = self.const_int(index);
         let op = self.execute_and_record(
             None,
@@ -4783,11 +4845,8 @@ impl TraceCtx {
             None,
             0,
         );
-        let live = self.stamp_vable_array_item(op, array_op, index, &array_descr, item_type);
-        (
-            op,
-            live.unwrap_or_else(|| Self::placeholder_value(item_type)),
-        )
+        self.stamp_vable_array_item(op, array_op, index, &array_descr, item_type);
+        op
     }
 
     fn record_vable_field_reads(
@@ -4796,11 +4855,10 @@ impl TraceCtx {
         dest_ptr: usize,
         vinfo: &VirtualizableInfo,
         array_lengths: &[usize],
-    ) -> (Vec<OpRef>, Vec<Value>) {
+    ) -> Vec<OpRef> {
         let mut boxes = Vec::with_capacity(
             vinfo.static_fields.len() + array_lengths.iter().copied().sum::<usize>(),
         );
-        let mut values = Vec::with_capacity(boxes.capacity());
         let static_descrs = vinfo.static_field_descrs();
         for (fi, field) in vinfo.static_fields.iter().enumerate() {
             let opcode = match field.field_type {
@@ -4809,7 +4867,7 @@ impl TraceCtx {
                 Type::Float => OpCode::GetfieldGcF,
                 Type::Void => continue,
             };
-            let (op, value) = self.record_getfield_stamped(
+            let op = self.record_getfield_stamped(
                 opcode,
                 vbox,
                 dest_ptr,
@@ -4817,12 +4875,11 @@ impl TraceCtx {
                 field.field_type,
             );
             boxes.push(op);
-            values.push(value);
         }
         let array_field_descrs = vinfo.array_field_descrs();
         for (ai, array_field_descr) in array_field_descrs.iter().enumerate() {
             let array_len = array_lengths.get(ai).copied().unwrap_or(0);
-            let (array_op, _) = self.record_getfield_stamped(
+            let array_op = self.record_getfield_stamped(
                 OpCode::GetfieldGcR,
                 vbox,
                 dest_ptr,
@@ -4840,7 +4897,7 @@ impl TraceCtx {
                 }
             };
             for index in 0..array_len {
-                let (op, value) = self.record_getarrayitem_stamped(
+                let op = self.record_getarrayitem_stamped(
                     item_opcode,
                     array_op,
                     index as i64,
@@ -4848,10 +4905,9 @@ impl TraceCtx {
                     item_type,
                 );
                 boxes.push(op);
-                values.push(value);
             }
         }
-        (boxes, values)
+        boxes
     }
 
     fn extend_vable_array_from_frame(
@@ -4878,21 +4934,16 @@ impl TraceCtx {
             Type::Float => OpCode::GetarrayitemGcF,
             Type::Void => return,
         };
-        let (array_op, _) = self.record_getfield_stamped(
+        let array_op = self.record_getfield_stamped(
             OpCode::GetfieldGcR,
             vbox,
             dest_ptr,
             field_descr,
             Type::Ref,
         );
-        let mut values = self.virtualizable_values.clone().unwrap_or_default();
         let identity = boxes.pop().unwrap();
-        if values.len() == boxes.len() + 1 {
-            values.pop();
-        }
-        let keep_values = values.len() == boxes.len();
         for index in cached_array..dest_array {
-            let (op, value) = self.record_getarrayitem_stamped(
+            let op = self.record_getarrayitem_stamped(
                 item_opcode,
                 array_op,
                 index as i64,
@@ -4900,17 +4951,9 @@ impl TraceCtx {
                 item_type,
             );
             boxes.push(op);
-            if keep_values {
-                values.push(value);
-            }
         }
         boxes.push(identity);
-        if keep_values {
-            values.push(Value::Ref(majit_ir::GcRef(dest_ptr)));
-        } else {
-            values.clear();
-        }
-        self.set_virtualizable_boxes_with_info(boxes, values, info, dest_lengths);
+        self.replace_loaded_virtualizable_boxes(boxes, info, dest_lengths);
     }
 
     fn truncate_vable_array_to(&mut self, dest_array: usize, dest_lengths: &[usize]) {
@@ -4927,15 +4970,7 @@ impl TraceCtx {
         let identity = boxes[boxes.len() - 1];
         boxes.truncate(nstatic + dest_array);
         boxes.push(identity);
-        let mut values = self.virtualizable_values.clone().unwrap_or_default();
-        if values.len() >= nstatic + dest_array + 1 {
-            let identity_val = values[values.len() - 1];
-            values.truncate(nstatic + dest_array);
-            values.push(identity_val);
-        } else {
-            values.clear();
-        }
-        self.set_virtualizable_boxes_with_info(boxes, values, &info, dest_lengths);
+        self.replace_loaded_virtualizable_boxes(boxes, &info, dest_lengths);
     }
 
     /// `compile.py patch_new_loop_to_load_virtualizable_fields`
@@ -5780,11 +5815,8 @@ impl TraceCtx {
             .expect("vable_setfield: virtualizable_info missing")
             .static_field_by_descr(&fielddescr)
             .expect("vable_setfield: standard virtualizable field descr missing");
-        // `virtualizable_values` is a dense `Vec<Value>`, so an unknown
-        // concrete still needs a placeholder slot.  This is the lone
-        // remaining materialization of the "no concrete" marker; the
-        // role-2 shadow store keeps a `Value::Ref(GcRef::NO_CONCRETE)`
-        // until that store is itself moved to `Vec<Option<Value>>`.
+        // An unknown concrete still needs a stamp so the box carries the
+        // "no concrete" marker (`Value::Ref(GcRef::NO_CONCRETE)`).
         let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         let overwritten = VableEntryWrite::of(self, index);
         self.set_virtualizable_entry_at(index, value, stored);
@@ -7761,8 +7793,8 @@ mod tests {
         );
     }
 
-    /// history.py `record_same_as` also carries a standard
-    /// virtualizable payload box's value from its concrete shadow.
+    /// `record_same_as` carries a standard virtualizable payload box's
+    /// value from the box itself (`InputArgInt.getint`).
     #[test]
     fn remove_consts_and_duplicates_carries_virtualizable_payload_value() {
         let info = make_test_vable_info();
@@ -7785,14 +7817,14 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.concrete_of_opref(payload),
-            None,
-            "the recorder's per-position table has no payload value"
+            ctx.box_value(payload),
+            Some(Value::Int(37)),
+            "the payload box carries its concrete"
         );
         assert_eq!(
             ctx.virtualizable_entry_at(0),
             Some((payload, Value::Int(37))),
-            "the virtualizable shadow pairs the payload with its value"
+            "virtualizable_boxes[0] is the payload box with its value"
         );
 
         let mut boxes = [(payload, Type::Int), (payload, Type::Int)];
@@ -7803,6 +7835,43 @@ mod tests {
             ctx.concrete_of_opref(boxes[1].0),
             Some(Value::Int(37)),
             "the duplicate's wrapper carries the virtualizable payload value"
+        );
+    }
+
+    /// `set_virtualizable_box_at` is SSA-rename: the new box carries the
+    /// previous box's payload when it does not yet have one (`record_same_as`
+    /// / wrapint `NewWithVtable` before the caller stamps).
+    #[test]
+    fn set_virtualizable_box_at_stamps_unstamped_new_box_from_old() {
+        let info = make_test_vable_info();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let payload = recorder.record_input_arg(Type::Int);
+        let other = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[payload, other],
+            &[Value::Int(37), ph(Type::Int)],
+            &[],
+        );
+        let renamed = ctx.record_op(majit_ir::OpCode::IntAdd, &[payload, other]);
+        assert!(ctx.box_value(renamed).is_none(), "new op starts unstamped");
+        assert!(ctx.set_virtualizable_box_at(0, renamed));
+        assert_eq!(
+            ctx.box_value(renamed),
+            Some(Value::Int(37)),
+            "the renamed box carries the slot's previous payload"
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(0),
+            Some((renamed, Value::Int(37))),
         );
     }
 
@@ -7998,9 +8067,22 @@ mod tests {
         info
     }
 
+    /// Production `walk_active_trace_refs` forwards `InputArg*` `_res*` on
+    /// the recorder, then `ConstPtr` in `virtualizable_boxes` and
+    /// `virtualizable_heap_ptr` through `walk_virtualizable_value_refs`.
+    fn walk_vable_refs_as_gc(ctx: &mut TraceCtx, mut visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        for ia in ctx.recorder.inputargs() {
+            if let Some(Value::Ref(mut r)) = ia.get_value() {
+                visitor(&mut r);
+                ia.set_value(Value::Ref(r));
+            }
+        }
+        ctx.walk_virtualizable_value_refs(visitor);
+    }
+
     // Test helper: typed placeholder matching each slot's declared type so
     // the Box's (OpRef, concrete) pair stays internally consistent — the
-    // RPython `virtualizable_boxes[index] = valuebox` invariant.  Tests
+    // `virtualizable_boxes[index] = valuebox` invariant.  Tests
     // only inspect OpRef plumbing; the concrete half is never read.
     fn ph(ty: Type) -> Value {
         match ty {
@@ -8357,7 +8439,7 @@ mod tests {
         );
         ctx.set_virtualizable_heap_ptr(SNAPSHOT_COPY as *const u8);
 
-        ctx.walk_virtualizable_value_refs(|gcref| gcref.0 += MOVED_BY);
+        walk_vable_refs_as_gc(&mut ctx, |gcref| gcref.0 += MOVED_BY);
 
         assert_eq!(
             ctx.virtualizable_heap_ptr(),
@@ -8396,7 +8478,7 @@ mod tests {
         );
         ctx.set_virtualizable_heap_ptr(LIVE_FRAME as *const u8);
 
-        ctx.walk_virtualizable_value_refs(|gcref| gcref.0 += MOVED_BY);
+        walk_vable_refs_as_gc(&mut ctx, |gcref| gcref.0 += MOVED_BY);
 
         assert_eq!(
             ctx.virtualizable_heap_ptr(),
@@ -9058,6 +9140,15 @@ mod tests {
         assert_eq!(boxes.len(), 4, "pc + 2 array items + dest identity");
         assert_eq!(*boxes.last().unwrap(), dest);
         assert_eq!(ctx.virtualizable_array_lengths(), Some(&[2][..]));
+        // dest_ptr 0 records GETFIELD/GETARRAYITEM with no resvalue;
+        // each box's value is its own recorded result, not a placeholder.
+        assert!(
+            ctx.box_value(boxes[0]).is_none()
+                && ctx.box_value(boxes[1]).is_none()
+                && ctx.box_value(boxes[2]).is_none(),
+            "reloaded field boxes carry only their recorded result"
+        );
+        assert_eq!(ctx.box_value(dest), ctx.box_value(*boxes.last().unwrap()));
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 4);
@@ -9107,6 +9198,25 @@ mod tests {
         assert_eq!(boxes[1], box_arr0, "live array prefix is kept");
         assert_eq!(*boxes.last().unwrap(), vable);
         assert_ne!(boxes[2], box_arr0);
+        assert_eq!(
+            ctx.box_value(boxes[0]),
+            Some(ph(Type::Int)),
+            "live static prefix keeps its own value"
+        );
+        assert_eq!(
+            ctx.box_value(boxes[1]),
+            Some(ph(Type::Int)),
+            "live array prefix keeps its own value"
+        );
+        assert!(
+            ctx.box_value(boxes[2]).is_none(),
+            "appended GETARRAYITEM carries only its recorded result"
+        );
+        assert_eq!(
+            ctx.box_value(*boxes.last().unwrap()),
+            Some(ph(Type::Ref)),
+            "identity box keeps its own value last"
+        );
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 2);
