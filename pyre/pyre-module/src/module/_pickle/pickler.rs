@@ -2494,6 +2494,9 @@ fn batch_appends(
         return Ok(());
     }
 
+    // The iterator pin needs a scope this body opened. A pin into the
+    // caller's stack has no owner the liveness reader can name.
+    let _iter_roots = pyre_object::gc_roots::push_roots();
     let w_iter =
         pyre_interpreter::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(slot))?;
     let _ = pyre_object::gc_roots::pin_root(w_iter);
@@ -2631,6 +2634,9 @@ fn batch_setitems(
     slot: usize,
     obj_slot: Option<usize>,
 ) -> Result<(), PyError> {
+    // The iterator pin needs a scope this body opened. A pin into the
+    // caller's stack has no owner the liveness reader can name.
+    let _iter_roots = pyre_object::gc_roots::push_roots();
     let w_iter =
         pyre_interpreter::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(slot))?;
     let _ = pyre_object::gc_roots::pin_root(w_iter);

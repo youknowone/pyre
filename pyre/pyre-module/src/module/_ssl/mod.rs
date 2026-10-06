@@ -3497,12 +3497,14 @@ pyre_interpreter::py_module! {
                 pyre_interpreter::py_module_fn!("enum_crls", 1, cert_store::enum_crls),
             ),
         ] {
-            pyre_interpreter::module_ns_store(ns, name, pyre_interpreter::gateway::with_module("_ssl", func));
+            pyre_interpreter::__pyre_store!(ns, name, pyre_interpreter::gateway::with_module("_ssl", func));
         }
         let ssl_error = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError")
             .expect("SSLError installed");
+        let ssl_error = pyre_object::gc_roots::pin_root(ssl_error);
         let ssl_error_dict =
             unsafe { pyre_object::w_type_get_dict_ptr(ssl_error) as PyObjectRef };
+        let ssl_error_dict = pyre_object::gc_roots::pin_root(ssl_error_dict);
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ssl_error_dict,
@@ -3518,7 +3520,8 @@ pyre_interpreter::py_module! {
             pyre_interpreter::builtins::exc_os_error_new,
             &[ssl_error, value_error],
         ));
-        pyre_interpreter::module_ns_store(ns, "SSLCertVerificationError", cert_error);
+        ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_interpreter::__pyre_store!(ns, "SSLCertVerificationError", cert_error);
         for (name, value) in [
             ("ALERT_DESCRIPTION_CLOSE_NOTIFY", 0),
             ("ALERT_DESCRIPTION_UNEXPECTED_MESSAGE", 10),
@@ -3555,7 +3558,7 @@ pyre_interpreter::py_module! {
             ("ALERT_DESCRIPTION_CERTIFICATE_REQUIRED", 116),
             ("ALERT_DESCRIPTION_NO_APPLICATION_PROTOCOL", 120),
         ] {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
+            pyre_interpreter::__pyre_store!(ns, name, w_int_new(value));
         }
     },
 }

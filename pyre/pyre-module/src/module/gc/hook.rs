@@ -619,8 +619,11 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_object::w_dict_setitem_str_from_root(
+                ns_slot,
                 "__getattribute__",
                 pyre_interpreter::make_builtin_function_with_arity(
                     "__getattribute__",
@@ -628,8 +631,8 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                     2,
                 ),
             );
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::w_dict_setitem_str_from_root(
+                ns_slot,
                 "__setattr__",
                 pyre_interpreter::make_builtin_function_with_arity(
                     "__setattr__",
@@ -644,10 +647,10 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 ("STATE_FINALIZING", STATE_FINALIZING),
                 ("STATE_USERDEL", STATE_USERDEL),
             ] {
-                pyre_object::w_dict_setitem_str_no_proxy(ns, name, w_int_new(value as i64));
+                pyre_object::w_dict_setitem_str_from_root(ns_slot, name, w_int_new(value as i64));
             }
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::w_dict_setitem_str_from_root(
+                ns_slot,
                 "GC_STATES",
                 w_tuple_new(
                     ["SCANNING", "MARKING", "SWEEPING", "FINALIZING", "USERDEL"]
@@ -668,8 +671,8 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 ("newstate", collect_step_newstate),
                 ("major_is_done", collect_step_major_is_done),
             ] {
-                pyre_object::w_dict_setitem_str_no_proxy(
-                    ns,
+                pyre_object::w_dict_setitem_str_from_root(
+                    ns_slot,
                     name,
                     pyre_interpreter::typedef::make_getset_descriptor_named(
                         pyre_interpreter::make_builtin_function_with_arity(name, getter, 2),
@@ -805,8 +808,11 @@ fn make_private_stats_type(
     fields: &[(&'static str, pyre_interpreter::gateway::BuiltinCodeFn)],
 ) -> PyObjectRef {
     let tp = pyre_interpreter::typedef::make_builtin_type(name, |ns| unsafe {
-        pyre_object::w_dict_setitem_str_no_proxy(
-            ns,
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_object::w_dict_setitem_str_from_root(
+            ns_slot,
             "__getattribute__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__getattribute__",
@@ -814,14 +820,14 @@ fn make_private_stats_type(
                 2,
             ),
         );
-        pyre_object::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::w_dict_setitem_str_from_root(
+            ns_slot,
             "__setattr__",
             pyre_interpreter::make_builtin_function_with_arity("__setattr__", stats_setattr, 3),
         );
         for &(field, getter) in fields {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::w_dict_setitem_str_from_root(
+                ns_slot,
                 field,
                 pyre_interpreter::typedef::make_getset_descriptor_named(
                     pyre_interpreter::make_builtin_function_with_arity(field, getter, 2),

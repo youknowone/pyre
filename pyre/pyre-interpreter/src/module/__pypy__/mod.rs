@@ -142,24 +142,39 @@ fn hidden_applevel(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// visible instead of hiding them behind a missing `__pypy__` function.
 fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
-    let dict = crate::type_methods::resolve_dict_backing(obj);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let dict = crate::type_methods::resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(
+        obj_slot,
+    ));
     if !dict.is_null() && unsafe { pyre_object::is_dict(dict) } {
         return Ok(pyre_object::w_str_new_managed(unsafe {
             pyre_object::dictmultiobject::w_dict_strategy_name(dict)
         }));
     }
-    if unsafe { pyre_object::is_list(obj) } {
+    if unsafe { pyre_object::is_list(pyre_object::gc_roots::shadow_stack_get(obj_slot)) } {
         return Ok(pyre_object::w_str_new_managed(unsafe {
-            pyre_object::listobject::w_list_strategy_name(obj)
+            pyre_object::listobject::w_list_strategy_name(pyre_object::gc_roots::shadow_stack_get(
+                obj_slot,
+            ))
         }));
     }
-    if unsafe { pyre_object::setobject::is_set_or_frozenset(obj) } {
+    if unsafe {
+        pyre_object::setobject::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(
+            obj_slot,
+        ))
+    } {
         // W_SetObject currently has one ObjectKey-backed representation.  The
         // helper reports that real shape; EmptySetStrategy and
         // IntegerSetStrategy remain explicit builtin-type porting work.
         return Ok(pyre_object::w_str_new_managed("ObjectSetStrategy"));
     }
-    if let Some(name) = unsafe { crate::objspace::std::mapdict::mapdict_strategy_repr(obj) } {
+    if let Some(name) = unsafe {
+        crate::objspace::std::mapdict::mapdict_strategy_repr(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        )
+    } {
         return Ok(pyre_object::w_str_from_wtf8_managed(name));
     }
     Err(crate::PyError::type_error(
@@ -220,11 +235,25 @@ fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             Some(w) => pyre_object::with_roots!(d, key => crate::baseobjspace::is_true(w))?,
             None => true,
         };
-    let backing = dict_backing_or_type_error(d, "move_to_end")?;
-    if crate::baseobjspace::dict_move_to_end(backing, key, last)? {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let d_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(d);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(key);
+    let backing = dict_backing_or_type_error(
+        pyre_object::gc_roots::shadow_stack_get(d_slot),
+        "move_to_end",
+    )?;
+    if crate::baseobjspace::dict_move_to_end(
+        backing,
+        pyre_object::gc_roots::shadow_stack_get(key_slot),
+        last,
+    )? {
         Ok(pyre_object::w_none())
     } else {
-        Err(crate::PyError::key_error_with_key(key))
+        Err(crate::PyError::key_error_with_key(
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        ))
     }
 }
 
@@ -324,13 +353,14 @@ crate::py_module! {
         // treats `__pypy__` as a package with submodules.
         let mut ns = ns;
         let w_path = pyre_object::with_roots!(ns => pyre_object::w_list_new(vec![]));
-        crate::module_ns_store(ns, "__path__", w_path);
+        ns = pyre_object::gc_roots::pin_root(ns);
+        crate::__pyre_store!(ns, "__path__", w_path);
         // Snapshot the canonical `identity_dict` type before any app code can
         // reassign `__pypy__.identity_dict`, keyed so attribute access cannot
         // reach it.  `objects_in_repr` builds its recursion guard from this
         // snapshot, matching PyPy's direct `W_IdentityDict` construction.
         if let Some(ty) = crate::module_ns_get(ns, "identity_dict") {
-            crate::module_ns_store(ns, CANONICAL_IDENTITY_DICT_KEY, ty);
+            crate::__pyre_store!(ns, CANONICAL_IDENTITY_DICT_KEY, ty);
         }
     }
 }

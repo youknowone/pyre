@@ -42,12 +42,15 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
 /// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    // `lib_pypy/resource.py error = OSError` and
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+        // `lib_pypy/resource.py error = OSError` and
     // `:15-37 class struct_rusage`.
     let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before init_resource");
-    pyre_interpreter::module_ns_store(ns, "error", w_os_error);
-    pyre_interpreter::module_ns_store(ns, "struct_rusage", struct_rusage_type());
+    { let __pyre_stored = w_os_error; let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "error", __pyre_stored) };
+    { let __pyre_stored = struct_rusage_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "struct_rusage", __pyre_stored) };
     // ── struct_rusage tuple (16-field layout matches CPython) ──
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
@@ -71,10 +74,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         fields.push(pyre_object::w_int_new(r.ru_nivcsw));
         pyre_interpreter::_structseq::new_instance(struct_rusage_type(), fields.take())
     }
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getrusage",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getrusage",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
@@ -120,12 +120,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getrlimit",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "getrusage", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getrlimit",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
@@ -165,12 +161,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "setrlimit",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "getrlimit", __pyre_stored) };
+    pyre_interpreter::__pyre_store!(ns, "setrlimit", pyre_interpreter::make_builtin_function_with_arity(
             "setrlimit",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
@@ -254,8 +246,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             2,
-        ),
-    );
+        ));
     // ── Constants (POSIX subset matching CPython) ──
     #[cfg(unix)]
     {
@@ -263,72 +254,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         use libc as host_resource;
         #[cfg(feature = "host_env")]
         use rustpython_host_env::resource as host_resource;
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RUSAGE_SELF",
-            pyre_object::w_int_new(host_resource::RUSAGE_SELF as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RUSAGE_CHILDREN",
-            pyre_object::w_int_new(host_resource::RUSAGE_CHILDREN as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_CPU",
-            pyre_object::w_int_new(host_resource::RLIMIT_CPU as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_FSIZE",
-            pyre_object::w_int_new(host_resource::RLIMIT_FSIZE as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_DATA",
-            pyre_object::w_int_new(host_resource::RLIMIT_DATA as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_STACK",
-            pyre_object::w_int_new(host_resource::RLIMIT_STACK as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_CORE",
-            pyre_object::w_int_new(host_resource::RLIMIT_CORE as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_NOFILE",
-            pyre_object::w_int_new(host_resource::RLIMIT_NOFILE as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_AS",
-            pyre_object::w_int_new(host_resource::RLIMIT_AS as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_RSS",
-            pyre_object::w_int_new(host_resource::RLIMIT_RSS as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_NPROC",
-            pyre_object::w_int_new(host_resource::RLIMIT_NPROC as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIMIT_MEMLOCK",
-            pyre_object::w_int_new(host_resource::RLIMIT_MEMLOCK as i64),
-        );
+        pyre_interpreter::__pyre_store!(ns, "RUSAGE_SELF", pyre_object::w_int_new(host_resource::RUSAGE_SELF as i64));
+        pyre_interpreter::__pyre_store!(ns, "RUSAGE_CHILDREN", pyre_object::w_int_new(host_resource::RUSAGE_CHILDREN as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_CPU", pyre_object::w_int_new(host_resource::RLIMIT_CPU as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_FSIZE", pyre_object::w_int_new(host_resource::RLIMIT_FSIZE as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_DATA", pyre_object::w_int_new(host_resource::RLIMIT_DATA as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_STACK", pyre_object::w_int_new(host_resource::RLIMIT_STACK as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_CORE", pyre_object::w_int_new(host_resource::RLIMIT_CORE as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_NOFILE", pyre_object::w_int_new(host_resource::RLIMIT_NOFILE as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_AS", pyre_object::w_int_new(host_resource::RLIMIT_AS as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_RSS", pyre_object::w_int_new(host_resource::RLIMIT_RSS as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_NPROC", pyre_object::w_int_new(host_resource::RLIMIT_NPROC as i64));
+        pyre_interpreter::__pyre_store!(ns, "RLIMIT_MEMLOCK", pyre_object::w_int_new(host_resource::RLIMIT_MEMLOCK as i64));
         // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIM_INFINITY",
-            pyre_object::w_int_new(host_resource::RLIM_INFINITY as i64),
-        );
+        pyre_interpreter::__pyre_store!(ns, "RLIM_INFINITY", pyre_object::w_int_new(host_resource::RLIM_INFINITY as i64));
     }
     Ok(())
 }

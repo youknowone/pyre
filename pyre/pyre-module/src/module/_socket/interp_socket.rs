@@ -384,6 +384,9 @@ fn socket_writebuf(
 }
 
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
     // `_rsocket_rffi.py:1150 rwin32.get_wsa_error`'s companion: WinSock has to
     // be started before any of its entry points answers, so the module takes
     // that cost at import rather than leaving the first call to fail with
@@ -402,7 +405,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     {
         macro_rules! cst {
             ($name:literal, $val:expr) => {
-                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                { let __pyre_stored = pyre_object::w_int_new($val as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, $name, __pyre_stored) };
             };
         }
         // ── Address families ──
@@ -743,7 +746,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     {
         macro_rules! cst {
             ($name:literal, $val:expr) => {
-                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                { let __pyre_stored = pyre_object::w_int_new($val as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, $name, __pyre_stored) };
             };
         }
         // `$host as i32` before the widening cast: `PyModule_AddIntConstant`
@@ -1051,7 +1054,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             ("HV_GUID_PARENT", "A42E7CDA-D03F-480C-9CC2-A4DE20ABB878"),
         ];
         for (name, value) in address_names {
-            pyre_interpreter::module_ns_store(ns, name, pyre_object::w_str_new(value));
+            { let __pyre_stored = pyre_object::w_str_new(value); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, name, __pyre_stored) };
         }
         // `<winsock2.h>` SOMAXCONN is 0x7fffffff. The Winsock 1.1 value 5 is
         // not the one `listen` grew into.
@@ -1059,10 +1062,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     }
 
     // ── htons / htonl / ntohs / ntohl ──
-    pyre_interpreter::module_ns_store(
-        ns,
-        "htons",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "htons",
             |args| {
                 if args.is_empty() {
@@ -1078,12 +1078,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_int_new(ordered))
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "ntohs",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "htons", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "ntohs",
             |args| {
                 if args.is_empty() {
@@ -1099,12 +1095,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_int_new(ordered))
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "htonl",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ntohs", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "htonl",
             |args| {
                 if args.is_empty() {
@@ -1120,12 +1112,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_int_new(ordered))
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "ntohl",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "htonl", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "ntohl",
             |args| {
                 if args.is_empty() {
@@ -1141,14 +1129,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_int_new(ordered))
             },
             1,
-        ),
-    );
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ntohl", __pyre_stored) };
 
     // ── inet_aton / inet_ntoa ──
-    pyre_interpreter::module_ns_store(
-        ns,
-        "inet_aton",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "inet_aton",
             |args| {
                 if args.is_empty() {
@@ -1179,12 +1163,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "inet_ntoa",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "inet_aton", __pyre_stored) };
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "inet_ntoa",
             |args| {
                 if args.is_empty() {
@@ -1220,14 +1200,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 }
             },
             1,
-        ),
-    );
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "inet_ntoa", __pyre_stored) };
 
     // inet_pton(af, ip) → bytes
-    pyre_interpreter::module_ns_store(
-        ns,
-        "inet_pton",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "inet_pton",
             |args| {
                 if args.len() < 2 {
@@ -1273,14 +1249,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&packed))
             },
             2,
-        ),
-    );
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "inet_pton", __pyre_stored) };
 
     // inet_ntop(af, packed) → str
-    pyre_interpreter::module_ns_store(
-        ns,
-        "inet_ntop",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "inet_ntop",
             |args| {
                 if args.len() < 2 {
@@ -1322,16 +1294,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_str_new_managed(&text))
             },
             2,
-        ),
-    );
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "inet_ntop", __pyre_stored) };
 
     // gethostname() → str, over the name the host layer reports.  Where there
     // is none, `interp_socket_wasm` registers the one its `uname` answers.
     #[cfg(any(unix, windows))]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "gethostname",
-        pyre_interpreter::make_builtin_function_with_arity(
+    { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "gethostname",
             |_| {
                 #[cfg(unix)]
@@ -1357,17 +1325,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_interpreter::gateway::fsdecode_os_str(&name))
             },
             0,
-        ),
-    );
+        ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "gethostname", __pyre_stored) };
     // `sethostname` alone stays POSIX-only: WinSock has no counterpart and
     // `moduledef.py` does not export it where rsocket cannot provide it.
     #[cfg(unix)]
     {
         // sethostname(name) → None
-        pyre_interpreter::module_ns_store(
-            ns,
-            "sethostname",
-            pyre_interpreter::make_builtin_function_with_arity(
+        { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
                 "sethostname",
                 |args| {
                     if args.is_empty() {
@@ -1407,8 +1371,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_none())
                 },
                 1,
-            ),
-        );
+            ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "sethostname", __pyre_stored) };
     }
 
     // The legacy resolvers. Both platforms reach them through
@@ -1419,10 +1382,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         // gethostbyname(name) → ip_string.  `interp_func.py` —
         // host argument runs through encode_idna (→ idna_converter)
         // before the rsocket call.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "gethostbyname",
-            pyre_interpreter::make_builtin_function_with_arity(
+        { let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
                 "gethostbyname",
                 |args| {
                     if args.is_empty() {
@@ -1450,16 +1410,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_str_new_managed(&text))
                 },
                 1,
-            ),
-        );
+            ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "gethostbyname", __pyre_stored) };
 
         // gethostbyname_ex(name) → (name, aliases, addresses)
         // `interp_func.py` — same lookup as gethostbyname but
         // returns the full hostent triple.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "gethostbyname_ex",
-            pyre_interpreter::make_builtin_function_with_arity(
+        pyre_interpreter::__pyre_store!(ns, "gethostbyname_ex", pyre_interpreter::make_builtin_function_with_arity(
                 "gethostbyname_ex",
                 |args| {
                     if args.is_empty() {
@@ -1481,17 +1437,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     unpack_hostent(he)
                 },
                 1,
-            ),
-        );
+            ));
 
         // gethostbyaddr(addr) → (name, aliases, addresses)
         // `interp_func.py` — reverse lookup; `addr` is an
         // IPv4/IPv6 string we resolve through inet_pton, then feed
         // to gethostbyaddr.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "gethostbyaddr",
-            pyre_interpreter::make_builtin_function_with_arity(
+        pyre_interpreter::__pyre_store!(ns, "gethostbyaddr", pyre_interpreter::make_builtin_function_with_arity(
                 "gethostbyaddr",
                 |args| {
                     if args.is_empty() {
@@ -1529,14 +1481,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     unpack_hostent(he)
                 },
                 1,
-            ),
-        );
+            ));
 
         // getservbyname(name[, proto]) → port
-        pyre_interpreter::module_ns_store(
-            ns,
-            "getservbyname",
-            pyre_interpreter::make_builtin_function("getservbyname", |args| {
+        pyre_interpreter::__pyre_store!(ns, "getservbyname", pyre_interpreter::make_builtin_function("getservbyname", |args| {
                 if args.is_empty() {
                     return Err(pyre_interpreter::PyError::type_error(
                         "getservbyname() missing argument",
@@ -1593,14 +1541,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     let port = unsafe { u16::from_be(rffi::servent_port(p)) };
                     Ok(pyre_object::w_int_new(port as i64))
                 }
-            }),
-        );
+            }));
 
         // getservbyport(port[, proto]) → name
-        pyre_interpreter::module_ns_store(
-            ns,
-            "getservbyport",
-            pyre_interpreter::make_builtin_function("getservbyport", |args| {
+        pyre_interpreter::__pyre_store!(ns, "getservbyport", pyre_interpreter::make_builtin_function("getservbyport", |args| {
                 if args.is_empty() {
                     return Err(pyre_interpreter::PyError::type_error(
                         "getservbyport() missing argument",
@@ -1667,8 +1611,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     };
                     Ok(pyre_object::w_str_new_managed(&name))
                 }
-            }),
-        );
+            }));
     }
 
     // `moduledef.py:12-16`:
@@ -1683,54 +1626,52 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     // inherit the OSError family constructor and its errno/strerror parse.
     let mut w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _socket init");
-    pyre_interpreter::module_ns_store(ns, "error", w_os_error);
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_os_error);
+    pyre_interpreter::__pyre_store!(
+        ns,
+        "error",
+        pyre_object::gc_roots::shadow_stack_get(err_slot)
+    );
+    w_os_error = pyre_object::gc_roots::shadow_stack_get(err_slot);
     let w_herror = pyre_object::with_roots!(ns, w_os_error => pyre_interpreter::builtins::new_exception_class(
         "socket.herror",
         pyre_interpreter::builtins::exc_os_error_new,
         w_os_error,
     ));
-    pyre_interpreter::module_ns_store(ns, "herror", w_herror);
+    ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(ns, "herror", w_herror);
     let w_gaierror = pyre_object::with_roots!(ns => pyre_interpreter::builtins::new_exception_class(
         "socket.gaierror",
         pyre_interpreter::builtins::exc_os_error_new,
         w_os_error,
     ));
-    pyre_interpreter::module_ns_store(ns, "gaierror", w_gaierror);
+    ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(ns, "gaierror", w_gaierror);
     let w_timeout_error = pyre_interpreter::builtins::lookup_exc_class("TimeoutError")
         .expect("TimeoutError must be installed before _socket init");
-    pyre_interpreter::module_ns_store(ns, "timeout", w_timeout_error);
+    pyre_interpreter::__pyre_store!(ns, "timeout", w_timeout_error);
 
     // Default timeout (None) — modulus has a getter/setter; we just stash
     // a None so attribute lookups succeed.
-    pyre_interpreter::module_ns_store(ns, "_default_timeout", pyre_object::w_none());
+    pyre_interpreter::__pyre_store!(ns, "_default_timeout", pyre_object::w_none());
 
     // `_rsocket_rffi.py constants['has_ipv6'] = True` — exposed by
     // PyPy's moduledef.py constants loop as a module-level boolean.  It
     // reports the runtime's support for the family, not the header's number
     // for it, so a target with no socket layer answers false while still
     // carrying `AF_INET6`.
-    pyre_interpreter::module_ns_store(
-        ns,
-        "has_ipv6",
-        pyre_object::boolobject::w_bool_from(cfg!(any(unix, windows))),
-    );
+    pyre_interpreter::__pyre_store!(ns, "has_ipv6", pyre_object::boolobject::w_bool_from(cfg!(any(unix, windows))));
 
     // ── module-level getdefaulttimeout / setdefaulttimeout ──
     // `interp_func.py` — None means "blocking", float means
     // "timeout in seconds".  Stored as a process-wide cell.
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getdefaulttimeout",
-        pyre_interpreter::make_builtin_function_with_arity(
+    pyre_interpreter::__pyre_store!(ns, "getdefaulttimeout", pyre_interpreter::make_builtin_function_with_arity(
             "getdefaulttimeout",
             |_| Ok(get_default_socket_timeout()),
             0,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "setdefaulttimeout",
-        pyre_interpreter::make_builtin_function_with_arity(
+        ));
+    pyre_interpreter::__pyre_store!(ns, "setdefaulttimeout", pyre_interpreter::make_builtin_function_with_arity(
             "setdefaulttimeout",
             |args| {
                 if args.is_empty() {
@@ -1763,17 +1704,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
-    );
+        ));
 
     // ── module-level close(fd) ──
     // `interp_socket.py:close(fd)` — the bare host close, used for
     // cleanup when callers obtain a descriptor via .detach().
     #[cfg(any(unix, windows))]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "close",
-        pyre_interpreter::make_builtin_function_with_arity(
+    pyre_interpreter::__pyre_store!(ns, "close", pyre_interpreter::make_builtin_function_with_arity(
             "close",
             |args| {
                 if args.is_empty() {
@@ -1794,18 +1731,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
-    );
+        ));
 
     // ── getprotobyname(name) ──
     // `interp_func.py` — returns the IPPROTO_* number for a
     // protocol name.  libc getprotobyname returns NULL on lookup
     // failure; we surface that as OSError to match `converted_error`.
     #[cfg(any(unix, windows))]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getprotobyname",
-        pyre_interpreter::make_builtin_function_with_arity(
+    pyre_interpreter::__pyre_store!(ns, "getprotobyname", pyre_interpreter::make_builtin_function_with_arity(
             "getprotobyname",
             |args| {
                 if args.is_empty() || !unsafe { pyre_object::is_str(args[0]) } {
@@ -1829,18 +1762,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_int_new(proto))
             },
             1,
-        ),
-    );
+        ));
 
     // ── if_nameindex / if_nametoindex / if_indextoname ──
     // `interp_socket.py:if_nameindex|if_nametoindex|if_indextoname`
     // — direct wrappers around libc's network-interface accessors.
     #[cfg(unix)]
     {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "if_nameindex",
-            pyre_interpreter::make_builtin_function_with_arity(
+        pyre_interpreter::__pyre_store!(ns, "if_nameindex", pyre_interpreter::make_builtin_function_with_arity(
                 "if_nameindex",
                 |_| {
                     let interfaces = majit_rlib::rsocket::if_nameindex().map_err(|error| {
@@ -1861,12 +1790,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_list_new(result_w.take()))
                 },
                 0,
-            ),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "if_nametoindex",
-            pyre_interpreter::make_builtin_function_with_arity(
+            ));
+        pyre_interpreter::__pyre_store!(ns, "if_nametoindex", pyre_interpreter::make_builtin_function_with_arity(
                 "if_nametoindex",
                 |args| {
                     if args.is_empty() {
@@ -1902,12 +1827,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     }
                 },
                 1,
-            ),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "if_indextoname",
-            pyre_interpreter::make_builtin_function_with_arity(
+            ));
+        pyre_interpreter::__pyre_store!(ns, "if_indextoname", pyre_interpreter::make_builtin_function_with_arity(
                 "if_indextoname",
                 |args| {
                     // PyPy `if_indextoname` receives an unsigned interface
@@ -1944,8 +1865,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     }
                 },
                 1,
-            ),
-        );
+            ));
     }
 
     // Windows has the same public trio but no POSIX `if_nameindex` array.
@@ -1954,19 +1874,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     // the two scalar directions.
     #[cfg(all(windows, feature = "host_env"))]
     {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "if_nameindex",
-            pyre_interpreter::make_builtin_function_with_arity(
+        pyre_interpreter::__pyre_store!(ns, "if_nameindex", pyre_interpreter::make_builtin_function_with_arity(
                 "if_nameindex",
                 |_| windows_if_nameindex(),
                 0,
-            ),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "if_nametoindex",
-            pyre_interpreter::make_builtin_function_with_arity(
+            ));
+        pyre_interpreter::__pyre_store!(ns, "if_nametoindex", pyre_interpreter::make_builtin_function_with_arity(
                 "if_nametoindex",
                 |args| {
                     let name = pyre_interpreter::gateway::fsencode_bytes_w(args[0])?;
@@ -1978,12 +1891,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_int_new(index as i64))
                 },
                 1,
-            ),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "if_indextoname",
-            pyre_interpreter::make_builtin_function_with_arity(
+            ));
+        pyre_interpreter::__pyre_store!(ns, "if_indextoname", pyre_interpreter::make_builtin_function_with_arity(
                 "if_indextoname",
                 |args| {
                     // `socket_if_indextoname`'s NET_IFINDEX converter reads
@@ -2021,8 +1930,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_str_new_managed(&name))
                 },
                 1,
-            ),
-        );
+            ));
     }
 
     // ── CMSG_SPACE / CMSG_LEN ──
@@ -2031,10 +1939,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     // unix target we ship, so we register them under the same cfg.
     #[cfg(unix)]
     {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "CMSG_SPACE",
-            pyre_interpreter::make_builtin_function_with_arity(
+        pyre_interpreter::__pyre_store!(ns, "CMSG_SPACE", pyre_interpreter::make_builtin_function_with_arity(
                 "CMSG_SPACE",
                 |args| {
                     let raw = pyre_interpreter::builtins::space_index_w(
@@ -2069,12 +1974,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
-            ),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "CMSG_LEN",
-            pyre_interpreter::make_builtin_function_with_arity(
+            ));
+        pyre_interpreter::__pyre_store!(ns, "CMSG_LEN", pyre_interpreter::make_builtin_function_with_arity(
                 "CMSG_LEN",
                 |args| {
                     let raw = pyre_interpreter::builtins::space_index_w(
@@ -2107,8 +2008,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
-            ),
-        );
+            ));
     }
 
     // ── getaddrinfo / getnameinfo ──
@@ -2124,8 +2024,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         let socket_tp = socket_type();
         // Expose the type itself as `socket` AND `SocketType` so the
         // stdlib's `class socket(_socket.socket):` pattern works.
-        pyre_interpreter::module_ns_store(ns, "socket", socket_tp);
-        pyre_interpreter::module_ns_store(ns, "SocketType", socket_tp);
+        let socket_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(socket_tp);
+        pyre_interpreter::__pyre_store!(
+            ns,
+            "socket",
+            pyre_object::gc_roots::shadow_stack_get(socket_slot)
+        );
+        pyre_interpreter::__pyre_store!(
+            ns,
+            "SocketType",
+            pyre_object::gc_roots::shadow_stack_get(socket_slot)
+        );
     }
     // The same two names, and the numbers, where there is no host layer to
     // build the rest of the module out of.
@@ -2141,10 +2051,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     #[cfg(unix)]
     {
         // socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0)
-        pyre_interpreter::module_ns_store(
-            ns,
-            "socketpair",
-            pyre_interpreter::make_builtin_function("socketpair", |args| {
+        pyre_interpreter::__pyre_store!(ns, "socketpair", pyre_interpreter::make_builtin_function("socketpair", |args| {
                 for (idx, label) in [(0, "family"), (1, "type"), (2, "proto")] {
                     if args.len() > idx && !unsafe { pyre_object::is_int(args[idx]) } {
                         return Err(pyre_interpreter::PyError::type_error(format!(
@@ -2175,14 +2082,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 fields.push(socket_from_fd(fd0, family, ty, proto)?);
                 fields.push(socket_from_fd(fd1, family, ty, proto)?);
                 Ok(pyre_object::w_tuple_new(fields.take()))
-            }),
-        );
+            }));
 
         // dup(fd) → new fd. The duplicated descriptor has FD_CLOEXEC set.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "dup",
-            pyre_interpreter::make_builtin_function_with_arity(
+        pyre_interpreter::__pyre_store!(ns, "dup", pyre_interpreter::make_builtin_function_with_arity(
                 "dup",
                 |args| {
                     if args.is_empty() {
@@ -2202,18 +2105,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
-            ),
-        );
+            ));
 
         // fromfd(fd, family, type, proto=0) — `interp_func.py:75
         // fromfd_w`: dup() the supplied fd (so the caller still owns the
         // original) and wrap it in a fresh `_socket.socket`.  CPython
         // requires the dup so close() on the returned socket leaves the
         // input descriptor intact.
-        pyre_interpreter::module_ns_store(
-            ns,
-            "fromfd",
-            pyre_interpreter::make_builtin_function("fromfd", |args| {
+        pyre_interpreter::__pyre_store!(ns, "fromfd", pyre_interpreter::make_builtin_function("fromfd", |args| {
                 if args.len() < 3 {
                     return Err(pyre_interpreter::PyError::type_error(
                         "fromfd() requires fd, family and type",
@@ -2243,8 +2142,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                     socket_io_err(std::io::Error::from_raw_os_error(error.errno))
                 })?;
                 socket_from_fd(new_fd, family, ty, proto)
-            }),
-        );
+            }));
     }
 
     // `socket.py`'s `socket.dup` and `fromfd` both go through
@@ -2256,10 +2154,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     // non-inheritable, as PEP 446 asks and as `socket_from_share_data` leaves
     // it.
     #[cfg(all(windows, feature = "host_env"))]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "dup",
-        pyre_interpreter::make_builtin_function_with_arity(
+    pyre_interpreter::__pyre_store!(ns, "dup", pyre_interpreter::make_builtin_function_with_arity(
             "dup",
             |args| {
                 let fd = pyre_interpreter::builtins::space_index_w(args[0])?;
@@ -2270,8 +2165,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 Ok(pyre_object::w_int_new(shared.raw as i64))
             },
             1,
-        ),
-    );
+        ));
     Ok(())
 }
 
@@ -2585,11 +2479,8 @@ fn nameinfo_from_sockaddr(
 }
 
 #[cfg(any(unix, windows))]
-fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getaddrinfo",
-        pyre_interpreter::make_builtin_function("getaddrinfo", |args| {
+fn init_socket_getaddrinfo(mut ns: pyre_object::PyObjectRef) {
+    pyre_interpreter::__pyre_store!(ns, "getaddrinfo", pyre_interpreter::make_builtin_function("getaddrinfo", |args| {
             if args.len() < 2 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "getaddrinfo() missing host or port",
@@ -2711,13 +2602,9 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 result_w.push(entry);
             }
             Ok(pyre_object::w_list_new(result_w.take()))
-        }),
-    );
+        }));
 
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getnameinfo",
-        pyre_interpreter::make_builtin_function_with_arity(
+    pyre_interpreter::__pyre_store!(ns, "getnameinfo", pyre_interpreter::make_builtin_function_with_arity(
             "getnameinfo",
             |args| {
                 if args.len() < 2 {
@@ -2845,8 +2732,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 Ok(pyre_object::w_tuple_new(fields.take()))
             },
             2,
-        ),
-    );
+        ));
 }
 
 // ── _socket socket() class implementation ─────────────────────────────
@@ -3281,9 +3167,7 @@ pub(crate) fn socket_send_bytes(
             #[cfg(unix)]
             {
                 match majit_rlib::rsocket::send(fd, buf, flags) {
-                    Ok(sent) => Ok(sent),
-                    Err(error) => Err(error.errno),
-                }
+                    Ok(sent) => Ok(sent), Err(error) => Err(error.errno), }
             }
             #[cfg(windows)]
             {
@@ -3291,14 +3175,12 @@ pub(crate) fn socket_send_bytes(
             }
         };
         match outcome {
-            Ok(sent) => return Ok(sent),
-            Err(errno) if !rffi::error_is_interrupted(errno) => {
+            Ok(sent) => return Ok(sent), Err(errno) if !rffi::error_is_interrupted(errno) => {
                 return Err(socket_error_for_operation(obj, errno));
             }
             // EINTR: deliver a pending signal, then retry
             // (`converted_error` eintr_retry).
-            Err(_) => pyre_interpreter::module::signal::interp_signal::checksignals_now()?,
-        }
+            Err(_) => pyre_interpreter::module::signal::interp_signal::checksignals_now()?, }
     }
 }
 
@@ -3931,8 +3813,7 @@ fn c_uint_converter(
 /// `socket` publishes no `gai_strerror` there either — so the message is the
 /// fixed `"getaddrinfo failed"`.  `rsocket.GAIError.get_msg` answers
 /// `_rsocket_rffi.gai_strerror_str`, which on Windows is
-/// `rwin32.FormatError(errno)`; that spelling is the system message table's,
-/// so it comes back in the host's UI language.  MEASURED 2026-08-27 against
+/// `rwin32.FormatError(errno)`; that spelling is the system message table's, /// so it comes back in the host's UI language.  MEASURED 2026-08-27 against
 /// CPython 3.14.2 on a ko-KR host: `socket.getaddrinfo` on an unresolvable
 /// name answers `gaierror(11001, 'getaddrinfo failed')` there and
 /// `gaierror(11001, '<localized>')` under PyPy 7.3.22.
@@ -4820,13 +4701,16 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 
 #[cfg(any(unix, windows))]
 fn init_socket_type(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `interp_socket.py:W_Socket.__init__` first creates an empty wrapper;
     // `descr_init` below installs the RSocket state.  Keeping allocation and
     // initialisation separate is required when socket.py's Python subclass
     // explicitly calls `_socket.socket.__init__(self, ...)`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__new__",
             pyre_interpreter::typedef::make_new_descr(|args| {
                 let cls = args
@@ -4839,8 +4723,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__del__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__del__",
@@ -4876,8 +4760,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__init__",
             pyre_interpreter::make_builtin_function("__init__", |args| {
                 // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
@@ -5080,8 +4964,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // callables).  The getter receives `(descriptor, instance)`, so the
     // socket object is `args[1]`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "family",
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(
@@ -5098,8 +4982,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "type",
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(
@@ -5116,8 +5000,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "proto",
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(
@@ -5136,8 +5020,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `interp_socket.py gettimeout_w` — `timeout` is the stored
     // `_timeout` object (float, or `None` when disabled).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "timeout",
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(
@@ -5158,8 +5042,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "fileno",
             pyre_interpreter::make_builtin_function_with_arity(
                 "fileno",
@@ -5173,8 +5057,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "close",
             pyre_interpreter::make_builtin_function_with_arity(
                 "close",
@@ -5204,8 +5088,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
     // detach() → returns the fd and forgets it.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "detach",
             pyre_interpreter::make_builtin_function_with_arity(
                 "detach",
@@ -5226,8 +5110,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `_reuse` increments the usecount; `_drop` decrements and closes
     // when it reaches zero.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "_reuse",
             pyre_interpreter::make_builtin_function_with_arity(
                 "_reuse",
@@ -5243,8 +5127,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "_drop",
             pyre_interpreter::make_builtin_function_with_arity(
                 "_drop",
@@ -5280,24 +5164,24 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // bind(addr) — addr is (host, port) for AF_INET / (host, port, flowinfo,
     // scopeid) for AF_INET6 / path string for AF_UNIX.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "bind",
             pyre_interpreter::make_builtin_function_with_arity("bind", __majit_wrap_socket_bind, 2),
         )
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "listen",
             pyre_interpreter::make_builtin_function("listen", __majit_wrap_socket_listen),
         )
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "accept",
             pyre_interpreter::make_builtin_function_with_arity(
                 "accept",
@@ -5359,8 +5243,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // pyre's `accept` above bundles both steps for callers that
     // bypass the stdlib wrapper.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "_accept",
             pyre_interpreter::make_builtin_function_with_arity(
                 "_accept",
@@ -5411,8 +5295,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "connect",
             pyre_interpreter::make_builtin_function_with_arity(
                 "connect",
@@ -5487,8 +5371,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `interp_socket.py W_Socket.connect_ex_w` — `try: connect; except` equivalent
     // that returns the errno integer instead of raising OSError.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "connect_ex",
             pyre_interpreter::make_builtin_function_with_arity(
                 "connect_ex",
@@ -5557,8 +5441,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "send",
             pyre_interpreter::make_builtin_function("send", |args| {
                 if args.len() < 2 {
@@ -5603,8 +5487,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "sendall",
             pyre_interpreter::make_builtin_function("sendall", |args| {
                 if args.len() < 2 {
@@ -5700,8 +5584,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "recv",
             pyre_interpreter::make_builtin_function("recv", |args| {
                 if args.len() < 2 {
@@ -5745,8 +5629,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "sendto",
             pyre_interpreter::make_builtin_function("sendto", |args| {
                 // sendto(buffer, [flags,] address)
@@ -5856,8 +5740,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "recvfrom",
             pyre_interpreter::make_builtin_function("recvfrom", |args| {
                 if args.len() < 2 {
@@ -5940,8 +5824,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `interp_socket.py W_Socket.recv_into_w` — writes directly into a writable
     // bytes-like buffer.  nbytes==0 uses the full buffer length.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "recv_into",
             pyre_interpreter::make_builtin_function("recv_into", |args| {
                 if args.len() < 2 {
@@ -6005,8 +5889,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `interp_socket.py W_Socket.recvfrom_into_w` — recvfrom variant that fills a
     // caller-provided buffer rather than allocating a new bytes.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "recvfrom_into",
             pyre_interpreter::make_builtin_function("recvfrom_into", |args| {
                 if args.len() < 2 {
@@ -6110,8 +5994,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "recvmsg",
             pyre_interpreter::make_builtin_function("recvmsg", |args| {
                 if args.len() < 2 {
@@ -6284,8 +6168,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "recvmsg_into",
             pyre_interpreter::make_builtin_function("recvmsg_into", |args| {
                 if args.len() < 2 {
@@ -6463,8 +6347,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // `socket.py` test for each before reaching for it.
     #[cfg(unix)]
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "sendmsg",
             pyre_interpreter::make_builtin_function("sendmsg", |args| {
                 if args.len() < 2 {
@@ -6702,8 +6586,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "shutdown",
             pyre_interpreter::make_builtin_function_with_arity(
                 "shutdown",
@@ -6714,8 +6598,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "getsockname",
             pyre_interpreter::make_builtin_function_with_arity(
                 "getsockname",
@@ -6726,8 +6610,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "getpeername",
             pyre_interpreter::make_builtin_function_with_arity(
                 "getpeername",
@@ -6738,16 +6622,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "setsockopt",
             pyre_interpreter::make_builtin_function("setsockopt", __majit_wrap_socket_setsockopt),
         )
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "getsockopt",
             pyre_interpreter::make_builtin_function("getsockopt", __majit_wrap_socket_getsockopt),
         )
@@ -6758,8 +6642,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // it names are the ones whose input is a value rather than a buffer.
     #[cfg(windows)]
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "ioctl",
             pyre_interpreter::make_builtin_function("ioctl", |args| {
                 use windows_sys::Win32::Networking::WinSock as ws;
@@ -6826,8 +6710,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // exists, and hands the blob straight back to the constructor.
     #[cfg(all(windows, feature = "host_env"))]
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "share",
             pyre_interpreter::make_builtin_function("share", |args| {
                 // `METH_O`, so a wrong count is reported by the call machinery
@@ -6856,8 +6740,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // consistent with the timeout attribute and prevents a stale
     // SO_RCVTIMEO from surviving a `setblocking(True)` call.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "setblocking",
             pyre_interpreter::make_builtin_function_with_arity(
                 "setblocking",
@@ -6887,8 +6771,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "getblocking",
             pyre_interpreter::make_builtin_function_with_arity(
                 "getblocking",
@@ -6916,8 +6800,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // duration being `wait_for_data`'s to enforce rather than the
     // descriptor's; <0 → ValueError "Timeout value out of range".
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "settimeout",
             pyre_interpreter::make_builtin_function_with_arity(
                 "settimeout",
@@ -6969,8 +6853,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "gettimeout",
             pyre_interpreter::make_builtin_function_with_arity(
                 "gettimeout",
@@ -6989,8 +6873,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__enter__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__enter__",
@@ -7001,8 +6885,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__exit__",
             pyre_interpreter::make_builtin_function("__exit__", |args| {
                 if let Some(&(mut obj)) = args.first() {
@@ -7029,8 +6913,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // __repr__ — `interp_socket.py descr_repr`.  Format
     // matches CPython: `<socket object, fd=N, family=F, type=T, proto=P>`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__repr__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__repr__",
@@ -7053,8 +6937,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     // set_inheritable / get_inheritable — `interp_socket.py` wraps whether
     // an exec'd child keeps the descriptor.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "set_inheritable",
             pyre_interpreter::make_builtin_function_with_arity(
                 "set_inheritable",
@@ -7086,8 +6970,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "get_inheritable",
             pyre_interpreter::make_builtin_function_with_arity(
                 "get_inheritable",

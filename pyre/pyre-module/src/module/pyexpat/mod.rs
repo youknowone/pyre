@@ -2311,8 +2311,19 @@ pyre_interpreter::py_module! {
             pyre_interpreter::builtins::lookup_exc_class("Exception")
                 .expect("Exception must be installed before pyexpat init"),
         ));
-        pyre_interpreter::module_ns_store(ns, "error", err);
-        pyre_interpreter::module_ns_store(ns, "ExpatError", err);
+        ns = pyre_object::gc_roots::pin_root(ns);
+        let err_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(err);
+        pyre_interpreter::__pyre_store!(
+            ns,
+            "error",
+            pyre_object::gc_roots::shadow_stack_get(err_slot)
+        );
+        pyre_interpreter::__pyre_store!(
+            ns,
+            "ExpatError",
+            pyre_object::gc_roots::shadow_stack_get(err_slot)
+        );
 
         // model — content-model integer constants.
         // Each submodule object is a fresh instance named only by its local

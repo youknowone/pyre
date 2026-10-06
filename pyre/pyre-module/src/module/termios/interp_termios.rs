@@ -507,180 +507,164 @@ fn tcsetwinsize(
 /// back through `rtermios.tcsetattr`.
 #[cfg(all(unix, feature = "host_env"))]
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcgetattr",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcgetattr",
             __majit_wrap_termios_tcgetattr,
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcsetattr",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcsetattr",
             __majit_wrap_termios_tcsetattr,
             3,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcsendbreak",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcsendbreak",
             __majit_wrap_termios_tcsendbreak,
             2,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcdrain",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcdrain",
             __majit_wrap_termios_tcdrain,
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcflush",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcflush",
             __majit_wrap_termios_tcflush,
             2,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcflow",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcflow",
             __majit_wrap_termios_tcflow,
             2,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcgetwinsize",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcgetwinsize",
             __majit_wrap_termios_tcgetwinsize,
             1,
-        ),
+        )
     );
-    pyre_interpreter::module_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "tcsetwinsize",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcsetwinsize",
             __majit_wrap_termios_tcsetwinsize,
             2,
-        ),
+        )
     );
+
 
     // ── Constants ──
-    pyre_interpreter::module_ns_store(ns, "B0", pyre_object::w_int_new(libc::B0 as i64));
-    pyre_interpreter::module_ns_store(ns, "B50", pyre_object::w_int_new(libc::B50 as i64));
-    pyre_interpreter::module_ns_store(ns, "B75", pyre_object::w_int_new(libc::B75 as i64));
-    pyre_interpreter::module_ns_store(ns, "B110", pyre_object::w_int_new(libc::B110 as i64));
-    pyre_interpreter::module_ns_store(ns, "B134", pyre_object::w_int_new(libc::B134 as i64));
-    pyre_interpreter::module_ns_store(ns, "B150", pyre_object::w_int_new(libc::B150 as i64));
-    pyre_interpreter::module_ns_store(ns, "B200", pyre_object::w_int_new(libc::B200 as i64));
-    pyre_interpreter::module_ns_store(ns, "B300", pyre_object::w_int_new(libc::B300 as i64));
-    pyre_interpreter::module_ns_store(ns, "B600", pyre_object::w_int_new(libc::B600 as i64));
-    pyre_interpreter::module_ns_store(ns, "B1200", pyre_object::w_int_new(libc::B1200 as i64));
-    pyre_interpreter::module_ns_store(ns, "B1800", pyre_object::w_int_new(libc::B1800 as i64));
-    pyre_interpreter::module_ns_store(ns, "B2400", pyre_object::w_int_new(libc::B2400 as i64));
-    pyre_interpreter::module_ns_store(ns, "B4800", pyre_object::w_int_new(libc::B4800 as i64));
-    pyre_interpreter::module_ns_store(ns, "B9600", pyre_object::w_int_new(libc::B9600 as i64));
-    pyre_interpreter::module_ns_store(ns, "B19200", pyre_object::w_int_new(libc::B19200 as i64));
-    pyre_interpreter::module_ns_store(ns, "B38400", pyre_object::w_int_new(libc::B38400 as i64));
-    pyre_interpreter::module_ns_store(ns, "B57600", pyre_object::w_int_new(libc::B57600 as i64));
-    pyre_interpreter::module_ns_store(ns, "B115200", pyre_object::w_int_new(libc::B115200 as i64));
-    pyre_interpreter::module_ns_store(ns, "B230400", pyre_object::w_int_new(libc::B230400 as i64));
+    { let __pyre_stored = pyre_object::w_int_new(libc::B0 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B0", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B50 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B50", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B75 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B75", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B110 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B110", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B134 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B134", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B150 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B150", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B200 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B200", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B300 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B300", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B600 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B600", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B1200 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B1200", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B1800 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B1800", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B2400 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B2400", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B4800 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B4800", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B9600 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B9600", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B19200 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B19200", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B38400 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B38400", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B57600 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B57600", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B115200 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B115200", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::B230400 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "B230400", __pyre_stored) };
 
-    pyre_interpreter::module_ns_store(ns, "BRKINT", pyre_object::w_int_new(libc::BRKINT as i64));
-    pyre_interpreter::module_ns_store(ns, "CLOCAL", pyre_object::w_int_new(libc::CLOCAL as i64));
-    pyre_interpreter::module_ns_store(ns, "CREAD", pyre_object::w_int_new(libc::CREAD as i64));
-    pyre_interpreter::module_ns_store(ns, "CS5", pyre_object::w_int_new(libc::CS5 as i64));
-    pyre_interpreter::module_ns_store(ns, "CS6", pyre_object::w_int_new(libc::CS6 as i64));
-    pyre_interpreter::module_ns_store(ns, "CS7", pyre_object::w_int_new(libc::CS7 as i64));
-    pyre_interpreter::module_ns_store(ns, "CS8", pyre_object::w_int_new(libc::CS8 as i64));
-    pyre_interpreter::module_ns_store(ns, "CSIZE", pyre_object::w_int_new(libc::CSIZE as i64));
-    pyre_interpreter::module_ns_store(ns, "CSTOPB", pyre_object::w_int_new(libc::CSTOPB as i64));
-    pyre_interpreter::module_ns_store(ns, "ECHO", pyre_object::w_int_new(libc::ECHO as i64));
-    pyre_interpreter::module_ns_store(ns, "ECHOE", pyre_object::w_int_new(libc::ECHOE as i64));
-    pyre_interpreter::module_ns_store(ns, "ECHOK", pyre_object::w_int_new(libc::ECHOK as i64));
-    pyre_interpreter::module_ns_store(ns, "ECHONL", pyre_object::w_int_new(libc::ECHONL as i64));
-    pyre_interpreter::module_ns_store(ns, "HUPCL", pyre_object::w_int_new(libc::HUPCL as i64));
-    pyre_interpreter::module_ns_store(ns, "ICANON", pyre_object::w_int_new(libc::ICANON as i64));
-    pyre_interpreter::module_ns_store(ns, "ICRNL", pyre_object::w_int_new(libc::ICRNL as i64));
-    pyre_interpreter::module_ns_store(ns, "IEXTEN", pyre_object::w_int_new(libc::IEXTEN as i64));
-    pyre_interpreter::module_ns_store(ns, "IGNBRK", pyre_object::w_int_new(libc::IGNBRK as i64));
-    pyre_interpreter::module_ns_store(ns, "IGNCR", pyre_object::w_int_new(libc::IGNCR as i64));
-    pyre_interpreter::module_ns_store(ns, "IGNPAR", pyre_object::w_int_new(libc::IGNPAR as i64));
-    pyre_interpreter::module_ns_store(ns, "INLCR", pyre_object::w_int_new(libc::INLCR as i64));
-    pyre_interpreter::module_ns_store(ns, "INPCK", pyre_object::w_int_new(libc::INPCK as i64));
-    pyre_interpreter::module_ns_store(ns, "ISIG", pyre_object::w_int_new(libc::ISIG as i64));
-    pyre_interpreter::module_ns_store(ns, "ISTRIP", pyre_object::w_int_new(libc::ISTRIP as i64));
-    pyre_interpreter::module_ns_store(ns, "IXANY", pyre_object::w_int_new(libc::IXANY as i64));
-    pyre_interpreter::module_ns_store(ns, "IXOFF", pyre_object::w_int_new(libc::IXOFF as i64));
-    pyre_interpreter::module_ns_store(ns, "IXON", pyre_object::w_int_new(libc::IXON as i64));
-    pyre_interpreter::module_ns_store(ns, "NOFLSH", pyre_object::w_int_new(libc::NOFLSH as i64));
-    pyre_interpreter::module_ns_store(ns, "OCRNL", pyre_object::w_int_new(libc::OCRNL as i64));
-    pyre_interpreter::module_ns_store(ns, "ONLCR", pyre_object::w_int_new(libc::ONLCR as i64));
-    pyre_interpreter::module_ns_store(ns, "ONLRET", pyre_object::w_int_new(libc::ONLRET as i64));
-    pyre_interpreter::module_ns_store(ns, "ONOCR", pyre_object::w_int_new(libc::ONOCR as i64));
-    pyre_interpreter::module_ns_store(ns, "OPOST", pyre_object::w_int_new(libc::OPOST as i64));
-    pyre_interpreter::module_ns_store(ns, "PARENB", pyre_object::w_int_new(libc::PARENB as i64));
-    pyre_interpreter::module_ns_store(ns, "PARMRK", pyre_object::w_int_new(libc::PARMRK as i64));
-    pyre_interpreter::module_ns_store(ns, "PARODD", pyre_object::w_int_new(libc::PARODD as i64));
+    { let __pyre_stored = pyre_object::w_int_new(libc::BRKINT as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "BRKINT", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CLOCAL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CLOCAL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CREAD as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CREAD", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CS5 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CS5", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CS6 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CS6", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CS7 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CS7", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CS8 as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CS8", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CSIZE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CSIZE", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::CSTOPB as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CSTOPB", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ECHO as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ECHO", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ECHOE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ECHOE", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ECHOK as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ECHOK", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ECHONL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ECHONL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::HUPCL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "HUPCL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ICANON as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ICANON", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ICRNL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ICRNL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IEXTEN as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IEXTEN", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IGNBRK as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IGNBRK", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IGNCR as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IGNCR", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IGNPAR as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IGNPAR", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::INLCR as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "INLCR", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::INPCK as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "INPCK", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ISIG as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ISIG", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ISTRIP as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ISTRIP", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IXANY as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IXANY", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IXOFF as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IXOFF", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::IXON as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "IXON", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::NOFLSH as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "NOFLSH", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::OCRNL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "OCRNL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ONLCR as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ONLCR", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ONLRET as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ONLRET", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::ONOCR as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ONOCR", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::OPOST as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "OPOST", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::PARENB as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PARENB", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::PARMRK as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PARMRK", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::PARODD as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PARODD", __pyre_stored) };
 
-    pyre_interpreter::module_ns_store(
-        ns,
-        "TCIFLUSH",
-        pyre_object::w_int_new(libc::TCIFLUSH as i64),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "TCOFLUSH",
-        pyre_object::w_int_new(libc::TCOFLUSH as i64),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "TCIOFLUSH",
-        pyre_object::w_int_new(libc::TCIOFLUSH as i64),
-    );
-    pyre_interpreter::module_ns_store(ns, "TCIOFF", pyre_object::w_int_new(libc::TCIOFF as i64));
-    pyre_interpreter::module_ns_store(ns, "TCION", pyre_object::w_int_new(libc::TCION as i64));
-    pyre_interpreter::module_ns_store(ns, "TCOOFF", pyre_object::w_int_new(libc::TCOOFF as i64));
-    pyre_interpreter::module_ns_store(ns, "TCOON", pyre_object::w_int_new(libc::TCOON as i64));
-    pyre_interpreter::module_ns_store(ns, "TCSANOW", pyre_object::w_int_new(libc::TCSANOW as i64));
-    pyre_interpreter::module_ns_store(
-        ns,
-        "TCSADRAIN",
-        pyre_object::w_int_new(libc::TCSADRAIN as i64),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "TCSAFLUSH",
-        pyre_object::w_int_new(libc::TCSAFLUSH as i64),
-    );
-    pyre_interpreter::module_ns_store(ns, "TOSTOP", pyre_object::w_int_new(libc::TOSTOP as i64));
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCIFLUSH as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCIFLUSH", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCOFLUSH as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCOFLUSH", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCIOFLUSH as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCIOFLUSH", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCIOFF as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCIOFF", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCION as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCION", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCOOFF as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCOOFF", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCOON as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCOON", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCSANOW as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCSANOW", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCSADRAIN as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCSADRAIN", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TCSAFLUSH as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TCSAFLUSH", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::TOSTOP as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "TOSTOP", __pyre_stored) };
 
-    pyre_interpreter::module_ns_store(ns, "VEOF", pyre_object::w_int_new(libc::VEOF as i64));
-    pyre_interpreter::module_ns_store(ns, "VEOL", pyre_object::w_int_new(libc::VEOL as i64));
-    pyre_interpreter::module_ns_store(ns, "VERASE", pyre_object::w_int_new(libc::VERASE as i64));
-    pyre_interpreter::module_ns_store(ns, "VINTR", pyre_object::w_int_new(libc::VINTR as i64));
-    pyre_interpreter::module_ns_store(ns, "VKILL", pyre_object::w_int_new(libc::VKILL as i64));
-    pyre_interpreter::module_ns_store(ns, "VMIN", pyre_object::w_int_new(libc::VMIN as i64));
-    pyre_interpreter::module_ns_store(ns, "VQUIT", pyre_object::w_int_new(libc::VQUIT as i64));
-    pyre_interpreter::module_ns_store(ns, "VSTART", pyre_object::w_int_new(libc::VSTART as i64));
-    pyre_interpreter::module_ns_store(ns, "VSTOP", pyre_object::w_int_new(libc::VSTOP as i64));
-    pyre_interpreter::module_ns_store(ns, "VSUSP", pyre_object::w_int_new(libc::VSUSP as i64));
-    pyre_interpreter::module_ns_store(ns, "VTIME", pyre_object::w_int_new(libc::VTIME as i64));
+    { let __pyre_stored = pyre_object::w_int_new(libc::VEOF as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VEOF", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VEOL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VEOL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VERASE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VERASE", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VINTR as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VINTR", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VKILL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VKILL", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VMIN as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VMIN", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VQUIT as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VQUIT", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VSTART as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VSTART", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VSTOP as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VSTOP", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VSUSP as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VSUSP", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(libc::VTIME as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "VTIME", __pyre_stored) };
 
     // Darwin names these beside the portable set. Most are `libc`
     // constants; the rest are the values `<sys/termios.h>`,
@@ -689,7 +673,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     {
         macro_rules! tc {
             ($name:literal, $val:expr) => {
-                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                { let __pyre_stored = pyre_object::w_int_new($val as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, $name, __pyre_stored) };
             };
         }
         // `c_iflag` bits.
@@ -859,7 +843,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
         pyre_interpreter::builtins::exc_exception_new,
         w_exception,
     ));
-    pyre_interpreter::module_ns_store(ns, "error", w_error);
+    ns = pyre_object::gc_roots::pin_root(ns);
+    { let __pyre_stored = w_error; let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "error", __pyre_stored) };
     Ok(())
 }
 

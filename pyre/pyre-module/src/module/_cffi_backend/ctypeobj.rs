@@ -808,8 +808,11 @@ const ATTRIBUTE_NAMES: [&str; 11] = [
 ];
 
 fn init_ctype_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value)
     };
     store(
         "__repr__",
@@ -821,7 +824,9 @@ fn init_ctype_type(ns: PyObjectRef) {
     );
     store(
         "__weakref__",
-        pyre_interpreter::typedef::make_weakref_descr(ns),
+        pyre_interpreter::typedef::make_weakref_descr(pyre_object::gc_roots::shadow_stack_get(
+            ns_slot,
+        )),
     );
     for (name, doc, attrchar) in [
         ("kind", "kind", 'k'),
