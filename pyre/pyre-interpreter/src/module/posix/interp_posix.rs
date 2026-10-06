@@ -4884,17 +4884,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     /// (`rposix.py` `_listdir`/`fdlistdir`).
     ///
     /// `fdopendir` takes the descriptor over and `closedir` closes it, so the
-    /// caller's own is duplicated first — `interp_posix.py:1118` spells that
-    /// `rposix.dup(fd, inheritable=False)`, which is `F_DUPFD_CLOEXEC`.  The
-    /// duplicate shares its file description — and so its directory offset —
-    /// with the caller's descriptor, which would be left at the end of the
+    /// caller's own is duplicated first — `interp_posix.listdir` spells that
+    /// `rposix.dup(fd, inheritable=False)`, which is `c_dup_noninheritable`.
+    /// The duplicate shares its file description — and so its directory offset
+    /// — with the caller's descriptor, which would be left at the end of the
     /// directory and read as empty next time; `_listdir`'s `rewind=True`
     /// (`rposix.py`) puts it back before the close.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn fd_readdir(fd: i32, f: impl FnMut(&[u8], i64, u8)) -> Result<(), i32> {
-        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        let dup = unsafe { majit_rlib::rposix::c_dup_noninheritable(fd) };
         if dup < 0 {
-            return Err(crate::builtins::crt_errno());
+            return Err(majit_rlib::rposix::get_saved_errno());
         }
         // `rposix.c_fdopendir` releases the GIL and saves errno. Capture
         // that errno before `c_close`, which saves errno of its own.
