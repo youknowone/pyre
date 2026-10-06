@@ -15935,6 +15935,8 @@ impl<'a> Lowering<'a> {
                 "core::slice::<Impl>::len"
                 | "core::slice::<Impl>::is_empty"
                 | "core::slice::<Impl>::reverse"
+                | "core::slice::<Impl>::rotate_left"
+                | "core::slice::<Impl>::rotate_right"
                 | "core::slice::<Impl>::copy_from_slice"
                 | "core::slice::<Impl>::as_ptr"
                 | "core::slice::<Impl>::as_mut_ptr"
@@ -15959,7 +15961,8 @@ impl<'a> Lowering<'a> {
     /// A call that defines a pair slice, or a slice method over one.
     ///
     /// - `<[T]>::len` is the length word, `is_empty` compares it with 0 and
-    ///   `reverse` is `ll_slice_reverse`. `copy_from_slice` is
+    ///   `reverse` is `ll_slice_reverse`. `rotate_left` / `rotate_right` are
+    ///   `ll_slice_rotate_*` of the pair plus the count. `copy_from_slice` is
     ///   `ll_slice_arraycopy` of the destination length. `as_ptr` and
     ///   `as_mut_ptr` are the pointer word.
     /// - `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice` and
@@ -16291,6 +16294,26 @@ impl<'a> Lowering<'a> {
                         mir_bb,
                         majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Reverse, kind),
                         vec![args[0].clone(), len],
+                        ValueType::Void,
+                    )
+                }
+                "core::slice::<Impl>::rotate_left" | "core::slice::<Impl>::rotate_right" => {
+                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
+                    let kind = kind.expect("pair receiver");
+                    let Some(count) = args.get(1).cloned() else {
+                        return Err(LowerError::Schema(format!(
+                            "bb{mir_bb}: {name} without a count"
+                        )));
+                    };
+                    let op = if name == "core::slice::<Impl>::rotate_left" {
+                        majit_ir::rvec::SliceOp::RotateLeft
+                    } else {
+                        majit_ir::rvec::SliceOp::RotateRight
+                    };
+                    self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::slice_helper_path(op, kind),
+                        vec![args[0].clone(), len, count],
                         ValueType::Void,
                     )
                 }
@@ -77223,6 +77246,209 @@ mod tests {
                 } if segments.last().map(String::as_str) == Some("extend_from_slice")
             )),
             "extend_from_slice must not remain as a residual; ops={ops:?}"
+        );
+    }
+
+    fn object_pointer_vec_tys() -> (
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        Vec<serde_json::Value>,
+    ) {
+        let named = |path: &[&str], def_id: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": fixture_item_meta(ident_path(path)),
+                "kind": {"Struct": []}
+            })
+        };
+        let obj_adt = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {"types": [objptr.clone()]}}
+        });
+        let recv = serde_json::json!({"Ref": ["'_", vec_ty, "Mut"]});
+        let slice = serde_json::json!({
+            "Ref": ["'_", {"Slice": [objptr, null]}, "Mut"]
+        });
+        (
+            recv,
+            slice,
+            serde_json::json!({"Tuple": []}),
+            vec![named(&["PyObject"], 0), named(&["alloc", "vec", "Vec"], 1)],
+        )
+    }
+
+    #[test]
+    fn object_vec_deref_mut_rotate_calls_ll_slice_rotate() {
+        use majit_ir::rvec::{SliceOp, VecItemKind, slice_helper_path};
+        let (recv, slice, unit, types) = object_pointer_vec_tys();
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            let mut meta = fixture_item_meta(ident_path(path));
+            meta["is_local"] = serde_json::json!(is_local);
+            meta
+        };
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": i, "name": name, "span": span(), "ty": ty});
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "object_vec_deref_mut_rotate"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [recv.clone(), usize_ty.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 2,
+                        "locals": [
+                            local(0, None, &unit),
+                            local(1, Some("v"), &recv),
+                            local(2, Some("k"), &usize_ty),
+                            local(3, Some("s"), &slice)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 1},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [copy(1, &recv)],
+                                            "dest": place(3, &slice)
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 2},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [copy(3, &slice), copy(2, &usize_ty)],
+                                            "dest": place(0, &unit)
+                                        },
+                                        "target": 4,
+                                        "on_unwind": 3
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let deref_mut = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["alloc", "vec", "<Impl>", "deref_mut"], false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [recv.clone()],
+                "output": slice.clone()
+            },
+            "body": "Opaque"
+        });
+        let rotate = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["core", "slice", "<Impl>", "rotate_right"], false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [slice.clone(), usize_ty.clone()],
+                "output": unit.clone()
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": [caller, deref_mut, rotate],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes())
+            .expect("object vec deref_mut rotate fixture parses");
+        let graph = super::lower_function(&llbc, "object_vec_deref_mut_rotate")
+            .expect("lower deref_mut then <[T]>::rotate_right of Vec<PyObjectRef>");
+        let expected: Vec<String> = slice_helper_path(SliceOp::RotateRight, VecItemKind::Ref)
+            .split("::")
+            .map(str::to_string)
+            .collect();
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if *segments == expected && args.len() == 3
+            )),
+            "<[T]>::rotate_right after Vec<PyObjectRef>::deref_mut must call {expected:?}; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("deref_mut")
+                    || segments.last().map(String::as_str) == Some("rotate_right")
+                    && segments != &expected
+            )),
+            "deref_mut / slice rotate_right must not remain residual; ops={ops:?}"
         );
     }
 

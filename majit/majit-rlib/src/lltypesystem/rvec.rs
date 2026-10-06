@@ -48,6 +48,87 @@ const _: () = assert!(VEC_CAP_WORD == majit_ir::rvec::VEC_CAP_WORD);
 const _: () = assert!(VEC_PTR_WORD == majit_ir::rvec::VEC_PTR_WORD);
 const _: () = assert!(VEC_LEN_WORD == majit_ir::rvec::VEC_LEN_WORD);
 
+/// In-place reverse of `items[start..end]`, the swap loop of `rlist.ll_reverse`.
+/// Expanded at each `ll_slice_rotate_*` site.
+macro_rules! ll_slice_reverse_range {
+    ($getitem:ident, $setitem:ident, $items:ident, $start:expr, $end:expr) => {{
+        let mut i = $start as isize;
+        let mut j = $end as isize - 1;
+        while i < j {
+            let tmp = $getitem($items, i as usize);
+            let other = $getitem($items, j as usize);
+            $setitem($items, i as usize, other);
+            $setitem($items, j as usize, tmp);
+            i += 1;
+            j -= 1;
+        }
+    }};
+}
+
+/// In-place reverse of a managed-reference range; items move as address words,
+/// the same as [`ll_slice_reverse_r`].
+macro_rules! ll_slice_reverse_range_r {
+    ($items:ident, $start:expr, $end:expr) => {{
+        let mut i = $start as isize;
+        let mut j = $end as isize - 1;
+        while i < j {
+            let low = slice_item_addr($items, i as usize, ITEM_SIZE_R);
+            let high = slice_item_addr($items, j as usize, ITEM_SIZE_R);
+            let tmp = raw_read_ptr(low);
+            raw_write_ptr(low, raw_read_ptr(high));
+            raw_write_ptr(high, tmp);
+            i += 1;
+            j -= 1;
+        }
+    }};
+}
+
+/// Three-reverse rotate of a pair slice. `$right` is `rotate_right`.
+macro_rules! ll_slice_rotate_body {
+    ($items:ident, $length:ident, $k:ident, $reverse_range:ident, $right:expr) => {{
+        if $length <= 1 {
+            return;
+        }
+        let k = if $k >= $length { $k % $length } else { $k };
+        if k == 0 {
+            return;
+        }
+        if $right {
+            $reverse_range!($items, 0, $length);
+            $reverse_range!($items, 0, k);
+            $reverse_range!($items, k, $length);
+        } else {
+            $reverse_range!($items, 0, k);
+            $reverse_range!($items, k, $length);
+            $reverse_range!($items, 0, $length);
+        }
+    }};
+}
+
+macro_rules! ll_slice_reverse_range_i {
+    ($items:ident, $start:expr, $end:expr) => {
+        ll_slice_reverse_range!(
+            ll_slice_getitem_fast_i,
+            ll_slice_setitem_fast_i,
+            $items,
+            $start,
+            $end
+        )
+    };
+}
+
+macro_rules! ll_slice_reverse_range_f {
+    ($items:ident, $start:expr, $end:expr) => {
+        ll_slice_reverse_range!(
+            ll_slice_getitem_fast_f,
+            ll_slice_setitem_fast_f,
+            $items,
+            $start,
+            $end
+        )
+    };
+}
+
 use super::rffi::{
     raw_free, raw_malloc_varsize_char, raw_ptradd, raw_read_f64, raw_read_ptr, raw_write_f64,
     raw_write_ptr,
@@ -551,6 +632,21 @@ pub fn ll_slice_reverse_i(items: usize, length: usize) {
     }
 }
 
+/// `<[T]>::rotate_right` on a pair slice. Three `ll_reverse` passes, the
+/// same swap loop as [`ll_slice_reverse_i`]. The items are a raw address,
+/// which `jit.isvirtual` does not describe, so the loop stays a residual
+/// call — the same treatment as [`ll_slice_reverse_i`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_right_i(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_i, true);
+}
+
+/// `<[T]>::rotate_left` on a pair slice.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_left_i(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_i, false);
+}
+
 // ── `_r`: managed-reference items ───────────────────────────────────────
 
 /// `ll_newemptylist`.
@@ -927,6 +1023,19 @@ pub fn ll_slice_reverse_r(items: usize, length: usize) {
     }
 }
 
+/// `<[T]>::rotate_right` on a pair slice. Three `ll_reverse` passes, the
+/// same address-word swap as [`ll_slice_reverse_r`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_right_r(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_r, true);
+}
+
+/// `<[T]>::rotate_left` on a pair slice.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_left_r(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_r, false);
+}
+
 // ── `_f`: `f64` items ───────────────────────────────────────────────────
 
 /// `ll_newemptylist`.
@@ -1250,6 +1359,19 @@ pub fn ll_slice_reverse_f(items: usize, length: usize) {
     }
 }
 
+/// `<[T]>::rotate_right` on a pair slice. Three `ll_reverse` passes, the
+/// same swap loop as [`ll_slice_reverse_f`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_right_f(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_f, true);
+}
+
+/// `<[T]>::rotate_left` on a pair slice.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_left_f(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_f, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::rffi::raw_malloc_varsize_char;
@@ -1363,6 +1485,42 @@ mod tests {
     }
 
     #[test]
+    fn helpers_rotate_a_pair_slice() {
+        let mut v: Vec<usize> = (0..5).collect();
+        let items = ll_vec_items_i(&mut v);
+        let n = ll_vec_length_i(&mut v);
+        ll_slice_rotate_right_i(items, n, 2);
+        assert_eq!(v, vec![3, 4, 0, 1, 2]);
+        ll_slice_rotate_left_i(items, n, 2);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+        ll_slice_rotate_right_i(items, n, 0);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+        ll_slice_rotate_right_i(items, n, 5);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+        ll_slice_rotate_left_i(items, n, 7);
+        assert_eq!(v, vec![2, 3, 4, 0, 1]);
+
+        ll_slice_rotate_right_i(0, 0, 3);
+
+        let a = 0x10 as *mut u8;
+        let b = 0x20 as *mut u8;
+        let c = 0x30 as *mut u8;
+        let mut r = vec![a, b, c];
+        let items = ll_vec_items_r(&mut r);
+        ll_slice_rotate_right_r(items, 3, 1);
+        assert_eq!(r, vec![c, a, b]);
+        ll_slice_rotate_left_r(items, 3, 1);
+        assert_eq!(r, vec![a, b, c]);
+
+        let mut f = vec![1.5, 2.5, 3.5, 4.5];
+        let items = ll_vec_items_f(&mut f);
+        ll_slice_rotate_left_f(items, 4, 1);
+        assert_eq!(f, vec![2.5, 3.5, 4.5, 1.5]);
+        ll_slice_rotate_right_f(items, 4, 1);
+        assert_eq!(f, vec![1.5, 2.5, 3.5, 4.5]);
+    }
+
+    #[test]
     fn free_releases_a_raw_header_and_its_buffer() {
         let header = raw_malloc_varsize_char(VEC_HEADER_WORDS * WORD);
         unsafe { (header as *mut Vec<usize>).write(Vec::new()) };
@@ -1454,6 +1612,9 @@ mod tests {
             "ll_slice_reverse_i",
             "ll_slice_reverse_r",
             "ll_slice_reverse_f",
+            "ll_slice_rotate_left_i",
+            "ll_slice_rotate_right_r",
+            "ll_slice_rotate_left_f",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(

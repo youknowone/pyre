@@ -270,10 +270,16 @@ pub enum SliceOp {
     /// `dst.copy_from_slice(src)`: `ll_arraycopy` of `dst`'s length items
     /// from `src` at index 0 into `dst` at index 0.
     ArrayCopy,
+    /// `<[T]>::rotate_left` on a pair slice — in-place, same structure as
+    /// [`SliceOp::Reverse`].
+    RotateLeft,
+    /// `<[T]>::rotate_right` on a pair slice — in-place, same structure as
+    /// [`SliceOp::Reverse`].
+    RotateRight,
 }
 
 impl SliceOp {
-    pub const ALL: [SliceOp; 11] = [
+    pub const ALL: [SliceOp; 13] = [
         SliceOp::GetItem,
         SliceOp::SetItem,
         SliceOp::Reverse,
@@ -285,6 +291,8 @@ impl SliceOp {
         SliceOp::LoadOr,
         SliceOp::ToVec,
         SliceOp::ArrayCopy,
+        SliceOp::RotateLeft,
+        SliceOp::RotateRight,
     ];
 
     fn row(self) -> usize {
@@ -300,6 +308,8 @@ impl SliceOp {
             SliceOp::LoadOr => 8,
             SliceOp::ToVec => 9,
             SliceOp::ArrayCopy => 10,
+            SliceOp::RotateLeft => 11,
+            SliceOp::RotateRight => 12,
         }
     }
 }
@@ -391,7 +401,7 @@ const VEC_HELPERS: [[&str; 3]; 12] = [
 
 /// `(operation, item kind)` → slice helper path, rows in [`SliceOp::ALL`]
 /// order and columns in [`VecItemKind::ALL`] order.
-const SLICE_HELPERS: [[&str; 3]; 11] = [
+const SLICE_HELPERS: [[&str; 3]; 13] = [
     [
         "majit_rlib::lltypesystem::rvec::ll_slice_getitem_fast_i",
         "majit_rlib::lltypesystem::rvec::ll_slice_getitem_fast_r",
@@ -446,6 +456,16 @@ const SLICE_HELPERS: [[&str; 3]; 11] = [
         "majit_rlib::lltypesystem::rvec::ll_slice_arraycopy_i",
         "majit_rlib::lltypesystem::rvec::ll_slice_arraycopy_r",
         "majit_rlib::lltypesystem::rvec::ll_slice_arraycopy_f",
+    ],
+    [
+        "majit_rlib::lltypesystem::rvec::ll_slice_rotate_left_i",
+        "majit_rlib::lltypesystem::rvec::ll_slice_rotate_left_r",
+        "majit_rlib::lltypesystem::rvec::ll_slice_rotate_left_f",
+    ],
+    [
+        "majit_rlib::lltypesystem::rvec::ll_slice_rotate_right_i",
+        "majit_rlib::lltypesystem::rvec::ll_slice_rotate_right_r",
+        "majit_rlib::lltypesystem::rvec::ll_slice_rotate_right_f",
     ],
 ];
 
