@@ -77,6 +77,7 @@ walkdir = { workspace = true, optional = true }
 [dev-dependencies]
 majit-ir = { workspace = true, features = ["test-support"] }
 majit-translate = { workspace = true }
+majit-charon-reader = { workspace = true }
 insta = { workspace = true }
 # `#[test]`s here drive interpreter frames through `init_typeobjects` without
 # compiling pyre-interpreter under `cfg(test)`; enable its `test-hooks` feature

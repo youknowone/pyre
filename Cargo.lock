@@ -2861,6 +2861,7 @@ dependencies = [
  "majit-backend-cranelift",
  "majit-backend-dynasm",
  "majit-backend-wasm",
+ "majit-charon-reader",
  "majit-gc",
  "majit-ir",
  "majit-jitcode",
