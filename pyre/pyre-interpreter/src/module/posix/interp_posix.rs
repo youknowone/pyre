@@ -1596,6 +1596,44 @@ fn create_environ() -> pyre_object::PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
+/// Convert `path` then `attribute` in `interp_posix.py` unwrap order.
+///
+/// Each [`crate::gateway::FsEncodedPath`] owns a `push_roots` bracket
+/// (`gctransform/shadowstack.py` `push_roots`/`pop_roots`). Locals that must
+/// survive those conversions are pinned in the returned outer bracket; the
+/// caller binds that guard first so the encoded paths drop before it.
+#[cfg(any(
+    test,
+    all(
+        not(feature = "sandbox"),
+        any(target_os = "linux", target_os = "android")
+    )
+))]
+fn fsencode_path_then_attribute(
+    w_path: &mut PyObjectRef,
+    w_attribute: &mut PyObjectRef,
+    funcname: &str,
+) -> Result<
+    (
+        pyre_object::gc_roots::RootScope,
+        crate::gateway::FsEncodedPath,
+        crate::gateway::FsEncodedPath,
+    ),
+    crate::PyError,
+> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[*w_path, *w_attribute]);
+    let path = crate::gateway::fsencode_path_or_fd_w(roots.get(base), funcname, true);
+    *w_path = roots.get(base);
+    *w_attribute = roots.get(base + 1);
+    let path = path?;
+    let attribute = crate::gateway::fsencode_path_named_w(*w_attribute, funcname, "attribute");
+    *w_path = roots.get(base);
+    *w_attribute = roots.get(base + 1);
+    let attribute = attribute?;
+    Ok((roots, path, attribute))
+}
+
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
@@ -8820,16 +8858,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             };
                         (w_path, w_attribute, follow_symlinks)
                     };
-                    let path = pyre_object::with_roots!(w_path, w_attribute => {
-                        crate::gateway::fsencode_path_or_fd_w(w_path, "getxattr", true)
-                    })?;
-                    let attribute = pyre_object::with_roots!(w_path, w_attribute => {
-                        crate::gateway::fsencode_path_named_w(
-                            w_attribute,
-                            "getxattr",
-                            "attribute",
-                        )
-                    })?;
+                    let (_path_roots, path, attribute) =
+                        fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "getxattr")?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "getxattr: cannot use fd and follow_symlinks together",
@@ -8944,22 +8974,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         w_value,
                         w_flags => crate::baseobjspace::charbuf_w(w_value)
                     )?;
-                    let path = pyre_object::with_roots!(
-                        w_path,
-                        w_attribute,
-                        w_value,
-                        w_flags => crate::gateway::fsencode_path_or_fd_w(w_path, "setxattr", true)
-                    )?;
-                    let attribute = pyre_object::with_roots!(
-                        w_path,
-                        w_attribute,
-                        w_value,
-                        w_flags => crate::gateway::fsencode_path_named_w(
-                            w_attribute,
-                            "setxattr",
-                            "attribute",
-                        )
-                    )?;
+                    // The path and attribute each own a bracket of their own,
+                    // above this one; this one stays open until they are gone.
+                    let path_roots = pyre_object::gc_roots::push_roots();
+                    let path_base = path_roots.pin_roots(&[w_path, w_attribute, w_value, w_flags]);
+                    let path = crate::gateway::fsencode_path_or_fd_w(
+                        path_roots.get(path_base),
+                        "setxattr",
+                        true,
+                    );
+                    w_path = path_roots.get(path_base);
+                    w_attribute = path_roots.get(path_base + 1);
+                    w_value = path_roots.get(path_base + 2);
+                    w_flags = path_roots.get(path_base + 3);
+                    let path = path?;
+                    let attribute =
+                        crate::gateway::fsencode_path_named_w(w_attribute, "setxattr", "attribute");
+                    w_path = path_roots.get(path_base);
+                    w_attribute = path_roots.get(path_base + 1);
+                    w_value = path_roots.get(path_base + 2);
+                    w_flags = path_roots.get(path_base + 3);
+                    let attribute = attribute?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "setxattr: cannot use fd and follow_symlinks together",
@@ -9039,16 +9074,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             };
                         (w_path, w_attribute, follow_symlinks)
                     };
-                    let path = pyre_object::with_roots!(w_path, w_attribute => {
-                        crate::gateway::fsencode_path_or_fd_w(w_path, "removexattr", true)
-                    })?;
-                    let attribute = pyre_object::with_roots!(w_path, w_attribute => {
-                        crate::gateway::fsencode_path_named_w(
-                            w_attribute,
-                            "removexattr",
-                            "attribute",
-                        )
-                    })?;
+                    let (_path_roots, path, attribute) =
+                        fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "removexattr")?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "removexattr: cannot use fd and follow_symlinks together",
@@ -9104,9 +9131,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             };
                         (w_path, follow_symlinks)
                     };
-                    let path = pyre_object::with_roots!(w_path => {
-                        crate::gateway::fsencode_path_or_fd_w(w_path, "listxattr", true)
-                    })?;
+                    // The path owns a bracket of its own, above this one; this
+                    // one stays open until the path is gone.
+                    let path_roots = pyre_object::gc_roots::push_roots();
+                    let path_base = path_roots.pin_roots(&[w_path]);
+                    let path = crate::gateway::fsencode_path_or_fd_w(
+                        path_roots.get(path_base),
+                        "listxattr",
+                        true,
+                    );
+                    w_path = path_roots.get(path_base);
+                    let path = path?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "listxattr: cannot use fd and follow_symlinks together",
@@ -10916,13 +10951,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // with `eintr_retry=False`. `rposix_stat.c_statvfs` /
                     // `c_fstatvfs` release the GIL and save errno.
                     let mut w_path = args[0];
-                    let path = pyre_object::with_roots!(w_path => {
-                        crate::gateway::fsencode_path_or_fd_w(
-                            w_path,
-                            "statvfs",
-                            HAVE_FSTATVFS,
-                        )
-                    })?;
+                    // The path owns a bracket of its own, above this one; this
+                    // one stays open until the path is gone.
+                    let path_roots = pyre_object::gc_roots::push_roots();
+                    let path_base = path_roots.pin_roots(&[w_path]);
+                    let path = crate::gateway::fsencode_path_or_fd_w(
+                        path_roots.get(path_base),
+                        "statvfs",
+                        HAVE_FSTATVFS,
+                    );
+                    w_path = path_roots.get(path_base);
+                    let path = path?;
                     if path.is_fd {
                         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
                         let ret = pyre_object::with_roots!(w_path => unsafe {
@@ -15900,5 +15939,25 @@ mod normpath_tests {
             ("C:\\foo\\", "C:\\foo\\"),
         ];
         check_normpath(cases, POSIX_SEPS);
+    }
+}
+
+#[cfg(test)]
+mod xattr_filename_tests {
+    /// `OSErrorTests.test_oserror_filename`: `os.getxattr(<missing path>,
+    /// "user.test")` must report the path as `OSError.filename`. Wrapping each
+    /// `FsEncodedPath` in `with_roots!` closed the path's bracket before the
+    /// attribute conversion reused that slot, so the filename became the
+    /// attribute.
+    #[test]
+    fn getxattr_oserror_filename_is_the_path() {
+        crate::typedef::init_typeobjects();
+        let mut w_path = pyre_object::w_str_new("/missing/getxattr-path");
+        let mut w_attribute = pyre_object::w_str_new("user.test");
+        let (_roots, path, _attribute) =
+            super::fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "getxattr")
+                .expect("str path and attribute convert");
+        let filename = crate::baseobjspace::str_utf8_w(path.w_path()).expect("filename is a str");
+        assert_eq!(filename, "/missing/getxattr-path");
     }
 }
