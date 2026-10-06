@@ -14188,10 +14188,12 @@ fn init_type_type(ns: PyObjectRef) {
             // typeobject.py:1050 — `space.isinstance_w(w_value, space.w_text)`
             // accepts str and any str subclass, not only the exact type.
             if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {
-                return Err(crate::PyError::type_error(format!(
-                    "can only assign string to {}.__name__, not '{}'",
+                return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    "can only assign string to ",
                     unsafe { pyre_object::w_type_get_name(w_type) },
-                    type_name_of(w_value)
+                    ".__name__, not '",
+                    type_name_of(w_value),
+                    "'"
                 )));
             }
             // typeobject.py:1054 text_w — read through the surrogate-aware
@@ -14424,8 +14426,14 @@ fn check_set_special_type_attr(
     }
     let verb = if immutable { "set" } else { "delete" };
     let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
-    Err(crate::PyError::type_error(format!(
-        "cannot {verb} '{name}' attribute of immutable type '{type_name}'"
+    Err(crate::PyError::type_error(crate::display::wtf8_format!(
+        "cannot ",
+        verb,
+        " '",
+        name,
+        "' attribute of immutable type '",
+        type_name,
+        "'"
     )))
 }
 
