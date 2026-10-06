@@ -813,13 +813,27 @@ fn ensure_intern_table() {
         INTERN_TABLE_OBJ.compare_exchange(0, obj as usize, Ordering::Release, Ordering::Acquire);
 }
 
+fn intern_ptr_live(addr: usize) -> Option<PyObjectRef> {
+    // A cleared weak target is null. A weakref the collector already reused
+    // can leave a non-null word in the first page, or a misaligned word.
+    // Neither is a `PyObject`.
+    if addr < 0x1000 || !addr.is_multiple_of(std::mem::align_of::<PyObjectRef>()) {
+        None
+    } else {
+        Some(addr as PyObjectRef)
+    }
+}
+
 fn intern_slot_alive(slot: &InternSlot) -> Option<PyObjectRef> {
     match *slot {
-        InternSlot::Immortal(addr) => Some(addr as PyObjectRef),
+        InternSlot::Immortal(addr) => intern_ptr_live(addr),
         InternSlot::Weak(addr) => {
+            if intern_ptr_live(addr).is_none() {
+                return None;
+            }
             let obj =
                 unsafe { crate::weakref::w_weakref_deref(addr as *const crate::weakref::Weakref) };
-            if obj.is_null() { None } else { Some(obj) }
+            intern_ptr_live(obj as usize)
         }
     }
 }
@@ -903,9 +917,9 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 /// `value`, built only when the value is not interned yet.
 ///
 /// [`intern_exact_str`] answers the same question for a caller that already
-/// holds an object. A miss from characters still allocates an immortal exact
-/// str. `newtext` is GC-managed upstream. A managed miss moves, and host
-/// tables still store `W_UnicodeObject.value` as their own key.
+/// holds an object. A miss from characters allocates a managed exact str and
+/// stores it as a weak value, the same `interned_strings.set` as
+/// `new_interned_str`. `box_str_constant` is the immortal path.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     {
@@ -915,12 +929,36 @@ pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
         }
     }
     let value = value.to_owned();
-    let obj = w_str_from_wtf8(value.clone());
-    let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
-        return existing;
+    // `new_interned_str` builds the miss with `newtext`, a collectable
+    // `W_UnicodeObject`. `w_str_from_wtf8` is the immortal raw malloc;
+    // a dynamic intern has to be GC-owned or `intern_store` keeps it forever.
+    let obj = w_str_from_wtf8_managed(value.clone());
+    // `new_interned_str` stores the fresh text with `interned_strings.set`,
+    // the same weak value `intern_exact_str` publishes. `w_weakref_new`
+    // collects, so the object sits on the shadow stack across that call.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let slot = intern_store(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let weak_slot = matches!(slot, InternSlot::Weak(_));
+    {
+        let mut table = STRING_INTERN_TABLE.lock();
+        if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
+            return existing;
+        }
+        if weak_slot {
+            INTERN_WEAK_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        table.insert(value, slot);
     }
-    table.insert(value, InternSlot::Immortal(obj as usize));
+    if weak_slot {
+        let table_obj = INTERN_TABLE_OBJ.load(Ordering::Acquire);
+        if table_obj != 0 {
+            crate::gc_hook::try_gc_write_barrier(table_obj as *mut u8);
+        }
+    }
     obj
 }
 

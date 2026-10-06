@@ -46,7 +46,22 @@ use crate::pyobject::PyObjectRef;
 ///   are constant via `jit.look_inside_iff`.
 /// - At size ≥ 16 entries (`kwargsdict.py`) the strategy
 ///   auto-promotes to `UnicodeDictStrategy` to avoid degenerate O(n).
-pub struct KwargsDictStrategy;
+pub struct KwargsDictStrategy {
+    /// `DictStrategy.space` (`dictmultiobject.py`). The singleton does
+    /// not read this word; it exists so the strategy is an instance
+    /// (`rclass.py` InstanceRepr) rather than a zero-sized marker.
+    #[allow(dead_code)]
+    space: usize,
+}
+
+/// `keys_w[i].eq_w(w_key)` (`KwargsDictStrategy._getitem_correct_indirection`).
+///
+/// `is_correct_type` has already required an exact str, and a key stored on
+/// this strategy is one too, so `eq_w` is the WTF-8 compare. The object-dict
+/// key ladder is not part of this scan.
+fn kwargs_text_eq(w_stored: PyObjectRef, w_key: PyObjectRef) -> bool {
+    unsafe { crate::w_str_get_wtf8(w_stored) == crate::w_str_get_wtf8(w_key) }
+}
 
 /// `ll_getitem_fast` on the parallel `keys_w` / `values_w` lists
 /// (`kwargsdict.py` `keys_w[i]` / `values_w[i]`).
@@ -60,7 +75,7 @@ fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
 
 /// `pypy/objspace/std/kwargsdict.py KwargsDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
-pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
+pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy { space: 0 };
 
 /// The [`crate::dictmultiobject::DictStrategyRef`] holder a dict's `dstrategy`
 /// slot points at.
@@ -162,6 +177,63 @@ unsafe fn kwargs_storage_mut<'a>(obj: PyObjectRef) -> &'a mut (Vec<PyObjectRef>,
     &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>))
 }
 
+/// `KwargsDictStrategy.switch_to_unicode_strategy`.
+///
+/// The looked-inside scan stops at this call. Upstream does not inline the
+/// switch into `_setitem_correct_indirection`: the switch is its own loop and
+/// is not `unroll_safe`. The body installs `UnicodeDictStrategy` storage and
+/// reinserts each pair with `W_DictMultiObject.setitem`.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` on [`KWARGS_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_switch_kwargs_to_unicode_strategy(w_dict: PyObjectRef) {
+    // kwargsdict.py `switch_to_unicode_strategy`: unerase the parallel
+    // arrays, install UnicodeDictStrategy storage, then `w_dict.setitem`
+    // each pair. Each store can collect, so the pairs live in root slots
+    // rather than the old box after `dstorage` is overwritten.
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let w_dict = roots.pin_root(w_dict);
+    let len = kwargs_storage(w_dict).0.len();
+    let pairs_base = dict_slot + 1;
+    for i in 0..len {
+        let (keys_w, values_w) = kwargs_storage(roots.get(dict_slot));
+        roots.publish(&[kwargs_at(keys_w, i), kwargs_at(values_w, i)]);
+    }
+    let w_dict = roots.get(dict_slot);
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+    dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+    crate::dictmultiobject::dict_write_barrier(w_dict);
+    for i in 0..len {
+        crate::dictmultiobject::w_dict_store(
+            roots.get(dict_slot),
+            roots.get(pairs_base + 2 * i),
+            roots.get(pairs_base + 2 * i + 1),
+        );
+    }
+}
+
+/// `W_DictMultiObject.setitem` after `switch_to_unicode_strategy` or
+/// `switch_to_object_strategy`. The store runs on the strategy just
+/// installed; it is not part of the kwargs scan.
+#[majit_macros::dont_look_inside]
+unsafe fn kwargs_switched_setitem(w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
+    crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
+}
+
+/// `W_DictMultiObject.getitem` after `switch_to_object_strategy`.
+/// `PY_NULL` is a miss. A pointer return keeps the residual call on the
+/// object-pointer ABI; `Option` would be a real enum the stub would lift.
+#[majit_macros::dont_look_inside]
+unsafe fn kwargs_switched_getitem(w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
+    match crate::dictmultiobject::w_dict_lookup(w_dict, w_key) {
+        Some(w_value) => w_value,
+        None => crate::PY_NULL,
+    }
+}
+
 impl KwargsDictStrategy {
     /// `kwargsdict.py is_correct_type` — `space.is_w
     /// (space.type(w_obj), space.w_text)`.  Plain str (Py3 unicode).
@@ -176,37 +248,74 @@ impl KwargsDictStrategy {
     /// `w_dict.setitem`; pyre does the same so any non-ASCII keys
     /// further promote to ObjectDictStrategy.
     unsafe fn switch_to_unicode_strategy(&self, w_dict: PyObjectRef) {
-        // Drain the parallel arrays out of the old box (leaving it holding
-        // empty Vecs); after `dstorage` is overwritten the box is unreachable
-        // and the sweep drops it. `std::mem::take` mirrors the old
-        // `Box::from_raw` move without freeing the GC-managed box here.
-        // Each `w_dict_store` below can collect, so the drained words live
-        // in root slots rather than a bare `Vec<PyObjectRef>`.
-        let roots = crate::gc_roots::push_roots();
-        let dict_slot = roots.base();
-        let w_dict = roots.pin_root(w_dict);
-        let old = &mut *((*(w_dict as *mut crate::dictmultiobject::W_DictObject)).dstorage
-            as *mut KwargsDictStorage);
-        let keys_w = std::mem::take(&mut old.0);
-        let values_w = std::mem::take(&mut old.1);
-        let len = keys_w.len();
-        let pairs_base = dict_slot + 1;
-        for i in 0..len {
-            roots.publish(&[keys_w[i], values_w[i]]);
-        }
-        let w_dict = roots.get(dict_slot);
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
-        crate::dictmultiobject::dict_write_barrier(w_dict);
-        for i in 0..len {
-            crate::dictmultiobject::w_dict_store(
-                roots.get(dict_slot),
-                roots.get(pairs_base + 2 * i),
-                roots.get(pairs_base + 2 * i + 1),
-            );
-        }
+        w_dict_switch_kwargs_to_unicode_strategy(w_dict);
     }
+
+    /// `kwargsdict.py _setitem_correct_indirection`.
+    ///
+    /// `look_inside_iff(isconstant(length) and isconstant(key))` so a
+    /// constant-key store on a known-length kwargs dict is the traced
+    /// linear scan, not a residual call.
+    #[majit_macros::look_inside_iff(kwargs_setitem_correct_iff)]
+    unsafe fn setitem_correct_indirection(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+        w_value: PyObjectRef,
+    ) {
+        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+        let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+        crate::dictmultiobject::dict_write_barrier(w_dict);
+        for i in 0..storage.0.len() {
+            if kwargs_text_eq(kwargs_at(&storage.0, i), w_key) {
+                storage.1[i] = w_value;
+                return;
+            }
+        }
+        if storage.0.len() >= KWARGS_PROMOTE_THRESHOLD {
+            self.switch_to_unicode_strategy(w_dict);
+            kwargs_switched_setitem(w_dict, w_key, w_value);
+            return;
+        }
+        storage.0.push(w_key);
+        storage.1.push(w_value);
+        crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+    }
+
+    /// `kwargsdict.py _getitem_correct_indirection`.
+    #[majit_macros::look_inside_iff(kwargs_getitem_correct_iff)]
+    unsafe fn getitem_correct_indirection(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+    ) -> Option<PyObjectRef> {
+        let (keys_w, values_w) = kwargs_storage(w_dict);
+        for i in 0..keys_w.len() {
+            if kwargs_text_eq(kwargs_at(keys_w, i), w_key) {
+                return Some(kwargs_at(values_w, i));
+            }
+        }
+        None
+    }
+}
+
+fn kwargs_setitem_correct_iff(
+    _this: &KwargsDictStrategy,
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+    _w_value: PyObjectRef,
+) -> bool {
+    let length = unsafe { kwargs_storage(w_dict).0.len() };
+    majit_rlib::jit::isconstant(&length) && majit_rlib::jit::isconstant(&w_key)
+}
+
+fn kwargs_getitem_correct_iff(
+    _this: &KwargsDictStrategy,
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+) -> bool {
+    let length = unsafe { kwargs_storage(w_dict).0.len() };
+    majit_rlib::jit::isconstant(&length) && majit_rlib::jit::isconstant(&w_key)
 }
 
 impl DictStrategy for KwargsDictStrategy {
@@ -217,10 +326,12 @@ impl DictStrategy for KwargsDictStrategy {
     /// `kwargsdict.py get_empty_storage` — erased `([], [])`.
     /// GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        crate::gc_storage::gc_alloc_storage_box(
-            KwargsDictStorage::default(),
-            kwargs_dict_storage_gc_type_id(),
-        ) as *mut u8
+        // `([], [])` (`kwargsdict.py get_empty_storage`). The pair's
+        // `Default` is `tuple::default`, which has no translated body;
+        // each list is the empty list that constructor would build.
+        let storage: KwargsDictStorage = (Vec::new(), Vec::new());
+        crate::gc_storage::gc_alloc_storage_box(storage, kwargs_dict_storage_gc_type_id())
+            as *mut u8
     }
 
     /// `kwargsdict.py switch_to_object_strategy` — walk
@@ -234,18 +345,17 @@ impl DictStrategy for KwargsDictStrategy {
     /// linear scan, else `_never_equal_to` short-circuit or promote.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if Self::is_correct_type(w_key) {
-            let (keys_w, values_w) = kwargs_storage(w_dict);
-            for i in 0..keys_w.len() {
-                if crate::dictmultiobject::dict_keys_equal(kwargs_at(keys_w, i), w_key) {
-                    return Some(kwargs_at(values_w, i));
-                }
-            }
-            return None;
+            return self.getitem_correct_indirection(w_dict, w_key);
         }
         // `kwargsdict.py _never_equal_to` returns False — no
         // short-circuit; always promote and retry.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        let w_found = kwargs_switched_getitem(w_dict, w_key);
+        if w_found == crate::PY_NULL {
+            None
+        } else {
+            Some(w_found)
+        }
     }
 
     /// `kwargsdict.py setdefault` — keep an exact unicode key on the
@@ -273,32 +383,11 @@ impl DictStrategy for KwargsDictStrategy {
     /// `kwargsdict.py setitem` + `_setitem_correct_indirection`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
-            let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-            let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
-            crate::dictmultiobject::dict_write_barrier(w_dict);
-            for i in 0..storage.0.len() {
-                if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
-                    // Direct element store in this body. A helper that
-                    // returns `&mut items[i]` leaves an opaque `index_mut`
-                    // whose destination is not a single deref here.
-                    storage.1[i] = w_value;
-
-                    return;
-                }
-            }
-            if storage.0.len() >= KWARGS_PROMOTE_THRESHOLD {
-                self.switch_to_unicode_strategy(w_dict);
-                crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
-                return;
-            }
-            storage.0.push(w_key);
-            storage.1.push(w_value);
-            crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-
+            self.setitem_correct_indirection(w_dict, w_key, w_value);
             return;
         }
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
+        kwargs_switched_setitem(w_dict, w_key, w_value);
     }
 
     /// `kwargsdict.py delitem` — switches to object strategy

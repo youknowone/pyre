@@ -637,8 +637,14 @@ fn module_dict_key_block(key: &str) -> *mut crate::unicodeobject::Utf8Str {
         // An immortal interned str's payload does not move. A managed one
         // does: aliasing `W_UnicodeObject.value` leaves this HashMap key
         // pointing at the pre-move block.
-        if !crate::gc_hook::try_gc_owns_object(w_name as *mut u8) {
-            return unsafe { (*(w_name as *const crate::unicodeobject::W_UnicodeObject)).value };
+        if (w_name as usize).is_multiple_of(std::mem::align_of::<PyObjectRef>())
+            && !crate::gc_hook::try_gc_owns_object(w_name as *mut u8)
+        {
+            let value =
+                unsafe { (*(w_name as *const crate::unicodeobject::W_UnicodeObject)).value };
+            if !value.is_null() && (value as usize).is_multiple_of(std::mem::align_of::<usize>()) {
+                return value;
+            }
         }
     }
     crate::unicodeobject::alloc_utf8_payload(key.as_bytes(), true)
