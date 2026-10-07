@@ -4677,10 +4677,11 @@ impl Bookkeeper {
             //     if hasattr(x, '_cleanup_'): x._cleanup_()
             call_cleanup_method(obj)?;
             // A unit-variant singleton is folded to a prebuilt instance whose
-            // class host is minted from the dotted ctor path with no bases
-            // (`unit_variant_fold::intern_unit_variant_prebuilt_instance`).
-            // Field reads of the same enum use the discriminant-only class, so
-            // the instance must annotate as the variant that subclasses it.
+            // class host is interned through `intern_enum_variant_host`
+            // (`unit_variant_fold::intern_unit_variant_prebuilt_instance`)
+            // so `value.__class__` is the variant ClassDef.  A dotted ctor
+            // host (bookkeeper-less fold) is re-interned as that variant
+            // so field reads of the discriminant-only class still union.
             let classdef = self.classdef_for_prebuilt_instance(class_obj)?;
             super::classdesc::ClassDef::see_instance(&classdef, obj)?;
             let mut inst = super::model::SomeInstance::new(
@@ -6166,6 +6167,7 @@ mod tests {
             crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
                 "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
                 Some(0),
+                Some(&bk),
             )
             .expect("prebuilt Continue");
         let s = bk

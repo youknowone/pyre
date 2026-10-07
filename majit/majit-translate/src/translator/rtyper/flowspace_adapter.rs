@@ -4079,6 +4079,7 @@ fn legacy_const_define_hlvalue(
                 crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
                     &qualname,
                     *variant_tag,
+                    call_registry.map(|registry| registry.bookkeeper()),
                 );
             let Some(instance) = instance else {
                 return Ok(None);
