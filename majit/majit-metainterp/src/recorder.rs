@@ -44,9 +44,6 @@ struct ValueSlot {
     concrete: Cell<Option<Value>>,
     /// `history.py` `FrontendOp.getopnum` — the FrontendOp carries its opnum.
     opcode: OpCode,
-    /// Index in `slots` (byte mode) / `ops` (Vec recorder) of this
-    /// value FrontendOp. `OpRef.raw()` is `_index`, not this sequence.
-    seq: u32,
     /// `history.py` `RefFrontendOp._heapc_flags` / `_heapc_deps` and
     /// `FrontendOp.position_and_flags & FO_REPLACED_WITH_CONST`.
     heapc: majit_trace::heapcache::HeapcRecord,
@@ -938,7 +935,6 @@ impl Trace {
                 ty,
                 concrete: Cell::new(value),
                 opcode,
-                seq: self.slots.len() as u32 - 1,
                 heapc: majit_trace::heapcache::HeapcRecord::default(),
             });
             self.box_count += 1;
@@ -1186,14 +1182,14 @@ impl Trace {
             #[cfg(test)]
             return Operand::bound_from_opref(r);
         }
-        // ResOp operand: value-producing `OpRef.raw()` is `_index`.
-        // The FrontendOp lives at `value_slots[_index - _start]`; `seq`
-        // is that op's index in `ops` / `slots` (`history.py` FrontendOp).
+        // ResOp operand: value-producing `OpRef.raw()` is `_index`
+        // (`history.py` `FrontendOp.get_position`). The FrontendOp lives
+        // at `value_slots[_index - _start]`. A materialized producer is
+        // the op whose result position is that `_index`
+        // (`opencoder.py` `TraceIterator._cache[_index]` / `get_op_by_pos`).
         if !r.is_none() && r.ty() != Some(Type::Void) && !matches!(r, OpRef::VoidOp(_)) {
-            if let Some(vs) = self.value_slot(r.raw()) {
-                if let Some(op) = self.ops.get(vs.seq as usize)
-                    && op.pos().get() == r
-                {
+            if self.value_slot(r.raw()).is_some() {
+                if let Some(op) = self.ops.iter().find(|op| op.pos().get() == r) {
                     return Operand::from_bound_op(op);
                 }
                 if self.byte_mode() {
