@@ -145,9 +145,10 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let length = buf.len();
     let alloc = if buf.is_empty() { 0 } else { buf.len() + 1 };
     // `build_bytes` (bytesobject.rs): the data box has no heap edge until
-    // the body is written, and both `get_instantiate` and the body malloc
-    // can collect.  Pin the box and the class, reload after the last
-    // allocation, and remember the old-to-young data edge.
+    // the body is written, and both `get_instantiate` and the post-pressure
+    // collect can move nursery pointers. Pin the box, the class, and the
+    // body; reload after the last collection; remember the old-to-young
+    // data edge.
     let _roots = crate::gc_roots::push_roots();
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
@@ -169,16 +170,28 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         logical_offset: 0,
         exports: 0,
     };
-    if !raw.is_null() {
+    let obj = if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut W_BytearrayObject, body);
         }
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        account_buffer_growth(raw as PyObjectRef, alloc);
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(body) as PyObjectRef
+    };
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    account_buffer_growth(crate::gc_roots::shadow_stack_get(obj_slot), alloc);
+    // `ByteBuffer.__init__` is a GC list malloc; `external_malloc` then
+    // runs `minor_collection_with_major_progress` when `threshold_reached`.
+    // The `Vec` payload sits outside `get_total_memory_used`, so
+    // `raw_malloc_memory_pressure` is what moves the threshold.
+    // That helper cannot collect; `collect(0)` is the malloc's collection
+    // at this constructor safepoint.
+    if alloc > 0 && crate::gc_hook::try_gc_major_threshold_reached() {
+        crate::gc_hook::try_gc_collect(0);
     }
+    crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
 /// Charge `bytes` of buffer to the collector's major-collection threshold.

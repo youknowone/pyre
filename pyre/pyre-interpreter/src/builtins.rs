@@ -6943,6 +6943,26 @@ fn type_descr_new_with_metaclass(
         pyre_object::gc_roots::normalize_roots(name_slot, 3 + n_args + 2);
         let name_obj = || pyre_object::gc_roots::shadow_stack_get(name_slot);
         let meta = || pyre_object::gc_roots::shadow_stack_get(meta_slot);
+        // Mixed NUL+surrogate is UnicodeEncodeError: `type_new_set_name`
+        // encodes with `PyUnicode_AsUTF8AndSize` before the `strlen` NUL
+        // test (Objects/typeobject.c, read at v3.14.6 in
+        // ~/Projects/cpython-3146). `_create_new_type` does `'\x00' in name`
+        // then `_check_surrogate` and answers ValueError. The exception type
+        // is observable, so `_check_surrogate` runs first; both checks stay
+        // before the namespace copy. `_check_utf8` `@jit.elidable` governs
+        // the utf8 scan, not this order. `W_TypeObject.__init__`
+        // `@dont_look_inside` and `name?` sit after a successful name.
+        // U+0000 is a single 0x00 byte in WTF-8.
+        check_surrogate(name_obj())?;
+        if unsafe { pyre_object::w_str_get_wtf8(name_obj()) }
+            .as_bytes()
+            .contains(&0)
+        {
+            return Err(crate::PyError::value_error(
+                "type name must not contain null characters",
+            ));
+        }
+        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
         // Resolve and pin the backing immediately. Later regions dispatch
         // through user code (`lookup`, metaclass `__new__`) and would
         // otherwise leave this word unrooted.
@@ -6952,17 +6972,6 @@ fn type_descr_new_with_metaclass(
                 namespace_root,
             ))
         });
-        // typeobject.py `_check_surrogate(space, name)` — reject a lone
-        // surrogate in the name before it is read as UTF-8 below.
-        check_surrogate(name_obj())?;
-        for cp in unsafe { pyre_object::w_str_get_wtf8(name_obj()) }.code_points() {
-            if cp.to_u32() == 0 {
-                return Err(crate::PyError::value_error(
-                    "type name must not contain null characters",
-                ));
-            }
-        }
-        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
 
         // typeobject.py `_create_new_type` — direct three-argument
         // `type()` never performs PEP 560 base rewriting.  A non-type base

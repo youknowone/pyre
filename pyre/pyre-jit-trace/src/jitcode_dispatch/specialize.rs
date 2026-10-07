@@ -3770,14 +3770,7 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
             if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
                 return Ok(None);
             }
-            let type_const = ctx.trace_ctx.const_int(method_type_addr);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[attr, type_const],
-            )?;
-            ctx.trace_ctx.heap_cache_mut().class_now_known(attr);
+            walker_guard_stamped_class(ctx, op_pc, attr, method_type_addr)?;
         }
         let null_const = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, null_const)?;
@@ -4710,9 +4703,7 @@ pub(crate) fn try_walker_fold_super_attr_unwrap<Sym: WalkSym>(
             return Ok(None);
         }
         let phys_type = unsafe { (*concrete_raw).ob_type } as i64;
-        let type_const = ctx.trace_ctx.const_int(phys_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[raw, type_const])?;
-        ctx.trace_ctx.heap_cache_mut().class_now_known(raw);
+        walker_guard_stamped_class(ctx, op_pc, raw, phys_type)?;
     }
     let value = if unsafe { pyre_object::is_method(concrete_raw) } {
         let (descr, concrete) = if which == 0 {
@@ -5912,14 +5903,9 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     if !match_op.is_constant()
         && !walker_guard_exc_match_tuple_items(ctx, op_pc, match_op, match_type)?
     {
-        let expected = ctx.trace_ctx.const_ref(match_type as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[match_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(match_op, expected);
+        walker_guard_fold_callable(ctx, op_pc, match_op, match_type)?;
         if unsafe { pyre_object::is_type(match_type) } {
+            let expected = ctx.trace_ctx.const_ref(match_type as i64);
             walker_pin_type_version_tag(ctx, op_pc, expected)?;
         }
     }
@@ -12176,14 +12162,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // `w_locals` to read, so the guard pins that direction and the fresh-dict
     // arm below stands in for the materialisation.
     let debugdata_present = debugdata_ref.as_usize() != 0;
-    if !debugdata_op.is_constant() {
-        let opcode = if debugdata_present {
-            OpCode::GuardNonnull
-        } else {
-            OpCode::GuardIsnull
-        };
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[debugdata_op])?;
-    }
+    walker_guard_stamped_presence(ctx, op.pc, debugdata_op, debugdata_present)?;
     // `d.w_locals` — pyframe.py:556.  Read whenever there is a payload to read
     // it from, and guarded in the direction recorded, so a frame that
     // materialises its mapping mid-loop side-exits instead of going on writing
@@ -12196,14 +12175,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             debugdata_op,
             crate::descr::frame_debug_data_w_locals_descr(),
         );
-        if !op_ref.is_constant() {
-            let opcode = if frame_owned {
-                OpCode::GuardNonnull
-            } else {
-                OpCode::GuardIsnull
-            };
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[op_ref])?;
-        }
+        walker_guard_stamped_presence(ctx, op.pc, op_ref, frame_owned)?;
         field_op = Some(op_ref);
         // `d.w_extra_locals` — read here so the merge below the slot chain
         // has it, and pinned absent when there is none so a mid-loop proxy
@@ -12213,14 +12185,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             debugdata_op,
             crate::descr::frame_debug_data_w_extra_locals_descr(),
         );
-        if !extra_op.is_constant() {
-            let opcode = if extras_present {
-                OpCode::GuardNonnull
-            } else {
-                OpCode::GuardIsnull
-            };
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[extra_op])?;
-        }
+        walker_guard_stamped_presence(ctx, op.pc, extra_op, extras_present)?;
         extra_field_op = Some(extra_op);
     }
     // `w_cell_get` per cell slot, and every slot's own boundness guard, BEFORE
@@ -12261,39 +12226,12 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // frame prologue put the `Cell` there and nothing in the body replaces
         // it, so the slot itself is bound on every execution of this path.
         let bound = !modelled.value.is_null();
-        if !slot_op.is_constant() {
-            let opcode = if bound || modelled.cell {
-                OpCode::GuardNonnull
-            } else {
-                OpCode::GuardIsnull
-            };
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[slot_op])?;
-        }
+        walker_guard_stamped_presence(ctx, op.pc, slot_op, bound || modelled.cell)?;
         // `w_cell_get` -- `Cell.contents`, the whole of `fast2locals`' cell
         // half.  The compiled loop re-reads the slot, so the class the walk saw
         // is stated rather than assumed.
         let value_op = if modelled.cell {
-            let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-            walker_guard_stamped_class(ctx, op.pc, slot_op, cell_type)?;
-            let contents = walker_record_getfield_gc_r_uncached(
-                ctx,
-                slot_op,
-                crate::descr::cell_contents_descr(),
-            );
-            ctx.trace_ctx.set_opref_concrete(
-                contents,
-                majit_ir::Value::Ref(majit_ir::GcRef(modelled.value as usize)),
-            );
-            // Boundness is what decides whether this name appears at all, and
-            // a cell can be rebound or deleted between iterations, so pin the
-            // answer in BOTH directions.
-            let guard = if bound {
-                OpCode::GuardNonnull
-            } else {
-                OpCode::GuardIsnull
-            };
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, guard, &[contents])?;
-            contents
+            walker_pin_cell_contents(ctx, op.pc, slot_op, modelled.value)?
         } else {
             slot_op
         };
@@ -12917,27 +12855,12 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         // The slot holds a `Cell` on every execution of this path: the frame
         // prologue put it there and nothing in the body replaces it, but the
         // compiled loop re-reads the slot, so say so.
-        let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-        walker_guard_stamped_class(ctx, op.pc, slot.slot_op, cell_type)?;
-        let contents = walker_record_getfield_gc_r_uncached(
+        value_ops.push(walker_pin_cell_contents(
             ctx,
+            op.pc,
             slot.slot_op,
-            crate::descr::cell_contents_descr(),
-        );
-        ctx.trace_ctx.set_opref_concrete(
-            contents,
-            majit_ir::Value::Ref(majit_ir::GcRef(slot.value as usize)),
-        );
-        // Boundness is what decides whether this name appears at all, and a
-        // cell can be rebound or deleted between iterations, so pin the answer
-        // in BOTH directions.
-        let guard = if slot.value.is_null() {
-            OpCode::GuardIsnull
-        } else {
-            OpCode::GuardNonnull
-        };
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, guard, &[contents])?;
-        value_ops.push(contents);
+            slot.value,
+        )?);
     }
     // Same reason as the portal arm: the last cell read's guard lands after
     // that loop's own check.
@@ -14215,6 +14138,21 @@ fn walker_guard_fold_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// Unstamped `GuardClass` plus GETFIELD `w_class` + `GuardValue`.
+/// `is_plain_int1` / `is_plain_float_strict` read `value.w_class`.
+fn walker_guard_fold_value_w_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    value_op: OpRef,
+    value: pyre_object::PyObjectRef,
+    value_type_addr: i64,
+) -> Result<(), DispatchError> {
+    walker_guard_fold_class(ctx, pc, value_op, value_type_addr)?;
+    let w_class_ref =
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, value_op, crate::descr::w_class_descr());
+    walker_guard_fold_callable(ctx, pc, w_class_ref, unsafe { (*value).w_class })
+}
+
 /// Unstamped `GuardClass` tagged with a FOR_ITER green-key FailDescr when
 /// one is available. Skips when the box is constant or the class is already
 /// known; always stamps `class_now_known`.
@@ -14329,6 +14267,53 @@ fn walker_guard_stamped_isnull<Sym: WalkSym>(
     let null_const = ctx.trace_ctx.const_ref(0);
     ctx.trace_ctx.replace_box(op, null_const);
     Ok(null_const)
+}
+
+/// Stamped `GuardNonnull` or `GuardIsnull` when the box is not already a
+/// constant. Direction follows the recorded presence.
+fn walker_guard_stamped_presence<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    present: bool,
+) -> Result<(), DispatchError> {
+    if op.is_constant() {
+        return Ok(());
+    }
+    let opcode = if present {
+        OpCode::GuardNonnull
+    } else {
+        OpCode::GuardIsnull
+    };
+    walker_emit_fold_guard_with_snapshot(ctx, pc, opcode, &[op])?;
+    Ok(())
+}
+
+/// Pin a `Cell`: stamped `GuardClass` of `CELL_TYPE`, uncached GETFIELD
+/// `contents`, then `GuardNonnull`/`GuardIsnull` of the recorded boundness.
+/// `fast2locals` reads `w_cell_get` (`Cell.contents`); a cell can be rebound
+/// or deleted between iterations.
+fn walker_pin_cell_contents<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    slot_op: OpRef,
+    value: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
+    walker_guard_stamped_class(ctx, pc, slot_op, cell_type)?;
+    let contents =
+        walker_record_getfield_gc_r_uncached(ctx, slot_op, crate::descr::cell_contents_descr());
+    ctx.trace_ctx.set_opref_concrete(
+        contents,
+        majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+    );
+    let guard = if value.is_null() {
+        OpCode::GuardIsnull
+    } else {
+        OpCode::GuardNonnull
+    };
+    walker_emit_fold_guard_with_snapshot(ctx, pc, guard, &[contents])?;
+    Ok(contents)
 }
 
 /// Pin a bound method: unstamped `GuardClass` of `METHOD_TYPE`, then
@@ -16498,7 +16483,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
-        walker_guard_fold_class(ctx, op.pc, value_op, value_type_addr)?;
         // The strict predicate (`is_plain_int1` / `is_plain_float_strict`)
         // rejects subclasses by reading `value.w_class` and requiring it null
         // or == `get_instantiate(<type>)`. The ob_type pin above only folds the
@@ -16510,12 +16494,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         // (`OrthodoxSubWalkTraceUnsupported`). Pin w_class to the concrete
         // value's field so the subclass test folds too (the recognition gate
         // already proved the strict predicate).
-        let w_class_ref = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            value_op,
-            crate::descr::w_class_descr(),
-        );
-        walker_guard_fold_callable(ctx, op.pc, w_class_ref, unsafe { (*value).w_class })?;
+        walker_guard_fold_value_w_class(ctx, op.pc, value_op, value, value_type_addr)?;
     }
 
     // Pre-publish the ONE append-site resume coordinate the sub-walk's guards
@@ -17693,21 +17672,17 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     let w_class = unsafe { (*concrete_self).w_class };
 
     let self_box = if from_bound_method {
-        let method_op = callable_op;
-        let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-        if !method_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(method_op) {
-            let type_const = ctx.trace_ctx.const_int(method_type_addr);
-            walker_emit_fold_guard_with_snapshot(
+        if !callable_op.is_constant() {
+            walker_guard_stamped_class(
                 ctx,
                 op.pc,
-                OpCode::GuardClass,
-                &[method_op, type_const],
+                callable_op,
+                &pyre_object::function::METHOD_TYPE as *const _ as i64,
             )?;
-            ctx.trace_ctx.heap_cache_mut().class_now_known(method_op);
         }
         crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
-            method_op,
+            callable_op,
             crate::descr::method_w_self_descr(),
         )
     } else {
@@ -18730,13 +18705,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
-        walker_guard_fold_class(ctx, op_pc, value_op, value_type_addr)?;
-        let w_class_ref = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            value_op,
-            crate::descr::w_class_descr(),
-        );
-        walker_guard_fold_callable(ctx, op_pc, w_class_ref, unsafe { (*value_obj).w_class })?;
+        walker_guard_fold_value_w_class(ctx, op_pc, value_op, value_obj, value_type_addr)?;
     }
 
     ctx.trace_ctx.set_opref_concrete(
@@ -20358,18 +20327,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
             frame_op,
             crate::descr::pyframe_w_builtin_descr(),
         );
-        let expected = ctx.trace_ctx.const_ref(w_builtin as i64);
-        if !live_builtin.is_constant() {
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[live_builtin, expected],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(live_builtin, expected);
-        } else if ctx.trace_ctx.const_value(live_builtin) != Some(w_builtin as i64) {
+        walker_guard_stamped_ref_unless_const(ctx, op_pc, live_builtin, w_builtin)?;
+        if live_builtin.is_constant()
+            && ctx.trace_ctx.const_value(live_builtin) != Some(w_builtin as i64)
+        {
             return Ok(false);
         }
         return emit_namespace_cell_fold(
@@ -20413,18 +20374,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
         return Ok(false);
     }
     let debugdata_present = debugdata_ref.as_usize() != 0;
-    if !debugdata_op.is_constant() {
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            if debugdata_present {
-                OpCode::GuardNonnull
-            } else {
-                OpCode::GuardIsnull
-            },
-            &[debugdata_op],
-        )?;
-    } else if ctx.trace_ctx.const_value(debugdata_op) != Some(debugdata_ref.as_usize() as i64) {
+    walker_guard_stamped_presence(ctx, op_pc, debugdata_op, debugdata_present)?;
+    if debugdata_op.is_constant()
+        && ctx.trace_ctx.const_value(debugdata_op) != Some(debugdata_ref.as_usize() as i64)
+    {
         return Ok(false);
     }
 
@@ -20442,14 +20395,8 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
                     crate::descr::frame_debug_data_w_locals_descr(),
                 );
                 if w_locals.is_null() {
-                    if !live.is_constant() {
-                        walker_emit_fold_guard_with_snapshot(
-                            ctx,
-                            op_pc,
-                            OpCode::GuardIsnull,
-                            &[live],
-                        )?;
-                    } else if ctx.trace_ctx.const_value(live) != Some(0) {
+                    walker_guard_stamped_presence(ctx, op_pc, live, false)?;
+                    if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(0) {
                         return Ok(false);
                     }
                     ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
