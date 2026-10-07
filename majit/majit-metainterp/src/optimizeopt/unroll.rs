@@ -2130,6 +2130,17 @@ impl UnrollOptimizer {
                 // box short of `exported_renamed_inputargs` (an entry-only
                 // invariant). Pad/truncate here so consider_jump /
                 // the assembler remap never sees JUMP 33 vs LABEL 34.
+                // A missing *middle* slot shifts later JUMP boxes onto the
+                // wrong LABEL kinds: an Int then lands in a Ref register and
+                // GuardClass loads `[loop_counter + vtable_offset]`.
+                // `unroll.py jump_to_preamble` keeps the arglist; give up
+                // rather than compile that remap.
+                if jump_and_preamble_slot_kinds_disagree(&end_jump, &exported_renamed_inputargs) {
+                    crate::mc_diag_bump(57);
+                    return Err(crate::optimize::InvalidLoop(
+                        "jump_to_preamble: JUMP/LABEL slot kinds disagree",
+                    ));
+                }
                 apply_preamble_shape_to_jump(&mut end_jump, &exported_renamed_inputargs);
                 if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
                     // unroll.py parity: jump_to_preamble retargets
@@ -6128,6 +6139,26 @@ fn replace_terminal_jump(body_ops: &[majit_ir::OpRc], jump_op: Op) -> Vec<majit_
     result
 }
 
+/// True when a positional JUMP box and the start LABEL box at the same
+/// index carry different `AbstractValue.type` tags.
+///
+/// `unroll.py jump_to_preamble` keeps the JUMP arglist. Pad/truncate is
+/// only sound for an extra trailing invariant of the same kind; a kind
+/// disagreement means a missing middle slot, and the assembler would
+/// remap an Int into a Ref (`x86/assembler.py` `_cmp_guard_class`).
+fn jump_and_preamble_slot_kinds_disagree(jump: &Op, preamble_args: &[OpRef]) -> bool {
+    jump.args_slice()
+        .iter()
+        .map(|a| a.to_opref())
+        .zip(preamble_args.iter().copied())
+        .any(
+            |(jump_arg, preamble_arg)| match (jump_arg.ty(), preamble_arg.ty()) {
+                (Some(jump_ty), Some(preamble_ty)) => jump_ty != preamble_ty,
+                _ => false,
+            },
+        )
+}
+
 /// Match a jump_to_preamble JUMP to the start LABEL's
 /// `ExportedState.renamed_inputargs`. Extra LABEL slots are
 /// loop-invariant entry boxes: pad with the preamble arg at that
@@ -6708,6 +6739,25 @@ mod tests {
         let mut jump_args = vec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)];
         reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::int_op(10), OpRef::int_op(11)]);
         assert_eq!(jump_args.as_slice(), &[OpRef::int_op(0), OpRef::int_op(1)]);
+    }
+
+    #[test]
+    fn test_jump_and_preamble_slot_kinds_disagree_on_shifted_ref() {
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_resop_operand(Type::Int, 0),
+                rooted_resop_operand(Type::Int, 1),
+            ],
+        );
+        assert!(jump_and_preamble_slot_kinds_disagree(
+            &jump,
+            &[OpRef::int_op(0), OpRef::ref_op(1)],
+        ));
+        assert!(!jump_and_preamble_slot_kinds_disagree(
+            &jump,
+            &[OpRef::int_op(0), OpRef::int_op(1), OpRef::ref_op(2)],
+        ));
     }
 
     #[test]
