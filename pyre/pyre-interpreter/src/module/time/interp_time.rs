@@ -1960,15 +1960,15 @@ fn strftime_one(
         return Ok(rustpython_wtf8::Wtf8Buf::new());
     }
     let c_fmt = std::ffi::CString::new(format).expect("NUL-free strftime segment");
-    let libc_tm = c_tm_to_libc_tm(tm);
+    let mut libc_tm = c_tm_to_libc_tm(tm);
     let mut buf = vec![0u8; 1024];
     unsafe {
         loop {
-            let n = libc::strftime(
-                buf.as_mut_ptr() as *mut libc::c_char,
+            let n = majit_rlib::rtime::c_strftime(
+                buf.as_mut_ptr() as majit_rlib::rffi::CCHARP,
                 buf.len(),
-                c_fmt.as_ptr(),
-                &libc_tm,
+                c_fmt.as_ptr() as majit_rlib::rffi::CCHARP,
+                &mut libc_tm,
             );
             // A buffer 256 times the format length is not failing for
             // lack of room: the format simply yields an empty result,
@@ -2100,8 +2100,8 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // strftime is available on both Unix and Windows CRT.
     #[cfg(all(unix, not(feature = "sandbox")))]
     {
-        let libc_tm = c_tm_to_libc_tm(&tm);
-        let render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
+        let mut libc_tm = c_tm_to_libc_tm(&tm);
+        let mut render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
             if segment.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2110,11 +2110,11 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let mut buf = vec![0u8; 256];
             loop {
                 let n = unsafe {
-                    libc::strftime(
-                        buf.as_mut_ptr() as *mut libc::c_char,
+                    majit_rlib::rtime::c_strftime(
+                        buf.as_mut_ptr() as majit_rlib::rffi::CCHARP,
                         buf.len(),
-                        c_fmt.as_ptr(),
-                        &libc_tm,
+                        c_fmt.as_ptr() as majit_rlib::rffi::CCHARP,
+                        &mut libc_tm,
                     )
                 };
                 if n != 0 {
