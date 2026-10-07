@@ -263,18 +263,19 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // multiplies by 10**9 under the same overflow guard; anything else is a
     // TypeError.
     const SECS_TO_NS: i64 = 1_000_000_000;
+    let mut w_secs = args[0];
     let timeout_ns: i64 = unsafe {
         let overflow = || {
             crate::PyError::overflow_error(crate::display::wtf8_format!(
                 "timestamp ",
-                crate::display::py_repr_wtf8(args[0]).unwrap_or_else(|_| {
+                crate::display::py_repr_wtf8(w_secs).unwrap_or_else(|_| {
                     rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string())
                 }),
                 " too large to convert to C _PyTime_t"
             ))
         };
-        if is_float(args[0]) {
-            let secs = floatobject::w_float_get_value(args[0]);
+        if is_float(w_secs) {
+            let secs = floatobject::w_float_get_value(w_secs);
             if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
@@ -285,29 +286,29 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
             result_float as i64
         } else {
-            let sec = if is_bool(args[0]) {
+            let sec = if is_bool(w_secs) {
                 // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
-                boolobject::w_bool_get_value(args[0]) as i64
-            } else if is_int(args[0]) {
-                w_int_get_value(args[0])
-            } else if pyre_object::pyobject::is_long(args[0]) {
-                let big = pyre_object::longobject::w_long_get_value(args[0]);
+                boolobject::w_bool_get_value(w_secs) as i64
+            } else if is_int(w_secs) {
+                w_int_get_value(w_secs)
+            } else if pyre_object::pyobject::is_long(w_secs) {
+                let big = pyre_object::longobject::w_long_get_value(w_secs);
                 i64::try_from(big).map_err(|_| overflow())?
             } else {
                 // `timeutils.py` — `space.bigint_w(w_secs)` applies
                 // `space.int`, so an object with `__int__` / `__index__` is
                 // accepted and reduced to a longlong.
-                let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
-                    || crate::baseobjspace::lookup(args[0], "__index__").is_some();
+                let has_int = crate::baseobjspace::lookup(w_secs, "__int__").is_some()
+                    || crate::baseobjspace::lookup(w_secs, "__index__").is_some();
                 if !has_int {
                     // `_PyTime_FromSecondsObject` accepts either domain, so
                     // an argument that is neither names both.
                     return Err(crate::PyError::type_error(format!(
                         "'{}' object cannot be interpreted as an integer or float",
-                        crate::type_methods::arg_type_name(args[0])
+                        crate::type_methods::arg_type_name(w_secs)
                     )));
                 }
-                let w_int = crate::baseobjspace::space_int(args[0])?;
+                let w_int = crate::baseobjspace::space_int(w_secs)?;
                 if is_int(w_int) {
                     w_int_get_value(w_int)
                 } else {
@@ -354,7 +355,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let deadline = now + dur;
         let mut remaining = dur;
         loop {
-            let slept = {
+            let slept = pyre_object::with_roots!(w_secs => {
                 let _blocking = crate::module::thread::before_external_block();
                 let mut ts = libc::timespec {
                     tv_sec: remaining.as_secs() as libc::time_t,
@@ -363,13 +364,15 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // `interp_time.nanosleep` — GIL already left by
                 // `before_external_block`; `rtime.c_nanosleep` saves errno.
                 unsafe { majit_rlib::rtime::c_nanosleep(&mut ts, std::ptr::null_mut()) }
-            };
+            });
             if slept == 0 {
                 return Ok(w_none());
             }
             let errno = majit_rlib::rposix::get_saved_errno();
             if errno == libc::EINTR {
-                crate::module::signal::interp_signal::checksignals_now()?;
+                pyre_object::with_roots!(w_secs => {
+                    crate::module::signal::interp_signal::checksignals_now()
+                })?;
                 let now =
                     clock_monotonic_duration().unwrap_or_else(|| monotonic_baseline().elapsed());
                 if now >= deadline {
@@ -831,8 +834,9 @@ pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let ts = clock_gettime_timespec(id).map_err(|errno| {
+    let mut w_clk_id = args[0];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
+    let ts = pyre_object::with_roots!(w_clk_id => clock_gettime_timespec(id)).map_err(|errno| {
         crate::PyError::os_error_with_errno(
             errno,
             format!(
@@ -855,8 +859,9 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let ts = clock_gettime_timespec(id).map_err(|errno| {
+    let mut w_clk_id = args[0];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
+    let ts = pyre_object::with_roots!(w_clk_id => clock_gettime_timespec(id)).map_err(|errno| {
         crate::PyError::os_error_with_errno(
             errno,
             format!(
@@ -884,12 +889,14 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let mut w_clk_id = args[0];
+    let mut w_when = args[1];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
     let secs = unsafe {
-        if is_int(args[1]) {
-            w_int_get_value(args[1]) as f64
-        } else if is_float(args[1]) {
-            floatobject::w_float_get_value(args[1])
+        if is_int(w_when) {
+            w_int_get_value(w_when) as f64
+        } else if is_float(w_when) {
+            floatobject::w_float_get_value(w_when)
         } else {
             return Err(crate::PyError::type_error(
                 "clock_settime: time must be a real number",
@@ -904,7 +911,9 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         tv_sec: integer_secs as libc::time_t,
         tv_nsec: (frac * 1e9) as libc::c_long,
     };
-    let ret = unsafe { majit_rlib::rtime::c_clock_settime(id as _, &mut ts) };
+    let ret = pyre_object::with_roots!(w_clk_id, w_when => unsafe {
+        majit_rlib::rtime::c_clock_settime(id as _, &mut ts)
+    });
     if ret != 0 {
         let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
@@ -936,15 +945,19 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             "clock_settime_ns: clock id and time must be integers",
         ));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let ns = unsafe { w_int_get_value(args[1]) };
+    let mut w_clk_id = args[0];
+    let mut w_when = args[1];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
+    let ns = unsafe { w_int_get_value(w_when) };
     // `tv_sec = ns // 10**9`, `tv_nsec = ns % 10**9` (Python floor div/mod,
     // so a negative `ns` normalises to a non-negative `tv_nsec`).
     let mut ts = libc::timespec {
         tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
         tv_nsec: ns.rem_euclid(1_000_000_000) as libc::c_long,
     };
-    let ret = unsafe { majit_rlib::rtime::c_clock_settime(id as _, &mut ts) };
+    let ret = pyre_object::with_roots!(w_clk_id, w_when => unsafe {
+        majit_rlib::rtime::c_clock_settime(id as _, &mut ts)
+    });
     if ret != 0 {
         let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
@@ -969,9 +982,12 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let mut w_clk_id = args[0];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
     let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
-    let ret = unsafe { majit_rlib::rtime::c_clock_getres(id as _, &mut ts) };
+    let ret = pyre_object::with_roots!(w_clk_id => unsafe {
+        majit_rlib::rtime::c_clock_getres(id as _, &mut ts)
+    });
     if ret != 0 {
         let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(

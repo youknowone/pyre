@@ -169,7 +169,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // and rejects other out-of-range values rather than
                 // silently truncating.  Mirror that here so a Python
                 // bigint that doesn't fit in `gid_t` raises OverflowError.
-                let val = pyre_interpreter::baseobjspace::int_w(args[0])?;
+                let mut w_gid = args[0];
+                let val = pyre_object::with_roots!(w_gid => pyre_interpreter::baseobjspace::int_w(w_gid))?;
                 let gid_min = libc::gid_t::MIN as i64;
                 let gid_max = libc::gid_t::MAX as i64;
                 let gid = if val == -1 {
@@ -183,7 +184,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 };
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let g = unsafe { ll::c_getgrgid(gid) };
+                    let g = pyre_object::with_roots!(w_gid => unsafe { ll::c_getgrgid(gid) });
                     if g.is_null() {
                         Err(pyre_interpreter::PyError::key_error(format!(
                             "getgrgid(): gid not found: {}",
@@ -227,7 +228,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getgrnam(): name should be a string",
                     ));
                 }
-                let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
+                let mut w_name = args[0];
+                let name = pyre_object::with_roots!(w_name => {
+                    pyre_interpreter::baseobjspace::str_utf8_w(w_name)
+                })?;
                 // Reject embedded NULs (parity with PyPy's @unwrap_spec
                 // text0 used for similar lookup APIs).
                 if name.as_bytes().contains(&0) {
@@ -237,11 +241,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let g = {
+                    let g = pyre_object::with_roots!(w_name => {
                         let ll_name =
                             majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
                         unsafe { ll::c_getgrnam(ll_name.buf) }
-                    };
+                    });
                     if g.is_null() {
                         Err(pyre_interpreter::PyError::key_error(format!(
                             "getgrnam(): name not found: {}",

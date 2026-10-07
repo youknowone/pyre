@@ -56,7 +56,7 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             "shm_open() requires (path, flags[, mode])",
         ));
     }
-    let w_path = args[0];
+    let mut w_path = args[0];
     let mut w_flags = args[1];
     let mut w_mode = args.get(2).copied().unwrap_or(PY_NULL);
     let name = unsafe {
@@ -65,7 +65,7 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
                 "shm_open: path must be a string",
             ));
         }
-        pyre_object::with_roots!(w_flags, w_mode =>
+        pyre_object::with_roots!(w_path, w_flags, w_mode =>
             pyre_interpreter::baseobjspace::str_utf8_w(w_path)
         )?
         .to_string()
@@ -82,8 +82,9 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     #[cfg(not(feature = "sandbox"))]
     {
         let fd = loop {
-            let fd =
-                unsafe { ll::c_shm_open(c_name.as_ptr() as majit_rlib::rffi::CCHARP, flags, mode) };
+            let fd = pyre_object::with_roots!(w_path, w_flags, w_mode => unsafe {
+                ll::c_shm_open(c_name.as_ptr() as majit_rlib::rffi::CCHARP, flags, mode)
+            });
             if fd < 0 {
                 let errno = majit_rlib::rposix::_get_errno();
                 if errno == libc::EINTR {
@@ -124,13 +125,15 @@ fn shm_unlink(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
             "shm_unlink() needs path",
         ));
     }
+    let mut w_path = args[0];
     let name = unsafe {
-        if !is_str(args[0]) {
+        if !is_str(w_path) {
             return Err(pyre_interpreter::PyError::type_error(
                 "shm_unlink: path must be a string",
             ));
         }
-        pyre_interpreter::baseobjspace::str_utf8_w(args[0])?.to_string()
+        pyre_object::with_roots!(w_path => pyre_interpreter::baseobjspace::str_utf8_w(w_path))?
+            .to_string()
     };
     let c_name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
@@ -138,7 +141,9 @@ fn shm_unlink(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     #[cfg(not(feature = "sandbox"))]
     {
         loop {
-            let rv = unsafe { ll::c_shm_unlink(c_name.as_ptr() as majit_rlib::rffi::CCHARP) };
+            let rv = pyre_object::with_roots!(w_path => unsafe {
+                ll::c_shm_unlink(c_name.as_ptr() as majit_rlib::rffi::CCHARP)
+            });
             if rv < 0 {
                 let errno = majit_rlib::rposix::_get_errno();
                 if errno == libc::EINTR {

@@ -37,9 +37,10 @@ fn struct_passwd_type() -> pyre_object::PyObjectRef {
 /// inputs raise TypeError via `int_w`.
 #[cfg(unix)]
 fn pwd_uid_converter(
-    w_uid: pyre_object::PyObjectRef,
+    mut w_uid: pyre_object::PyObjectRef,
 ) -> Result<libc::uid_t, pyre_interpreter::PyError> {
-    let val = match pyre_interpreter::baseobjspace::int_w(w_uid) {
+    let val = match pyre_object::with_roots!(w_uid => pyre_interpreter::baseobjspace::int_w(w_uid))
+    {
         Ok(v) => v,
         Err(e) if matches!(e.kind, pyre_interpreter::PyErrorKind::OverflowError) => {
             return Err(pyre_interpreter::PyError::overflow_error(
@@ -215,7 +216,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 };
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let pw = unsafe { ll::c_getpwuid(uid) };
+                    let mut w_uid = args[0];
+                    let pw = pyre_object::with_roots!(w_uid => unsafe { ll::c_getpwuid(uid) });
                     if pw.is_null() {
                         Err(pyre_interpreter::PyError::key_error(format!(
                             "getpwuid(): uid not found: {}",
@@ -259,7 +261,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getpwnam(): name should be a string",
                     ));
                 }
-                let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
+                let mut w_name = args[0];
+                let name = pyre_object::with_roots!(w_name => {
+                    pyre_interpreter::baseobjspace::str_utf8_w(w_name)
+                })?;
                 // `interp_pwd.py @unwrap_spec(name='text0')` rejects
                 // embedded NULs.
                 if name.as_bytes().contains(&0) {
@@ -269,11 +274,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let pw = {
+                    let pw = pyre_object::with_roots!(w_name => {
                         let ll_name =
                             majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
                         unsafe { ll::c_getpwnam(ll_name.buf) }
-                    };
+                    });
                     if pw.is_null() {
                         Err(pyre_interpreter::PyError::key_error(format!(
                             "getpwnam(): name not found: {}",

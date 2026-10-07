@@ -172,10 +172,12 @@ fn itimer_retval(val: &libc::itimerval) -> pyre_object::PyObjectRef {
 
 /// interp_signal.py `SignalMask.__enter__` — `c_sigemptyset` then `c_sigaddset`.
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-fn fill_sigset(w_signals: PyObjectRef) -> Result<libc::sigset_t, crate::PyError> {
+fn fill_sigset(mut w_signals: PyObjectRef) -> Result<libc::sigset_t, crate::PyError> {
     let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let _ = unsafe { majit_rlib::rsignal::c_sigemptyset(&mut mask) };
-    for it in signal_set_items(w_signals)? {
+    let _ = pyre_object::with_roots!(w_signals => unsafe {
+        majit_rlib::rsignal::c_sigemptyset(&mut mask)
+    });
+    for it in pyre_object::with_roots!(w_signals => signal_set_items(w_signals))? {
         let signum = unsafe { pyre_object::w_int_get_value(it) };
         check_signum_in_range(signum)?;
         let _ = unsafe { majit_rlib::rsignal::c_sigaddset(&mut mask, signum as _) };
@@ -1046,7 +1048,10 @@ pub fn register_module(
                     };
                     #[cfg(unix)]
                     let raised = {
-                        let err = unsafe { majit_rlib::rsignal::c_raise(signum) };
+                        let mut w_signum = args[0];
+                        let err = pyre_object::with_roots!(w_signum => unsafe {
+                            majit_rlib::rsignal::c_raise(signum)
+                        });
                         if err == 0 {
                             Ok(())
                         } else {
@@ -1286,7 +1291,14 @@ pub fn register_module(
                             "setitimer() requires at least 2 arguments",
                         ));
                     }
-                    let which = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    let mut w_which = args[0];
+                    let mut w_seconds = args[1];
+                    let mut w_interval = if args.len() >= 3 {
+                        args[2]
+                    } else {
+                        pyre_object::PY_NULL
+                    };
+                    let which = (unsafe { pyre_object::w_int_get_value(w_which) }) as i32;
                     let read_f = |o: pyre_object::PyObjectRef| -> f64 {
                         unsafe {
                             if pyre_object::is_float(o) {
@@ -1297,17 +1309,17 @@ pub fn register_module(
                         }
                     };
                     let mut new_value = libc::itimerval {
-                        it_value: timeval_from_double(read_f(args[1])),
-                        it_interval: if args.len() >= 3 {
-                            timeval_from_double(read_f(args[2]))
-                        } else {
+                        it_value: timeval_from_double(read_f(w_seconds)),
+                        it_interval: if w_interval.is_null() {
                             timeval_from_double(0.0)
+                        } else {
+                            timeval_from_double(read_f(w_interval))
                         },
                     };
                     let mut old = unsafe { std::mem::zeroed::<libc::itimerval>() };
-                    let ret = unsafe {
+                    let ret = pyre_object::with_roots!(w_which, w_seconds, w_interval => unsafe {
                         majit_rlib::rsignal::c_setitimer(which, &mut new_value, &mut old)
-                    };
+                    });
                     if ret != 0 {
                         return Err(errno_exception(
                             "signal.ItimerError",
@@ -1344,9 +1356,12 @@ pub fn register_module(
                                 "getitimer() requires 1 argument",
                             ));
                         }
-                        let which = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                        let mut w_which = args[0];
+                        let which = (unsafe { pyre_object::w_int_get_value(w_which) }) as i32;
                         let mut old = unsafe { std::mem::zeroed::<libc::itimerval>() };
-                        let _ = unsafe { majit_rlib::rsignal::c_getitimer(which, &mut old) };
+                        let _ = pyre_object::with_roots!(w_which => unsafe {
+                            majit_rlib::rsignal::c_getitimer(which, &mut old)
+                        });
                         Ok(itimer_retval(&old))
                     }
                     #[cfg(not(feature = "host_env"))]
@@ -1430,11 +1445,14 @@ pub fn register_module(
                                 "sigwait() takes exactly one argument (0 given)",
                             ));
                         }
-                        let mut set = fill_sigset(args[0])?;
+                        let mut w_sigset = args[0];
+                        let mut set = pyre_object::with_roots!(w_sigset => fill_sigset(w_sigset))?;
                         let mut signum: libc::c_int = 0;
                         // interp_signal.sigwait — `rsignal.c_sigwait` returns
                         // the error number (`releasegil=True`).
-                        let ret = unsafe { majit_rlib::rsignal::c_sigwait(&mut set, &mut signum) };
+                        let ret = pyre_object::with_roots!(w_sigset => unsafe {
+                            majit_rlib::rsignal::c_sigwait(&mut set, &mut signum)
+                        });
                         if ret != 0 {
                             return Err(errno_exception("OSError", ret));
                         }

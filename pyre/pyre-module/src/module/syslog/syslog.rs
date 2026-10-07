@@ -136,7 +136,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function("syslog", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
-                let (priority, msg_obj) = if args.len() >= 2 {
+                let (priority, mut w_msg) = if args.len() >= 2 {
                     if !unsafe { pyre_object::is_int(args[0]) } {
                         return Err(pyre_interpreter::PyError::type_error(
                             "syslog(): priority must be an integer",
@@ -151,12 +151,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 } else {
                     return Err(pyre_interpreter::PyError::type_error("syslog() requires a message"));
                 };
-                if !unsafe { pyre_object::is_str(msg_obj) } {
+                if !unsafe { pyre_object::is_str(w_msg) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "syslog(): message must be a string",
                     ));
                 }
-                let msg = pyre_interpreter::baseobjspace::str_utf8_w(msg_obj)?;
+                let msg = pyre_object::with_roots!(w_msg => {
+                    pyre_interpreter::baseobjspace::str_utf8_w(w_msg)
+                })?;
                 if let Ok(cmsg) = std::ffi::CString::new(msg) {
                     // `lib_pypy/syslog.py` — auto-call openlog() with
                     // a NULL ident (libc falls back to argv[0]) so the
@@ -167,9 +169,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         {
                             let mut held = S_IDENT_O.lock().unwrap();
                             *held = None;
-                            unsafe {
+                            pyre_object::with_roots!(w_msg => unsafe {
                                 ll::c_openlog(std::ptr::null_mut(), 0, libc::LOG_USER);
-                            }
+                            });
                         }
                         #[cfg(feature = "sandbox")]
                         {
@@ -178,13 +180,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     #[cfg(not(feature = "sandbox"))]
-                    unsafe {
+                    pyre_object::with_roots!(w_msg => unsafe {
                         ll::c_syslog(
                             priority,
                             "%s\0".as_ptr() as majit_rlib::rffi::CCHARP,
                             cmsg.as_ptr() as majit_rlib::rffi::CCHARP,
                         );
-                    }
+                    });
                     #[cfg(feature = "sandbox")]
                     {
                         rustpython_host_env::syslog::syslog(priority, &cmsg);

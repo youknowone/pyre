@@ -140,9 +140,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    let who = if let Some(&a) = args.first() {
+                    let mut w_who = if let Some(&a) = args.first() {
                         if unsafe { pyre_object::is_int(a) } {
-                            unsafe { pyre_object::w_int_get_value(a) as i32 }
+                            a
                         } else {
                             return Err(pyre_interpreter::PyError::type_error(
                                 "getrusage(): who should be an integer",
@@ -153,13 +153,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "getrusage() missing argument",
                         ));
                     };
+                    let who = unsafe { pyre_object::w_int_get_value(w_who) as i32 };
                     // `rtime.c_getrusage` (`releasegil=False`, no `save_err`).
                     // This is `resource.getrusage`, not `time.clock`.
                     #[cfg(not(feature = "sandbox"))]
                     {
                         let mut ru =
                             unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
-                        let ret = unsafe { majit_rlib::rtime::c_getrusage(who, &mut ru) };
+                        let ret = pyre_object::with_roots!(w_who => unsafe {
+                            majit_rlib::rtime::c_getrusage(who, &mut ru)
+                        });
                         if ret == -1 {
                             let errno = majit_rlib::rposix::_get_errno();
                             // `lib_pypy/resource.py getrusage` raises ValueError for
@@ -220,9 +223,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    let res = if let Some(&a) = args.first() {
+                    let mut w_res = if let Some(&a) = args.first() {
                         if unsafe { pyre_object::is_int(a) } {
-                            unsafe { pyre_object::w_int_get_value(a) as libc::rlim_t }
+                            a
                         } else {
                             return Err(pyre_interpreter::PyError::type_error(
                                 "getrlimit(): resource should be an integer",
@@ -233,12 +236,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "getrlimit() missing argument",
                         ));
                     };
+                    let res = unsafe { pyre_object::w_int_get_value(w_res) as libc::rlim_t };
                     #[cfg(not(feature = "sandbox"))]
                     {
                         let mut rl = unsafe { std::mem::zeroed::<libc::rlimit>() };
-                        let ret = unsafe {
+                        let ret = pyre_object::with_roots!(w_res => unsafe {
                             ll::c_getrlimit(res as majit_rlib::rffi::INT, &mut rl)
-                        };
+                        });
                         if ret == -1 {
                             let errno = majit_rlib::rposix::_get_errno();
                             let e = std::io::Error::from_raw_os_error(errno);
@@ -293,13 +297,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "setrlimit() requires 2 arguments",
                         ));
                     }
+                    let mut w_res = args[0];
                     let res = unsafe {
-                        if !pyre_object::is_int(args[0]) {
+                        if !pyre_object::is_int(w_res) {
                             return Err(pyre_interpreter::PyError::type_error(
                                 "setrlimit(): resource should be an integer",
                             ));
                         }
-                        pyre_object::w_int_get_value(args[0]) as libc::rlim_t
+                        pyre_object::w_int_get_value(w_res) as libc::rlim_t
                     };
                     // `lib_pypy/resource.py setrlimit` — `soft, hard = limits;
                     // soft = int(soft); hard = int(hard)`.  Accept any
@@ -307,7 +312,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // (PyPy unpacks via Python iteration; pyre's surface
                     // covers the two concrete sequence shapes callers
                     // actually use).
-                    let (w_soft, mut w_hard) = unsafe {
+                    let (mut w_soft, mut w_hard) = unsafe {
                         if pyre_object::is_tuple(args[1]) && pyre_object::w_tuple_len(args[1]) == 2
                         {
                             (
@@ -327,17 +332,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             ));
                         }
                     };
-                    let soft = pyre_object::with_roots!(w_hard => pyre_interpreter::baseobjspace::int_w(w_soft))? as libc::rlim_t;
-                    let hard = pyre_interpreter::baseobjspace::int_w(w_hard)? as libc::rlim_t;
+                    let soft = pyre_object::with_roots!(w_res, w_soft, w_hard => pyre_interpreter::baseobjspace::int_w(w_soft))? as libc::rlim_t;
+                    let hard = pyre_object::with_roots!(w_res, w_soft, w_hard => pyre_interpreter::baseobjspace::int_w(w_hard))? as libc::rlim_t;
                     let rl = libc::rlimit {
                         rlim_cur: soft,
                         rlim_max: hard,
                     };
                     #[cfg(not(feature = "sandbox"))]
                     {
-                        let ret = unsafe {
+                        let ret = pyre_object::with_roots!(w_res, w_soft, w_hard => unsafe {
                             ll::c_setrlimit(res as majit_rlib::rffi::INT, &rl)
-                        };
+                        });
                         if ret == -1 {
                             // `lib_pypy/resource.py setrlimit` — EINVAL and
                             // EPERM both surface as ValueError with

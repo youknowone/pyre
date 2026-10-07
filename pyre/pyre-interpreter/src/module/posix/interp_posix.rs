@@ -4960,18 +4960,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             // One resolution yields both the path and its bytes-ness, so
             // `__fspath__` runs exactly once. The omitted argument is the same
             // `None` the signature names, which resolves to `"."` there.
-            let arg = bound[0].unwrap_or(pyre_object::w_none());
-            let resolved =
-                crate::gateway::fsencode_path_or_fd_nullable_w(arg, "listdir", HAVE_FDOPENDIR)?;
+            let mut w_arg = bound[0].unwrap_or(pyre_object::w_none());
+            let path_roots = pyre_object::gc_roots::push_roots();
+            let path_base = path_roots.pin_roots(&[w_arg]);
+            let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(
+                path_roots.get(path_base),
+                "listdir",
+                HAVE_FDOPENDIR,
+            );
+            w_arg = path_roots.get(path_base);
+            let resolved = resolved?;
             // A descriptor names no directory to prefix and is not `bytes`, so
             // its names come back as `str` whatever the caller held
             // (`interp_posix.py:1112-1121`).
             #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
             if resolved.is_fd {
                 // The descriptor is what named the directory, so it is what
-                // names the failure.
-                let names = fdlistdir(resolved.as_fd)
-                    .map_err(|errno| errno_err_with_filename(errno, resolved.w_path()))?;
+                // names the failure. `c_dup_noninheritable` / `c_fdopendir`
+                // release the GIL (`rposix.dup` / `c_fdopendir`).
+                let mut w_path = resolved.w_path();
+                let names = pyre_object::with_roots!(w_path, w_arg => fdlistdir(resolved.as_fd))
+                    .map_err(|errno| errno_err_with_filename(errno, w_path))?;
                 // Each name is freshly allocated and the next one allocates
                 // again, so they are pinned as they arrive.
                 let mut items = pyre_object::gc_roots::RootedItems::new();
@@ -4996,7 +5005,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
             {
                 let mut w_path = w_path();
-                let names = pyre_object::with_roots!(w_path => path_listdir(path))
+                let names = pyre_object::with_roots!(w_path, w_arg => path_listdir(path))
                     .map_err(|errno| errno_err_with_filename(errno, w_path))?;
                 let mut items = pyre_object::gc_roots::RootedItems::new();
                 for n in &names {
@@ -5090,7 +5099,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // `__index__` conversion, so a non-integer is a TypeError
                 // instead of a raw field read that asks for an arbitrary
                 // number of bytes.
-                let n = crate::builtins::space_index_w(args[0])?;
+                let mut w_n = args[0];
+                let n = pyre_object::with_roots!(w_n => crate::builtins::space_index_w(w_n))?;
                 if n < 0 {
                     return Err(crate::PyError::value_error("negative argument not allowed"));
                 }
@@ -5118,7 +5128,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 }
                             }
                         };
-                        majit_rlib::rurandom::urandom(n, Some(&mut checker))
+                        pyre_object::with_roots!(w_n => {
+                            majit_rlib::rurandom::urandom(n, Some(&mut checker))
+                        })
                     };
                     match outcome {
                         Ok(buf) => buf,
@@ -6903,9 +6915,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // One resolution yields both the path and its bytes-ness, so
         // `__fspath__` runs exactly once. The omitted argument is the same
         // `None` the signature names, which resolves to `"."` there.
-        let arg = bound[0].unwrap_or(pyre_object::w_none());
-        let resolved =
-            crate::gateway::fsencode_path_or_fd_nullable_w(arg, "scandir", HAVE_FDOPENDIR)?;
+        let mut w_arg = bound[0].unwrap_or(pyre_object::w_none());
+        let path_roots = pyre_object::gc_roots::push_roots();
+        let path_base = path_roots.pin_roots(&[w_arg]);
+        let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(
+            path_roots.get(path_base),
+            "scandir",
+            HAVE_FDOPENDIR,
+        );
+        w_arg = path_roots.get(path_base);
+        let resolved = resolved?;
         let bytes_mode = unsafe { resolved.is_bytes() };
         let path = resolved.as_bytes.as_slice();
         let w_path = || resolved.w_path();
@@ -6934,10 +6953,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // `path` is its bare `name`, and a descriptor is not `bytes`,
                 // so both come back as `str`. Every entry records the
                 // descriptor so its own stat resolves the bare name against it.
-                fd_readdir(fd, |name, ino, d_type| {
-                    scandir_push_entry(list_slot, false, name, name, fd, ino, d_type);
+                let mut w_path = w_path();
+                pyre_object::with_roots!(w_path, w_arg => {
+                    fd_readdir(fd, |name, ino, d_type| {
+                        scandir_push_entry(list_slot, false, name, name, fd, ino, d_type);
+                    })
                 })
-                .map_err(|errno| errno_err_with_filename(errno, w_path()))?;
+                .map_err(|errno| errno_err_with_filename(errno, w_path))?;
             }
             // A name is enumerated through `opendir`/`readdir` so each entry
             // carries the `d_ino` and `d_type` the dirent reports
@@ -6949,22 +6971,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let c_path = std::ffi::CString::new(path)
                     .map_err(|_| crate::PyError::value_error("embedded null byte"))?;
                 // `rposix.c_opendir` releases the GIL and saves errno.
-                let dirp = unsafe { majit_rlib::rposix::c_opendir(c_path.as_ptr()) };
+                let mut w_path = w_path();
+                let dirp = pyre_object::with_roots!(w_path, w_arg => unsafe {
+                    majit_rlib::rposix::c_opendir(c_path.as_ptr())
+                });
                 if dirp.is_null() {
                     return Err(errno_err_with_filename(
                         majit_rlib::rposix::get_saved_errno(),
-                        w_path(),
+                        w_path,
                     ));
                 }
-                let errno = readdir_collect(dirp, |name, ino, d_type| {
-                    let full = join_dir_name(path, name);
-                    scandir_push_entry(list_slot, bytes_mode, name, &full, -1, ino, d_type);
+                let errno = pyre_object::with_roots!(w_path, w_arg => {
+                    readdir_collect(dirp, |name, ino, d_type| {
+                        let full = join_dir_name(path, name);
+                        scandir_push_entry(list_slot, bytes_mode, name, &full, -1, ino, d_type);
+                    })
                 });
                 unsafe {
                     let _ = majit_rlib::rposix::c_closedir(dirp);
                 }
                 if errno != 0 {
-                    return Err(errno_err_with_filename(errno, w_path()));
+                    return Err(errno_err_with_filename(errno, w_path));
                 }
             }
             // `FindFirstFileW` reports each entry's whole `WIN32_FIND_DATAW`,
@@ -7515,7 +7542,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // The path names itself; the argv entries below do not,
                     // because each of those is converted on the sequence's
                     // behalf rather than as an argument of its own.
-                    let w_path = args[0];
+                    let mut w_path = args[0];
                     let mut w_argv = args[1];
                     let command = pyre_object::with_roots!(w_argv =>
                         crate::gateway::fsencode_path_named_w(w_path, "execv", "path")
@@ -7523,13 +7550,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
-                    let argv = exec_argv(w_argv, "execv")?;
+                    let argv = pyre_object::with_roots!(w_path => exec_argv(w_argv, "execv"))?;
                     let argv_ptrs = exec_pointer_array(&argv);
                     // `rposix.c_execv` releases the GIL and saves errno.
                     // The call returns only on failure.
-                    unsafe {
+                    pyre_object::with_roots!(w_path, w_argv => unsafe {
                         majit_rlib::rposix::c_execv(command_c.as_ptr(), argv_ptrs.as_ptr());
-                    }
+                    });
                     let errno = majit_rlib::rposix::get_saved_errno();
                     // interp_posix.py:1814-1817 uses `wrap_oserror`, which does
                     // not attach the command path.
@@ -7547,7 +7574,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
-                    let w_path = args[0];
+                    let mut w_path = args[0];
                     let mut w_argv = args[1];
                     let mut w_env = args[2];
                     let command = pyre_object::with_roots!(w_argv, w_env =>
@@ -7556,10 +7583,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execve() path contains an embedded null byte")
                     })?;
-                    let argv = pyre_object::with_roots!(w_env => exec_argv(w_argv, "execve"))?;
+                    let argv = pyre_object::with_roots!(w_path, w_env => exec_argv(w_argv, "execve"))?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
-                    let env = collect_env_entries(w_env, "execve", false)?
+                    let env = pyre_object::with_roots!(w_path, w_argv => {
+                        collect_env_entries(w_env, "execve", false)
+                    })?
                         .into_iter()
                         .map(|entry| {
                             std::ffi::CString::new(entry).map_err(|_| {
@@ -7572,13 +7601,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let env_ptrs = exec_pointer_array(&env);
                     // `rposix.c_execve` releases the GIL and saves errno.
                     // The call returns only on failure.
-                    unsafe {
+                    pyre_object::with_roots!(w_path, w_argv, w_env => unsafe {
                         majit_rlib::rposix::c_execve(
                             command_c.as_ptr(),
                             argv_ptrs.as_ptr(),
                             env_ptrs.as_ptr(),
                         );
-                    }
+                    });
                     let errno = majit_rlib::rposix::get_saved_errno();
                     // `interp_posix.py:1812,1817` wraps the failure with
                     // `wrap_oserror`, which names no file, so the path stays
@@ -8087,10 +8116,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             "setgroups() requires 1 argument",
                         ));
                     };
+                    let mut w_list = w_list;
                     // interp_posix.py:1053-1064 — the list is unpacked as any
                     // iterable and each element read with `c_uid_t_w`, which is
                     // what lets -1 name `(gid_t)-1` instead of being refused.
-                    let items = crate::builtins::collect_iterable(w_list)?;
+                    let items = pyre_object::with_roots!(w_list => {
+                        crate::builtins::collect_iterable(w_list)
+                    })?;
                     // `c_uid_t_w` reaches `__index__` for a non-int entry, so
                     // converting one entry can collect and move the entries not
                     // yet converted -- `collect_iterable` hands back a plain
@@ -8103,7 +8135,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         let w_gid = pyre_object::gc_roots::shadow_stack_get(items_base + offset);
                         groups.push(crate::baseobjspace::c_uid_t_w(w_gid)?);
                     }
-                    host_setgroups(&groups).map_err(|e| io_err(e, ""))?;
+                    pyre_object::with_roots!(w_list => host_setgroups(&groups))
+                        .map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -9164,12 +9197,24 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     // interp_posix.py dispatches `rposix.chdir` with
                     // `allow_fd_fn=os.fchdir` when `rposix.HAVE_FCHDIR`.
-                    let path =
-                        crate::gateway::fsencode_path_or_fd_w(args[0], "chdir", HAVE_FCHDIR)?;
+                    // The path owns a bracket of its own, above this one; this
+                    // one stays open until the path is gone.
+                    let mut w_path = args[0];
+                    let path_roots = pyre_object::gc_roots::push_roots();
+                    let path_base = path_roots.pin_roots(&[w_path]);
+                    let path = crate::gateway::fsencode_path_or_fd_w(
+                        path_roots.get(path_base),
+                        "chdir",
+                        HAVE_FCHDIR,
+                    );
+                    w_path = path_roots.get(path_base);
+                    let path = path?;
                     if path.is_fd {
                         // `rposix.c_fchdir` releases the GIL and saves errno.
                         // `interp_posix.chdir` dispatches an fd through `os.fchdir`.
-                        let ret = unsafe { majit_rlib::rposix::c_fchdir(path.as_fd) };
+                        let ret = pyre_object::with_roots!(w_path => unsafe {
+                            majit_rlib::rposix::c_fchdir(path.as_fd)
+                        });
                         if ret < 0 {
                             return Err(io_err(
                                 std::io::Error::from_raw_os_error(
@@ -9183,7 +9228,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     // `rposix.c_chdir` releases the GIL and saves errno.
-                    let ret = unsafe { majit_rlib::rposix::c_chdir(c_path.as_ptr()) };
+                    let ret = pyre_object::with_roots!(w_path => unsafe {
+                        majit_rlib::rposix::c_chdir(c_path.as_ptr())
+                    });
                     if ret < 0 {
                         return Err(errno_err_with_filename(
                             majit_rlib::rposix::get_saved_errno(),
@@ -9209,11 +9256,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interp_posix.py `fchdir(space, w_fd)` unwraps
                     // through `space.c_filedescriptor_w`, which takes an int or
                     // anything exposing `fileno()`.
-                    let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                    let mut w_fd = args[0];
+                    let fd = pyre_object::with_roots!(w_fd => {
+                        crate::baseobjspace::c_filedescriptor_w(w_fd)
+                    })?;
                     // `interp_posix.fchdir`: retry on EINTR. `rposix.c_fchdir`
                     // releases the GIL and saves errno.
                     loop {
-                        let ret = unsafe { majit_rlib::rposix::c_fchdir(fd) };
+                        let ret = pyre_object::with_roots!(w_fd => unsafe {
+                            majit_rlib::rposix::c_fchdir(fd)
+                        });
                         if ret == 0 {
                             break;
                         }
@@ -12581,23 +12633,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_int_new(pid as i64))
             }
             fn collect_spawn_env(
-                mapping: pyre_object::PyObjectRef,
+                mut mapping: pyre_object::PyObjectRef,
             ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
                 // Inherit snapshot is `rposix_environ.envitems_llimpl` so it
                 // shares the keepalive mutex with `putenv_llimpl`.
                 let entries = if unsafe { pyre_object::is_none(mapping) } {
-                    majit_rlib::rposix_environ::envitems_llimpl()
-                        .into_iter()
-                        .map(|(key, value)| {
-                            let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
-                            entry.extend_from_slice(&key);
-                            entry.push(b'=');
-                            entry.extend_from_slice(&value);
-                            entry
-                        })
-                        .collect()
+                    pyre_object::with_roots!(mapping => {
+                        majit_rlib::rposix_environ::envitems_llimpl()
+                    })
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
+                        entry.extend_from_slice(&key);
+                        entry.push(b'=');
+                        entry.extend_from_slice(&value);
+                        entry
+                    })
+                    .collect()
                 } else {
-                    collect_env_entries(mapping, "posix_spawn", true)?
+                    pyre_object::with_roots!(mapping => {
+                        collect_env_entries(mapping, "posix_spawn", true)
+                    })?
                 };
                 entries
                     .into_iter()
@@ -15882,6 +15938,20 @@ mod xattr_filename_tests {
         let filename = crate::baseobjspace::str_utf8_w(path.w_path()).expect("filename is a str");
         assert_eq!(filename, "/missing/getxattr-path");
         let filename = crate::baseobjspace::str_utf8_w(wrapped).expect("held path is a str");
+        assert_eq!(filename, "/missing/getxattr-path");
+    }
+
+    /// `OSErrorTests.test_oserror_filename`: `os.setxattr(<missing path>,
+    /// "user.test", b'user')` must report the path as `OSError.filename`.
+    #[test]
+    fn setxattr_oserror_filename_is_the_path() {
+        crate::typedef::init_typeobjects();
+        let mut w_path = pyre_object::w_str_new("/missing/getxattr-path");
+        let mut w_attribute = pyre_object::w_str_new("user.test");
+        let (_roots, path, _attribute) =
+            super::fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "setxattr")
+                .expect("str path and attribute convert");
+        let filename = crate::baseobjspace::str_utf8_w(path.w_path()).expect("filename is a str");
         assert_eq!(filename, "/missing/getxattr-path");
     }
 }
