@@ -1397,7 +1397,14 @@ fn analyze_pipeline_from_module_paths(
         let mut entries: Vec<_> = program.struct_field_attrs.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (qualified, fields) in entries {
-            crate::annotator::classdesc::register_struct_fields(qualified, fields);
+            let layout = program
+                .struct_fields
+                .fields
+                .get(qualified)
+                .map(Vec::as_slice);
+            crate::annotator::classdesc::register_struct_fields_with_layout(
+                qualified, fields, layout,
+            );
         }
     }
     mark_phase!("build_semantic_program_from_parsed_files");

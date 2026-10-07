@@ -6768,6 +6768,12 @@ pub struct ListIteratorRepr {
     /// `mutated`, so `rtype_next` gates the foldable read on
     /// `list_is_fixed && foldable`.
     foldable: bool,
+    /// Header field `ll_listnext` reads for length (`"length"` on
+    /// `ListRepr`, `"len"` on a `RustVec` header).
+    length_field: &'static str,
+    /// Header field `ll_listnext` reads for the item array (`"items"` on
+    /// `ListRepr`, `"ptr"` on a `RustVec` header).
+    items_field: &'static str,
 }
 
 impl ListIteratorRepr {
@@ -6777,6 +6783,29 @@ impl ListIteratorRepr {
         external_item_repr: Arc<dyn Repr>,
         list_is_fixed: bool,
         foldable: bool,
+    ) -> Result<Self, TyperError> {
+        Self::new_with_header_fields(
+            list_lltype,
+            item_repr,
+            external_item_repr,
+            list_is_fixed,
+            foldable,
+            "length",
+            "items",
+        )
+    }
+
+    /// Same iterator layout as [`Self::new`], reading a raw header whose
+    /// length/items fields are not the list struct's `"length"` / `"items"`.
+    /// `RustVecRepr.make_iterator_repr` uses this for `{ptr, len, cap}`.
+    pub fn new_with_header_fields(
+        list_lltype: LowLevelType,
+        item_repr: Arc<dyn Repr>,
+        external_item_repr: Arc<dyn Repr>,
+        list_is_fixed: bool,
+        foldable: bool,
+        length_field: &'static str,
+        items_field: &'static str,
     ) -> Result<Self, TyperError> {
         // upstream `Ptr(GcStruct('listiter', ('list', r_list.lowleveltype),
         // ('index', Signed)))`.
@@ -6798,6 +6827,8 @@ impl ListIteratorRepr {
             external_item_repr,
             list_is_fixed,
             foldable,
+            length_field,
+            items_field,
         })
     }
 }
@@ -7002,6 +7033,8 @@ impl Repr for ListIteratorRepr {
         let iter_for_builder = iter_lltype.clone();
         let list_for_builder = list_lltype.clone();
         let item_for_builder = item_lltype.clone();
+        let length_field = self.length_field;
+        let items_field = self.items_field;
         let helper = hop.rtyper.lowlevel_helper_function_with_builder(
             helper_name.to_string(),
             vec![iter_lltype],
@@ -7014,6 +7047,8 @@ impl Repr for ListIteratorRepr {
                     item_for_builder.clone(),
                     list_is_fixed,
                     foldable,
+                    length_field,
+                    items_field,
                 )
             },
         )?;
@@ -7161,23 +7196,25 @@ pub(crate) fn build_ll_listnext_helper_graph(
     item_lltype: LowLevelType,
     list_is_fixed: bool,
     foldable: bool,
+    length_field: &str,
+    items_field: &str,
 ) -> Result<PyGraph, TyperError> {
-    // The resized list keeps its element array in the "items" field; the
+    // The resized list keeps its element array in `items_field`; the
     // fixed list IS the bare `Ptr(GcArray)`.
     let items_lltype = if list_is_fixed {
         None
     } else {
         let extracted = match &list_lltype {
             LowLevelType::Ptr(p) => match &p.TO {
-                PtrTarget::Struct(s) => s._flds.get("items").cloned(),
+                PtrTarget::Struct(s) => s._flds.get(items_field).cloned(),
                 _ => None,
             },
             _ => None,
         };
         Some(extracted.ok_or_else(|| {
-            TyperError::message(
-                "build_ll_listnext_helper_graph: resized list lltype missing items field",
-            )
+            TyperError::message(format!(
+                "build_ll_listnext_helper_graph: resized list lltype missing {items_field} field"
+            ))
         })?)
     };
 
@@ -7227,7 +7264,10 @@ pub(crate) fn build_ll_listnext_helper_graph(
         } else {
             b.operations.push(SpaceOperation::new(
                 "getfield",
-                vec![Hlvalue::Variable(v_l.clone()), void_field_const("length")],
+                vec![
+                    Hlvalue::Variable(v_l.clone()),
+                    void_field_const(length_field),
+                ],
                 Hlvalue::Variable(v_len.clone()),
             ));
         }
@@ -7305,7 +7345,10 @@ pub(crate) fn build_ll_listnext_helper_graph(
             let v_items = variable_with_lltype("items", items_lltype);
             b.operations.push(SpaceOperation::new(
                 "getfield",
-                vec![Hlvalue::Variable(c_l.clone()), void_field_const("items")],
+                vec![
+                    Hlvalue::Variable(c_l.clone()),
+                    void_field_const(items_field),
+                ],
                 Hlvalue::Variable(v_items.clone()),
             ));
             b.operations.push(SpaceOperation::new(
@@ -9495,6 +9538,8 @@ mod tests {
             LowLevelType::Signed,
             true,
             false,
+            "length",
+            "items",
         )
         .expect("build_ll_listnext_helper_graph");
         let graph = pygraph.graph.borrow();
@@ -9571,6 +9616,8 @@ mod tests {
             LowLevelType::Signed,
             true,
             true,
+            "length",
+            "items",
         )
         .expect("build_ll_listnext_helper_graph");
         let graph = pygraph.graph.borrow();
@@ -9617,6 +9664,8 @@ mod tests {
             LowLevelType::Signed,
             false,
             false,
+            "length",
+            "items",
         )
         .expect("build_ll_listnext_helper_graph");
         let graph = pygraph.graph.borrow();

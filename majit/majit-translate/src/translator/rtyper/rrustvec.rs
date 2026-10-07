@@ -24,8 +24,9 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
+use crate::translator::rtyper::rlist::ListIteratorRepr;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, inputconst_from_lltype};
-use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp};
+use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList};
 
 /// Struct hint marking the `RustVec` header lltype.
 pub const RUST_VEC_HINT: &str = "rust_vec";
@@ -179,6 +180,33 @@ impl Repr for RustVecRepr {
         super::pairtype::ReprClassId::RustVecRepr
     }
 
+    /// Same iterator as a resized list: `ListIteratorRepr` over the header
+    /// pointer, reading `len` / `ptr` instead of `length` / `items`.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
+    )]
+    fn make_iterator_repr(
+        &self,
+        variant: &[String],
+        foldable: bool,
+    ) -> Result<Arc<dyn Repr>, TyperError> {
+        if !variant.is_empty() {
+            return Err(TyperError::missing_rtype_operation(
+                "RustVecRepr.make_iterator_repr: non-default variant (reversed) deferred",
+            ));
+        }
+        Ok(Arc::new(ListIteratorRepr::new_with_header_fields(
+            self.lltype.clone(),
+            self.item_repr.clone(),
+            self.item_repr.clone(),
+            false,
+            foldable,
+            "len",
+            "ptr",
+        )?))
+    }
+
     /// `ll_length`.
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         let v = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
@@ -304,6 +332,28 @@ impl Repr for RustVecRepr {
             _ => Err(self.missing_rtype_operation(&format!("method_{method_name}"))),
         }
     }
+}
+
+/// `r_uint` of a `Vec` header is the header address as an integer.
+/// RPython `lltype.cast_ptr_to_int` of a raw pointer.
+pub fn pair_rustvec_integer_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let _ = r_from;
+    match r_to.lowleveltype() {
+        LowLevelType::Unsigned | LowLevelType::Signed => {}
+        _ => return Ok(None),
+    }
+    Ok(llops
+        .genop(
+            "cast_ptr_to_int",
+            vec![v.clone()],
+            GenopResult::LLType(r_to.lowleveltype().clone()),
+        )
+        .map(Hlvalue::Variable))
 }
 
 /// `newrustvec(kind)` / `newrustvec(kind, lengthhint)` — `ll_newemptylist` /
