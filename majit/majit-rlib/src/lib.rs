@@ -38,6 +38,10 @@ pub mod rsocket;
 #[cfg(unix)]
 pub mod rtermios;
 pub mod rthread;
+#[cfg(unix)]
+pub mod rtime;
+#[cfg(unix)]
+pub mod rurandom;
 pub mod rvmprof;
 #[cfg(target_os = "windows")]
 #[allow(non_snake_case)]

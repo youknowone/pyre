@@ -9,7 +9,11 @@ use pyre_object::*;
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
 
-#[cfg(feature = "host_env")]
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    any(not(unix), feature = "sandbox")
+))]
 use rustpython_host_env::time as host_time;
 use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
@@ -113,6 +117,42 @@ fn monotonic_baseline() -> Instant {
     *BASELINE.get_or_init(Instant::now)
 }
 
+/// `interp_time._timespec_to_seconds`.
+#[cfg(all(unix, feature = "host_env"))]
+fn timespec_to_seconds(ts: &libc::timespec) -> f64 {
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+}
+
+/// `interp_time._timespec_to_nanoseconds`.
+#[cfg(all(unix, feature = "host_env"))]
+fn timespec_to_nanos_i128(ts: &libc::timespec) -> i128 {
+    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
+}
+
+/// `rtime.c_clock_gettime` into a `TIMESPEC`.
+#[cfg(all(unix, feature = "host_env"))]
+fn clock_gettime_timespec(clk: libc::clockid_t) -> Result<libc::timespec, i32> {
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    let ret = unsafe { majit_rlib::rtime::c_clock_gettime(clk as _, &mut ts) };
+    if ret != 0 {
+        return Err(majit_rlib::rposix::get_saved_errno());
+    }
+    Ok(ts)
+}
+
+/// Monotonic reading as a `Duration`, for sleep deadlines.
+#[cfg(all(unix, feature = "host_env"))]
+fn clock_monotonic_duration() -> Option<std::time::Duration> {
+    let ts = clock_gettime_timespec(libc::CLOCK_MONOTONIC).ok()?;
+    if ts.tv_sec < 0 {
+        return None;
+    }
+    Some(std::time::Duration::new(
+        ts.tv_sec as u64,
+        ts.tv_nsec as u32,
+    ))
+}
+
 fn monotonic_seconds() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -122,8 +162,8 @@ fn monotonic_seconds() -> f64 {
     {
         #[cfg(all(unix, feature = "host_env"))]
         {
-            if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
-                return d.as_secs_f64();
+            if let Ok(ts) = clock_gettime_timespec(libc::CLOCK_MONOTONIC) {
+                return timespec_to_seconds(&ts);
             }
         }
         monotonic_baseline().elapsed().as_secs_f64()
@@ -146,10 +186,26 @@ pub fn duration_since_epoch() -> std::time::Duration {
         let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
         std::time::Duration::from_secs_f64(secs)
     }
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    {
+        // `rtime.time` / `interp_time._gettimeofday_impl`.
+        let mut tv = unsafe { std::mem::zeroed::<libc::timeval>() };
+        let tz = std::ptr::null_mut::<libc::timezone>();
+        let errcode = unsafe { majit_rlib::rtime::c_gettimeofday(&mut tv, tz) };
+        if errcode == 0 && tv.tv_sec >= 0 {
+            return std::time::Duration::new(
+                tv.tv_sec as u64,
+                (tv.tv_usec as u32).saturating_mul(1000),
+            );
+        }
+        let t = unsafe { majit_rlib::rtime::c_time(std::ptr::null_mut()) };
+        std::time::Duration::from_secs(t.max(0) as u64)
+    }
     #[cfg(all(
         feature = "host_env",
         not(feature = "sandbox"),
-        not(target_arch = "wasm32")
+        not(target_arch = "wasm32"),
+        not(unix)
     ))]
     {
         host_time::duration_since_system_now().unwrap_or_default()
@@ -291,31 +347,40 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         // `interp_time.py time_sleep` — sleep toward a monotonic
-        // deadline; on EINTR deliver any pending signal and retry with the
-        // remaining time, breaking once the deadline has passed.
-        let deadline = std::time::Instant::now() + dur;
+        // deadline from `rtime.c_clock_gettime(CLOCK_MONOTONIC)`; on EINTR
+        // deliver any pending signal and retry with the remaining time,
+        // breaking once the deadline has passed.
+        let now = clock_monotonic_duration().unwrap_or_else(|| monotonic_baseline().elapsed());
+        let deadline = now + dur;
         let mut remaining = dur;
         loop {
             let slept = {
                 let _blocking = crate::module::thread::before_external_block();
-                host_time::nanosleep(remaining)
+                let mut ts = libc::timespec {
+                    tv_sec: remaining.as_secs() as libc::time_t,
+                    tv_nsec: remaining.subsec_nanos() as libc::c_long,
+                };
+                // `interp_time.nanosleep` — GIL already left by
+                // `before_external_block`; `rtime.c_nanosleep` saves errno.
+                unsafe { majit_rlib::rtime::c_nanosleep(&mut ts, std::ptr::null_mut()) }
             };
-            match slept {
-                Ok(()) => return Ok(w_none()),
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        return Ok(w_none());
-                    }
-                    remaining = deadline - now;
+            if slept == 0 {
+                return Ok(w_none());
+            }
+            let errno = majit_rlib::rposix::get_saved_errno();
+            if errno == libc::EINTR {
+                crate::module::signal::interp_signal::checksignals_now()?;
+                let now =
+                    clock_monotonic_duration().unwrap_or_else(|| monotonic_baseline().elapsed());
+                if now >= deadline {
+                    return Ok(w_none());
                 }
-                Err(e) => {
-                    return Err(crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("sleep: {e}"),
-                    ));
-                }
+                remaining = deadline - now;
+            } else {
+                return Err(crate::PyError::os_error_with_errno(
+                    errno,
+                    format!("sleep: {}", std::io::Error::from_raw_os_error(errno)),
+                ));
             }
         }
     }
@@ -362,8 +427,8 @@ pub(crate) fn monotonic_nanos() -> i128 {
     {
         #[cfg(all(unix, feature = "host_env"))]
         {
-            if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
-                return d.as_nanos() as i128;
+            if let Ok(ts) = clock_gettime_timespec(libc::CLOCK_MONOTONIC) {
+                return timespec_to_nanos_i128(&ts);
             }
         }
         monotonic_baseline().elapsed().as_nanos() as i128
@@ -446,6 +511,9 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 ("clock_gettime(CLOCK_MONOTONIC)", true, false)
             }
         }
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        "process_time" => ("clock_gettime(CLOCK_PROF)", true, false),
+        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
         "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
         // `interp_time.py` gates `thread_time` on HAS_THREAD_TIME; describe
         // it only where the platform carries CLOCK_THREAD_CPUTIME_ID and the
@@ -483,16 +551,6 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_none())
 }
 
-/// A clock `Duration` in seconds the way `_timespec_to_seconds` computes it —
-/// `sec + nsec * 1e-9`.  `Duration::as_secs_f64` divides the nanoseconds by 1e9
-/// instead, which rounds one ULP off from CPython for sub-microsecond ticks
-/// (`1000 * 1e-9` != `1000 / 1e9`), so `get_clock_info().resolution` and
-/// `clock_getres()` would otherwise disagree with the reference in the last bit.
-#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
-fn clock_seconds_from_duration(d: std::time::Duration) -> f64 {
-    d.as_secs() as f64 + f64::from(d.subsec_nanos()) * 1e-9
-}
-
 /// Resolution of the mach clock backing `monotonic`/`perf_counter` on macOS:
 /// one `mach_absolute_time` tick is `numer/denom` nanoseconds
 /// (`_PyTime_GetMonotonicClockWithInfo` reports the same).  `clock_getres` is
@@ -528,16 +586,20 @@ fn get_clock_info_resolution(name: &str) -> f64 {
         }
     }
     let clk = match name {
-        "time" => host_time::ClockId::CLOCK_REALTIME,
-        "monotonic" | "perf_counter" => host_time::ClockId::CLOCK_MONOTONIC,
+        "time" => libc::CLOCK_REALTIME,
+        "monotonic" | "perf_counter" => libc::CLOCK_MONOTONIC,
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        "process_time" => libc::CLOCK_PROF,
         #[cfg(not(any(
             target_os = "illumos",
             target_os = "netbsd",
             target_os = "solaris",
             target_os = "openbsd",
             target_os = "wasi",
+            target_os = "freebsd",
+            target_os = "dragonfly",
         )))]
-        "process_time" => host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID,
+        "process_time" => libc::CLOCK_PROCESS_CPUTIME_ID,
         #[cfg(not(any(
             target_os = "illumos",
             target_os = "netbsd",
@@ -545,12 +607,16 @@ fn get_clock_info_resolution(name: &str) -> f64 {
             target_os = "openbsd",
             target_os = "redox",
         )))]
-        "thread_time" => host_time::ClockId::CLOCK_THREAD_CPUTIME_ID,
+        "thread_time" => libc::CLOCK_THREAD_CPUTIME_ID,
         _ => return 1.0e-9,
     };
-    host_time::clock_getres(clk)
-        .map(clock_seconds_from_duration)
-        .unwrap_or(1.0e-9)
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    let ret = unsafe { majit_rlib::rtime::c_clock_getres(clk as _, &mut ts) };
+    if ret == 0 {
+        timespec_to_seconds(&ts)
+    } else {
+        1.0e-9
+    }
 }
 
 /// Windows has no `clock_getres`; each clock's resolution is a property of
@@ -580,10 +646,12 @@ fn get_clock_info_resolution(_name: &str) -> f64 {
 
 /// Process CPU time (kernel + user) as nanoseconds.
 ///
-/// Prefers `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`; falls back to
-/// `getrusage(RUSAGE_SELF)` summing `ru_utime` and `ru_stime`.  With no
-/// usable process clock, `_clock_impl` raises RuntimeError rather than
-/// reporting a bogus zero.
+/// `interp_time._process_time_impl` Unix arm: `clock_gettime(CLOCK_PROF)`
+/// when libc defines it, else `CLOCK_PROCESS_CPUTIME_ID`; on failure
+/// `rtime.c_getrusage(RUSAGE_SELF)` and `decode_timeval_ns` of
+/// `ru_utime` + `ru_stime`. This is the process_time fallback, not a
+/// clock. With no usable reading, `_clock_impl` raises RuntimeError
+/// rather than reporting a bogus zero.
 #[cfg(all(unix, feature = "host_env"))]
 fn process_time_nanos() -> Result<i128, crate::PyError> {
     #[cfg(feature = "sandbox")]
@@ -594,15 +662,21 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
     }
     #[cfg(not(feature = "sandbox"))]
     {
-        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_PROCESS_CPUTIME_ID) {
-            return Ok(d.as_nanos() as i128);
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        let clk_id = libc::CLOCK_PROF;
+        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+        let clk_id = libc::CLOCK_PROCESS_CPUTIME_ID;
+        if let Ok(ts) = clock_gettime_timespec(clk_id) {
+            return Ok(timespec_to_nanos_i128(&ts));
         }
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
-            let tv_ns = |tv: &libc::timeval| -> i128 {
-                tv.tv_sec as i128 * 1_000_000_000 + tv.tv_usec as i128 * 1_000
-            };
-            return Ok(tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime));
+        let mut rusage = unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
+        let ret =
+            unsafe { majit_rlib::rtime::c_getrusage(majit_rlib::rtime::RUSAGE_SELF, &mut rusage) };
+        if ret == 0 {
+            return Ok(
+                majit_rlib::rtime::decode_timeval_ns(&rusage.ru_utime) as i128
+                    + majit_rlib::rtime::decode_timeval_ns(&rusage.ru_stime) as i128,
+            );
         }
         Err(crate::PyError::runtime_error(
             "the processor time used is not available or its value cannot be represented",
@@ -697,12 +771,15 @@ pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     ))
 ))]
 fn thread_time_nanos() -> Result<i128, crate::PyError> {
-    host_time::clock_gettime(host_time::ClockId::CLOCK_THREAD_CPUTIME_ID)
-        .map(|d| d.as_nanos() as i128)
-        .map_err(|e| {
+    clock_gettime_timespec(libc::CLOCK_THREAD_CPUTIME_ID)
+        .map(|ts| timespec_to_nanos_i128(&ts))
+        .map_err(|errno| {
             crate::PyError::os_error_with_errno(
-                e.raw_os_error().unwrap_or(0),
-                format!("clock_gettime: {e}"),
+                errno,
+                format!(
+                    "clock_gettime: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ),
             )
         })
 }
@@ -755,13 +832,16 @@ pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
+    let ts = clock_gettime_timespec(id).map_err(|errno| {
         crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("clock_gettime: {e}"),
+            errno,
+            format!(
+                "clock_gettime: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
         )
     })?;
-    Ok(floatobject::w_float_new(d.as_secs_f64()))
+    Ok(floatobject::w_float_new(timespec_to_seconds(&ts)))
 }
 
 /// time.clock_gettime_ns(clk_id) → int nanoseconds
@@ -776,13 +856,16 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
+    let ts = clock_gettime_timespec(id).map_err(|errno| {
         crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("clock_gettime_ns: {e}"),
+            errno,
+            format!(
+                "clock_gettime_ns: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
         )
     })?;
-    Ok(w_int_new(d.as_nanos() as i64))
+    Ok(w_int_new(timespec_to_nanos_i128(&ts) as i64))
 }
 
 /// time.clock_settime(clk_id, time: float) → None
@@ -817,16 +900,19 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // truncates toward zero, `frac = secs - integer_secs`.
     let integer_secs = secs.trunc();
     let frac = secs - integer_secs;
-    let ts = libc::timespec {
+    let mut ts = libc::timespec {
         tv_sec: integer_secs as libc::time_t,
         tv_nsec: (frac * 1e9) as libc::c_long,
     };
-    let ret = unsafe { libc::clock_settime(id, &ts) };
+    let ret = unsafe { majit_rlib::rtime::c_clock_settime(id as _, &mut ts) };
     if ret != 0 {
-        let e = std::io::Error::last_os_error();
+        let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("clock_settime: {e}"),
+            errno,
+            format!(
+                "clock_settime: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
         ));
     }
     Ok(w_none())
@@ -854,16 +940,19 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let ns = unsafe { w_int_get_value(args[1]) };
     // `tv_sec = ns // 10**9`, `tv_nsec = ns % 10**9` (Python floor div/mod,
     // so a negative `ns` normalises to a non-negative `tv_nsec`).
-    let ts = libc::timespec {
+    let mut ts = libc::timespec {
         tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
         tv_nsec: ns.rem_euclid(1_000_000_000) as libc::c_long,
     };
-    let ret = unsafe { libc::clock_settime(id, &ts) };
+    let ret = unsafe { majit_rlib::rtime::c_clock_settime(id as _, &mut ts) };
     if ret != 0 {
-        let e = std::io::Error::last_os_error();
+        let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("clock_settime_ns: {e}"),
+            errno,
+            format!(
+                "clock_settime_ns: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
         ));
     }
     Ok(w_none())
@@ -881,13 +970,16 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let d = host_time::clock_getres(host_time::ClockId::from_raw(id)).map_err(|e| {
-        crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("clock_getres: {e}"),
-        )
-    })?;
-    Ok(floatobject::w_float_new(clock_seconds_from_duration(d)))
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    let ret = unsafe { majit_rlib::rtime::c_clock_getres(id as _, &mut ts) };
+    if ret != 0 {
+        let errno = majit_rlib::rposix::get_saved_errno();
+        return Err(crate::PyError::os_error_with_errno(
+            errno,
+            format!("clock_getres: {}", std::io::Error::from_raw_os_error(errno)),
+        ));
+    }
+    Ok(floatobject::w_float_new(timespec_to_seconds(&ts)))
 }
 
 // ── libc tm helpers ──────────────────────────────────────────────────
@@ -919,7 +1011,22 @@ struct c_tm {
 #[allow(non_camel_case_types)]
 type time_t = i64;
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    let mut t = seconds as majit_rlib::rtime::TIME_T;
+    let p = unsafe { majit_rlib::rtime::c_gmtime(&mut t) };
+    if p.is_null() {
+        let errno = majit_rlib::rposix::get_saved_errno();
+        return Err(crate::PyError::os_error_with_errno(errno, ""));
+    }
+    Ok(libc_tm_to_c_tm(unsafe { &*p }))
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    any(windows, feature = "sandbox")
+))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
@@ -1264,7 +1371,22 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(msvc_tm_to_c_tm(&tm))
 }
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    let mut t = seconds as majit_rlib::rtime::TIME_T;
+    let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
+    if p.is_null() {
+        let errno = majit_rlib::rposix::get_saved_errno();
+        return Err(crate::PyError::os_error_with_errno(errno, ""));
+    }
+    Ok(libc_tm_to_c_tm(unsafe { &*p }))
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    any(windows, feature = "sandbox")
+))]
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
@@ -1413,11 +1535,7 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
 #[cfg(unix)]
 pub fn tzset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    unsafe extern "C" {
-        #[link_name = "tzset"]
-        fn c_tzset();
-    }
-    unsafe { c_tzset() };
+    unsafe { majit_rlib::rtime::c_tzset() };
     if let Some(module) = crate::importing::get_sys_module("time") {
         let ns = unsafe { pyre_object::w_module_get_w_dict(module) };
         if !ns.is_null() {
@@ -2094,7 +2212,14 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let mut tm = _gettmarg(args, false)?;
         tm.tm_wday = -1;
 
-        #[cfg(feature = "host_env")]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        let tt = {
+            let mut libc_tm = c_tm_to_libc_tm(&tm);
+            let result = unsafe { majit_rlib::rtime::c_mktime(&mut libc_tm) };
+            tm.tm_wday = libc_tm.tm_wday;
+            result as i64
+        };
+        #[cfg(all(feature = "host_env", any(windows, feature = "sandbox")))]
         let tt = {
             let mut libc_tm = c_tm_to_libc_tm(&tm);
             let result = host_time::mktime(&mut libc_tm);
