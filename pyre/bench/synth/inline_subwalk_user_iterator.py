@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=8.3
-# dynasm 3.4x, cranelift 4.1x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=7.0
+# ubuntu dynasm 1.9x, cranelift 5.9x; floor 1.75x.
 # gh#495 guard: inlined callee consumes user iterator whose next mutates state.
 # FOR loop over user iterator INSIDE branch-bearing inlined callee; __next__ mutates shared counter
 N = 2000000
