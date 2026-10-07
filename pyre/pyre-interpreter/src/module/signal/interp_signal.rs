@@ -138,7 +138,7 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
 }
 
 /// interp_signal.py `timeval_from_double`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn timeval_from_double(d: f64) -> libc::timeval {
     let c_tv_sec = d as i64;
     let c_tv_usec = ((d - c_tv_sec as f64) * 1_000_000.0) as i64;
@@ -154,13 +154,13 @@ fn timeval_from_double(d: f64) -> libc::timeval {
 }
 
 /// interp_signal.py `double_from_timeval`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn double_from_timeval(tv: &libc::timeval) -> f64 {
     tv.tv_sec as f64 + (tv.tv_usec as f64) / 1_000_000.0
 }
 
 /// interp_signal.py `itimer_retval`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn itimer_retval(val: &libc::itimerval) -> pyre_object::PyObjectRef {
     let mut fields = pyre_object::gc_roots::RootedItems::new();
     fields.push(pyre_object::w_float_new(double_from_timeval(&val.it_value)));
@@ -902,7 +902,7 @@ pub fn register_module(
             // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
             // and the fd must already be in non-blocking mode.
             if fd != -1 {
-                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                #[cfg(all(unix, feature = "host_env"))]
                 {
                     let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
                     let blocking = rustpython_host_env::fileutils::fstat(borrowed)
@@ -925,7 +925,7 @@ pub fn register_module(
                         )));
                     }
                 }
-                #[cfg(all(unix, any(not(feature = "host_env"), feature = "sandbox")))]
+                #[cfg(all(unix, not(feature = "host_env")))]
                 unsafe {
                     let mut st: libc::stat = std::mem::zeroed();
                     let bad_fd = libc::fstat(fd, &mut st) != 0;
@@ -1016,12 +1016,7 @@ pub fn register_module(
         crate::make_builtin_function_with_arity(
             "raise_signal",
             |args| {
-                #[cfg(feature = "sandbox")]
-                {
-                    let _ = args;
-                    return Err(crate::host_seam::stub("signal.raise_signal"));
-                }
-                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                #[cfg(feature = "host_env")]
                 {
                     let signum = if let Some(&a) = args.first() {
                         unsafe { pyre_object::w_int_get_value(a) as i32 }
@@ -1219,12 +1214,7 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "alarm",
                 |args| {
-                    #[cfg(feature = "sandbox")]
-                    {
-                        let _ = args;
-                        return Err(crate::host_seam::stub("signal.alarm"));
-                    }
-                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                    #[cfg(feature = "host_env")]
                     {
                         let secs = if let Some(&a) = args.first() {
                             unsafe { pyre_object::w_int_get_value(a) as u32 }
@@ -1252,11 +1242,7 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "pause",
                 |_| {
-                    #[cfg(feature = "sandbox")]
-                    {
-                        return Err(crate::host_seam::stub("signal.pause"));
-                    }
-                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                    #[cfg(feature = "host_env")]
                     {
                         // interp_signal.pause — `rsignal.c_pause` (`releasegil=True`).
                         let _ = unsafe { majit_rlib::rsignal::c_pause() };
@@ -1277,12 +1263,7 @@ pub fn register_module(
             ns,
             "setitimer",
             crate::make_builtin_function("setitimer", |args| {
-                #[cfg(feature = "sandbox")]
-                {
-                    let _ = args;
-                    return Err(crate::host_seam::stub("signal.setitimer"));
-                }
-                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                #[cfg(feature = "host_env")]
                 {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(
@@ -1342,12 +1323,7 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "getitimer",
                 |args| {
-                    #[cfg(feature = "sandbox")]
-                    {
-                        let _ = args;
-                        return Err(crate::host_seam::stub("signal.getitimer"));
-                    }
-                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                    #[cfg(feature = "host_env")]
                     {
                         if args.is_empty() {
                             return Err(crate::PyError::type_error(

@@ -9,11 +9,7 @@ use pyre_object::*;
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
 
-#[cfg(all(
-    feature = "host_env",
-    not(target_arch = "wasm32"),
-    any(not(unix), feature = "sandbox")
-))]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32"), not(unix)))]
 use rustpython_host_env::time as host_time;
 use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1027,7 +1023,7 @@ struct c_tm {
 #[allow(non_camel_case_types)]
 type time_t = i64;
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_gmtime(&mut t) };
@@ -1038,11 +1034,7 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(libc_tm_to_c_tm(unsafe { &*p }))
 }
 
-#[cfg(all(
-    feature = "host_env",
-    not(target_arch = "wasm32"),
-    any(windows, feature = "sandbox")
-))]
+#[cfg(all(windows, feature = "host_env"))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
@@ -1387,7 +1379,7 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(msvc_tm_to_c_tm(&tm))
 }
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
@@ -1398,11 +1390,7 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(libc_tm_to_c_tm(unsafe { &*p }))
 }
 
-#[cfg(all(
-    feature = "host_env",
-    not(target_arch = "wasm32"),
-    any(windows, feature = "sandbox")
-))]
+#[cfg(all(windows, feature = "host_env"))]
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
@@ -1965,7 +1953,7 @@ fn decode_strftime_output(
     }
 }
 
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 #[allow(dead_code)]
 fn strftime_one(
     format: &[u8],
@@ -2108,13 +2096,13 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // strftime consults $TZ/tzname (%Z/%z) and the LC_TIME locale DB; under
     // sandbox the registration is stubbed, so the real body is compiled out.
-    #[cfg(all(unix, feature = "sandbox"))]
+    #[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
     {
         let _ = format_len;
         Err(crate::host_seam::stub("time.strftime"))
     }
     // strftime is available on both Unix and Windows CRT.
-    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         let mut libc_tm = c_tm_to_libc_tm(&tm);
         let mut render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
@@ -2167,6 +2155,13 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Err(_) => crate::typedef::charp2uni(&rendered),
         };
         Ok(result)
+    }
+    #[cfg(all(unix, not(feature = "host_env")))]
+    {
+        let _ = format_len;
+        Err(crate::PyError::not_implemented(
+            "time.strftime requires host_env feature",
+        ))
     }
     // The wide runtime call, which is what `format_time` resolves to here.
     // The narrow one goes through the active code page, so it can neither be
@@ -2271,14 +2266,14 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let mut tm = _gettmarg(args, false)?;
         tm.tm_wday = -1;
 
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env"))]
         let tt = {
             let mut libc_tm = c_tm_to_libc_tm(&tm);
             let result = unsafe { majit_rlib::rtime::c_mktime(&mut libc_tm) };
             tm.tm_wday = libc_tm.tm_wday;
             result as i64
         };
-        #[cfg(all(feature = "host_env", any(windows, feature = "sandbox")))]
+        #[cfg(all(windows, feature = "host_env"))]
         let tt = {
             let mut libc_tm = c_tm_to_libc_tm(&tm);
             let result = host_time::mktime(&mut libc_tm);
