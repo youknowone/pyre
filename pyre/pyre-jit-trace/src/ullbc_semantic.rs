@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn digest(data: &[u8]) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -264,33 +264,52 @@ mod tests {
         assert_eq!(digest(a), digest(c));
     }
 
-    #[test]
-    fn eighty_thousand_spans_finish_in_a_second() {
-        // The rejected extract digest called find() from each span. 80k
-        // copies of this object is enough that a quadratic walk misses
-        // this bound on a laptop; a single pass stays well under it.
-        let span = br#"{"span":{"data":{"file_id":0,"beg":{"line":10,"col":1},"end":{"line":11,"col":2}}}}"#;
-        let mut data = Vec::with_capacity(span.len() * 80_000);
-        for _ in 0..80_000 {
+    fn repeat_span(span: &[u8], copies: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(span.len() * copies);
+        for _ in 0..copies {
             data.extend_from_slice(span);
         }
-        let start = Instant::now();
-        let mut emitted = 0usize;
-        feed_semantic_ullbc(&data, &mut |chunk| emitted += chunk.len());
+        data
+    }
+
+    fn min_feed_time(data: &[u8]) -> (Duration, usize) {
+        (0..3)
+            .map(|_| {
+                let start = Instant::now();
+                let mut emitted = 0usize;
+                feed_semantic_ullbc(data, &mut |chunk| emitted += chunk.len());
+                (start.elapsed(), emitted)
+            })
+            .min_by_key(|(elapsed, _)| *elapsed)
+            .expect("timed three feeds")
+    }
+
+    #[test]
+    fn semantic_feed_scales_linearly_with_span_count() {
+        // The rejected extract digest called find() from each span. This
+        // guards that quadratic regression: 8x input is ~8x for a single
+        // pass and ~64x for that walk.
+        let span = br#"{"span":{"data":{"file_id":0,"beg":{"line":10,"col":1},"end":{"line":11,"col":2}}}}"#;
+        let small = repeat_span(span, 10_000);
+        let large = repeat_span(span, 80_000);
+        let (t_small, emitted_small) = min_feed_time(&small);
+        let (t_large, emitted_large) = min_feed_time(&large);
+        assert_eq!(emitted_large, 8 * emitted_small);
         assert!(
-            start.elapsed().as_millis() < 1_000,
-            "semantic feed took {:?} over {} bytes",
-            start.elapsed(),
-            data.len()
+            t_large < t_small * 24,
+            "semantic feed did not scale linearly: t_small={t_small:?} over {} bytes, t_large={t_large:?} over {} bytes, ratio={}",
+            small.len(),
+            large.len(),
+            t_large.as_secs_f64() / t_small.as_secs_f64(),
         );
-        assert!(emitted > 0);
+        assert!(emitted_large > 0);
         let needle = br#""line":10"#;
-        let at = data
+        let at = large
             .windows(needle.len())
             .position(|window| window == needle)
             .expect("fixture contains a span line");
-        let mut shifted = data.clone();
+        let mut shifted = large.clone();
         shifted[at + 8] = b'9';
-        assert_eq!(digest(&data), digest(&shifted));
+        assert_eq!(digest(&large), digest(&shifted));
     }
 }

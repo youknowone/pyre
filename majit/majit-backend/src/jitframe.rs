@@ -288,10 +288,10 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
     if let Some(base) = crate::deadframe::take_pooled_block(total) {
         // A parked block keeps its size slot. Zero the header word and the
         // fixed JITFRAME fields (`jf_gcmap` must be null before any walk).
-        // Spill slots are written by the entry before they are read or
-        // published through a gcmap; `jitframe_allocate` does not scrub a
-        // recycled nursery object per slot either — the nursery reset did
-        // that in bulk, and a parked block is this path's recycle.
+        // `malloc_host_jitframe` is also `malloc_jitframe` /
+        // `dynasm_nursery_slowpath_jitframe`, which does not call
+        // `JitFrame::init`. Spill slots are written by the entry before
+        // they are read or published through a gcmap.
         zero_off_gc_frame_prefix(base);
         return unsafe { base.add(OFF_GC_PREFIX) as *mut JitFrame };
     }
@@ -317,9 +317,20 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
 
 /// Header word plus the fixed `JITFRAME` fields. Does not touch the size
 /// slot at `base`, or the spill array.
+///
+/// `malloc_host_jitframe` via `malloc_jitframe` /
+/// `dynasm_nursery_slowpath_jitframe` does not call [`JitFrame::init`],
+/// so a CALL_ASSEMBLER callee frame must already have `jf_forward` /
+/// `jf_gcmap` / `jf_descr` zero.
 fn zero_off_gc_frame_prefix(base: *mut u8) {
     let n = OFF_GC_HEADER + std::mem::size_of::<JitFrame>();
     unsafe { std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, n) };
+}
+
+/// GC header word ahead of the frame pointer. Does not touch the size
+/// slot at `base`, the `JITFRAME` fields, or the spill array.
+fn zero_off_gc_header(base: *mut u8) {
+    unsafe { std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, OFF_GC_HEADER) };
 }
 
 /// Payload bytes of an [`alloc_off_gc_jitframe`] block (the `size_bytes`
@@ -336,12 +347,13 @@ pub unsafe fn off_gc_payload_size(frame: *mut JitFrame) -> usize {
 }
 
 /// Prepare a frame [`alloc_off_gc_jitframe`] already returned for another
-/// `execute_token`. Clears the header word and the fixed `JITFRAME` fields.
+/// `execute_token`. Clears the GC header word; [`JitFrame::init`] writes
+/// the fixed `JITFRAME` fields.
 ///
-/// `llmodel.py` `execute_token` allocates a fresh zero-filled frame
-/// (`malloc_jitframe`) for every entry. Reusing one here leaves the previous
-/// entry's spill slots in place; they are unobservable because no collector
-/// scans an off-GC frame and compiled code writes a slot before it reads it.
+/// `llmodel.py` `execute_token` allocates a fresh frame (`malloc_jitframe`)
+/// for every entry. Reusing one here leaves the previous entry's spill
+/// slots in place; they are unobservable because no collector scans an
+/// off-GC frame and compiled code writes a slot before it reads it.
 ///
 /// # Safety
 /// `frame` must come from [`alloc_off_gc_jitframe`] and must not be reachable
@@ -349,7 +361,7 @@ pub unsafe fn off_gc_payload_size(frame: *mut JitFrame) -> usize {
 pub unsafe fn reuse_off_gc_jitframe(frame: *mut JitFrame) {
     unsafe {
         let base = (frame as *mut u8).sub(OFF_GC_PREFIX);
-        zero_off_gc_frame_prefix(base);
+        zero_off_gc_header(base);
     }
 }
 
@@ -697,16 +709,25 @@ impl JitFrame {
 
     /// jitframe.py — jitframe_allocate.
     ///
-    /// Initialize a freshly-allocated JitFrame at `ptr`.
-    /// Caller is responsible for allocation (nursery or malloc).
+    /// `jitframe_allocate` is `lltype.malloc(JITFRAME, depth)` then
+    /// `frame.jf_frame_info = frame_info`. GC malloc zeros the fixed
+    /// fields; this writes them so a reused off-GC block does not need
+    /// a whole-header memset (`reuse_off_gc_jitframe`).
     ///
     /// # Safety
-    /// `ptr` must point to at least `alloc_size(depth)` writable bytes with a
-    /// zero-filled fixed header. Trailing slots need not be initialized yet.
+    /// `ptr` must point to at least `alloc_size(depth)` writable bytes.
+    /// Trailing spill slots need not be initialized yet.
     pub unsafe fn init(ptr: *mut JitFrame, info: *const JitFrameInfo, depth: usize) {
         unsafe {
-            (*ptr).jf_frame_info = info;
-            // Write the jf_frame array length
+            ptr.write(JitFrame {
+                jf_frame_info: info,
+                jf_descr: 0,
+                jf_force_descr: 0,
+                jf_gcmap: std::ptr::null(),
+                jf_savedata: 0,
+                jf_guard_exc: 0,
+                jf_forward: std::ptr::null_mut(),
+            });
             let len_ptr = (ptr as *mut u8).add(JF_FRAME_OFS) as *mut isize;
             *len_ptr = depth as isize;
         }
@@ -742,6 +763,23 @@ impl JitFrame {
         unsafe {
             let len_ptr = (ptr as *const u8).add(JF_FRAME_OFS + LENGTHOFS) as *const isize;
             *len_ptr
+        }
+    }
+
+    /// jitframe.py `jitframe_resolve`: walk `jf_forward` only.
+    ///
+    /// Off-GC host frames are not nursery objects. `execute_token` on that
+    /// path uses this, not [`Self::resolve`].
+    ///
+    /// # Safety
+    /// `frame` is a jitframe pointer whose `jf_forward` chain stays live.
+    #[inline(always)]
+    pub unsafe fn resolve_forward(mut frame: *mut JitFrame) -> *mut JitFrame {
+        unsafe {
+            while !(*frame).jf_forward.is_null() {
+                frame = (*frame).jf_forward;
+            }
+            frame
         }
     }
 
@@ -1128,6 +1166,25 @@ mod tests {
         assert_eq!(info.depth(), high as isize);
         let consistent = base_ofs as isize + (high as isize) * SIZEOFSIGNED as isize;
         assert_eq!(info.size(), consistent);
+    }
+
+    /// `jitframe_resolve` walks `jf_forward` and does not query the nursery.
+    #[test]
+    fn resolve_forward_walks_jf_forward_only() {
+        let bytes = JitFrame::alloc_size(4);
+        let head = alloc_off_gc_jitframe(bytes);
+        let tail = alloc_off_gc_jitframe(bytes);
+        assert!(!head.is_null() && !tail.is_null());
+        unsafe {
+            let info = JitFrameInfo::default();
+            JitFrame::init(head, &info, 4);
+            JitFrame::init(tail, &info, 4);
+            assert_eq!(JitFrame::resolve_forward(head), head);
+            (*head).jf_forward = tail;
+            assert_eq!(JitFrame::resolve_forward(head), tail);
+            free_off_gc_jitframe(tail);
+            free_off_gc_jitframe(head);
+        }
     }
 
     /// Off-GC frames have a header word so the write-barrier byte load is

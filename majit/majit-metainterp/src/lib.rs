@@ -74,6 +74,22 @@ pub fn __majit_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
     majit_ir::descr::path_hash_for_gc_kind(definition_path, is_gc_managed)
 }
 
+/// Host-registered GC type id for a varsize array header.
+///
+/// `gc.py` `init_array_descr` stamps `descr.tid` from
+/// `layoutbuilder.get_type_id(ARRAY)`. A `#[jit_inline]` varsize literal
+/// has no lltype, so the host names the same slot on the header type.
+pub trait HasGcTypeId {
+    const GC_TYPE_ID: u32;
+}
+
+/// [`HasGcTypeId::GC_TYPE_ID`] for the header `add_gc_varsize_array_descr`
+/// stamps into `gc_type_id`.
+#[doc(hidden)]
+pub fn __majit_struct_gc_type_id<T: HasGcTypeId>() -> u32 {
+    T::GC_TYPE_ID
+}
+
 pub mod blackhole;
 pub mod box_trace;
 pub(crate) mod call_descr;

@@ -27,6 +27,10 @@ struct Items {
     items: [Slot; 0],
 }
 
+impl majit_metainterp::HasGcTypeId for Items {
+    const GC_TYPE_ID: u32 = 1;
+}
+
 #[repr(C)]
 struct Holder {
     block: *mut Items,

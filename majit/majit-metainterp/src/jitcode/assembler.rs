@@ -2473,8 +2473,10 @@ impl JitCodeBuilder {
     /// (`get_field_arraylen_descr`). `is_gc_managed` stays false: the
     /// pointer addresses the payload, and a `GUARD_GC_TYPE` would read a
     /// header the concrete block does not carry in front of that pointer.
-    /// `type_id` is still stamped so the allocator can write a type word
-    /// ahead of the payload (`bh_new_array`).
+    /// `type_id` is the lltype cache key (`path_hash`). `gc_type_id` is
+    /// `init_array_descr` `descr.tid` — the collector's type-registry slot
+    /// (`layoutbuilder.get_type_id(ARRAY)`). `rewrite.py`
+    /// `gen_malloc_nursery_varsize` stamps that tid into the header.
     #[allow(clippy::too_many_arguments)]
     pub fn add_gc_varsize_array_descr(
         &mut self,
@@ -2484,6 +2486,7 @@ impl JitCodeBuilder {
         is_array_of_pointers: bool,
         is_item_signed: bool,
         type_id: u64,
+        gc_type_id: u32,
     ) -> u16 {
         let item_type = if is_array_of_pointers {
             majit_ir::value::Type::Ref
@@ -2495,7 +2498,7 @@ impl JitCodeBuilder {
             itemsize,
             len_offset: Some(len_offset),
             type_id,
-            gc_type_id: 0,
+            gc_type_id,
             item_type,
             is_array_of_pointers,
             is_array_of_structs: false,
@@ -2517,13 +2520,14 @@ impl JitCodeBuilder {
         base_size: usize,
         len_offset: usize,
         type_id: u64,
+        gc_type_id: u32,
     ) -> u16 {
         self.add_array_descr(CanonicalBhDescr::Array {
             base_size,
             itemsize: std::mem::size_of::<f64>(),
             len_offset: Some(len_offset),
             type_id,
-            gc_type_id: 0,
+            gc_type_id,
             item_type: majit_ir::value::Type::Float,
             is_array_of_pointers: false,
             is_array_of_structs: false,
@@ -7186,7 +7190,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 itemsize: lhs_itemsize,
                 len_offset: lhs_len_offset,
                 type_id: lhs_type_id,
-                gc_type_id: _,
+                gc_type_id: lhs_gc_type_id,
                 item_type: lhs_item_type,
                 is_array_of_pointers: lhs_is_array_of_pointers,
                 is_array_of_structs: lhs_is_array_of_structs,
@@ -7201,7 +7205,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 itemsize: rhs_itemsize,
                 len_offset: rhs_len_offset,
                 type_id: rhs_type_id,
-                gc_type_id: _,
+                gc_type_id: rhs_gc_type_id,
                 item_type: rhs_item_type,
                 is_array_of_pointers: rhs_is_array_of_pointers,
                 is_array_of_structs: rhs_is_array_of_structs,
@@ -7224,10 +7228,14 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
             // that disagree on the Rust type spelling stay on distinct
             // canonical slots even when their numeric `type_id`
             // collides (default `0`).
+            //
+            // `gc_type_id` is `init_array_descr` `descr.tid`. Two ARRAY
+            // lltypes that share a layout still have distinct tids.
             lhs_base_size == rhs_base_size
                 && lhs_itemsize == rhs_itemsize
                 && lhs_len_offset == rhs_len_offset
                 && lhs_type_id == rhs_type_id
+                && lhs_gc_type_id == rhs_gc_type_id
                 && lhs_item_type == rhs_item_type
                 && lhs_is_array_of_pointers == rhs_is_array_of_pointers
                 && lhs_is_array_of_structs == rhs_is_array_of_structs
@@ -8743,5 +8751,46 @@ mod tests {
         modulo.record_int_mod(0, 1, 2);
         assert!(modulo.encoding_overflow);
         assert_eq!(modulo.code.len(), before);
+    }
+
+    /// `init_array_descr` `descr.tid` is the 7th argument, not a truncated
+    /// `path_hash` left in `type_id`.
+    #[test]
+    fn add_gc_varsize_array_descr_stores_the_gc_type_id() {
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_gc_varsize_array_descr(8, 0, 8, false, true, 0xABCD, 22);
+        match builder.finish().exec.descrs[idx as usize].as_bh_descr() {
+            Some(CanonicalBhDescr::Array {
+                gc_type_id,
+                type_id,
+                ..
+            }) => {
+                assert_eq!(*gc_type_id, 22);
+                assert_eq!(*type_id, 0xABCD);
+            }
+            other => panic!("expected Array descr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_gc_varsize_float_array_descr_stores_the_gc_type_id() {
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_gc_varsize_float_array_descr(8, 0, 0xBEEF, 23);
+        match builder.finish().exec.descrs[idx as usize].as_bh_descr() {
+            Some(CanonicalBhDescr::Array { gc_type_id, .. }) => {
+                assert_eq!(*gc_type_id, 23);
+            }
+            other => panic!("expected Array descr, got {other:?}"),
+        }
+    }
+
+    /// Two ARRAY types that share a layout still have distinct tids
+    /// (`get_array_descr` keys on the lltype).
+    #[test]
+    fn array_descrs_with_distinct_gc_type_ids_do_not_share_a_slot() {
+        let mut builder = JitCodeBuilder::new();
+        let a = builder.add_gc_varsize_array_descr(8, 0, 8, false, true, 1, 22);
+        let b = builder.add_gc_varsize_array_descr(8, 0, 8, false, true, 1, 23);
+        assert_ne!(a, b);
     }
 }

@@ -3747,6 +3747,10 @@ mod tests {
             "pointer varsize must be new_array_clear, got {emitted}"
         );
         assert!(emitted.contains("add_gc_varsize_array_descr"));
+        assert!(
+            emitted.contains("__majit_struct_gc_type_id"),
+            "varsize descr must stamp the registered GC type id, got {emitted}"
+        );
         assert!(!emitted.contains("new_struct"));
     }
 
@@ -3798,6 +3802,10 @@ mod tests {
         assert!(
             emitted.contains("add_gc_varsize_float_array_descr"),
             "float varsize must use the float descr, got {emitted}"
+        );
+        assert!(
+            emitted.contains("__majit_struct_gc_type_id"),
+            "float varsize descr must stamp the registered GC type id, got {emitted}"
         );
     }
 
