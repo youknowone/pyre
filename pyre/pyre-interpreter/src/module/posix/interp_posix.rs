@@ -8750,13 +8750,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     };
                     // `interp_posix.getxattr` unwraps path, attribute, then
                     // follow_symlinks. Path then attribute share one root
-                    // scope (`fsencode_path_then_attribute`); follow stays
-                    // pinned across that encoding.
-                    let follow_roots = pyre_object::gc_roots::push_roots();
-                    let follow_base = follow_roots.pin_roots(&[w_follow]);
+                    // scope (`fsencode_path_then_attribute`). The original
+                    // path argument is pinned here for `wrap_oserror2`
+                    // (`path.w_path`): `FsEncodedPath::w_path` is a shadow-
+                    // stack slot a later `with_roots!` can reuse.
+                    let hold = pyre_object::gc_roots::push_roots();
+                    let hold_base = hold.pin_roots(&[w_path, w_attribute, w_follow]);
                     let (_path_roots, path, attribute) =
                         fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "getxattr")?;
-                    w_follow = follow_roots.get(follow_base);
+                    w_path = hold.get(hold_base);
+                    w_attribute = hold.get(hold_base + 1);
+                    w_follow = hold.get(hold_base + 2);
                     let follow_symlinks = if w_follow.is_null() {
                         true
                     } else {
@@ -8813,7 +8817,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         if err != libc::ERANGE {
                             return Err(io_err_with_filename(
                                 std::io::Error::from_raw_os_error(err),
-                                path.w_path(),
+                                hold.get(hold_base),
                             ));
                         }
                     }
@@ -8823,7 +8827,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         })),
                         None => Err(io_err_with_filename(
                             std::io::Error::from_raw_os_error(libc::ERANGE),
-                            path.w_path(),
+                            hold.get(hold_base),
                         )),
                     }
                 }),
@@ -8852,24 +8856,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     };
                     // `interp_posix.setxattr` unwraps path, attribute, flags,
                     // follow_symlinks, then `space.bufferstr_w(w_value)`.
-                    let path = pyre_object::with_roots!(
-                        w_path,
-                        w_attribute,
-                        w_value,
-                        w_flags,
-                        w_follow => crate::gateway::fsencode_path_or_fd_w(w_path, "setxattr", true)
-                    )?;
-                    let attribute = pyre_object::with_roots!(
-                        w_path,
-                        w_attribute,
-                        w_value,
-                        w_flags,
-                        w_follow => crate::gateway::fsencode_path_named_w(
-                            w_attribute,
-                            "setxattr",
-                            "attribute",
-                        )
-                    )?;
+                    // Path then attribute share one root scope, matching
+                    // `getxattr`. The original path argument is pinned for
+                    // `wrap_oserror2`.
+                    let hold = pyre_object::gc_roots::push_roots();
+                    let hold_base =
+                        hold.pin_roots(&[w_path, w_attribute, w_value, w_flags, w_follow]);
+                    let (_path_roots, path, attribute) =
+                        fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "setxattr")?;
+                    w_path = hold.get(hold_base);
+                    w_attribute = hold.get(hold_base + 1);
+                    w_value = hold.get(hold_base + 2);
+                    w_flags = hold.get(hold_base + 3);
+                    w_follow = hold.get(hold_base + 4);
                     let flags = if w_flags.is_null() {
                         0
                     } else {
@@ -8959,7 +8958,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             std::io::Error::from_raw_os_error(
                                 majit_rlib::rposix::get_saved_errno(),
                             ),
-                            path.w_path(),
+                            hold.get(hold_base),
                         ));
                     }
                     Ok(pyre_object::w_none())
@@ -8986,12 +8985,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         (w_path, w_attribute, w_follow)
                     };
                     // `interp_posix.removexattr` unwraps path, attribute, then
-                    // follow_symlinks.
-                    let follow_roots = pyre_object::gc_roots::push_roots();
-                    let follow_base = follow_roots.pin_roots(&[w_follow]);
+                    // follow_symlinks. The original path argument is pinned
+                    // for `wrap_oserror2`.
+                    let hold = pyre_object::gc_roots::push_roots();
+                    let hold_base = hold.pin_roots(&[w_path, w_attribute, w_follow]);
                     let (_path_roots, path, attribute) =
                         fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "removexattr")?;
-                    w_follow = follow_roots.get(follow_base);
+                    w_path = hold.get(hold_base);
+                    w_attribute = hold.get(hold_base + 1);
+                    w_follow = hold.get(hold_base + 2);
                     let follow_symlinks = if w_follow.is_null() {
                         true
                     } else {
@@ -9026,7 +9028,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             std::io::Error::from_raw_os_error(
                                 majit_rlib::rposix::get_saved_errno(),
                             ),
-                            path.w_path(),
+                            hold.get(hold_base),
                         ));
                     }
                     Ok(pyre_object::w_none())
@@ -9110,7 +9112,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         if err != libc::ERANGE {
                             return Err(io_err_with_filename(
                                 std::io::Error::from_raw_os_error(err),
-                                path.w_path(),
+                                path_roots.get(path_base),
                             ));
                         }
                     }
@@ -9119,7 +9121,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         None => {
                             return Err(io_err_with_filename(
                                 std::io::Error::from_raw_os_error(libc::ERANGE),
-                                path.w_path(),
+                                path_roots.get(path_base),
                             ));
                         }
                     };
@@ -15864,19 +15866,30 @@ mod normpath_tests {
 #[cfg(test)]
 mod xattr_filename_tests {
     /// `OSErrorTests.test_oserror_filename`: `os.getxattr(<missing path>,
-    /// "user.test")` must report the path as `OSError.filename`. Wrapping each
-    /// `FsEncodedPath` in `with_roots!` closed the path's bracket before the
-    /// attribute conversion reused that slot, so the filename became the
-    /// attribute.
+    /// "user.test")` must report the path as `OSError.filename` (`assertIs`).
+    /// Wrapping each `FsEncodedPath` in `with_roots!` closed the path's
+    /// bracket before the attribute conversion reused that slot, so the
+    /// filename became the attribute. The builtins pass the original path
+    /// argument to `wrap_oserror2`.
     #[test]
     fn getxattr_oserror_filename_is_the_path() {
         crate::typedef::init_typeobjects();
         let mut w_path = pyre_object::w_str_new("/missing/getxattr-path");
         let mut w_attribute = pyre_object::w_str_new("user.test");
+        let orig_path = w_path;
+        let hold = pyre_object::gc_roots::push_roots();
+        let hold_base = hold.pin_roots(&[w_path, w_attribute]);
         let (_roots, path, _attribute) =
             super::fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "getxattr")
                 .expect("str path and attribute convert");
+        let wrapped = hold.get(hold_base);
+        assert!(
+            std::ptr::eq(wrapped, orig_path),
+            "wrap_oserror2 must keep the original path argument"
+        );
         let filename = crate::baseobjspace::str_utf8_w(path.w_path()).expect("filename is a str");
+        assert_eq!(filename, "/missing/getxattr-path");
+        let filename = crate::baseobjspace::str_utf8_w(wrapped).expect("held path is a str");
         assert_eq!(filename, "/missing/getxattr-path");
     }
 }
