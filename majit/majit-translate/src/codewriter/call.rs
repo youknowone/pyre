@@ -2569,6 +2569,11 @@ pub struct CallControl {
     /// Repeat `fielddescrof_keyed` hits replay the mint records and return
     /// the cached descr. The layout walk runs once per key.
     fielddescrof_memo: std::cell::RefCell<FieldDescrofMemo>,
+    /// `(inner, outer, field)` for every by-value nested struct row:
+    /// `outer` stores an `inner` inline as `field`. Built from
+    /// `struct_fields` on the first query; reset whenever `struct_fields` or
+    /// `known_struct_names` change.
+    by_value_embedders: std::cell::OnceCell<Vec<(String, String, String)>>,
 
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     /// If an array's element type is in this set, the array descriptor gets
@@ -3218,6 +3223,7 @@ impl CallControl {
             struct_size_log: std::cell::RefCell::new(None),
             field_footprint: std::cell::RefCell::new(FieldDescrofMemoEntry::default()),
             fielddescrof_memo: std::cell::RefCell::new(HashMap::new()),
+            by_value_embedders: std::cell::OnceCell::new(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
             error_carrier: crate::OwnedErrorCarrierSpec::default(),
@@ -3300,12 +3306,14 @@ impl CallControl {
     /// RPython: register struct type names for get_type_flag(ARRAY.OF).
     pub fn set_known_struct_names(&mut self, names: HashSet<String>) {
         self.known_struct_names = names;
+        self.by_value_embedders = std::cell::OnceCell::new();
         self.clear_fielddescrof_memo();
     }
 
     /// RPython: register struct field types for op.args[0].concretetype resolution.
     pub fn set_struct_fields(&mut self, registry: crate::front::StructFieldRegistry) {
         self.struct_fields = registry;
+        self.by_value_embedders = std::cell::OnceCell::new();
         self.clear_fielddescrof_memo();
     }
 
@@ -4307,6 +4315,37 @@ impl CallControl {
             .iter()
             .find(|f| f.name.as_str() == field)
             .map(|f| f.offset)
+    }
+
+    /// Every `(outer, "field.<path>")` dotted leaf that names `owner.path`
+    /// on a GC owner storing the by-value struct `owner` inline.
+    ///
+    /// `heaptracker.py all_fielddescrs` flattens a nested STRUCT's leaves
+    /// into its GC owner, and the trace caches that owner's dotted leaf. A
+    /// body reaching the nested struct through a reference (`&l.int_items`)
+    /// reads or writes the same bytes, while `effectinfo.py consider_struct`
+    /// keeps no effect on a non-GC STRUCT. The dotted leaves are the ones
+    /// [`crate::front::mir::is_flattened_storage_leaf`] names.
+    fn by_value_embedding_leaves(&self, owner: &str, path: &str) -> Vec<(String, String)> {
+        let rows = self.by_value_embedders.get_or_init(|| {
+            let mut rows: Vec<(String, String, String)> = (&self.struct_fields.fields)
+                .into_iter()
+                .flat_map(|(outer, fields)| {
+                    fields
+                        .iter()
+                        .filter(|(_, fty)| self.is_known_struct(fty))
+                        .map(move |(fname, fty)| (fty.clone(), outer.clone(), fname.clone()))
+                })
+                .collect();
+            rows.sort();
+            rows
+        });
+        rows.iter()
+            .filter(|(inner, outer, fname)| {
+                inner == owner && crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
+            })
+            .map(|(_, outer, fname)| (outer.clone(), format!("{fname}.{path}")))
+            .collect()
     }
 
     /// `(flag, type, size, offset)` of the leaf `path` names inside the
@@ -9728,7 +9767,7 @@ impl CallControl {
         let index = self
             .descr_indices
             .field_index(&field.owner_root, &field.name);
-        ReadWriteEffects::singleton(
+        let mut result = ReadWriteEffects::singleton(
             RwKey {
                 tag,
                 index,
@@ -9739,7 +9778,46 @@ impl CallControl {
                 owner_id: field.owner_id,
                 name: field.name.clone(),
             },
-        )
+        );
+        let Some(owner) = field.owner_root.as_deref() else {
+            return result;
+        };
+        // A whole by-value nested struct field is each of its dotted leaves
+        // (`heaptracker.py all_fielddescrs` flattens them into `owner`):
+        // copying it out reads them, storing it writes them.
+        let mut leaves = Vec::new();
+        if let Some(fty) = self.field_type(owner, &field.name)
+            && self.is_known_struct(fty)
+            && let Some(rows) = self.struct_field_entries(fty)
+        {
+            leaves.extend(
+                rows.iter()
+                    .filter(|(leaf, _)| {
+                        crate::front::mir::is_flattened_storage_leaf(owner, &field.name, leaf)
+                    })
+                    .map(|(leaf, _)| (owner.to_string(), format!("{}.{leaf}", field.name))),
+            );
+        }
+        // A field of a by-value nested struct is also the dotted leaf of
+        // the GC owner storing that struct inline.
+        leaves.extend(self.by_value_embedding_leaves(owner, &field.name));
+        for (outer, dotted) in leaves {
+            let owner_root = Some(outer);
+            let index = self.descr_indices.field_index(&owner_root, &dotted);
+            result.insert(
+                RwKey {
+                    tag,
+                    index,
+                    owner_id: None,
+                },
+                RwOperand::Field {
+                    owner_root,
+                    owner_id: None,
+                    name: dotted,
+                },
+            );
+        }
+        result
     }
 
     /// `_array_result(op.args[0].concretetype)`.
@@ -17111,6 +17189,52 @@ mod tests {
             write_fields(&rw_of(&cc, &mut cache, "grow"))
         );
         assert_eq!(write_fields(&effects).len(), 1);
+    }
+
+    /// A write of a by-value nested struct's field through a reference to
+    /// it is a write of the owner's dotted leaf too: the owner stores the
+    /// struct inline, and the trace caches the dotted `(STRUCT, "f.leaf")`.
+    /// A write of the whole nested struct field writes every dotted leaf.
+    #[test]
+    fn readwrite_nested_struct_field_names_the_owner_dotted_leaf() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "IntArray".to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "W_ListObject".to_string(),
+            vec![
+                ("strategy".to_string(), "usize".to_string()),
+                ("int_items".to_string(), "IntArray".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["IntArray".to_string()].into_iter().collect());
+        let list = Some("W_ListObject".to_string());
+        rw_register(&mut cc, "set_len", vec![rw_write_field("IntArray", "len")]);
+        let effects = rw_of(&cc, &mut cache, "set_len");
+        let own = cc
+            .descr_indices
+            .field_index(&Some("IntArray".to_string()), "len");
+        let len = cc.descr_indices.field_index(&list, "int_items.len");
+        assert_eq!(write_fields(&effects), vec![own, len]);
+
+        // Storing the whole nested struct stores each of its leaves.
+        rw_register(
+            &mut cc,
+            "set_items",
+            vec![rw_write_field("W_ListObject", "int_items")],
+        );
+        let effects = rw_of(&cc, &mut cache, "set_items");
+        let whole = cc.descr_indices.field_index(&list, "int_items");
+        let block = cc.descr_indices.field_index(&list, "int_items.block");
+        assert_eq!(write_fields(&effects), vec![whole, block, len]);
     }
 
     /// Every graph a walk enters keeps its set in `_analyzed_calls`; a

@@ -10251,11 +10251,7 @@ impl<'a> Lowering<'a> {
                     let nested_payload = v.as_object().and_then(|m| m.get("Field"))?;
                     let (owner, nested_name, _, owner_id) =
                         self.resolve_adt_field(&nested_base.ty, nested_payload)?;
-                    if matches!(
-                        nested_name.as_str(),
-                        "int_items" | "float_items" | "bytes_items" | "ascii_items"
-                    ) && owner == "W_ListObject"
-                    {
+                    if is_flattened_storage_leaf(&owner, &nested_name, &leaf_name) {
                         return Some((owner, format!("{nested_name}.{leaf_name}"), owner_id));
                     }
                     return None;
@@ -55310,6 +55306,20 @@ pub(crate) fn charon_array_len_to_string(len: &serde_json::Value, llbc: &Llbc) -
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("??len:{body}"))
+}
+
+/// The by-value nested struct leaves [`Lowering::flatten_list_storage_field`]
+/// names `nested.leaf` on their GC owner: `W_ListObject`'s inline
+/// Integer/Float/Bytes/Ascii storage `block` and `len`. writeanalyze reads
+/// the same set, so an effect names a dotted leaf exactly when the trace's
+/// field descr is that leaf.
+pub(crate) fn is_flattened_storage_leaf(owner: &str, nested: &str, leaf: &str) -> bool {
+    matches!(leaf, "block" | "len")
+        && matches!(
+            nested,
+            "int_items" | "float_items" | "bytes_items" | "ascii_items"
+        )
+        && owner.rsplit("::").next() == Some("W_ListObject")
 }
 
 /// Drop Deref wrappers and the by-value storage field (`int_items` /
