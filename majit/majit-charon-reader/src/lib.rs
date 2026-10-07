@@ -111,6 +111,12 @@ pub struct Llbc {
     stack_sensitive_fns: parking_lot::RwLock<Vec<String>>,
     /// Set once the set above is complete for this artefact.
     stack_sensitive_ready: std::sync::atomic::AtomicBool,
+    /// Function paths whose own body opens and closes a `RootScope`.
+    /// They rewind whatever they published, so a caller may treat the
+    /// call as depth-neutral even when the path is also in
+    /// `stack_sensitive_fns`.  Sorted.  Harvested in link order like
+    /// the sensitive set, so a later crate sees earlier crates' answers.
+    stack_depth_neutral_fns: parking_lot::RwLock<Vec<String>>,
     /// Trait-decl id → associated-type bindings of its unique impl.
     /// `trait_impls` is immutable after parse, so the map is built once.
     /// See [`TraitAssocIndex`].
@@ -304,6 +310,7 @@ impl Llbc {
             eval_fn_type_id: std::sync::OnceLock::new(),
             stack_sensitive_fns: parking_lot::RwLock::new(Vec::new()),
             stack_sensitive_ready: std::sync::atomic::AtomicBool::new(false),
+            stack_depth_neutral_fns: parking_lot::RwLock::new(Vec::new()),
             trait_assoc_index: std::sync::OnceLock::new(),
             drop_impl_owners: std::sync::OnceLock::new(),
         })
@@ -439,6 +446,23 @@ impl Llbc {
     /// [`register_stack_sensitive_fns`](Self::register_stack_sensitive_fns).
     pub fn is_stack_sensitive_fn(&self, path: &str) -> bool {
         self.stack_sensitive_fns
+            .read()
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
+    }
+
+    /// Record function paths whose body opens and closes a `RootScope`.
+    pub fn register_stack_depth_neutral_fns(&self, paths: impl IntoIterator<Item = String>) {
+        let mut known = self.stack_depth_neutral_fns.write();
+        known.extend(paths);
+        known.sort();
+        known.dedup();
+    }
+
+    /// Whether `path` was registered through
+    /// [`register_stack_depth_neutral_fns`](Self::register_stack_depth_neutral_fns).
+    pub fn is_stack_depth_neutral_fn(&self, path: &str) -> bool {
+        self.stack_depth_neutral_fns
             .read()
             .binary_search_by(|known| known.as_str().cmp(path))
             .is_ok()

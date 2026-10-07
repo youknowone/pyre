@@ -9165,6 +9165,11 @@ impl<'a> Transformer<'a> {
                     NewlistClearShape::Resized { .. } => None,
                 }
             });
+            // rgc.py `ll_arraycopy` `_canraise` is False (`call.py`).
+            // The Rust body still has `assert!` on negative starts, which
+            // the graph analyser reports as CanRaise; a transparent
+            // helper walk then declines the residual as CallMayForceR.
+            // Pass CannotRaise so OS_ARRAYCOPY records as CallN.
             let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
@@ -9173,7 +9178,7 @@ impl<'a> Transformer<'a> {
                 &ValueType::Void,
                 graph_name,
                 OopSpecIndex::Arraycopy,
-                None,
+                Some(majit_ir::descr::ExtraEffect::CannotRaise),
                 array_descrs,
             );
             return Some(match rewritten {
@@ -9750,45 +9755,70 @@ impl<'a> Transformer<'a> {
             // `ItemsBlock` over IntegerListStrategy storage.
             "newlist" => {
                 let length = args.first()?.clone();
-                let (detail, kind) =
-                    match newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref()) {
-                        NewlistClearShape::Fixed {
-                            item_ty,
-                            array_type_id,
-                        } => {
-                            let array_type_id = match (&item_ty, array_type_id) {
-                                (_, Some(id)) => Some(id),
-                                (ValueType::Int, None) => Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                                (ValueType::Float, None) => {
-                                    Some(LIST_FLOAT_ITEMS_ARRAY.to_string())
-                                }
-                                (_, None) => None,
-                            };
-                            if matches!(item_ty, ValueType::Ref(_)) {
-                                (
-                                    "newlist → new_array_clear(length, arraydescr) \
-                                 [fixed array of GC pointers]",
-                                    OpKind::NewArrayClear {
-                                        length,
-                                        item_ty,
-                                        array_type_id,
-                                    },
-                                )
-                            } else {
-                                (
-                                    "newlist → new_array(length, arraydescr) [fixed array]",
-                                    OpKind::NewArray {
-                                        length,
-                                        item_ty,
-                                        array_type_id,
-                                    },
-                                )
-                            }
-                        }
-                        NewlistClearShape::Resized { .. } | NewlistClearShape::Fallback => {
-                            return None;
-                        }
+                let mut shape =
+                    newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref());
+                // `int_ll_newlist` returns `*mut TypedItemsBlock`. When the
+                // result variable has no rtyper annotation, `newlist_clear_shape`
+                // is Fallback and the oopspec residualizes as CallR+GuardNoException
+                // instead of `new_array`. Recover IntegerListStrategy storage from
+                // the callee (`typed_items_array_shape` leaf `TypedItemsBlock`).
+                if matches!(shape, NewlistClearShape::Fallback)
+                    && let OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } = &op.kind
+                    && segments.last().is_some_and(|s| s == "int_ll_newlist")
+                {
+                    shape = NewlistClearShape::Fixed {
+                        item_ty: ValueType::Int,
+                        array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                     };
+                }
+                let (detail, kind) = match shape {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    } => {
+                        let array_type_id = match (&item_ty, array_type_id) {
+                            (_, Some(id)) => Some(id),
+                            (ValueType::Int, None) => Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                            (ValueType::Float, None) => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+                            // `do_fixed_newlist` (jtransform.py): a GC-pointer
+                            // OF emits `new_array_clear` with
+                            // `cpu.arraydescrof(ARRAY)`. An identity-less
+                            // Ref descr cannot trace the block; name the
+                            // same `GcArray(OBJECTPTR)` identity the
+                            // `newlist_clear` Fallback uses.
+                            (ValueType::Ref(_), None) => {
+                                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+                            }
+                            (_, None) => None,
+                        };
+                        if matches!(item_ty, ValueType::Ref(_)) {
+                            (
+                                "newlist → new_array_clear(length, arraydescr) \
+                                 [fixed array of GC pointers]",
+                                OpKind::NewArrayClear {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                },
+                            )
+                        } else {
+                            (
+                                "newlist → new_array(length, arraydescr) [fixed array]",
+                                OpKind::NewArray {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                },
+                            )
+                        }
+                    }
+                    NewlistClearShape::Resized { .. } | NewlistClearShape::Fallback => {
+                        return None;
+                    }
+                };
                 (
                     detail,
                     vec![SpaceOperation {
@@ -26969,6 +26999,64 @@ mod tests {
                 assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
             }
             other => panic!("expected NewArray, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// `do_fixed_newlist` (jtransform.py): `Ptr(GcArray(GCREF))` emits
+    /// `new_array_clear` with the `GcArray(OBJECTPTR)` identity, so the
+    /// collector can trace the items.
+    #[test]
+    fn handle_list_call_newlist_fixed_gcref_assigns_object_ref_array_id() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let array_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+        }));
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_fixed_gcref");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = variable_with_lltype("a", array_ptr);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist",
+                &op,
+                std::slice::from_ref(&count),
+                &mut graph,
+                "newlist_fixed_gcref",
+            )
+            .expect("newlist must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(
+                    matches!(item_ty, ValueType::Ref(None)),
+                    "GCREF-element fixed array must recover ValueType::Ref, got {item_ty:?}"
+                );
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "fixed GCREF array must name the GcArray(OBJECTPTR) identity"
+                );
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
     }

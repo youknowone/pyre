@@ -3651,51 +3651,103 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
     );
-    // BINARY_SLICE list arm: lock-free inner and per-strategy copy leaves.
-    // Word ABI `(obj, start, n)` so a declined helper walk residualizes
-    // through `jitcode.fnaddr` instead of a fat `&[T]`.
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_inner",
-        "pyre_object::ll_listslice_inner",
-        pyre_object::listobject::ll_listslice_inner,
-    );
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_ints",
-        "pyre_object::ll_listslice_ints",
-        pyre_object::listobject::ll_listslice_ints,
-    );
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_floats",
-        "pyre_object::ll_listslice_floats",
-        pyre_object::listobject::ll_listslice_floats,
-    );
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_objects",
-        "pyre_object::ll_listslice_objects",
-        pyre_object::listobject::ll_listslice_objects,
-    );
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_new_int_list",
-        "pyre_object::ll_listslice_new_int_list",
-        pyre_object::listobject::ll_listslice_new_int_list,
-    );
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_new_float_list",
-        "pyre_object::ll_listslice_new_float_list",
-        pyre_object::listobject::ll_listslice_new_float_list,
-    );
-    upa3(
-        &mut entries,
-        "pyre_object::listobject::ll_listslice_new_object_list",
-        "pyre_object::ll_listslice_new_object_list",
-        pyre_object::listobject::ll_listslice_new_object_list,
-    );
+    // BINARY_SLICE list arm: locked wrapper, lock-free inner, and
+    // per-strategy copy leaves. Word ABI `(i64, i64, i64) -> i64` so a
+    // declined helper walk residualizes through `jitcode.fnaddr`. The
+    // raw helpers take `PyObjectRef`/`usize`, which are i32 on wasm32;
+    // `call_indirect` is typed from the descr as three i64 words.
+    {
+        macro_rules! listslice_word {
+            ($name:ident, $target:path) => {
+                extern "C" fn $name(obj: i64, start: i64, stop: i64) -> i64 {
+                    unsafe {
+                        $target(
+                            obj as pyre_object::PyObjectRef,
+                            start as usize,
+                            stop as usize,
+                        ) as i64
+                    }
+                }
+            };
+        }
+        listslice_word!(ll_listslice_word, pyre_object::listobject::ll_listslice);
+        listslice_word!(
+            ll_listslice_inner_word,
+            pyre_object::listobject::ll_listslice_inner
+        );
+        listslice_word!(
+            ll_listslice_ints_word,
+            pyre_object::listobject::ll_listslice_ints
+        );
+        listslice_word!(
+            ll_listslice_floats_word,
+            pyre_object::listobject::ll_listslice_floats
+        );
+        listslice_word!(
+            ll_listslice_objects_word,
+            pyre_object::listobject::ll_listslice_objects
+        );
+        listslice_word!(
+            ll_listslice_new_int_list_word,
+            pyre_object::listobject::ll_listslice_new_int_list
+        );
+        listslice_word!(
+            ll_listslice_new_float_list_word,
+            pyre_object::listobject::ll_listslice_new_float_list
+        );
+        listslice_word!(
+            ll_listslice_new_object_list_word,
+            pyre_object::listobject::ll_listslice_new_object_list
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice",
+            "pyre_object::ll_listslice",
+            ll_listslice_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_inner",
+            "pyre_object::ll_listslice_inner",
+            ll_listslice_inner_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_ints",
+            "pyre_object::ll_listslice_ints",
+            ll_listslice_ints_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_floats",
+            "pyre_object::ll_listslice_floats",
+            ll_listslice_floats_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_objects",
+            "pyre_object::ll_listslice_objects",
+            ll_listslice_objects_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_new_int_list",
+            "pyre_object::ll_listslice_new_int_list",
+            ll_listslice_new_int_list_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_new_float_list",
+            "pyre_object::ll_listslice_new_float_list",
+            ll_listslice_new_float_list_word,
+        );
+        cpa3(
+            &mut entries,
+            "pyre_object::listobject::ll_listslice_new_object_list",
+            "pyre_object::ll_listslice_new_object_list",
+            ll_listslice_new_object_list_word,
+        );
+    }
     // `ll_math.py` C llexternals, under the `ll_math::math_*` / crate-root
     // alias paths the front retargets the Opaque `f64` methods to. Float
     // `**` and `%` reach them without the `math` module.

@@ -18,14 +18,23 @@ pub fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
         !w_int.is_null(),
         "eval_slice_index: slice bound Ref is null (wasm offset-0 silent-null); getindex_w would read ob_type at guest offset 0"
     );
-    match crate::builtins::getindex_w(w_int) {
+    // Own RootScope so the BINARY_SLICE caller can erase its bracket:
+    // this body is depth-neutral (`is_stack_depth_neutral_fn`) even
+    // though `getindex_w` is in the sensitive set. `shadow_stack_erase`
+    // scalar-replaces the pins; `getindex_w` still runs `__index__`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_int = pyre_object::gc_roots::pin_root(w_int);
+    // One return so the RootScope Drop is a regular close, not an
+    // unwind-only cleanup `body_has_balanced_root_scope` misses.
+    let result = match crate::baseobjspace::getindex_w(w_int) {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(crate::PyError::new(
             crate::PyErrorKind::TypeError,
             "slice indices must be integers or None or have an __index__ method".to_string(),
         )),
         Err(e) => Err(e),
-    }
+    };
+    result
 }
 
 /// sliceobject.py `adapt_lower_bound(space, size, w_index)`.

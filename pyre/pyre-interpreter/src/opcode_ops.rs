@@ -1245,7 +1245,8 @@ pub extern "C" fn jit_runtime_ops_is_op(
 
 /// One-word C-ABI residual for `binary_slice_values`. Guard-failure
 /// blackholing calls this; the walker descends the named graph
-/// (`specialize.rs try_walker_orthodox_binary_slice`).
+/// (`specialize.rs try_walker_orthodox_binary_slice`). The inner owns
+/// the operand-root bracket and takes the list lock only around the copy.
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_runtime_ops_binary_slice_values(
     obj: PyObjectRef,
@@ -1253,12 +1254,7 @@ pub extern "C" fn jit_runtime_ops_binary_slice_values(
     stop: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[obj, start, stop]);
-    match crate::runtime_ops::binary_slice_values_inner(
-        pyre_object::gc_roots::shadow_stack_get(base),
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-        pyre_object::gc_roots::shadow_stack_get(base + 2),
-    ) {
+    match crate::runtime_ops::binary_slice_values_inner(obj, start, stop) {
         Ok(result) => result,
         Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }

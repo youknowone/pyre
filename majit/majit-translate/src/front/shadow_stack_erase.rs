@@ -23,8 +23,12 @@
 //! stack depth first.  A callee is assumed to leave the depth where it found
 //! it: a body whose own depth at `Return` is not zero is refused, so the only
 //! functions that could break that assumption are the ones this pass never
-//! rewrites.  Anything the interpretation cannot model refuses the whole body,
-//! which then lowers exactly as it did before.
+//! rewrites.  A callee that *calls* such a function but still returns at
+//! depth 0 (its own `RootScope` Close rewinds) is depth-neutral: it does not
+//! read the caller's slots by index, and a collection inside it roots the
+//! caller's replaced slots through the jitframe gcmap, the blackhole's
+//! `registers_r`, and the recorder.  Anything the interpretation cannot
+//! model refuses the whole body, which then lowers exactly as it did before.
 //!
 //! Unwind edges are not followed: the flow-graph builder does not lower an
 //! `on_unwind` cleanup chain either, and one chain is shared by calls made at
@@ -228,6 +232,72 @@ fn assign_json(dest: Value, rvalue: Value) -> Value {
     json!({ "Assign": [dest, rvalue] })
 }
 
+/// Locals this place names that are bound as specials, including a
+/// tuple-field or deref of one (`AddChecked` overflow bit, `*guard`).
+fn specials_in_place(place: &Place, specials: &HashMap<usize, Special>) -> Vec<Special> {
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<Special>, local: usize| {
+        if let Some(s) = specials.get(&local) {
+            out.push(*s);
+        }
+    };
+    if let Some(l) = place_local(place) {
+        push(&mut out, l);
+    }
+    if let Some((pair, _)) = tuple_field_of_local(place) {
+        push(&mut out, pair);
+    }
+    if let Some(l) = deref_of_local(place) {
+        push(&mut out, l);
+    }
+    out
+}
+
+fn specials_in_json(v: &Value, specials: &HashMap<usize, Special>) -> Vec<Special> {
+    let mut out = Vec::new();
+    fn walk(v: &Value, specials: &HashMap<usize, Special>, out: &mut Vec<Special>) {
+        match v {
+            Value::Object(map) => {
+                if let Some(local) = map.get("Local").and_then(Value::as_u64)
+                    && let Some(s) = specials.get(&(local as usize))
+                {
+                    out.push(*s);
+                }
+                for nested in map.values() {
+                    walk(nested, specials, out);
+                }
+            }
+            Value::Array(items) => {
+                for nested in items {
+                    walk(nested, specials, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, specials, &mut out);
+    out
+}
+
+/// `Assert` whose condition / `check_kind` names only erased slot-index
+/// specials (`shadow_stack_len` or `len + k`). Failure is the bounds-check
+/// panic; the offsets are compile-time so the check is statically true.
+/// A Guard/Alias mention is a live RootScope check and must keep its close.
+fn assert_is_slot_index_bounds_check(
+    assert: &majit_charon_reader::ullbc::AssertStmt,
+    specials: &HashMap<usize, Special>,
+) -> bool {
+    let mut mentioned = match &assert.cond {
+        Operand::Copy(p) | Operand::Move(p) => specials_in_place(p, specials),
+        Operand::Const(_) => Vec::new(),
+    };
+    mentioned.extend(specials_in_json(&assert.check_kind, specials));
+    !mentioned.is_empty()
+        && mentioned
+            .iter()
+            .all(|s| matches!(s, Special::Index(_) | Special::IndexPair(_)))
+}
+
 /// Build the rewrite, or say why this body keeps its bracket.
 fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
@@ -248,11 +318,10 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     }
     for block in &body.body {
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
-            // A classified leaf is this body's own bracket; `stack_sensitivity`
-            // models it the same way and only consults the sensitive set for
-            // a callee it does not classify.
             && classify_call(call, llbc).is_none()
-            && callee_path(call, llbc).is_some_and(|path| llbc.is_stack_sensitive_fn(&path))
+            && callee_path(call, llbc).is_some_and(|path| {
+                llbc.is_stack_sensitive_fn(&path) && !llbc.is_stack_depth_neutral_fn(&path)
+            })
         {
             return Err("calls-stack-sensitive-fn");
         }
@@ -576,13 +645,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 }
             }
             Ok(TermKind::Assert { assert, target, .. }) => {
-                let pair = match &assert.cond {
-                    Operand::Copy(p) | Operand::Move(p) => tuple_field_of_local(p),
-                    Operand::Const(_) => None,
-                };
-                if let Some((pair, 1)) = pair
-                    && matches!(plan.specials.get(&pair), Some(Special::IndexPair(_)))
-                {
+                if assert_is_slot_index_bounds_check(assert, &plan.specials) {
                     plan.terms.insert(
                         bb,
                         TermRewrite {
@@ -590,10 +653,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             stmts: Vec::new(),
                         },
                     );
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
-                } else {
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
                 }
+                reach(&mut depth_in, &mut queue, *target, depth)?;
             }
             Ok(TermKind::Goto { target }) => reach(&mut depth_in, &mut queue, *target, depth)?,
             Ok(TermKind::Switch { targets, .. }) => match targets {
@@ -663,7 +724,27 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             continue;
         }
         if super::mentions_local(block.terminator.kind_value(), &watched) {
-            return Err("unmodeled-use-in-terminator");
+            // BoundsCheck / overflow asserts on erased slot-index
+            // arithmetic (`shadow_stack_len` + `+ k`, or the array
+            // index of `publish_roots(&[...])`). Failure is the
+            // panic edge; the offsets are compile-time so the check
+            // is statically true. Guard/Alias mentions stay: rewriting
+            // those Goto'd past Drop of a surviving RootScope.
+            let target = match block.term_ref(llbc) {
+                Ok(TermKind::Assert { assert, target, .. })
+                    if assert_is_slot_index_bounds_check(assert, &plan.specials) =>
+                {
+                    *target
+                }
+                _ => return Err("unmodeled-use-in-terminator"),
+            };
+            plan.terms.insert(
+                bb,
+                TermRewrite {
+                    target,
+                    stmts: Vec::new(),
+                },
+            );
         }
     }
     plan.unreachable = (0..n_blocks).filter(|bb| !visited[*bb]).collect();
@@ -945,6 +1026,33 @@ fn callee_path(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> O
     llbc.fn_by_id(id).map(|fd| fd.item_meta.name_path())
 }
 
+/// The callee's own body opens and closes a `RootScope`. It rewinds
+/// whatever it published, so a caller may treat the call as depth-neutral
+/// even when the callee is in the sensitive set for some *internal*
+/// reason (a `publish` of a parameter slice the analyser cannot size,
+/// a nursery malloc). It does not `Get` the caller's slots by index;
+/// a collection inside it roots the caller's replaced slots through
+/// the jitframe gcmap, the blackhole's `registers_r`, and the recorder.
+fn body_has_balanced_root_scope(body: &Unstructured, llbc: &Llbc) -> bool {
+    let mut opened = false;
+    let mut closed = false;
+    for block in &body.body {
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) {
+            match classify_call(call, llbc) {
+                Some((Leaf::Open, _)) => opened = true,
+                Some((Leaf::Close, _)) => closed = true,
+                _ => {}
+            }
+        }
+        if let Ok(TermKind::Drop { place, .. }) = block.term_ref(llbc)
+            && place_local(place).is_some_and(|l| is_root_scope_local(body, llbc, l))
+        {
+            closed = true;
+        }
+    }
+    opened && closed
+}
+
 /// Whether a body can leave slots published past its return, or reads a
 /// slot it did not publish itself.  Either makes it unsafe for a caller to
 /// scalar-replace its own bracket: the caller's slots would be missing from
@@ -1115,6 +1223,9 @@ fn stack_sensitivity(
                         if path.as_deref().is_some_and(sensitive) {
                             // A sensitive callee may read our slots or leave
                             // its own; either way nothing after it is known.
+                            // Callers that still erase do so only when
+                            // `is_stack_depth_neutral_fn` proves this
+                            // callee rewinds itself (`analyze`).
                             reads_below = true;
                             depth = Depth::Unknown;
                             why = format!("callee {}", path.as_deref().unwrap_or(""));
@@ -1254,6 +1365,24 @@ pub fn discover_stack_sensitive_fns(llbc: &Llbc) -> Vec<String> {
     out
 }
 
+/// Local bodies that open and close a `RootScope`. Harvested in link
+/// order like [`discover_stack_sensitive_fns`]: a later crate sees
+/// earlier crates' depth-neutral answers through
+/// [`Llbc::is_stack_depth_neutral_fn`].
+pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
+    let mut out: Vec<String> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            fd.unstructured()
+                .is_some_and(|body| body_has_balanced_root_scope(&body, llbc))
+        })
+        .map(|fd| fd.item_meta.name_path())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Classify `llbc`'s own functions and mark its set complete, for a caller
 /// that lowers one artefact on its own.  Callees from other artefacts count
 /// as insensitive here; the linked translation registers them first.
@@ -1263,6 +1392,7 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
     }
     let found = discover_stack_sensitive_fns(llbc);
     llbc.register_stack_sensitive_fns(found);
+    llbc.register_stack_depth_neutral_fns(discover_depth_neutral_fns(llbc));
     llbc.mark_stack_sensitive_fns_complete();
 }
 
