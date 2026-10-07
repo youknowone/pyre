@@ -5969,6 +5969,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "gil_ready::GIL_READY_STATE",
             &raw const pyre_object::gil_ready::GIL_READY_STATE as *const _ as i64,
         ),
+        // `rsiphash.py seed`: a prebuilt 16-byte secret. The Global is a
+        // `OnceLock`; the refs row is the initialized `[u8; 16]`
+        // `hash_secret` / `get_or_init` return (`bookkeeper.py
+        // immutablevalue` of that object).
+        (
+            "builtins::HASH_SECRET",
+            crate::builtins::hash_secret() as *const [u8; 16] as i64,
+        ),
     ]
 }
 
