@@ -4556,6 +4556,21 @@ impl CallControl {
                 continue;
             }
             if fname == field_name {
+                // `all_interiorfielddescrs` takes the offset from the
+                // registered layout (`symbolic.get_field_token`). The running
+                // total above does not insert `repr(C)` padding, so a `bool`
+                // before a pointer is one byte early. Prefer the layout field
+                // when it is present.
+                let (offset, field_size, flag, ir_type) = self
+                    .struct_layout_for(&elem_name)
+                    .and_then(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .find(|f| f.name == field_name)
+                            .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
+                    })
+                    .unwrap_or((offset, field_size, flag, ir_type));
                 // Use-import resolver: hash the canonical
                 // `defining_module::Bare` form so analyzer hits the
                 // same `_cache_size` slot the runtime's qualified
@@ -13604,6 +13619,61 @@ mod tests {
         assert_eq!(array.len_descr().map(|fd| fd.offset()), Some(0));
     }
 
+    /// `interiorfielddescrof_keyed` takes the offset from
+    /// `symbolic.get_field_token`, not the running field-size total.
+    /// `key: i64` then `f_valid: bool` then `value` is 9 without padding
+    /// and 16 with `repr(C)` on a 64-bit word.
+    #[test]
+    fn interiorfielddescrof_keyed_uses_layout_padding() {
+        let elem = "padded_interior_entry::Entry";
+        let atid = format!("GcArray<{elem}>");
+        let sid = majit_ir::descr::StructId::from_canonical(elem);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (elem.to_string(), Some(sid)),
+            ]));
+        let rows = [
+            ("key".into(), "i64".into()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([elem.to_string()]);
+        let layout = StructLayout::from_type_strings(
+            &rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let value_offset = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "value")
+            .expect("value field")
+            .offset;
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(elem.to_string(), rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(sid, layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), "value")
+            .expect("interior field descr");
+        let offset = descr
+            .as_interior_field_descr()
+            .expect("InteriorFieldDescr")
+            .field_descr()
+            .offset();
+        assert_eq!(offset, value_offset);
+        assert_ne!(offset, 9);
+        if crate::layout::target_word_size() == 8 {
+            assert_eq!(offset, 16);
+        }
+    }
+
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
     /// int kind across the field/return classifiers (FLAG_UNSIGNED,
     /// descr.py), while `f64` (`lltype.Float`) keeps the float kind.
@@ -14289,6 +14359,89 @@ mod tests {
             cc.guess_call_kind(&direct_call_op(target)),
             CallKind::Builtin
         );
+    }
+
+    /// A lazy funcobj whose registration carries `oopspec:…` must classify
+    /// `Builtin` on the crate-qualified call path. `mark_oopspec` writes the
+    /// attribute; `GraphTransform` hints are what `lazy_graph_source` stores
+    /// for the same token.
+    #[test]
+    fn lazy_oopspec_hint_classifies_crate_qualified_call_builtin() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        let hints = vec!["oopspec:int.py_div(x, y)".to_string()];
+        cc.register_function_graph_with_hints(
+            path,
+            GraphSource::Lazy {
+                graph: crate::model::LazyGraph::built(FunctionGraph::new("dict_count_py_div")),
+                transform: GraphTransform {
+                    return_type: Some("i64".to_string()),
+                    hints: hints.clone(),
+                },
+            },
+            hints.clone(),
+        );
+        cc.mark_decorator_hints(
+            &CallPath::from_segments(["pyre_object", "rordereddict", "dict_count_py_div"]),
+            &hints,
+        );
+        let target =
+            CallTarget::function_path(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target.clone())),
+            CallKind::Builtin,
+            "mark_decorator_hints on the registered path",
+        );
+        assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+    }
+
+    /// The lazy transform carries `oopspec:…`. Building the graph projects
+    /// that token onto `func.oopspec`, so the call is `Builtin` without a
+    /// separate `mark_oopspec`.
+    #[test]
+    fn lazy_oopspec_hint_projects_onto_func_without_explicit_mark() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        let hints = vec!["oopspec:int.py_div(x, y)".to_string()];
+        cc.register_function_graph_with_hints(
+            path,
+            GraphSource::Lazy {
+                graph: crate::model::LazyGraph::built(FunctionGraph::new("dict_count_py_div")),
+                transform: GraphTransform {
+                    return_type: Some("i64".to_string()),
+                    hints: hints.clone(),
+                },
+            },
+            hints,
+        );
+        let target =
+            CallTarget::function_path(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target.clone())),
+            CallKind::Builtin,
+            "transform hint projects onto func.oopspec",
+        );
+        assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+    }
+
+    /// A mark on the crate-stripped harvest key classifies the
+    /// crate-qualified call when that spelling has no graph of its own.
+    #[test]
+    fn guess_call_kind_oopspec_follows_crate_stripped_alias() {
+        let mut cc = CallControl::new();
+        cc.mark_oopspec(
+            CallPath::from_segments(["rordereddict", "dict_count_py_div"]),
+            "int.py_div(x, y)".to_string(),
+        );
+        let target =
+            CallTarget::function_path(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            assert_eq!(
+                cc.guess_call_kind(&direct_call_op(target.clone())),
+                CallKind::Builtin,
+            );
+            assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+        });
     }
 
     /// A sole registered impl does NOT make its method name resolvable

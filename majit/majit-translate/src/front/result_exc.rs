@@ -4982,6 +4982,11 @@ fn catch_and_rewrap(
                 *v = payload.clone();
             }
         }
+    } else {
+        // The shell does not flow onward, but the call still has a
+        // result. FUNC.RESULT is the Ok payload, so the unused shell
+        // takes that bank.
+        narrow_call_result_ty(graph, a, r, payload_ty.clone());
     }
     graph.set_control_flow_metadata(
         BlockId(a),
@@ -8138,8 +8143,14 @@ fn narrow_call_result_ty(
     else {
         return;
     };
-    if let OpKind::Call { result_ty, .. } = &mut op.kind {
-        *result_ty = payload_ty;
+    // A dyn vtable slot is `IndirectCall`, not `Call`. The `?` rewrite
+    // unwraps both, and `CallControl.getcalldescr` checks the op's bank
+    // against the family's FUNC.RESULT (the Ok payload).
+    match &mut op.kind {
+        OpKind::Call { result_ty, .. } | OpKind::IndirectCall { result_ty, .. } => {
+            *result_ty = payload_ty;
+        }
+        _ => {}
     }
 }
 
@@ -10982,6 +10993,152 @@ mod rewire_dead_arm_tests {
             Err(msg) => msg,
         };
         assert!(err.contains("scoped call result var has no producer block"));
+    }
+}
+
+/// `(*action).perform(...)?` lowers as `OpKind::IndirectCall`. The
+/// family's FUNC.RESULT is the fieldless-enum Ok payload (`Int`). The
+/// diamond must retarget that call onto the payload bank.
+#[cfg(test)]
+mod indirect_call_try_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor};
+
+    fn pos0(owner: &str) -> FieldDescriptor {
+        FieldDescriptor::new("__pos_0", Some(owner.to_string()))
+    }
+
+    #[test]
+    fn question_mark_on_an_indirect_call_narrows_to_the_ok_payload() {
+        let mut graph = FunctionGraph::new("indirect_perform_try");
+        let entry = graph.startblock;
+        let funcptr = graph.alloc_value_var();
+        let recv = graph.alloc_value_var();
+        graph.blocks[entry.0].inputargs = vec![funcptr.clone(), recv.clone()];
+        let shell = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr,
+                    args: vec![recv],
+                    graphs: None,
+                    family_key: Some(("AsyncAction".into(), "perform".into())),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("shell");
+
+        let (branch_bb, branch_in) = graph.create_block_with_arg_vars(1);
+        let result_in = branch_in[0].clone();
+        let cf = graph
+            .push_op_var(
+                branch_bb,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("Try".into())),
+                    args: crate::model::call_args(vec![result_in]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_goto(entry, branch_bb, vec![shell.clone()]);
+
+        let (disc_bb, disc_in) = graph.create_block_with_arg_vars(1);
+        let cf_in = disc_in[0].clone();
+        let disc = graph
+            .push_op_var(
+                disc_bb,
+                OpKind::FieldRead {
+                    base: cf_in.clone(),
+                    field: FieldDescriptor::new("__discriminant", Some("ControlFlow".into())),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        graph.set_goto(branch_bb, disc_bb, vec![cf]);
+
+        let (cont_bb, cont_in) = graph.create_block_with_arg_vars(1);
+        let cont_payload = graph
+            .push_op_var(
+                cont_bb,
+                OpKind::FieldRead {
+                    base: cont_in[0].clone(),
+                    field: pos0("ControlFlow::Continue"),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("continue payload");
+        graph.set_return(cont_bb, Some(cont_payload));
+
+        let (break_bb, break_in) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                break_bb,
+                OpKind::FieldRead {
+                    base: break_in[0].clone(),
+                    field: pos0("ControlFlow::Break"),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                break_bb,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(break_bb, Some(residual));
+
+        graph.block_mut(disc_bb).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(disc_bb).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_in.clone())],
+                cont_bb,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_in)],
+                break_bb,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(shell.clone(), None, ValueType::Int)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("indirect `?` diamond lowers");
+        assert_eq!(outcome.diamonds, 1);
+
+        let call = graph.blocks[entry.0]
+            .operations
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::IndirectCall { .. }))
+            .expect("indirect call survives");
+        let OpKind::IndirectCall { result_ty, .. } = &call.kind else {
+            unreachable!("filtered");
+        };
+        assert_eq!(*result_ty, ValueType::Int);
+        assert_ne!(call.result.as_ref(), Some(&shell));
+        assert!(matches!(
+            graph.blocks[entry.0].exitswitch,
+            Some(ExitSwitch::LastException)
+        ));
     }
 }
 

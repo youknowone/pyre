@@ -7,6 +7,7 @@
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
+    front::llbc_hints::harvest_hints_from_llbcs,
     front::mir::{
         build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
     },
@@ -249,6 +250,48 @@ fn spec_copy_keeps_bare_lltype_malloc_typed() {
             .map(|f| f.name.as_str())
             .filter(|name| name.contains("malloc"))
             .collect::<Vec<_>>()
+    );
+}
+
+/// `probe_i64_store` / `probe_i64_lookup` are `unroll_safe` and only reached
+/// from a `BuildHasher` spec copy. `look_inside_graph` declines a loopy copy
+/// that dropped `_jit_unroll_safe_`, and the call then residualizes at a
+/// symbolic fnaddr.
+#[test]
+fn int_dict_lookup_orig_is_unroll_safe() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let harvested = harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict"],
+        &[
+            "ll_dict_lookup_orig",
+            "ll_dict_lookup_trampoline",
+            "w_dict_store_int_strategy",
+            "w_dict_delitem_int_strategy",
+        ],
+    )
+    .expect("lower int-strategy store and ll_dict_lookup_orig");
+    let lookups: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("ll_dict_lookup_orig"))
+        .collect();
+    let harvested_keys: Vec<_> = harvested
+        .iter()
+        .filter(|(path, _)| {
+            path.contains("ll_dict_lookup_orig") || path.contains("ll_dict_lookup_trampoline")
+        })
+        .map(|(path, hints)| format!("{path} -> {hints:?}"))
+        .collect();
+    let spec_rows: Vec<_> = lookups
+        .iter()
+        .map(|f| format!("{} hints {:?}", f.name, f.hints))
+        .collect();
+    assert!(
+        !lookups.is_empty(),
+        "no ll_dict_lookup_orig graph\nharvested {harvested_keys:?}\nspecs {spec_rows:?}"
     );
 }
 
