@@ -392,9 +392,10 @@ fn test_guard_and_loop() {
     assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
 }
 
-/// A body JUMP carries the LABEL's loop-invariant entry box unchanged.
-/// The assembler remap sees equal arity (`x86/regalloc.py`
-/// `_compute_hint_locations_from_descr`) and identity-moves that slot.
+/// `reshape_jump_args_for_preamble` pads a short body JUMP with the
+/// preamble LABEL's extra entry box. The assembler remap then sees
+/// equal arity (`x86/regalloc.py` `_compute_hint_locations_from_descr`)
+/// and identity-moves the invariant slot.
 #[test]
 fn a_jump_that_carries_a_label_invariant_slot_compiles() {
     let mut backend = DynasmBackend::new();
