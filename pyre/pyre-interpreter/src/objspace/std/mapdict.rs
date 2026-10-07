@@ -707,8 +707,8 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
 /// `w_class` field authoritative for `type()` (the node layer's
-/// `terminator.w_cls` is never read for `getclass`), so the caller sets that
-/// after this returns.
+/// `terminator.w_cls` is never read for `getclass`), so this store writes
+/// that field while the stripes are held.
 ///
 /// `dont_look_inside` — same residual-call rationale as
 /// [`instance_node_setdictvalue`]: `node_set_terminator` rebuilds through
@@ -717,14 +717,10 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
 /// not annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject`. `publish` runs while both the
-/// old and the new class stripes are held; it stores `w_class`.
+/// `obj` must be a live `W_ObjectObject`. The class store runs while both
+/// the old and the new class stripes are held.
 #[majit_macros::dont_look_inside]
-pub unsafe fn instance_setclass(
-    obj: PyObjectRef,
-    w_cls: PyObjectRef,
-    publish: unsafe fn(PyObjectRef, PyObjectRef),
-) {
+pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     // `node_set_terminator` can collect. Both pointers are pinned so the
     // storage write below addresses the instance the collector left live.
     // Hold the old and new stripes across that write and `publish`: an
@@ -759,7 +755,16 @@ pub unsafe fn instance_setclass(
         inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
         let obj = pyre_object::gc_roots::shadow_stack_get(slots);
         let w_cls = pyre_object::gc_roots::shadow_stack_get(slots + 1);
-        unsafe { publish(obj, w_cls) };
+        // objectobject.py W_Root.setclass: store while the stripes from
+        // this rebuild are still held. Folded here so `descr_set___class__`
+        // does not mint a nested `publish_assigned_class` graph.
+        pyre_object::notify_w_class_mutated_then(|| {
+            if pyre_object::is_instance(obj) {
+                let (typeptr, _) = pyre_object::instance_typeptr_for(w_cls);
+                (*obj).ob_type = typeptr;
+            }
+            (*obj).w_class = w_cls;
+        });
         return;
     }
 }
@@ -833,8 +838,9 @@ pub unsafe fn mapdict_boxed_dict_attr(obj: PyObjectRef, name: &Wtf8) -> Option<P
     }
     // Map and storage move together under the same stripe as
     // `instance_node_getdictvalue_checked`. This probe does not convert
-    // or write, so the lock only covers the read.
-    let _instance_guard = instance_lock(obj);
+    // or write, so the lock only covers the read. A contended stripe
+    // wait can forward the receiver; the carrier reads that word.
+    let (_instance_guard, obj) = instance_lock(obj);
     let inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
     if map.is_null() || unsafe { map_is_devolved(map) } {

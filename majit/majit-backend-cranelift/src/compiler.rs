@@ -9231,20 +9231,18 @@ fn snapshot_trace_ops(ops: &[OpRc]) -> Vec<Op> {
 }
 
 /// The trace id is assigned by `do_compile`; the caller fills it in once the
-/// compile succeeds.
+/// compile succeeds. The graph is registered there so a later minor traces
+/// its `ConstPtr` indexes.
 fn retained_merge_source(inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource {
-    MergeSource {
-        trace_id: 0,
-        inputargs: snapshot_inputargs(inputargs),
-        ops: snapshot_trace_ops(ops),
-    }
+    MergeSource::new(0, snapshot_inputargs(inputargs), snapshot_trace_ops(ops))
 }
 
+/// Share the registered graph. A second `snapshot_ops` would re-intern
+/// every `ConstPtr` (`Operand::from_opref`).
 fn clone_merge_source(src: &MergeSource) -> MergeSource {
     MergeSource {
         trace_id: src.trace_id,
-        inputargs: snapshot_inputargs(&src.inputargs),
-        ops: snapshot_ops(&src.ops),
+        graph: Arc::clone(&src.graph),
     }
 }
 
@@ -9451,10 +9449,10 @@ fn has_inline_constptr(ops: &[Op]) -> bool {
 
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
-/// fail-arg `_gcref_index` put each such constant there, keyed by the address
-/// it had at that compile. The retained ops still name that address; the slot
-/// holds the address after any collection since. `None` when a constant is
-/// not in the table, which refuses the merge.
+/// fail-arg `_gcref_index` put each such constant there.
+/// [`GcTable::index_for_retained_const`] matches the forwarded slot, then the
+/// compile-time key a leftover fail arg still carries. `None` when a constant
+/// is not in the table, which refuses the merge.
 fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> Option<()> {
     let refresh = |arg: &majit_ir::operand::Operand| -> Option<majit_ir::operand::Operand> {
         let Some(majit_ir::Value::Ref(gcref)) = arg.const_value() else {
@@ -9464,7 +9462,7 @@ fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> 
             return Some(arg.clone());
         }
         let table = table?;
-        let index = (0..table.len()).find(|&i| table.compile_key(i) == gcref.0)?;
+        let index = table.index_for_retained_const(gcref.0)?;
         Some(majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
             table.slot(index),
         )))
@@ -9688,24 +9686,24 @@ fn collect_merged_bridges(
         // bridge but `GuardNoOverflow` there resumes on a NULL object.
         // `GuardNoOverflow` is the overflow edge and still splices.
         let bridge_has_noexc = bridge_src
-            .ops
+            .ops()
             .iter()
             .any(|bridge_op| bridge_op.opcode == OpCode::GuardNoException);
         let only_overflow = owner_has_noexc
             || bridge_has_noexc
             || owner_has_inline_constptr
-            || has_inline_constptr(&bridge_src.ops);
+            || has_inline_constptr(bridge_src.ops());
         if op.opcode == OpCode::GuardNoException {
             continue;
         }
         if only_overflow && op.opcode != OpCode::GuardNoOverflow {
             continue;
         }
-        let bridge_ops = snapshot_ops(&bridge_src.ops);
+        let bridge_ops = snapshot_ops(bridge_src.ops());
         refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
         pieces.push(MergedBridgePiece {
             source_guard_op: op_idx,
-            inputargs: snapshot_inputargs(&bridge_src.inputargs),
+            inputargs: snapshot_inputargs(bridge_src.inputargs()),
             ops: bridge_ops,
             invalidation_flag_ptr: bridge_segment_flag(&bridge, owner),
         });
@@ -9752,7 +9750,7 @@ fn try_accept_family_member(
             .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())?;
         let src = compiled.merge_source.as_ref()?;
-        let label_in_ops = src.ops.iter().any(|op| {
+        let label_in_ops = src.ops().iter().any(|op| {
             op.opcode == OpCode::Label
                 && op
                     .getdescr()
@@ -9761,8 +9759,8 @@ fn try_accept_family_member(
         if !label_in_ops {
             return None;
         }
-        let first_label = src.ops.iter().position(|op| op.opcode == OpCode::Label)?;
-        ops = snapshot_ops(&src.ops[first_label..]);
+        let first_label = src.ops().iter().position(|op| op.opcode == OpCode::Label)?;
+        ops = snapshot_ops(&src.ops()[first_label..]);
         entry_args = member_entry_args(&ops)?;
         refresh_retained_constptrs(&ops, compiled.gc_table.as_deref())?;
         if ops_refuse_merge(&ops) {
@@ -9841,8 +9839,8 @@ fn prepare_merged_recompile(
         (
             compiled.trace_id,
             compiled.gc_table.clone(),
-            snapshot_inputargs(&loop_src.inputargs),
-            snapshot_ops(&loop_src.ops),
+            snapshot_inputargs(loop_src.inputargs()),
+            snapshot_ops(loop_src.ops()),
         )
     };
     let pieces = collect_merged_bridges(&loop_ops, token)?;
@@ -21374,7 +21372,7 @@ fn retained_loop_label_ids(compiled: &CompiledLoop) -> Vec<usize> {
     let Some(src) = compiled.merge_source.as_ref() else {
         return Vec::new();
     };
-    src.ops
+    src.ops()
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .filter_map(|op| op.getdescr().map(|descr| majit_ir::descr_identity(&descr)))
@@ -26082,13 +26080,13 @@ mod tests {
         ops: &[OpRc],
     ) {
         assert_eq!(src.trace_id, trace_id);
-        assert_eq!(src.inputargs.len(), inputargs.len());
-        for (got, exp) in src.inputargs.iter().zip(inputargs.iter()) {
+        assert_eq!(src.inputargs().len(), inputargs.len());
+        for (got, exp) in src.inputargs().iter().zip(inputargs.iter()) {
             assert_eq!(got.tp.get(), exp.tp.get());
             assert_eq!(got.index, exp.index);
         }
-        assert_eq!(src.ops.len(), ops.len());
-        for (got, exp) in src.ops.iter().zip(ops.iter()) {
+        assert_eq!(src.ops().len(), ops.len());
+        for (got, exp) in src.ops().iter().zip(ops.iter()) {
             assert_eq!(got.opcode, exp.opcode);
             assert_eq!(got.num_args(), exp.num_args());
             for i in 0..got.num_args() {
@@ -26106,6 +26104,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A retained graph is a `ConstPtr` holder. Dropping it must drop the
+    /// registry `Weak`, or the next collection would keep the referent.
+    #[test]
+    fn merge_graph_walk_forwards_constptr_until_drop() {
+        let _exclusive = crate::guard::MERGE_CONST_WALK_LOCK.write();
+        let from = GcRef(0x1111_0000);
+        let index = match OpRef::const_ptr(from) {
+            OpRef::ConstPtr(index) => index,
+            other => panic!("const_ptr interned to {other:?}"),
+        };
+        let op = OpRc::new(Op::new(
+            OpCode::DebugMergePoint,
+            &[Operand::from_opref(OpRef::ConstPtr(index))],
+        ));
+        let source = retained_merge_source(&[InputArg::new_int_rc(0)], &[op]);
+        let registered = Arc::as_ptr(&source.graph);
+        assert!(crate::guard::merge_graph_live_at(registered));
+        let stored = match source.ops()[0].arg(0).to_opref() {
+            OpRef::ConstPtr(stored) => stored,
+            other => panic!("retained arg is {other:?}"),
+        };
+        let to = GcRef(0x2222_0000);
+        source.ops()[0].walk_const_ptr_refs_mut(&mut |slot| {
+            if *slot == from {
+                *slot = to;
+            }
+        });
+        match source.ops()[0].arg(0).const_value() {
+            Some(Value::Ref(got)) => assert_eq!(got, to),
+            other => panic!("retained const is {other:?}"),
+        }
+        assert_eq!(majit_ir::const_ptr_table::resolve(stored), to);
+        drop(source);
+        assert!(
+            !crate::guard::merge_graph_live_at(registered),
+            "dropped merge graph is still a root"
+        );
     }
 
     #[test]

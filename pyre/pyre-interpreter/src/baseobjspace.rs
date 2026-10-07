@@ -14512,8 +14512,12 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // `INSTANCE_USER_TYPE` and the header tid does not change. Other
         // layouts keep the typeptr their own allocator stamped.
         // A mapdict carrier also holds both class stripes across this store.
-        // `instance_setclass` rewrites `map`/`storage` before `publish`.
-        unsafe fn publish_assigned_class(w_obj: PyObjectRef, w_newcls: PyObjectRef) {
+        // `instance_setclass` rewrites `map`/`storage` then stores the
+        // class while both stripes are held. The non-mapdict arm stores
+        // here, the same body, without a nested helper graph.
+        if crate::objspace::std::mapdict::has_mapdict_layout(w_obj) {
+            crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
+        } else {
             pyre_object::notify_w_class_mutated_then(|| {
                 if pyre_object::is_instance(w_obj) {
                     let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
@@ -14521,15 +14525,6 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 }
                 (*w_obj).w_class = w_newcls;
             });
-        }
-        if crate::objspace::std::mapdict::has_mapdict_layout(w_obj) {
-            crate::objspace::std::mapdict::instance_setclass(
-                w_obj,
-                w_newcls,
-                publish_assigned_class,
-            );
-        } else {
-            unsafe { publish_assigned_class(w_obj, w_newcls) };
         }
         // `setfield` of a GC pointer into `w_obj`: a heap class is born young
         // (`w_type_new`), so an old instance pointing at it has to be in the

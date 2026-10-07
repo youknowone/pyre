@@ -206,6 +206,20 @@ impl GcTable {
         self.compile_keys[i]
     }
 
+    /// Slot whose current address is `addr`, else the slot whose
+    /// compile-time key is `addr`.
+    ///
+    /// [`Self::trace`] forwards [`Self::slot`] and leaves [`Self::compile_key`].
+    /// A ConstPtr the collector also forwarded names the live slot; a leftover
+    /// fail arg still names the key. One pass that accepts either key binds a
+    /// forwarded address to another slot's compile-time key when the nursery
+    /// reuses that address.
+    pub fn index_for_retained_const(&self, addr: usize) -> Option<usize> {
+        (0..self.array_length)
+            .find(|&i| self.slot(i).0 == addr)
+            .or_else(|| (0..self.array_length).find(|&i| self.compile_keys[i] == addr))
+    }
+
     /// Read slot `i`.
     pub fn slot(&self, i: usize) -> GcRef {
         assert!(i < self.array_length);
@@ -335,6 +349,14 @@ mod tests {
             "ConstPtr lookup keys stay at the compile-time address"
         );
         assert_eq!(table.compile_key(1), 0x2000);
+        assert_eq!(table.index_for_retained_const(0x9000), Some(0));
+        assert_eq!(
+            table.index_for_retained_const(0x1000),
+            Some(0),
+            "a leftover fail arg still names the compile-time address"
+        );
+        assert_eq!(table.index_for_retained_const(0x2000), Some(1));
+        assert_eq!(table.index_for_retained_const(0x3000), None);
         assert_eq!(
             table.base_addr(),
             table._owned.as_ref().unwrap().as_ptr() as usize
