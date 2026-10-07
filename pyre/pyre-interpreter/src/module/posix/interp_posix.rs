@@ -2664,12 +2664,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 args.len()
             )));
         }
-        let fd = libc::c_int::try_from(crate::builtins::space_index_w(args[0])?)
+        let mut w_fd = args[0];
+        let fd_value =
+            pyre_object::with_roots!(w_fd => crate::builtins::space_index_w(w_fd))?;
+        let fd = libc::c_int::try_from(fd_value)
             .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             // `interp_posix.get_blocking`: `eintr_retry=False`.
-            let mut w_fd = args[0];
             let flags = pyre_object::with_roots!(w_fd => unsafe {
                 majit_rlib::rposix::c_get_status_flags(fd)
             });
@@ -2738,7 +2740,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // CPython 3.14's Argument Clinic declares this parameter `bool`, so
         // it truth-tests arbitrary objects.  This intentionally differs from
         // PyPy's older `@unwrap_spec(blocking=int)` gateway.
-        let blocking = crate::baseobjspace::is_true(w_blocking)?;
+        let blocking =
+            pyre_object::with_roots!(w_blocking => crate::baseobjspace::is_true(w_blocking))?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             // `interp_posix.set_blocking`: `eintr_retry=False`.
@@ -5026,7 +5029,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if args.is_empty() {
                     return Ok(pyre_object::w_bool_from(false));
                 }
-                let fd = crate::baseobjspace::c_int_w(args[0])?;
+                let mut w_fd = args[0];
+                let fd = pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?;
                 #[cfg(feature = "sandbox")]
                 {
                     return Ok(pyre_object::w_bool_from(
@@ -5036,7 +5040,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 {
                     // `rposix.isatty`: `c_isatty(fd) != 0` (`save_err` is `RFFI_ERR_NONE`).
-                    let mut w_fd = args[0];
                     let res = pyre_object::with_roots!(w_fd => unsafe {
                         majit_rlib::rposix::c_isatty(fd)
                     });
@@ -12353,8 +12356,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             }
                         }
                     }
-                    let out_b = fd_borrow(out_fd)?;
-                    let in_b = fd_borrow(in_fd)?;
+                    let out_b = pyre_object::with_roots!(
+                        w_out_fd, w_in_fd, w_offset, w_count,
+                        w_headers, w_trailers, w_flags => fd_borrow(out_fd)
+                    )?;
+                    let in_b = pyre_object::with_roots!(
+                        w_out_fd, w_in_fd, w_offset, w_count,
+                        w_headers, w_trailers, w_flags => fd_borrow(in_fd)
+                    )?;
                     // An empty sequence is indistinguishable from an absent
                     // one at the syscall boundary, independently for headers
                     // and trailers.
