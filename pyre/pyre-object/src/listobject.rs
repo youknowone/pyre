@@ -10,10 +10,9 @@
 
 use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
-    alloc_typed_items_block_nursery, dealloc_list_items_block, gc_float_array_gc_type_id,
-    gc_int_array_gc_type_id, grow_list_items_block_gc, grow_typed_items_block,
-    items_block_capacity, items_block_items_base, items_block_set_ref, jit_ll_arraycopy,
-    typed_items_block_items_base,
+    alloc_typed_items_block_nursery, dealloc_list_items_block, gc_int_array_gc_type_id,
+    grow_float_items_block, grow_int_items_block, grow_list_items_block_gc, items_block_capacity,
+    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -3133,7 +3132,7 @@ fn ll_list_int_resize_hint_really_iff(
 #[majit_macros::look_inside_iff(ll_list_int_resize_hint_really_iff)]
 pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
     // rlist.py `_ll_list_resize_hint_really`: malloc then `l.items = newitems`.
-    // `grow_typed_items_block` is a collecting allocation; pin the owner
+    // `grow_int_items_block` is a collecting allocation; pin the owner
     // the way `object_grow` does and reload it before the setfield.
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
@@ -3147,12 +3146,7 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, o
             .max(crate::int_array::INT_ARRAY_INLINE_CAP);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let newitems = grow_typed_items_block(
-            list.int_items.block,
-            target_cap,
-            list.int_items.len(),
-            gc_int_array_gc_type_id(),
-        );
+        let newitems = grow_int_items_block(list.int_items.block, target_cap, list.int_items.len());
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
         ll_list_int_set_items(list, newitems);
@@ -3275,12 +3269,8 @@ pub unsafe fn ll_list_float_resize_hint_really(
             .max(crate::float_array::FLOAT_ARRAY_INLINE_CAP);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let newitems = grow_typed_items_block(
-            list.float_items.block,
-            target_cap,
-            list.float_items.len(),
-            gc_float_array_gc_type_id(),
-        );
+        let newitems =
+            grow_float_items_block(list.float_items.block, target_cap, list.float_items.len());
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
         ll_list_float_set_items(list, newitems);
@@ -4709,26 +4699,21 @@ unsafe fn resize_backing_to(obj: PyObjectRef, root_base: usize, target: usize) -
             // resize and differ only in the field it lands in and the array
             // token it carries.
             let float = matches!(list.strategy, ListStrategy::Float);
-            let (old, len, tid) = if float {
-                (
-                    list.float_items.block,
-                    list.float_items.len(),
-                    crate::object_array::gc_float_array_gc_type_id(),
-                )
+            let (old, len) = if float {
+                (list.float_items.block, list.float_items.len())
             } else {
-                (
-                    list.int_items.block,
-                    list.int_items.len(),
-                    crate::object_array::gc_int_array_gc_type_id(),
-                )
+                (list.int_items.block, list.int_items.len())
             };
             let fresh = if target == 0 {
                 crate::object_array::dealloc_typed_items_block(old);
                 std::ptr::null_mut()
             } else {
-                let Some(fresh) =
-                    crate::object_array::try_grow_typed_items_block(old, target, len, tid)
-                else {
+                let grown = if float {
+                    crate::object_array::try_grow_float_items_block(old, target, len)
+                } else {
+                    crate::object_array::try_grow_int_items_block(old, target, len)
+                };
+                let Some(fresh) = grown else {
                     return false;
                 };
                 fresh
@@ -5859,22 +5844,12 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         ListStrategy::Integer => {
-            let fresh = crate::object_array::grow_typed_items_block(
-                list.int_items.block,
-                4,
-                0,
-                crate::object_array::gc_int_array_gc_type_id(),
-            );
+            let fresh = crate::object_array::grow_int_items_block(list.int_items.block, 4, 0);
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             (*(obj as *mut W_ListObject)).int_items.block = fresh;
         }
         ListStrategy::Float => {
-            let fresh = crate::object_array::grow_typed_items_block(
-                list.float_items.block,
-                4,
-                0,
-                crate::object_array::gc_float_array_gc_type_id(),
-            );
+            let fresh = crate::object_array::grow_float_items_block(list.float_items.block, 4, 0);
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             (*(obj as *mut W_ListObject)).float_items.block = fresh;
         }

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::object_array::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock, alloc_typed_items_block,
-    dealloc_typed_items_block, gc_int_array_gc_type_id, grow_typed_items_block,
+    dealloc_typed_items_block, gc_int_array_gc_type_id, grow_int_items_block,
     try_alloc_typed_items_block, typed_items_block_capacity,
 };
 
@@ -272,14 +272,7 @@ impl IntArray {
             .saturating_add(extra)
             .saturating_add(min_cap >> 3)
             .max(INT_ARRAY_INLINE_CAP);
-        self.block = unsafe {
-            grow_typed_items_block(
-                self.block,
-                target_cap,
-                self.len_relaxed(),
-                gc_int_array_gc_type_id(),
-            )
-        };
+        self.block = unsafe { grow_int_items_block(self.block, target_cap, self.len_relaxed()) };
     }
 
     pub fn push(&mut self, value: i64) {
