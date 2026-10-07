@@ -119,7 +119,8 @@ crate::py_module! {
         // is not exposed — matching the tz-dependent stubs installed below.
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            t::init_timezone(ns);
+            let mut ns = ns;
+            pyre_object::with_roots!(ns => t::init_timezone(ns));
             crate::module_ns_store(
                 ns,
                 "tzset",
@@ -131,7 +132,8 @@ crate::py_module! {
         // the MSVC runtime's `_tzset` is not exposed under that name either.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            t::init_timezone(ns);
+            let mut ns = ns;
+            pyre_object::with_roots!(ns => t::init_timezone(ns));
             // `GetThreadTimes` is unconditional on Windows, so `thread_time`
             // is published there for the same reason the Unix arm publishes
             // it wherever `CLOCK_THREAD_CPUTIME_ID` exists.

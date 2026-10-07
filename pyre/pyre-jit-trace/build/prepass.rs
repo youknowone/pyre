@@ -1595,6 +1595,35 @@ fn real_main() {
                 .copied()
                 .unwrap_or(u32::MAX);
         }
+        // `effectinfo.py compute_bitstrings` is the one writer of
+        // `descr.ei_index`. A serialized `BhDescr::Array` still holds the
+        // index the codewriter's live descr had before this freeze, and the
+        // runtime descr rebuilt from it is stamped with that index, so give
+        // it the frozen partition's slot (or the sentinel) the frozen
+        // bitstrings test.
+        fn restamp_array_ei_index(
+            descr: &mut majit_translate::jitcode::BhDescr,
+            arrays: &std::collections::BTreeMap<majit_ir::effectinfo::DescrSetMember, u32>,
+        ) {
+            match descr {
+                majit_translate::jitcode::BhDescr::Array {
+                    type_id, ei_index, ..
+                } => {
+                    *ei_index = arrays
+                        .get(&majit_ir::effectinfo::DescrSetMember::Array { array_id: *type_id })
+                        .copied()
+                        .filter(|_| *type_id != 0)
+                        .unwrap_or(u32::MAX);
+                }
+                majit_translate::jitcode::BhDescr::InteriorField { array, .. } => {
+                    restamp_array_ei_index(array, arrays);
+                }
+                _ => {}
+            }
+        }
+        for descr in &mut frozen_descrs {
+            restamp_array_ei_index(descr, &frozen_layout.descr_indices[1]);
+        }
 
         // JSON metadata for debugging
         let mut frozen_pipeline = pipeline.clone();

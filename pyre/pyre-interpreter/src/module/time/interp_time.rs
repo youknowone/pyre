@@ -1477,14 +1477,16 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
 /// timezone attributes from libc's January/July broken-down times.  This
 /// preserves the standard-vs-DST ordering in both hemispheres.
 #[cfg(unix)]
-pub(crate) fn init_timezone(ns: PyObjectRef) {
+pub(crate) fn init_timezone(mut ns: PyObjectRef) {
     const YEAR: i64 = (365 * 24 + 6) * 3600;
     let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
-    let january = _c_localtime(start);
-    let july = _c_localtime(start + YEAR / 2);
+    let (january, july) = pyre_object::with_roots!(ns => {
+        let january = _c_localtime(start).ok();
+        (january, _c_localtime(start + YEAR / 2).ok())
+    });
 
     let (timezone, altzone, daylight, standard_name, daylight_name) = match (january, july) {
-        (Ok(january), Ok(july)) => {
+        (Some(january), Some(july)) => {
             let january_offset = -january.tm_gmtoff;
             let july_offset = -july.tm_gmtoff;
             let january_name = if january.tm_zone.is_empty() {
@@ -1599,15 +1601,17 @@ fn windows_fill_local_zone(tm: &mut c_tm, when: time_t) {
 /// `daylight` says the zone observes DST at all, which is what the runtime
 /// reports and what a January/July pair shows.
 #[cfg(windows)]
-pub(crate) fn init_timezone(ns: PyObjectRef) {
+pub(crate) fn init_timezone(mut ns: PyObjectRef) {
     const YEAR: i64 = (365 * 24 + 6) * 3600;
     let info = host_time::get_tz_info();
     let timezone = i64::from(info.bias + info.standard_bias) * 60;
     let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
-    let observes_dst = [start, start + YEAR / 2]
-        .iter()
-        .filter_map(|&when| _c_localtime(when).ok())
-        .any(|tm| tm.tm_isdst > 0);
+    let observes_dst = pyre_object::with_roots!(ns => {
+        [start, start + YEAR / 2]
+            .iter()
+            .filter_map(|&when| _c_localtime(when).ok())
+            .any(|tm| tm.tm_isdst > 0)
+    });
 
     crate::module_ns_store(ns, "timezone", w_int_new(timezone));
     crate::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
