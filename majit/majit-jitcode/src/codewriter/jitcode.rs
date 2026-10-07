@@ -1988,8 +1988,9 @@ pub enum BhDescr {
         /// the producer-side `SimpleArrayDescr.get_ei_index()`. Passed
         /// to `make_descr_from_bh` so the runtime `SimpleArrayDescr` it
         /// reconstructs publishes the same ei_index — without this
-        /// field the bridge breaks across the BhDescr boundary.
-        /// `u32::MAX` is the unset sentinel.
+        /// field the bridge breaks across the BhDescr boundary. The
+        /// prepass replaces it with the slot of the frozen bitstrings
+        /// before serializing. `u32::MAX` is the unset sentinel.
         ei_index: u32,
         /// Codewriter-side ARRAY identity proxy
         /// (`call.rs::DescrIndexRegistry::array_index` key) — the Rust
