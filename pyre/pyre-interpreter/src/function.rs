@@ -4014,7 +4014,82 @@ pub fn funccall_result(
             _ => unreachable!(),
         };
     }
+    // function.py `Function.funccall`:
+    //   elif (nargs | PyCode.FLATPYCALL) == fast_natural_arity:
+    //       assert isinstance(code, PyCode)
+    //       if nargs < 5:
+    //           createframe; funccallunrolling local copy; new_frame.run
+    // A user dunder (`__add__` and the rest) has `fast_natural_arity =
+    // FLATPYCALL | co_argcount`, so the builtin arm above does not match
+    // and this arm is what looks inside to `PyFrame.run` instead of
+    // residualising `call_args` / `fill_user_function_args`.
+    if (nargs | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity
+        && nargs < 5
+    {
+        return funccall_flat_from_args(func, code, args);
+    }
     crate::call::call_function_impl_result(func, args)
+}
+
+/// function.py `Function.funccall` FLATPYCALL arm (`nargs < 5`).
+///
+/// `space.createframe(code, self.w_func_globals, self)` then
+/// `funccallunrolling` writes `args_w[i]` into
+/// `locals_cells_stack_w[i]`, then `new_frame.run`.  PyPy has no extra
+/// GC API on that path; pyre is 3.14t, so the converted `PyObjectRef`s
+/// stay pinned across `createframe` /
+/// `try_new_for_call_with_closure_and_globals_obj` and `PyFrame.run_with_jit`
+/// with `pin_root` / `with_roots`, matching interp_posix and `_flat_pycall`.
+#[majit_macros::unroll_safe]
+fn funccall_flat_from_args(
+    mut func: PyObjectRef,
+    code: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let nargs = args.len();
+    debug_assert!(
+        !unsafe { crate::gateway::is_builtin_code(code) },
+        "function.py funccall FLATPYCALL arm is PyCode only"
+    );
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.base();
+    let _ = _roots.pin_root(func);
+    let _ = _roots.pin_root(code as PyObjectRef);
+    for &arg in args {
+        let _ = _roots.pin_root(arg);
+    }
+    func = _roots.get(root_base);
+    let mut code = _roots.get(root_base + 1);
+    let mut w_globals = unsafe { function_get_globals_obj(func) };
+    let mut closure = unsafe { function_get_closure(func) };
+
+    let mut new_frame = crate::pyframe::FrameBox::new(
+        match pyre_object::with_roots!(func, code, w_globals, closure =>
+            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                code as *const (),
+                &[],
+                w_globals,
+                crate::call::getexecutioncontext(),
+                closure,
+                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+            )
+        ) {
+            Ok(f) => f,
+            Err(e) => return Err(e),
+        },
+    );
+
+    // function.py funccall: `for i in funccallunrolling: if i < nargs`
+    for i in 0..4 {
+        if i < nargs {
+            new_frame.set_locals_w(i, _roots.get(root_base + 2 + i));
+        }
+    }
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    new_frame.fix_array_ptrs();
+    let result = new_frame.run_with_jit();
+    drop(_roots);
+    result
 }
 
 /// PyPy-compatible `funccall` helper.
