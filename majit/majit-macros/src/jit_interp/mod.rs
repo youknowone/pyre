@@ -2471,7 +2471,8 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     // registers just reached. Re-read those slots (live
                     // `MetaInterp.framestack`, or the Continue-walk
                     // snapshot taken before the last portal frame was
-                    // popped) before adopting them as close_greens.
+                    // popped) and build `live_arg_boxes` the way
+                    // `reached_loop_header` does at `opimpl_jit_merge_point`.
                     __meta.close_header_revisit(__pc);
                     return majit_metainterp::TraceAction::CloseLoop;
                 }

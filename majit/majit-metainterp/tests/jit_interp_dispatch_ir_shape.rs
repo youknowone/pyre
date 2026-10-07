@@ -1105,34 +1105,47 @@ mod oparg_minimal {
             greens_f_len
         );
 
-        // Reds: pc (Int/i0) then program (Ref/r0).
+        // Reds: pc (Int/i0), last_instr/acc identity slots, program (Ref/r0).
+        // `handle_jit_marker__jit_merge_point` lists identity slots as reds.
         let reds_i_len = code[greens_base + 3] as usize;
         assert_eq!(
-            reds_i_len, 1,
-            "A.3.3: reds_i_len must be 1 (pc → Int i0); got {}",
+            reds_i_len, 3,
+            "A.3.3: reds_i_len must be 3 (pc + last_instr + acc); got {}",
             reds_i_len
         );
-        let reds_i_byte = code[greens_base + 4];
         assert_eq!(
-            reds_i_byte, 0,
+            code[greens_base + 4],
+            0,
             "A.3.3: reds_i[0] must be 0 (pc at register i0); got {}",
-            reds_i_byte
+            code[greens_base + 4]
+        );
+        assert_eq!(
+            code[greens_base + 5],
+            1,
+            "A.3.3: reds_i[1] must be 1 (last_instr identity); got {}",
+            code[greens_base + 5]
+        );
+        assert_eq!(
+            code[greens_base + 6],
+            2,
+            "A.3.3: reds_i[2] must be 2 (acc identity); got {}",
+            code[greens_base + 6]
         );
 
-        let reds_r_len = code[greens_base + 5] as usize;
+        let reds_r_len = code[greens_base + 7] as usize;
         assert_eq!(
             reds_r_len, 1,
             "A.3.3: reds_r_len must be 1 (program → Ref r0); got {}",
             reds_r_len
         );
-        let reds_r_byte = code[greens_base + 6];
+        let reds_r_byte = code[greens_base + 8];
         assert_eq!(
             reds_r_byte, 0,
             "A.3.3: reds_r[0] must be 0 (program at register r0); got {}",
             reds_r_byte
         );
 
-        let reds_f_len = code[greens_base + 7] as usize;
+        let reds_f_len = code[greens_base + 9] as usize;
         assert_eq!(
             reds_f_len, 0,
             "A.3.3: reds_f_len must be 0 (no float reds); got {}",
@@ -1616,36 +1629,36 @@ mod oparg_with_pc_green {
             greens_f_len
         );
 
-        // A.3.3 reds layout: greens = [pc], so pc is filtered out of reds.
-        // Remaining candidates: ["program"] (Ref at r0).
-        //
-        // Byte layout continues directly after greens_f:
-        //   greens_base + 4: reds_i_len  = 0  (pc filtered out — it's green)
-        //   greens_base + 5: reds_r_len  = 1  (program → Ref r0)
-        //   greens_base + 6: reds_r[0]   = 0
-        //   greens_base + 7: reds_f_len  = 0
+        // A.3.3 reds: pc is green, identity slots last_instr/acc remain.
+        //   greens_base + 4: reds_i_len  = 2
+        //   greens_base + 5..6: last_instr, acc identity
+        //   greens_base + 7: reds_r_len  = 1  (program → Ref r0)
+        //   greens_base + 8: reds_r[0]   = 0
+        //   greens_base + 9: reds_f_len  = 0
 
         let reds_i_len = code[greens_base + 4] as usize;
         assert_eq!(
-            reds_i_len, 0,
-            "A.3.3: reds_i_len must be 0 (pc filtered as green); got {}",
+            reds_i_len, 2,
+            "A.3.3: reds_i_len must be 2 (last_instr + acc identity); got {}",
             reds_i_len
         );
+        assert_eq!(code[greens_base + 5], 1, "last_instr identity at i1");
+        assert_eq!(code[greens_base + 6], 2, "acc identity at i2");
 
-        let reds_r_len = code[greens_base + 5] as usize;
+        let reds_r_len = code[greens_base + 7] as usize;
         assert_eq!(
             reds_r_len, 1,
             "A.3.3: reds_r_len must be 1 (program → Ref r0); got {}",
             reds_r_len
         );
-        let reds_r_byte = code[greens_base + 6];
+        let reds_r_byte = code[greens_base + 8];
         assert_eq!(
             reds_r_byte, 0,
             "A.3.3: reds_r[0] must be 0 (program at register r0); got {}",
             reds_r_byte
         );
 
-        let reds_f_len = code[greens_base + 7] as usize;
+        let reds_f_len = code[greens_base + 9] as usize;
         assert_eq!(
             reds_f_len, 0,
             "A.3.3: reds_f_len must be 0 (no float reds); got {}",
@@ -1841,20 +1854,22 @@ mod oparg_with_pypy_parity_greens {
             greens_f_len
         );
 
-        // Reds: all empty (both portal inputs declared as green).
+        // Portal inputs are green; identity slots last_instr/acc stay red.
         let reds_i_len = code[greens_base + 5] as usize;
         assert_eq!(
-            reds_i_len, 0,
-            "A.3.3 parity: reds_i_len must be 0 (pc is green); got {}",
+            reds_i_len, 2,
+            "A.3.3 parity: reds_i_len must be 2 (last_instr + acc); got {}",
             reds_i_len
         );
-        let reds_r_len = code[greens_base + 6] as usize;
+        assert_eq!(code[greens_base + 6], 1, "last_instr identity at i1");
+        assert_eq!(code[greens_base + 7], 2, "acc identity at i2");
+        let reds_r_len = code[greens_base + 8] as usize;
         assert_eq!(
             reds_r_len, 0,
             "A.3.3 parity: reds_r_len must be 0 (program is green); got {}",
             reds_r_len
         );
-        let reds_f_len = code[greens_base + 7] as usize;
+        let reds_f_len = code[greens_base + 9] as usize;
         assert_eq!(
             reds_f_len, 0,
             "A.3.3 parity: reds_f_len must be 0; got {}",
@@ -2480,11 +2495,11 @@ mod oparg_with_full_4_green_parity {
 
         let reds_i_offset = greens_f_offset + 1 + greens_f_len;
         assert_eq!(
-            code[reds_i_offset], 0,
-            "A.3.7: reds_i_len must be 0 (pc declared as green); got {}",
+            code[reds_i_offset], 3,
+            "A.3.7: reds_i_len must be 3 (f1 + f2 + sel identity); got {}",
             code[reds_i_offset]
         );
-        let reds_r_offset = reds_i_offset + 1;
+        let reds_r_offset = reds_i_offset + 1 + 3;
         assert_eq!(
             code[reds_r_offset], 0,
             "A.3.7: reds_r_len must be 0 (program declared as green); got {}",

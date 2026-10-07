@@ -451,6 +451,89 @@ fn a_header_revisit_after_continue_rereads_kind() {
     );
 }
 
+/// Header-revisit CloseLoop builds `live_arg_boxes` from this merge
+/// point's red operand registers (`reached_loop_header`), so JUMP
+/// arity matches LABEL arity with a nonempty red list.
+#[test]
+fn a_header_revisit_close_matches_label_arity() {
+    let _guard = PROBE_LOCK.lock();
+    let mut builder = JitCodeBuilder::new();
+    builder.ensure_i_regs(4);
+    builder.jit_merge_point(0, &[0, 1], &[], &[], &[2, 3], &[], &[]);
+    builder.load_const_i_value(1, 1);
+    let jitcode = builder.finish();
+
+    let mut driver: JitDriver<KindResumeState> = JitDriver::new(1);
+    let mut state = KindResumeState { acc: 7, cnt: 3 };
+    let program = program();
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, &program)
+            .install_canonical_liveness(&mut driver);
+    }
+    driver.force_start_tracing(0, 0, &mut state, &program[..]);
+    assert!(
+        driver.is_tracing(),
+        "force_start_tracing must start a trace"
+    );
+
+    let acc = OpRef::input_arg_typed(0, majit_ir::Type::Int);
+    let cnt = OpRef::input_arg_typed(1, majit_ir::Type::Int);
+    let mut walk_continued = false;
+    driver.merge_point(|meta, sym| {
+        let ctx = meta.trace_ctx().expect("tracing");
+        let action = trace_jitcode_with_args(
+            ctx,
+            sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[
+                (JitArgKind::Int, OpRef::ConstInt(0), 0),
+                (JitArgKind::Int, OpRef::ConstInt(0), 0),
+                (JitArgKind::Int, acc, 7),
+                (JitArgKind::Int, cnt, 3),
+            ],
+        );
+        walk_continued = matches!(action, TraceAction::Continue);
+        action
+    });
+    assert!(
+        walk_continued,
+        "the first header visit must Continue so CloseLoop is the revisit"
+    );
+    assert!(
+        driver.is_tracing(),
+        "Continue leaves the trace live for the header-revisit CloseLoop"
+    );
+
+    let mut jump_arity = None;
+    driver.merge_point(|meta, _sym| {
+        meta.close_header_revisit(0);
+        let ctx = meta.trace_ctx().expect("tracing");
+        let boxes = ctx
+            .close_jump_boxes
+            .as_ref()
+            .expect("reached_loop_header must stash close_jump_boxes");
+        assert!(
+            !boxes.is_empty(),
+            "header-revisit close must carry a nonempty red list"
+        );
+        jump_arity = Some(boxes.len());
+        // The generated wrapper returns CloseLoop next. This walk is too
+        // short to compile (`GUARD_NOT_INVALIDATED`); Abort after the
+        // `live_arg_boxes` stash, matching `a_header_revisit_after_continue_rereads_kind`.
+        TraceAction::Abort
+    });
+    let jump_n = jump_arity.expect("header-revisit must publish JUMP boxes");
+    // LABEL is the setup_call InputArgs for acc and cnt.
+    assert_eq!(
+        jump_n, 2,
+        "JUMP arity must equal LABEL arity (acc, cnt reds)"
+    );
+}
+
 /// cel's float-bank portal: `greens = [pc, program]`, two `[; virt]` banks,
 /// no extra mut green. A compiled `cnt > 0` guard failure must end the
 /// upstream way (`blackhole.py resume_in_blackhole` / `bhimpl_jit_merge_point`):

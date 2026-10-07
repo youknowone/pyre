@@ -394,6 +394,15 @@ pub struct TraceCtx {
     pub(crate) portal_green_regs_i: Vec<u8>,
     pub(crate) portal_green_regs_r: Vec<u8>,
     pub(crate) portal_green_regs_f: Vec<u8>,
+    /// Merge-point red register bytes, `(I, R, F)` operand order.
+    /// `prepare_list_of_boxes` copies these slots; header-revisit CloseLoop
+    /// re-reads them off the live portal frame or the last-pop snapshot.
+    pub(crate) portal_red_regs_i: Vec<u8>,
+    pub(crate) portal_red_regs_r: Vec<u8>,
+    pub(crate) portal_red_regs_f: Vec<u8>,
+    /// Red `OpRef`s from [`Self::portal_red_regs_*`] at the last portal
+    /// frame, for a Continue walk that has already dropped that frame.
+    pub(crate) live_portal_reds: Option<Vec<(OpRef, Type)>>,
     /// The int pc green that belongs to [`Self::close_greens`].  The structured
     /// `can_enter_jit` key prepends the back-edge target before the declared
     /// greens, so reconstructing the interpreter-entered key for a close needs
@@ -631,10 +640,6 @@ pub struct TraceCtx {
     /// Loop-carried boxes collected from the portal frame at walk end,
     /// the `pyjitpl.py reached_loop_header` `live_arg_boxes` list.
     pub close_jump_boxes: Option<Vec<(OpRef, Type)>>,
-    /// Generated `loop_carried_boxes_from_portal` found an empty required
-    /// identity slot. CloseLoop must abort (`ABORT_BAD_LOOP`) instead of
-    /// compiling a short JUMP or consuming a stale `close_jump_boxes`.
-    pub portal_slot_missing: bool,
     /// Walk-final int+float scalar identity values, in
     /// `collect_scalar_state_field_values` order.
     pub close_scalar_values: Option<Vec<i64>>,
@@ -2202,6 +2207,10 @@ impl TraceCtx {
             portal_green_regs_i: Vec::new(),
             portal_green_regs_r: Vec::new(),
             portal_green_regs_f: Vec::new(),
+            portal_red_regs_i: Vec::new(),
+            portal_red_regs_r: Vec::new(),
+            portal_red_regs_f: Vec::new(),
+            live_portal_reds: None,
             close_green_pc: None,
             close_typed_key: None,
             close_jump_into_key: None,
@@ -2217,7 +2226,6 @@ impl TraceCtx {
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
-            portal_slot_missing: false,
             close_scalar_values: None,
             close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
@@ -2296,6 +2304,10 @@ impl TraceCtx {
             portal_green_regs_i: Vec::new(),
             portal_green_regs_r: Vec::new(),
             portal_green_regs_f: Vec::new(),
+            portal_red_regs_i: Vec::new(),
+            portal_red_regs_r: Vec::new(),
+            portal_red_regs_f: Vec::new(),
+            live_portal_reds: None,
             close_green_pc: None,
             close_typed_key: None,
             close_jump_into_key: None,
@@ -2311,7 +2323,6 @@ impl TraceCtx {
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
-            portal_slot_missing: false,
             close_scalar_values: None,
             close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
@@ -3078,6 +3089,36 @@ impl TraceCtx {
         ));
     }
 
+    /// Re-read merge-point red registers off a live frame (`prepare_list_of_boxes`).
+    pub fn snapshot_portal_reds_from_frame(
+        &mut self,
+        ints: &[Option<OpRef>],
+        refs: &[Option<OpRef>],
+        floats: &[Option<OpRef>],
+    ) {
+        fn read(bank: &[Option<OpRef>], regs: &[u8], what: &str, ty: Type) -> Vec<(OpRef, Type)> {
+            regs.iter()
+                .map(|&reg| {
+                    let opref = bank
+                        .get(reg as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "merge-point red {what} register {reg} must be live \
+                                 (`prepare_list_of_boxes` / `reached_loop_header`)"
+                            )
+                        });
+                    (opref, ty)
+                })
+                .collect()
+        }
+        let mut reds = read(ints, &self.portal_red_regs_i, "int", Type::Int);
+        reds.extend(read(refs, &self.portal_red_regs_r, "ref", Type::Ref));
+        reds.extend(read(floats, &self.portal_red_regs_f, "float", Type::Float));
+        self.live_portal_reds = Some(reds);
+    }
+
     /// Header-revisit close: copy the live portal greens into
     /// `close_greens` when the merge point did not write its own.
     ///
@@ -3088,6 +3129,30 @@ impl TraceCtx {
         if self.close_greens.is_none() {
             self.close_greens = self.live_portal_greens.clone();
         }
+    }
+
+    /// `pyjitpl.py MetaInterp.reached_loop_header`: one `duplicates` dict;
+    /// reds first, then `virtualizable_boxes[:-1]`. Stashes `close_jump_boxes`
+    /// as the JUMP/registration list (reds + vable elements).
+    pub fn reached_loop_header_live_arg_boxes(
+        &mut self,
+        redboxes: &mut [(OpRef, Type)],
+    ) -> Vec<(OpRef, Type)> {
+        self.heap_cache_mut().reset();
+        let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
+            indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
+        self.remove_consts_and_duplicates_with(redboxes, &mut duplicates);
+        let mut live: Vec<(OpRef, Type)> = redboxes.to_vec();
+        if let Some(mut typed) = self.collect_virtualizable_typed_boxes() {
+            if let Some(end) = typed.len().checked_sub(1) {
+                self.remove_consts_and_duplicates_with(&mut typed[..end], &mut duplicates);
+                let elements: Vec<OpRef> = typed[..end].iter().map(|(opref, _)| *opref).collect();
+                self.adopt_normalized_virtualizable_elements(&elements);
+                live.extend_from_slice(&typed[..end]);
+            }
+        }
+        self.close_jump_boxes = Some(live.clone());
+        live
     }
 
     /// pyjitpl.py / :3005 `get_procedure_token(greenboxes)` analog: the
@@ -3333,6 +3398,17 @@ impl TraceCtx {
     pub fn remove_consts_and_duplicates(&mut self, boxes: &mut [(OpRef, Type)]) {
         let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
             indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
+        self.remove_consts_and_duplicates_with(boxes, &mut duplicates);
+    }
+
+    /// `pyjitpl.py MetaInterp.remove_consts_and_duplicates(boxes, endindex, duplicates)`.
+    /// `reached_loop_header` shares one `duplicates` dict: reds first, then
+    /// `virtualizable_boxes[:-1]`.
+    pub fn remove_consts_and_duplicates_with(
+        &mut self,
+        boxes: &mut [(OpRef, Type)],
+        duplicates: &mut indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher>,
+    ) {
         for slot in boxes.iter_mut() {
             let (opref, declared) = *slot;
             if !opref.is_constant() && duplicates.insert(opref) {

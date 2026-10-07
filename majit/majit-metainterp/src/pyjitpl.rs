@@ -5,10 +5,10 @@ pub use dispatch::build_state_field_snapshot;
 pub use dispatch::implement_guard_value_on_frames;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    MergePointBanks, PortalCarriedBoxes, RecycleFramestackOnDrop, StandaloneFrameStack,
-    decode_jit_merge_point_banks, recycle_framestack, residual_write_effect_info,
-    setup_frame_from_merge_point, trace_jitcode, trace_jitcode_at_resume_framestack,
-    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    MergePointBanks, RecycleFramestackOnDrop, StandaloneFrameStack, decode_jit_merge_point_banks,
+    recycle_framestack, residual_write_effect_info, setup_frame_from_merge_point, trace_jitcode,
+    trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
@@ -7045,7 +7045,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Header-revisit CloseLoop: publish the greens `bhimpl_jit_merge_point`
-    /// would read at this merge point.
+    /// would read at this merge point, and build `live_arg_boxes` the way
+    /// `opimpl_jit_merge_point` → `reached_loop_header` does.
     ///
     /// Re-reads declaration-order slots off the live portal frame when
     /// `framestack` still holds one. A `#[jit_interp]` Continue walk has
@@ -7058,8 +7059,11 @@ impl<M: Clone> MetaInterp<M> {
         ctx.walk_final_pc = Some(pc);
         if let Some(root) = self.framestack.frames.first() {
             ctx.snapshot_portal_greens_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
+            ctx.snapshot_portal_reds_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
         }
         ctx.adopt_live_greens_as_close();
+        let mut redboxes = ctx.live_portal_reds.clone().unwrap_or_default();
+        ctx.reached_loop_header_live_arg_boxes(&mut redboxes);
     }
 
     /// Split-borrow helper that lets a

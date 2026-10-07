@@ -3621,6 +3621,18 @@ pub(super) fn resolve_reds(
         }
     }
 
+    // `handle_jit_marker__jit_merge_point` / `make_three_lists`: every
+    // declared red is a live Variable on the marker. State-field identity
+    // slots (plain scalars; flattened `[int]` cells join at JitCode-build
+    // from Meta lengths) are those reds.
+    for reg in config.identity_slot_registers() {
+        match reg.kind {
+            BindingKind::Int => reds_i.push(reg.index),
+            BindingKind::Ref => reds_r.push(reg.index),
+            BindingKind::Float => reds_f.push(reg.index),
+        }
+    }
+
     // Validate uniqueness within each bucket (jtransform.py:1701).
     for (label, bucket) in [
         ("reds_i", &reds_i),
@@ -3846,6 +3858,13 @@ pub(super) fn red_schema(lowerer: &Lowerer, config: &LowererConfig) -> Vec<(Stri
         }
     }
     assert_kind_sorted("reds", &out);
+    // Identity slots are listed on the `jit_merge_point` marker
+    // (`resolve_reds` / `handle_jit_marker__jit_merge_point`) and in
+    // `-live-` (`identity_slot_registers`). They are not JitDriver reds:
+    // `warmspot.py` `jd.portal_calldescr = cpu.calldescrof(portal_runner)`
+    // describes the original function, whose arguments are the named
+    // greens/reds. State-field identity lives in those reds the way
+    // frame fields live in the portal frame, not as extra runner args.
     out.into_iter().map(|(_, n, t)| (n, t)).collect()
 }
 
@@ -4115,12 +4134,20 @@ pub(crate) fn lower_dispatch_body(
         OpMeta::linear(OpKind::JitMergePoint, merge_reads, vec![]),
         quote::quote! {
             // __jdindex: jtransform.py:1704 portal_jd.index threaded as runtime param.
+            // Flattened `[int]` cells join here from Meta lengths
+            // (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
+            let mut __reds_i: Vec<u8> = vec![#(#reds_i_lit),*];
+            for &__s in __flat_array_identity_slots.iter() {
+                if !__reds_i.contains(&__s) {
+                    __reds_i.push(__s);
+                }
+            }
             __builder.jit_merge_point(
                 __jdindex,
                 &[#(#greens_i_lit),*],
                 &[#(#greens_r_lit),*],
                 &[#(#greens_f_lit),*],
-                &[#(#reds_i_lit),*],
+                &__reds_i,
                 &[#(#reds_r_lit),*],
                 &[#(#reds_f_lit),*],
             );
@@ -4344,18 +4371,34 @@ pub(crate) fn lower_dispatch_body(
             .floats
             .max(portal_f_regs)
             .max(config.float_identity_end());
+        let int_identity_base = config.int_identity_base() as usize;
+        let plain_int_scalars = config.plain_int_scalar_count() as usize;
         lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
             __builder.ensure_r_regs(#final_r_regs);
-            __builder.ensure_i_regs(#final_i_regs);
+            // Span flattened `[int]` cells the marker lists from Meta
+            // lengths (`typed_array_parts` / `make_three_lists`).
+            let __i_regs = (#final_i_regs as usize).max(
+                #int_identity_base
+                    + #plain_int_scalars
+                    + __flat_array_lens.iter().copied().sum::<usize>(),
+            );
+            __builder.ensure_i_regs(__i_regs as u16);
             __builder.ensure_f_regs(#final_f_regs);
         };
     }
 
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
-    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
-    let liveness_prebuild =
-        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
+    rewrite_live_marker_statements_with_triples_ex(
+        &lowerer.op_metadata,
+        &mut lowerer.statements,
+        true,
+    );
+    let liveness_prebuild = liveness_prebuild_tokens_ex(
+        &lowerer.op_metadata,
+        &lowerer.inline_liveness_prebuild,
+        true,
+    );
     // Slice (audit Issue #5) — surface the dispatch JitCode's
     // (name, IR Type) green / red schemas to the install path so it
     // can populate `JitDriverStaticData::vars` via

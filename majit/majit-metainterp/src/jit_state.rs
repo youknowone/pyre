@@ -987,7 +987,12 @@ pub trait JitState: Sized {
         true
     }
 
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef>;
+    /// `reached_loop_header` builds `live_arg_boxes` from the merge-point
+    /// operands and stashes it on `TraceCtx::close_jump_boxes`. Generated
+    /// `#[jit_interp]` states do not keep a second copy on the sym.
+    fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+        Vec::new()
+    }
 
     /// Loop-close jump-arg collection with access to the live
     /// `virtualizable_boxes` shadow (the trace ctx's standard-virtualizable
@@ -1021,9 +1026,8 @@ pub trait JitState: Sized {
     /// Closing JUMP boxes from the live portal frame
     /// (`pyjitpl.py` `reached_loop_header` `live_arg_boxes` =
     /// `greenboxes + redboxes` then `+= virtualizable_boxes; pop`).
-    /// Header-revisit `CloseLoop` uses this when `close_jump_boxes` is
-    /// absent so JUMP matches LABEL for a heap-frame virtualizable
-    /// that also carries scalar reds. Default is the vable-only list.
+    /// Default is the vable-only list. Header-revisit CloseLoop uses
+    /// `reached_loop_header_live_arg_boxes` instead of this hook.
     fn collect_jump_args_from_portal(
         sym: &Self::Sym,
         _frame: &crate::pyjitpl::MIFrame,
