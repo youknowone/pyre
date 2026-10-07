@@ -5067,15 +5067,16 @@ fn build_imported_virtuals_from_state(
     /// parity: walk `fielddescrs` in parent-local slot order, looking up
     /// the matching field state via descr.get_index() (= field_idx in pyre).
     fn ordered_fields(
+        owner: &majit_ir::DescrRef,
         field_descrs: &[majit_ir::DescrRef],
         fields: &[(u32, std::rc::Rc<VirtualStateInfoNode>)],
     ) -> Vec<(majit_ir::DescrRef, VirtualStateInfo)> {
         field_descrs
             .iter()
             .filter_map(|field_descr| {
-                let field_idx = field_descr
-                    .as_field_descr()
-                    .map(crate::optimizeopt::virtualize::parent_list_slot)?;
+                let field_idx = field_descr.as_field_descr().map(|fd| {
+                    crate::optimizeopt::virtualize::parent_list_slot_in(Some(owner), fd)
+                })?;
                 fields
                     .iter()
                     .find(|(idx, _)| *idx == field_idx)
@@ -5100,7 +5101,7 @@ fn build_imported_virtuals_from_state(
                     kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Instance {
                         known_class: *known_class,
                     },
-                    fields: ordered_fields(field_descrs, fields),
+                    fields: ordered_fields(descr, field_descrs, fields),
                     head_load_descr_index: None,
                 });
             }
@@ -5113,7 +5114,7 @@ fn build_imported_virtuals_from_state(
                     inputarg_index: idx,
                     size_descr: descr.clone(),
                     kind: crate::optimizeopt::optimizer::ImportedVirtualKind::Struct,
-                    fields: ordered_fields(field_descrs, fields),
+                    fields: ordered_fields(descr, field_descrs, fields),
                     head_load_descr_index: None,
                 });
             }

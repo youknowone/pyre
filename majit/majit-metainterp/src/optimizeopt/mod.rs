@@ -1689,37 +1689,26 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: vi.known_class,
-                // info.py `_visitor_walk_recursive` registers the
-                // full `_fields` list in descriptor order, leaving unfilled
-                // slots as `None`. Preserve that shape so `fieldnums` aligns
-                // 1:1 with `descr.get_all_fielddescrs()` for `_cached_vinfo`
-                // reuse at resume.py make_virtual_info.
-                field_oprefs: fielddescrs
-                    .iter()
-                    .enumerate()
-                    .map(|(fi, _)| {
-                        vi.fields
-                            .iter()
-                            .find(|(field_idx, _)| *field_idx == fi as u32)
-                            .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
-                            .unwrap_or(OpRef::NONE)
-                    })
-                    .collect(),
+                // info.py `_visitor_walk_recursive` registers `_fields` in
+                // `descr.get_all_fielddescrs()` order. Storage keys by
+                // `parent_list_slot` (identity in the field's parent list),
+                // which is not always the enumerate index of this list.
+                field_oprefs: virtual_field_oprefs_for_descrs(
+                    &vi.fields,
+                    &fielddescrs,
+                    self.ctx,
+                    Some(&vi.descr),
+                ),
             }),
             PtrInfo::VirtualStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: None,
-                field_oprefs: fielddescrs
-                    .iter()
-                    .enumerate()
-                    .map(|(fi, _)| {
-                        vi.fields
-                            .iter()
-                            .find(|(field_idx, _)| *field_idx == fi as u32)
-                            .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
-                            .unwrap_or(OpRef::NONE)
-                    })
-                    .collect(),
+                field_oprefs: virtual_field_oprefs_for_descrs(
+                    &vi.fields,
+                    &fielddescrs,
+                    self.ctx,
+                    Some(&vi.descr),
+                ),
             }),
             PtrInfo::VirtualArray(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
@@ -1730,22 +1719,23 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|vref| self.ctx.get_replacement_opref(vref.to_opref()))
                     .collect(),
             }),
-            PtrInfo::VirtualArrayStruct(vi) => Some(majit_ir::VirtualFieldsInfo {
-                descr: Some(vi.descr.clone()),
-                known_class: None,
-                field_oprefs: vi
-                    .element_fields
-                    .iter()
-                    .flat_map(|ef| {
-                        vi.fielddescrs.iter().enumerate().map(|(fi, _)| {
-                            ef.iter()
-                                .find(|(field_idx, _)| *field_idx == fi as u32)
-                                .map(|(_, vref)| self.ctx.get_replacement_opref(vref.to_opref()))
-                                .unwrap_or(OpRef::NONE)
+            PtrInfo::VirtualArrayStruct(vi) => {
+                // Same list `visit_varraystruct` snapshots: ArrayDescr
+                // `get_all_fielddescrs` is `all_interiorfielddescrs`
+                // (`info.py ArrayStructInfo.visitor_dispatch_virtual_type`).
+                let fielddescrs = varraystruct_visitor_fielddescrs(&vi.descr, &vi.fielddescrs);
+                Some(majit_ir::VirtualFieldsInfo {
+                    descr: Some(vi.descr.clone()),
+                    known_class: None,
+                    field_oprefs: vi
+                        .element_fields
+                        .iter()
+                        .flat_map(|ef| {
+                            virtual_field_oprefs_for_descrs(ef, fielddescrs, self.ctx, None)
                         })
-                    })
-                    .collect(),
-            }),
+                        .collect(),
+                })
+            }
             PtrInfo::VirtualRawBuffer(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: None,
                 known_class: None,
@@ -1905,6 +1895,101 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
 /// itself.
 struct RdVirtualInfoBuilder;
 
+/// `info.py ArrayStructInfo.visitor_dispatch_virtual_type` hands
+/// `descr.get_all_fielddescrs()` (ArrayDescr: `all_interiorfielddescrs`)
+/// to `visit_varraystruct`. Fall back to the cached list when the array
+/// descr has not published interiors yet.
+fn varraystruct_visitor_fielddescrs<'a>(
+    arraydescr: &'a majit_ir::DescrRef,
+    fallback: &'a [majit_ir::DescrRef],
+) -> &'a [majit_ir::DescrRef] {
+    arraydescr
+        .as_array_descr()
+        .and_then(|ad| ad.get_all_interiorfielddescrs())
+        .unwrap_or(fallback)
+}
+
+/// Storage slot for a visitor fielddescr. `visit_varraystruct` unwraps
+/// `InteriorFieldDescr`; SETFIELD / SETINTERIORFIELD key `_fields` by
+/// `parent_list_slot` of that inner `FieldDescr`.
+///
+/// RPython `ArrayStructInfo._compute_index` uses
+/// `fielddescr.get_field_descr().get_index()` against
+/// `arraydescr.get_all_fielddescrs()`. pyre's `parent_list_slot` is the
+/// identity lookup in the parent SizeDescr list that replaces a stale
+/// `index_in_parent`. Those two lists can differ in order or length, so
+/// `fieldnums[i]` must be looked up by that slot, not by enumerate.
+fn visitor_fielddescr_storage_slot(
+    descr: &majit_ir::DescrRef,
+    owner: Option<&majit_ir::DescrRef>,
+) -> Option<u32> {
+    let fd = descr
+        .as_field_descr()
+        .or_else(|| descr.as_interior_field_descr().map(|ifd| ifd.field_descr()))?;
+    Some(crate::optimizeopt::virtualize::parent_list_slot_in(
+        owner, fd,
+    ))
+}
+
+/// `field_oprefs[i]` is the value stored for `fielddescrs[i]`, so
+/// `set_content` fieldnums pair 1:1 with the snapshot `visit_*` wrote.
+fn virtual_field_oprefs_for_descrs(
+    fields: &[(u32, Operand)],
+    fielddescrs: &[majit_ir::DescrRef],
+    ctx: &OptContext,
+    owner: Option<&majit_ir::DescrRef>,
+) -> Vec<OpRef> {
+    fielddescrs
+        .iter()
+        .enumerate()
+        .map(|(fi, descr)| {
+            let slot = visitor_fielddescr_storage_slot(descr, owner).unwrap_or(fi as u32);
+            fields
+                .iter()
+                .find(|(field_idx, _)| *field_idx == slot)
+                .map(|(_, vref)| ctx.get_replacement_opref(vref.to_opref()))
+                .unwrap_or(OpRef::NONE)
+        })
+        .collect()
+}
+
+/// Snapshot a live field descr the way `setfield` classifies it:
+/// `is_pointer_field` → Ref, `is_float_field` → Float, else `field_type()`.
+/// A FLAG_POINTER field whose IR type is Int (raw `*mut`) still decodes as
+/// Ref. Unwraps `as_interior_field_descr().field_descr()` when
+/// `as_field_descr()` is None (`visit_varraystruct` does the same unwrap).
+fn snapshot_field_descr_info(descr: &majit_ir::DescrRef) -> majit_ir::FieldDescrInfo {
+    let fd = descr
+        .as_field_descr()
+        .or_else(|| descr.as_interior_field_descr().map(|ifd| ifd.field_descr()));
+    match fd {
+        Some(fd) => {
+            let field_type = if fd.is_pointer_field() {
+                majit_ir::Type::Ref
+            } else if fd.is_float_field() {
+                majit_ir::Type::Float
+            } else {
+                fd.field_type()
+            };
+            majit_ir::FieldDescrInfo {
+                index: descr.index(),
+                offset: fd.offset(),
+                field_type,
+                field_size: fd.field_size(),
+            }
+        }
+        None => majit_ir::FieldDescrInfo {
+            index: descr.index(),
+            offset: 0,
+            field_type: majit_ir::Type::Int,
+            // The fallback pairs with `Type::Int` above, whose storage is
+            // `i64` on every target — only a `Ref` field follows the target
+            // word.
+            field_size: crate::jitcode::scalar_size(majit_ir::Type::Int),
+        },
+    }
+}
+
 impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     type VInfo = Option<majit_ir::RdVirtualInfo>;
 
@@ -1926,23 +2011,8 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         // byte offset. Previously stored `fi as u32` (iteration counter),
         // which made `extract_runtime_field_offset` always fail for virtuals
         // being materialized on bridge entry.
-        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
-            .iter()
-            .map(|descr| {
-                let fd = descr.as_field_descr();
-                majit_ir::FieldDescrInfo {
-                    index: descr.index(),
-                    offset: fd.map(|f| f.offset()).unwrap_or(0),
-                    field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
-                    // The fallback pairs with the `Type::Int` above, whose
-                    // storage is `i64` on every target — only a `Ref` field
-                    // follows the target word.
-                    field_size: fd
-                        .map(|f| f.field_size())
-                        .unwrap_or_else(|| crate::jitcode::scalar_size(majit_ir::Type::Int)),
-                }
-            })
-            .collect();
+        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> =
+            fielddescrs.iter().map(snapshot_field_descr_info).collect();
         let sd = descr.as_size_descr();
         Some(majit_ir::RdVirtualInfo::VirtualInfo {
             descr: Some(descr.clone()),
@@ -1966,23 +2036,8 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     ) -> Self::VInfo {
         // See `visit_virtual` — index must be the stable descriptor index,
         // not the iteration counter.
-        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
-            .iter()
-            .map(|descr| {
-                let fd = descr.as_field_descr();
-                majit_ir::FieldDescrInfo {
-                    index: descr.index(),
-                    offset: fd.map(|f| f.offset()).unwrap_or(0),
-                    field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
-                    // The fallback pairs with the `Type::Int` above, whose
-                    // storage is `i64` on every target — only a `Ref` field
-                    // follows the target word.
-                    field_size: fd
-                        .map(|f| f.field_size())
-                        .unwrap_or_else(|| crate::jitcode::scalar_size(majit_ir::Type::Int)),
-                }
-            })
-            .collect();
+        let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> =
+            fielddescrs.iter().map(snapshot_field_descr_info).collect();
         let sd = typedescr.as_size_descr();
         Some(majit_ir::RdVirtualInfo::VStructInfo {
             typedescr: Some(typedescr.clone()),
@@ -2027,32 +2082,24 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
-        // info.py: visitor_dispatch_virtual_type always hands
-        // down the canonical get_all_interiorfielddescrs() list; fall
+        // info.py ArrayStructInfo.visitor_dispatch_virtual_type hands
+        // descr.get_all_fielddescrs() (all_interiorfielddescrs); fall
         // back to the variant's cached fielddescrs when descr lacks it.
-        let canonical_fielddescrs: Vec<majit_ir::DescrRef> = arraydescr
-            .as_array_descr()
-            .and_then(|ad| ad.get_all_interiorfielddescrs())
-            .map(|fds| fds.to_vec())
-            .unwrap_or_else(|| fielddescrs.to_vec());
+        let canonical_fielddescrs: Vec<majit_ir::DescrRef> =
+            varraystruct_visitor_fielddescrs(arraydescr, fielddescrs).to_vec();
         let mut fo = Vec::new();
         let mut fs = Vec::new();
         let mut ft = Vec::new();
         for fd in &canonical_fielddescrs {
-            if let Some(ifd) = fd.as_interior_field_descr() {
-                let fld = ifd.field_descr();
-                fo.push(fld.offset());
-                fs.push(fld.field_size());
-                ft.push(match fld.field_type() {
-                    majit_ir::Type::Float => 2u8,
-                    majit_ir::Type::Int => 1u8,
-                    _ => 0u8,
-                });
-            } else {
-                fo.push(fo.len() * 8);
-                fs.push(8);
-                ft.push(0);
-            }
+            let info = snapshot_field_descr_info(fd);
+            fo.push(info.offset);
+            fs.push(info.field_size);
+            // resume.py setinteriorfield: is_pointer_field / is_float_field.
+            ft.push(match info.field_type {
+                majit_ir::Type::Float => 2u8,
+                majit_ir::Type::Int => 1u8,
+                _ => 0u8,
+            });
         }
         if ft.is_empty() {
             ft = vec![0u8; canonical_fielddescrs.len()];
@@ -8585,18 +8632,19 @@ impl OptContext {
         descr: &majit_ir::descr::DescrRef,
     ) -> Option<OpRef> {
         let fd = descr.as_field_descr()?;
-        // virtualstate.py:162 `opinfo._fields[descr.get_index()]`: the slot key
-        // is the parent-local field index, not the global Descr.index(), and is
-        // only meaningful when a parent SizeDescr is bound (descr.rs index_in_parent).
-        let slot = fd
-            .get_parent_descr()
-            .map(|_| crate::optimizeopt::virtualize::parent_list_slot(fd))
-            .unwrap_or_else(|| descr.index());
         // virtualstate.py:149-151 `opinfo = getptrinfo(box); assert
         // opinfo.is_virtual()`. Read the field box only off a virtual struct
         // ptrinfo; a concrete/instance ptrinfo falls through to the eager read.
         let op = self.get_box_replacement_operand_opt(runtime_box)?;
         let info = self.getptrinfo(&op)?;
+        // virtualstate.py `opinfo._fields[descr.get_index()]`. Storage
+        // keys by the allocation SizeDescr list (`parent_list_slot_in`).
+        let owner = match &info {
+            crate::optimizeopt::info::PtrInfo::Virtual(v) => Some(&v.descr),
+            crate::optimizeopt::info::PtrInfo::VirtualStruct(v) => Some(&v.descr),
+            _ => None,
+        };
+        let slot = crate::optimizeopt::virtualize::parent_list_slot_in(owner, fd);
         let field_opref = match &info {
             crate::optimizeopt::info::PtrInfo::Virtual(_)
             | crate::optimizeopt::info::PtrInfo::VirtualStruct(_) => {
@@ -11724,7 +11772,7 @@ mod ensure_ptr_info_arg0_tests {
 mod rd_virtual_info_builder_tests {
     use super::*;
     use crate::walkvirtual::VirtualVisitor;
-    use majit_ir::{Descr, DescrRef, FieldDescr, SizeDescr, Type};
+    use majit_ir::{BoxEnv, Descr, DescrRef, FieldDescr, SizeDescr, Type};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -11768,6 +11816,7 @@ mod rd_virtual_info_builder_tests {
         offset: usize,
         field_size: usize,
         field_type: Type,
+        is_pointer: bool,
     }
 
     impl Descr for TestFieldDescr {
@@ -11792,6 +11841,10 @@ mod rd_virtual_info_builder_tests {
         fn field_type(&self) -> Type {
             self.field_type
         }
+
+        fn is_pointer_field(&self) -> bool {
+            self.is_pointer
+        }
     }
 
     #[test]
@@ -11807,12 +11860,14 @@ mod rd_virtual_info_builder_tests {
             offset: 16,
             field_size: 8,
             field_type: Type::Int,
+            is_pointer: false,
         });
         let field1: DescrRef = Arc::new(TestFieldDescr {
             index: 0x1000_0456,
             offset: 24,
             field_size: 8,
             field_type: Type::Ref,
+            is_pointer: true,
         });
 
         let Some(majit_ir::RdVirtualInfo::VirtualInfo { fielddescrs, .. }) =
@@ -11823,6 +11878,548 @@ mod rd_virtual_info_builder_tests {
 
         assert_eq!(fielddescrs[0].index, field0.index());
         assert_eq!(fielddescrs[1].index, field1.index());
+    }
+
+    #[test]
+    fn visit_virtual_classifies_pointer_field_by_is_pointer_field() {
+        // `setfield` / `is_pointer_field`: FLAG_POINTER is independent of
+        // `field_type()`. A GC pointer whose IR type is Int still snapshots
+        // as Ref so `visit_vstruct` / `visit_virtual` decode via decode_ref.
+        let mut builder = RdVirtualInfoBuilder;
+        let size_descr: DescrRef = Arc::new(TestSizeDescr {
+            index: 0x3000_0002,
+            type_id: 9,
+            is_object: true,
+        });
+        let struct_descr: DescrRef = Arc::new(TestSizeDescr {
+            index: 0x3000_0003,
+            type_id: 11,
+            is_object: false,
+        });
+        let pointer_as_int: DescrRef = Arc::new(TestFieldDescr {
+            index: 0x1000_0abc,
+            offset: 24,
+            field_size: 8,
+            field_type: Type::Int,
+            is_pointer: true,
+        });
+        let true_int: DescrRef = Arc::new(TestFieldDescr {
+            index: 0x1000_0def,
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+            is_pointer: false,
+        });
+
+        let Some(majit_ir::RdVirtualInfo::VirtualInfo { fielddescrs, .. }) = builder.visit_virtual(
+            &size_descr,
+            &[],
+            &[pointer_as_int.clone(), true_int.clone()],
+        ) else {
+            panic!("expected VirtualInfo");
+        };
+        assert_eq!(fielddescrs[0].field_type, Type::Ref);
+        assert_eq!(fielddescrs[0].offset, 24);
+        assert_eq!(fielddescrs[0].field_size, 8);
+        assert_eq!(fielddescrs[1].field_type, Type::Int);
+        assert_eq!(fielddescrs[1].offset, 16);
+
+        let Some(majit_ir::RdVirtualInfo::VStructInfo { fielddescrs, .. }) =
+            builder.visit_vstruct(&struct_descr, &[], &[pointer_as_int, true_int])
+        else {
+            panic!("expected VStructInfo");
+        };
+        assert_eq!(fielddescrs[0].field_type, Type::Ref);
+        assert_eq!(fielddescrs[0].offset, 24);
+        assert_eq!(fielddescrs[0].field_size, 8);
+        assert_eq!(fielddescrs[1].field_type, Type::Int);
+        assert_eq!(fielddescrs[1].offset, 16);
+    }
+
+    // Parent SizeDescr list and visitor all_fielddescrs in different
+    // order: storage keys by parent_list_slot, resume snapshots the
+    // visitor list. ArrayStructInfo._compute_index / parent_list_slot.
+    #[derive(Debug)]
+    struct PairingSizeDescr {
+        index: u32,
+        type_id: u32,
+        is_object: bool,
+        fields: std::sync::OnceLock<Vec<Arc<dyn FieldDescr>>>,
+    }
+
+    impl Descr for PairingSizeDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for PairingSizeDescr {
+        fn size(&self) -> usize {
+            32
+        }
+
+        fn type_id(&self) -> u32 {
+            self.type_id
+        }
+
+        fn is_immutable(&self) -> bool {
+            false
+        }
+
+        fn is_object(&self) -> bool {
+            self.is_object
+        }
+
+        fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            self.fields.get().map(|v| v.as_slice()).unwrap_or(&[])
+        }
+    }
+
+    #[derive(Debug)]
+    struct PairingFieldDescr {
+        index: u32,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_pointer: bool,
+        name: &'static str,
+        parent: DescrRef,
+    }
+
+    impl Descr for PairingFieldDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for PairingFieldDescr {
+        fn offset(&self) -> usize {
+            self.offset
+        }
+
+        fn field_size(&self) -> usize {
+            self.field_size
+        }
+
+        fn field_type(&self) -> Type {
+            self.field_type
+        }
+
+        fn is_pointer_field(&self) -> bool {
+            self.is_pointer
+        }
+
+        fn field_name(&self) -> &str {
+            self.name
+        }
+
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(self.parent.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PairingDummyArray;
+
+    impl Descr for PairingDummyArray {
+        fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::ArrayDescr for PairingDummyArray {
+        fn base_size(&self) -> usize {
+            8
+        }
+
+        fn item_size(&self) -> usize {
+            16
+        }
+
+        fn type_id(&self) -> u32 {
+            0
+        }
+
+        fn item_type(&self) -> Type {
+            Type::Void
+        }
+
+        fn is_array_of_structs(&self) -> bool {
+            true
+        }
+    }
+
+    static PAIRING_DUMMY_ARRAY: PairingDummyArray = PairingDummyArray;
+
+    #[derive(Debug)]
+    struct PairingInteriorFieldDescr {
+        field: Arc<PairingFieldDescr>,
+    }
+
+    impl Descr for PairingInteriorFieldDescr {
+        fn as_interior_field_descr(&self) -> Option<&dyn majit_ir::InteriorFieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::InteriorFieldDescr for PairingInteriorFieldDescr {
+        fn array_descr(&self) -> &dyn majit_ir::ArrayDescr {
+            &PAIRING_DUMMY_ARRAY
+        }
+
+        fn field_descr(&self) -> &dyn FieldDescr {
+            self.field.as_ref()
+        }
+    }
+
+    #[derive(Debug)]
+    struct PairingArrayDescr {
+        interiors: std::sync::OnceLock<Vec<DescrRef>>,
+    }
+
+    impl Descr for PairingArrayDescr {
+        fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::ArrayDescr for PairingArrayDescr {
+        fn base_size(&self) -> usize {
+            8
+        }
+
+        fn item_size(&self) -> usize {
+            16
+        }
+
+        fn type_id(&self) -> u32 {
+            3
+        }
+
+        fn item_type(&self) -> Type {
+            Type::Void
+        }
+
+        fn is_array_of_structs(&self) -> bool {
+            true
+        }
+
+        fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
+            self.interiors.get().map(|v| v.as_slice())
+        }
+    }
+
+    fn reversed_parent_int_ref_fields() -> (DescrRef, Arc<PairingFieldDescr>, Arc<PairingFieldDescr>)
+    {
+        let parent_sd = Arc::new(PairingSizeDescr {
+            index: 0x3000_0100,
+            type_id: 21,
+            is_object: true,
+            fields: std::sync::OnceLock::new(),
+        });
+        let parent: DescrRef = parent_sd.clone();
+        let int_fd = Arc::new(PairingFieldDescr {
+            index: 0x1000_1001,
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+            is_pointer: false,
+            name: "ival",
+            parent: parent.clone(),
+        });
+        let ref_fd = Arc::new(PairingFieldDescr {
+            index: 0x1000_1002,
+            offset: 24,
+            field_size: 8,
+            field_type: Type::Int,
+            is_pointer: true,
+            name: "rval",
+            parent: parent.clone(),
+        });
+        parent_sd
+            .fields
+            .set(vec![
+                ref_fd.clone() as Arc<dyn FieldDescr>,
+                int_fd.clone() as Arc<dyn FieldDescr>,
+            ])
+            .unwrap();
+        (parent, int_fd, ref_fd)
+    }
+
+    #[test]
+    fn get_virtual_fields_pairs_parent_list_slot_not_enumerate() {
+        // Parent list [ref, int] vs visitor list [int, ref]. Storage keys
+        // by parent_list_slot; fieldnums must follow the visitor list so
+        // AbstractVirtualStructInfo.setfields decodes each fieldnum with
+        // the descr at the same index.
+        let (_parent, int_fd, ref_fd) = reversed_parent_int_ref_fields();
+        assert_eq!(
+            crate::optimizeopt::virtualize::parent_list_slot(int_fd.as_ref()),
+            1
+        );
+        assert_eq!(
+            crate::optimizeopt::virtualize::parent_list_slot(ref_fd.as_ref()),
+            0
+        );
+
+        let visitor_sd = Arc::new(PairingSizeDescr {
+            index: 0x3000_0101,
+            type_id: 22,
+            is_object: true,
+            fields: std::sync::OnceLock::new(),
+        });
+        visitor_sd
+            .fields
+            .set(vec![
+                int_fd.clone() as Arc<dyn FieldDescr>,
+                ref_fd.clone() as Arc<dyn FieldDescr>,
+            ])
+            .unwrap();
+        let visitor: DescrRef = visitor_sd;
+
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let int_val = ctx.materialize_operand_at(majit_ir::OpRef::int_op(50));
+        let ref_val = ctx.materialize_operand_at(majit_ir::OpRef::ref_op(51));
+        let virtual_op = majit_ir::OpRef::ref_op(7);
+        let virtual_box = ctx.materialize_operand_at(virtual_op);
+        let mut fields = majit_ir::ptr_info::VirtualFieldList::new();
+        // Storage keys follow the allocation/visitor SizeDescr list
+        // (parent_list_slot_in), not the field's nested parent list.
+        fields.push((0, int_val.clone()));
+        fields.push((1, ref_val.clone()));
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::Virtual(crate::optimizeopt::info::VirtualInfo {
+                descr: visitor.clone(),
+                known_class: None,
+                ob_type_descr: None,
+                fields,
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let env = OptBoxEnv { ctx: &ctx };
+        let vf = env
+            .get_virtual_fields(virtual_op)
+            .expect("virtual must expose fields");
+        let int_opref = env.get_box_replacement(int_val.to_opref());
+        let ref_opref = env.get_box_replacement(ref_val.to_opref());
+        assert_eq!(vf.field_oprefs, vec![int_opref, ref_opref]);
+
+        let visitor_descrs: Vec<DescrRef> =
+            vec![int_fd.clone() as DescrRef, ref_fd.clone() as DescrRef];
+        let mut builder = RdVirtualInfoBuilder;
+        let Some(majit_ir::RdVirtualInfo::VirtualInfo { fielddescrs, .. }) =
+            builder.visit_virtual(&visitor, &[], &visitor_descrs)
+        else {
+            panic!("expected VirtualInfo");
+        };
+        assert_eq!(fielddescrs[0].field_type, Type::Int);
+        assert_eq!(fielddescrs[1].field_type, Type::Ref);
+        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Int);
+        assert_eq!(env.get_type(vf.field_oprefs[1]), Type::Ref);
+    }
+
+    #[test]
+    fn get_virtual_fields_pairs_varraystruct_interior_by_parent_list_slot() {
+        // Interior visitor list [int, ref]; inner FieldDescr parent list
+        // [ref, int]. ArrayStructInfo._compute_index uses
+        // get_field_descr().get_index(); pyre stores via parent_list_slot.
+        let (_parent, int_fd, ref_fd) = reversed_parent_int_ref_fields();
+        let int_ifd: DescrRef = Arc::new(PairingInteriorFieldDescr {
+            field: int_fd.clone(),
+        });
+        let ref_ifd: DescrRef = Arc::new(PairingInteriorFieldDescr {
+            field: ref_fd.clone(),
+        });
+        let array_sd = Arc::new(PairingArrayDescr {
+            interiors: std::sync::OnceLock::new(),
+        });
+        array_sd
+            .interiors
+            .set(vec![int_ifd.clone(), ref_ifd.clone()])
+            .unwrap();
+        let arraydescr: DescrRef = array_sd;
+
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let int_val = ctx.materialize_operand_at(majit_ir::OpRef::int_op(60));
+        let ref_val = ctx.materialize_operand_at(majit_ir::OpRef::ref_op(61));
+        let virtual_op = majit_ir::OpRef::ref_op(8);
+        let virtual_box = ctx.materialize_operand_at(virtual_op);
+        let mut elem = majit_ir::ptr_info::VirtualFieldList::new();
+        elem.push((1, int_val.clone()));
+        elem.push((0, ref_val.clone()));
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::VirtualArrayStruct(crate::optimizeopt::info::ArrayStructInfo {
+                descr: arraydescr.clone(),
+                fielddescrs: vec![int_ifd.clone(), ref_ifd.clone()],
+                element_fields: vec![elem],
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let env = OptBoxEnv { ctx: &ctx };
+        let vf = env
+            .get_virtual_fields(virtual_op)
+            .expect("array struct must expose fields");
+        let int_opref = env.get_box_replacement(int_val.to_opref());
+        let ref_opref = env.get_box_replacement(ref_val.to_opref());
+        assert_eq!(vf.field_oprefs, vec![int_opref, ref_opref]);
+
+        let mut builder = RdVirtualInfoBuilder;
+        let Some(majit_ir::RdVirtualInfo::VArrayStructInfo {
+            field_types,
+            fielddescrs,
+            ..
+        }) = builder.visit_varraystruct(&arraydescr, 1, &[], &[int_ifd, ref_ifd])
+        else {
+            panic!("expected VArrayStructInfo");
+        };
+        assert_eq!(field_types, vec![1u8, 0u8]);
+        assert_eq!(fielddescrs.len(), 2);
+        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Int);
+        assert_eq!(env.get_type(vf.field_oprefs[1]), Type::Ref);
+    }
+
+    fn same_offset_empty_name_fields() -> (
+        DescrRef,
+        Arc<PairingFieldDescr>,
+        Arc<PairingFieldDescr>,
+        Arc<PairingFieldDescr>,
+        Arc<PairingFieldDescr>,
+    ) {
+        let parent_sd = Arc::new(PairingSizeDescr {
+            index: 0x3000_0200,
+            type_id: 31,
+            is_object: true,
+            fields: std::sync::OnceLock::new(),
+        });
+        let parent: DescrRef = parent_sd.clone();
+        let mk = |index, is_pointer| {
+            Arc::new(PairingFieldDescr {
+                index,
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                is_pointer,
+                name: "",
+                parent: parent.clone(),
+            })
+        };
+        let listed_ref = mk(0x1000_1002, true);
+        let listed_int = mk(0x1000_1001, false);
+        let visitor_int = mk(0x1000_10aa, false);
+        let visitor_ref = mk(0x1000_10bb, true);
+        parent_sd
+            .fields
+            .set(vec![
+                listed_ref.clone() as Arc<dyn FieldDescr>,
+                listed_int.clone() as Arc<dyn FieldDescr>,
+            ])
+            .unwrap();
+        (parent, listed_int, listed_ref, visitor_int, visitor_ref)
+    }
+
+    #[test]
+    fn get_virtual_fields_pairs_same_offset_empty_name_int_ref() {
+        // Flattened unnamed leaves at one offset. The field's nested parent
+        // list is [ref, int]; the allocation/visitor list is [int, ref].
+        // Storage keys follow parent_list_slot_in(visitor) so Int is
+        // slot 0 and AbstractVirtualStructInfo.setfields does not
+        // decode_int the Ref TAGCONST.
+        let (_parent, _listed_int, _listed_ref, visitor_int, visitor_ref) =
+            same_offset_empty_name_fields();
+        assert_eq!(
+            crate::optimizeopt::virtualize::parent_list_slot(visitor_int.as_ref()),
+            1
+        );
+        assert_eq!(
+            crate::optimizeopt::virtualize::parent_list_slot(visitor_ref.as_ref()),
+            0
+        );
+
+        let visitor_sd = Arc::new(PairingSizeDescr {
+            index: 0x3000_0201,
+            type_id: 32,
+            is_object: true,
+            fields: std::sync::OnceLock::new(),
+        });
+        visitor_sd
+            .fields
+            .set(vec![
+                visitor_int.clone() as Arc<dyn FieldDescr>,
+                visitor_ref.clone() as Arc<dyn FieldDescr>,
+            ])
+            .unwrap();
+        let visitor: DescrRef = visitor_sd;
+        assert_eq!(
+            crate::optimizeopt::virtualize::parent_list_slot_in(
+                Some(&visitor),
+                visitor_int.as_ref()
+            ),
+            0
+        );
+        assert_eq!(
+            crate::optimizeopt::virtualize::parent_list_slot_in(
+                Some(&visitor),
+                visitor_ref.as_ref()
+            ),
+            1
+        );
+
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let int_val = ctx.materialize_operand_at(majit_ir::OpRef::int_op(70));
+        let ref_val = ctx.materialize_operand_at(majit_ir::OpRef::ref_op(71));
+        let virtual_op = majit_ir::OpRef::ref_op(9);
+        let virtual_box = ctx.materialize_operand_at(virtual_op);
+        let mut fields = majit_ir::ptr_info::VirtualFieldList::new();
+        fields.push((0, int_val.clone()));
+        fields.push((1, ref_val.clone()));
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::Virtual(crate::optimizeopt::info::VirtualInfo {
+                descr: visitor.clone(),
+                known_class: None,
+                ob_type_descr: None,
+                fields,
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let env = OptBoxEnv { ctx: &ctx };
+        let vf = env
+            .get_virtual_fields(virtual_op)
+            .expect("virtual must expose fields");
+        let int_opref = env.get_box_replacement(int_val.to_opref());
+        let ref_opref = env.get_box_replacement(ref_val.to_opref());
+        assert_eq!(vf.field_oprefs, vec![int_opref, ref_opref]);
+
+        let visitor_descrs: Vec<DescrRef> = vec![
+            visitor_int.clone() as DescrRef,
+            visitor_ref.clone() as DescrRef,
+        ];
+        let mut builder = RdVirtualInfoBuilder;
+        let Some(majit_ir::RdVirtualInfo::VirtualInfo { fielddescrs, .. }) =
+            builder.visit_virtual(&visitor, &[], &visitor_descrs)
+        else {
+            panic!("expected VirtualInfo");
+        };
+        assert_eq!(fielddescrs[0].field_type, Type::Int);
+        assert_eq!(fielddescrs[1].field_type, Type::Ref);
+        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Int);
+        assert_eq!(env.get_type(vf.field_oprefs[1]), Type::Ref);
     }
 }
 

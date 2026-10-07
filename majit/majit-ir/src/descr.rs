@@ -5065,10 +5065,7 @@ pub trait SizeDescr: Descr {
     /// Byte-offset consumers want `class_word_field()`; positional ones want
     /// this.
     fn class_word_index_in_parent(&self) -> Option<usize> {
-        self.all_fielddescrs()
-            .iter()
-            .find(|fd| fd.is_w_class())
-            .map(|fd| fd.index_in_parent())
+        self.all_fielddescrs().iter().position(|fd| fd.is_w_class())
     }
 
     /// The field slot of *this* layout that holds the class word, or `None`
@@ -8853,6 +8850,35 @@ mod tests {
         assert!(Arc::ptr_eq(&sd.all_fielddescrs()[0], &header));
         assert_eq!(sd.all_fielddescrs()[1].index_in_parent(), 1);
         assert_eq!(group.field_descrs[0].index_in_parent, 1);
+    }
+
+    #[test]
+    fn class_word_index_in_parent_is_list_position_not_stale_mint() {
+        // Shared header descr mints `index_in_parent` 0; a listed layout
+        // puts it at `all_fielddescrs[1]` behind payload. Positional
+        // consumers read the list index, not the mint.
+        let payload: Arc<dyn FieldDescr> = Arc::new(
+            SimpleFieldDescr::new(0x1000_2001, 16, 8, Type::Int, false).with_index_in_parent(0),
+        );
+        let w_class: Arc<dyn FieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class".to_string(),
+            )
+            .with_class_word(true)
+            .with_index_in_parent(0),
+        );
+        assert!(w_class.is_w_class());
+        let sd =
+            SimpleSizeDescr::new(0x3000_2000, 32, 7).with_all_fielddescrs(vec![payload, w_class]);
+        assert_eq!(sd.class_word_index_in_parent(), Some(1));
+        assert_eq!(sd.all_fielddescrs()[1].index_in_parent(), 0);
     }
 
     /// A traced pointer that is not the class word stays out of
