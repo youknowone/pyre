@@ -49,10 +49,13 @@ const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers
 /// repaired later.
 const MIN_RELOCATED_JUMP_TARGET: usize = 4096;
 
-/// Bytes the trace entry frame reserves: the frame-pointer/link pair, the
-/// callee-saved registers the trace body clobbers, and the thread-local base
-/// slot. The prologue, the stack-overflow early return and the epilogue must
-/// all agree on this, or the return unwinds a corrupt SP.
+/// Bytes the trace entry frame reserves. Layout after `_call_header`:
+/// `[sp,#0]` x29/x30, `[sp,#16]` x19/x20 (`r.callee_saved_registers`),
+/// `[sp,#32]` unused 16-byte hole, `[sp,#48]` thread-local base,
+/// `[sp,#56]` unused 8-byte pad. The holes held x21/x22 and d8 when
+/// loops pinned constants; they stay so `SAVED_THREADLOCAL_OFS` and every
+/// unwind keep the same 64-byte SP delta. The prologue, the stack-overflow
+/// early return and the epilogue must all agree on this size.
 const CALL_FRAME_SIZE: u32 = 64;
 
 /// Frame offset of the thread-local base a compiled entry receives in `x1`.
@@ -62,9 +65,9 @@ const CALL_FRAME_SIZE: u32 = 64;
 /// trace can reach `pypy_threadlocal_s` without the caller keeping a register
 /// live across the body. The upstream constant is `3 * WORD` because its frame
 /// reserves eight scratch words below the callee-saved area
-/// (`_call_header`: `STP_rri(..., (i + 8) * WORD)`); this frame packs its three
-/// register pairs from offset 0, so the slot lands above them instead. The
-/// offset differs, the mechanism does not.
+/// (`_call_header`: `STP_rri(..., (i + 8) * WORD)`); this frame packs fp/lr
+/// and `r.callee_saved_registers` from offset 0, so the slot lands above
+/// them instead. The offset differs, the mechanism does not.
 ///
 /// Reads must add any `sub sp, sp, #n` in effect at the read point, the way
 /// `aarch64/callbuilder.py` `write_real_errno` adds `self.current_sp`.
@@ -256,8 +259,6 @@ pub(crate) fn build_propagate_exception_path(
         ; str x17, [x16]
         ; mov x0, x29
         ; ldp x19, x20, [sp, #16]
-        ; ldp x21, x22, [sp, #32]
-        ; ldr d8, [sp, #56]
         ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
         ; ret
     );
@@ -866,9 +867,6 @@ pub struct AssemblerARM64<'a> {
     /// helpers, indexed `withcards + 2 * withfloats`, with `[4]` the
     /// `for_frame` one.
     wb_slowpath: [usize; 5],
-    /// Back-edge label, bound after `LoopPins`. `ll_loop_code` stays on
-    /// the entry so a bridge executes the pin moves.
-    pending_loop_hot: Option<DynamicLabel>,
 }
 
 /// imm8 for `fmov Dd, #imm`, or `None` when `bits` is outside that set.
@@ -888,34 +886,6 @@ fn fmov64_imm8(bits: u64) -> Option<u8> {
     };
     let payload = ((bits >> 48) & 0x3f) as u8;
     Some((sign << 7) | (b << 6) | payload)
-}
-
-/// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
-pub(crate) fn imm_mov_count(val: i64) -> u32 {
-    if val < 0 {
-        if val >= -65536 {
-            return 1;
-        }
-        let mut value = (val as u64) >> 16;
-        let mut n = 1u32;
-        let mut shift = 16;
-        while shift < 64 {
-            if (value & 0xFFFF) != 0xFFFF {
-                n += 1;
-            }
-            shift += 16;
-            value >>= 16;
-        }
-        return n;
-    }
-    let mut value = val as u64;
-    let mut n = 1u32;
-    value >>= 16;
-    while value != 0 {
-        n += 1;
-        value >>= 16;
-    }
-    n
 }
 
 /// `NOP` (`HINT #0`), the placeholder `_emit_guard` leaves at a
@@ -1117,7 +1087,6 @@ impl<'a> AssemblerARM64<'a> {
             gcref_table: Vec::new(),
             malloc_slowpath_fixed,
             wb_slowpath,
-            pending_loop_hot: None,
         }
     }
 
@@ -1685,13 +1654,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
-            // x21/x22 are outside all_regs. A loop parks wide integer
-            // immediates there. The overflow return already reloads this pair.
-            ; stp x21, x22, [sp, #32]
-            // d8 is outside all_vfp_regs. A loop parks one float immediate
-            // there so the body does not reload it. The byte at [sp,#56]
-            // sits above the thread-local slot.
-            ; str d8, [sp, #56]
             // assembler.py:1128-1129: spill the thread-local base the entry
             // received in x1, then take the jitframe out of x0.
             ; str x1, [sp, #SAVED_THREADLOCAL_OFS]
@@ -1742,10 +1704,11 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64
                 ; str x0, [x29, JF_DESCR_OFS as u32]
                 // Overflow fallthrough: return x29 as jf_ptr.
+                // Restore the same set `_call_header` saved and
+                // `_call_footer` / `gen_func_epilog` restore:
+                // `r.callee_saved_registers` (x19, x20) plus fp/lr.
                 ; mov x0, x29
                 ; ldp x19, x20, [sp, #16]
-                ; ldp x21, x22, [sp, #32]
-                ; ldr d8, [sp, #56]
                 ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
                 ; ret
                 ; =>continue_label
@@ -1765,8 +1728,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
-            ; ldp x21, x22, [sp, #32]
-            ; ldr d8, [sp, #56]
             ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
             ; ret
         );
@@ -2493,22 +2454,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Emit code from regalloc decisions ──
         for ra_op in &ra_ops {
-            if let RegAllocOp::LoopPins { moves } = ra_op {
-                for (src, dst) in moves {
-                    self.regalloc_mov(src, dst);
-                }
-                if let Some(hot) = self.pending_loop_hot.take() {
-                    dynasm!(self.mc ; =>hot);
-                }
-                continue;
-            }
-            if let Some(hot) = self.pending_loop_hot.take() {
-                dynasm!(self.mc ; =>hot);
-            }
             match ra_op {
-                RegAllocOp::LoopPins { .. } => {
-                    continue;
-                }
                 RegAllocOp::Skip => {
                     // Dead operation — skip.
                     continue;
@@ -3758,8 +3704,6 @@ impl<'a> AssemblerARM64<'a> {
                     );
                 }
                 dynasm!(self.mc ; =>label);
-                let hot = self.mc.new_dynamic_label();
-                self.pending_loop_hot = Some(hot);
                 if let Some(descr) = label_descr {
                     let stored_arglocs = arglocs
                         .iter()
@@ -3775,7 +3719,7 @@ impl<'a> AssemblerARM64<'a> {
                     descr.set_target_arglocs(stored_arglocs);
                     descr.set_ll_loop_code(self.mc.offset().0);
                     if let Some(id) = loop_target_id(op) {
-                        self.target_tokens_currently_compiling.insert(id, hot);
+                        self.target_tokens_currently_compiling.insert(id, label);
                     }
                     if let Some(descr_ref) = op.getdescr() {
                         self.compiled_target_tokens.push(descr_ref.clone());
@@ -8207,6 +8151,99 @@ mod tests {
     };
 
     use crate::runner::DynasmBackend;
+    use dynasmrt::{DynasmApi, dynasm};
+
+    /// Encode a 32-bit aarch64 instruction with the same dynasm path the
+    /// prologue uses, so a search through the compiled buffer matches the
+    /// word `_call_header` would have emitted.
+    fn aarch64_insn_bytes(emit: impl FnOnce(&mut super::Assembler)) -> [u8; 4] {
+        let mut mc = super::Assembler::new(0);
+        emit(&mut mc);
+        let buf = mc.finalize().unwrap();
+        assert_eq!(buf.len(), 4, "expected a single 32-bit instruction");
+        [buf[0], buf[1], buf[2], buf[3]]
+    }
+
+    /// `_call_header` saves fp/lr and `r.callee_saved_registers` (x19, x20).
+    /// The overflow fallthrough and `_call_footer` must restore that same
+    /// set (`gen_func_epilog`). Reloading x21/x22 or d8 from slots the
+    /// prologue no longer writes would return to native code with those
+    /// callee-saved registers overwritten.
+    #[test]
+    fn call_header_overflow_return_restores_only_saved_callee_regs() {
+        static STACK_END: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static STACK_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        extern "C" fn dummy_slowpath(_sp: usize) -> u8 {
+            0
+        }
+        crate::register_stack_check_addresses(
+            &STACK_END as *const AtomicUsize as usize,
+            &STACK_LEN as *const AtomicUsize as usize,
+            dummy_slowpath as *const () as usize,
+        );
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(0));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+        let token = JitCellToken::new(530);
+        backend
+            .compile_loop(&[], &[OpRc::new(finish)], &token)
+            .expect("compile a loop whose prologue includes the stack check");
+
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled code")
+            .downcast_ref::<super::CompiledCode>()
+            .expect("dynasm compiled code");
+        let code = unsafe {
+            std::slice::from_raw_parts(
+                compiled.buffer.ptr(dynasmrt::AssemblyOffset(0)),
+                compiled.buffer.len(),
+            )
+        };
+
+        let restore_x19_x20 = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldp x19, x20, [sp, #16]);
+        });
+        let restore_fp_lr = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldp x29, x30, [sp], super::CALL_FRAME_SIZE as i32);
+        });
+        let forbidden_x21_x22 = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldp x21, x22, [sp, #32]);
+        });
+        let forbidden_d8 = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldr d8, [sp, #56]);
+        });
+
+        assert!(
+            code.windows(4).any(|w| w == restore_x19_x20),
+            "overflow return / epilogue must restore x19/x20"
+        );
+        assert!(
+            code.windows(4).any(|w| w == restore_fp_lr),
+            "overflow return / epilogue must restore fp/lr with CALL_FRAME_SIZE"
+        );
+        assert!(
+            !code.windows(4).any(|w| w == forbidden_x21_x22),
+            "must not LDP x21, x22 from a slot _call_header no longer writes"
+        );
+        assert!(
+            !code.windows(4).any(|w| w == forbidden_d8),
+            "must not LDR d8 from a slot _call_header no longer writes"
+        );
+
+        let mut restore_pair = [0u8; 8];
+        restore_pair[..4].copy_from_slice(&restore_x19_x20);
+        restore_pair[4..].copy_from_slice(&restore_fp_lr);
+        assert!(
+            code.windows(8).any(|w| w == restore_pair),
+            "each x19/x20 restore must be followed by the fp/lr pop, matching _call_footer"
+        );
+    }
 
     /// aarch64/regalloc.py prepare_op_call_malloc_nursery keeps CALL_MALLOC_NURSERY's result in x0;
     /// only FrameManager may decide to spill it later.  The old hybrid emitter
