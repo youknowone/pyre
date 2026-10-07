@@ -840,6 +840,26 @@ pub fn is_list_container_spelling(spelling: &str) -> bool {
         || stripped.starts_with("Slice<")
 }
 
+/// `object_array::ItemsBlock` is RPython `GcArray(OBJECTPTR)`
+/// (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`, the tuple
+/// `wrappeditems` array and the resizable list's `l.items` field).
+/// The leaf is exactly `ItemsBlock`; `TypedItemsBlock` is
+/// `GcArray(Signed|Float)` and stays out.
+pub fn is_object_gcarray_items_block(name: &str) -> bool {
+    let stripped = name
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim();
+    strip_instantiation_suffix(stripped)
+        .rsplit("::")
+        .next()
+        .unwrap_or(stripped)
+        == "ItemsBlock"
+}
+
 /// Remove the first balanced generic-argument group from a (possibly
 /// variant-qualified) name, preserving any trailing path segment:
 /// `Result<Tuple>::Ok` → `Result::Ok`, `Result<Tuple>` → `Result`,
@@ -10185,6 +10205,18 @@ mod tests {
         assert!(!is_shaped_array_name("Array"));
         assert!(is_shaped_array_name("Array<*mut PyObject;1>"));
         assert!(!is_shaped_array_name("module::Array<i64;2>"));
+    }
+
+    #[test]
+    fn object_gcarray_items_block_is_the_array_not_typed_digits() {
+        assert!(is_object_gcarray_items_block("ItemsBlock"));
+        assert!(is_object_gcarray_items_block("*mut ItemsBlock"));
+        assert!(is_object_gcarray_items_block("object_array::ItemsBlock"));
+        assert!(is_object_gcarray_items_block(
+            "*mut object_array::ItemsBlock"
+        ));
+        assert!(!is_object_gcarray_items_block("TypedItemsBlock"));
+        assert!(!is_object_gcarray_items_block("rlist::TypedItemsBlock"));
     }
 
     #[test]

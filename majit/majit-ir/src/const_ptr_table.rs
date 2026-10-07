@@ -11,7 +11,9 @@
 //! (`trace_index`). `history.py` drops a `ConstPtr` with the trace that
 //! referenced the box; walking every slot would keep a dead trace's
 //! referent alive for the process. Compiled loops keep their own
-//! `GcTable` roots.
+//! `GcTable` roots. A major collection stamps the slots extra-root
+//! walkers still hold and [`sweep_untraced`] frees the rest onto a
+//! free list `intern` reuses. Index 0 stays null.
 //!
 //! Intern key is `gc_id_or_identityhash` (`minimark.py`
 //! `id_or_identityhash`), not the address. The key is recorded at
@@ -26,11 +28,19 @@ use crate::value::{GcRef, gc_id_or_identityhash};
 struct Table {
     /// Index 0 is null and is never interned.
     slots: Vec<GcRef>,
+    /// Intern key recorded with the slot. `minimark.py`
+    /// `id_or_identityhash` is not recomputed on a stale address.
+    hashes: Vec<u64>,
     /// `(identity hash, index)`, sorted by hash then index.
     by_hash: Vec<(u64, u32)>,
     /// `begin_wave` generation that last traced this slot. Wave 0 does
     /// not dedup: a unit test that never opens a wave still forwards.
     marks: Vec<u32>,
+    /// [`MAJOR_LIVE`] generation a holder last stamped. A slot whose
+    /// generation is older than the current major is dead at sweep.
+    live: Vec<u32>,
+    /// Reclaimed indexes `intern` reuses. Index 0 is never queued.
+    free: Vec<u32>,
 }
 
 /// Non-zero while a collection (or a test helper) is forwarding.
@@ -47,16 +57,22 @@ impl Table {
     fn new() -> Self {
         Self {
             slots: vec![GcRef::NULL],
+            hashes: vec![0],
             by_hash: Vec::new(),
             marks: vec![0],
+            live: vec![0],
+            free: Vec::new(),
         }
     }
 }
 
 static TABLE: Mutex<Table> = Mutex::new(Table {
     slots: Vec::new(),
+    hashes: Vec::new(),
     by_hash: Vec::new(),
     marks: Vec::new(),
+    live: Vec::new(),
+    free: Vec::new(),
 });
 static READY: AtomicBool = AtomicBool::new(false);
 
@@ -77,45 +93,95 @@ fn set_walking(value: bool) {
 /// Lock-free mirror of `Table.slots` for `history.py` `ConstPtr.getref_base`.
 ///
 /// `resolve` runs once per constant ref in a blackhole resume. Taking
-/// the intern mutex there is not the field load upstream emits. Chunks
-/// are append-only and never freed, so a published chunk pointer stays
-/// valid. The table mutex still covers intern, the hash index, and the
-/// forwarding walk.
+/// the intern mutex there is not the field load upstream emits. The
+/// directory grows under the intern mutex; a published directory and
+/// each published chunk pointer stay valid for lock-free readers, so a
+/// replaced directory is leaked. The table mutex still covers intern,
+/// the hash index, reclamation, and the forwarding walk.
 const SLOT_CHUNK: usize = 256;
-const SLOT_CHUNKS: usize = 1024;
 
 struct SlotChunk {
     slots: [AtomicUsize; SLOT_CHUNK],
 }
 
-static SLOT_CHUNK_PTRS: [AtomicPtr<SlotChunk>; SLOT_CHUNKS] = {
-    const NULL: AtomicPtr<SlotChunk> = AtomicPtr::new(std::ptr::null_mut());
-    [NULL; SLOT_CHUNKS]
-};
+struct ChunkDir {
+    n: usize,
+    ptrs: *mut AtomicPtr<SlotChunk>,
+}
+
+static DIR: AtomicPtr<ChunkDir> = AtomicPtr::new(std::ptr::null_mut());
+
+/// `history.py` drops a `ConstPtr` with the last holder. A major that
+/// traces every live holder then frees a slot no holder stamped.
+static MAJOR_LIVE: AtomicU32 = AtomicU32::new(1);
+
+fn current_live() -> u32 {
+    MAJOR_LIVE.load(Ordering::Relaxed)
+}
+
+/// Open a major-live generation. Slots interned or `trace_index`'d
+/// after this call survive [`sweep_untraced`]; older stamps die.
+pub fn begin_major_live() {
+    let cur = MAJOR_LIVE.load(Ordering::Relaxed);
+    let mut next = cur.wrapping_add(1);
+    if next == 0 {
+        next = 1;
+    }
+    MAJOR_LIVE.store(next, Ordering::Relaxed);
+}
+
+fn grow_dir(min_len: usize) {
+    let old = DIR.load(Ordering::Acquire);
+    let old_len = if old.is_null() {
+        0
+    } else {
+        unsafe { (*old).n }
+    };
+    if min_len <= old_len {
+        return;
+    }
+    let new_len = min_len.next_power_of_two().max(8);
+    let chunks: Vec<AtomicPtr<SlotChunk>> = (0..new_len)
+        .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+        .collect();
+    if !old.is_null() {
+        let old_ptrs = unsafe { (*old).ptrs };
+        for i in 0..old_len {
+            chunks[i].store(
+                unsafe { (*old_ptrs.add(i)).load(Ordering::Relaxed) },
+                Ordering::Relaxed,
+            );
+        }
+    }
+    let ptrs = Box::into_raw(chunks.into_boxed_slice()) as *mut AtomicPtr<SlotChunk>;
+    let fresh = Box::into_raw(Box::new(ChunkDir { n: new_len, ptrs }));
+    DIR.store(fresh, Ordering::Release);
+}
 
 fn publish_slot(index: usize, addr: GcRef) {
     if index == 0 {
         return;
     }
     let ci = index / SLOT_CHUNK;
-    assert!(
-        ci < SLOT_CHUNKS,
-        "const_ptr_table: more than {} slots",
-        SLOT_CHUNK * SLOT_CHUNKS
-    );
-    let mut chunk = SLOT_CHUNK_PTRS[ci].load(Ordering::Acquire);
+    let mut dir = DIR.load(Ordering::Acquire);
+    if dir.is_null() || ci >= unsafe { (*dir).n } {
+        grow_dir(ci + 1);
+        dir = DIR.load(Ordering::Acquire);
+    }
+    let slot = unsafe { (*dir).ptrs.add(ci) };
+    let mut chunk = unsafe { (*slot).load(Ordering::Acquire) };
     if chunk.is_null() {
         let fresh = Box::into_raw(Box::new(SlotChunk {
             slots: std::array::from_fn(|_| AtomicUsize::new(0)),
         }));
-        match SLOT_CHUNK_PTRS[ci].compare_exchange(
-            std::ptr::null_mut(),
-            fresh,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            // `Ok` is the previous (null) value. The published pointer is
-            // `fresh`.
+        match unsafe {
+            (*slot).compare_exchange(
+                std::ptr::null_mut(),
+                fresh,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+        } {
             Ok(_) => chunk = fresh,
             Err(existing) => {
                 unsafe { drop(Box::from_raw(fresh)) };
@@ -140,6 +206,8 @@ fn table() -> parking_lot::MutexGuard<'static, Table> {
 }
 
 /// Index of `addr` in the table. Null is 0. Same referent, same index.
+/// A find-hit stamps `live` so a new holder of an existing slot survives
+/// [`sweep_untraced`] without a later [`trace_index`].
 pub fn intern(addr: GcRef) -> u32 {
     if addr.is_null() {
         return 0;
@@ -147,11 +215,33 @@ pub fn intern(addr: GcRef) -> u32 {
     let hash = gc_id_or_identityhash(addr.0) as u64;
     let mut guard = table();
     if let Some(idx) = find(&guard, hash, addr.0) {
+        // A new holder of an existing slot is still a holder. Stamp
+        // `live` on the find-hit too: between `begin_major_live` and
+        // `sweep_untraced` a dropped holder can leave the slot unstamped
+        // and a later intern of the same referent must keep it.
+        let i = idx as usize;
+        if i >= guard.live.len() {
+            guard.live.resize(i + 1, 0);
+        }
+        guard.live[i] = current_live();
         return idx;
     }
-    let idx = guard.slots.len() as u32;
-    guard.slots.push(addr);
-    guard.marks.push(0);
+    let live = current_live();
+    let idx = if let Some(free_idx) = guard.free.pop() {
+        let i = free_idx as usize;
+        guard.slots[i] = addr;
+        guard.hashes[i] = hash;
+        guard.marks[i] = 0;
+        guard.live[i] = live;
+        free_idx
+    } else {
+        let idx = guard.slots.len() as u32;
+        guard.slots.push(addr);
+        guard.hashes.push(hash);
+        guard.marks.push(0);
+        guard.live.push(live);
+        idx
+    };
     let pos = guard
         .by_hash
         .partition_point(|&(h, i)| (h, i) < (hash, idx));
@@ -229,6 +319,10 @@ pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
     if idx >= guard.slots.len() || guard.slots[idx].is_null() {
         return;
     }
+    if idx >= guard.live.len() {
+        guard.live.resize(idx + 1, 0);
+    }
+    guard.live[idx] = current_live();
     if !claim_wave(&mut guard.marks, idx) {
         return;
     }
@@ -288,10 +382,14 @@ pub fn resolve(index: u32) -> GcRef {
     }
     let i = index as usize;
     let ci = i / SLOT_CHUNK;
-    if ci >= SLOT_CHUNKS {
+    let dir = DIR.load(Ordering::Acquire);
+    if dir.is_null() {
         return GcRef::NULL;
     }
-    let chunk = SLOT_CHUNK_PTRS[ci].load(Ordering::Acquire);
+    if ci >= unsafe { (*dir).n } {
+        return GcRef::NULL;
+    }
+    let chunk = unsafe { (*(*dir).ptrs.add(ci)).load(Ordering::Acquire) };
     if chunk.is_null() {
         return GcRef::NULL;
     }
@@ -340,6 +438,44 @@ pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {
         visitor(&mut guard.slots[idx]);
         publish_slot(idx, guard.slots[idx]);
         idx += 1;
+    }
+}
+
+/// Free a slot no holder stamped in this major. `history.py` drops
+/// the `ConstPtr` when no trace, descr, or op holds the box.
+pub fn sweep_untraced() {
+    let live = current_live();
+    let mut guard = table();
+    let mut idx = 1usize;
+    while idx < guard.slots.len() {
+        if !guard.slots[idx].is_null() && guard.live[idx] != live {
+            free_slot(&mut guard, idx);
+        }
+        idx += 1;
+    }
+}
+
+fn free_slot(guard: &mut Table, idx: usize) {
+    let hash = guard.hashes[idx];
+    remove_hash(&mut guard.by_hash, hash, idx as u32);
+    guard.slots[idx] = GcRef::NULL;
+    guard.hashes[idx] = 0;
+    guard.marks[idx] = 0;
+    guard.live[idx] = 0;
+    publish_slot(idx, GcRef::NULL);
+    guard.free.push(idx as u32);
+}
+
+fn remove_hash(by_hash: &mut Vec<(u64, u32)>, hash: u64, idx: u32) {
+    let start = by_hash.partition_point(|&(h, _)| h < hash);
+    for i in start..by_hash.len() {
+        if by_hash[i].0 != hash {
+            break;
+        }
+        if by_hash[i].1 == idx {
+            by_hash.remove(i);
+            return;
+        }
     }
 }
 
@@ -443,5 +579,81 @@ mod tests {
             });
             assert!(visited);
         }
+    }
+
+    fn reclaim_unheld() {
+        begin_major_live();
+        sweep_untraced();
+    }
+
+    #[test]
+    fn intern_grows_past_the_old_chunk_directory_cap() {
+        let _serial = TEST_SERIAL.lock();
+        reclaim_unheld();
+        const N: usize = SLOT_CHUNK * 1024 + 1;
+        let base = 0x6E6B_C100usize;
+        let first = intern(GcRef(base));
+        for i in 1..N {
+            intern(GcRef(base + i * 16));
+        }
+        let last_addr = GcRef(base + (N - 1) * 16);
+        let last = intern(last_addr);
+        assert_eq!(resolve(first), GcRef(base));
+        assert_eq!(resolve(last), last_addr);
+        assert_ne!(first, last);
+        reclaim_unheld();
+    }
+
+    #[test]
+    fn intern_reuses_slots_across_major_sweeps_past_the_old_cap() {
+        let _serial = TEST_SERIAL.lock();
+        reclaim_unheld();
+        const BATCH: usize = 80_000;
+        const ROUNDS: usize = 4;
+        let mut lifetime = 0usize;
+        for round in 0..ROUNDS {
+            begin_major_live();
+            for i in 0..BATCH {
+                intern(GcRef(0x6E6B_D000 + round * 1_000_000 + i * 16));
+            }
+            sweep_untraced();
+            lifetime += BATCH;
+            begin_major_live();
+            sweep_untraced();
+        }
+        assert!(
+            lifetime > SLOT_CHUNK * 1024,
+            "lifetime interned {lifetime} must exceed the old 256×1024 cap"
+        );
+        let probe = intern(GcRef(0x6E6B_E001));
+        assert_eq!(resolve(probe), GcRef(0x6E6B_E001));
+        reclaim_unheld();
+    }
+
+    #[test]
+    fn a_held_slot_survives_a_major_and_keeps_its_index() {
+        let _serial = TEST_SERIAL.lock();
+        reclaim_unheld();
+        let addr = GcRef(0x6E6B_F010);
+        let idx = intern(addr);
+        begin_major_live();
+        trace_index(idx, &mut |_| {});
+        sweep_untraced();
+        assert_eq!(resolve(idx), addr);
+        assert_eq!(intern(addr), idx);
+        reclaim_unheld();
+    }
+
+    #[test]
+    fn intern_find_hit_stamps_live_without_trace_index() {
+        let _serial = TEST_SERIAL.lock();
+        reclaim_unheld();
+        let addr = GcRef(0x6E6B_F110);
+        let idx = intern(addr);
+        begin_major_live();
+        assert_eq!(intern(addr), idx);
+        sweep_untraced();
+        assert_eq!(resolve(idx), addr);
+        reclaim_unheld();
     }
 }

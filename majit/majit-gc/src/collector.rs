@@ -6252,6 +6252,10 @@ impl MiniMarkGC {
     }
 
     fn seed_major_roots(&mut self) {
+        // `history.py` `ConstPtr` dies with its last holder. Open a
+        // live generation so `trace_index` stamps the slots extra-root
+        // walkers still hold; `finish_incremental_marking` frees the rest.
+        majit_ir::const_ptr_table::begin_major_live();
         // One wave for this marking root walk. See the minor path.
         let _const_ptr_wave = majit_ir::const_ptr_table::Wave::enter();
         // incminimark.py collect_roots: root_walker.walk_roots()
@@ -8540,6 +8544,10 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
+        // Extra-root walkers have stamped every live `ConstPtr` slot.
+        // A slot no holder marked is dead, matching `history.py` dropping
+        // the box when no trace, descr, or op holds it.
+        majit_ir::const_ptr_table::sweep_untraced();
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
         self.stat_ac_arenas_count = self.oldgen.arenas_count();
