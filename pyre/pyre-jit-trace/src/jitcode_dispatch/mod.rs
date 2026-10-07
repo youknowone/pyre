@@ -12517,16 +12517,11 @@ fn emit_namespace_cell_value<Sym: WalkSym>(
     specialize::try_walker_orthodox_unwrap_cell(ctx, op_pc, stored)
 }
 
-/// #67 shape fix: append virtualizable data boxes so the walker merge-point
-/// `live_arg_boxes` matches the JUMP `close_loop_args_at` records.
-fn append_virtualizable_boxes(ctx: &TraceCtx, mut reds: Vec<OpRef>) -> Vec<OpRef> {
-    if let Some(total) = ctx.virtualizable_boxes_len() {
-        for i in 0..total.saturating_sub(1) {
-            if let Some(b) = ctx.virtualizable_box_at(i) {
-                reds.push(b);
-            }
-        }
-    }
+/// pyjitpl.py `reached_loop_header`: `live_arg_boxes += virtualizable_boxes;
+/// live_arg_boxes.pop()`. Every declared slot is a box
+/// (`virtualizable.py read_boxes`); a missing slot is a producer bug.
+pub(crate) fn append_virtualizable_boxes(ctx: &TraceCtx, mut reds: Vec<OpRef>) -> Vec<OpRef> {
+    reds.extend(ctx.virtualizable_data_boxes());
     reds
 }
 
@@ -16142,6 +16137,18 @@ fn handle<Sym: WalkSym>(
                 // dest's slot to merge_pc-1 after that write.
                 sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
             }
+            // Array index `>= valuestackdepth` is the dead stack tail
+            // (`pyframe.py popvalue_maybe_none`). majit's fill is generic
+            // (`virtualizable.py VirtualizableInfo`); supply the boundary
+            // from the concrete frame, falling back to the symbolic mirror
+            // the same way `close_loop_args_at` does.
+            let dead_array_tail_from = (!ctx.fbw_mode.snapshot_sym.is_null()).then(|| {
+                let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+                crate::state::concrete_stack_depth(sym.tracing_vable_frame_addr())
+                    .unwrap_or_else(|| sym.valuestackdepth())
+            });
+            ctx.trace_ctx
+                .fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
             live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
 
             // pyjitpl.py remove_consts_and_duplicates over the

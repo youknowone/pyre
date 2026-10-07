@@ -7063,7 +7063,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         ctx.adopt_live_greens_as_close();
         let mut redboxes = ctx.live_portal_reds.clone().unwrap_or_default();
-        ctx.reached_loop_header_live_arg_boxes(&mut redboxes);
+        ctx.reached_loop_header_live_arg_boxes(&mut redboxes, None);
     }
 
     /// Split-borrow helper that lets a

@@ -16903,6 +16903,41 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     }
 }
 
+/// The walker JUMP used to skip a missing `virtualizable_box_at` slot, so
+/// `live_arg_boxes` was one shorter than the LABEL registered from
+/// `inputarg_types`. Every declared slot is now a box.
+#[test]
+fn append_virtualizable_boxes_includes_every_declared_slot() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let red0 = tc.const_ref(0x10);
+    let red1 = tc.const_ref(0x20);
+    let live = super::append_virtualizable_boxes(&tc, vec![red0, red1]);
+    assert_eq!(
+        live.len(),
+        2 + slot_count,
+        "JUMP reds + virtualizable_boxes[:-1] must match the declared layout"
+    );
+    assert_eq!(live[0], red0);
+    assert_eq!(live[1], red1);
+    assert_eq!(&live[2..], initial_boxes.as_slice());
+}
+
 /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
 /// int-constant operand and records nothing (pyjitpl.py).
 #[test]

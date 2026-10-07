@@ -4307,7 +4307,7 @@ where
             // (reds), so the JUMP/registration list is reds + vable
             // elements — greens stay in `greenboxes` for same_greenkey /
             // procedure tokens.
-            let boxes = ctx.reached_loop_header_live_arg_boxes(&mut redboxes);
+            let boxes = ctx.reached_loop_header_live_arg_boxes(&mut redboxes, None);
             sym.set_redboxes(&redboxes);
             live_arg_boxes.clear();
             live_arg_boxes.extend(

@@ -530,6 +530,41 @@ pub(crate) fn mirror_vable_static_to_boxes_nosync(
     }
 }
 
+/// `pyframe.py popvalue_maybe_none` leaves `locals_cells_stack_w[i] is None`
+/// for every `i >= valuestackdepth`. `fill_virtualizable_boxes_to_declared_layout`
+/// only fills `OpRef::NONE` holes; an occupied leftover stays in
+/// `virtualizable_boxes` and `reached_loop_header` concatenates it.
+///
+/// `fill()` must not overwrite occupied slots: a stale snapshot vsd
+/// below `nlocals` used as `dead_array_tail_from` nulled live local `i`
+/// and the `range` iterator at `locals_cells_stack_w[nlocals]`. This
+/// writes CONST_NULL into the dead tail using the merge-point's live
+/// `valuestackdepth` so `virtualizable_data_boxes()` already holds the
+/// null tail `read_boxes` reports.
+fn null_vable_dead_array_tail(ctx: &mut TraceCtx, from: usize) {
+    let nstatic = match ctx.virtualizable_info() {
+        Some(info) => info.num_static_extra_boxes,
+        None => return,
+    };
+    let mut data_len = 0;
+    while ctx.virtualizable_box_at(data_len).is_some() {
+        data_len += 1;
+    }
+    if data_len == 0 {
+        return;
+    }
+    data_len -= 1;
+    let start = nstatic.saturating_add(from);
+    if start >= data_len {
+        return;
+    }
+    let null = ctx.const_null();
+    let concrete = Value::Ref(GcRef::NULL);
+    for idx in start..data_len {
+        ctx.set_virtualizable_entry_at(idx, null, concrete);
+    }
+}
+
 /// Live STANDARD `last_instr` / `valuestackdepth` boxes saved across a
 /// resume-image publish.
 ///
@@ -2073,22 +2108,21 @@ impl MIFrame {
         if let Some(pc) = target_pc {
             let last_instr_value = pc as i64 - 1;
             let opref = ctx.const_int(last_instr_value);
-            let owns = {
+            {
                 let s = self.sym_mut();
                 s.vable_last_instr = opref;
-                s.owns_virtualizable_shadow()
-            };
-            if owns {
-                // `interp_jit.py` `jump_absolute` writes `frame.last_instr`
-                // before `can_enter_jit`. The merge image is that live-frame
-                // write; snapshot capture still save/restores the boxes.
-                mirror_vable_static_to_boxes(
-                    ctx,
-                    "last_instr",
-                    opref,
-                    Value::Int(last_instr_value),
-                );
             }
+            // `interp_jit.py` `jump_absolute` writes `self.last_instr =
+            // intmask(jumpto)` before `can_enter_jit`. On a virtualizable
+            // that is `_opimpl_setfield_vable` / `synchronize_virtualizable`,
+            // so `virtualizable_boxes[0]` already holds the header pc when
+            // `reached_loop_header` concatenates it. The walker records that
+            // store in `setfield_vable_via_metainterp`; this pin is the same
+            // write for the source-level close, including traces whose
+            // `owns_virtualizable_shadow` gate would otherwise leave the
+            // shadow on the pre-pin box. Snapshot capture still
+            // save/restores the boxes.
+            mirror_vable_static_to_boxes(ctx, "last_instr", opref, Value::Int(last_instr_value));
         }
         // No vable heap-writeback before the closing JUMP: the
         // virtualizable stays virtual across the loop/bridge edge. The
@@ -2180,6 +2214,12 @@ impl MIFrame {
                 }
             }
         }
+        // pyjitpl.py reached_loop_header builds one `live_arg_boxes` from
+        // reds + `virtualizable_boxes[:-1]`. Fill any short shadow before
+        // both this JUMP and the walker's `append_virtualizable_boxes` read
+        // that same list. Array index `>= valuestackdepth` is the dead
+        // stack tail (`pyframe.py popvalue_maybe_none`); majit is generic
+        // and takes that boundary from here.
         // The stack depth reads from `PyFrame.valuestackdepth`
         // (via `concrete_valuestackdepth()`) rather than the symbolic
         // mirror.  `close_loop_args_at` runs at the orgpc anchor where
@@ -2187,6 +2227,11 @@ impl MIFrame {
         let concrete_vsd = self
             .concrete_valuestackdepth()
             .unwrap_or_else(|| self.sym().valuestackdepth);
+        ctx.fill_virtualizable_boxes_to_declared_layout(Some(concrete_vsd));
+        // `popvalue_maybe_none` stored None at every `i >= valuestackdepth`.
+        // Fill only covers NONE holes; occupied leftovers of a loop-carried
+        // local stay in the shadow and split peel/body GuardTrue.
+        null_vable_dead_array_tail(ctx, concrete_vsd);
         let (
             frame,
             execution_context,
@@ -2285,46 +2330,55 @@ impl MIFrame {
         let mut args = vec![frame];
         // NUM_EXTRA_REDS == 1 (crate const-assert): `reds = ['frame', 'ec']`.
         args.push(execution_context);
-        args.extend_from_slice(&[next_instr, code, stack_depth, debugdata]);
-        for (idx, value) in locals.into_iter().enumerate() {
-            let target_type = inputarg_types
-                .get(num_scalars + idx)
-                .copied()
-                .unwrap_or(Type::Ref);
-            // Materialize NONE slots from concrete frame before boxing.
-            // RPython's live_arg_boxes never contains holes at loop closure
-            // because MIFrame.run_one_step always updates all live registers.
-            let value = self.materialize_fail_arg_slot(ctx, value, target_type, idx);
-            args.push(self.materialize_loop_carried_value(ctx, value, target_type));
-        }
-        // Live value-stack window: slots at index >= live_stack_len are dead
-        // capacity (Python index >= valuestackdepth). `interpreter/pyframe.py`
-        // `popvalue_maybe_none` nulls a popped slot, so `read_boxes` reports
-        // None for every dead stack slot and `virtualizable_boxes` carries a
-        // null tail; the target loop LABEL's stack tail is therefore all-null
-        // and folds away. pyre's bridge value-stack clear is gated off
-        // (`is_active_vable_owner` excludes bridges to avoid the null-base
-        // `InvalidLoop` abort), so the concrete frame still holds the stale
-        // popped pointers (e.g. a caught exception) in those slots. Reading
-        // them through `materialize_fail_arg_slot` would put live pointers in
-        // the JUMP tail where the loop label expects null, blocking
-        // `optimize_bridge` retarget, and would also disagree with resume,
-        // which reconstructs the dead tail as null. Force the null here: these
-        // slots reach only the terminal JUMP args, never an in-trace field
-        // base, so no `get_const_info_mut` null-base abort.
-        let live_stack_len = concrete_vsd.saturating_sub(nlocals);
-        for (stack_idx, value) in stack.into_iter().enumerate() {
-            let target_type = inputarg_types
-                .get(num_scalars + nlocals + stack_idx)
-                .copied()
-                .unwrap_or(Type::Ref);
-            let value = if stack_idx >= live_stack_len {
-                let typed_null = extract_concrete_typed_value(target_type, PY_NULL);
-                fail_arg_opref_for_typed_value(ctx, typed_null)
-            } else {
-                self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx)
-            };
-            args.push(self.materialize_loop_carried_value(ctx, value, target_type));
+        if ctx.has_virtualizable_boxes() {
+            // Same list the walker JUMP already built:
+            // `append_virtualizable_boxes` = reds + `virtualizable_boxes[:-1]`.
+            // `pyjitpl.py reached_loop_header` concatenates that list after
+            // `jump_absolute` has written `last_instr` (`_opimpl_setfield_vable`)
+            // and `popvalue_maybe_none` has stored None (`_opimpl_setarrayitem_vable`).
+            args.extend(ctx.virtualizable_data_boxes());
+        } else {
+            args.extend_from_slice(&[next_instr, code, stack_depth, debugdata]);
+            for (idx, value) in locals.into_iter().enumerate() {
+                let target_type = inputarg_types
+                    .get(num_scalars + idx)
+                    .copied()
+                    .unwrap_or(Type::Ref);
+                // Materialize NONE slots from concrete frame before boxing.
+                // RPython's live_arg_boxes never contains holes at loop closure
+                // because MIFrame.run_one_step always updates all live registers.
+                let value = self.materialize_fail_arg_slot(ctx, value, target_type, idx);
+                args.push(self.materialize_loop_carried_value(ctx, value, target_type));
+            }
+            // Live value-stack window: slots at index >= live_stack_len are dead
+            // capacity (Python index >= valuestackdepth). `interpreter/pyframe.py`
+            // `popvalue_maybe_none` nulls a popped slot, so `read_boxes` reports
+            // None for every dead stack slot and `virtualizable_boxes` carries a
+            // null tail; the target loop LABEL's stack tail is therefore all-null
+            // and folds away. pyre's bridge value-stack clear is gated off
+            // (`is_active_vable_owner` excludes bridges to avoid the null-base
+            // `InvalidLoop` abort), so the concrete frame still holds the stale
+            // popped pointers (e.g. a caught exception) in those slots. Reading
+            // them through `materialize_fail_arg_slot` would put live pointers in
+            // the JUMP tail where the loop label expects null, blocking
+            // `optimize_bridge` retarget, and would also disagree with resume,
+            // which reconstructs the dead tail as null. Force the null here: these
+            // slots reach only the terminal JUMP args, never an in-trace field
+            // base, so no `get_const_info_mut` null-base abort.
+            let live_stack_len = concrete_vsd.saturating_sub(nlocals);
+            for (stack_idx, value) in stack.into_iter().enumerate() {
+                let target_type = inputarg_types
+                    .get(num_scalars + nlocals + stack_idx)
+                    .copied()
+                    .unwrap_or(Type::Ref);
+                let value = if stack_idx >= live_stack_len {
+                    let typed_null = extract_concrete_typed_value(target_type, PY_NULL);
+                    fail_arg_opref_for_typed_value(ctx, typed_null)
+                } else {
+                    self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx)
+                };
+                args.push(self.materialize_loop_carried_value(ctx, value, target_type));
+            }
         }
         // virtualizable.py:44 parity (delayed): now that all materialize_loop_
         // carried_value calls have consulted each OpRef's actual type, flip the

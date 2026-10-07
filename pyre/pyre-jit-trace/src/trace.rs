@@ -5076,13 +5076,28 @@ fn run_perfn_walk<Sym: WalkSym>(
             // The closing frame and GuardFutureCondition remain anchored at
             // the loop header.  The tick poll is walked inside JUMP_BACKWARD
             // (`emit_jump_absolute_tick`), not synthesized here.
-            *jump_args = sym.close_loop_args_at(
+            //
+            // pyjitpl.py `reached_loop_header` builds one `live_arg_boxes`.
+            // The walker already produced that list via
+            // `append_virtualizable_boxes`; `close_loop_args_at` rebuilds
+            // it from the same `virtualizable_data_boxes` (plus GFC /
+            // last_instr pin). The two constructions must agree.
+            let rebuilt = sym.close_loop_args_at(
                 ctx,
                 cf_addr,
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
             );
+            if ctx.has_virtualizable_boxes() {
+                debug_assert_eq!(
+                    rebuilt.len(),
+                    jump_args.len(),
+                    "reached_loop_header builds one live_arg_boxes; walker JUMP and \
+                     close_loop_args_at rebuild disagreed"
+                );
+            }
+            *jump_args = rebuilt;
         }
         // pyjitpl.py raise_continue_running_normally parity: a
         // walk that ends at a merge point hands the interpreter (and the

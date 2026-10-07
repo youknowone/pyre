@@ -7391,7 +7391,28 @@ impl PyreSym {
             // them with a shared const-NULL OpRef.
             let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let live_prefix = nlocals + stack_only_depth;
-            let array_len = concrete_frame_array_len(concrete_frame).unwrap_or(live_prefix);
+            // virtualizable.py read_boxes iterates `len(lst)` — the heap
+            // array, not the live valuestackdepth window. Prefer the live
+            // interpreter frame (the compiled loop's object), then the
+            // tracing snapshot, then jitcode metadata. Never shrink below
+            // an already-seeded `initialize_virtualizable` layout: that
+            // length is the LABEL `inputarg_types`, and a shorter re-seed
+            // made the walker JUMP one box short of it.
+            let mut array_len = concrete_frame_array_len(self.live_vable_frame_addr)
+                .or_else(|| concrete_frame_array_len(concrete_frame))
+                .or_else(|| {
+                    (!self.jitcode.is_null()).then(|| {
+                        let jc = unsafe { &*self.jitcode };
+                        jc.payload.metadata.stack_base + jc.payload.metadata.max_stackdepth
+                    })
+                })
+                .unwrap_or(live_prefix);
+            if let Some(existing) = ctx.virtualizable_array_lengths() {
+                let existing_array: usize = existing.iter().copied().sum();
+                if existing_array > array_len {
+                    array_len = existing_array;
+                }
+            }
             // pyjitpl.py initialize_virtualizable parity: the concrete
             // half of virtualizable_boxes at portal entry comes from a live
             // heap read (vinfo.read_boxes(cpu, virtualizable, 0)). There is
@@ -16114,6 +16135,66 @@ mod tests {
         unsafe {
             let _ = Box::from_raw(jc_ptr);
         }
+    }
+
+    /// `init_symbolic` must not replace `initialize_virtualizable`'s
+    /// `read_boxes` layout with the live valuestackdepth prefix. That shrink
+    /// left `append_virtualizable_boxes` one slot short of the LABEL
+    /// registered from `inputarg_types`.
+    #[test]
+    fn init_symbolic_does_not_shrink_an_already_seeded_virtualizable_array() {
+        ensure_test_callbacks();
+        // Seed a full `read_boxes` layout, then call init_symbolic with no
+        // concrete frame so the live_prefix fallback would be 0.
+        let array_len = 8;
+        let mut input_types = vec![
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+        ];
+        input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.become_active_vable_owner();
+        let array_items: Vec<OpRef> = (0..array_len)
+            .map(|i| OpRef::input_arg_ref(6 + i as u32))
+            .collect();
+        seed_virtualizable_boxes(
+            &mut ctx,
+            OpRef::input_arg_ref(0),
+            majit_ir::Value::Ref(majit_ir::GcRef(0x1000)),
+            &[
+                OpRef::input_arg_int(2),
+                OpRef::input_arg_ref(3),
+                OpRef::input_arg_int(4),
+                OpRef::input_arg_ref(5),
+            ],
+            &array_items,
+            array_len,
+            &[],
+            std::ptr::null(),
+        );
+        let seeded = ctx.virtualizable_boxes_len();
+        // concrete_frame=0: array_len would fall back to live_prefix=0
+        // without keeping the already-seeded layout.
+        sym.init_symbolic(&mut ctx, 0);
+        assert_eq!(
+            ctx.virtualizable_boxes_len(),
+            seeded,
+            "init_symbolic must not shrink initialize_virtualizable's read_boxes layout"
+        );
+        assert_eq!(
+            ctx.virtualizable_array_lengths()
+                .map(|l| l.iter().copied().sum::<usize>()),
+            Some(array_len),
+        );
+        assert_eq!(
+            ctx.virtualizable_data_boxes().len(),
+            crate::virtualizable_gen::NUM_VABLE_SCALARS + array_len,
+        );
     }
 
     /// A walk that resumed from a guard leaves `PyFrame.valuestackdepth` at
