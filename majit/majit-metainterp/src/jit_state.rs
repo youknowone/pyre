@@ -965,8 +965,8 @@ pub trait JitState: Sized {
         sym: &Self::Sym,
         _frame: &crate::pyjitpl::MIFrame,
         boxes: &[(OpRef, Type)],
-    ) -> Vec<OpRef> {
-        Self::collect_jump_args_with_boxes(sym, boxes)
+    ) -> Option<Vec<OpRef>> {
+        Some(Self::collect_jump_args_with_boxes(sym, boxes))
     }
 
     /// `pyjitpl.py MetaInterp.capture_resumedata` for jitdriver-level

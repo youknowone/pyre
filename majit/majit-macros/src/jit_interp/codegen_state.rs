@@ -1098,13 +1098,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // gated on `num_virt_arrays >= 1` (the trait default already delegates to
     // `collect_jump_args` there).
     let vable_ref_reg: usize = ref_identity_base.saturating_sub(usize::from(has_vable_identity));
+    // pyjitpl.py `reached_loop_header` always has a redbox per declared
+    // portal slot (`greenboxes + redboxes`). Skipping an empty identity
+    // slot shortens JUMP against the LABEL that recorded the slot as live,
+    // which then panics in x86/regalloc.py `assert len(arglocs) == jump_op.numargs()`.
+    // A missing slot is SwitchToBlackhole, not a shorter JUMP.
     let typed_scalar_parts: Vec<TokenStream> = (0..num_scalars)
         .map(|k| {
             let slot = int_identity_base + k;
             quote! {
-                if let Some(__op) = __frame.int_regs.get(#slot).copied().flatten() {
-                    args.push((__op, majit_ir::Type::Int));
-                }
+                let __op = __frame.int_regs.get(#slot).copied().flatten()?;
+                args.push((__op, majit_ir::Type::Int));
             }
         })
         .collect();
@@ -1124,9 +1128,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 {
                     let __base = #int_identity_base + #num_scalars #(#prev)*;
                     for __i in 0..__sym.#len_name {
-                        if let Some(__op) = __frame.int_regs.get(__base + __i).copied().flatten() {
-                            args.push((__op, majit_ir::Type::Int));
-                        }
+                        let __op = __frame.int_regs.get(__base + __i).copied().flatten()?;
+                        args.push((__op, majit_ir::Type::Int));
                     }
                 }
             }
@@ -1136,7 +1139,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {
             if let Some((__op, __ty)) = __boxes.last() {
                 args.push((*__op, *__ty));
-            } else if let Some(__op) = __frame.ref_regs.get(#vable_ref_reg).copied().flatten() {
+            } else {
+                let __op = __frame.ref_regs.get(#vable_ref_reg).copied().flatten()?;
                 args.push((__op, majit_ir::Type::Ref));
             }
         }
@@ -1147,9 +1151,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|j| {
             let slot = ref_identity_base + j;
             quote! {
-                if let Some(__op) = __frame.ref_regs.get(#slot).copied().flatten() {
-                    args.push((__op, majit_ir::Type::Ref));
-                }
+                let __op = __frame.ref_regs.get(#slot).copied().flatten()?;
+                args.push((__op, majit_ir::Type::Ref));
             }
         })
         .collect();
@@ -1157,9 +1160,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|k| {
             let slot = float_identity_base + k;
             quote! {
-                if let Some(__op) = __frame.float_regs.get(#slot).copied().flatten() {
-                    args.push((__op, majit_ir::Type::Float));
-                }
+                let __op = __frame.float_regs.get(#slot).copied().flatten()?;
+                args.push((__op, majit_ir::Type::Float));
             }
         })
         .collect();
@@ -1180,7 +1182,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             __sym: &#sym_ty,
             __frame: &majit_metainterp::MIFrame,
             __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
-        ) -> Vec<(majit_ir::OpRef, majit_ir::Type)> {
+        ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
             let mut args: Vec<(majit_ir::OpRef, majit_ir::Type)> = Vec::new();
             #(#typed_scalar_parts)*
             #(#typed_array_parts)*
@@ -1188,7 +1190,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             #(#typed_ref_scalar_parts)*
             #(#typed_float_scalar_parts)*
             #typed_element_splice
-            args
+            Some(args)
         }
     };
     let collect_jump_args_with_boxes_method: TokenStream = if carry_vable_boxes {
@@ -1216,11 +1218,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             __sym: &#sym_ty,
             __frame: &majit_metainterp::MIFrame,
             __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
-        ) -> Vec<majit_ir::OpRef> {
-            #loop_carried_boxes_fn_name(__sym, __frame, __boxes)
-                .into_iter()
-                .map(|(__op, _)| __op)
-                .collect()
+        ) -> Option<Vec<majit_ir::OpRef>> {
+            Some(
+                #loop_carried_boxes_fn_name(__sym, __frame, __boxes)?
+                    .into_iter()
+                    .map(|(__op, _)| __op)
+                    .collect(),
+            )
         }
     };
     let writeback_live_ref_scalar_arms: Vec<TokenStream> = ref_scalars
@@ -2284,7 +2288,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
                 __frame: &majit_metainterp::MIFrame,
             ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
-                Some(#loop_carried_boxes_fn_name(self, __frame, __boxes))
+                #loop_carried_boxes_fn_name(self, __frame, __boxes)
             }
 
             #[allow(clippy::reversed_empty_ranges)]
