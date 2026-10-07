@@ -1854,16 +1854,22 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // way the walk-level SubRaise catch and the root `CarrierRaiseSeed`
         // path do, then start at `catch_target` instead of the CALL resume pc.
         let mut walk_entry = if let Some((exc, exc_concrete, catch_target)) = handler_entry {
-            sub_wc.set_last_exc_value(exc, exc_concrete);
+            // The raised object is already the callee's `SubRaise`. Recording
+            // another `GUARD_EXCEPTION` at this call snapshots a liveness
+            // window the bridge did not replay, and a live box that was never
+            // written aborts the bridge (`LoopBearingCalleeInlineUnsupported`).
+            // `finishframe_exception` continues at `catch_target` with `exc`.
+            let exc_box = exc;
+            sub_wc.set_last_exc_value(exc_box, exc_concrete);
             sub_wc.fbw_mode.class_of_last_exc_is_const = true;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             if let Err(error) =
-                record_bridge_handler_entry_traceback(&mut sub_wc, exc, exc_concrete, entry)
+                record_bridge_handler_entry_traceback(&mut sub_wc, exc_box, exc_concrete, entry)
             {
                 drop(bank_guard);
                 return Some(Err(error));
             }
-            vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
+            vstack_enter_exception_handler(&mut sub_wc, catch_target, exc_box);
             catch_target
         } else if let Some(catch_target) = routed_catch {
             match route_deepest_carrier_exc_edge(
@@ -1982,6 +1988,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
+    handler_entry: Option<(OpRef, ConcreteValue, usize)>,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
         ctx,
@@ -2004,7 +2011,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         portal_ec_box,
         None,
         paused_parent_recipes,
-        None,
+        handler_entry,
     )
 }
 

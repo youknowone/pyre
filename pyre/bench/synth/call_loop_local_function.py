@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=3.8
-# Dynasm floor-fail 1.0x against 4.8; 3.8 keeps the derived floor at 0.95x.
+# pyre-check: max-pypy-ratio=3.5
+# CI runs 37343153276 (PR #2123) and 37333456730 (main 953d81a): 1.0x-2.8x
+# across hosts/backends. The ceiling sits above the slowest; the derived
+# floor (ceiling/4) sits below the fastest.
 # pyre-check: skip-cpython
 # cpython 1.00s vs pyre 0.07s (14x), and it is not gated on — only pypy is.
 # A loop that defines a function in its own body and calls it.

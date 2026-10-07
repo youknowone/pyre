@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=7.2
-# Ubuntu run 33279264115: 5.6x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=7.0
+# Dynasm floor-fail 1.8x against 11.2; 7.0 keeps the derived floor at 1.75x.
+# Main had 7.2 (twice ubuntu 5.6x); 7.2/4 = 1.8, which is the dynasm reading.
 # A hot compiled CALLEE holding a try block the exception does not stay in used
 # to record its own traceback node TWICE.
 #

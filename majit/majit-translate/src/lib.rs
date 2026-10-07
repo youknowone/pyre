@@ -2420,14 +2420,20 @@ fn analyze_pipeline_from_module_paths(
             call_control.mark_decorator_hints(path, &func.hints);
         }
     }
-    // A `dont_look_inside` helper is residualized and may never appear in
-    // `program.functions`. Its harvested `cannot_raise` mark must still
-    // reach `getcalldescr`, or the residual records GUARD_NO_EXCEPTION.
+    // A helper may never appear in `program.functions` (no body, or the
+    // body did not lower) and still be the target of a residual call.
+    // `#[oopspec]` / `cannot_raise` live on the funcobj either way:
+    // `guess_call_kind` reads `func.oopspec` (`call.py`), and a missing
+    // `cannot_raise` makes `getcalldescr` record GUARD_NO_EXCEPTION.
     for (path_str, hints) in &program.harvested_hints {
-        if !hints
+        let cannot_raise = hints
             .iter()
-            .any(|h| h == "cannot_raise" || h == "elidable_cannot_raise")
-        {
+            .any(|h| h == "cannot_raise" || h == "elidable_cannot_raise");
+        let oopspecs: Vec<&str> = hints
+            .iter()
+            .filter_map(|h| h.strip_prefix("oopspec:"))
+            .collect();
+        if !cannot_raise && oopspecs.is_empty() {
             continue;
         }
         let segs: Vec<&str> = path_str.split("::").collect();
@@ -2438,18 +2444,24 @@ fn analyze_pipeline_from_module_paths(
         // `method` would share the GraphStore row with an unrelated
         // `module::method` (e.g. `RootStackGuard::get` vs
         // `baseobjspace::get`).
-        if module_segs
+        let paths = if module_segs
             .last()
             .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()))
         {
-            call_control.mark_cannot_raise_assertion(crate::parse::CallPath::from_segments(
-                segs.iter().copied(),
-            ));
-            continue;
+            vec![crate::parse::CallPath::from_segments(segs.iter().copied())]
+        } else {
+            let module = module_segs.join("::");
+            free_function_alias_paths(name, &module)
+        };
+        for p in &paths {
+            for spec in &oopspecs {
+                call_control.mark_oopspec(p.clone(), (*spec).to_string());
+            }
         }
-        let module = module_segs.join("::");
-        for p in free_function_alias_paths(name, &module) {
-            call_control.mark_cannot_raise_assertion(p);
+        if cannot_raise {
+            for p in paths {
+                call_control.mark_cannot_raise_assertion(p);
+            }
         }
     }
 

@@ -1153,6 +1153,10 @@ impl PackedFrameState {
 pub(crate) struct CrateLoweringState {
     known_trait_names: std::collections::HashSet<String>,
     struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    /// Copied by [`Self::finish`]; a body lowered after that still reads
+    /// it, including Opaque scalar-word projections that resolve a
+    /// declared name from the defining crate's harvest.
+    struct_fields: crate::front::semantic::StructFieldRegistry,
     /// Taken by [`Self::finish`]; no body lowering reads them.
     exports: std::cell::RefCell<CrateExports>,
     tombstoned_leaves: std::collections::HashSet<String>,
@@ -1180,7 +1184,6 @@ pub(crate) struct CrateLoweringState {
 #[derive(Default)]
 struct CrateExports {
     known_struct_names: std::collections::HashSet<String>,
-    struct_fields: crate::front::semantic::StructFieldRegistry,
     enum_variant_by_discriminant:
         std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
     struct_origins: std::collections::HashMap<String, String>,
@@ -1359,9 +1362,9 @@ impl CrateLoweringState {
         Self {
             known_trait_names,
             struct_field_attrs,
+            struct_fields,
             exports: std::cell::RefCell::new(CrateExports {
                 known_struct_names,
-                struct_fields,
                 enum_variant_by_discriminant,
                 struct_origins,
                 exact_layouts,
@@ -1377,6 +1380,25 @@ impl CrateLoweringState {
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Union `other`'s harvested rows into this crate's registry. Later
+    /// crates see earlier ones so an Opaque projection can name a field
+    /// the defining crate registered. `or_insert` keeps the first row.
+    pub(crate) fn absorb_struct_fields(
+        &mut self,
+        other: &crate::front::semantic::StructFieldRegistry,
+    ) {
+        for (key, fields) in other.fields.iter() {
+            self.struct_fields
+                .fields
+                .entry(key.clone())
+                .or_insert_with(|| fields.clone());
+        }
+    }
+
+    pub(crate) fn struct_fields(&self) -> &crate::front::semantic::StructFieldRegistry {
+        &self.struct_fields
     }
 }
 
@@ -1634,6 +1656,7 @@ impl<'l> CrateLowering<'l> {
     ) -> Result<crate::model::FunctionGraph, DeclBuildError> {
         let CrateLoweringState {
             struct_field_attrs,
+            struct_fields,
             tombstoned_leaves,
             dont_look_inside,
             spec,
@@ -1671,6 +1694,7 @@ impl<'l> CrateLowering<'l> {
             static_addrs,
             jitdriver_receiver_roots,
             struct_field_attrs,
+            struct_fields,
             dont_look_inside,
             tombstoned_leaves,
             builder_mode,
@@ -1816,6 +1840,7 @@ impl<'l> CrateLowering<'l> {
     pub(crate) fn build_spec_body(&self, spec: &SpecBody) -> Option<crate::model::FunctionGraph> {
         let CrateLoweringState {
             struct_field_attrs,
+            struct_fields,
             tombstoned_leaves,
             dont_look_inside,
             spec: spec_queue,
@@ -1842,6 +1867,7 @@ impl<'l> CrateLowering<'l> {
             static_addrs,
             jitdriver_receiver_roots,
             &struct_field_attrs,
+            &struct_fields,
             &dont_look_inside,
             &tombstoned_leaves,
             builder_mode,
@@ -1921,18 +1947,18 @@ impl DeclaredSpec {
 impl CrateLoweringState {
     /// The program.
     ///
-    /// The program takes the tables only it reads. `known_trait_names` and
-    /// `struct_field_attrs` are copied: a body lowered after this still
-    /// reads them.
+    /// The program takes the tables only it reads. `known_trait_names`,
+    /// `struct_field_attrs`, and `struct_fields` are copied: a body
+    /// lowered after this still reads them.
     pub(crate) fn finish(
         &self,
         functions: Vec<crate::front::semantic::SemanticFunction>,
     ) -> crate::front::semantic::SemanticProgram {
         let known_trait_names = self.known_trait_names.clone();
         let struct_field_attrs = self.struct_field_attrs.clone();
+        let struct_fields = self.struct_fields.clone();
         let CrateExports {
             known_struct_names,
-            struct_fields,
             enum_variant_by_discriminant,
             struct_origins,
             exact_layouts,
@@ -4131,6 +4157,11 @@ fn framestate_enabled() -> bool {
 pub struct LowerContext<'a> {
     llbc: &'a Llbc,
     struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    /// Harvested field rows, without `StructFieldRegistry`'s query-cache
+    /// interior mutability (`RefCell` / `Cell`). Tests share this context
+    /// through `OnceLock`, so the stored tables stay `Sync`; lowering
+    /// rebuilds a registry from these rows for `field_name_at`.
+    struct_fields: std::collections::HashMap<String, Vec<(String, String)>>,
     dont_look_inside: std::collections::HashSet<String>,
     /// Leaves [`harden_duplicate_leaf_metadata`] emptied for this LLBC.
     /// Single-function entry points paint with this set, the same one the
@@ -4146,13 +4177,26 @@ impl<'a> LowerContext<'a> {
         // [`link_transparent_scalar_types`]. Publish the same external
         // scalar the link pass adds, so a `CodeFlags` borrow is the word.
         llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
-        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
         Self {
             llbc,
             struct_field_attrs,
+            struct_fields: struct_fields.fields.into(),
             dont_look_inside: dont_look_inside_set_of(llbc),
             tombstoned_leaves: tombstoned_leaves_of(llbc),
         }
+    }
+}
+
+/// Query-cached registry over the frozen rows [`LowerContext`] stores.
+/// Same `field_name_at` / `lookup_fields` convention as the whole-program
+/// harvest; `__pos_N` remains the missing-row fallback.
+fn struct_field_registry_from_rows(
+    rows: &std::collections::HashMap<String, Vec<(String, String)>>,
+) -> crate::front::semantic::StructFieldRegistry {
+    crate::front::semantic::StructFieldRegistry {
+        fields: crate::front::semantic::FieldRows::from(rows.clone()),
+        ..Default::default()
     }
 }
 
@@ -4162,6 +4206,7 @@ pub fn lower_fun_decl_with_static_addrs(
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
     let llbc = context.llbc;
+    let struct_fields = struct_field_registry_from_rows(&context.struct_fields);
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -4171,6 +4216,7 @@ pub fn lower_fun_decl_with_static_addrs(
             static_addrs,
             &jitdriver_receiver_roots,
             &context.struct_field_attrs,
+            &struct_fields,
             &context.dont_look_inside,
             &context.tombstoned_leaves,
         )
@@ -4239,6 +4285,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
@@ -4259,6 +4306,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         static_addrs,
         jitdriver_receiver_roots,
         struct_field_attrs,
+        struct_fields,
         &dont_look_inside,
         &tombstoned_leaves,
         builder_mode,
@@ -4283,6 +4331,7 @@ fn lower_fat_dyn_callee(
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Option<FunctionGraph> {
@@ -4303,6 +4352,7 @@ fn lower_fat_dyn_callee(
         static_addrs,
         jitdriver_receiver_roots,
         struct_field_attrs,
+        struct_fields,
         dont_look_inside,
         tombstoned_leaves,
     )
@@ -4320,6 +4370,7 @@ fn splice_recorded_fat_dyn_returns(
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) {
@@ -4339,6 +4390,7 @@ fn splice_recorded_fat_dyn_returns(
             static_addrs,
             jitdriver_receiver_roots,
             struct_field_attrs,
+            struct_fields,
             dont_look_inside,
             tombstoned_leaves,
         );
@@ -4503,6 +4555,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     // When set, each strategy's `Lowering` is switched to builder form
@@ -5259,6 +5312,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             static_addrs,
             jitdriver_receiver_roots,
             struct_field_attrs,
+            struct_fields,
             dont_look_inside,
             tombstoned_leaves,
         );
@@ -5289,6 +5343,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             root_stack,
             self_dont_look_inside,
         )?;
+        lo.struct_fields = Some(struct_fields);
         if builder_mode {
             lo.enable_builder_mode();
         }
@@ -5342,6 +5397,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         root_stack,
         self_dont_look_inside,
     )?;
+    lo.struct_fields = Some(struct_fields);
     if builder_mode {
         lo.enable_builder_mode();
     }
@@ -5381,6 +5437,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 root_stack,
                 self_dont_look_inside,
             )?;
+            lo.struct_fields = Some(struct_fields);
             if builder_mode {
                 lo.enable_builder_mode();
             }
@@ -7454,6 +7511,11 @@ struct TaggedPairAggregateSite {
 struct Lowering<'a> {
     graph: FunctionGraph,
     llbc: &'a Llbc,
+    /// Cross-crate struct field harvest. An Opaque scalar-word projection
+    /// reads the declared name from the defining crate's harvest; `__pos_N`
+    /// is only the missing-row fallback. `None` in unit tests that do not
+    /// lower Opaque scalar fields.
+    struct_fields: Option<&'a crate::front::semantic::StructFieldRegistry>,
     /// Harvested `#[dont_look_inside]` marker set (keyed
     /// `strip_crate_prefix(name_path())`, the same spelling
     /// `stamp_return_token` uses at the whole-program registration loop).
@@ -8545,6 +8607,7 @@ impl<'a> Lowering<'a> {
         Ok(Self {
             graph,
             llbc,
+            struct_fields: None,
             dont_look_inside,
             tombstoned_leaves,
             body,
@@ -15821,6 +15884,12 @@ impl<'a> Lowering<'a> {
     /// path. A class root that is already qualified, or that carries an
     /// instantiation suffix, stays the result type too.
     fn instance_narrow_for_type(&self, dest_ty: &TyRef, arg: &Variable) -> Option<OpKind> {
+        // Fieldless enums are ints. A classdef here is the
+        // `pair(rtype_eq) (InstanceRepr, IntegerRepr)` wall: the tag
+        // compare becomes `eq` of a minted empty instance with `ConstInt`.
+        if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
+            return None;
+        }
         let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
         let result_owner = self
             .cast_dest_layout_owner(dest_ty)
@@ -18798,10 +18867,16 @@ impl<'a> Lowering<'a> {
         }
         let offset = usize::try_from(layout.struct_field_offset(field_idx)?).ok()?;
         let place = strip_ty_indirections(tyref_node(place_ty, self.llbc)?, self.llbc)?;
-        if !json_ty_is_copy_scalar(place, self.llbc) {
-            return None;
-        }
-        let (ty, size, signed) = json_ty_raw_store_descr(place, self.llbc)?;
+        // A fieldless (C-like) enum is the discriminant integer — RPython
+        // has no enum type — including when the defining crate is Opaque
+        // here.  Leaving the projection to collapse onto the parent struct
+        // makes `eq` compare that instance with a `ConstInt` tag
+        // (`pair(rtype_eq) not implemented for (InstanceRepr, IntegerRepr)`).
+        let (ty, size, signed) = if json_ty_is_copy_scalar(place, self.llbc) {
+            json_ty_raw_store_descr(place, self.llbc)?
+        } else {
+            fieldless_enum_raw_store_descr(place_ty, self.llbc)?
+        };
         let width = match (&ty, signed, size) {
             (ValueType::Int, true, 1 | 2 | 4 | 8) => crate::model::ScalarFieldWidth::Signed,
             (ValueType::Int | ValueType::Unsigned, false, 1 | 2 | 4 | 8) => {
@@ -18814,9 +18889,13 @@ impl<'a> Lowering<'a> {
         if owner.is_empty() {
             return None;
         }
+        let name = self.struct_fields.map_or_else(
+            || format!("__pos_{field_idx}"),
+            |reg| opaque_struct_field_name(&owner, field_idx, reg),
+        );
         Some((
             owner,
-            format!("__pos_{field_idx}"),
+            name,
             ty,
             crate::model::ScalarFieldWord {
                 offset,
@@ -27156,6 +27235,11 @@ impl<'a> Lowering<'a> {
         }
         let td = self.llbc.type_by_id(adt_def_id)?;
         if !matches!(td.kind, TypeDeclKind::Opaque) {
+            return None;
+        }
+        // A fieldless enum is an int. Painting `self` as an instance
+        // makes `eq` compare `InstanceRepr` with the `ConstInt` tag.
+        if type_decl_is_fieldless_enum(td, self.llbc) {
             return None;
         }
         let name = td.item_meta.name_path();
@@ -49843,6 +49927,19 @@ fn no_tombstoned_leaves() -> &'static std::collections::HashSet<String> {
     EMPTY.get_or_init(std::collections::HashSet::new)
 }
 
+/// Declared name of an Opaque scalar-word field, from the defining
+/// crate's harvest. `__pos_N` only when that owner has no row.
+fn opaque_struct_field_name(
+    owner: &str,
+    field_idx: usize,
+    registry: &crate::front::semantic::StructFieldRegistry,
+) -> String {
+    registry
+        .field_name_at(owner, field_idx)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("__pos_{field_idx}"))
+}
+
 fn scalar_value_type(scalar: &serde_json::Value) -> Option<ValueType> {
     if let Some(atom) = scalar.as_str() {
         return match atom {
@@ -50611,6 +50708,62 @@ fn type_decl_is_fieldless_enum(td: &TypeDecl, llbc: &Llbc) -> bool {
 fn opaque_fieldless_enum_tags(llbc: &Llbc, td: &TypeDecl) -> Option<Vec<i64>> {
     td.layout_for_target(llbc, &std::env::var("TARGET").unwrap_or_default())?
         .fieldless_enum_tags()
+}
+
+/// `ty` itself, or a `Ref`/`RawPtr` of it, names a fieldless (C-like) enum.
+fn tyref_fieldless_enum_pointee<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDecl> {
+    let mut node = tyref_node(ty, llbc)?;
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            node = arr.get(1)?;
+            continue;
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            node = arr.first()?;
+            continue;
+        }
+        let def_id = inline_adt_def_id(node)?;
+        return llbc
+            .type_by_id(def_id)
+            .filter(|td| type_decl_is_fieldless_enum(td, llbc));
+    }
+    None
+}
+
+/// Integer bank, byte width, and signedness of a fieldless enum's tag.
+fn fieldless_enum_raw_store_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+    let td = tyref_fieldless_enum_pointee(ty, llbc)?;
+    let layout = td.layout_for_target(llbc, &std::env::var("TARGET").unwrap_or_default())?;
+    if let Some(int_ty) = layout.discriminant_int_type() {
+        return discr_int_ty_raw_store(int_ty);
+    }
+    let size = usize::try_from(layout.size?).ok()?;
+    matches!(size, 1 | 2 | 4 | 8).then_some((ValueType::Int, size, true))
+}
+
+fn discr_int_ty_raw_store(int_ty: &str) -> Option<(ValueType, usize, bool)> {
+    Some(match int_ty {
+        "i8" => (ValueType::Int, 1, true),
+        "i16" => (ValueType::Int, 2, true),
+        "i32" => (ValueType::Int, 4, true),
+        "i64" => (ValueType::Int, 8, true),
+        "u8" => (ValueType::Unsigned, 1, false),
+        "u16" => (ValueType::Unsigned, 2, false),
+        "u32" => (ValueType::Unsigned, 4, false),
+        "u64" => (ValueType::Unsigned, 8, false),
+        _ => return None,
+    })
 }
 
 /// The crate-stripped `module::Enum` spelling of a fieldless enum `ty`,
@@ -77014,6 +77167,33 @@ mod tests {
         assert_eq!(
             owner_root, "fixture::Code",
             "the field owner uses the same full path as the class root"
+        );
+    }
+
+    /// An Opaque scalar-word projection takes the declared name from the
+    /// defining crate's harvest. `__pos_N` is only the missing-row fallback.
+    #[test]
+    fn opaque_struct_field_name_uses_harvested_declared_name() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        reg.fields.insert(
+            "error::PyError".to_string(),
+            vec![("kind".to_string(), "i32".to_string())],
+        );
+        assert_eq!(
+            super::opaque_struct_field_name("pyre_interpreter::error::PyError", 0, &reg),
+            "kind"
+        );
+        assert_eq!(
+            super::opaque_struct_field_name("error::PyError", 0, &reg),
+            "kind"
+        );
+        assert_eq!(
+            super::opaque_struct_field_name("unknown::Owner", 0, &reg),
+            "__pos_0"
+        );
+        assert_eq!(
+            super::opaque_struct_field_name("error::PyError", 1, &reg),
+            "__pos_1"
         );
     }
 

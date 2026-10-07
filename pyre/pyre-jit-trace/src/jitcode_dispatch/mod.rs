@@ -10635,7 +10635,14 @@ fn walker_concrete_ref_object<Sym: WalkSym>(
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
             let obj = r.as_usize() as pyre_object::PyObjectRef;
-            if obj.is_null() { None } else { Some(obj) }
+            // A bit-cast of a small int is a non-null `Ref` and not an
+            // object. `is_method` loads `ob_type` from it.
+            let aligned = (obj as usize) % std::mem::align_of::<usize>() == 0;
+            if obj.is_null() || !aligned {
+                None
+            } else {
+                Some(obj)
+            }
         }
         _ => None,
     }

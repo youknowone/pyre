@@ -51,7 +51,7 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,
         },
-        destructor: None,
+        destructor: Some(gc_destructor!(ctypeobj::w_ctype_dealloc)),
     });
     types.push(ModuleGcType {
         descriptor: <ctypearray::W_CDataIter as PyreClassPyTypeOf>::DESCRIPTOR,

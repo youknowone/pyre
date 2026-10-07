@@ -863,7 +863,7 @@ pub fn complete_struct_or_union(
         totalalignment
     };
 
-    ct.size = totalsize;
+    ctypeobj::set_size(ct, totalsize);
     ct.align = totalalignment;
     ct.fields_list = roots.get(list_slot);
     ct.fields_dict = roots.get(dict_slot);

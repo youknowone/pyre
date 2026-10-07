@@ -47,7 +47,7 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
             }
             // `W_CTypePrimitiveSigned.convert_to_object`.
             ctypeobj::KIND_PRIM_SIGNED => {
-                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) {
+                if ct.value_fits_long {
                     Ok(pyre_object::w_int_new(misc::read_raw_long_data(
                         cdata, ct.size,
                     )?))
@@ -61,7 +61,7 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
             )),
             // `W_CTypePrimitiveUnsigned.convert_to_object`.
             ctypeobj::KIND_PRIM_UNSIGNED => {
-                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_ULONG) {
+                if ct.value_fits_ulong {
                     Ok(unsigned_as_object(
                         ct,
                         misc::read_raw_ulong_data(cdata, ct.size)?,
@@ -165,18 +165,32 @@ pub unsafe fn convert_from_object(
             }
             // `W_CTypePrimitiveSigned.convert_from_object`.
             ctypeobj::KIND_PRIM_SIGNED => {
-                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) {
-                    // The conversion runs `__index__`, so the object the
-                    // overflow message names has to be read back out of
-                    // its slot.
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let ob_slot = roots.base();
-                    let _ = roots.pin_root(w_ob);
-                    let value = misc::as_long(roots.get(ob_slot))?;
-                    if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
-                        && value != misc::signext(value, ct.size)
-                    {
-                        return Err(overflow(ct, roots.get(ob_slot)));
+                if ct.value_fits_long {
+                    // `space.int_w(..., allow_conversion=False)` on an exact
+                    // int or bool is a field read. It does not run `__index__`
+                    // and does not collect, so the object does not need a
+                    // shadow-stack slot. The converting arm still pins,
+                    // because the overflow message names the object after
+                    // `__index__`.
+                    let (value, w_overflow) = if unsafe { pyre_object::pyobject::is_bool(w_ob) } {
+                        (
+                            unsafe { pyre_object::boolobject::w_bool_get_value(w_ob) } as i64,
+                            w_ob,
+                        )
+                    } else if unsafe { pyre_object::pyobject::is_int(w_ob) } {
+                        (
+                            unsafe { pyre_object::intobject::w_int_get_value(w_ob) },
+                            w_ob,
+                        )
+                    } else {
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let ob_slot = roots.base();
+                        let _ = roots.pin_root(w_ob);
+                        let value = misc::as_long(roots.get(ob_slot))?;
+                        (value, roots.get(ob_slot))
+                    };
+                    if ct.value_smaller_than_long && value != misc::signext(value, ct.size) {
+                        return Err(overflow(ct, w_overflow));
                     }
                     misc::write_raw_signed_data(cdata, value, ct.size)
                 } else {
@@ -186,12 +200,12 @@ pub unsafe fn convert_from_object(
             // `W_CTypePrimitiveBool` and `W_CTypePrimitiveUnsigned` share
             // `convert_from_object`; only the range differs.
             ctypeobj::KIND_PRIM_BOOL | ctypeobj::KIND_PRIM_UNSIGNED => {
-                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_ULONG) {
+                if ct.value_fits_ulong {
                     let roots = pyre_object::gc_roots::push_roots();
                     let ob_slot = roots.base();
                     let _ = roots.pin_root(w_ob);
                     let value = misc::as_unsigned_long(roots.get(ob_slot), true)?;
-                    if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) && value > vrange_max(ct) {
+                    if ct.value_fits_long && value > vrange_max(ct) {
                         return Err(overflow(ct, roots.get(ob_slot)));
                     }
                     misc::write_raw_unsigned_data(cdata, value, ct.size)
@@ -487,9 +501,7 @@ pub unsafe fn pack_list_of_items(
                 let Some(value) = exact_int(w_item) else {
                     return Ok(false);
                 };
-                if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
-                    && value != misc::signext(value, ct.size)
-                {
+                if ct.value_smaller_than_long && value != misc::signext(value, ct.size) {
                     return Err(unsafe { PyError::from_exc_object(overflow_value(ct, value)) });
                 }
                 unsafe {
@@ -548,7 +560,7 @@ pub unsafe fn unpack_list_of_items(
         }
         // `W_CTypePrimitiveUnsigned.unpack_list_of_int_items` only takes the
         // fast path for a width that still fits a signed word.
-        ctypeobj::KIND_PRIM_UNSIGNED if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) => {
+        ctypeobj::KIND_PRIM_UNSIGNED if ct.value_fits_long => {
             for i in 0..length {
                 items.push(pyre_object::w_int_new(unsafe {
                     misc::read_raw_unsigned_data(
@@ -586,7 +598,7 @@ fn instance_ctype(ct: &W_CType) -> PyObjectRef {
 /// `W_CTypePrimitiveUnsigned.convert_to_object`'s two arms: a width narrower
 /// than a word is an ordinary `int`, and a full word may need a bigint.
 pub fn unsigned_as_object(ct: &W_CType, value: u64) -> PyObjectRef {
-    if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) {
+    if ct.value_fits_long {
         return pyre_object::w_int_new(value as i64);
     }
     if value <= i64::MAX as u64 {

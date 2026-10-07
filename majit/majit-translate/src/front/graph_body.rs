@@ -160,12 +160,15 @@ impl GraphBodyProvider {
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
-        let state = CrateLoweringState::new(
+        let mut state = CrateLoweringState::new(
             &llbc,
             &paint_tombstones,
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
         );
+        for prev in &self.crates {
+            state.absorb_struct_fields(prev.state.struct_fields());
+        }
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
         let mut program = krate.state.finish(functions);
@@ -189,12 +192,15 @@ impl GraphBodyProvider {
             .map(|name| (*name).to_string())
             .collect();
         let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new());
-        let state = CrateLoweringState::new(
+        let mut state = CrateLoweringState::new(
             &llbc,
             &paint_tombstones,
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
         );
+        for prev in &self.crates {
+            state.absorb_struct_fields(prev.state.struct_fields());
+        }
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, None, Some(&function_filter));
         let mut program = krate.state.finish(functions);

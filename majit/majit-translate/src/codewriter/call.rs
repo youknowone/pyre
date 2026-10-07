@@ -1896,6 +1896,22 @@ pub(crate) enum FuncRef<'a> {
     Record(&'a crate::model::FuncEffects),
 }
 
+impl FuncRef<'_> {
+    /// `func.oopspec`, or the `oopspec:` token still sitting on `graph.hints`.
+    fn recorded_oopspec(&self) -> Option<&str> {
+        if let Some(spec) = self.oopspec.as_deref() {
+            return Some(spec);
+        }
+        let FuncRef::Graph(graph) = self else {
+            return None;
+        };
+        graph.hints.iter().find_map(|hint| {
+            let spec = hint.strip_prefix("oopspec:")?;
+            (!spec.is_empty()).then_some(spec)
+        })
+    }
+}
+
 impl std::ops::Deref for FuncRef<'_> {
     type Target = crate::model::FuncEffects;
 
@@ -4704,18 +4720,33 @@ impl CallControl {
     /// Look up effects on `path`, then on the crate-stripped spelling
     /// `harvest_hints_from_llbcs` uses (`rhai::grain::…` → `grain::…`).
     fn func_effects_with_crate_alias(&self, path: &CallPath) -> Option<FuncRef<'_>> {
-        if let Some(effects) = self.func_effects(path) {
-            return Some(effects);
+        let direct = self.func_effects(path);
+        if direct
+            .as_ref()
+            .is_some_and(|effects| effects.recorded_oopspec().is_some())
+        {
+            return direct;
         }
+        // A callsite spells the defining crate (`pyre_module::module::…`)
+        // while the harvest key and the module-qualified alias are
+        // crate-stripped (`module::…`). A graph registered under the full
+        // path with an empty `func.oopspec` must not hide that alias.
+        // Only `crate` and registered local crate roots use that harvest
+        // spelling; a missing direct record on a foreign crate is not
+        // an alias of `module::f`.
         if path.segments.len() > 1 {
             let root = path.segments[0].as_str();
             if root == "crate" || crate::local_crates::is_local_crate_root(root) {
                 let stripped =
                     CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
-                return self.func_effects(&stripped);
+                if let Some(alt) = self.func_effects(&stripped) {
+                    if alt.recorded_oopspec().is_some() || direct.is_none() {
+                        return Some(alt);
+                    }
+                }
             }
         }
-        None
+        direct
     }
 
     /// Register a free function graph.
@@ -6267,8 +6298,8 @@ impl CallControl {
                             // `call.py:135-136`
                             // `hasattr(targetgraph.func, 'oopspec')` → builtin.
                             if self
-                                .func_effects(&callee_path)
-                                .is_some_and(|f| f.oopspec.is_some())
+                                .func_effects_with_crate_alias(&callee_path)
+                                .is_some_and(|f| f.recorded_oopspec().is_some())
                             {
                                 crate::decline::record(
                                     BFS_GATE,
@@ -7071,8 +7102,13 @@ impl CallControl {
                     );
                     return CallKind::Residual;
                 }
-                // call.py `hasattr(targetgraph.func, 'oopspec')` → 'builtin'
-                if self.func_effects(p).is_some_and(|f| f.oopspec.is_some()) {
+                // call.py `hasattr(targetgraph.func, 'oopspec')` → 'builtin'.
+                // A callsite spells the defining crate (`pyre_module::…`)
+                // while the harvest key is crate-stripped; look up both.
+                if self
+                    .func_effects_with_crate_alias(p)
+                    .is_some_and(|f| f.recorded_oopspec().is_some())
+                {
                     return CallKind::Builtin;
                 }
                 // `@jit.dont_look_inside` builder residual helpers
@@ -8208,7 +8244,7 @@ impl CallControl {
     /// RPython: `getattr(func, 'oopspec', None)` — look up oopspec for a target.
     pub fn get_oopspec(&self, target: &CallTarget) -> Option<String> {
         self.target_func_effects(target)
-            .and_then(|f| f.oopspec.clone())
+            .and_then(|f| f.recorded_oopspec().map(str::to_string))
     }
 
     /// `support.py argnames = ll_func.__code__.co_varnames[:nb_args]` —

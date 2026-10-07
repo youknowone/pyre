@@ -883,8 +883,14 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
             count_ops_recorded(ctx, opcode);
             let result = ctx.trace_ctx.record_op(opcode, &[a]);
             if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
-                ctx.trace_ctx
-                    .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(n as usize)));
+                let bits = n as usize;
+                // `concrete_of_opref` is what a residual executor dereferences.
+                // An unaligned bit-cast (1, a bool) is not a PyObject;
+                // publishing it made `is_method` load `ob_type` from that word.
+                if bits % std::mem::align_of::<usize>() == 0 {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(bits)));
+                }
             }
             write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
         }

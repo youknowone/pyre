@@ -353,6 +353,15 @@ impl StructFieldRegistry {
             .map(|(_, ty)| ty.as_str())
     }
 
+    /// Declared field name at `index` for `owner`, using this registry's
+    /// own key convention ([`Self::lookup_fields`]). `None` when `owner`
+    /// has no row, the index is past the harvested list, or that slot's
+    /// name is empty.
+    pub fn field_name_at(&self, owner: &str, index: usize) -> Option<&str> {
+        let (name, _) = self.lookup_fields(owner)?.get(index)?;
+        (!name.is_empty()).then_some(name.as_str())
+    }
+
     /// True when `owner` is registered as an enum base class — its sole
     /// row is the synthetic `__discriminant` tag (`rclass.py:499-518`: the
     /// sum-type base carries only the discriminant, each variant subclass
@@ -884,6 +893,37 @@ mod tests {
             vec![("x".to_string(), "u8".to_string())],
         );
         assert_eq!(reg.field_type("Foo", "x"), Some("u8"));
+    }
+
+    /// Dual-publish keys are the full path, the crate-stripped path, and
+    /// the leaf; `lookup_fields` resolves all three. A missing owner has
+    /// no row, so lowering keeps `__pos_N`.
+    #[test]
+    fn field_name_at_uses_registry_key_convention() {
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("kind".to_string(), "i32".to_string())];
+        reg.fields
+            .insert("pyre_interpreter::error::PyError".to_string(), rows.clone());
+        reg.fields
+            .insert("error::PyError".to_string(), rows.clone());
+        reg.fields.insert("PyError".to_string(), rows);
+        assert_eq!(
+            reg.field_name_at("pyre_interpreter::error::PyError", 0),
+            Some("kind")
+        );
+        assert_eq!(reg.field_name_at("error::PyError", 0), Some("kind"));
+        assert_eq!(reg.field_name_at("PyError", 0), Some("kind"));
+        let mut stripped_only = StructFieldRegistry::default();
+        stripped_only.fields.insert(
+            "error::PyError".to_string(),
+            vec![("kind".to_string(), "i32".to_string())],
+        );
+        assert_eq!(
+            stripped_only.field_name_at("pyre_interpreter::error::PyError", 0),
+            Some("kind")
+        );
+        assert_eq!(reg.field_name_at("UnknownOwner", 0), None);
+        assert_eq!(reg.field_name_at("PyError", 1), None);
     }
 
     fn free_fn(name: &str) -> SemanticFunction {
