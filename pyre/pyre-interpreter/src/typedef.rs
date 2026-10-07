@@ -12437,23 +12437,25 @@ pub(crate) fn getset_property_get(
     }
 }
 
-/// `typedef.py GetSetProperty.descr_property_set`'s body, published as
-/// `getset_descriptor.__set__`.
+/// `typedef.py GetSetProperty.descr_property_set`'s body, reachable without
+/// the `getset_descriptor.__set__` entry that publishes it below.
 ///
 /// Twin of [`getset_property_get`]: upstream `descr_property_set` is the
-/// descriptor's own interp-level method. `StdObjSpace.setattr` looks up
-/// `__set__` then `get_and_call_function` on this interp2app, which reaches
-/// `self.fset(self, space, w_obj, w_value)`. Naming the body lets the
-/// `__set__` entry call it directly; `baseobjspace::set` does not type-test
-/// `GetSetProperty` (there is no such arm in `setattr` / `set`).
+/// descriptor's own interp-level method, so it reaches
+/// `self.fset(self, space, w_obj, w_value)` after a single space-level call.
+/// Here the `__set__` entry is itself a builtin function object, so a caller
+/// that resolves it through the type MRO and calls it pays a second generic
+/// call for every getset write.  Naming the body lets `baseobjspace::set`
+/// run it in place of that lookup, the way it already runs
+/// `getset_property_get` in place of `getset_descriptor.__get__`.
 pub(crate) fn getset_property_set(
     mut w_self: PyObjectRef,
     mut w_obj: PyObjectRef,
     mut w_value: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     // `getset_set` runs `descr_setcheck` ahead of the missing-setter
-    // refusal, so a receiver that is wrong in both respects reports
-    // itself rather than the setter.
+    // refusal, so a receiver that is wrong in both respects reports itself
+    // rather than the setter.
     unsafe { getset_descr_check(w_self, w_obj) }?;
     let fset = read_fset(w_self);
     if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
@@ -12468,13 +12470,21 @@ pub(crate) fn getset_property_set(
         }
         return Err(e);
     }
-    // typedef.py descr_property_set: `fset(self, space, w_obj, w_value)` —
-    // an interp-level call. `fset` is the typecheck-wrapped setter
-    // Function; `funccall` is `Function.funccall`, which for a
-    // FunctionWithFixedCode BuiltinCode3 is `fastcall_3`.
-    match pyre_object::with_roots!(reqcls, w_obj, w_self, w_value => {
-        crate::function::funccall_result(fset, &[w_self, w_obj, w_value])
-    }) {
+    // typedef.py calls the setter as `self.fset(self, space, w_obj, w_value)`
+    // — an interp-level call, not `space.call_function`.  Every
+    // `GetSetProperty` registration declares the setter with exactly this
+    // receiver/instance/value triple, so when the callee is the plain
+    // fixed-arity builtin that declaration builds, the dispatcher in
+    // between has nothing left to decide.  Anything else — a setter
+    // carrying a receiver owner, a bound signature, another arity — keeps
+    // the dispatcher.
+    let result = match unsafe { crate::gateway::builtin_fixed_arity_fn(fset, 3) } {
+        Some(func) => call_getset_fset_direct(func, w_self, w_obj, w_value),
+        None => pyre_object::with_roots!(reqcls, w_obj, w_self, w_value => {
+            crate::call::call_function_impl_result(fset, &[w_self, w_obj, w_value])
+        }),
+    };
+    match result {
         Ok(_) => Ok(pyre_object::w_none()),
         Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
             Err(getset_descr_mismatch(w_self, w_obj, reqcls))
@@ -12517,6 +12527,25 @@ fn call_getset_fget_direct(
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[w_self, w_obj]);
     func(&[roots.get(base), roots.get(base + 1)])
+}
+
+/// Invoke a getset setter's registered function with the three words
+/// `typedef.py` hands it, under the roots `call_builtin_code_positional`
+/// publishes for the same call.  Pinned one at a time for the reason
+/// `call_getset_fget_direct` gives.
+///
+/// `dont_look_inside` for the same reason `shadow_stack_len` carries it: the
+/// body reads the thread-local root stack, which the tracer cannot type.
+#[majit_macros::dont_look_inside]
+fn call_getset_fset_direct(
+    func: crate::gateway::BuiltinCodeFn,
+    w_self: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[w_self, w_obj, w_value]);
+    func(&[roots.get(base), roots.get(base + 1), roots.get(base + 2)])
 }
 
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)

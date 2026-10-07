@@ -12585,6 +12585,7 @@ pub unsafe fn type_set_name_would_store(w_type: PyObjectRef, w_value: PyObjectRe
         return false;
     }
     let wtf8 = pyre_object::w_str_get_wtf8(w_value);
+    // descr_set__name__: `'\x00' in name` after `text_w` (UTF-8 bytes).
     if wtf8.as_bytes().contains(&0) {
         return false;
     }
@@ -14160,6 +14161,24 @@ unsafe fn set(
         // w_obj, w_value)`: the setter's exception propagates rather than
         // being swallowed.
         crate::call::call_function_impl_result(fset, &[obj, value])?;
+        return Ok(true);
+    }
+
+    // typedef.py GetSetProperty.descr_property_set reaches
+    // `self.fset(self, space, w_obj, w_value)` as an interp-level call, so a
+    // getset write costs one space-level call there.  The general `__set__`
+    // lookup at the end of this function reaches the same body through the
+    // `getset_descriptor.__set__` entry, which is itself a builtin function
+    // object, and so pays a second one on every `C.__name__ = ...`.  Run the
+    // body in place of the lookup, the licence the `property` arm above cites.
+    //
+    // `is_getset_property` compares `ob_type` against the static
+    // `GETSET_DESCRIPTOR_TYPE`, which only `w_getset_property_new` installs,
+    // and `getset_descriptor` is not an acceptable base type — so unlike
+    // `property` it needs no separate exact-type test to exclude a subclass
+    // that could have overridden `__set__`.
+    if pyre_object::typedef::is_getset_property(descr) {
+        crate::typedef::getset_property_set(descr, obj, value)?;
         return Ok(true);
     }
 
