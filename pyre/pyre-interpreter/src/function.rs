@@ -4097,16 +4097,19 @@ fn funccall_flat_from_args(
     // `frame_into_generator_for_function` / `get_eval_fn` stay under one
     // `push_roots`, matching `_flat_pycall_defaults`.
     let env_base = _roots.pin_roots(&[w_globals, closure]);
+    let func = _roots.get(root_base);
 
     let mut new_frame = crate::pyframe::FrameBox::new(
-        match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            _roots.get(root_base + 1) as *const (),
-            &[],
-            _roots.get(env_base),
-            crate::call::getexecutioncontext(),
-            _roots.get(env_base + 1),
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
+        match pyre_object::with_roots!(func => {
+            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                _roots.get(root_base + 1) as *const (),
+                &[],
+                _roots.get(env_base),
+                crate::call::getexecutioncontext(),
+                _roots.get(env_base + 1),
+                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+            )
+        }) {
             Ok(f) => f,
             Err(e) => return Err(e),
         },
