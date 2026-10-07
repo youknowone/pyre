@@ -13594,7 +13594,9 @@ mod set_member_lookup_tests {
         use majit_ir::descr::{ArrayFlag, LLType, SimpleFieldDescr, SimpleSizeDescr};
         use majit_ir::value::Type;
 
-        let struct_id = 0x7e57_0000_0000_0004u64;
+        // Distinct from `a_gc_only_w_class_on_the_size_is_the_effectinfo_field`:
+        // both tests publish into the process-global `gc_cache`.
+        let struct_id = 0x7e57_0000_0000_0005u64;
         let key = "Owner.w_class";
         let field = Arc::new(SimpleFieldDescr::new_with_name(
             0,
