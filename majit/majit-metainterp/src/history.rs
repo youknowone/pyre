@@ -2802,7 +2802,7 @@ mod tests {
 
         let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
         let descr: DescrRef = Arc::new(TestFailDescr(0));
-        let g = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
+        let g = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(descr));
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
@@ -3405,7 +3405,7 @@ impl TraceCtx {
     /// Mutate `op.fail_args` on a recorded op identified by `opref`.
     ///
     /// Port of `resoperation.Op.setfailargs`. Production guard recording uses
-    /// the snapshot path (`record_guard_typed` + `capture_resumedata`
+    /// the snapshot path (`record_guard` + `capture_resumedata`
     /// + `set_last_guard_resume_position`); the optimizer's
     /// `OptContext::store_final_boxes_in_guard`, which derives `op.fail_args`
     /// from the snapshot through `Op::store_final_boxes`. This setter serves
@@ -3464,18 +3464,6 @@ impl TraceCtx {
         descr: DescrRef,
     ) -> OpRef {
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr));
-        // pyjitpl.py:2581 — see record_guard.
-        self.profiler().count_ops(opcode, crate::counters::GUARDS);
-        opref
-    }
-
-    /// `pyjitpl.py generate_guard()`: tracer-stage typed guards carry
-    /// `descr=None` and no fail args. The caller attaches a snapshot via
-    /// `capture_resumedata` + `set_last_guard_resume_position`;
-    /// `store_final_boxes_in_guard` (`optimizer.py`) derives liveboxes
-    /// and types from those boxes (`compile.py` `store_final_boxes`).
-    pub fn record_guard_typed(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
-        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
         // pyjitpl.py:2581 — see record_guard.
         self.profiler().count_ops(opcode, crate::counters::GUARDS);
         opref

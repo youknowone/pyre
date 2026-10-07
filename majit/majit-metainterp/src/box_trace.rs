@@ -102,7 +102,7 @@ pub fn trace_unbox_int(
     // emitted opcode shape.
     if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(int_type_addr);
-        ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const]);
+        ctx.record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         ctx.heap_cache_mut().class_now_known(obj);
     }
     getfield_gc_i_pureornot(ctx, obj, intval_descr)
@@ -169,10 +169,10 @@ pub fn trace_int_binop_ovf(
     // No production caller of this AST→trace helper: pyre-jit-trace
     // routes overflow guards through the retired int fast path's
     // `frame.generate_guard` instead.  The bare
-    // `record_guard_typed` keeps the guard shape correct in unit tests
+    // `record_guard` keeps the guard shape correct in unit tests
     // (`trace_verify.rs`) without a synthetic snapshot — convergence
     // path is convergence to register-machine jitcode.
-    ctx.record_guard_typed(OpCode::GuardNoOverflow, &[]);
+    ctx.record_guard(OpCode::GuardNoOverflow, &[], 0);
     trace_box_int(ctx, result, size_descr, intval_descr, int_type_addr)
 }
 
@@ -303,7 +303,7 @@ pub fn trace_unbox_float(
     use majit_ir::OpCode;
     if !obj.is_constant() && !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
-        ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const]);
+        ctx.record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         ctx.heap_cache_mut().class_now_known(obj);
     }
     getfield_gc_f_pureornot(ctx, obj, floatval_descr)

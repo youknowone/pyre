@@ -2701,7 +2701,7 @@ impl MIFrame {
         // no inline fail_args; `capture_resumedata` + `_number_boxes`
         // populate them from the snapshot chain. Types come from the
         // live boxes at `store_final_boxes` (`compile.py`).
-        ctx.record_guard_typed(opcode, args);
+        ctx.record_guard(opcode, args, 0);
 
         // pyjitpl.py: self.capture_resumedata(resumepc, after_residual_call)
         self.capture_resumedata(
@@ -2712,7 +2712,7 @@ impl MIFrame {
             &snapshot_full_types,
         );
         // pyjitpl.py `count_ops(opnum, Counters.GUARDS)` is bumped
-        // inside `TraceCtx::record_guard_typed` (the record chokepoint),
+        // inside `TraceCtx::record_guard` (the record chokepoint),
         // so no explicit count here.
     }
 

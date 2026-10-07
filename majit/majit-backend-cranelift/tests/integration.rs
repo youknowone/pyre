@@ -1384,12 +1384,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let fn_ptr = OpRef::const_int(ffi_add as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, a, b], cd);
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        Some(make_descr(0)),
-        &[a, b, result],
-    );
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
 
@@ -1429,12 +1424,7 @@ fn test_call_release_gil_i_no_args() {
     let fn_ptr = OpRef::const_int(ffi_constant as *const () as usize as i64);
 
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr], cd);
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        Some(make_descr(0)),
-        &[dummy, result],
-    );
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
 
@@ -1472,7 +1462,7 @@ fn test_call_release_gil_n_void_return() {
     let fn_ptr = OpRef::const_int(ffi_sink as *const () as usize as i64);
 
     rec.record_op_with_descr(OpCode::CallReleaseGilN, &[saveerr, fn_ptr, input], cd);
-    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(0)), &[input]);
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     rec.finish(&[input], make_descr(1));
     let trace = rec.get_trace();
 
@@ -1509,7 +1499,7 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let tmp =
         rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, x, const_10], cd);
-    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(0)), &[x, tmp]);
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
     let result = rec.record_op(OpCode::IntAdd, &[tmp, const_5]);
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -1910,12 +1900,7 @@ fn test_call_release_gil_with_guard_not_forced() {
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, x], cd);
 
     // GuardNotForced with fail_args — exits here if the callee forced
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        Some(make_descr(0)),
-        &[x, result],
-    );
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -1968,12 +1953,7 @@ fn test_call_may_force_with_forcing_semantics() {
 
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        Some(make_descr(0)),
-        &[flag, result],
-    );
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -2034,19 +2014,9 @@ fn test_ffi_call_exception_propagation() {
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNotForced,
-        &[],
-        Some(make_descr(2)),
-        &[val, result],
-    );
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(2)));
     // GuardNoException: exits if jit_exc_get_value() != 0
-    rec.record_guard_with_fail_args(
-        OpCode::GuardNoException,
-        &[],
-        Some(make_descr(0)),
-        &[result],
-    );
+    rec.record_guard(OpCode::GuardNoException, &[], Some(make_descr(0)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -2339,12 +2309,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     let const_0 = OpRef::const_int(0);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
-    rec.record_guard_with_fail_args(
-        OpCode::GuardTrue,
-        &[cmp],
-        Some(make_descr(0)),
-        &[x_int, x_float],
-    );
+    rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
     rec.finish(&[x_int], make_descr(1));
     let trace = rec.get_trace();
 
@@ -2443,7 +2408,7 @@ fn test_ffi_exchange_buffer_pattern() {
     let _call_result =
         rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, r0], cd);
     // RPython: CallReleaseGilI must be followed by GuardNotForced
-    rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(1)), &[r0, i0]);
+    rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(1)));
 
     // Step 3: Load result from buffer at offset 32 (exchange_result)
     let loaded = rec.record_op_with_descr(OpCode::RawLoadI, &[r0, off_result], ad);

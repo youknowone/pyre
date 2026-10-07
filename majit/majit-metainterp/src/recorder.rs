@@ -1278,24 +1278,6 @@ impl Trace {
         self.record_bytes(opcode, args, descr, None)
     }
 
-    /// Record a guard and, on the `Vec<Op>` recorder, stamp fail_args on
-    /// the materialized `Op` (`resoperation.py` `setfailargs`). Byte-mode
-    /// recording stores none; tests that need fail args call
-    /// `Op::setfailargs` after `get_iter` / `materialize_ops`.
-    /// See `record_guard` for the descr=None convention.
-    pub fn record_guard_with_fail_args(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: Option<DescrRef>,
-        fail_args: &[OpRef],
-    ) -> OpRef {
-        assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
-        let _ = fail_args;
-        self.ensure_byte_buffer();
-        self.record_bytes(opcode, args, descr, None)
-    }
-
     /// Set rd_resume_position on the last recorded op.
     /// Called after record_guard* to associate a snapshot.
     /// Byte mode patches the guard's descr slot in `_ops`
@@ -2873,8 +2855,7 @@ mod tests {
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         let descr = make_fail_descr(0);
-        let guard =
-            rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], Some(descr), &[i0, i1, add]);
+        let guard = rec.record_guard(OpCode::GuardTrue, &[add], Some(descr));
 
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         rec.close_loop(&[sub, i1]);
@@ -2901,13 +2882,12 @@ mod tests {
         let i1 = rec.record_input_arg(Type::Int);
 
         let descr0 = make_fail_descr(0);
-        let g0 = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], Some(descr0), &[i0, i1]);
+        let g0 = rec.record_guard(OpCode::GuardTrue, &[i0], Some(descr0));
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
 
         let descr1 = make_fail_descr(1);
-        let g1 =
-            rec.record_guard_with_fail_args(OpCode::GuardFalse, &[add], Some(descr1), &[i0, add]);
+        let g1 = rec.record_guard(OpCode::GuardFalse, &[add], Some(descr1));
 
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         rec.close_loop(&[sub, i1]);
@@ -3126,7 +3106,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(0);
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], Some(descr), &[]);
+        rec.record_guard(OpCode::GuardTrue, &[i0], Some(descr));
 
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
@@ -3291,8 +3271,7 @@ mod tests {
         fail_args.push(add);
 
         let descr = make_fail_descr(0);
-        let guard =
-            rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], Some(descr), &fail_args);
+        let guard = rec.record_guard(OpCode::GuardTrue, &[add], Some(descr));
 
         rec.close_loop(&inputs);
         rec.materialize_into_ops();
