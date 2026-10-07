@@ -4171,9 +4171,13 @@ impl TraceCtx {
             );
         }
         // pyjitpl.py: op = execute_and_record_varargs(opnum, ...)
-        let op = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+        let op = self.recorder.record_op_with_descr_value(
+            opcode,
+            &call_args,
+            descr.clone(),
+            Some(concrete_result),
+        );
         // pyjitpl.py: record_result_of_call_pure patches CALL → CALL_PURE
         // and populates call_pure_results.
         self.record_result_of_call_pure(
@@ -4247,8 +4251,14 @@ impl TraceCtx {
         };
         let pure_opcode = OpCode::call_pure_for_type(ret_type);
         self.recorder.cut(patch_pos);
-        self.recorder
-            .record_op_with_descr(pure_opcode, argboxes, descr)
+        // pyjitpl.py MetaInterp.record_result_of_call_pure →
+        // history.record_nospec(opnum, argboxes, resbox_as_const, descr)
+        self.recorder.record_op_with_descr_value(
+            pure_opcode,
+            argboxes,
+            descr,
+            Some(resbox_as_const),
+        )
     }
 
     // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call, 292) ──

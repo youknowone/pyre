@@ -666,8 +666,14 @@ where
         ctx.profiler().count_ops(kind, crate::counters::OPS);
         ctx.profiler()
             .count_ops(kind, crate::counters::RECORDED_OPS);
-        let op = ctx.record_op_with_descr(kind, &[], descr);
-        ctx.set_opref_concrete(op, Value::Ref(majit_ir::GcRef(ptr as usize)));
+        // `execute_and_record` → `history.record(..., resvalue)`:
+        // `History._make_op` builds the RefFrontendOp with the pointer.
+        let op = ctx.record_op_with_descr_value(
+            kind,
+            &[],
+            descr,
+            Some(Value::Ref(majit_ir::GcRef(ptr as usize))),
+        );
         // `execute_new` stamps `heapcache.new(resbox)`;
         // `execute_new_with_vtable` stamps `class_now_known` on top of
         // it. The vtable written at offset 0 just above is the word
