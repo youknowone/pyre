@@ -437,6 +437,82 @@ pub extern "C" fn jit_ll_arraycopy(
     }
 }
 
+/// rgc.py `ll_arraycopy` for the object `ItemsBlock` ARRAY.
+///
+/// Upstream's `@specialize.ll()` gives every ARRAY its own `ll_arraycopy`
+/// graph, and the `length <= 1` `copy_item` head ("Hack to ensure that we
+/// get a proper effectinfo.write_descrs_arrays") is the getarrayitem /
+/// setarrayitem writeanalyze reads that ARRAY's effects off.
+/// [`jit_ll_arraycopy`] picks its layout at run time, so a graph that calls
+/// it names no ARRAY; a resize graph copies through this one instead.
+///
+/// # Safety
+/// `source` and `dest` are live `ItemsBlock`s and both ranges are in bounds.
+pub unsafe fn ll_arraycopy_items_block(
+    source: *mut ItemsBlock,
+    dest: *mut ItemsBlock,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) {
+    if length <= 1 {
+        if length == 1 {
+            // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
+            let item = unsafe { *items_block_items_base(source).add(source_start) };
+            let dest_managed = majit_gc::gc_varsize_layout(dest as usize).is_some();
+            unsafe { arraycopy_store_item(dest, dest_start, item, dest_managed) };
+        }
+        return;
+    }
+    jit_ll_arraycopy(
+        source as PyObjectRef,
+        dest as PyObjectRef,
+        source_start as i64,
+        dest_start as i64,
+        length as i64,
+    );
+}
+
+/// [`ll_arraycopy_items_block`] for the `GcArray(Signed)` /
+/// `GcArray(Float)` blocks; `tid` says which ARRAY the blocks are.
+///
+/// # Safety
+/// `source` and `dest` are live `TypedItemsBlock`s of type `tid` and both
+/// ranges are in bounds.
+pub unsafe fn ll_arraycopy_typed_items_block(
+    source: *mut TypedItemsBlock,
+    dest: *mut TypedItemsBlock,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+    tid: u32,
+) {
+    if length <= 1 {
+        if length == 1 {
+            // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
+            if tid == gc_float_array_gc_type_id() {
+                let item = unsafe {
+                    *(typed_items_block_items_base(source) as *const f64).add(source_start)
+                };
+                unsafe { *(typed_items_block_items_base(dest) as *mut f64).add(dest_start) = item };
+            } else {
+                let item = unsafe {
+                    *(typed_items_block_items_base(source) as *const i64).add(source_start)
+                };
+                unsafe { *(typed_items_block_items_base(dest) as *mut i64).add(dest_start) = item };
+            }
+        }
+        return;
+    }
+    jit_ll_arraycopy(
+        source as PyObjectRef,
+        dest as PyObjectRef,
+        source_start as i64,
+        dest_start as i64,
+        length as i64,
+    );
+}
+
 /// Allocated capacity (GcArray length header) of an `ItemsBlock`.
 /// Returns 0 for a null pointer so "empty list" is represented by
 /// a null `items` field.
@@ -850,19 +926,21 @@ pub unsafe fn try_grow_list_items_block_gc(
         crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
     }
     // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy` then
-    // `l.items = newitems`. The oopspec (`list.ll_arraycopy`) is what
-    // writeanalyze records as an array write, so `force_from_effectinfo`
+    // `l.items = newitems`. The copy's `copy_item` head is what writeanalyze
+    // records as this ARRAY's read and write, so `force_from_effectinfo`
     // flushes lazy SETARRAYITEM_GC before the residual COND_CALL.
     if let Some(old_slot) = old_slot
         && live_len > 0
     {
-        jit_ll_arraycopy(
-            crate::gc_roots::shadow_stack_get(old_slot),
-            crate::gc_roots::shadow_stack_get(new_block_slot),
-            0,
-            0,
-            live_len as i64,
-        );
+        unsafe {
+            ll_arraycopy_items_block(
+                crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock,
+                crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock,
+                0,
+                0,
+                live_len,
+            );
+        }
     }
     let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
     let new_base = unsafe { items_block_items_base(new_block) };
@@ -1305,9 +1383,10 @@ pub unsafe fn try_grow_typed_items_block(
         let fresh_root = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
         // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy` then
-        // `l.items = newitems`. The oopspec (`list.ll_arraycopy`) is what
-        // writeanalyze records as an array write, so `force_from_effectinfo`
-        // flushes lazy SETARRAYITEM_GC before the residual COND_CALL.
+        // `l.items = newitems`. The copy's `copy_item` head is what
+        // writeanalyze records as this ARRAY's read and write, so
+        // `force_from_effectinfo` flushes lazy SETARRAYITEM_GC before the
+        // residual COND_CALL.
         let old_root = if !old.is_null() {
             let slot = crate::gc_roots::shadow_stack_len();
             let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
@@ -1318,12 +1397,13 @@ pub unsafe fn try_grow_typed_items_block(
         if let Some(old_root) = old_root
             && live_len > 0
         {
-            jit_ll_arraycopy(
-                crate::gc_roots::shadow_stack_get(old_root),
-                crate::gc_roots::shadow_stack_get(fresh_root),
+            ll_arraycopy_typed_items_block(
+                crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock,
+                crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock,
                 0,
                 0,
-                live_len as i64,
+                live_len,
+                tid,
             );
         }
         if let Some(old_root) = old_root {
