@@ -225,18 +225,18 @@ pub struct Trace {
     /// optimizer (`AbstractValue` object identity).
     ops: Vec<OpRc>,
     /// Input arguments to the trace (live variables at the loop header).
-    /// Stored as `InputArgRc` so the recorder's `box_args` bridge can resolve a
-    /// canonical, identity-stable `Operand` per input arg (`from_bound_inputarg`
-    /// carries the `Rc<InputArg>` directly), and the same `Rc<InputArg>` flows
-    /// through `into_parts` / `from_oprc` into `TreeLoop.inputargs` unchanged.
+    /// `History.set_inputargs` stores the hole-filtered list: dead fail args
+    /// are absent, and each live `InputArg` keeps its original TAGBOX
+    /// position (`get_position()`). Stored as `InputArgRc` so the recorder's
+    /// `box_args` bridge can resolve a canonical, identity-stable `Operand`
+    /// per input arg (`from_bound_inputarg` carries the `Rc<InputArg>`
+    /// directly), and the same `Rc<InputArg>` flows through `into_parts` /
+    /// `from_oprc` into `TreeLoop.inputargs` unchanged.
     inputargs: Vec<InputArgRc>,
-    /// Positions reserved by `Trace(max_num_inputargs)` that survived
-    /// `initialize_state_from_guard_failure`'s hole filtering.
-    ///
-    /// The backing vector stays dense while recording so an original TAGBOX
-    /// position resolves directly. `into_parts` exposes only live FrontendOps,
-    /// matching `History.set_inputargs` in RPython.
-    inputarg_live: Vec<bool>,
+    /// `opencoder.py Trace.__init__(max_num_inputargs)` reserved prefix.
+    /// The byte stream's `_start` / `_count` / `_index` baseline; live
+    /// `inputargs` may be shorter when a bridge drops dead fail args.
+    max_num_inputargs: u32,
     /// Next OpRef index to assign.
     op_count: u32,
     /// opencoder.py parity: count of box-yielding positions
@@ -265,15 +265,30 @@ fn box_index_to_opref_parts(
     inputargs: &[InputArgRc],
     value_slots: &[ValueSlot],
     box_index: u32,
+    max_num_inputargs: u32,
 ) -> OpRef {
-    let n = inputargs.len() as u32;
-    if box_index < n {
-        return OpRef::input_arg_typed(box_index, inputargs[box_index as usize].tp.get());
+    if let Some(ia) = inputarg_at_position(inputargs, box_index) {
+        return OpRef::input_arg_typed(box_index, ia.tp.get());
     }
-    let vs = value_slots
-        .get((box_index - n) as usize)
+    let vs = box_index
+        .checked_sub(max_num_inputargs)
+        .and_then(|i| value_slots.get(i as usize))
         .unwrap_or_else(|| panic!("decode snapshot: TAGBOX({box_index}) has no value FrontendOp"));
     OpRef::op_typed(box_index, vs.ty)
+}
+
+/// `opencoder.py` `AbstractResOpOrInputArg.get_position()` on the
+/// hole-filtered `History.set_inputargs` list.
+fn inputarg_at_position(inputargs: &[InputArgRc], position: u32) -> Option<&InputArgRc> {
+    if let Some(ia) = inputargs.get(position as usize)
+        && ia.index == position
+    {
+        return Some(ia);
+    }
+    inputargs
+        .binary_search_by_key(&position, |ia| ia.index)
+        .ok()
+        .map(|i| &inputargs[i])
 }
 
 /// `Trace::untag_snapshot` over already-split const pools.
@@ -289,7 +304,8 @@ fn untag_snapshot_pools(
     match tag {
         TAGBOX => {
             debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
-            let opref = box_index_to_opref_parts(inputargs, value_slots, v as u32);
+            let opref =
+                box_index_to_opref_parts(inputargs, value_slots, v as u32, trb.max_num_inputargs);
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
@@ -404,7 +420,7 @@ impl Trace {
         Trace {
             ops: Vec::with_capacity(256),
             inputargs: Vec::new(),
-            inputarg_live: Vec::new(),
+            max_num_inputargs: 0,
             op_count: 0,
             box_count: 0,
             trb: None,
@@ -432,12 +448,26 @@ impl Trace {
         recorder
     }
 
-    /// Reserve the full guard failarg coordinate space while exposing only
-    /// the live positions when the trace is handed to the optimizer.
+    /// Reserve the full guard failarg coordinate space while storing only
+    /// live `InputArg`s, each keeping its original `get_position()`.
+    /// `opencoder.py Trace.__init__(max_num_inputargs)` still reserves the
+    /// dense prefix; dead fail args are simply absent from `inputargs`
+    /// (`History.set_inputargs`).
     pub fn with_input_layout(input_types: &[Type], live_inputs: &[bool]) -> Self {
         assert_eq!(input_types.len(), live_inputs.len());
-        let mut recorder = Self::with_input_types(input_types);
-        recorder.inputarg_live.copy_from_slice(live_inputs);
+        let mut recorder = Self::new();
+        for (&tp, &live) in input_types.iter().zip(live_inputs.iter()) {
+            if live {
+                recorder.record_input_arg(tp);
+            } else {
+                recorder
+                    .inputarg_heapc
+                    .push(majit_trace::heapcache::HeapcRecord::default());
+                recorder.max_num_inputargs += 1;
+                recorder.op_count += 1;
+                recorder.box_count += 1;
+            }
+        }
         recorder
     }
 
@@ -454,11 +484,14 @@ impl Trace {
         if self.trb.is_some() || !self.ops.is_empty() || !self.slots.is_empty() {
             return;
         }
-        let n = self.inputargs.len() as u32;
+        let n = self.max_num_inputargs;
         let mut trb = TraceRecordBuffer::new(n, metainterp_sd);
-        for ia in &self.inputargs {
-            trb.record_input_arg(ia.tp.get());
-        }
+        trb.set_inputargs(
+            self.inputargs
+                .iter()
+                .map(|ia| InputArg::from_type(ia.tp.get(), ia.index))
+                .collect(),
+        );
         // Bridge traces are tens of ops; grow the tables once instead of
         // doubling through the 16/32/64-byte size classes on every record.
         self.slots.reserve(128);
@@ -771,7 +804,7 @@ impl Trace {
         let last_is_guard = self.last_guard_has_descr_placeholder();
         // opencoder.py Trace.create_top_snapshot encodes the existing box
         // lists directly. `OpRef.raw()` is already `_index`.
-        let num_inputs = self.inputargs.len();
+        let num_inputs = self.max_num_inputargs as usize;
         let vable = virtualizable_boxes
             .iter()
             .map(|r| Self::arg_to_box_at(*r, num_inputs));
@@ -860,7 +893,7 @@ impl Trace {
     }
 
     fn arg_to_box(&self, r: OpRef) -> OcBox {
-        Self::arg_to_box_at(r, self.inputargs.len())
+        Self::arg_to_box_at(r, self.max_num_inputargs as usize)
     }
 
     /// Encode a box for TAGBOX. `OpRef.raw()` of a value op *is* `_index`
@@ -948,13 +981,12 @@ impl Trace {
         opref
     }
 
-    /// `_index` / `_count` prefix: `Trace(max_num_inputargs)` / TRB `_start`,
-    /// equal to `inputargs.len()` after `attach_byte_buffer`.
+    /// `_index` / `_count` prefix: `Trace(max_num_inputargs)` / TRB `_start`.
     fn box_prefix(&self) -> u32 {
         self.trb
             .as_ref()
             .map(|t| t._start)
-            .unwrap_or(self.inputargs.len() as u32)
+            .unwrap_or(self.max_num_inputargs)
     }
 
     fn value_slot(&self, box_index: u32) -> Option<&ValueSlot> {
@@ -998,6 +1030,9 @@ impl Trace {
                 let arg = op.arg(i);
                 if arg.is_inputarg() {
                     if let Some(idx) = arg.position() {
+                        // `ByteTraceIter` remints the live list densely from
+                        // `start_fresh=0`, so the reminted index is the live
+                        // list index. Rebind onto the recorder's `InputArgRc`.
                         if let Some(ours) = self.inputargs.get(idx as usize) {
                             op.setarg(i, Operand::from_bound_inputarg(ours));
                         }
@@ -1005,14 +1040,22 @@ impl Trace {
                 }
             }
         }
+        // `ByteTraceIter` remints live inputargs densely from
+        // `start_fresh=0`, so value-op `_fresh` would collide with a
+        // surviving `get_position()` (InputArg(2) vs IntAdd at compact 2).
+        // Restore `FrontendOp.get_position()` = `_index` (`Trace._start`
+        // plus the value-op ordinal), matching `opencoder.py` `cls()`.
+        let mut orig = trb._start;
         for (i, op) in ops.iter().enumerate() {
             if op.opcode.result_type() != Type::Void {
-                let p = op.pos().get().raw();
-                if let Some(vs) = self.value_slot(p)
+                let ty = op.opcode.result_type();
+                op.pos().set(OpRef::op_typed(orig, ty));
+                if let Some(vs) = self.value_slot(orig)
                     && let Some(v) = vs.concrete.get()
                 {
                     op.set_value(v);
                 }
+                orig += 1;
             }
             if let Some(d) = self.slots.get(i).and_then(|s| s.descr.clone()) {
                 op.setdescr(d);
@@ -1119,15 +1162,16 @@ impl Trace {
              after every inputarg exists (pyjitpl.py create_empty_history \
              after initialize_virtualizable)"
         );
-        let index = self.inputargs.len() as u32;
+        let index = self.max_num_inputargs;
+        debug_assert!(self.inputargs.last().is_none_or(|prev| prev.index < index));
         self.inputargs.push(InputArg::from_type_rc(tp, index));
         self.inputarg_heapc
             .push(majit_trace::heapcache::HeapcRecord::default());
-        self.inputarg_live.push(true);
+        self.max_num_inputargs += 1;
         let opref = match tp {
-            Type::Int => OpRef::input_arg_int(self.op_count),
-            Type::Float => OpRef::input_arg_float(self.op_count),
-            Type::Ref => OpRef::input_arg_ref(self.op_count),
+            Type::Int => OpRef::input_arg_int(index),
+            Type::Float => OpRef::input_arg_float(index),
+            Type::Ref => OpRef::input_arg_ref(index),
             Type::Void => panic!("input args cannot be Void"),
         };
         self.op_count += 1;
@@ -1150,16 +1194,16 @@ impl Trace {
     /// Resolve one operand `OpRef` to its canonical `Operand`. Const operands
     /// carry their `Value` inline on the `OpRef` (history.py:227/268/314) and
     /// are minted via `from_opref`; InputArg / ResOp operands resolve to the
-    /// producing `InputArg` / `Op` already held in `self.inputargs` / `self.ops`,
-    /// which are dense by construction. A non-const operand that does not resolve
-    /// to a recorded producer is a recorder invariant violation and panics
-    /// (opencoder.py:635/640 assert position rather than mint); the S0/#121 probe
+    /// producing `InputArg` / `Op` already held in `self.inputargs` / `self.ops`.
+    /// A non-const operand that does not resolve to a recorded producer is a
+    /// recorder invariant violation and panics (`opencoder.py` `_encode`
+    /// asserts `get_position()` rather than mint); the S0/#121 probe
     /// measured 0 hits across the corpus. `#[cfg(test)]` fixtures that build
     /// position-only synthetic operands bind a synthetic producer via
     /// `bound_from_opref` (`to_opref`-identical) rather than panicking.
     /// Deterministic per recorded position: a ResOp / InputArg operand always
-    /// binds to the SAME producer `Rc` (`self.ops` / `self.inputargs` are dense
-    /// and immutable once recorded), so two calls for the same `OpRef` return
+    /// binds to the SAME producer `Rc` (`self.ops` / `self.inputargs` are
+    /// immutable once recorded), so two calls for the same `OpRef` return
     /// `Operand`s that compare equal under `Operand::eq` (`Rc::ptr_eq`). This is
     /// the real box object — `MIFrame.registers_r` holds these in `pyjitpl.py` —
     /// so consumers can key by box identity instead of flat `OpRef`.
@@ -1168,16 +1212,16 @@ impl Trace {
             return Operand::from_opref(r);
         }
         if let OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) = r {
-            if let Some(ia) = self.inputargs.get(r.raw() as usize) {
+            if let Some(ia) = self.inputarg_at(r.raw()) {
                 return Operand::from_bound_inputarg(ia);
             }
-            // S3/#124: inputargs are dense `[0, n)`, so an InputArg operand
-            // always resolves above (opencoder.py:635 asserts).
+            // Live `InputArg`s keep `get_position()`; a missing position is a
+            // dead failarg hole or an unrecorded operand (`opencoder.py` `_encode`).
             #[cfg(not(test))]
             panic!(
-                "box_for_operand: InputArg operand {r:?} outside dense \
-                 inputargs[0,{}) (opencoder.py:635)",
-                self.inputargs.len()
+                "box_for_operand: InputArg operand {r:?} not in live \
+                 inputargs (max_num_inputargs={})",
+                self.max_num_inputargs
             );
             #[cfg(test)]
             return Operand::bound_from_opref(r);
@@ -1511,11 +1555,9 @@ impl Trace {
     /// optimizer has to see a copy.
     pub fn clone_materialized_parts(&mut self) -> (Vec<InputArgRc>, Vec<OpRc>) {
         self.materialize_into_ops();
-        // `History.set_inputargs` stores the hole-filtered list
+        // `History.set_inputargs` already stores the hole-filtered list
         // (`initialize_state_from_guard_failure` drops dead failargs).
-        // `into_parts` already does that filter; the retrace snapshot must
-        // hand the optimizer the same list, or a dead position becomes an input.
-        (self.live_inputargs_cloned(), self.ops.clone())
+        (self.inputargs.clone(), self.ops.clone())
     }
 
     pub fn into_parts(mut self) -> (Vec<InputArgRc>, Vec<OpRc>) {
@@ -1523,14 +1565,7 @@ impl Trace {
         // stream, not a `Vec<Op>` that an earlier `materialize_into_ops`
         // may have filled before `close_loop` recorded JUMP.
         self.materialize_into_ops();
-        let ops = self.ops;
-        let inputargs = self
-            .inputargs
-            .into_iter()
-            .zip(self.inputarg_live)
-            .filter_map(|(arg, live)| live.then_some(arg))
-            .collect();
-        (inputargs, ops)
+        (self.inputargs, self.ops)
     }
 
     /// Materialize the history's live input box list without consuming it.
@@ -1540,11 +1575,7 @@ impl Trace {
     /// retains its original position in the recorder's reserved coordinate
     /// space.  This is the pre-`into_parts` view used while closing a bridge.
     pub fn live_inputargs_cloned(&self) -> Vec<InputArgRc> {
-        self.inputargs
-            .iter()
-            .zip(self.inputarg_live.iter())
-            .filter_map(|(arg, &live)| live.then(|| arg.clone()))
-            .collect()
+        self.inputargs.clone()
     }
 
     /// Convenience: consume the recorder and produce a `TreeLoop`.
@@ -1607,7 +1638,7 @@ impl Trace {
     /// (pyjitpl.py finally: `self.history.cut(cut_at)`).
     pub fn cut(&mut self, pos: TracePosition) {
         if let Some(trb) = self.trb.as_mut() {
-            let n = self.inputargs.len() as u32;
+            let n = self.max_num_inputargs;
             trb.cut_at(crate::recorder::TracePosition {
                 _pos: pos._pos,
                 _count: n + (pos._count.saturating_sub(n)),
@@ -1625,7 +1656,7 @@ impl Trace {
             return;
         }
         self.ops.truncate(pos._pos);
-        let n = self.inputargs.len() as u32;
+        let n = self.max_num_inputargs;
         self.value_slots
             .truncate(pos._index.saturating_sub(n) as usize);
         self.op_count = pos._count;
@@ -1642,9 +1673,10 @@ impl Trace {
         self.ops.len()
     }
 
-    /// Number of input arguments registered.
+    /// `opencoder.py Trace.max_num_inputargs` — reserved TAGBOX prefix.
+    /// Live `inputargs` may be shorter when a bridge drops dead fail args.
     pub fn num_inputargs(&self) -> usize {
-        self.inputargs.len()
+        self.max_num_inputargs as usize
     }
 
     /// Input argument types in loop-header order.
@@ -1777,9 +1809,14 @@ impl Trace {
         self.ops.push(OpRc::new(op));
     }
 
-    /// Access the recorded input arguments.
+    /// Access the recorded live input arguments (`History.set_inputargs`).
     pub fn inputargs(&self) -> &[InputArgRc] {
         &self.inputargs
+    }
+
+    /// Lookup by `InputArg.get_position()`, not by compact list index.
+    fn inputarg_at(&self, position: u32) -> Option<&InputArgRc> {
+        inputarg_at_position(&self.inputargs, position)
     }
 
     /// Get an operation by its OpRef position.
@@ -1847,16 +1884,16 @@ impl Trace {
 
     /// Stamp the concrete runtime value on the canonical frontend object
     /// for `position` (`history.py *FrontendOp.setint` / `_make_op`).
-    /// `position` is the `_index` TAGBOX coordinate: `[0, inputargs.len())`
-    /// are inputargs, later indices are value-producing ops. Void ops have
-    /// no value slot. Returns `false` if `position` is past the recorded
-    /// range.
+    /// `position` is the `_index` TAGBOX coordinate: live inputargs keep
+    /// their original `get_position()`, later indices are value-producing
+    /// ops. Void ops have no value slot. Returns `false` if `position` is
+    /// past the recorded range or a dead failarg hole.
     pub(crate) fn set_concrete_at(&self, position: u32, value: Value) -> bool {
-        let pos = position as usize;
-        let n = self.inputargs.len();
-        if pos < n {
-            self.inputargs[pos].set_value(value);
+        if let Some(ia) = self.inputarg_at(position) {
+            ia.set_value(value);
             true
+        } else if position < self.max_num_inputargs {
+            false
         } else if let Some(vs) = self.value_slot(position) {
             vs.concrete.set(Some(value));
             if let Some(op) = self
@@ -1881,12 +1918,13 @@ impl Trace {
 
     /// Read the concrete runtime value stamped on the canonical frontend
     /// object for `position` (`history.py *FrontendOp.getint()`).
-    /// `position` is `_index`. `None` when never stamped or out of range.
+    /// `position` is `_index`. `None` when never stamped, a dead failarg
+    /// hole, or out of range.
     pub(crate) fn concrete_at(&self, position: u32) -> Option<Value> {
-        let pos = position as usize;
-        let n = self.inputargs.len();
-        if pos < n {
-            self.inputargs[pos].get_value()
+        if let Some(ia) = self.inputarg_at(position) {
+            ia.get_value()
+        } else if position < self.max_num_inputargs {
+            None
         } else if let Some(vs) = self.value_slot(position) {
             vs.concrete.get()
         } else {
@@ -3024,10 +3062,10 @@ mod tests {
 
     #[test]
     fn clone_materialized_parts_drops_dead_failarg_holes() {
-        // Guard-failure retrace: `History.set_inputargs` leaves the dead
-        // failarg reserved in the dense vector (`inputarg_live` false) but
-        // `into_parts` omits it. The snapshot clone is what `compile_retrace`
-        // optimizes, so it has to apply the same filter.
+        // Guard-failure retrace: `History.set_inputargs` stores only live
+        // InputArgs; the reserved hole stays in `max_num_inputargs`.
+        // The snapshot clone is what `compile_retrace` optimizes, so it
+        // has to hand over that same live list.
         let mut rec =
             Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Int], &[true, false, true]);
         let result = rec.record_op(OpCode::IntAdd, &[iarg(0), iarg(2)]);
