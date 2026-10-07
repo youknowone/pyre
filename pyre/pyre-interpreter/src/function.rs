@@ -3990,12 +3990,17 @@ pub fn funccall_result(
         && nargs <= 4
         && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) }
     {
+        // One-shot `pin_roots`: `gc_push_roots` publishes the whole live set.
+        // Sequential `pin_root(code)` then per-arg is a safepoint window.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        for &arg in args {
-            let _ = _roots.pin_root(arg);
-        }
+        let root_base = match nargs {
+            0 => _roots.pin_roots(&[code as PyObjectRef]),
+            1 => _roots.pin_roots(&[code as PyObjectRef, args[0]]),
+            2 => _roots.pin_roots(&[code as PyObjectRef, args[0], args[1]]),
+            3 => _roots.pin_roots(&[code as PyObjectRef, args[0], args[1], args[2]]),
+            4 => _roots.pin_roots(&[code as PyObjectRef, args[0], args[1], args[2], args[3]]),
+            _ => unreachable!(),
+        };
         let code = _roots.get(root_base);
         let rooted_arg = |index| _roots.get(root_base + 1 + index);
         return match nargs {
@@ -4028,6 +4033,24 @@ pub fn funccall_result(
     {
         return funccall_flat_from_args(func, code, args);
     }
+    // function.py `Function.funccall` PASSTHROUGHARGS1:
+    //   elif nargs >= 1 and fast_natural_arity == Code.PASSTHROUGHARGS1:
+    //       return code.funcrun_obj(self, args_w[0], Arguments(..., list(args_w[1:])))
+    // BuiltinCodePassThroughArguments1.funcrun_obj calls
+    // `self.func__args__(space, w_obj, args)` with the receiver separate
+    // from the Arguments rest. It prepends the receiver only on
+    // DescrMismatch (`args.prepend(w_obj)`). Pyre's BuiltinCodeFn takes a
+    // flat slice, so the call is `[args[0], ...args[1:]]`.
+    if nargs >= 1 && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
+    {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut live = Vec::with_capacity(1 + nargs);
+        live.push(code as PyObjectRef);
+        live.extend_from_slice(args);
+        let root_base = _roots.pin_roots(&live);
+        let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
+        return unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) };
+    }
     crate::call::call_function_impl_result(func, args)
 }
 
@@ -4035,14 +4058,18 @@ pub fn funccall_result(
 ///
 /// `space.createframe(code, self.w_func_globals, self)` then
 /// `funccallunrolling` writes `args_w[i]` into
-/// `locals_cells_stack_w[i]`, then `new_frame.run`.  PyPy has no extra
-/// GC API on that path; pyre is 3.14t, so the converted `PyObjectRef`s
-/// stay pinned across `createframe` /
-/// `try_new_for_call_with_closure_and_globals_obj` and `PyFrame.run_with_jit`
-/// with `pin_root` / `with_roots`, matching interp_posix and `_flat_pycall`.
-#[majit_macros::unroll_safe]
+/// `locals_cells_stack_w[i]`, then `new_frame.run`.
+///
+/// `funccallunrolling = unrolling_iterable(range(4))` expands the copy in
+/// flowspace, so the graph has no loop and `Function.funccall` carries no
+/// `@jit.unroll_safe`. The `match nargs` below is that expansion. PyPy has
+/// no extra GC API on that path; pyre is 3.14t, so the converted
+/// `PyObjectRef`s stay pinned across `createframe` /
+/// `try_new_for_call_with_closure_and_globals_obj` with one-shot
+/// `pin_roots` (`gc_push_roots` publishes the whole live set), matching
+/// `_flat_pycall_defaults`.
 fn funccall_flat_from_args(
-    mut func: PyObjectRef,
+    func: PyObjectRef,
     code: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -4051,45 +4078,82 @@ fn funccall_flat_from_args(
         !unsafe { crate::gateway::is_builtin_code(code) },
         "function.py funccall FLATPYCALL arm is PyCode only"
     );
+    // One-shot publish before any allocating call: sequential `pin_root(func)`
+    // then `pin_root(code)` then per-arg is a safepoint window.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = _roots.base();
-    let _ = _roots.pin_root(func);
-    let _ = _roots.pin_root(code as PyObjectRef);
-    for &arg in args {
-        let _ = _roots.pin_root(arg);
-    }
-    func = _roots.get(root_base);
-    let mut code = _roots.get(root_base + 1);
-    let mut w_globals = unsafe { function_get_globals_obj(func) };
-    let mut closure = unsafe { function_get_closure(func) };
+    let root_base = match nargs {
+        0 => _roots.pin_roots(&[func, code]),
+        1 => _roots.pin_roots(&[func, code, args[0]]),
+        2 => _roots.pin_roots(&[func, code, args[0], args[1]]),
+        3 => _roots.pin_roots(&[func, code, args[0], args[1], args[2]]),
+        4 => _roots.pin_roots(&[func, code, args[0], args[1], args[2], args[3]]),
+        _ => unreachable!(),
+    };
+    let func = _roots.get(root_base);
+    let w_globals = unsafe { function_get_globals_obj(func) };
+    let closure = unsafe { function_get_closure(func) };
+    // Pin globals/closure on the same scope as func/code/args so
+    // `createframe` / `getexecutioncontext` / `FrameBox::new` /
+    // `frame_into_generator_for_function` / `get_eval_fn` stay under one
+    // `push_roots`, matching `_flat_pycall_defaults`.
+    let env_base = _roots.pin_roots(&[w_globals, closure]);
+    let mut func = _roots.get(root_base);
 
     let mut new_frame = crate::pyframe::FrameBox::new(
-        match pyre_object::with_roots!(func, code, w_globals, closure =>
+        match pyre_object::with_roots!(func => {
             crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                code as *const (),
+                _roots.get(root_base + 1) as *const (),
                 &[],
-                w_globals,
+                _roots.get(env_base),
                 crate::call::getexecutioncontext(),
-                closure,
+                _roots.get(env_base + 1),
                 crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             )
-        ) {
+        }) {
             Ok(f) => f,
             Err(e) => return Err(e),
         },
     );
 
-    // function.py funccall: `for i in funccallunrolling: if i < nargs`
-    for i in 0..4 {
-        if i < nargs {
-            new_frame.set_locals_w(i, _roots.get(root_base + 2 + i));
+    // funccallunrolling: `for i in unrolling_iterable(range(4)): if i < nargs`
+    match nargs {
+        0 => {}
+        1 => new_frame.set_locals_w(0, _roots.get(root_base + 2)),
+        2 => {
+            new_frame.set_locals_w(0, _roots.get(root_base + 2));
+            new_frame.set_locals_w(1, _roots.get(root_base + 3));
         }
+        3 => {
+            new_frame.set_locals_w(0, _roots.get(root_base + 2));
+            new_frame.set_locals_w(1, _roots.get(root_base + 3));
+            new_frame.set_locals_w(2, _roots.get(root_base + 4));
+        }
+        4 => {
+            new_frame.set_locals_w(0, _roots.get(root_base + 2));
+            new_frame.set_locals_w(1, _roots.get(root_base + 3));
+            new_frame.set_locals_w(2, _roots.get(root_base + 4));
+            new_frame.set_locals_w(3, _roots.get(root_base + 5));
+        }
+        _ => unreachable!(),
     }
     crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     new_frame.fix_array_ptrs();
-    let result = new_frame.run_with_jit();
-    drop(_roots);
-    result
+    // function.py `Function.funccall` — `new_frame.run(self.name, self.qualname)`
+    // → `initialize_as_generator(name, qualname)` / `GeneratorIterator`.
+    // Same arm as `_flat_pycall`: transfer the owned `FrameBox`, do not
+    // snapshot through `run_with_jit` / `initialize_as_generator`. Re-read
+    // `func` off the live publish the way `_flat_pycall_defaults` does.
+    let mut func = _roots.get(root_base);
+    if new_frame._is_generator_or_coroutine() {
+        pyre_object::with_roots!(func => {
+            crate::call::frame_into_generator_for_function(new_frame, func)
+        })
+    } else {
+        pyre_object::with_roots!(func => {
+            let eval_fn = crate::call::get_eval_fn();
+            eval_fn(&mut new_frame, None)
+        })
+    }
 }
 
 /// PyPy-compatible `funccall` helper.
@@ -4312,12 +4376,12 @@ pub fn funccall_valuestack(
     }
 
     // function.py:194-199 — PASSTHROUGHARGS1 dispatch.
-    // PyPy's BuiltinCodePassThroughArguments1.funcrun_obj receives w_obj
-    // separately from an Arguments rest, then concatenates them as
-    // `args_w = [w_obj] + _args_w` before calling the unwrapped fn. Pyre's
-    // single BuiltinCodeFn signature already takes a flat slice, so the
-    // peek/Arguments split is structural — the final closure invocation
-    // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
+    // BuiltinCodePassThroughArguments1.funcrun_obj calls
+    // `self.func__args__(space, w_obj, args)` with the receiver separate
+    // from the Arguments rest. It prepends the receiver only on
+    // DescrMismatch (`args.prepend(w_obj)`). Pyre's BuiltinCodeFn takes a
+    // flat slice, so the peek/Arguments split is structural — the closure
+    // sees `[w_obj, ...rest]`.
     if !natural_arity_call
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1

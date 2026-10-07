@@ -6322,16 +6322,22 @@ pub unsafe fn w_list_install_bytes_items(
     }
     let base = crate::gc_roots::publish_roots(&published);
     crate::gc_roots::normalize_roots(base, published.len());
+    let mut obj = crate::gc_roots::shadow_stack_get(base);
     let fresh = if values.is_empty() {
         BytesArray::empty()
     } else {
-        let mut live = Vec::with_capacity(values.len());
-        for index in 0..values.len() {
-            live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
-                as *const crate::bytesobject::BytesBlock);
-        }
-        BytesArray::from_vec(live)
+        crate::with_roots!(obj => {
+            let mut live = Vec::with_capacity(values.len());
+            for index in 0..values.len() {
+                live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
+                    as *const crate::bytesobject::BytesBlock);
+            }
+            BytesArray::from_vec(live)
+        })
     };
+    // Pin the items block before any later root query. A nested
+    // `with_roots!(obj)` around `pin_block` can collect first and
+    // reclaim `fresh.block`. Same order as `w_list_install_int_items`.
     let fresh_slot = fresh.pin_block();
     let obj = crate::gc_roots::shadow_stack_get(base);
     let _guard = w_list_lock(obj);
