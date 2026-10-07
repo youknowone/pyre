@@ -5798,9 +5798,14 @@ impl CallControl {
     /// argument in that case instead of being written on the callee.
     /// `seeded_inputs` are that callee's formals the flagged actuals
     /// bind to, so a later `hint_fresh_virtualizable` inside the body
-    /// still forwards the flag. Returns whether the seed set grew, so
-    /// BFS can scan an already-candidate graph again the way RPython
-    /// discovers the `AccessDirect` specialized graph.
+    /// still forwards the flag.
+    ///
+    /// The first AccessDirect call assigns those formals. A later call
+    /// to the same graph intersects them: `pairtype(SomeInstance,
+    /// SomeInstance).union` keeps a flag only when every binding has
+    /// it, and `default_specialize` caches one `(AccessDirect, key)`
+    /// graph for every flagged call. Returns whether the seed set
+    /// changed, so BFS can scan an already-candidate graph again.
     fn note_access_directly_callee(&mut self, path: &CallPath, seeded_inputs: &[u64]) -> bool {
         let Some(graph) = self.function_graphs.get_mut(path) else {
             return false;
@@ -5808,15 +5813,18 @@ impl CallControl {
         if graph.func.jit_look_inside == Some(false) {
             return false;
         }
-        let mut changed = !graph.access_directly;
-        graph.access_directly = true;
-        for &id in seeded_inputs {
-            if !graph.access_directly_inputs.contains(&id) {
-                graph.access_directly_inputs.push(id);
-                changed = true;
-            }
+        if !graph.access_directly {
+            graph.access_directly = true;
+            graph
+                .access_directly_inputs
+                .extend_from_slice(seeded_inputs);
+            return true;
         }
-        changed
+        let before = graph.access_directly_inputs.len();
+        graph
+            .access_directly_inputs
+            .retain(|id| seeded_inputs.contains(id));
+        graph.access_directly_inputs.len() != before
     }
 
     /// Formals of `callee` whose actual is in `hinted`.
@@ -6209,8 +6217,8 @@ impl CallControl {
                         // the already-candidate continue in `find_all_graphs`
                         // does not skip that later call. One codewriter
                         // graph records the later seed and is scanned
-                        // again when the set grew. `get` clones the `Rc`,
-                        // so drop it and re-read after the write
+                        // again when the set changed. `get` clones the
+                        // `Rc`, so drop it and re-read after the write
                         // (`make_mut` would otherwise copy).
                         let already_candidate = self.candidate_graphs.contains(&callee_path);
                         if passes_access_directly {
@@ -6220,9 +6228,9 @@ impl CallControl {
                                 &graph_ref,
                             );
                             drop(graph_ref);
-                            let grew = self.note_access_directly_callee(&callee_path, &seeded);
+                            let changed = self.note_access_directly_callee(&callee_path, &seeded);
                             if already_candidate {
-                                if grew {
+                                if changed {
                                     todo.push(callee_path);
                                 }
                                 continue;
@@ -11926,6 +11934,150 @@ mod tests {
     #[should_panic(expected = "access_directly on a function which we don't see")]
     fn unflagged_then_flagged_fresh_virtualizable_seeds_the_formal() {
         drive_parameter_access_directly(true, true);
+    }
+
+    /// `todo` is LIFO. Calling `helper` first and `mid` second scans
+    /// `mid` before `helper`. The flagged call lives in `helper`, so
+    /// `mid` is already a candidate with no seeds when that call is
+    /// seen and must be queued again.
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn flagged_call_requeues_after_the_callee_was_scanned() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let mid_path = CallPath::from_segments(["mid"]);
+        let mut mid = FunctionGraph::new("mid");
+        let entry = mid.startblock;
+        let param = mid.alloc_value_var();
+        mid.block_mut(entry).inputargs.push(param.clone());
+        mid.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([param]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(mid_path.clone(), mid);
+
+        let helper_path = CallPath::from_segments(["helper"]);
+        let mut helper = FunctionGraph::new("helper");
+        let entry = helper.startblock;
+        let frame = helper.alloc_value_var();
+        let hinted = helper.alloc_value_var();
+        helper.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        helper.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(helper_path.clone(), helper);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(helper_path.segments.iter().map(String::as_str)),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        });
+        let plain = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([plain]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+    }
+
+    /// Two AccessDirect calls that flag different formals keep only
+    /// the flags `pairtype(SomeInstance, SomeInstance).union` keeps:
+    /// none, when the positions do not overlap. A loopy child of the
+    /// second formal is not stamped.
+    #[test]
+    fn accessdirect_calls_intersect_formals_across_sites() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let mid_path = CallPath::from_segments(["mid"]);
+        let mut mid = FunctionGraph::new("mid");
+        let entry = mid.startblock;
+        let p0 = mid.alloc_value_var();
+        let p1 = mid.alloc_value_var();
+        mid.block_mut(entry).inputargs.push(p0);
+        mid.block_mut(entry).inputargs.push(p1.clone());
+        mid.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([p1]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(mid_path.clone(), mid);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let plain = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted.clone(), plain.clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([plain, hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        let stored_mid = cc.function_graphs().get(&mid_path).expect("mid");
+        assert!(stored_mid.access_directly);
+        assert!(stored_mid.access_directly_inputs.is_empty());
+        let stored_inner = cc.function_graphs().get(&inner_path).expect("inner");
+        assert!(!stored_inner.access_directly);
+        assert!(!cc.is_candidate(&inner_path));
     }
 
     /// A formal that did not arrive flagged does not invent the flag
