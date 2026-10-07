@@ -1570,35 +1570,18 @@ pub unsafe fn module_dict_strategy_force_version_qmut(
 /// W_DictObject.__init__(w_obj, space, strategy, storage)
 /// ```
 ///
-/// The initial strategy is `EMPTY_DICT_STRATEGY`; the first
-/// mutating call (setitem / setitem_str / setdefault) promotes the
-/// dict to a concrete strategy via
-/// `EmptyDictStrategy::setitem`'s `switch_to_correct_strategy` step.
-/// Pyre keeps a non-null `dstorage` Vec at construction so legacy
-/// helpers reading the Vec directly still see an empty container;
-/// when EmptyDictStrategy is active the Vec is observationally
-/// empty (the trait readers return empty without touching the slot).
-///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `alloc_dict_object` / `w_str_new` twin: the body builds the host
-/// `IndexMap` storage box (`gc_alloc_storage_box`) before
-/// `alloc_dict_object` runs, so the foreign `IndexMap::new` construction sits
-/// outside `alloc_dict_object`'s own residual boundary.  Tracing into it
-/// carries the unported host container op into the caller; residualising the
-/// whole constructor models it by signature — a plain `PyObjectRef` GCREF.
+/// `EmptyDictStrategy.get_empty_storage` is `erase(None)`.  The first
+/// mutating call promotes via `switch_to_correct_strategy` and installs
+/// real storage, the same `w_dict_new_kwargs` path.
 #[majit_macros::dont_look_inside]
 pub fn w_dict_new() -> PyObjectRef {
-    let entries: *mut ObjectDictStorage = crate::gc_storage::gc_alloc_storage_box(
-        object_dict_storage_new(),
-        object_dict_storage_gc_type_id(),
-    );
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
                 ob_type: &DICT_TYPE as *const PyType,
                 w_class: get_instantiate(&DICT_TYPE),
             },
-            dstorage: entries as *mut u8,
+            dstorage: std::ptr::null_mut(),
             dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
             keys_version: 0,
             clear_gen: 0,
@@ -3947,10 +3930,10 @@ pub unsafe fn w_dict_is_regular_empty(obj: PyObjectRef) -> bool {
 ///
 /// PyPy `update1_dict_dict` performs:
 /// `w_copy = w_data.get_strategy().copy(w_data); w_dict.set_strategy(...);
-/// w_dict.dstorage = w_copy.dstorage`. Pyre keeps a regular empty dict's
-/// placeholder storage allocated, so this helper drops that placeholder,
-/// installs the copy's strategy/storage/len, and fires the explicit GC
-/// write barrier that RPython field stores would get from the GC.
+/// w_dict.dstorage = w_copy.dstorage`.  Empty dest storage is
+/// `erased(None)`; this helper installs the copy's strategy/storage
+/// and fires the explicit GC write barrier that RPython field stores
+/// would get from the GC.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -3972,8 +3955,7 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     // null storage during that same collection.
     dict_write_barrier(dst);
 
-    // The destination previously held a placeholder Object-shape box; now
-    // unreachable, it is reclaimed by the sweep.  The off-GC side-table case
+    // Empty dest storage is `erased(None)`.  The off-GC side-table case
     // is freed via the shared guarded helper.
     dealloc_offgc_object_dict_storage(old_dstorage);
 }
@@ -7176,11 +7158,9 @@ impl EmptyDictStrategy {
     ///     w_dict.dstorage = storage
     /// ```
     ///
-    /// The placeholder Object-shape box allocated by `w_dict_new` is a
-    /// GC-managed storage box; overwriting `dstorage` with the fresh
-    /// `IntDictStrategy::get_empty_storage` box leaves the old one
-    /// unreachable, and the sweep reclaims it — matching `w_dict.dstorage
-    /// = storage`, where the GC frees the previous backing.
+    /// Empty dest storage is `erased(None)`; overwriting `dstorage`
+    /// with the fresh `IntDictStrategy::get_empty_storage` box matches
+    /// `w_dict.dstorage = storage`.
     ///
     /// # Safety
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
@@ -7198,9 +7178,8 @@ impl EmptyDictStrategy {
     ///     w_dict.dstorage = storage
     /// ```
     ///
-    /// The field overwrite is a `setfield_gc`; the unreachable old
-    /// Object-shape placeholder box is reclaimed by the sweep — same
-    /// lifetime contract as `switch_to_int_strategy`.
+    /// The field overwrite is a `setfield_gc`; same lifetime contract
+    /// as `switch_to_int_strategy`.
     ///
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
@@ -7311,11 +7290,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     /// An empty kwargs dict has the `erased(None)` null `dstorage` from
     /// `w_dict_new_kwargs` and holds no entries — `setitem`/`setitem_str`
     /// switch to a concrete strategy before storing — so there is nothing
-    /// to trace.  This overrides (rather than inherits `EmptyDictStrategy`'s
-    /// trait-default) walk, which would unerase the null `dstorage` as an
-    /// `IndexMap` and dereference null. EmptyDictStrategy keeps the default
-    /// walk because its ordinary empty dicts carry a non-null placeholder
-    /// `dstorage`.
+    /// to trace.  Same walk as `EmptyDictStrategy`.
     unsafe fn walk_gc_refs(
         &self,
         _w_dict: PyObjectRef,
@@ -7407,12 +7382,18 @@ impl DictStrategy for EmptyDictStrategy {
 
     fn get_empty_storage(&self) -> *mut u8 {
         // `erased(None)` — null is the only inhabitant of "empty
-        // storage" before a switch installs a real backing.  Pyre's
-        // W_DictObject keeps an always-non-null `dstorage` Vec for
-        // legacy callers; the EmptyDictStrategy treats it as empty
-        // until `switch_to_correct_strategy` flips the dict to a
-        // concrete strategy and the Vec starts receiving entries.
+        // storage" before a switch installs a real backing.
         std::ptr::null_mut()
+    }
+
+    /// An empty dict holds `erased(None)` and no entries.  Walking it as
+    /// `ObjectDictStorage` would dereference null, the same kwargs empty
+    /// case (`EmptyKwargsDictStrategy.walk_gc_refs`).
+    unsafe fn walk_gc_refs(
+        &self,
+        _w_dict: PyObjectRef,
+        _visitor: &mut dyn FnMut(*mut PyObjectRef),
+    ) {
     }
 
     /// `dictmultiobject.py EmptyDictStrategy.switch_to_object_strategy`
@@ -7420,8 +7401,7 @@ impl DictStrategy for EmptyDictStrategy {
     /// w_dict.dstorage = storage`.  Allocates a fresh Object-shape box
     /// so subclasses whose `dstorage` is null (`w_dict_new_kwargs`)
     /// don't end up with an OBJECT_DICT_STRATEGY label over a null
-    /// pointer.  The field overwrite is a `setfield_gc`; the unreachable
-    /// old placeholder box is reclaimed by the sweep.
+    /// pointer.  The field overwrite is a `setfield_gc`.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
         install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
     }

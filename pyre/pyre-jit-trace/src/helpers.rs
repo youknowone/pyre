@@ -693,8 +693,7 @@ pub fn note_class_word_after_new(
     let Some(size) = size_descr.as_size_descr() else {
         return;
     };
-    ctx.heap_cache_mut()
-        .class_now_known(new_op, size.vtable() as i64);
+    ctx.heap_cache_mut().class_now_known(new_op);
     let seed = size
         .class_word_field()
         .map(|field| field.index())

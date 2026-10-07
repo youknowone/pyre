@@ -202,8 +202,9 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     // through `execute_and_record`, so a constant on both sides folds the
     // comparison and no guard is minted — which would leave the `guards > 0`
     // line measuring nothing. A virtualizable in a register is a recorded box
-    // in production anyway; the concrete pointer arrives from the frame's
-    // `ref_values`, not from the box being constant.
+    // in production anyway; the concrete pointer lives on the box
+    // (`InputArg.getref_base` / `set_opref_concrete`), not from the
+    // box being a ConstPtr.
     let other_vable = match vable {
         VableBox::Recorded => {
             let b = OpRef::input_arg_ref(0);
@@ -229,12 +230,9 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     // MIFrame::new initializes the bytecode cursor independently of `pc`.
     frame.code_cursor = pc;
     frame.ref_regs[VABLE_REG as usize] = Some(other_vable);
-    frame.ref_values[VABLE_REG as usize] = Some(2);
     frame.int_regs[INDEX_REG as usize] = Some(index);
-    frame.int_values[INDEX_REG as usize] = Some(0);
     if arm == Arm::Set {
         frame.int_regs[VALUE_REG as usize] = Some(stored);
-        frame.int_values[VALUE_REG as usize] = Some(7);
     }
     let mut frames = MIFrameStack::empty();
     frames.frames.push(frame);
@@ -323,9 +321,7 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
 /// are *different* constants and cannot be equal at runtime either — the
 /// `PTR_EQ` folds to `ConstInt(0)` and `implement_guard_value`'s Const arm then
 /// declines the promote, leaving neither the comparison nor a `GUARD_VALUE` in
-/// the trace. `capture_vable_promote_guard` derives its stamp count from
-/// `ctx.num_guards()` rather than assuming one, so minting none is a case it
-/// already handles.
+/// the trace.
 #[test]
 fn a_constant_vable_folds_the_step_four_ptr_eq_away() {
     for arm in [Arm::Get, Arm::Set] {

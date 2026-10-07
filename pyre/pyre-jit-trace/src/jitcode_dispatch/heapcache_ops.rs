@@ -629,11 +629,22 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let is_typeptr_field = descr
         .as_field_descr()
         .is_some_and(|fd| fd.offset() == pyre_object::pyobject::OB_TYPE_OFFSET);
-    let typeptr_const = if ctx.fbw_mode.inline_subwalk && !obj.is_constant() && is_typeptr_field {
-        let known = ctx.trace_ctx.heap_cache().get_known_class(obj);
-        match (known, opcode) {
-            (Some(cls), OpCode::GetfieldGcI) => Some(ctx.trace_ctx.const_int(cls)),
-            (Some(cls), OpCode::GetfieldGcR) => Some(ctx.trace_ctx.const_ref(cls)),
+    let typeptr_const = if ctx.fbw_mode.inline_subwalk
+        && !obj.is_constant()
+        && is_typeptr_field
+        && ctx.trace_ctx.heap_cache().is_class_known(obj)
+    {
+        match (concrete_obj_ptr, opcode) {
+            (Some(p), OpCode::GetfieldGcI) => {
+                let cls =
+                    unsafe { (*(p as *const pyre_object::pyobject::PyObject)).ob_type as i64 };
+                Some(ctx.trace_ctx.const_int(cls))
+            }
+            (Some(p), OpCode::GetfieldGcR) => {
+                let cls =
+                    unsafe { (*(p as *const pyre_object::pyobject::PyObject)).ob_type as i64 };
+                Some(ctx.trace_ctx.const_ref(cls))
+            }
             _ => None,
         }
     } else {

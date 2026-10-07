@@ -181,8 +181,10 @@ mod tests {
         let zero = ctx.const_int(0);
         let cond = ctx.record_op(OpCode::IntGt, &[i0, zero]);
         let g = ctx.record_guard(OpCode::GuardTrue, &[cond], 1);
+        ctx.finish(&[i0], make_fail_descr(1));
         ctx.set_fail_args(g, &[i0]);
-        let (trace, constants) = finish_trace_ctx(ctx, &[i0]);
+        let constants = IndexMap::new();
+        let trace = ctx.into_tree_loop();
 
         let case = TraceParityCase {
             name: "guard_fail_args_surface_in_seam",
@@ -214,8 +216,10 @@ mod tests {
         let xored = ctx.record_op(OpCode::IntXor, &[anded, seven]);
         let cond = ctx.record_op(OpCode::IntGe, &[xored, zero]);
         let g = ctx.record_guard(OpCode::GuardTrue, &[cond], 2);
+        ctx.finish(&[xored], make_fail_descr(1));
         ctx.set_fail_args(g, &[i0, i1]);
-        let (trace, constants) = finish_trace_ctx(ctx, &[xored]);
+        let constants = IndexMap::new();
+        let trace = ctx.into_tree_loop();
 
         let case = TraceParityCase {
             name: "unary_bitwise_and_comparison_ops",

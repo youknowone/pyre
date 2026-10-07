@@ -188,8 +188,14 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
 /// classified `can_raise` and already grown a `GuardNoException`. Skip those
 /// when deciding whether the preceding barrier was a moving safepoint.
 fn last_non_guard_is_cond_call_gc_wb<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
-    for op in ctx.trace_ctx.ops().iter().rev() {
-        match op.opcode {
+    // Byte-mode `ops()` is empty until materialize. Opcode lives on
+    // `FrontendSlot` (`history.py AbstractResOp.getopnum`).
+    let n = ctx.trace_ctx.num_ops();
+    for i in (0..n).rev() {
+        let Some(opcode) = ctx.trace_ctx.opcode_at(i) else {
+            continue;
+        };
+        match opcode {
             OpCode::GuardNoException | OpCode::GuardNotForced | OpCode::GuardException => {
                 continue;
             }
@@ -454,10 +460,7 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
         let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
         let vable_frame = latched
             .miframe
-            .ref_values
-            .get(frame_reg as usize)
-            .copied()
-            .flatten()
+            .ref_value_for_blackhole(frame_reg as usize)
             .unwrap_or(0) as usize;
         vable_frame != 0
             && crate::state::capture_frame_stack_from_mirror(
@@ -743,10 +746,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         };
         let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
         let vable_frame = miframe
-            .ref_values
-            .get(frame_reg as usize)
-            .copied()
-            .flatten()
+            .ref_value_for_blackhole(frame_reg as usize)
             .unwrap_or(0) as usize;
         if vable_frame == 0
             || vable_frame != root_addr
@@ -915,7 +915,7 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             latchdbg!("origin={origin} pf-frame-reg-none");
             return false;
         }
-        let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
+        let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
             latchdbg!(
                 "origin={origin} pf-frame-ptr-unset index={index}/{} jitcode={} frame_reg={frame_reg}",
                 framestack.frames.len(),
@@ -975,9 +975,15 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     // Null/old data and must not make the all-live-color pass decline.
     if let Some((bank, color, value)) = lastop_result {
         match bank {
-            'i' => *miframe.int_values.get_mut(color)? = Some(value),
-            'r' => *miframe.ref_values.get_mut(color)? = Some(value),
-            'f' => *miframe.float_values.get_mut(color)? = Some(value),
+            'i' => *miframe.int_regs.get_mut(color)? = Some(OpRef::const_int(value)),
+            'r' => {
+                *miframe.ref_regs.get_mut(color)? =
+                    Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)))
+            }
+            'f' => {
+                *miframe.float_regs.get_mut(color)? =
+                    Some(OpRef::const_float(f64::from_bits(value as u64)))
+            }
             'v' => {}
             _ => return None,
         }
@@ -998,7 +1004,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     // the drive can read it and the walk lost the value.
     for &color in &live.int {
         let color = color as usize;
-        if miframe.int_values.get(color).copied().flatten().is_some() {
+        if miframe.int_regs.get(color).copied().flatten().is_some() {
             continue;
         }
         let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
@@ -1007,11 +1013,11 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             }
             return None;
         };
-        *miframe.int_values.get_mut(color)? = Some(value);
+        *miframe.int_regs.get_mut(color)? = Some(OpRef::const_int(value));
     }
     for &color in &live.ref_ {
         let color = color as usize;
-        if miframe.ref_values.get(color).copied().flatten().is_some() {
+        if miframe.ref_regs.get(color).copied().flatten().is_some() {
             continue;
         }
         let value = match ctx
@@ -1039,11 +1045,11 @@ fn build_single_frame_miframe<Sym: WalkSym>(
                 }
             }
         };
-        *miframe.ref_values.get_mut(color)? = Some(value);
+        *miframe.ref_regs.get_mut(color)? = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
     }
     for &color in &live.float {
         let color = color as usize;
-        if miframe.float_values.get(color).copied().flatten().is_some() {
+        if miframe.float_regs.get(color).copied().flatten().is_some() {
             continue;
         }
         let opref = ctx.registers_f.get(color)?;
@@ -1053,7 +1059,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
             return None;
         };
-        *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
+        *miframe.float_regs.get_mut(color)? = Some(OpRef::const_float(value));
     }
 
     // Seed every REMAINING color the walk has a concrete value for, not just the
@@ -1078,14 +1084,14 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     // what the walk observed at the force point, which is what a merge reached
     // without an intervening definition expects.  Colors with no concrete value
     // stay unset, exactly as an absent upstream box does.
-    for (color, slot) in miframe.int_values.iter_mut().enumerate() {
+    for (color, slot) in miframe.int_regs.iter_mut().enumerate() {
         if slot.is_none()
             && let Some(ConcreteValue::Int(value)) = ctx.concrete_registers_i.get(color).copied()
         {
-            *slot = Some(value);
+            *slot = Some(OpRef::const_int(value));
         }
     }
-    for (color, slot) in miframe.ref_values.iter_mut().enumerate() {
+    for (color, slot) in miframe.ref_regs.iter_mut().enumerate() {
         // `ConcreteValue::Null` is the walker's "unknown" sentinel, not a proven
         // Python null, so it seeds nothing.
         if slot.is_none()
@@ -1096,21 +1102,21 @@ fn build_single_frame_miframe<Sym: WalkSym>(
                 .get(color)
                 .copied()
         {
-            *slot = Some(value as i64);
+            *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
         }
     }
     // `num_regs_f()` is the third bank `_copy_data_from_miframe` walks, so the
     // rationale above covers floats too.  There is no float concrete shadow —
     // resolve the recorded box, and leave the color unset when it has none.
-    for color in 0..miframe.float_values.len() {
-        if miframe.float_values[color].is_some() {
+    for color in 0..miframe.float_regs.len() {
+        if miframe.float_regs[color].is_some() {
             continue;
         }
         let Some(opref) = ctx.registers_f.get(color) else {
             continue;
         };
         if let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) {
-            miframe.float_values[color] = Some(value.to_bits() as i64);
+            miframe.float_regs[color] = Some(OpRef::const_float(value));
         }
     }
 
@@ -1218,7 +1224,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             }
         };
     }
-    for color in 0..miframe.int_values.len() {
+    for color in 0..miframe.int_regs.len() {
         if let Some(value) = ctx
             .concrete_registers_i
             .get(color)
@@ -1229,10 +1235,10 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                 _ => None,
             })
         {
-            miframe.int_values[color] = Some(value);
+            miframe.int_regs[color] = Some(OpRef::const_int(value));
             continue;
         }
-        if miframe.int_values[color].is_none() {
+        if miframe.int_regs[color].is_none() {
             let Some(opref) = ctx.registers_i.get(color) else {
                 continue;
             };
@@ -1243,11 +1249,11 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                 s2dbg!("int color={color} opref={opref:?} has no concrete");
                 return false;
             };
-            miframe.int_values[color] = Some(value);
+            miframe.int_regs[color] = Some(OpRef::const_int(value));
         }
     }
 
-    for color in 0..miframe.ref_values.len() {
+    for color in 0..miframe.ref_regs.len() {
         let opref = ctx.registers_r.get(color);
         let forwarded = opref
             .filter(|&value| value != OpRef::NONE)
@@ -1279,15 +1285,15 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         // NULL, and `is_true(NULL)` is false, sending a `while` straight to its
         // exit arm and dropping every remaining iteration.
         if let Some(value) = forwarded.or(from_shadow) {
-            miframe.ref_values[color] = Some(value);
+            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
             return false;
         }
     }
 
-    for color in 0..miframe.float_values.len() {
-        if miframe.float_values[color].is_some() {
+    for color in 0..miframe.float_regs.len() {
+        if miframe.float_regs[color].is_some() {
             continue;
         }
         let Some(opref) = ctx.registers_f.get(color) else {
@@ -1300,7 +1306,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             s2dbg!("float color={color} opref={opref:?} has no concrete");
             return false;
         };
-        miframe.float_values[color] = Some(value.to_bits() as i64);
+        miframe.float_regs[color] = Some(OpRef::const_float(value));
     }
     true
 }
@@ -1370,38 +1376,38 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         };
         let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
         for &(color, value) in &concrete.int_values {
-            let bank_len = miframe.int_values.len();
-            let Some(slot) = miframe.int_values.get_mut(color) else {
+            let bank_len = miframe.int_regs.len();
+            let Some(slot) = miframe.int_regs.get_mut(color) else {
                 s2dbg!(
                     "origin={origin} frame {index}: int color {color} out of range (len {bank_len})"
                 );
                 return None;
             };
-            *slot = Some(value);
+            *slot = Some(OpRef::const_int(value));
         }
         for &(color, value) in &concrete.ref_values {
-            let bank_len = miframe.ref_values.len();
-            let Some(slot) = miframe.ref_values.get_mut(color) else {
+            let bank_len = miframe.ref_regs.len();
+            let Some(slot) = miframe.ref_regs.get_mut(color) else {
                 s2dbg!(
                     "origin={origin} frame {index}: ref color {color} out of range (len {bank_len})"
                 );
                 return None;
             };
-            *slot = Some(value as i64);
+            *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
         }
         for &(color, opref) in &concrete.float_values {
             let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
                 s2dbg!("origin={origin} frame {index}: float opref {opref:?} not a stamped Float");
                 return None;
             };
-            let bank_len = miframe.float_values.len();
-            let Some(slot) = miframe.float_values.get_mut(color) else {
+            let bank_len = miframe.float_regs.len();
+            let Some(slot) = miframe.float_regs.get_mut(color) else {
                 s2dbg!(
                     "origin={origin} frame {index}: float color {color} out of range (len {bank_len})"
                 );
                 return None;
             };
-            *slot = Some(value.to_bits() as i64);
+            *slot = Some(OpRef::const_float(value));
         }
         frames.push(miframe);
     }
@@ -5238,7 +5244,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // i.e. the FORCED frame.  A ladder leg that needs PRE-walk shadow
             // state after a cancelled commit has to re-read it after the
             // walk-end restore, not here.
-            ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            ctx.trace_ctx.reload_virtualizable_boxes_from_heap();
             // Read the pre-call image back out of the root slots: a collection
             // inside the residual forwarded them alongside the frame's array,
             // so these words and `locals_w!` name the same objects.
@@ -5978,9 +5984,11 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
 
     for (slot, value, concrete) in slots {
         let index = ctx.trace_ctx.const_int(slot);
-        let guards_before = ctx.trace_ctx.num_guards();
         let store = vable_ops::with_replace_frames(ctx, |ctx| {
-            ctx.trace_ctx.vable_setarrayitem_indexed(
+            let nonstandard =
+                vable_ops::walker_nonstandard_virtualizable(ctx, pc, callee_frame, &fdescr)?;
+            Ok(ctx.trace_ctx.vable_setarrayitem_checked(
+                nonstandard,
                 pc,
                 callee_frame,
                 index,
@@ -5990,16 +5998,12 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
                 value,
                 concrete,
                 false,
-            )
-        });
-        let write = match store {
-            VableArrayStore::Stored(write) => write,
-            // The out-of-vable store recorded nothing, so there is no pre-store
-            // entry to roll back. Whether it should abort the trace is tracked
-            // separately.
-            VableArrayStore::OutOfVable => None,
-        };
-        walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before, write)?;
+            ))
+        })?;
+        match store {
+            VableArrayStore::Stored(_) => {}
+            VableArrayStore::OutOfVable => {}
+        }
     }
     if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut()
         && shadow.frame_box == callee_frame
@@ -6985,9 +6989,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
             OpCode::GuardClass,
             &[cell_op, type_const],
         )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(cell_op, cell_type);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(cell_op);
     }
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(

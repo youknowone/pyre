@@ -2126,7 +2126,6 @@ dependencies = [
 name = "majit-trace"
 version = "0.0.2"
 dependencies = [
- "bit-set",
  "bitflags 2.13.0",
  "indexmap",
  "majit-backend",

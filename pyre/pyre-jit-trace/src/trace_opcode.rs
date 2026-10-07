@@ -486,12 +486,10 @@ use crate::frame_layout::{PYFRAME_DEBUGDATA_OFFSET, PYFRAME_PYCODE_OFFSET};
 /// spec at `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`
 /// (`last_instr`, `pycode`, `valuestackdepth`, `debugdata`, `w_globals`).
 ///
-/// No-op when the virtualizable shadow is not seeded (non-virtualizable
-/// trace, or before `init_virtualizable_boxes`) and when only its OpRef
-/// half is live — a bridge-entry rebuild seeds no concrete values, and
-/// there is no concrete slot to mirror into. When a concrete slot is
-/// mirrored, pair the shadow write with `synchronize_virtualizable()`, just
-/// like `TraceCtx::vable_setfield` / RPython `_opimpl_setfield_vable`, so the
+/// No-op when `virtualizable_boxes` is not seeded (non-virtualizable
+/// trace, or before `init_virtualizable_boxes`). When a slot is mirrored,
+/// pair the write with `synchronize_virtualizable()`, matching
+/// `TraceCtx::vable_setfield` / `_opimpl_setfield_vable`, so the
 /// live virtualizable cannot lag behind `virtualizable_boxes`.
 pub(crate) fn mirror_vable_static_to_boxes(
     ctx: &mut TraceCtx,
@@ -609,27 +607,19 @@ pub(crate) fn write_stack_slot(
             crate::state::request_trace_abort();
             return;
         }
-        // pyjitpl.py _opimpl_setarrayitem_vable: a Ref/Null
-        // concrete carries a real W_Root heap pointer; update both
-        // halves of the shadow. Int/Float concrete means pyre's lazy
-        // wrapint/wrapfloat emitted a NewWithVtable OpRef without
-        // allocating yet — update only the OpRef half so
-        // synchronize_virtualizable keeps writing the existing W_Root.
-        //
-        // The `has_virtualizable_shadow()` guard is a shadow-ownership
-        // safeguard: an owner (`owns_virtualizable_shadow()`) normally seeds
-        // both halves, but the disabled-concrete-shadow state (owner seeded
-        // with no live values — the init-before-run path) leaves
-        // `virtualizable_values` absent. Writing only the OpRef half there
-        // matches that state's contract (`virtualizable_entry_at` returns
-        // None, readers use the zero placeholder) and mirrors the #699 guard
-        // on `mirror_vable_static_to_boxes`.
-        match concrete.to_ir_ref_value() {
-            Some(v) if ctx.has_virtualizable_shadow() => {
-                ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
-            }
-            _ => {
-                ctx.set_virtualizable_box_at(flat_idx, boxed);
+        // `_opimpl_setarrayitem_vable`: a Ref/Null concrete carries a real
+        // W_Root heap pointer; store the box and stamp it. Int/Float concrete
+        // means lazy wrapint/wrapfloat emitted a NewWithVtable OpRef without
+        // allocating yet — store only the OpRef so synchronize_virtualizable
+        // keeps writing the existing W_Root.
+        if ctx.has_virtualizable_boxes() {
+            match concrete.to_ir_ref_value() {
+                Some(v) => {
+                    ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
+                }
+                _ => {
+                    ctx.set_virtualizable_box_at(flat_idx, boxed);
+                }
             }
         }
     }
@@ -745,18 +735,18 @@ pub(crate) fn swap_stack_slots(
             ctx.virtualizable_entry_at(flat_top),
             ctx.virtualizable_entry_at(flat_other),
         ) {
-            ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
-            ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
+            // Swap the boxes. A box keeps only its own result; an unstamped
+            // slot's current concrete lives on the virtualizable, so write
+            // the swapped values there (`write_box_at` over the slot, not
+            // `_make_op` on the box).
+            ctx.set_virtualizable_box_at(flat_top, op_other);
+            ctx.set_virtualizable_box_at(flat_other, op_top);
+            ctx.write_virtualizable_heap_value_at(flat_top, val_other);
+            ctx.write_virtualizable_heap_value_at(flat_other, val_top);
         } else if let (Some(op_top), Some(op_other)) = (
             ctx.virtualizable_box_at(flat_top),
             ctx.virtualizable_box_at(flat_other),
         ) {
-            // Disabled-concrete-shadow owner (seeded with no live values):
-            // `virtualizable_entry_at` returns None because
-            // `virtualizable_values` is absent, so the pair-read above fails
-            // even though the boxes exist. Swap only the OpRef halves, the
-            // sole readers in that state, matching the disabled-shadow
-            // contract (see `write_stack_slot`).
             ctx.set_virtualizable_box_at(flat_top, op_other);
             ctx.set_virtualizable_box_at(flat_other, op_top);
         } else {
@@ -2529,14 +2519,29 @@ impl MIFrame {
                     break;
                 };
                 if let Some((shadow_opref, value)) = ctx.virtualizable_entry_at(i) {
-                    if shadow_opref == opref {
+                    if shadow_opref == opref && ctx.box_carries_runtime_concrete(opref) {
                         record(ctx, opref, value);
                     }
                 }
             }
+            // Locals/stack InputArgs are the vable array boxes. Stamping them
+            // from `concrete_locals` (seed-time, not updated by setarrayitem)
+            // overwrote `_res*` after the last vable store and made
+            // `flush_walk_end_state_to_frame` read a stale W_Root.
+            // Same as the scalar loop: the box already carries
+            // `virtualizable_entry_at`.
             for i in 0..nlocals {
                 let slot_idx = header_off + i;
                 if let Some(&opref) = args.get(slot_idx) {
+                    let vable_idx = nvs + i;
+                    if let Some((slot_op, value)) = ctx.virtualizable_entry_at(vable_idx) {
+                        if slot_op == opref {
+                            if ctx.box_carries_runtime_concrete(opref) {
+                                record(ctx, opref, value);
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(v) = collect_kind(opref, self.sym().concrete_value_at(i)) {
                         record(ctx, opref, v);
                     }
@@ -2545,6 +2550,15 @@ impl MIFrame {
             for j in 0..stack_only {
                 let slot_idx = header_off + nlocals + j;
                 if let Some(&opref) = args.get(slot_idx) {
+                    let vable_idx = nvs + nlocals + j;
+                    if let Some((slot_op, value)) = ctx.virtualizable_entry_at(vable_idx) {
+                        if slot_op == opref {
+                            if ctx.box_carries_runtime_concrete(opref) {
+                                record(ctx, opref, value);
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(v) = collect_kind(opref, self.sym().concrete_value_at(nlocals + j))
                     {
                         record(ctx, opref, v);
@@ -3287,8 +3301,7 @@ impl MIFrame {
             // when the type guard is skipped, otherwise the watcher and the
             // trace's quasi-immut dependency would be silently dropped.
             self.flush_guard_not_invalidated(ctx);
-            ctx.heap_cache_mut()
-                .class_now_known(obj, expected_type as usize as i64);
+            ctx.heap_cache_mut().class_now_known(obj);
             return;
         }
         let expected_type_const = ctx.const_int(expected_type as usize as i64);
@@ -3302,8 +3315,7 @@ impl MIFrame {
         // into GUARD_NONNULL_CLASS (rewrite.py:408-444 / optimize_guard_class).
         self.generate_guard(ctx, OpCode::GuardClass, &[obj, expected_type_const]);
         // heapcache.py: class_now_known sets class + nullity.
-        ctx.heap_cache_mut()
-            .class_now_known(obj, expected_type as usize as i64);
+        ctx.heap_cache_mut().class_now_known(obj);
     }
 
     pub(crate) fn trace_guarded_int_payload(
@@ -3434,25 +3446,21 @@ mod tests {
     }
 
     #[test]
-    fn stack_slot_writers_degrade_to_opref_only_when_concrete_shadow_disabled() {
-        // A disabled-concrete-shadow owner (`owns_virtualizable_shadow()` true
-        // but `virtualizable_values` absent — the init-before-run seed state)
-        // must update only the OpRef half of the vable shadow instead of
-        // panicking in `set_virtualizable_entry_at`. Production never reaches
-        // this state; the guard hardens the incidental owns/values coupling.
+    fn stack_slot_writers_stamp_the_box_when_seeded_without_concretes() {
+        // An owner seeded with no live values still has boxes; a Ref push
+        // stores the box and the box carries the concrete (`ConstPtr` inline /
+        // `*FrontendOp._resref`). Production never reaches the unstamped
+        // InputArg seed; this hardens that a write does not panic.
         let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let placeholder = ctx.const_ref(0);
         // Boxes cover stack slots 0 and 1 at `nlocals == 0`; the empty values
-        // slice disables the concrete shadow.
+        // slice leaves InputArg/`*FrontendOp` boxes unstamped. These slots
+        // are `ConstPtr(0)` so each already carries a concrete.
         let boxes = vec![placeholder; nvs + 4];
         ctx.install_virtualizable_info(info.clone());
         ctx.set_virtualizable_boxes_with_info(boxes, Vec::new(), &info, &[4]);
-        assert!(
-            !ctx.has_virtualizable_shadow(),
-            "empty values must disable the concrete shadow",
-        );
 
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.bridge_local_oprefs.replace(Vec::new()); // owns via the bridge half
@@ -3463,20 +3471,30 @@ mod tests {
         let ptr = 0xdead_beef_usize as *mut pyre_object::pyobject::PyObject;
         let boxed0 = ctx.const_ref(0x1111);
         let boxed1 = ctx.const_ref(0x2222);
-        // Ref concrete + disabled shadow: OpRef-only write, no panic.
         write_stack_slot(&mut sym, &mut ctx, 0, boxed0, ConcreteValue::Ref(ptr));
         write_stack_slot(&mut sym, &mut ctx, 1, boxed1, ConcreteValue::Ref(ptr));
         assert_eq!(ctx.virtualizable_box_at(nvs), Some(boxed0));
         assert_eq!(ctx.virtualizable_box_at(nvs + 1), Some(boxed1));
-        assert!(
-            !ctx.has_virtualizable_shadow(),
-            "the values half stays disabled after a Ref push",
+        assert_eq!(
+            ctx.virtualizable_entry_at(nvs),
+            Some((boxed0, majit_ir::Value::Ref(majit_ir::GcRef(0x1111)))),
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(nvs + 1),
+            Some((boxed1, majit_ir::Value::Ref(majit_ir::GcRef(0x2222)))),
         );
 
-        // Swap degrades to an OpRef-only exchange rather than the entry-pair panic.
         swap_stack_slots(&mut sym, &mut ctx, 0, 1);
         assert_eq!(ctx.virtualizable_box_at(nvs), Some(boxed1));
         assert_eq!(ctx.virtualizable_box_at(nvs + 1), Some(boxed0));
+        assert_eq!(
+            ctx.virtualizable_entry_at(nvs),
+            Some((boxed1, majit_ir::Value::Ref(majit_ir::GcRef(0x2222)))),
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(nvs + 1),
+            Some((boxed0, majit_ir::Value::Ref(majit_ir::GcRef(0x1111)))),
+        );
     }
 
     #[test]

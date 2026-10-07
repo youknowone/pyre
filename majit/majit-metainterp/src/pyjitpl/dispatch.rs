@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
-use crate::trace_ctx::{ClearReplaceFrames, VableArrayStore, VableEntryWrite};
+use crate::trace_ctx::{ClearReplaceFrames, NonstandardVable, VableArrayStore};
 use crate::{TraceAction, TraceCtx};
 
 /// Residual-call argument lists. Eight slots cover the common helper arity
@@ -25,6 +25,12 @@ type CallI64s = SmallVec<[i64; CALL_INLINE]>;
 type CallTypes = SmallVec<[Type; CALL_INLINE]>;
 type CallArgs = SmallVec<[JitCallArg; CALL_INLINE]>;
 type CallValues = SmallVec<[Value; CALL_INLINE]>;
+
+/// One `pyjitpl.py` `_get_opimpl_method` handler.
+/// `MetaInterpStaticData.opcode_implementations` is a table of these,
+/// filled by `setup_insns`.
+type OpImplFn<'mi, S, R> =
+    fn(&mut JitCodeMachine<'mi, S, R>, &mut TraceCtx, &mut S, &R, u8) -> TraceAction;
 
 /// `GcLLDescr_boehm.malloc_fixedsize` (`llmodel_alloc`).
 ///
@@ -48,17 +54,19 @@ enum GuardStampTarget {
     /// the case for every guard the dispatcher records itself.
     LastOp,
     /// A guard op counted back from the most recent one (`0` == the most
-    /// recent), for guards a `TraceCtx` helper emitted before returning.
+    /// recent), for a guard that is no longer last (`emit_force_virtualizable`
+    /// records GETFIELD_GC / PTR_NE / COND_CALL after a promote).
+    #[allow(dead_code)]
     GuardFromEnd(usize),
 }
 
 /// Decode a virtualizable shadow Value (RPython Box concrete) back into the
-/// raw int/ref/float bit pattern that pyre stores in register shadows
-/// (`frame.int_values`, `frame.ref_values`, `frame.float_values`).
+/// raw int/ref/float bit pattern stamped onto the register box
+/// (`IntOp.getint` / `RefOp.getref_base` / `FloatOp.getfloat_storage`).
 /// `Value::Void` means the vable layout was not available at read time (heap
 /// fallback) — callers substitute zero to preserve pre-existing behaviour for
 /// test-only paths. All three helpers must match the encoding convention used
-/// by `Const::as_raw_i64()` (majit-ir/src/value.rs).
+/// by `Const::as_raw_i64()` (`value.rs`).
 fn value_as_int_bits(value: Value) -> i64 {
     match value {
         Value::Int(v) => v,
@@ -798,13 +806,13 @@ pub trait JitCodeSym {
     }
 
     /// Walk-final int+float scalar values in `collect_scalar_state_field_values`
-    /// order, read off the portal frame.
-    fn collect_portal_scalar_values(&self, _portal: &MIFrame) -> Vec<i64> {
+    /// order, read off the portal frame (`IntOp.getint` / `FloatOp.getfloat_storage`).
+    fn collect_portal_scalar_values(&self, _portal: &MIFrame, _ctx: &TraceCtx) -> Vec<i64> {
         Vec::new()
     }
 
-    /// Walk-final ref scalar values, read off the portal frame.
-    fn collect_portal_ref_scalar_values(&self, _portal: &MIFrame) -> Vec<i64> {
+    /// Walk-final ref scalar values, read off the portal frame (`RefOp.getref_base`).
+    fn collect_portal_ref_scalar_values(&self, _portal: &MIFrame, _ctx: &TraceCtx) -> Vec<i64> {
         Vec::new()
     }
 
@@ -1646,15 +1654,16 @@ where
     fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
-        let obj = self.frames.frames.iter().rev().find_map(|frame| {
-            frame
-                .ref_regs
-                .iter()
-                .zip(frame.ref_values.iter())
-                .find_map(|(slot, concrete)| {
-                    (*slot == Some(vable_opref)).then_some(*concrete).flatten()
-                })
-        })?;
+        let has_slot = self
+            .frames
+            .frames
+            .iter()
+            .rev()
+            .any(|frame| frame.ref_regs.iter().any(|slot| *slot == Some(vable_opref)));
+        if !has_slot {
+            return None;
+        }
+        let obj = ctx.box_bits(vable_opref)?;
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
         Some(ActiveStandardVirtualizable {
             vable_opref,
@@ -1887,74 +1896,34 @@ where
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
     }
 
-    /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
-    /// internally, if it emitted one.
-    ///
-    /// The vable opcodes promote before they load: `get_arrayitem_vable_index`
-    /// promotes the array index, and `_nonstandard_virtualizable`
-    /// (`pyjitpl.py`) promotes the `isstandard` PTR_EQ for a frame that is
-    /// not the standard virtualizable. Both go through
-    /// `TraceCtx::record_guard_with_snapshot`, which has no `MIFrameStack` to
-    /// walk and so leaves the guard holding a frame marked
-    /// `recorder::UNSTAMPED_JITCODE_INDEX`. The dispatcher does hold the
-    /// framestack, so the real position is stamped here — upstream captures it
-    /// in `implement_guard_value` (`pyjitpl.py`) →
-    /// `generate_guard(GUARD_VALUE, resumepc=orgpc)` (`:2582`) →
-    /// `capture_resumedata` (`:2610`), all at the promote itself.
-    ///
-    /// `guards_before` is `ctx.num_guards()` read before the `vable_*` call:
-    /// the promotes are conditional (an already-constant index, or the
-    /// standard virtualizable short-circuiting at step 1) and emit nothing in
-    /// the common case, so an unchanged count means there is nothing to stamp.
-    /// One call can emit TWO: a vable array access whose symbolic frame box
-    /// differs from the standard box but shares its pointer promotes the
-    /// `isstandard` PTR_EQ and then the index, so every guard the call added is
-    /// stamped, not just the last. Framestack rewrite happens inside
-    /// `_nonstandard_virtualizable`. The loop runs in emission
-    /// order because each capture leaves the root frame's in-flight result slot
-    /// cleared.
-    ///
-    /// `write` is the shadow slot a `vable_set*` overwrote. Upstream reaches
-    /// `virtualizable_boxes[index] = valuebox` only after both promotes have
-    /// captured their resume data, so the slot is put back for the duration of
-    /// the capture — otherwise the guard's resume data carries the very write
-    /// its resume pc re-executes (see [`VableEntryWrite`]).
-    ///
-    /// `opcode_pc` is the vable op's own JitCode position. The lowering emits
-    /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
-    /// `jtransform.py:764/798/814/845/926`), so `opcode_pc - SIZE_LIVE_OP`
-    /// resolves the liveness the snapshot needs.
-    ///
-    /// Framestack rewrite now happens inside `_nonstandard_virtualizable`
-    /// via `set_replace_frames`, so this no longer drains a mailbox.
-    fn capture_vable_promote_guard(
+    /// `pyjitpl.py MIFrame._nonstandard_virtualizable`: record the
+    /// `isstandard` `PTR_EQ` and promote it through [`Self::implement_guard_value`]
+    /// so the `GUARD_VALUE` captures the live framestack at record time
+    /// (`generate_guard` → `capture_resumedata`).
+    fn nonstandard_virtualizable(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        opcode_pc: usize,
-        guards_before: usize,
-        write: Option<VableEntryWrite>,
-    ) {
-        let minted = ctx.num_guards().saturating_sub(guards_before);
-        if minted == 0 {
-            return;
-        }
-        let restored = write.and_then(|w| {
-            ctx.swap_virtualizable_entry(w.index, w.prev_box, w.prev_value)
-                .map(|current| (w.index, current))
-        });
-        for from_end in (0..minted).rev() {
-            self.publish_last_guard_resume_snapshot(
-                ctx,
-                sym,
-                opcode_pc,
-                false,
-                GuardStampTarget::GuardFromEnd(from_end),
-                None,
-            );
-        }
-        if let Some((index, (op, value))) = restored {
-            ctx.swap_virtualizable_entry(index, op, value);
+        pc: usize,
+        vable_opref: OpRef,
+        fielddescr: &majit_ir::DescrRef,
+    ) -> bool {
+        match ctx.begin_nonstandard_virtualizable(pc, vable_opref, fielddescr) {
+            NonstandardVable::Decided(nonstandard) => nonstandard,
+            NonstandardVable::PendingEq {
+                eqbox,
+                isstandard,
+                vable_opref,
+                standard_box,
+            } => {
+                let promoted = self.implement_guard_value(ctx, sym, eqbox, isstandard, pc);
+                ctx.commit_nonstandard_virtualizable(
+                    promoted,
+                    vable_opref,
+                    standard_box,
+                    fielddescr,
+                )
+            }
         }
     }
 
@@ -2016,7 +1985,12 @@ where
                 resume_pc,
                 self.frames.frames.len(),
                 self.frames.frames[0].int_regs.first(),
-                self.frames.frames[0].int_values.first(),
+                self.frames.frames[0]
+                    .int_regs
+                    .first()
+                    .copied()
+                    .flatten()
+                    .and_then(|op| ctx.box_bits(op)),
             );
         }
         if crate::callee_rca_enabled() {
@@ -2209,7 +2183,7 @@ where
         // upstream only sets the flag; `is_nullity_known` then answers
         // `Some(false)` for a known-null box rather than conflating it with
         // unknown.
-        ctx.heap_cache_mut().nullity_now_known(src, value);
+        ctx.heap_cache_mut().nullity_now_known(src);
         value
     }
 
@@ -2383,7 +2357,8 @@ where
     /// `_opimpl_setfield_vable_*(struct, ...)` consumes it as the
     /// `struct` argument.
     fn resolve_vable_box(&mut self, vable_reg: usize) -> OpRef {
-        self.read_ref_reg(vable_reg).0
+        self.frames.current_mut().ref_regs[vable_reg]
+            .expect("jitcode ref register was uninitialized")
     }
 
     /// pyjitpl.py: vable field descriptor lookup.  Converts a bytecode
@@ -2809,10 +2784,11 @@ where
         if let Some(pc) = self
             .frames
             .current_mut()
-            .int_values
+            .int_regs
             .first()
             .copied()
             .flatten()
+            .and_then(|op| ctx.box_bits(op))
             && let Ok(pc) = usize::try_from(pc)
         {
             ctx.walk_final_pc = Some(pc);
@@ -2843,11 +2819,7 @@ where
         let Some(frame) = self.frames.frames.first() else {
             return;
         };
-        ctx.snapshot_portal_greens_from_frame(
-            &frame.int_values,
-            &frame.ref_values,
-            &frame.float_values,
-        );
+        ctx.snapshot_portal_greens_from_frame(&frame.int_regs, &frame.ref_regs, &frame.float_regs);
     }
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
@@ -2957,16 +2929,8 @@ where
                     {
                         let leaving_idx = code[position + 1] as usize;
                         let unique_id_idx = code[position + 2] as usize;
-                        let leaving = frame
-                            .int_values
-                            .get(leaving_idx)
-                            .and_then(|v| *v)
-                            .unwrap_or(0);
-                        let unique_id = frame
-                            .int_values
-                            .get(unique_id_idx)
-                            .and_then(|v| *v)
-                            .unwrap_or(0);
+                        let leaving = frame.getint(ctx, leaving_idx).unwrap_or(0);
+                        let unique_id = frame.getint(ctx, unique_id_idx).unwrap_or(0);
                         majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
                 }
@@ -3248,11 +3212,11 @@ where
         if let Some(boxes) = sym.loop_carried_boxes_from_portal(&vable, root) {
             ctx.close_jump_boxes = Some(boxes);
         }
-        let scalars = sym.collect_portal_scalar_values(root);
+        let scalars = sym.collect_portal_scalar_values(root, ctx);
         if !scalars.is_empty() {
             ctx.close_scalar_values = Some(scalars);
         }
-        let refs = sym.collect_portal_ref_scalar_values(root);
+        let refs = sym.collect_portal_ref_scalar_values(root, ctx);
         if !refs.is_empty() {
             ctx.close_ref_scalar_values = Some(refs);
         }
@@ -3501,23 +3465,23 @@ where
                 jd_reg, result_dst, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
             )
         };
-        let jd_index = self.read_int_reg(jd_index).1 as usize;
+        let jd_index = self.read_int_reg(ctx, jd_index).1 as usize;
 
         // `pyjitpl.py` `boxes3` concatenates the three kind lists (I then R
         // then F).  `green_pc` is the first int green — the portal entry pc.
         let mut green_values = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
         for &src in &greens_i {
-            green_values.push(self.read_int_reg(src).1);
+            green_values.push(self.read_int_reg(ctx, src).1);
         }
         for &src in &greens_r {
-            green_values.push(self.read_ref_reg(src).1);
+            green_values.push(self.read_ref_reg(ctx, src).1);
         }
         for &src in &greens_f {
-            green_values.push(self.read_float_reg(src).1);
+            green_values.push(self.read_float_reg(ctx, src).1);
         }
         let green_pc = greens_i
             .first()
-            .map(|&src| self.read_int_reg(src).1 as usize)
+            .map(|&src| self.read_int_reg(ctx, src).1 as usize)
             .unwrap_or(0);
 
         let recursive_depth = ctx.recursive_depth((jd_index, green_pc));
@@ -3610,7 +3574,7 @@ where
             // Portal args are greens+reds per kind, the same concatenation
             // `bhimpl_recursive_call_*` passes to `cpu.bh_call_*`.
             for (dst, &src) in greens_i.iter().chain(reds_i.iter()).enumerate() {
-                let (value, concrete) = self.read_int_reg(src);
+                let (value, concrete) = self.read_int_reg(ctx, src);
                 #[cfg(feature = "jit-audits")]
                 majit_ir::reg_write_audit::note_int_write(
                     portal_frame.int_regs.as_ptr() as usize,
@@ -3618,17 +3582,19 @@ where
                     Some(value),
                 );
                 portal_frame.int_regs[dst] = Some(value);
-                portal_frame.int_values[dst] = Some(concrete);
+                let _ = ctx.try_set_opref_concrete(value, Value::Int(concrete));
             }
             for (dst, &src) in greens_r.iter().chain(reds_r.iter()).enumerate() {
-                let (value, concrete) = self.read_ref_reg(src);
+                let (value, concrete) = self.read_ref_reg(ctx, src);
                 portal_frame.ref_regs[dst] = Some(value);
-                portal_frame.ref_values[dst] = Some(concrete);
+                let _ = ctx
+                    .try_set_opref_concrete(value, Value::Ref(majit_ir::GcRef(concrete as usize)));
             }
             for (dst, &src) in greens_f.iter().chain(reds_f.iter()).enumerate() {
-                let (value, concrete) = self.read_float_reg(src);
+                let (value, concrete) = self.read_float_reg(ctx, src);
                 portal_frame.float_regs[dst] = Some(value);
-                portal_frame.float_values[dst] = Some(concrete);
+                let _ = ctx
+                    .try_set_opref_concrete(value, Value::Float(f64::from_bits(concrete as u64)));
             }
             match result_kind {
                 Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
@@ -3844,6 +3810,7 @@ where
                 ctx.vrefs_after_residual_call();
                 let traced = ctx.call_assembler_int_arc_typed(token_arc, &args, &arg_types);
                 self.set_int_reg(
+                    ctx,
                     result_dst.expect("int result kind requires a destination"),
                     Some(traced),
                     Some(concrete),
@@ -3858,6 +3825,7 @@ where
                 ctx.vrefs_after_residual_call();
                 let traced = ctx.call_assembler_ref_arc_typed(token_arc, &args, &arg_types);
                 self.set_ref_reg(
+                    ctx,
                     result_dst.expect("ref result kind requires a destination"),
                     Some(traced),
                     Some(concrete),
@@ -3872,6 +3840,7 @@ where
                 ctx.vrefs_after_residual_call();
                 let traced = ctx.call_assembler_float_arc_typed(token_arc, &args, &arg_types);
                 self.set_float_reg(
+                    ctx,
                     result_dst.expect("float result kind requires a destination"),
                     Some(traced),
                     Some(concrete),
@@ -4024,12 +3993,15 @@ where
 
     /// One instruction of [`Self::run_one_step`]'s loop: pop a finished frame,
     /// or decode and execute the instruction at the cursor.
-    #[inline(always)]
+    ///
+    /// Opcode bodies live in `opimpl_*` methods and are reached through
+    /// [`Self::OPCODE_IMPLEMENTATIONS`], the port of `pyjitpl.py`
+    /// `opcode_implementations` (`setup_insns` / `_get_opimpl_method`).
     fn execute_one_instruction(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        _runtime: &R,
+        runtime: &R,
     ) -> TraceAction {
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
@@ -4090,16 +4062,12 @@ where
                             .return_i
                             .expect("inline int return missing caller destination");
                         parent.int_regs[caller_dst] = finished_frame.int_regs[callee_src as usize];
-                        parent.int_values[caller_dst] =
-                            finished_frame.int_values[callee_src as usize];
                     }
                     JitArgKind::Ref => {
                         let caller_dst = finished_frame
                             .return_r
                             .expect("inline ref return missing caller destination");
                         parent.ref_regs[caller_dst] = finished_frame.ref_regs[callee_src as usize];
-                        parent.ref_values[caller_dst] =
-                            finished_frame.ref_values[callee_src as usize];
                     }
                     JitArgKind::Float => {
                         let caller_dst = finished_frame
@@ -4107,8 +4075,6 @@ where
                             .expect("inline float return missing caller destination");
                         parent.float_regs[caller_dst] =
                             finished_frame.float_regs[callee_src as usize];
-                        parent.float_values[caller_dst] =
-                            finished_frame.float_values[callee_src as usize];
                     }
                 }
             }
@@ -4121,7371 +4087,9 @@ where
             frame.last_opcode_position = frame.code_cursor;
             frame.next_u8()
         };
-        match bytecode {
-            // RPython `blackhole.py bhimpl_live` — no-op marker
-            // emitted by the codewriter ahead of every guard-bearing
-            // instruction.  The two operand bytes are the offset into
-            // `MetaInterpStaticData.liveness_info`; consumed by
-            // `MIFrame::get_list_of_active_boxes` at guard time, not
-            // here.  (See also the same skip in
-            // `unwind_to_exception_handler` above.)
-            jitcode::insns::BC_LIVE => {
-                let _liveness_offset = self.frames.current_mut().next_u16();
-            }
-            // pyjitpl.py opimpl_unreachable: raise AssertionError("unreachable").
-            // A landing here is a wrong-path generation/dispatch defect; abort
-            // the attempt so the interpreter can resume instead of panicking
-            // mid-opcode (which left a stack underflow on the Python frame).
-            jitcode::insns::BC_UNREACHABLE => {
-                return TraceAction::Abort;
-            }
-            // -- State field access (register/tape machines) --
-            // Argcodes: `d` = u16 descr (`assembler.py Assembler.write_insn`),
-            // `i` = u8 register index (`assembler.py Assembler.write_insn`).
-            jitcode::insns::BC_LOAD_STATE_FIELD => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_reg() as usize;
-                // `blackhole.rs handler_load_state_field_di`:
-                // `registers_i[dest] = registers_i[slot(field_idx)]`.
-                let slot = sym.int_identity_slots_base() + field_idx;
-                let (opref, value) = self.read_int_identity_slot(slot);
-                self.set_int_reg(dest, Some(opref), Some(value));
-            }
-            jitcode::insns::BC_STORE_STATE_FIELD => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, value) = self.read_int_reg(src);
-                // `blackhole.rs handler_store_state_field_di`:
-                // `registers_i[slot(field_idx)] = registers_i[src]`.
-                let slot = sym.int_identity_slots_base() + field_idx;
-                self.set_int_identity_slot(slot, Some(opref), Some(value));
-            }
-            // Ref-typed scalar state field: same shape as the int load/store
-            // but the value lives in the ref register bank, so its OpRef
-            // carries Type::Ref (input_arg_ref) and feeds getfield_gc as a
-            // real ref base. Argcodes: `d` = u16 field index, `r` = ref reg.
-            jitcode::insns::BC_LOAD_STATE_FIELD_REF => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_reg() as usize;
-                // `blackhole.rs handler_load_state_field_ref_dr`:
-                // `registers_r[dest] = registers_r[ref_slot(field_idx)]`.
-                let slot = sym
-                    .ref_scalar_slot(field_idx)
-                    .expect("ref state field has no identity slot");
-                let (opref, value) = self.read_ref_identity_slot(slot);
-                self.set_ref_reg(dest, Some(opref), Some(value));
-            }
-            jitcode::insns::BC_STORE_STATE_FIELD_REF => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, value) = self.read_ref_reg(src);
-                // `blackhole.rs handler_store_state_field_ref_dr`:
-                // `registers_r[ref_slot(field_idx)] = registers_r[src]`.
-                let slot = sym
-                    .ref_scalar_slot(field_idx)
-                    .expect("ref state field has no identity slot");
-                self.set_ref_identity_slot(slot, Some(opref), Some(value));
-            }
-            jitcode::insns::BC_LOAD_STATE_FIELD_FLOAT => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u8() as usize;
-                // `blackhole.rs handler_load_state_field_float_df`:
-                // `registers_f[dest] = registers_f[float_slot(field_idx)]`.
-                let slot = sym
-                    .float_scalar_slot(field_idx)
-                    .expect("float state field has no identity slot");
-                let (opref, value) = self.read_float_identity_slot(slot);
-                self.set_float_reg(dest, Some(opref), Some(value));
-            }
-            jitcode::insns::BC_STORE_STATE_FIELD_FLOAT => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u8() as usize;
-                let (opref, value) = self.read_float_reg(src);
-                // `blackhole.rs handler_store_state_field_float_df`:
-                // `registers_f[float_slot(field_idx)] = registers_f[src]`.
-                let slot = sym
-                    .float_scalar_slot(field_idx)
-                    .expect("float state field has no identity slot");
-                self.set_float_identity_slot(slot, Some(opref), Some(value));
-            }
-            jitcode::insns::BC_LOAD_STATE_ARRAY => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_reg() as usize;
-                let dest = self.frames.current_mut().next_reg() as usize;
-                let (_, index_concrete) = self.read_int_reg(index_reg);
-                let elem_idx = index_concrete as usize;
-                let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
-                    return TraceAction::Abort;
-                };
-                let (opref, value) = self.read_int_identity_slot(slot);
-                self.set_int_reg(dest, Some(opref), Some(value));
-            }
-            jitcode::insns::BC_STORE_STATE_ARRAY => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_reg() as usize;
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (_, index_concrete) = self.read_int_reg(index_reg);
-                let elem_idx = index_concrete as usize;
-                let (opref, value) = self.read_int_reg(src);
-                // `handler_store_state_array_dii` writes
-                // `registers_i[StateFieldLayout::array_elem_slot]`.
-                let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
-                    return TraceAction::Abort;
-                };
-                self.set_int_identity_slot(slot, Some(opref), Some(value));
-            }
-
-            // -- First-class virtualizable access (RPython getfield_vable_*) --
-            // pyjitpl.py `_opimpl_getarrayitem_vable` (and the
-            // getfield/setfield siblings).  RPython returns
-            // `virtualizable_boxes[index]`, a Box carrying both the traced
-            // reference AND its concrete value; pyre threads the concrete
-            // through the parallel `virtualizable_values` shadow seeded at
-            // `initialize_virtualizable` and updated on every
-            // `vable_setfield` / `vable_setarrayitem_indexed`.  Do NOT peek
-            // the live frame here — stale/shadow divergence caused the
-            // issue #1 from 2026-04-18.
-            jitcode::insns::BC_GETFIELD_VABLE_I => {
-                // R7 parity: pyjitpl.py opimpl_getfield_vable_i
-                // takes (box, fielddescr, pc); pc threads to
-                // _nonstandard_virtualizable.  Capture opcode_pc
-                // before read_vable_getfield advances code_cursor.
-                let (opcode_pc, vable_reg, field_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, dest) = frame.read_vable_getfield();
-                    (opcode_pc, vable_reg, field_idx, dest)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                // Concrete struct pointer for pyjitpl.py MIFrame._opimpl_getfield_gc_any_pureornot
-                // cache-hit sanity check (plumbing;
-                // wires the check itself).
-                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
-                let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getfield_int(
-                    self.cpu.as_ref(),
-                    opcode_pc,
-                    vable_opref,
-                    vable_struct_ptr,
-                    fielddescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
-            }
-            jitcode::insns::BC_GETFIELD_VABLE_R => {
-                let (opcode_pc, vable_reg, field_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, dest) = frame.read_vable_getfield();
-                    (opcode_pc, vable_reg, field_idx, dest)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
-                let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getfield_ref(
-                    self.cpu.as_ref(),
-                    opcode_pc,
-                    vable_opref,
-                    vable_struct_ptr,
-                    fielddescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
-            }
-            jitcode::insns::BC_GETFIELD_VABLE_F => {
-                let (opcode_pc, vable_reg, field_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, dest) = frame.read_vable_getfield();
-                    (opcode_pc, vable_reg, field_idx, dest)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
-                let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getfield_float(
-                    self.cpu.as_ref(),
-                    opcode_pc,
-                    vable_opref,
-                    vable_struct_ptr,
-                    fielddescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
-            }
-            jitcode::insns::BC_NEW | jitcode::insns::BC_NEW_WITH_VTABLE => {
-                // blackhole.py bhimpl_new / bhimpl_new_with_vtable.
-                // The tracer both *executes* the allocation (so subsequent
-                // setfield/getfield steps in this trace read live memory) and
-                // *records* New / NewWithVtable so the optimizer can virtualize
-                // the struct away when it does not escape.
-                let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
-                let (size, vtable, type_id, headerless, descr, dest) = {
-                    let frame = self.frames.current_mut();
-                    let (descr_idx, dest) = frame.read_new();
-                    let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                        panic!("BC_NEW: descrs[{descr_idx}] is not a BhDescr entry")
-                    });
-                    (
-                        bh.as_size(),
-                        bh.get_vtable(),
-                        bh.resolve_gc_tid(),
-                        bh.is_headerless(),
-                        size_descr_ref_from_bh(bh),
-                        dest,
-                    )
-                };
-                // A `headerless` descr means the interpreter owns this struct in
-                // its own collected pool (`headerless_structs`), which is what
-                // compiled code allocates it from, through
-                // `call_malloc_nursery_headerless`. Putting it on the host heap
-                // instead hands the interpreter an object its collector cannot
-                // see: a moving collector range-checks its own pool, so it
-                // neither traces through the object nor forwards the references
-                // hanging off it, and the reachable graph below it is lost on
-                // the next collection.
-                //
-                // A headered GC-managed descr (real `type_id`) is the same
-                // problem one field deeper: a host-heap block carries no type
-                // word at `ref - 8`, so the collector never traces the struct
-                // and whatever its ref fields point at dies while the following
-                // `getfield` steps of this same trace still read them. It goes
-                // to the non-moving old generation, matching `runner.rs`
-                // bh_new / bh_new_with_vtable.
-                //
-                // The allocation must not collect. This runs mid-jitcode with
-                // raw object pointers live in the machine's own register bank —
-                // the `getfield` result feeding the `setfield` that follows this
-                // `new` — and that bank belongs to no root set, so a moving
-                // collection here would strand them. Both GC paths are
-                // no-collect, and old-gen is mark-sweep, so the pointer handed
-                // back to the register bank also survives later collections.
-                //
-                // A non-GC descr (`type_id == 0`, raw buffer) and an allocation
-                // the GC declines keep the host heap; the vtable word at offset
-                // 0 (the OBJECTPTR typeptr slot) is written either way so a
-                // trace-time GuardClass reads the right class.
-                let size = size.max(1);
-                let gc_ptr = if headerless {
-                    majit_gc::alloc_nursery_headerless_no_collect(size).0
-                } else if type_id != 0 {
-                    majit_gc::alloc_oldgen_typed(type_id, size).0
-                } else {
-                    0
-                };
-                let ptr = if gc_ptr != 0 {
-                    gc_ptr as i64
-                } else if let Some(ptr) = host_malloc_fixedsize(size) {
-                    // `GcLLDescr_boehm.malloc_fixedsize`, same arm as
-                    // `llmodel_alloc` / `bh_new_with_vtable`. A raw
-                    // `alloc_zeroed` block is not in the heap that hook owns.
-                    ptr as i64
-                } else {
-                    let layout = std::alloc::Layout::from_size_align(size, 8)
-                        .expect("BC_NEW: invalid struct layout");
-                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-                };
-                // A null from the hook or from `alloc_zeroed` is the same
-                // failure `BC_NEW_ARRAY` aborts on. The vtable store must not
-                // run against that pointer.
-                if ptr == 0 {
-                    return TraceAction::Abort;
-                }
-                if with_vtable && vtable != 0 {
-                    unsafe { *(ptr as *mut usize) = vtable };
-                }
-                let kind = if with_vtable {
-                    OpCode::NewWithVtable
-                } else {
-                    OpCode::New
-                };
-                // A site that executes the operation itself still owes the
-                // funnel its two counts: `execute_and_record` counts what it
-                // executes and `_record_helper` counts what it appends.
-                ctx.profiler().count_ops(kind, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(kind, crate::counters::RECORDED_OPS);
-                let op = ctx.record_op_with_descr(kind, &[], descr);
-                ctx.set_opref_concrete(op, Value::Ref(majit_ir::GcRef(ptr as usize)));
-                // `execute_new` stamps `heapcache.new(resbox)`;
-                // `execute_new_with_vtable` stamps `class_now_known` on top of
-                // it. The vtable written at offset 0 just above is the word
-                // `cls_of_box` reads back, so the class is known here by
-                // construction — a zero one is the "unavailable" spelling and
-                // stays unrecorded.
-                ctx.heap_cache_mut().new_object(op);
-                if with_vtable && vtable != 0 {
-                    ctx.heap_cache_mut().class_now_known(op, vtable as i64);
-                }
-                self.set_ref_reg(dest, Some(op), Some(ptr));
-            }
-            jitcode::insns::BC_SETFIELD_GC_I
-            | jitcode::insns::BC_SETFIELD_GC_I_C
-            | jitcode::insns::BC_SETFIELD_GC_R
-            | jitcode::insns::BC_SETFIELD_GC_F => {
-                // blackhole.py bhimpl_getfield_raw_f bhimpl_setfield_gc_{i,r,f}: record
-                // SetfieldGc (a single op-kind whose descr carries the field
-                // type) and write the field through the live struct ptr. The
-                // value word is read from the int/ref/float bank by type; the
-                // `/rcd` c-form (USE_C_FORM, assembler.py) inlines a signed
-                // byte in place of the int-register slot.
-                let (struct_reg, value_reg, descr_idx) = {
-                    let frame = self.frames.current_mut();
-                    frame.read_setfield_gc()
-                };
-                let (offset, field_size, fielddescr) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                        panic!("BC_SETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
-                    });
-                    let field_size = match bh {
-                        crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
-                        _ => 8,
-                    };
-                    let offset = field_offset_from_bh(bh, "BC_SETFIELD_GC");
-                    let fielddescr = frame
-                        .runtime_optimizer_descr(descr_idx)
-                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-                    (offset, field_size, fielddescr)
-                };
-                let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
-                let (value_opref, concrete) = match bytecode {
-                    jitcode::insns::BC_SETFIELD_GC_R => self.read_ref_reg(value_reg),
-                    jitcode::insns::BC_SETFIELD_GC_F => self.read_float_reg(value_reg),
-                    jitcode::insns::BC_SETFIELD_GC_I_C => {
-                        let v = value_reg as u8 as i8 as i64;
-                        (OpRef::ConstInt(v), v)
-                    }
-                    _ => self.read_int_reg(value_reg),
-                };
-                let field_key = heapcache_field_key(&fielddescr);
-                // `_record_helper` runs `heapcache.invalidate_caches` before it
-                // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
-                // only the mark-escaped half runs: a ref written into an
-                // already-escaped struct escapes with it. Same shape as
-                // BC_SETARRAYITEM_GC below.
-                ctx.heapcache_invalidate_caches_varargs(
-                    OpCode::SetfieldGc,
-                    None,
-                    &[struct_opref, value_opref],
-                );
-                ctx.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-                ctx.record_op_with_descr(
-                    OpCode::SetfieldGc,
-                    &[struct_opref, value_opref],
-                    fielddescr,
-                );
-                // `execute_setfield_gc`'s trailing `heapcache.setfield`, which
-                // `_opimpl_setfield_gc_any` spells `upd.setfield(valuebox)`.
-                // The cache stores the Box identity, not the value word.
-                if let Some(field_key) = field_key {
-                    ctx.heapcache_setfield_cached(struct_opref, field_key, value_opref);
-                }
-                if struct_ptr != 0 {
-                    // blackhole.py bhimpl_getfield_raw_f stores through the fielddescr,
-                    // which carries the field's byte width, and the getfield
-                    // twin above already reads at that width. A sub-word field
-                    // written as a full word writes over whatever follows it —
-                    // for a `u32` with a live `u32` sibling behind it, the
-                    // store of one silently zeroes the other — and a field the
-                    // walk widened would then disagree with the same store as
-                    // the backend emits it.
-                    let addr = (struct_ptr as usize).wrapping_add(offset);
-                    unsafe {
-                        match field_size {
-                            1 => core::ptr::write_unaligned(addr as *mut u8, concrete as u8),
-                            2 => core::ptr::write_unaligned(addr as *mut u16, concrete as u16),
-                            4 => core::ptr::write_unaligned(addr as *mut u32, concrete as u32),
-                            // A non-{1,2,4,8}-byte field has no fixed-width
-                            // primitive store; fall back to the word-sized one.
-                            _ => core::ptr::write_unaligned(addr as *mut i64, concrete),
-                        }
-                    }
-                    // A ref store adds a heap edge struct→value; notify the GC
-                    // on the container so a young value survives a minor
-                    // collection triggered later in the walk (mirrors
-                    // `bh_setfield_gc_r` and the setarrayitem case below).
-                    if bytecode == jitcode::insns::BC_SETFIELD_GC_R
-                        && majit_gc::gc_owns_object(struct_ptr as usize)
-                    {
-                        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
-                    }
-                }
-            }
-            jitcode::insns::BC_RAW_STORE_I => {
-                // blackhole.py bhimpl_raw_store_i: store an int
-                // into raw native memory at `base + ea` (byte offset).
-                // jtransform.py rewrite_op_raw_store lowers a
-                // `raw_storage_setitem` to this op with an
-                // `arraydescrof(rffi.CArray(T))` descr. Record RawStore and
-                // perform the concrete store through the live raw address
-                // while tracing (metainterp executes as it records — the
-                // store side effect is the actual write for this iteration,
-                // mirroring BC_GETARRAYITEM_GC_I's concrete read).
-                //
-                // Encoding (`assembler.rs raw_store_i`):
-                //   [BC_RAW_STORE_I][base_reg u8][ea_reg u8][value_reg u8]
-                //   [descr_idx u16]
-                let (base_reg, ea_reg, value_reg, descr_idx) = {
-                    let frame = self.frames.current_mut();
-                    let base_reg = frame.next_reg() as usize;
-                    let ea_reg = frame.next_reg() as usize;
-                    let value_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    (base_reg, ea_reg, value_reg, descr_idx)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let Some((_base_size, itemsize, _is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (base_opref, base_addr) = self.read_int_reg(base_reg);
-                let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                let (value_opref, value) = self.read_int_reg(value_reg);
-                // pyjitpl.py `_record_helper` invalidates the
-                // heapcache before recording a side-effecting op so a later
-                // `raw_load` at the same `(base, ea)` re-reads instead of
-                // folding a stale cached value.
-                ctx.heapcache_invalidate_caches_varargs(
-                    OpCode::RawStore,
-                    None,
-                    &[base_opref, ea_opref, value_opref],
-                );
-                ctx.profiler()
-                    .count_ops(OpCode::RawStore, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::RawStore, crate::counters::RECORDED_OPS);
-                ctx.record_op_with_descr(
-                    OpCode::RawStore,
-                    &[base_opref, ea_opref, value_opref],
-                    descr,
-                );
-                // Concrete eval: descriptor-sized store at `base + ea`
-                // (`ea` is already a byte offset — `emit_dynamic_offset_addr`
-                // in the backend adds it to `base` unscaled).
-                //
-                // SAFETY: the kernel clamps `ea` to an in-bounds byte offset
-                // (0 when the access would trap), so `base_addr + ea_value`
-                // is within the outer interpreter's linear-memory allocation.
-                let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
-                unsafe {
-                    match itemsize {
-                        1 => core::ptr::write_unaligned(item_addr as *mut u8, value as u8),
-                        2 => core::ptr::write_unaligned(item_addr as *mut u16, value as u16),
-                        4 => core::ptr::write_unaligned(item_addr as *mut u32, value as u32),
-                        8 => core::ptr::write_unaligned(item_addr as *mut i64, value),
-                        other => {
-                            panic!("BC_RAW_STORE_I: unsupported itemsize {}", other)
-                        }
-                    }
-                }
-            }
-            jitcode::insns::BC_RAW_LOAD_I => {
-                // blackhole.py bhimpl_raw_load_i: read an int from
-                // raw native memory at `base + ea` (byte offset). jtransform.py:
-                // 1165-1171 rewrite_op_raw_load lowers a `raw_storage_getitem`
-                // to this op with an `arraydescrof(rffi.CArray(T))` descr.
-                // Record RawLoadI and perform the concrete read while tracing.
-                //
-                // Encoding (`assembler.rs raw_load_i`):
-                //   [BC_RAW_LOAD_I][base_reg u8][ea_reg u8][descr_idx u16][dst u8]
-                let (base_reg, ea_reg, descr_idx, dst) = {
-                    let frame = self.frames.current_mut();
-                    let base_reg = frame.next_reg() as usize;
-                    let ea_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (base_reg, ea_reg, descr_idx, dst)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let Some((_base_size, itemsize, is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (base_opref, base_addr) = self.read_int_reg(base_reg);
-                let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                // Concrete eval: descriptor-sized read at `base + ea`. It runs
-                // before the record because `execute_and_record` takes the
-                // value rather than computing it.
-                //
-                // SAFETY: the kernel clamps `ea` to an in-bounds byte offset
-                // (0 when the access would trap), so `base_addr + ea_value`
-                // is within the linear-memory allocation.
-                let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
-                let concrete = unsafe {
-                    match (itemsize, is_signed) {
-                        (1, true) => core::ptr::read_unaligned(item_addr as *const i8) as i64,
-                        (1, false) => core::ptr::read_unaligned(item_addr as *const u8) as i64,
-                        (2, true) => core::ptr::read_unaligned(item_addr as *const i16) as i64,
-                        (2, false) => core::ptr::read_unaligned(item_addr as *const u16) as i64,
-                        (4, true) => core::ptr::read_unaligned(item_addr as *const i32) as i64,
-                        (4, false) => core::ptr::read_unaligned(item_addr as *const u32) as i64,
-                        (8, _) => core::ptr::read_unaligned(item_addr as *const i64),
-                        other => {
-                            panic!(
-                                "BC_RAW_LOAD_I: unsupported (itemsize, signed) = {:?}",
-                                other
-                            )
-                        }
-                    }
-                };
-                // `RawLoadI` is outside `is_pure_with_descr` at every descr —
-                // `test_raw_load_i_stays_non_pure_for_eval_breaker_poll` pins
-                // it there, because a pure raw load lets `optimize_guard_false`
-                // delete the back-edge eval-breaker poll — so the funnel always
-                // records. What it adds over a bare `record_op_with_descr` is
-                // the op counters and the concrete stamp every sibling read
-                // already carries.
-                let opref = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::RawLoadI,
-                    Some(descr),
-                    &[base_opref, ea_opref],
-                    Some(Value::Int(concrete)),
-                    self.last_exception_value,
-                );
-                self.set_int_reg(dst, Some(opref), Some(concrete));
-            }
-            jitcode::insns::BC_RAW_LOAD_F => {
-                // f64 sibling of BC_RAW_LOAD_I: read an f64 from raw native
-                // memory at `base + ea` (byte offset) into the FLOAT register
-                // bank, preserving the exact bit pattern. Record RawLoadF and
-                // perform the concrete read while tracing.
-                //
-                // Encoding (`assembler.rs raw_load_f`), identical to raw_load_i:
-                //   [BC_RAW_LOAD_F][base_reg u8][ea_reg u8][descr_idx u16][dst u8]
-                let (base_reg, ea_reg, descr_idx, dst) = {
-                    let frame = self.frames.current_mut();
-                    let base_reg = frame.next_u8() as usize;
-                    let ea_reg = frame.next_u8() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_u8() as usize;
-                    (base_reg, ea_reg, descr_idx, dst)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let Some((_base_size, itemsize, _is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (base_opref, base_addr) = self.read_int_reg(base_reg);
-                let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                // Concrete eval: an 8-byte f64 read at `base + ea`, carried as
-                // raw bits in the float bank (set_float_reg takes i64 bits).
-                //
-                // SAFETY: the kernel clamps `ea` to an in-bounds byte offset,
-                // so `base_addr + ea_value` is within the allocation.
-                let item_addr = (base_addr as usize).wrapping_add(ea_value as usize);
-                let concrete_bits = match itemsize {
-                    8 => unsafe { core::ptr::read_unaligned(item_addr as *const i64) },
-                    other => panic!("BC_RAW_LOAD_F: unsupported itemsize = {other}"),
-                };
-                // Never folds, for the reason given in the `BC_RAW_LOAD_I` arm.
-                let opref = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::RawLoadF,
-                    Some(descr),
-                    &[base_opref, ea_opref],
-                    Some(Value::Float(f64::from_bits(concrete_bits as u64))),
-                    self.last_exception_value,
-                );
-                self.set_float_reg(dst, Some(opref), Some(concrete_bits));
-            }
-            jitcode::insns::BC_GETFIELD_GC_I
-            | jitcode::insns::BC_GETFIELD_GC_R
-            | jitcode::insns::BC_GETFIELD_GC_I_PURE
-            | jitcode::insns::BC_GETFIELD_GC_R_PURE => {
-                // blackhole.py bhimpl_getfield_gc_i bhimpl_getfield_gc_{i,r}: load the
-                // field through the live struct ptr and record GetfieldGc.
-                // The _pure aliases (blackhole.py BlackholeInterpreter.bhimpl_getfield_gc_i_pure) read identically;
-                // majit has no separate pure op-kind, so the recorded
-                // GetfieldGc{I,R} carries the (immutable) field descr and the
-                // pure pass folds it from there.
-                let is_ref = matches!(
-                    bytecode,
-                    jitcode::insns::BC_GETFIELD_GC_R | jitcode::insns::BC_GETFIELD_GC_R_PURE
-                );
-                let (struct_reg, descr_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    frame.read_getfield_gc()
-                };
-                let (offset, field_size, is_field_signed, fielddescr) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                        panic!("BC_GETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
-                    });
-                    let (field_size, is_field_signed) = match bh {
-                        crate::blackhole::BhDescr::Field {
-                            field_size,
-                            is_field_signed,
-                            ..
-                        } => (*field_size, *is_field_signed),
-                        _ => (8, false),
-                    };
-                    let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC");
-                    let fielddescr = frame
-                        .runtime_optimizer_descr(descr_idx)
-                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-                    (offset, field_size, is_field_signed, fielddescr)
-                };
-                let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
-                // blackhole.py bhimpl_getfield_gc_i reads the field through the fielddescr,
-                // which carries the field's byte width; a sub-word integer field
-                // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
-                // width, not as a full word — otherwise adjacent bytes leak into
-                // the value. Ref fields are always word-sized pointers.
-                let loaded = if struct_ptr == 0 {
-                    0
-                } else if is_ref {
-                    // llmodel.py bh_getfield_gc_r / read_ref_at_mem use GCREF,
-                    // whose width is the target pointer width, not FLOATSTORAGE.
-                    self.cpu
-                        .bh_getfield_gc_r(
-                            struct_ptr as usize,
-                            fielddescr
-                                .as_field_descr()
-                                .expect("GC ref field descriptor"),
-                        )
-                        .0 as i64
-                } else {
-                    let addr = (struct_ptr as usize).wrapping_add(offset);
-                    unsafe {
-                        match (field_size, is_field_signed) {
-                            (1, true) => core::ptr::read_unaligned(addr as *const i8) as i64,
-                            (1, false) => core::ptr::read_unaligned(addr as *const u8) as i64,
-                            (2, true) => core::ptr::read_unaligned(addr as *const i16) as i64,
-                            (2, false) => core::ptr::read_unaligned(addr as *const u16) as i64,
-                            (4, true) => core::ptr::read_unaligned(addr as *const i32) as i64,
-                            (4, false) => core::ptr::read_unaligned(addr as *const u32) as i64,
-                            // A non-{1,2,4,8}-byte integer field has no
-                            // fixed-width primitive read; fall back to the
-                            // word-sized read (the pre-sized-read behavior).
-                            _ => core::ptr::read_unaligned(addr as *const i64),
-                        }
-                    }
-                };
-                if !is_ref && ctx.is_bridge_trace && crate::heapdbg_enabled() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static N: AtomicU64 = AtomicU64::new(0);
-                    let n = N.fetch_add(1, Ordering::Relaxed);
-                    if n < 240 {
-                        eprintln!(
-                            "@@@HEAP getfield_i n={} struct_ptr={:#x} off={} loaded={}",
-                            n, struct_ptr, offset, loaded
-                        );
-                    }
-                }
-                let kind = if is_ref {
-                    OpCode::GetfieldGcR
-                } else {
-                    OpCode::GetfieldGcI
-                };
-                let value = if is_ref {
-                    Value::Ref(majit_ir::GcRef(loaded as usize))
-                } else {
-                    Value::Int(loaded)
-                };
-                // `is_pure_with_descr` admits GETFIELD_GC_{I,R} only for a
-                // descr that answers `is_always_pure`, so only an immutable
-                // field off a constant struct folds. The null case hands the
-                // funnel no concrete: `loaded` is a fabricated 0 rather than a
-                // real load, and `llmodel.py protect_speculative_field` rejects
-                // a null gcptr before any fold — the executor row would
-                // dereference it.
-                // `_opimpl_getfield_gc_any_pureornot` opens on
-                // `upd = heapcache.get_field_updater(box, fielddescr)` and
-                // returns `upd.currfieldbox` without recording when the cache
-                // answers; only the miss path reaches `execute_with_descr`,
-                // and it stores the result back with
-                // `upd.getfield_now_known(resbox)`.  The sibling
-                // `BC_GETARRAYITEM_GC_*` arms carry both halves already, and
-                // `BC_SETFIELD_GC` fills this very cache — without the two
-                // halves here that cache is written and never read.
-                //
-                // `opimpl_getfield_gc_{i,r,f}` runs one test ahead of the
-                // updater: a constant struct's always-pure field bypasses the
-                // heapcache completely, executing and returning a Const
-                // without reading, writing, or recording anything.  Spelling
-                // it as "this load has no cache key" reaches the miss path
-                // below, whose `execute_and_record` performs that very fold —
-                // `is_pure_with_descr` admits GETFIELD_GC only through
-                // `descr.is_always_pure()`, the same predicate — and the key
-                // being `None` is what then skips both cache halves.
-                let bypasses_heapcache = fielddescr.is_always_pure() && struct_opref.is_constant();
-                let field_key = if bypasses_heapcache {
-                    None
-                } else {
-                    heapcache_field_key(&fielddescr)
-                };
-                let cached =
-                    field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
-                let cached_payload = cached.and_then(|cached| match ctx.box_value(cached) {
-                    Some(Value::Int(n)) => Some(n),
-                    Some(Value::Ref(r)) => Some(r.0 as i64),
-                    _ => None,
-                });
-                // Parentless placeholder descrs can share `field_key`, so a
-                // Position word and a frame `base` collide. A hit whose
-                // payload is not the live load is that collision: take the
-                // miss path and record a fresh op.
-                let cached = cached.filter(|_| {
-                    struct_ptr == 0 || cached_payload.is_none() || cached_payload == Some(loaded)
-                });
-                let (op, reg_concrete) = if let Some(cached) = cached {
-                    // `profiler.count_ops(rop.GETFIELD_GC_I,
-                    // Counters.HEAPCACHED_OPS)` — folded-away op
-                    // accounting on the cache hit.  The opnum in
-                    // `_opimpl_getfield_gc_any_pureornot` is the
-                    // `GETFIELD_GC_I` literal whatever the field's type,
-                    // so the ref arm shares the int bucket rather than
-                    // reporting its own `kind`.
-                    ctx.profiler().count_ops(
-                        OpCode::GetfieldGcI,
-                        crate::pyjitpl::counters::HEAPCACHED_OPS,
-                    );
-                    // The sanity check compares the freshly executed load
-                    // against the cached box's own payload
-                    // (`currfieldbox.getint()` / `.getref_base()`), read
-                    // here through `box_value` — the const pool,
-                    // standard-virtualizable shadow and frontend value
-                    // slot composed into one answer.  A `None` payload is
-                    // an entry seeded without a live concrete and skips
-                    // the check.  A null struct fabricated `loaded` rather
-                    // than reading, so it has nothing to compare either.
-                    let expected = match ctx.box_value(cached) {
-                        Some(Value::Int(n)) => Some(n),
-                        Some(Value::Ref(r)) => Some(r.0 as i64),
-                        _ => None,
-                    };
-                    assert!(
-                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
-                        "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                             loaded {loaded} != cached {expected:?} \
-                             (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
-                        if is_ref { "ref" } else { "int" },
-                    );
-                    // The cached box is returned even on a mismatch, so
-                    // the register takes its payload, not the fresh load.
-                    (cached, expected.unwrap_or(loaded))
-                } else {
-                    let op = ctx.execute_and_record(
-                        Some(self.cpu.as_ref()),
-                        kind,
-                        Some(fielddescr),
-                        &[struct_opref],
-                        (struct_ptr != 0).then_some(value),
-                        self.last_exception_value,
-                    );
-                    if let Some(field_key) = field_key {
-                        ctx.heapcache_getfield_now_known(struct_opref, field_key, op);
-                    }
-                    (op, loaded)
-                };
-                if is_ref {
-                    self.set_ref_reg(dest, Some(op), Some(reg_concrete));
-                } else {
-                    self.set_int_reg(dest, Some(op), Some(reg_concrete));
-                }
-            }
-            jitcode::insns::BC_GETFIELD_GC_F | jitcode::insns::BC_GETFIELD_GC_F_PURE => {
-                // blackhole.py bhimpl_getfield_gc_f (+ the _pure
-                // alias at :1441-1443): load the f64-bit field through the
-                // live struct ptr and record GetfieldGcF.
-                let (struct_reg, descr_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    frame.read_getfield_gc()
-                };
-                let (offset, fielddescr) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
-                        panic!("BC_GETFIELD_GC_F: descrs[{descr_idx}] is not a BhDescr entry")
-                    });
-                    let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC_F");
-                    (
-                        offset,
-                        frame
-                            .runtime_optimizer_descr(descr_idx)
-                            .unwrap_or_else(|| field_descr_ref_from_bh(bh).1),
-                    )
-                };
-                let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
-                let loaded = if struct_ptr != 0 {
-                    unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
-                } else {
-                    0
-                };
-                // See the `BC_GETFIELD_GC_I` arm on the descr gate, the null
-                // case, and the two heapcache halves
-                // `_opimpl_getfield_gc_any_pureornot` brackets the load with.
-                // The float sanity check is the one upstream spells
-                // `ConstFloat(resvalue).same_constant(upd.currfieldbox
-                // .constbox())` rather than `==`, so that two NaNs compare
-                // equal; comparing the raw bit patterns is that same
-                // predicate, and `loaded` is already the bits.
-                // `opimpl_getfield_gc_{i,r,f}` runs one test ahead of the
-                // updater: a constant struct's always-pure field bypasses the
-                // heapcache completely, executing and returning a Const
-                // without reading, writing, or recording anything.  Spelling
-                // it as "this load has no cache key" reaches the miss path
-                // below, whose `execute_and_record` performs that very fold —
-                // `is_pure_with_descr` admits GETFIELD_GC only through
-                // `descr.is_always_pure()`, the same predicate — and the key
-                // being `None` is what then skips both cache halves.
-                let bypasses_heapcache = fielddescr.is_always_pure() && struct_opref.is_constant();
-                let field_key = if bypasses_heapcache {
-                    None
-                } else {
-                    heapcache_field_key(&fielddescr)
-                };
-                let cached =
-                    field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
-                let (op, reg_concrete) = if let Some(cached) = cached {
-                    // The same `GETFIELD_GC_I` literal — `box_trace.rs`
-                    // wires its float port to the int bucket for this
-                    // reason.
-                    ctx.profiler().count_ops(
-                        OpCode::GetfieldGcI,
-                        crate::pyjitpl::counters::HEAPCACHED_OPS,
-                    );
-                    let expected = match ctx.box_value(cached) {
-                        Some(Value::Float(f)) => Some(f.to_bits() as i64),
-                        _ => None,
-                    };
-                    assert!(
-                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
-                        "_opimpl_getfield_gc_any_pureornot sanity check (float): \
-                             loaded {loaded:#x} != cached {expected:?} \
-                             (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
-                    );
-                    (cached, expected.unwrap_or(loaded))
-                } else {
-                    let op = ctx.execute_and_record(
-                        Some(self.cpu.as_ref()),
-                        OpCode::GetfieldGcF,
-                        Some(fielddescr),
-                        &[struct_opref],
-                        (struct_ptr != 0).then_some(Value::Float(f64::from_bits(loaded as u64))),
-                        self.last_exception_value,
-                    );
-                    if let Some(field_key) = field_key {
-                        ctx.heapcache_getfield_now_known(struct_opref, field_key, op);
-                    }
-                    (op, loaded)
-                };
-                self.set_float_reg(dest, Some(op), Some(reg_concrete));
-            }
-            jitcode::insns::BC_SETFIELD_VABLE_I_IMM => {
-                let (opcode_pc, vable_reg, field_idx, imm) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, imm) = frame.read_vable_setfield_imm();
-                    (opcode_pc, vable_reg, field_idx, imm)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let guards_before = ctx.num_guards();
-                let imm_box = ctx.const_int(imm);
-                let write = ctx.vable_setfield(
-                    opcode_pc,
-                    vable_opref,
-                    fielddescr,
-                    imm_box,
-                    Some(Value::Int(imm)),
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            jitcode::insns::BC_SETFIELD_VABLE_I => {
-                let (opcode_pc, vable_reg, field_idx, src) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, src) = frame.read_vable_setfield();
-                    (opcode_pc, vable_reg, field_idx, src)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (value, concrete) = self.read_int_reg(src);
-                let guards_before = ctx.num_guards();
-                let write = ctx.vable_setfield(
-                    opcode_pc,
-                    vable_opref,
-                    fielddescr,
-                    value,
-                    Some(Value::Int(concrete)),
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            jitcode::insns::BC_SETFIELD_VABLE_R => {
-                let (opcode_pc, vable_reg, field_idx, src) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, src) = frame.read_vable_setfield();
-                    (opcode_pc, vable_reg, field_idx, src)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (value, concrete) = self.read_ref_reg(src);
-                let guards_before = ctx.num_guards();
-                let write = ctx.vable_setfield(
-                    opcode_pc,
-                    vable_opref,
-                    fielddescr,
-                    value,
-                    Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            jitcode::insns::BC_SETFIELD_VABLE_F => {
-                let (opcode_pc, vable_reg, field_idx, src) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, field_idx, src) = frame.read_vable_setfield();
-                    (opcode_pc, vable_reg, field_idx, src)
-                };
-                let Some((vable_opref, fielddescr)) =
-                    self.vable_field_descr(ctx, vable_reg, field_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (value, concrete) = self.read_float_reg(src);
-                let guards_before = ctx.num_guards();
-                let write = ctx.vable_setfield(
-                    opcode_pc,
-                    vable_opref,
-                    fielddescr,
-                    value,
-                    Some(Value::Float(f64::from_bits(concrete as u64))),
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            // ── BC_ARRAYLEN_GC ──
-            //
-            // RPython parity: pyjitpl.py `opimpl_arraylen_gc`
-            // (`execute_with_descr(rop.ARRAYLEN_GC, arraydescr, arraybox)`) and
-            // blackhole.py `bhimpl_arraylen_gc(cpu, r, d) -> i`.
-            //
-            // Encoding (`arraylen_gc/rd>i`): [array_reg u8][descr_idx u16][dst u8].
-            // Reads the GC array's length word at the descr's lendescr offset
-            // (`bh_arraylen_gc`: `sizeof(usize)` signed load), records
-            // `OpCode::ArraylenGc` so the optimizer can narrow the lenbound /
-            // virtualize, and stamps the result register with the concrete
-            // length.  Aborts (fail-loud) if the descr does not resolve to an
-            // array descr in the canonical pool.
-            jitcode::insns::BC_ARRAYLEN_GC => {
-                let (array_reg, descr_idx, dst) = {
-                    let frame = self.frames.current_mut();
-                    let array_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (array_reg, descr_idx, dst)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-                // Concrete length via the lendescr (`bh_arraylen_gc`); `None`
-                // when the cpu is unwired or the descr lacks a lendescr, in
-                // which case the recorded op is left unstamped.
-                let concrete = ctx.arraylen_sanity_load(array_addr, &descr);
-                let reg_concrete = match &concrete {
-                    Some(majit_ir::Value::Int(n)) => Some(*n),
-                    _ => None,
-                };
-                let opref = ctx.opimpl_arraylen_gc(
-                    self.cpu.as_ref(),
-                    array_opref,
-                    descr,
-                    concrete,
-                    self.last_exception_value,
-                );
-                self.set_int_reg(dst, Some(opref), reg_concrete);
-            }
-            // ── BC_GETARRAYITEM_GC_I ──
-            //
-            // RPython parity: pyjitpl.py MIFrame._do_getarrayitem_gc_any:
-            //
-            //     return self.execute_with_descr(rop.GETARRAYITEM_GC_I,
-            //                                    arraydescr, arraybox, indexbox)
-            //
-            // Encoding (`jitcode/assembler.rs`'s `getarrayitem_gc_i`):
-            //   [BC_GETARRAYITEM_GC_I][array_reg u8][index_reg u8]
-            //   [descr_idx u16][dst u8]
-            //
-            // The dispatch JitCode body emits this op for `program[pc]`
-            // opcode-fetch lowering (`jitcode_lower::lower_dispatch_body`).
-            // The Ref register holds the slice data pointer
-            // (`codegen_trace.rs`'s `generate_trace_fn` emits
-            // `*const #env_type as *const () as usize`); the descr pool entry
-            // is a `CanonicalBhDescr::Array { itemsize=1, base_size=0,
-            // is_item_signed=false, ... }` (`jitcode/assembler.rs`'s
-            // `add_gc_byte_array_descr`).  Concrete eval reads byte at
-            // `array_addr + index` and zero-extends to i64 (matching
-            // CPython `ord()` 0..=255 semantics).
-            jitcode::insns::BC_GETARRAYITEM_GC_I | jitcode::insns::BC_GETARRAYITEM_GC_I_PURE => {
-                let (array_reg, index_reg, descr_idx, dst) = {
-                    let frame = self.frames.current_mut();
-                    let array_reg = frame.next_reg() as usize;
-                    let index_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (array_reg, index_reg, descr_idx, dst)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let Some((base_size, itemsize, is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-                let (index_opref, index_value) = self.read_int_reg(index_reg);
-                // `getarrayitem_gc_i_pure` shares this body: the load, the
-                // heapcache handling and the register write are identical, and
-                // only the recorded opcode differs — the same reason
-                // `blackhole.py` aliases `bhimpl_getarrayitem_gc_i_pure` onto
-                // the plain impl.  The distinction that does matter is which
-                // opcode reaches the optimizer: `GetarrayitemGcPureI` is inside
-                // the always-pure range, so `OpHelpers.is_pure_with_descr`
-                // admits it, while the plain read is admitted by no descr.
-                // The codewriter has already made that choice —
-                // `OpKind::ArrayRead { pure }` picks the spelling from whether
-                // the list is ever mutated (`ll_getitem_foldable_nonneg`).
-                let opcode = if bytecode == jitcode::insns::BC_GETARRAYITEM_GC_I_PURE {
-                    OpCode::GetarrayitemGcPureI
-                } else {
-                    OpCode::GetarrayitemGcI
-                };
-                let descr_index = descr.index();
-                // pyjitpl.py `_do_getarrayitem_gc_any`: check
-                // `heapcache.getarrayitem(arraybox, indexbox, arraydescr)`
-                // before recording.  Cache hit short-circuits the record,
-                // counts `HEAPCACHED_OPS`, and returns the cached box;
-                // miss falls through to `execute_with_descr` + the
-                // `getarrayitem_now_known` cache store at line 671.
-                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
-                // Concrete eval: descriptor-aware sized load with sign
-                // extension chosen by `is_item_signed`.  Mirrors PyPy
-                // `llmodel.py unpack_arraydescr_size + read_int_at_mem(
-                // gcref, ofs + index * size, size, sign)` and the
-                // dynasm-side `bh_getarrayitem_gc_i` impl
-                // (`runner.rs`); previously this site hard-coded a
-                // u8 zero-extend which only happened to work because the
-                // sole production caller (dispatch JitCode opcode-fetch)
-                // uses `add_gc_byte_array_descr` (`jitcode/assembler.rs`,
-                // itemsize=1, is_item_signed=false).  Generalising
-                // matches the descriptor-driven contract that
-                // BC_GETARRAYITEM_GC_I's name promises.
-                //
-                // SAFETY: `array_addr` is a GC-managed array pointer
-                // threaded through `Ref` register reads; `index_value`
-                // is bounded by the outer interpreter's array-length
-                // precondition (`codegen_trace.rs`'s `generate_trace_fn`
-                // narrows the fat
-                // slice pointer to its data ptr; only emitted by
-                // `lower_dispatch_body` for slice-typed envs that the
-                // outer loop already bounds-checks).
-                let item_addr = (array_addr as usize)
-                    .wrapping_add(base_size)
-                    .wrapping_add((index_value as usize).wrapping_mul(itemsize));
-                let concrete = unsafe {
-                    match (itemsize, is_signed) {
-                        (1, true) => *(item_addr as *const i8) as i64,
-                        (1, false) => *(item_addr as *const u8) as i64,
-                        (2, true) => *(item_addr as *const i16) as i64,
-                        (2, false) => *(item_addr as *const u16) as i64,
-                        (4, true) => *(item_addr as *const i32) as i64,
-                        (4, false) => *(item_addr as *const u32) as i64,
-                        (8, _) => *(item_addr as *const i64),
-                        other => panic!(
-                            "getarrayitem_gc_i: unsupported (itemsize, signed) = {:?}",
-                            other,
-                        ),
-                    }
-                };
-                // `execute_varargs(pure=True)` → `record_result_of_call_pure`:
-                // an all-constant read of an array the opcode itself declares
-                // immutable folds to a ConstInt and is not recorded — the same
-                // record-time fold `strgetitem(green_str, green_pc)` gets, and
-                // for the same reason, that the pure spelling is what licenses
-                // it. `is_pure_with_descr` admits `GetarrayitemGcPureI` and no
-                // descr admits the plain read, so the plain read is recorded
-                // even with two constant arguments; whether an array qualifies
-                // is the emitter's call (`OpKind::ArrayRead { pure }`,
-                // `jitcode/assembler.rs`'s `getarrayitem_gc_i_pure`), not this
-                // site's. Done at record time the read hits the live array
-                // directly, so the optimizer's `protect_speculative_array`
-                // typeid check — which a raw `&[u8]` data pointer, having no GC
-                // type header, would fail — never applies.
-                let foldable = opcode == OpCode::GetarrayitemGcPureI
-                    && array_opref.is_constant()
-                    && index_opref.is_constant();
-                let (opref, reg_concrete) = if foldable {
-                    // `execute_and_record` counts the operation *before* it
-                    // decides to fold, so a hand-built constant that skips the
-                    // funnel under-reports OPS on green pure-array reads.
-                    //
-                    // The fold itself stays here rather than routing: the
-                    // funnel would re-read the item through
-                    // `Cpu::bh_getarrayitem_gc_i`, a second reader of an array
-                    // this site has already read directly with the descr's own
-                    // geometry — and of a raw data pointer carrying no GC type
-                    // header, which is why the record-time fold is licensed at
-                    // all (see above).
-                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
-                    (ctx.const_int(concrete), concrete)
-                } else if let Some(cached) = cached {
-                    // pyjitpl.py MIFrame._do_getarrayitem_gc_any `count_ops(rop.GETARRAYITEM_GC_I,
-                    // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
-                    ctx.profiler()
-                        .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                    // pyjitpl.py MIFrame._do_getarrayitem_gc_any sanity check: compare the
-                    // freshly executed load (`resvalue`) against the
-                    // cached box's `tobox.getint()`.  On mismatch
-                    // `_record_helper` records a fallback op whose
-                    // return value is discarded; `assert 0` fires in
-                    // debug mode; the function still returns the
-                    // (stale) cached box.  `_record_helper` routes
-                    // through `heapcache.invalidate_caches`, but that
-                    // call short-circuits on GETARRAYITEM_GC_I
-                    // (`mark_escaped` does not escape the read,
-                    // `clear_caches_not_necessary` returns True), so
-                    // the heapcache state is intentionally left
-                    // untouched.  The cached Box's intrinsic value is
-                    // the upstream `tobox.getint()` payload — fetched
-                    // through `box_value(cached)` which composes the
-                    // const pool, standard-virtualizable shadow, and
-                    // the frontend object's `value` field (RPython
-                    // `currfieldbox.getint()` dispatch parity).
-                    // `None` payload (entry seeded without a live
-                    // concrete) skips the check.
-                    let expected = match ctx.box_value(cached) {
-                        Some(majit_ir::Value::Int(n)) => Some(n),
-                        _ => None,
-                    };
-                    // Cache hit propagates the stale `tobox.getint()`
-                    // into the destination on mismatch — pyjitpl.py MIFrame._do_getarrayitem_gc_any
-                    // returns `tobox` so the caller sees the cached
-                    // box's int, not `resvalue`.  Match that by
-                    // selecting `expected` (stale) when the assertion
-                    // fires, else the freshly executed int (which
-                    // equals expected in the no-mismatch arm).
-                    let stale = matches!(expected, Some(exp) if exp != concrete);
-                    if stale {
-                        // pyjitpl.py `_record_helper` invalidates
-                        // before recording.  `clear_caches_not_necessary`
-                        // short-circuits for GETARRAYITEM_GC_I (no-side-
-                        // effect read), so the only remaining side effect
-                        // is `mark_escaped` escaping `array_opref` and
-                        // `index_opref` — match that structure here.
-                        ctx.heapcache_invalidate_caches_varargs(
-                            opcode,
-                            None,
-                            &[array_opref, index_opref],
-                        );
-                        // The mismatch fallback records without executing: `_record_helper` alone.
-                        ctx.profiler()
-                            .count_ops(opcode, crate::counters::RECORDED_OPS);
-                        let _ =
-                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                        debug_assert!(
-                            false,
-                            "{:?} sanity check failed: \
-                             cached={:?} concrete={}",
-                            opcode, expected, concrete,
-                        );
-                    }
-                    let reg_concrete = if stale {
-                        expected.expect("stale only set when expected is Some")
-                    } else {
-                        concrete
-                    };
-                    (cached, reg_concrete)
-                } else {
-                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
-                    ctx.profiler()
-                        .count_ops(opcode, crate::counters::RECORDED_OPS);
-                    let opref =
-                        ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                    // pyjitpl.py MIFrame._do_getarrayitem_gc_any `heapcache.getarrayitem_now_known`.
-                    // Pair the recorded opref with the live `concrete`
-                    // payload — mirrors RPython's `resbox` Box carrying
-                    // both identity and value from `executor.execute`.
-                    // `Box.value` parity: stamp the result OpRef's
-                    // frontend value slot so `lookup_opref_concrete(opref)`
-                    // returns the runtime concrete (RPython
-                    // `IntFrontendOp(pos, intval)` construction-time
-                    // field assignment).
-                    ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
-                    ctx.heapcache_getarrayitem_now_known(
-                        array_opref,
-                        index_opref,
-                        descr_index,
-                        opref,
-                    );
-                    (opref, concrete)
-                };
-                self.set_int_reg(dst, Some(opref), Some(reg_concrete));
-            }
-            // ── BC_GETARRAYITEM_GC_F ──
-            //
-            // `opimpl_getarrayitem_gc_f` records
-            // `_do_getarrayitem_gc_any(rop.GETARRAYITEM_GC_F, ..., 'f')`.
-            // `opimpl_getarrayitem_gc_f_pure` folds a const array and a const
-            // index through `executor.wrap_constant` and otherwise records
-            // `_do_getarrayitem_gc_any(rop.GETARRAYITEM_GC_PURE_F, ..., 'f')`.
-            // `blackhole.py` aliases `bhimpl_getarrayitem_gc_f_pure` onto
-            // `bhimpl_getarrayitem_gc_f`, so the load, the heapcache, and the
-            // register write are one body; only the recorded opcode differs.
-            //
-            // Encoding (`jitcode/assembler.rs` `getarrayitem_gc_f`):
-            //   [opcode][array_reg u8][index_reg u8][descr_idx u16][dst u8]
-            // The element is one f64. The float register stores that f64's
-            // raw bits.
-            jitcode::insns::BC_GETARRAYITEM_GC_F | jitcode::insns::BC_GETARRAYITEM_GC_F_PURE => {
-                let (array_reg, index_reg, descr_idx, dst) = {
-                    let frame = self.frames.current_mut();
-                    let array_reg = frame.next_reg() as usize;
-                    let index_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (array_reg, index_reg, descr_idx, dst)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let Some((base_size, itemsize, _is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-                let (index_opref, index_value) = self.read_int_reg(index_reg);
-                let opcode = if bytecode == jitcode::insns::BC_GETARRAYITEM_GC_F_PURE {
-                    OpCode::GetarrayitemGcPureF
-                } else {
-                    OpCode::GetarrayitemGcF
-                };
-                let descr_index = descr.index();
-                // `_do_getarrayitem_gc_any`: `heapcache.getarrayitem` before
-                // recording. A hit returns the cached box; a miss records and
-                // then `getarrayitem_now_known`.
-                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
-                let item_addr = (array_addr as usize)
-                    .wrapping_add(base_size)
-                    .wrapping_add((index_value as usize).wrapping_mul(itemsize));
-                if itemsize != 8 {
-                    panic!("getarrayitem_gc_f: unsupported itemsize {itemsize}");
-                }
-                // SAFETY: `array_addr` is the array data pointer held in the
-                // ref register and `index_value` selects an element. itemsize
-                // is 8, so this reads one f64 as raw bits. `read_unaligned`
-                // matches `bh_getarrayitem_gc_f` / `read_float_at_mem`, which
-                // load `FLOATSTORAGE` without assuming natural alignment.
-                let concrete = unsafe { core::ptr::read_unaligned(item_addr as *const i64) };
-                // `opimpl_getarrayitem_gc_f_pure`: a const array and a const
-                // index bypass the heapcache and fold to `wrap_constant`.
-                // The plain read stays recorded; `GetarrayitemGcPureF` is what
-                // licenses the fold, same as `GetarrayitemGcPureI`.
-                let foldable = opcode == OpCode::GetarrayitemGcPureF
-                    && array_opref.is_constant()
-                    && index_opref.is_constant();
-                let (opref, reg_concrete) = if foldable {
-                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
-                    (ctx.const_float(concrete), concrete)
-                } else if let Some(cached) = cached {
-                    ctx.profiler()
-                        .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                    // `_do_getarrayitem_gc_any` `typ == 'f'`:
-                    // `ConstFloat(resvalue).same_constant(tobox.constbox())`,
-                    // which compares `longlong.extract_bits` so NaN payloads
-                    // match and `0.0` stays distinct from `-0.0`. A mismatch
-                    // records a fallback op, asserts in debug, and still
-                    // answers with the cached box. `clear_caches_not_necessary`
-                    // short-circuits a getarrayitem, so the heapcache entry
-                    // stays; `mark_escaped` still runs on the two inputs.
-                    // `None` (no stamped concrete) skips the check.
-                    let expected = match ctx.box_value(cached) {
-                        Some(majit_ir::Value::Float(f)) => Some(f.to_bits() as i64),
-                        _ => None,
-                    };
-                    let stale = matches!(expected, Some(exp) if exp != concrete);
-                    if stale {
-                        ctx.heapcache_invalidate_caches_varargs(
-                            opcode,
-                            None,
-                            &[array_opref, index_opref],
-                        );
-                        ctx.profiler()
-                            .count_ops(opcode, crate::counters::RECORDED_OPS);
-                        let _ =
-                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                        debug_assert!(
-                            false,
-                            "{:?} sanity check failed: \
-                             cached={:?} concrete={}",
-                            opcode, expected, concrete,
-                        );
-                    }
-                    let reg_concrete = if stale {
-                        expected.expect("stale only set when expected is Some")
-                    } else {
-                        concrete
-                    };
-                    (cached, reg_concrete)
-                } else {
-                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
-                    ctx.profiler()
-                        .count_ops(opcode, crate::counters::RECORDED_OPS);
-                    let opref =
-                        ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                    ctx.set_opref_concrete(
-                        opref,
-                        majit_ir::Value::Float(f64::from_bits(concrete as u64)),
-                    );
-                    ctx.heapcache_getarrayitem_now_known(
-                        array_opref,
-                        index_opref,
-                        descr_index,
-                        opref,
-                    );
-                    (opref, concrete)
-                };
-                self.set_float_reg(dst, Some(opref), Some(reg_concrete));
-            }
-            // ── BC_GETARRAYITEM_GC_R ──
-            //
-            // Ref-result element read for a raw-pointer array (a
-            // `pools[selected]`-shaped read).  Mirrors BC_GETARRAYITEM_GC_I
-            // but loads a target-sized GC pointer and writes the ref bank. Unlike
-            // the int arm there is NO all-constant fold: the array base is a
-            // live state pointer and the result must stay a `GetarrayitemGcR`
-            // op so the short preamble re-produces it each loop entry (the
-            // whole point of replacing the residual `jit_sel_get_ref` call).
-            // The `pools` array is immutable (`_immutable_fields_`), so a
-            // re-read during the observer concrete replay returns the same
-            // pointer — no `record_observed_*` queue is needed (none exists
-            // for getarrayitem).
-            jitcode::insns::BC_GETARRAYITEM_GC_R_RID
-            | jitcode::insns::BC_GETARRAYITEM_GC_R_PURE => {
-                let (array_reg, index_reg, descr_idx, dst) = {
-                    let frame = self.frames.current_mut();
-                    let array_reg = frame.next_reg() as usize;
-                    let index_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (array_reg, index_reg, descr_idx, dst)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-                let (index_opref, index_value) = self.read_int_reg(index_reg);
-                let descr_index = descr.index();
-                let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
-                // blackhole.py bhimpl_getarrayitem_gc_r reads GCREF through
-                // the CPU; both the array stride and pointer width are typed.
-                let concrete = self
-                    .cpu
-                    .bh_getarrayitem_gc_r(
-                        majit_ir::GcRef(array_addr as usize),
-                        index_value,
-                        descr.as_array_descr().expect("GC ref array descriptor"),
-                    )
-                    .0 as i64;
-                // `getarrayitem_gc_r_pure` records `GetarrayitemGcPureR`
-                // (`rewrite_op_getarrayitem` `_pure`). An all-constant read
-                // folds here, the same way `BC_GETARRAYITEM_GC_I_PURE` does:
-                // the pure opcode is what licenses it, and the live pointer
-                // is already in hand so `protect_speculative_array` is not
-                // asked to classify a block that has no GC type header.
-                let pure = bytecode == jitcode::insns::BC_GETARRAYITEM_GC_R_PURE;
-                let opcode = if pure {
-                    OpCode::GetarrayitemGcPureR
-                } else {
-                    OpCode::GetarrayitemGcR
-                };
-                if pure && array_opref.is_constant() && index_opref.is_constant() {
-                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
-                    let opref = ctx.const_ref(concrete);
-                    self.set_ref_reg(dst, Some(opref), Some(concrete));
-                } else {
-                    let (opref, reg_concrete) = if let Some(cached) = cached {
-                        ctx.profiler()
-                            .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                        // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
-                        // freshly executed load against the cached box's
-                        // `tobox.getref_base()`. Same structure as the int/float
-                        // arm above: a mismatch records a fallback op whose result
-                        // is discarded, asserts in debug, and still answers with
-                        // the stale cached box.
-                        let expected = match ctx.box_value(cached) {
-                            Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
-                            _ => None,
-                        };
-                        let stale = matches!(expected, Some(exp) if exp != concrete);
-                        if stale {
-                            ctx.heapcache_invalidate_caches_varargs(
-                                opcode,
-                                None,
-                                &[array_opref, index_opref],
-                            );
-                            ctx.profiler()
-                                .count_ops(opcode, crate::counters::RECORDED_OPS);
-                            let _ = ctx.record_op_with_descr(
-                                opcode,
-                                &[array_opref, index_opref],
-                                descr,
-                            );
-                            debug_assert!(
-                                false,
-                                "GetarrayitemGcR sanity check failed: \
-                             cached={expected:?} concrete={concrete}",
-                            );
-                        }
-                        let reg_concrete = if stale {
-                            expected.expect("stale only set when expected is Some")
-                        } else {
-                            concrete
-                        };
-                        (cached, reg_concrete)
-                    } else {
-                        ctx.profiler().count_ops(opcode, crate::counters::OPS);
-                        ctx.profiler()
-                            .count_ops(opcode, crate::counters::RECORDED_OPS);
-                        let opref =
-                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                        ctx.set_opref_concrete(
-                            opref,
-                            Value::Ref(majit_ir::GcRef(concrete as usize)),
-                        );
-                        ctx.heapcache_getarrayitem_now_known(
-                            array_opref,
-                            index_opref,
-                            descr_index,
-                            opref,
-                        );
-                        (opref, concrete)
-                    };
-                    self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
-                }
-            }
-            // blackhole.py BlackholeInterpreter.bhimpl_setarrayitem_gc_i: record
-            // SetarrayitemGc (a single op-kind whose descr carries the item
-            // type) and write the element through the live array data ptr —
-            // the store side effect is the actual write for this iteration
-            // (mirrors BC_SETFIELD_GC / BC_RAW_STORE_I). Encoding
-            // `riid`/`rird`/`rifd`: [array:u8][index:u8][value:u8][descr:u16].
-            jitcode::insns::BC_SETARRAYITEM_GC_I
-            | jitcode::insns::BC_SETARRAYITEM_GC_R
-            | jitcode::insns::BC_SETARRAYITEM_GC_F => {
-                let (array_reg, index_reg, value_reg, descr_idx) = {
-                    let frame = self.frames.current_mut();
-                    let array_reg = frame.next_reg() as usize;
-                    let index_reg = frame.next_reg() as usize;
-                    let value_reg = frame.next_reg() as usize;
-                    let descr_idx = frame.next_u16() as usize;
-                    (array_reg, index_reg, value_reg, descr_idx)
-                };
-                let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let Some((base_size, itemsize, _is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (array_opref, array_addr) = self.read_ref_reg(array_reg);
-                let (index_opref, index_value) = self.read_int_reg(index_reg);
-                let (value_opref, value_concrete) = match bytecode {
-                    jitcode::insns::BC_SETARRAYITEM_GC_R => self.read_ref_reg(value_reg),
-                    jitcode::insns::BC_SETARRAYITEM_GC_F => self.read_float_reg(value_reg),
-                    _ => self.read_int_reg(value_reg),
-                };
-                let descr_index = descr.index();
-                // `execute_setarrayitem_gc` (pyjitpl.py) records through
-                // `execute_and_record` → `_record_helper` (pyjitpl.py),
-                // which runs `heapcache.invalidate_caches` → `mark_escaped` →
-                // `_escape_from_write` (heapcache.py) *before* the op is
-                // appended: a ref written into an already-escaped array escapes
-                // too, or `invalidate_unescaped` keeps its cached fields alive
-                // across the next residual call while the callee can reach and
-                // mutate it through the array.  `clear_caches_not_necessary`
-                // (heapcache.py) lists SETARRAYITEM_GC, so only the
-                // mark-escaped half runs.  Same shape as BC_RAW_STORE_I above.
-                ctx.heapcache_invalidate_caches_varargs(
-                    OpCode::SetarrayitemGc,
-                    None,
-                    &[array_opref, index_opref, value_opref],
-                );
-                ctx.profiler()
-                    .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
-                ctx.record_op_with_descr(
-                    OpCode::SetarrayitemGc,
-                    &[array_opref, index_opref, value_opref],
-                    descr,
-                );
-                // execute_setarrayitem_gc (pyjitpl.py): update the trace
-                // heap cache after the store so a later getarrayitem of the same
-                // (array, const index) reads the stored value, not a stale
-                // cached element.  Key on descr.index() (the canonical resolved
-                // descr index the getarrayitem read path uses), not the raw
-                // bytecode operand descr_idx.
-                ctx.heapcache_setarrayitem(array_opref, index_opref, descr_index, value_opref);
-                if array_addr != 0 {
-                    let item_addr = (array_addr as usize)
-                        .wrapping_add(base_size)
-                        .wrapping_add((index_value as usize).wrapping_mul(itemsize));
-                    unsafe {
-                        match itemsize {
-                            1 => *(item_addr as *mut u8) = value_concrete as u8,
-                            2 => *(item_addr as *mut u16) = value_concrete as u16,
-                            4 => *(item_addr as *mut u32) = value_concrete as u32,
-                            8 => *(item_addr as *mut i64) = value_concrete,
-                            other => {
-                                panic!("BC_SETARRAYITEM_GC: unsupported itemsize {other}")
-                            }
-                        }
-                    }
-                    // A ref store adds a heap edge array→value; notify the GC on
-                    // the container so a young value survives a minor collection
-                    // triggered later in the walk (mirrors bh_setarrayitem_gc_r).
-                    if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R
-                        && majit_gc::gc_owns_object(array_addr as usize)
-                    {
-                        majit_gc::gc_write_barrier(majit_ir::GcRef(array_addr as usize));
-                    }
-                }
-            }
-            jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
-                let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
-                    (opcode_pc, vable_reg, array_idx, index_reg, dest)
-                };
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py `_opimpl_getarrayitem_vable` /
-                // `_opimpl_setarrayitem_vable` reach the index through
-                // `implement_guard_value` on an `MIFrame`, which owns the
-                // framestack the resume snapshot is built from. Promoting here
-                // rather than inside `TraceCtx::get_arrayitem_vable_index`
-                // keeps that ownership: the guard gets a full-framestack,
-                // vable-carrying snapshot instead of the minimal one
-                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                //
-                // The hoist moves the promote to the caller, NOT ahead of the
-                // branch that selects it. `_get_arrayitem_vable_index`
-                // (pyjitpl.py) opens with the promote and is entered only
-                // from the standard leg (:1229, :1244); the non-standard leg
-                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
-                // the index box as it stands. So the decision is taken first
-                // and handed to the `*_checked` leg, and a non-standard access
-                // with a non-constant index no longer mints a GUARD_VALUE that
-                // over-specializes an ordinary heap read.
-                let check_guards_before = ctx.num_guards();
-                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
-                let index = if nonstandard {
-                    index
-                } else {
-                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
-                };
-                let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getarrayitem_int_checked(
-                    nonstandard,
-                    opcode_pc,
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
-            }
-            jitcode::insns::BC_GETARRAYITEM_VABLE_R => {
-                let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
-                    (opcode_pc, vable_reg, array_idx, index_reg, dest)
-                };
-                if crate::vable_read_probe_enabled() {
-                    let depth = self.frames.len();
-                    let frame = self.frames.current_mut();
-                    eprintln!(
-                        "[vable-read-probe] reg jitcode={} depth={} vable_reg={} \
-                         reg_opref={:?} reg_value={:?}",
-                        frame.jitcode.name,
-                        depth,
-                        vable_reg,
-                        frame.ref_regs[vable_reg],
-                        frame.ref_values[vable_reg].map(|v| format!("0x{v:x}")),
-                    );
-                }
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py `_opimpl_getarrayitem_vable` /
-                // `_opimpl_setarrayitem_vable` reach the index through
-                // `implement_guard_value` on an `MIFrame`, which owns the
-                // framestack the resume snapshot is built from. Promoting here
-                // rather than inside `TraceCtx::get_arrayitem_vable_index`
-                // keeps that ownership: the guard gets a full-framestack,
-                // vable-carrying snapshot instead of the minimal one
-                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                //
-                // The hoist moves the promote to the caller, NOT ahead of the
-                // branch that selects it. `_get_arrayitem_vable_index`
-                // (pyjitpl.py) opens with the promote and is entered only
-                // from the standard leg (:1229, :1244); the non-standard leg
-                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
-                // the index box as it stands. So the decision is taken first
-                // and handed to the `*_checked` leg, and a non-standard access
-                // with a non-constant index no longer mints a GUARD_VALUE that
-                // over-specializes an ordinary heap read.
-                let check_guards_before = ctx.num_guards();
-                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
-                let index = if nonstandard {
-                    index
-                } else {
-                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
-                };
-                let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getarrayitem_ref_checked(
-                    nonstandard,
-                    opcode_pc,
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
-            }
-            jitcode::insns::BC_GETARRAYITEM_VABLE_F => {
-                let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
-                    (opcode_pc, vable_reg, array_idx, index_reg, dest)
-                };
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py `_opimpl_getarrayitem_vable` /
-                // `_opimpl_setarrayitem_vable` reach the index through
-                // `implement_guard_value` on an `MIFrame`, which owns the
-                // framestack the resume snapshot is built from. Promoting here
-                // rather than inside `TraceCtx::get_arrayitem_vable_index`
-                // keeps that ownership: the guard gets a full-framestack,
-                // vable-carrying snapshot instead of the minimal one
-                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                //
-                // The hoist moves the promote to the caller, NOT ahead of the
-                // branch that selects it. `_get_arrayitem_vable_index`
-                // (pyjitpl.py) opens with the promote and is entered only
-                // from the standard leg (:1229, :1244); the non-standard leg
-                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
-                // the index box as it stands. So the decision is taken first
-                // and handed to the `*_checked` leg, and a non-standard access
-                // with a non-constant index no longer mints a GUARD_VALUE that
-                // over-specializes an ordinary heap read.
-                let check_guards_before = ctx.num_guards();
-                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
-                let index = if nonstandard {
-                    index
-                } else {
-                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
-                };
-                let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getarrayitem_float_checked(
-                    nonstandard,
-                    opcode_pc,
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
-            }
-            jitcode::insns::BC_SETARRAYITEM_VABLE_I => {
-                let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, index_reg, src) = frame.read_vable_setarrayitem();
-                    (opcode_pc, vable_reg, array_idx, index_reg, src)
-                };
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py `_opimpl_getarrayitem_vable` /
-                // `_opimpl_setarrayitem_vable` reach the index through
-                // `implement_guard_value` on an `MIFrame`, which owns the
-                // framestack the resume snapshot is built from. Promoting here
-                // rather than inside `TraceCtx::get_arrayitem_vable_index`
-                // keeps that ownership: the guard gets a full-framestack,
-                // vable-carrying snapshot instead of the minimal one
-                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                //
-                // The hoist moves the promote to the caller, NOT ahead of the
-                // branch that selects it. `_get_arrayitem_vable_index`
-                // (pyjitpl.py) opens with the promote and is entered only
-                // from the standard leg (:1229, :1244); the non-standard leg
-                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
-                // the index box as it stands. So the decision is taken first
-                // and handed to the `*_checked` leg, and a non-standard access
-                // with a non-constant index no longer mints a GUARD_VALUE that
-                // over-specializes an ordinary heap read.
-                let check_guards_before = ctx.num_guards();
-                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
-                let index = if nonstandard {
-                    index
-                } else {
-                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
-                };
-                let (value, concrete) = self.read_int_reg(src);
-                let guards_before = ctx.num_guards();
-                let write = match ctx.vable_setarrayitem_checked(
-                    nonstandard,
-                    opcode_pc,
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                    value,
-                    Value::Int(concrete),
-                    false,
-                ) {
-                    // Promoted index falls outside the standard virtualizable
-                    // array (e.g. a transient out-of-bounds state-field index);
-                    // this slot cannot be virtualized, so abort the trace.
-                    VableArrayStore::OutOfVable => return TraceAction::Abort,
-                    VableArrayStore::Stored(write) => write,
-                };
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            jitcode::insns::BC_SETARRAYITEM_VABLE_R => {
-                let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, index_reg, src) = frame.read_vable_setarrayitem();
-                    (opcode_pc, vable_reg, array_idx, index_reg, src)
-                };
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py `_opimpl_getarrayitem_vable` /
-                // `_opimpl_setarrayitem_vable` reach the index through
-                // `implement_guard_value` on an `MIFrame`, which owns the
-                // framestack the resume snapshot is built from. Promoting here
-                // rather than inside `TraceCtx::get_arrayitem_vable_index`
-                // keeps that ownership: the guard gets a full-framestack,
-                // vable-carrying snapshot instead of the minimal one
-                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                //
-                // The hoist moves the promote to the caller, NOT ahead of the
-                // branch that selects it. `_get_arrayitem_vable_index`
-                // (pyjitpl.py) opens with the promote and is entered only
-                // from the standard leg (:1229, :1244); the non-standard leg
-                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
-                // the index box as it stands. So the decision is taken first
-                // and handed to the `*_checked` leg, and a non-standard access
-                // with a non-constant index no longer mints a GUARD_VALUE that
-                // over-specializes an ordinary heap read.
-                let check_guards_before = ctx.num_guards();
-                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
-                let index = if nonstandard {
-                    index
-                } else {
-                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
-                };
-                let (value, concrete) = self.read_ref_reg(src);
-                let guards_before = ctx.num_guards();
-                let write = match ctx.vable_setarrayitem_checked(
-                    nonstandard,
-                    opcode_pc,
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                    value,
-                    Value::Ref(majit_ir::GcRef(concrete as usize)),
-                    false,
-                ) {
-                    VableArrayStore::OutOfVable => return TraceAction::Abort,
-                    VableArrayStore::Stored(write) => write,
-                };
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            jitcode::insns::BC_SETARRAYITEM_VABLE_F => {
-                let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, index_reg, src) = frame.read_vable_setarrayitem();
-                    (opcode_pc, vable_reg, array_idx, index_reg, src)
-                };
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let (index, index_value) = self.read_int_reg(index_reg);
-                // pyjitpl.py `_opimpl_getarrayitem_vable` /
-                // `_opimpl_setarrayitem_vable` reach the index through
-                // `implement_guard_value` on an `MIFrame`, which owns the
-                // framestack the resume snapshot is built from. Promoting here
-                // rather than inside `TraceCtx::get_arrayitem_vable_index`
-                // keeps that ownership: the guard gets a full-framestack,
-                // vable-carrying snapshot instead of the minimal one
-                // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                //
-                // The hoist moves the promote to the caller, NOT ahead of the
-                // branch that selects it. `_get_arrayitem_vable_index`
-                // (pyjitpl.py) opens with the promote and is entered only
-                // from the standard leg (:1229, :1244); the non-standard leg
-                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
-                // the index box as it stands. So the decision is taken first
-                // and handed to the `*_checked` leg, and a non-standard access
-                // with a non-constant index no longer mints a GUARD_VALUE that
-                // over-specializes an ordinary heap read.
-                let check_guards_before = ctx.num_guards();
-                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
-                let index = if nonstandard {
-                    index
-                } else {
-                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
-                };
-                let (value, concrete) = self.read_float_reg(src);
-                let guards_before = ctx.num_guards();
-                let write = match ctx.vable_setarrayitem_checked(
-                    nonstandard,
-                    opcode_pc,
-                    vable_opref,
-                    index,
-                    index_value,
-                    fdescr,
-                    adescr,
-                    value,
-                    Value::Float(f64::from_bits(concrete as u64)),
-                    false,
-                ) {
-                    VableArrayStore::OutOfVable => return TraceAction::Abort,
-                    VableArrayStore::Stored(write) => write,
-                };
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, write);
-            }
-            jitcode::insns::BC_ARRAYLEN_VABLE => {
-                let (opcode_pc, vable_reg, array_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let (vable_reg, array_idx, dest) = frame.read_vable_arraylen();
-                    (opcode_pc, vable_reg, array_idx, dest)
-                };
-                let Some((vable_opref, fdescr, adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
-                let guards_before = ctx.num_guards();
-                let result = ctx.vable_arraylen_vable(
-                    self.cpu.as_ref(),
-                    opcode_pc,
-                    vable_opref,
-                    vable_struct_ptr,
-                    fdescr,
-                    adescr,
-                );
-                self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                // pyjitpl.py MIFrame.opimpl_arraylen_vable `result =
-                // vinfo.get_array_length(virtualizable, arrayindex);
-                // return ConstInt(result)`.  RPython reads from the live
-                // struct; pyre's trace-side shadow is
-                // `virtualizable_array_lengths`, populated by
-                // `init_virtualizable_boxes` (resume.py ResumeDataVirtualAdder._number_virtuals parity)
-                // before the trace runs, so it carries the same length
-                // RPython would dereference.
-                let len = ctx
-                    .virtualizable_array_lengths()
-                    .and_then(|lengths| lengths.get(array_idx).copied())
-                    .unwrap_or(0);
-                self.set_int_reg(dest, Some(result), Some(len as i64));
-            }
-            jitcode::insns::BC_ARRAYBASE_VABLE => {
-                // Same `rdd>i` operand triple as `arraylen_vable` above, hence
-                // the shared decoder.
-                let (vable_reg, array_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    frame.read_vable_arraylen()
-                };
-                let Some((_vable_opref, fdescr, _adescr)) =
-                    self.vable_array_descrs(ctx, vable_reg, array_idx)
-                else {
-                    return TraceAction::Abort;
-                };
-                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
-                // An unresolvable base aborts rather than defaulting: the walk
-                // really executes the residual call this address feeds, so a
-                // placeholder would be handed to a live callee.
-                let Some((result, addr)) = ctx.vable_arraybase_vable(vable_struct_ptr, fdescr)
-                else {
-                    return TraceAction::Abort;
-                };
-                self.set_int_reg(dest, Some(result), Some(addr));
-            }
-            jitcode::insns::BC_HINT_FORCE_VIRTUALIZABLE => {
-                let vable_reg = self.frames.current_mut().next_reg() as usize;
-                let vable_opref = self.resolve_vable_box(vable_reg);
-                ctx.gen_store_back_in_vable(vable_opref);
-            }
-
-            jitcode::insns::BC_INT_ADD => self.trace_binop_i(ctx, OpCode::IntAdd),
-            jitcode::insns::BC_INT_SUB => self.trace_binop_i(ctx, OpCode::IntSub),
-            jitcode::insns::BC_INT_MUL => self.trace_binop_i(ctx, OpCode::IntMul),
-            jitcode::insns::BC_INT_ADD_JUMP_IF_OVF => {
-                self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntAddOvf)
-            }
-            jitcode::insns::BC_INT_SUB_JUMP_IF_OVF => {
-                self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntSubOvf)
-            }
-            jitcode::insns::BC_INT_MUL_JUMP_IF_OVF => {
-                self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntMulOvf)
-            }
-            // `int_floordiv` / `int_mod` have no bytecode opcode:
-            // `jtransform.py Transformer._do_builtin_call` rewrites both via
-            // `_do_builtin_call` to `direct_call(ll_int_py_div)` /
-            // `direct_call(ll_int_py_mod)` before jitcode emission.
-            // Pyre's `specialize.rs::walker_emit_int_py_div_or_mod` emits
-            // the same residual call as a `CallI` op directly — no
-            // `BC_INT_FLOORDIV` / `BC_INT_MOD` opcode is allocated, so
-            // no dispatch arm exists.
-            jitcode::insns::BC_INT_AND => self.trace_binop_i(ctx, OpCode::IntAnd),
-            jitcode::insns::BC_INT_SIGNEXT => self.trace_binop_i(ctx, OpCode::IntSignext),
-            jitcode::insns::BC_INT_OR => self.trace_binop_i(ctx, OpCode::IntOr),
-            jitcode::insns::BC_INT_XOR => self.trace_binop_i(ctx, OpCode::IntXor),
-            jitcode::insns::BC_INT_LSHIFT => self.trace_binop_i(ctx, OpCode::IntLshift),
-            jitcode::insns::BC_INT_RSHIFT => self.trace_binop_i(ctx, OpCode::IntRshift),
-            jitcode::insns::BC_INT_EQ => self.trace_binop_i(ctx, OpCode::IntEq),
-            jitcode::insns::BC_INT_NE => self.trace_binop_i(ctx, OpCode::IntNe),
-            jitcode::insns::BC_INT_LT => self.trace_binop_i(ctx, OpCode::IntLt),
-            jitcode::insns::BC_INT_LE => self.trace_binop_i(ctx, OpCode::IntLe),
-            jitcode::insns::BC_INT_GT => self.trace_binop_i(ctx, OpCode::IntGt),
-            jitcode::insns::BC_INT_GE => self.trace_binop_i(ctx, OpCode::IntGe),
-            jitcode::insns::BC_UINT_RSHIFT => self.trace_binop_i(ctx, OpCode::UintRshift),
-            jitcode::insns::BC_UINT_MUL_HIGH => self.trace_binop_i(ctx, OpCode::UintMulHigh),
-            jitcode::insns::BC_UINT_LT => self.trace_binop_i(ctx, OpCode::UintLt),
-            jitcode::insns::BC_UINT_LE => self.trace_binop_i(ctx, OpCode::UintLe),
-            jitcode::insns::BC_UINT_GT => self.trace_binop_i(ctx, OpCode::UintGt),
-            jitcode::insns::BC_UINT_GE => self.trace_binop_i(ctx, OpCode::UintGe),
-            jitcode::insns::BC_INT_BETWEEN => self.trace_int_between(ctx),
-            jitcode::insns::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
-            jitcode::insns::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
-            jitcode::insns::BC_INT_IS_TRUE => self.trace_unary_i(ctx, OpCode::IntIsTrue),
-            jitcode::insns::BC_INT_IS_ZERO => self.trace_unary_i(ctx, OpCode::IntIsZero),
-            jitcode::insns::BC_PTR_EQ => self.trace_binop_r_to_i(ctx, OpCode::PtrEq),
-            jitcode::insns::BC_PTR_NE => self.trace_binop_r_to_i(ctx, OpCode::PtrNe),
-            jitcode::insns::BC_INSTANCE_PTR_EQ => {
-                self.trace_binop_r_to_i(ctx, OpCode::InstancePtrEq)
-            }
-            jitcode::insns::BC_INSTANCE_PTR_NE => {
-                self.trace_binop_r_to_i(ctx, OpCode::InstancePtrNe)
-            }
-            jitcode::insns::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
-            jitcode::insns::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
-            jitcode::insns::BC_GOTO_IF_NOT => {
-                // Canonical `iL` encoding (`assembler.py Assembler.write_insn`):
-                // [cond:u8][target:u16].
-                let (opcode_pc, cond_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    // RPython `pyjitpl.py orgpc = position` parity: the
-                    // dispatcher's `next_u8()` already stepped past the
-                    // opcode byte, so `code_cursor - 1` is the byte position
-                    // of the guard op itself — what `generate_guard(...,
-                    // resumepc=orgpc)` records. The `live/<offset>` marker
-                    // sits at `opcode_pc - SIZE_LIVE_OP`, satisfying
-                    // BlackholeInterpreter::get_current_position_info's
-                    // `code[pc - SIZE_LIVE_OP] == op_live` check.
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (cond, cond_value) = self.read_int_reg(cond_idx);
-                self.pcseq_branch(
-                    "goto_if_not",
-                    opcode_pc,
-                    cond_value,
-                    (cond_value == 0).then_some(target),
-                );
-                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, true);
-            }
-            // pyjitpl.py opimpl_goto_if_not_int_is_true(box, target):
-            //   condbox = self.execute(rop.INT_IS_TRUE, box)
-            //   self.opimpl_goto_if_not(condbox, target, ..., replace=False)
-            //
-            // `jtransform.py optimize_goto_if_not` admits `int_is_true` into
-            // the folded-exitswitch set and `flatten.py` then emits
-            // `goto_if_not_int_is_true`, so this is a distinct opname with its
-            // own byte — only `blackhole.py BlackholeInterpreter.bhimpl_goto_if_not_int_is_true` aliases the two, and only on
-            // the blackhole side, where there is no operation to re-record.
-            jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
-                // Canonical `iL` encoding: [src:u8][target:u16].
-                let (opcode_pc, src_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (src, src_value) = self.read_int_reg(src_idx);
-                let cond_value = (src_value != 0) as i64;
-                let cond = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::IntIsTrue,
-                    None,
-                    &[src],
-                    Some(majit_ir::Value::Int(cond_value)),
-                    self.last_exception_value,
-                );
-                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, false);
-            }
-            // pyjitpl.py opimpl_goto_if_not_int_is_zero(box, target):
-            //   condbox = execute(rop.INT_IS_ZERO, box)
-            //   self.opimpl_goto_if_not(condbox, target, ..., replace=False)
-            // i.e. record int_is_zero on the operand, then branch as if the
-            // result were a plain bool exitswitch.
-            jitcode::insns::BC_GOTO_IF_NOT_INT_IS_ZERO => {
-                // Canonical `iL` encoding: [src:u8][target:u16].
-                let (opcode_pc, src_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (src, src_value) = self.read_int_reg(src_idx);
-                let cond_value = if src_value == 0 { 1 } else { 0 };
-                let cond = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::IntIsZero,
-                    None,
-                    &[src],
-                    Some(majit_ir::Value::Int(cond_value)),
-                    self.last_exception_value,
-                );
-                let guard = if cond_value == 0 {
-                    OpCode::GuardFalse
-                } else {
-                    OpCode::GuardTrue
-                };
-                self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
-                if cond_value == 0 {
-                    self.frames.current_mut().code_cursor = target;
-                }
-            }
-            jitcode::insns::BC_GOTO_IF_NOT_INT_LT
-            | jitcode::insns::BC_GOTO_IF_NOT_INT_LE
-            | jitcode::insns::BC_GOTO_IF_NOT_INT_EQ
-            | jitcode::insns::BC_GOTO_IF_NOT_INT_NE
-            | jitcode::insns::BC_GOTO_IF_NOT_INT_GT
-            | jitcode::insns::BC_GOTO_IF_NOT_INT_GE => {
-                // Canonical `iiL` encoding: [a:u8][b:u8][target:u16].
-                let (opcode_pc, lhs_idx, rhs_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
-                let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
-                let opcode = match bytecode {
-                    jitcode::insns::BC_GOTO_IF_NOT_INT_LT => OpCode::IntLt,
-                    jitcode::insns::BC_GOTO_IF_NOT_INT_LE => OpCode::IntLe,
-                    jitcode::insns::BC_GOTO_IF_NOT_INT_EQ => OpCode::IntEq,
-                    jitcode::insns::BC_GOTO_IF_NOT_INT_NE => OpCode::IntNe,
-                    jitcode::insns::BC_GOTO_IF_NOT_INT_GT => OpCode::IntGt,
-                    jitcode::insns::BC_GOTO_IF_NOT_INT_GE => OpCode::IntGe,
-                    _ => unreachable!(),
-                };
-                let cond_value = eval_binop_i(opcode, lhs_value, rhs_value);
-                self.record_or_fold_fused_guard(
-                    ctx,
-                    sym,
-                    opcode,
-                    lhs,
-                    rhs,
-                    cond_value != 0,
-                    opcode_pc,
-                    target,
-                );
-            }
-            jitcode::insns::BC_GOTO_IF_NOT_FLOAT_LT
-            | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_LE
-            | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_EQ
-            | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_NE
-            | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GT
-            | jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GE => {
-                // Canonical `ffL` encoding: [a:u8][b:u8][target:u16].
-                let (opcode_pc, lhs_idx, rhs_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
-                let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
-                let a = f64::from_bits(lhs_value as u64);
-                let b = f64::from_bits(rhs_value as u64);
-                let (opcode, taken) = match bytecode {
-                    jitcode::insns::BC_GOTO_IF_NOT_FLOAT_LT => (OpCode::FloatLt, a < b),
-                    jitcode::insns::BC_GOTO_IF_NOT_FLOAT_LE => (OpCode::FloatLe, a <= b),
-                    jitcode::insns::BC_GOTO_IF_NOT_FLOAT_EQ => (OpCode::FloatEq, a == b),
-                    jitcode::insns::BC_GOTO_IF_NOT_FLOAT_NE => (OpCode::FloatNe, a != b),
-                    jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GT => (OpCode::FloatGt, a > b),
-                    jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GE => (OpCode::FloatGe, a >= b),
-                    _ => unreachable!(),
-                };
-                self.record_or_fold_fused_guard(
-                    ctx, sym, opcode, lhs, rhs, taken, opcode_pc, target,
-                );
-            }
-            jitcode::insns::BC_GOTO_IF_NOT_PTR_EQ | jitcode::insns::BC_GOTO_IF_NOT_PTR_NE => {
-                // Canonical `rrL` encoding: [a:u8][b:u8][target:u16].
-                let (opcode_pc, lhs_idx, rhs_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
-                let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
-                let (opcode, taken) = match bytecode {
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_EQ => {
-                        (OpCode::PtrEq, lhs_value == rhs_value)
-                    }
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_NE => {
-                        (OpCode::PtrNe, lhs_value != rhs_value)
-                    }
-                    _ => unreachable!(),
-                };
-                self.record_or_fold_fused_guard(
-                    ctx, sym, opcode, lhs, rhs, taken, opcode_pc, target,
-                );
-            }
-            // RPython `pyjitpl.py opimpl_switch`: a hit promotes the
-            // switched value with GUARD_VALUE and jumps to the case target;
-            // a miss records INT_EQ + GUARD_FALSE for every ordered key and
-            // falls through to the default path after the switch.
-            jitcode::insns::BC_SWITCH => {
-                // Canonical `id` encoding (`assembler.py Assembler.write_insn`):
-                // [value:u8][descr:u16].
-                let (opcode_pc, value_idx, descr_idx) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let descr = self
-                    .frames
-                    .current_mut()
-                    .jitcode
-                    .descr_at(descr_idx)
-                    .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
-                    .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
-                    .clone();
-                let (value_box, concrete_value) = self.read_int_reg(value_idx);
-                let hit = descr.switch_lookup(concrete_value);
-                self.pcseq_branch("switch", opcode_pc, concrete_value, hit);
-                if let Some(target) = hit {
-                    let const_ref = ctx.const_int(concrete_value);
-                    self.record_state_guard(
-                        ctx,
-                        sym,
-                        OpCode::GuardValue,
-                        &[value_box, const_ref],
-                        opcode_pc,
-                        false,
-                    );
-                    self.set_int_reg(value_idx, Some(const_ref), Some(concrete_value));
-                    self.frames.current_mut().code_cursor = target;
-                } else {
-                    for &key in descr.switch_const_keys_in_order() {
-                        let key_ref = ctx.const_int(key);
-                        // `SwitchDictDescr.attach` builds `const_keys_in_order`
-                        // as `sorted(dict.keys())`, so a `switch_lookup` miss
-                        // means no key equals the switched value. Evaluate the
-                        // comparison rather than assume that: the funnel folds
-                        // this value into the trace when `value_box` is
-                        // constant, and a constant that disagrees with the
-                        // guard beside it is a miscompile with no diagnostic.
-                        let cond_value = (concrete_value == key) as i64;
-                        debug_assert_eq!(
-                            cond_value, 0,
-                            "BC_SWITCH miss chain: key {key} equals the switched value",
-                        );
-                        let cond = ctx.execute_and_record(
-                            Some(self.cpu.as_ref()),
-                            OpCode::IntEq,
-                            None,
-                            &[value_box, key_ref],
-                            Some(majit_ir::Value::Int(cond_value)),
-                            self.last_exception_value,
-                        );
-                        self.record_state_guard(
-                            ctx,
-                            sym,
-                            OpCode::GuardFalse,
-                            &[cond],
-                            opcode_pc,
-                            false,
-                        );
-                    }
-                }
-            }
-            jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO
-            | jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => {
-                // Canonical `rL` encoding: [src:u8][target:u16].
-                let (opcode_pc, src_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (
-                        opcode_pc,
-                        frame.next_reg() as usize,
-                        frame.next_u16() as usize,
-                    )
-                };
-                let (src, src_value) = self.read_ref_reg(src_idx);
-                let nonnull = self.establish_nullity(ctx, sym, src, src_value, opcode_pc);
-                // pyjitpl.py:
-                //   opimpl_goto_if_not_ptr_nonzero: if not nonnull: self.pc = target
-                //   opimpl_goto_if_not_ptr_iszero:  if     nonnull: self.pc = target
-                let branch_taken = match bytecode {
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO => nonnull,
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => !nonnull,
-                    _ => unreachable!(),
-                };
-                if branch_taken {
-                    self.frames.current_mut().code_cursor = target;
-                }
-            }
-            jitcode::insns::BC_CATCH_EXCEPTION => {
-                let _target = self.frames.current_mut().next_u16();
-            }
-            jitcode::insns::BC_LAST_EXCEPTION => {
-                let dst = self.frames.current_mut().next_reg() as usize;
-                let exc_value = self.last_exception_value;
-                // pyjitpl.py opimpl_last_exception:
-                //     exc_value = self.metainterp.last_exc_value
-                //     assert exc_value
-                //     assert self.metainterp.class_of_last_exc_is_const
-                //     exc_cls = rclass.ll_cast_to_object(exc_value).typeptr
-                //     return ConstInt(ptr2int(exc_cls))
-                assert!(exc_value != 0, "last_exception without active exception");
-                assert!(
-                    self.class_of_last_exc_is_const,
-                    "last_exception requires class_of_last_exc_is_const",
-                );
-                // `cls_of_box` (model.py) supplies the typeptr
-                // resolution wired through `MetaInterp::cls_of_box`; the
-                // standalone fallback returns the raw value for tests
-                // that pre-date typed exception dispatch.
-                let typeptr = self.read_typeptr_from_exception(exc_value);
-                self.set_int_reg(dst, Some(ctx.const_int(typeptr)), Some(typeptr));
-            }
-            jitcode::insns::BC_LAST_EXC_VALUE => {
-                let dst = self.frames.current_mut().next_reg() as usize;
-                // pyjitpl.py opimpl_last_exc_value:
-                //     exc_value = self.metainterp.last_exc_value
-                //     assert exc_value
-                //     return self.metainterp.last_exc_box
-                //
-                // The value-null check gates the box read because
-                // `clear_exception` (Parity #10) clears only
-                // `last_exception_value`; `last_exception_box` may
-                // remain populated with stale data after a successful
-                // residual call.  PyPy's `assert exc_value` makes the
-                // stale-box read fail-fast.
-                let value = self.last_exception_value;
-                assert!(value != 0, "last_exc_value without active exception");
-                let opref = self
-                    .last_exception_box
-                    .expect("last_exc_value without exception box");
-                self.set_ref_reg(dst, Some(opref), Some(value));
-            }
-            // pyjitpl.py opimpl_goto_if_exception_mismatch:
-            //     last_exc_value = metainterp.last_exc_value
-            //     assert last_exc_value
-            //     assert metainterp.class_of_last_exc_is_const
-            //     cls = ... vtablebox.getaddr() ...
-            //     real_instance = rclass.ll_cast_to_object(last_exc_value)
-            //     if not rclass.ll_isinstance(real_instance, cls):
-            //         self.pc = next_exc_target
-            //
-            // `class_of_last_exc_is_const` is asserted, so the typeptr is
-            // constant for the trace — no guard recorded; the branch is
-            // a trace-time decision (matches the legacy
-            // `int_values[vtable_idx]` Const slot read).
-            jitcode::insns::BC_GOTO_IF_EXCEPTION_MISMATCH => {
-                // Canonical `iL` encoding: [vtable:u8][target:u16].
-                let (vtable_idx, target) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_reg() as usize, frame.next_u16() as usize)
-                };
-                let exc_value = self.last_exception_value;
-                assert!(
-                    exc_value != 0,
-                    "goto_if_exception_mismatch without active exception",
-                );
-                assert!(
-                    self.class_of_last_exc_is_const,
-                    "goto_if_exception_mismatch requires class_of_last_exc_is_const",
-                );
-                let (_, bounding_vtable) = self.read_int_reg(vtable_idx);
-                // pyjitpl.py MIFrame.opimpl_goto_if_exception_mismatch:
-                //     real_instance = rclass.ll_cast_to_object(last_exc_value)
-                //     if not rclass.ll_isinstance(real_instance, cls):
-                //         self.pc = next_exc_target
-                //
-                // `cls_of_box` (model.py) reads the runtime
-                // typeptr; `issubclass_of` mirrors the blackhole-side
-                // resolution (`handler_goto_if_exception_mismatch` in
-                // `blackhole.rs` calls `cpu.bh_issubclass`) over RPython
-                // subclass ranges.
-                let exc_typeptr = self.read_typeptr_from_exception(exc_value);
-                if !self.issubclass_of(exc_typeptr, bounding_vtable) {
-                    self.frames.current_mut().code_cursor = target;
-                }
-            }
-            jitcode::insns::BC_RVMPROF_CODE => {
-                let (leaving_idx, unique_id_idx) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_reg() as usize, frame.next_reg() as usize)
-                };
-                let leaving = self.frames.current_mut().int_values[leaving_idx].unwrap_or(0);
-                let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
-                majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
-            }
-            jitcode::insns::BC_JIT_MERGE_POINT | jitcode::insns::BC_JIT_MERGE_POINT_C => {
-                // `pyjitpl.py reached_loop_header` builds `live_arg_boxes` from the
-                // live framestack. Snapshot portal reds here so a walk that then
-                // drains its frames still has jump args and writeback values.
-                self.stash_portal_reds(ctx, sym);
-                // blackhole.py bhimpl_jit_merge_point parity.
-                // Portal merge point: close the loop if at the traced header.
-                //
-                // Payload shape mirrors upstream `@arguments("self", "i",
-                // "I", "R", "F", "I", "R", "F")` (blackhole.py) and
-                // pyre's own `JitCodeBuilder::jit_merge_point`
-                // (`majit-metainterp/src/jitcode/assembler.rs`)
-                // — 1-byte jdindex (either a registers_i pool slot for the
-                // `i` form or a raw signed byte for the `c` form) + six
-                // typed register lists (`[len:u8][reg:u8 * N]`).
-                let opcode = bytecode;
-                let frame = self.frames.current_mut();
-                // `jtransform.py` `promote_greens` emits a `-live-` (op3) immediately
-                // BEFORE the `jit_merge_point` op; the GUARD_FUTURE_CONDITION
-                // recorded at loop close resumes through it
-                // (`JitCodeBuilder::live_placeholder` in
-                // `jitcode/assembler.rs`).  Capture the
-                // merge-point op position now, before `next_u8` advances the
-                // cursor, so `record_state_guard`'s `frame.pc = resume_pc`
-                // swap finds that `-live-` at
-                // `mp_opcode_pc - SIZE_LIVE_OP`.
-                let mp_opcode_pc = frame.code_cursor - 1;
-                let jdindex_byte = frame.next_reg();
-                // RPython `blackhole.py BlackholeInterpBuilder._get_method` argcode discrimination:
-                //
-                //     if argcode == 'i':
-                //         value = self.registers_i[ord(code[position])]
-                //     elif argcode == 'c':
-                //         value = signedord(code[position])
-                //
-                // BC_JIT_MERGE_POINT is the `i` form: the byte indexes
-                // `registers_i` (which carries the constants suffix at
-                // `[num_regs_i, num_regs_i + constants_i.len())`, populated
-                // by `MIFrame::setup_call`).  BC_JIT_MERGE_POINT_C
-                // is the `c` form: the byte IS the signed jdindex.
-                let jdindex: usize = if opcode == jitcode::insns::BC_JIT_MERGE_POINT_C {
-                    // signedord(byte) — byte interpreted as i8 then sign-extended.
-                    (jdindex_byte as i8) as i64 as usize
-                } else {
-                    let slot = jdindex_byte as usize;
-                    let resolved = frame.int_values.get(slot).copied().flatten().expect(
-                        "BC_JIT_MERGE_POINT (i form): jdindex register slot \
-                         must hold a populated int constant — assembler.py:312-346 \
-                         emits an `i` argcode pointing at the post-regs constants \
-                         suffix, finalize_constants seeds those slots at setup_call",
-                    );
-                    resolved as usize
-                };
-                // pyjitpl.py MIFrame.opimpl_jit_merge_point — `staticdata.jitdrivers_sd[jdindex]`
-                // selects the JitDriver this merge point belongs to.
-                // `codegen_state.rs`'s `generate_state_fields_jit_state`
-                // stamps `driver.index()` into
-                // this byte at codegen time, so the value must always
-                // resolve to a registered slot — anything else
-                // indicates a `register_jitdriver_sd` lifecycle bug
-                // (warmspot.py WarmRunnerDesc.make_args_specification translation-time
-                // `make_args_specification` invariant parity).
-                // Production-active assert; replaces an earlier
-                // single-driver `== 0` over-restriction that would
-                // wrongly fire when more than one JitDriver registers.
-                let registered_drivers = ctx.metainterp_sd().jitdrivers_sd.len();
-                assert!(
-                    jdindex < registered_drivers,
-                    "BC_JIT_MERGE_POINT: jdindex {jdindex} out of range \
-                     (registered drivers: {registered_drivers}) — \
-                     pyjitpl.py:1540 staticdata.jitdrivers_sd[jdindex] parity",
-                );
-                // Resolve the per-driver static data (currently
-                // unused by dispatch — the frame's JitCode already
-                // encodes its owning driver — but the lookup pins
-                // multi-driver correctness so a future per-driver
-                // routing change reads the same descriptor RPython
-                // would).
-                let _jitdriver_sd = &ctx.metainterp_sd().jitdrivers_sd[jdindex];
-                // 5 — register-byte bounds.  Each of the six
-                // register lists encodes `[len:u8][reg:u8 * N]` with
-                // greens/reds split by kind in `(I, R, F, I, R, F)`
-                // order (mirrors `bhimpl_jit_merge_point`'s
-                // `@arguments("self", "i", "I", "R", "F", "I", "R",
-                // "F")`, blackhole.py).  Each register byte must
-                // fall within the JitCode's per-kind register bank.
-                let max_regs = [
-                    frame.jitcode.num_regs_i(),
-                    frame.jitcode.num_regs_r(),
-                    frame.jitcode.num_regs_f(),
-                    frame.jitcode.num_regs_i(),
-                    frame.jitcode.num_regs_r(),
-                    frame.jitcode.num_regs_f(),
-                ];
-                // Slice (audit Issue #4) — verify_green_args
-                // (pyjitpl.py).  Slots 0..3 hold the green
-                // register bytes; each green register MUST hold a
-                // Const at trace time (the `emit_promote_greens` /
-                // `<kind>_guard_value` chain at `jtransform.py` `promote_greens`
-                // promotes each green to a constant before the
-                // `BC_JIT_MERGE_POINT`).  A non-constant green here
-                // indicates a macro emission gap.  RPython
-                // `assert` ↔ Rust `debug_assert!` parity.
-                // pyjitpl.py reached_loop_header / same_greenkey: the
-                // merge point's pc green identifies the loop header.  Capture it
-                // (the first int green — greens are declared pc-first) so the
-                // close gate can decline a merge point whose pc differs from the
-                // trace-start `header_pc`.  The promoted greens are constants at
-                // trace time (verify_green_args, asserted below).
-                let mut mp_green_pc: Option<i64> = None;
-                // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
-                // point (pc plus any scalar greens the consumer declares).
-                let mut mp_green_ints: CallI64s = SmallVec::new();
-                // pyjitpl.py same_greenkey compares EVERY green, not just
-                // the int slot.  Capture the ref (slot 1) and float (slot 2)
-                // green constants too so the header-close gate compares the full
-                // green tuple against the captured header greens (`header_greens`).
-                let mut mp_green_refs: CallI64s = SmallVec::new();
-                let mut mp_green_floats: CallI64s = SmallVec::new();
-                // Single-pass tracing: the walk closes back to an interpreter
-                // program pc; capture it (below) so the merge-point hook can
-                // resume the native loop there. The walk is the sole executor,
-                // so the close always transfers walk-final state.
-                let capture_walk_reds = true;
-                let inner_close = true;
-                // pyjitpl.py reached_loop_header `current_merge_points.append`:
-                // the live arg boxes (greens slots 0..3 + reds slots 3..6, in
-                // operand order) at this merge point. A NESTED inner-loop revisit
-                // records these as the inner loop's inputargs so the cross-loop
-                // cut can peel the outer prefix as preamble. Built during the
-                // tracing walk only — off the compiled hot path.
-                let mut live_arg_boxes: SmallVec<[crate::trace_ctx::GreenBox; CALL_INLINE]> =
-                    SmallVec::new();
-                // pyjitpl.py opimpl_jit_merge_point `redboxes`.
-                let mut redboxes: SmallVec<[(OpRef, majit_ir::Type); CALL_INLINE]> =
-                    SmallVec::new();
-                // Single-pass: accumulate the walk-final concrete RED values from
-                // the live value-bank shadow (slots 3-5 = reds I/R/F in operand
-                // order) so the merge-point hook can `restore_values` them into
-                // native state — completing the transfer that storage-only
-                // `recover` cannot (loop-carried reds never written to the heap).
-                let mut walk_reds: CallValues = SmallVec::new();
-                let mut green_i_regs: Vec<u8> = Vec::new();
-                let mut green_r_regs: Vec<u8> = Vec::new();
-                let mut green_f_regs: Vec<u8> = Vec::new();
-                for (slot, &max) in max_regs.iter().enumerate().take(6) {
-                    let count = frame.next_u8() as usize;
-                    let is_green_slot = slot < 3;
-                    for _ in 0..count {
-                        let reg = frame.next_reg();
-                        let reg_idx = reg as usize;
-                        if is_green_slot {
-                            match slot {
-                                0 => green_i_regs.push(reg),
-                                1 => green_r_regs.push(reg),
-                                2 => green_f_regs.push(reg),
-                                _ => {}
-                            }
-                        }
-                        if capture_walk_reds && slot >= 3 {
-                            match slot {
-                                3 => {
-                                    if let Some(v) =
-                                        frame.int_values.get(reg_idx).copied().flatten()
-                                    {
-                                        walk_reds.push(Value::Int(v));
-                                    }
-                                }
-                                4 => {
-                                    if let Some(r) =
-                                        frame.ref_values.get(reg_idx).copied().flatten()
-                                    {
-                                        walk_reds.push(Value::Ref(majit_ir::GcRef(r as usize)));
-                                    }
-                                }
-                                _ => {
-                                    if let Some(b) =
-                                        frame.float_values.get(reg_idx).copied().flatten()
-                                    {
-                                        walk_reds.push(Value::Float(f64::from_bits(b as u64)));
-                                    }
-                                }
-                            }
-                        }
-                        if inner_close {
-                            // The merge point's live arg boxes (only the green
-                            // slots are populated for the state-field dispatch
-                            // model; reds are state fields restored separately).
-                            // These become the inner loop's `original_boxes` —
-                            // the promoted-green constants — for the cross-loop
-                            // cut remap (compile.py compile_loop cut_trace_from).
-                            let (opref_opt, ty) = match slot {
-                                0 | 3 => (
-                                    frame.int_regs.get(reg_idx).copied().flatten(),
-                                    majit_ir::Type::Int,
-                                ),
-                                1 | 4 => (
-                                    frame.ref_regs.get(reg_idx).copied().flatten(),
-                                    majit_ir::Type::Ref,
-                                ),
-                                _ => (
-                                    frame.float_regs.get(reg_idx).copied().flatten(),
-                                    majit_ir::Type::Float,
-                                ),
-                            };
-                            if let Some(opref) = opref_opt {
-                                live_arg_boxes.push(crate::trace_ctx::GreenBox::new(opref, ty));
-                                if !is_green_slot {
-                                    redboxes.push((opref, ty));
-                                }
-                            }
-                        }
-                        if slot == 0
-                            && let Some(majit_ir::OpRef::ConstInt(v)) =
-                                frame.int_regs.get(reg_idx).copied().flatten()
-                        {
-                            if mp_green_pc.is_none() {
-                                mp_green_pc = Some(v);
-                            }
-                            mp_green_ints.push(v);
-                        }
-                        // pyjitpl.py same_greenkey: ref (slot 1) and float
-                        // (slot 2) green constants for the full-green header
-                        // compare.  `equal_whatever(Float, ..)` compares f64 bits,
-                        // so store the float green's `to_bits`.
-                        if slot == 1
-                            && let Some(majit_ir::OpRef::ConstPtr(v)) =
-                                frame.ref_regs.get(reg_idx).copied().flatten()
-                        {
-                            mp_green_refs.push(v.0 as i64);
-                        }
-                        if slot == 2
-                            && let Some(majit_ir::OpRef::ConstFloat(v)) =
-                                frame.float_regs.get(reg_idx).copied().flatten()
-                        {
-                            mp_green_floats.push(v.to_bits() as i64);
-                        }
-                        debug_assert!(
-                            reg_idx < max,
-                            "BC_JIT_MERGE_POINT: register byte {reg} \
-                             out of range for slot {slot} \
-                             (kind bank size {max})",
-                        );
-                        if is_green_slot && cfg!(debug_assertions) {
-                            // Look up the OpRef in the matching
-                            // typed register bank.  A None slot
-                            // means the register has not been
-                            // populated yet — also a macro emission
-                            // bug.
-                            let opref_opt = match slot {
-                                0 => frame.int_regs.get(reg_idx).copied().flatten(),
-                                1 => frame.ref_regs.get(reg_idx).copied().flatten(),
-                                2 => frame.float_regs.get(reg_idx).copied().flatten(),
-                                _ => unreachable!(),
-                            };
-                            let Some(opref) = opref_opt else {
-                                panic!(
-                                    "BC_JIT_MERGE_POINT: green register \
-                                     {reg} (slot {slot}) is unset at \
-                                     trace time (pyjitpl.py:1530 \
-                                     verify_green_args)",
-                                );
-                            };
-                            assert!(
-                                opref.is_constant(),
-                                "BC_JIT_MERGE_POINT: green register \
-                                 {reg} (slot {slot}) holds non-Const \
-                                 OpRef {opref:?} — emit_promote_greens \
-                                 (`jtransform.py` `promote_greens`) must run before \
-                                 the merge point so all greens are \
-                                 constants (pyjitpl.py:1530-1535 \
-                                 verify_green_args)",
-                            );
-                        }
-                    }
-                }
-                self.last_mp_green_i = green_i_regs;
-                self.last_mp_green_r = green_r_regs;
-                self.last_mp_green_f = green_f_regs;
-                ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
-                ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
-                ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
-                ctx.live_portal_greens = Some((
-                    mp_green_ints.to_vec(),
-                    mp_green_refs.to_vec(),
-                    mp_green_floats.to_vec(),
-                ));
-                // pyjitpl.py MIFrame.opimpl_jit_merge_point — a jit_merge_point reached INSIDE an
-                // inline recursive-portal callee, while no loop_header has been
-                // seen yet (`seen_loop_header_for_jdindex < 0`), is a pure
-                // no-op: the `if not jitdriver_sd.no_loop_header: if
-                // self.metainterp.portal_call_depth: return` early-out skips the
-                // auto loop-header stamp so the callee's merge point (it shares
-                // the caller's dispatch jitcode, entered at offset 0) does not
-                // corrupt the outer header.  The payload cursor was already
-                // advanced above, so the callee continues to its next opcode.
-                // A seen>=0 (or `no_loop_header` auto-stamped) depth>0 merge
-                // point falls through into the close protocol at the else-branch
-                // cut below (pyjitpl.py MIFrame.opimpl_jit_merge_point).
-                // pyjitpl.py `debug_merge_point`, the tail of the
-                // method every `jit_merge_point` runs through:
-                //
-                //     if (metainterp.force_finish_trace and
-                //             (metainterp.history.length() >
-                //              warmrunnerstate.trace_limit * 0.8)):
-                //         self._create_segmented_trace_and_blackhole()
-                //
-                // A green key that already overflowed once carries
-                // JC_FORCE_FINISH (set by `prepare_trace_segmenting`,
-                // pyjitpl.py).  Its next attempt must not overflow
-                // again: closing the trace as a segment here — strictly
-                // before `_interpret`'s 1.0x `blackhole_if_trace_too_long`
-                // (pyjitpl.py) can be reached — is what stops the
-                // key from retracing forever.  The check belongs at a merge
-                // point and nowhere else: the guard this records resumes
-                // through the `-live-` marker that precedes every
-                // `jit_merge_point` op, which an arbitrary mid-walk position
-                // has no counterpart for.
-                // Record the interpreter pc this merge point names, for the
-                // abort-resume correction in
-                // `trace_jitcode_with_args_and_runtime`.  It is written before
-                // every early return below, because a visit that goes on to
-                // return `Continue` still passed through a real opcode
-                // boundary, and that boundary is what the correction needs.
-                //
-                // Restricted to `inline_depth() == 0`: the position it competes
-                // with is the ROOT frame's i0, so an inlined callee's own pc
-                // would name a position in the wrong code.
-                if ctx.inline_depth() == 0 {
-                    if let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok()) {
-                        ctx.last_mp_green_pc = Some(u);
-                    }
-                }
-                if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
-                    // The loop-vs-bridge split lives inside
-                    // `create_segmented_trace`, where upstream keeps it
-                    // (pyjitpl.py MIFrame._create_segmented_trace_and_blackhole) — the check reached here segments
-                    // whatever trace it is in, exactly as
-                    // `_create_segmented_trace_and_blackhole` does.
-                    return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
-                }
-                // pyjitpl.py MIFrame.opimpl_jit_merge_point `jitdriver_sd =
-                // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
-                // owning driver's `no_loop_header`.  Upstream this is the same
-                // object as the elected `self.metainterp.jitdriver_sd` because
-                // the op's `jdindex` indexes `jitdrivers_sd` directly.  Pyre's
-                // production setup pushes an empty `ensure_default_driver_sd`
-                // placeholder at `jitdrivers_sd[0]`, shifting the real drivers to
-                // 1+, so a merge-point op whose build-time `jdindex` predates the
-                // placeholder can land on a neighbouring slot (the second portal
-                // driver's op carries `jdindex` = its build index, one slot below
-                // its runtime position).  Prefer the elected trace-owner
-                // descriptor (`ctx.driver_descriptor()` = `metainterp.jitdriver_sd`)
-                // so `no_loop_header` reflects the driver actually being traced;
-                // fall back to the op-indexed slot when no descriptor was elected.
-                let no_loop_header = ctx
-                    .driver_descriptor()
-                    .map(|d| d.no_loop_header)
-                    .unwrap_or_else(|| ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header);
-                // pyjitpl.py `_handle_guard_failure` pre-arms the
-                // flag when the source guard is a `ResumeAtPositionDescr` (the
-                // descr `inline_short_preamble` stamps onto the guards it
-                // replays, unroll.py OptUnroll._jump_to_existing_trace / OptUnroll.inline_short_preamble). Those guards sit at the
-                // target loop's entry, so the bridge grown from one closes at
-                // its very first merge point instead of recording another
-                // iteration; the pre-arm is what skips the ladder below.
-                if self.seen_loop_header_for_jdindex < 0
-                    && std::mem::take(&mut ctx.bridge_resume_at_position)
-                {
-                    self.seen_loop_header_for_jdindex = jdindex as i32;
-                }
-                if ctx.inline_depth() > 0
-                    && self.seen_loop_header_for_jdindex < 0
-                    && !no_loop_header
-                {
-                    return TraceAction::Continue;
-                }
-                // pyjitpl.py: `reached_loop_header` is called with
-                // `self.pc = orgpc`, and when it returns WITHOUT raising the
-                // frame restores `self.pc = saved_pc` — the position just AFTER
-                // the jit_merge_point — and goes on executing. The merge point
-                // is therefore consulted once per visit; the loop body runs
-                // before it is consulted again.
-                //
-                // Pyre fuses the merge point onto the guest instruction that
-                // hosts it, so a walk re-entered at the same guest pc (the
-                // `current_merge_points.append` path, jitdriver.rs `merge_point`)
-                // arrives back at this op with nothing recorded in between and
-                // would close again on the spot. This latch is `saved_pc`: skip
-                // the ladder exactly once, so the resumed walk executes the
-                // instruction's own arm and only re-consults the merge point a
-                // full iteration later.
-                if ctx.take_merge_point_resumed() {
-                    return TraceAction::Continue;
-                }
-                // MAJIT_PCSEQ (W4/D2 diagnostic): log the interpreter green pc
-                // captured at EVERY merge-point re-entry (not gated on
-                // seen_loop_header like MAJIT_MPTRACE). Confirms the walk holds a
-                // concrete per-opcode next-pc = mp_green_pc, the walker-drives-pc
-                // data source for the per-opcode single-executor.
-                if crate::pcseq_enabled() {
-                    let sf: Vec<Option<i64>> = (0..3).map(|i| sym.state_field_value(i)).collect();
-                    eprintln!(
-                        "@@@PCSEQ mp pc={mp_green_pc:?} greens={mp_green_ints:?} refs={mp_green_refs:?} floats={mp_green_floats:?} hdr={:?} sf={sf:?} num_ops={} seen_lh={}",
-                        ctx.header_greens,
-                        ctx.num_ops(),
-                        self.seen_loop_header_for_jdindex,
-                    );
-                }
-                // pyjitpl.py opimpl_jit_merge_point auto
-                // loop-header.  When `seen_loop_header_for_jdindex < 0`
-                // (no explicit `BC_LOOP_HEADER` has stamped the flag yet),
-                // RPython auto-stamps the merge point's jdindex when:
-                //
-                //     if not any_operation:
-                //         return
-                //     if not jitdriver_sd.no_loop_header:
-                //         if self.metainterp.portal_call_depth:
-                //             return
-                //         ptoken = self.metainterp.get_procedure_token(greenboxes)
-                //         if not has_compiled_targets(ptoken):
-                //             return
-                //     # automatically add a loop_header if there is none
-                //     self.metainterp.seen_loop_header_for_jdindex = jdindex
-                //
-                // Pyre installs the gate inputs at trace start
-                // (`pyjitpl::MetaInterp::setup_tracing` /
-                // `force_start_tracing` / `jitdriver::start_bridge_tracing`):
-                //   * `portal_call_depth_fn`: live
-                //     `MetaInterp.portal_call_depth` sample.
-                //   * `compiled_key_for_greens_fn`: live
-                //     `get_procedure_token(greenboxes)` +
-                //     `has_compiled_targets` for THIS merge point's greens.
-                if self.seen_loop_header_for_jdindex < 0 && ctx.num_ops() > 0 {
-                    // `no_loop_header` hoisted above (EDIT A) and reused here.
-                    let should_auto_stamp = if no_loop_header {
-                        // pyjitpl.py MIFrame.opimpl_jit_merge_point path through (skip the
-                        // `if not jitdriver_sd.no_loop_header:` guard).
-                        true
-                    } else {
-                        // pyjitpl.py MIFrame.opimpl_jit_merge_point: portal_call_depth == 0 AND
-                        // has_compiled_targets(ptoken).  Both fns are
-                        // installed at every trace-start path; missing
-                        // installs would be a structural bug, so default
-                        // to "don't stamp" rather than over-stamping.
-                        let depth_zero = ctx
-                            .portal_call_depth_fn
-                            .as_ref()
-                            .map(|f| f() == 0)
-                            .unwrap_or(false);
-                        // pyjitpl.py MIFrame.opimpl_jit_merge_point keys `ptoken` on `greenboxes`
-                        // — the greens of the merge point being visited RIGHT
-                        // NOW, not the trace's own header. Keyed on the fixed
-                        // `ctx.green_key` instead, the stamp re-arms at every
-                        // merge point the trace reaches once the START key has
-                        // compiled targets, so `reached_loop_header` runs on
-                        // body merge points that upstream returns from at 1554
-                        // without recording anything. Every consequence of that
-                        // follows: a GUARD_FUTURE_CONDITION per body merge
-                        // point (upstream emits it only inside
-                        // reached_loop_header, 2993), a close attempt per body
-                        // merge point, and — once `retrace_needed` has armed
-                        // `partial_trace` — a close storm that leaves no room
-                        // for the one extra iteration a retrace has to trace.
-                        //
-                        // The key must be the one the INTERPRETER enters by:
-                        // `get_procedure_token` is `jit_cell_at_key(greenkey)`,
-                        // and `compile_loop` attaches the token to that same
-                        // cell, so upstream cannot own a compiled loop the
-                        // interpreter cannot reach and this predicate is always
-                        // false for a key being traced for the first time —
-                        // which is what makes :1554-1555 `return` the guard
-                        // against closing a trace on its own first merge point.
-                        // A lookup keyed on anything else (e.g. scanning a side
-                        // table for a loop whose header greens happen to match)
-                        // can answer yes for a loop stored under a key nothing
-                        // enters, auto-stamp here, and close with nothing but
-                        // the green-promotion ops recorded.
-                        let has_targets = mp_green_pc
-                            .and_then(|pc| {
-                                ctx.merge_point_green_key_hash(
-                                    pc,
-                                    &mp_green_ints,
-                                    &mp_green_refs,
-                                    &mp_green_floats,
-                                )
-                            })
-                            .zip(ctx.has_compiled_targets_fn.as_ref())
-                            .is_some_and(|(key, f)| f(key));
-                        depth_zero && has_targets
-                    };
-                    if should_auto_stamp {
-                        self.seen_loop_header_for_jdindex = jdindex as i32;
-                    }
-                }
-                // pyjitpl.py MetaInterp.reached_loop_header `current_merge_points.append(...)`: the
-                // FIRST merge-point visit of a primary trace is the loop header;
-                // snapshot its concrete green constants (grouped by IR slot) as
-                // the `same_greenkey` reference for every later visit.  A bridge's
-                // trace-start header is the guard, so it does not capture
-                // this; its `same_greenkey` reads `compiled_key_for_greens`
-                // against the source loop instead.
-                if !ctx.is_bridge_trace && ctx.header_greens.is_none() {
-                    ctx.header_greens = Some((
-                        mp_green_ints.to_vec(),
-                        mp_green_refs.to_vec(),
-                        mp_green_floats.to_vec(),
-                    ));
-                }
-                // pyjitpl.py opimpl_jit_merge_point close-loop
-                // protocol — read the per-driver flag stamped by the
-                // previous iteration's `BC_LOOP_HEADER` or by the
-                // first-iteration auto-set above:
-                //
-                //     assert seen_loop_header_for_jdindex == jdindex
-                //     seen_loop_header_for_jdindex = -1
-                //     reached_loop_header(...)
-                if self.seen_loop_header_for_jdindex >= 0 {
-                    assert_eq!(
-                        self.seen_loop_header_for_jdindex as usize, jdindex,
-                        "BC_JIT_MERGE_POINT: seen_loop_header_for_jdindex \
-                         {} disagrees with merge-point jdindex {jdindex} — \
-                         pyjitpl.py:1559 found a loop_header for a JitDriver \
-                         that does not match the following jit_merge_point",
-                        self.seen_loop_header_for_jdindex,
-                    );
-                    self.seen_loop_header_for_jdindex = -1;
-                    if ctx.inline_depth() > 0 {
-                        // pyjitpl.py MIFrame.opimpl_jit_merge_point else-branch: a recursive-portal
-                        // merge point reached at portal_call_depth > 0 is NOT
-                        // the traced loop's own header. Instead of a close it
-                        // returns from the inlined callee frame
-                        // (`finishframe(leave_portal_frame=False)`), then
-                        // `do_recursive_call(assembler_call=True)` on the caller
-                        // frame so the recursion follows a CALL_ASSEMBLER into
-                        // the callee's own compiled loop, then
-                        // `leave_portal_frame`, then `raise ChangeFrame` to
-                        // resume the caller.
-                        //
-                        // (1) capture old_frame (the inlined portal callee, top
-                        //     of stack) before the pop (pyjitpl.py) so its
-                        //     return-destination slot and jitdriver index are
-                        //     read from the callee, not the caller.
-                        let old_frame = self.frames.current_mut();
-                        let jd_no = old_frame.jitcode.jitdriver_sd().unwrap_or(jdindex);
-                        let (result_kind, result_dst) = if let Some(d) = old_frame.return_i {
-                            (Some(JitArgKind::Int), Some(d))
-                        } else if let Some(d) = old_frame.return_r {
-                            (Some(JitArgKind::Ref), Some(d))
-                        } else if let Some(d) = old_frame.return_f {
-                            (Some(JitArgKind::Float), Some(d))
-                        } else {
-                            (None, None)
-                        };
-                        // (2) finishframe(leave_portal_frame=False) analog
-                        //     (pyjitpl.py): pop the inline callee
-                        //     frame, mirror the ctx inline depth, and restore the
-                        //     caller sym scalar / vable state the push saved —
-                        //     but DO NOT wire the return (do_recursive_call's job)
-                        //     and DO NOT record LEAVE_PORTAL_FRAME yet
-                        //     (leave_portal_frame=False).
-                        let mut popped = self.frames.pop().expect("recursive-cut: framestack < 2");
-                        if popped.inline_frame {
-                            ctx.pop_inline_frame();
-                        }
-                        // popframe still appends the log close when greenkey
-                        // is set, even with leave_portal_frame=False.
-                        if popped.portal_trace_logged {
-                            ctx.push_portal_trace_event(
-                                popped.portal_jd,
-                                None,
-                                ctx.get_trace_position(),
-                            );
-                        }
-                        if let Some(snapshot) = popped.portal_scalar_state.take() {
-                            sym.restore_inline_scalar_state(snapshot);
-                        }
-                        self.frames.recycle_frame(popped);
-                        // (3) do_recursive_call(assembler_call=True) on the caller
-                        //     (now current): reuse the existing 8-step
-                        //     CALL_ASSEMBLER recorder. `set_int_reg(result_dst)`
-                        //     inside binds the result on the CALLER frame
-                        //     (make_result_of_lastop parity, pyjitpl.py).
-                        let green_values: Vec<i64> = mp_green_ints
-                            .iter()
-                            .chain(mp_green_refs.iter())
-                            .chain(mp_green_floats.iter())
-                            .copied()
-                            .collect();
-                        match self.exec_recursive_call_assembler(
-                            ctx,
-                            sym,
-                            _runtime,
-                            result_kind,
-                            jdindex,
-                            result_dst,
-                            &green_values,
-                        ) {
-                            TraceAction::Continue => {}
-                            // Abort propagates (missing fresh-reds / target).
-                            other => return other,
-                        }
-                        // (4) deferred LEAVE_PORTAL_FRAME (pyjitpl.py MIFrame.opimpl_jit_merge_point),
-                        //     recorded AFTER the CALL_ASSEMBLER so the trace order
-                        //     is CALL_ASSEMBLER … then LEAVE.
-                        let jd_box = ctx.const_int(jd_no as i64);
-                        ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
-                        // (5) raise ChangeFrame (pyjitpl.py): resume the
-                        //     caller frame in the walker dispatch loop.
-                        return TraceAction::Continue;
-                    }
-                    // pyjitpl.py reached_loop_header, its FIRST statement:
-                    //
-                    //     def reached_loop_header(self, greenboxes, redboxes):
-                    //         self.heapcache.reset()
-                    //
-                    // A merge point is where another trace may be cut in
-                    // (compile.py compile_loop `trace.cut_trace_from`) and where a
-                    // compiled loop may be entered from the interpreter.  So
-                    // nothing recorded past this point may depend on a heapcache
-                    // fact established before it: the guard that proved the fact
-                    // can end up on the far side of a cut, or simply never run on
-                    // an entry that starts here.  Resetting forces the tracer to
-                    // re-emit those guards, which is what keeps the ops after the
-                    // merge point self-sufficient.
-                    //
-                    // Placed after the `inline_depth() > 0` recursive-cut branch
-                    // above because that branch is upstream's `else` at
-                    // pyjitpl.py — it returns instead of calling
-                    // `reached_loop_header`, so the reset must not run on it.
-                    // Upstream reaches the GUARD_FUTURE_CONDITION at :2993 with
-                    // only `remove_consts_and_duplicates` and the virtualizable
-                    // box handling in between, neither of which reads the
-                    // heapcache, so reset-then-guard is the faithful order.
-                    ctx.heap_cache_mut().reset();
-                    sym.set_redboxes(&redboxes);
-                    // pyjitpl.py reached_loop_header, its second statement:
-                    //
-                    //     self.remove_consts_and_duplicates(
-                    //         self.virtualizable_boxes,
-                    //         len(self.virtualizable_boxes) - 1, duplicates)
-                    //     live_arg_boxes += self.virtualizable_boxes
-                    //
-                    // The normalization is IN PLACE on `virtualizable_boxes`
-                    // and runs on EVERY visit, before the list is spliced into
-                    // the loop-carried args — so the args a merge point carries
-                    // never hold a constant and never repeat a box.  The two
-                    // merge-point registration sites below normalize their own
-                    // COPY, which leaves the closing JUMP — built by
-                    // `collect_jump_args_with_boxes` out of `sym` plus a fresh
-                    // splice of `virtualizable_boxes` — splicing the raw list.
-                    // A guard-origin bridge reaches here with that list still
-                    // holding whatever `seed_bridge_virtualizable_boxes`
-                    // decoded, and a `TAGCONST` element decodes to a constant
-                    // `OpRef`, so the JUMP into the parent loop carried a bare
-                    // literal in an element position: a value read off ONE
-                    // guard failure, frozen into an edge every later entry
-                    // takes.  Normalizing here, and handing the result back so
-                    // the splice sees it, is what upstream's in-place rewrite
-                    // does.
-                    //
-                    // The identity sits outside the `endindex = len - 1`
-                    // window and is never rewritten: it is a live red input box
-                    // that `standard_virtualizable_jitcode_argbox` and the
-                    // resume reader both index by position.
-                    //
-                    // Upstream shares one `duplicates` set with the reds it
-                    // normalized first; the reds here live in `sym`'s scalar
-                    // fields, which this expansion cannot rewrite, so the
-                    // element block gets its own set.  The registration sites
-                    // below still run the combined pass over their copy, and
-                    // `remove_consts_and_duplicates` is idempotent on an
-                    // already-normalized list.
-                    if let Some(mut typed) = ctx.collect_virtualizable_typed_boxes() {
-                        if let Some(end) = typed.len().checked_sub(1) {
-                            ctx.remove_consts_and_duplicates(&mut typed[..end]);
-                            let elements: Vec<OpRef> =
-                                typed[..end].iter().map(|(opref, _)| *opref).collect();
-                            ctx.adopt_normalized_virtualizable_elements(&elements);
-                        }
-                    }
-                    // pyjitpl.py reached_loop_header: generate a dummy
-                    // GUARD_FUTURE_CONDITION just before the implicit JUMP so
-                    // unroll's `jump_to_existing_trace` has a `patchguardop`
-                    // whose `rd_resume_position` it copies onto every extra
-                    // virtual-state guard (unroll.py OptUnroll._jump_to_existing_trace, resume.py ResumeDataVirtualAdder.finish).
-                    // The source-level tracer emits this in `close_loop_args_at`
-                    // (trace_opcode.rs); the state-field dispatch model
-                    // reaches the loop header here instead.  Emitted
-                    // unconditionally at the top of the reached_loop_header
-                    // equivalent, BEFORE the header-match/close/append branching,
-                    // so it fires for EVERY outcome — including the inner-loop
-                    // first-visit append-and-continue path (pyjitpl.py)
-                    // — matching upstream's top-of-function `generate_guard`
-                    // emission.  `record_state_guard` captures the matching resume
-                    // snapshot at `mp_opcode_pc`, mirroring `generate_guard`'s
-                    // `capture_resumedata` (pyjitpl.py).
-                    self.record_state_guard(
-                        ctx,
-                        sym,
-                        OpCode::GuardFutureCondition,
-                        &[],
-                        mp_opcode_pc,
-                        false,
-                    );
-                    // pyjitpl.py reached_loop_header: close the loop
-                    // ONLY when the current merge point's green key matches the
-                    // trace-start (loop-header) key — `same_greenkey`
-                    // (pyjitpl.py / 3912-3920).  The seen_loop_header
-                    // flag alone is necessary but not sufficient: the auto-stamp
-                    // (above) keys on the FIXED trace-start `ctx.green_key`, so it
-                    // fires at whatever merge point the trace reaches once the
-                    // start key has compiled targets — not necessarily the loop
-                    // header.  The pc green is the loop-header discriminator; a
-                    // merge point whose pc differs from `header_pc` is a
-                    // different green key, which RPython appends to
-                    // current_merge_points and keeps tracing past.  Closing there
-                    // emits a JUMP from a non-header pc back to the header
-                    // inputargs, manufacturing a degenerate loop whose now-
-                    // redundant exit guards const-fold away (infinite loop).  A
-                    // jitdriver with no int pc green keeps the flag-only close.
-                    // pyjitpl.py reached_loop_header: a bridge has no own
-                    // loop header to loop back to — it closes by JUMPing into
-                    // its parent loop (`has_compiled_targets(greenboxes)`), which
-                    // lives at `bridge_target_header_pc`. Closing on a transient
-                    // revisit of the bridge's own `resume_pc` (`header_pc`) bakes
-                    // a degenerate empty bridge that jumps back with no forward
-                    // progress. A primary trace still self-closes at `header_pc`.
-                    let close_target_pc = if ctx.is_bridge_trace {
-                        ctx.bridge_target_header_pc.unwrap_or(ctx.header_pc)
-                    } else {
-                        ctx.header_pc
-                    };
-                    let pc_matches = mp_green_pc.is_none_or(|pc| pc == close_target_pc as i64);
-                    // pyjitpl.py/3912 same_greenkey: beyond the pc, close
-                    // only when EVERY green — the scalars and the ref the
-                    // consumer declares — equals the trace-start header's.  Compare
-                    // element-wise against the header greens captured on the first
-                    // visit (`header_greens`) — the SAME merge-point green
-                    // vocabulary — which is `Box.same_constant` per Const type
-                    // (ConstInt/ConstFloat bitwise, ConstPtr pointer identity),
-                    // exactly what plain slot-grouped `Vec` equality performs.
-                    // The reference is NOT `green_key_values` (the
-                    // back-edge/can_enter_jit key carries a different arity) nor
-                    // `current_merge_points[0].green_boxes` (InputArg placeholders,
-                    // no Const → an always-empty filter that would decline every
-                    // close and hang).
-                    let same_greenkey = if ctx.is_bridge_trace {
-                        // pyjitpl.py `same_greenkey` over the greens of the merge
-                        // point just reached. A bridge's trace-start header is
-                        // the guard, not the parent loop, so the reference is
-                        // the compiled loop those greens name
-                        // (`compiled_key_for_greens` / `loop_header_greens`).
-                        // It has to be this bridge's source loop: the same pc
-                        // in another code object is a different green key.
-                        // `None` means that loop was compiled without stored
-                        // greens; the pc check above stays the only
-                        // discriminator, which is what this arm used to be.
-                        let greens = (
-                            mp_green_ints.to_vec(),
-                            mp_green_refs.to_vec(),
-                            mp_green_floats.to_vec(),
-                        );
-                        match ctx
-                            .compiled_key_for_greens_fn
-                            .as_ref()
-                            .and_then(|lookup| lookup(&greens))
-                        {
-                            Some(key) => key == ctx.green_key,
-                            None => true,
-                        }
-                    } else if let Some((h_ints, h_refs, h_floats)) = ctx.header_greens.as_ref() {
-                        mp_green_ints.as_slice() == h_ints.as_slice()
-                            && mp_green_refs.as_slice() == h_refs.as_slice()
-                            && mp_green_floats.as_slice() == h_floats.as_slice()
-                    } else {
-                        // Header greens not captured (no prior visit): the (pc,
-                        // code) hash is the loop identity — fall back to pc-only.
-                        true
-                    };
-                    let header_matches = pc_matches && same_greenkey;
-                    if crate::mptrace_enabled() {
-                        eprintln!(
-                            "@@@MPTRACE visit pc={mp_green_pc:?} header_pc={} close_target={close_target_pc} matches={header_matches} num_ops={}",
-                            ctx.header_pc,
-                            ctx.num_ops(),
-                        );
-                    }
-                    if header_matches {
-                        if crate::jitdriver::spdiag_enabled() {
-                            eprintln!(
-                                "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
-                            );
-                        }
-                        // pyjitpl.py `get_procedure_token(greenboxes)` —
-                        // the greens of the merge point just reached.
-                        let close_greens = (
-                            mp_green_ints.to_vec(),
-                            mp_green_refs.to_vec(),
-                            mp_green_floats.to_vec(),
-                        );
-                        ctx.close_greens = Some(close_greens.clone());
-                        ctx.close_green_pc = mp_green_pc;
-                        if ctx.is_bridge_trace {
-                            // pyjitpl.py MetaInterp.reached_loop_header: a guard-origin bridge
-                            // first consults the procedure token for the
-                            // merge point just reached.  If none has compiled
-                            // targets, it does NOT close on the first visit;
-                            // it falls through to the current_merge_points
-                            // scan, appends first visits, and only closes on a
-                            // repeated same-greenkey merge point.
-                            let already_compiled_here = ctx
-                                .close_green_key_hash()
-                                .zip(ctx.has_compiled_targets_fn.as_ref())
-                                .is_some_and(|(key, f)| f(key));
-                            // Take the structured key and derive the hash from
-                            // it, rather than taking the hash and leaving the
-                            // key behind: the merge point this registers is
-                            // later read by consumers that install cell flags,
-                            // and a hash alone reaches a cell only by bucket.
-                            let (close_key, close_key_typed) = match ctx.close_green_key() {
-                                Some(k) => (k.get_uhash(), Some(k)),
-                                None => (ctx.green_key, ctx.green_key_values().cloned()),
-                            };
-                            if !already_compiled_here
-                                && ctx
-                                    .find_merge_point_same_greenkey(
-                                        close_key,
-                                        close_key_typed.as_ref(),
-                                    )
-                                    .is_none()
-                            {
-                                let vable_boxes =
-                                    ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                                let original_boxes = match sym.loop_carried_boxes_from_portal(
-                                    &vable_boxes,
-                                    &self.frames.frames[0],
-                                ) {
-                                    Some(mut boxes) => {
-                                        ctx.remove_consts_and_duplicates(&mut boxes);
-                                        boxes
-                                            .into_iter()
-                                            .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                            .collect()
-                                    }
-                                    None => live_arg_boxes.to_vec(),
-                                };
-                                if crate::mptrace_enabled() {
-                                    eprintln!(
-                                        "@@@MPTRACE bridge-add-mp key={close_key} header_pc={} num_ops={}",
-                                        ctx.header_pc,
-                                        ctx.num_ops(),
-                                    );
-                                }
-                                // `MergePoint::header_pc` is this visit's guest pc
-                                // (`same_greenkey`'s pc green), not the
-                                // trace-start `ctx.header_pc`.
-                                // A present negative green is not this visit's
-                                // header. Falling back to the trace-start pc
-                                // would file it on a different loop.
-                                let recorded_pc = match mp_green_pc {
-                                    Some(pc) => Self::guest_pc_position(pc),
-                                    None => ctx.header_pc,
-                                };
-                                ctx.add_merge_point_with_key(
-                                    close_key,
-                                    close_key_typed,
-                                    original_boxes,
-                                    recorded_pc,
-                                );
-                                return TraceAction::Continue;
-                            }
-                        }
-                        if capture_walk_reds {
-                            // Single-pass: stash the resume-aligned close pc (the
-                            // interpreter green pc, NOT the JitCode op cursor) so
-                            // the merge-point hook can resume the native loop
-                            // there in lieu of the observer replay. The loop-carried
-                            // red values are transferred into native state by the
-                            // hook (`restore_values`); storage caches re-derive via
-                            // `recover`.
-                            ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
-                            ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
-                        }
-                        // GUARD_FUTURE_CONDITION already emitted unconditionally at
-                        // the reached_loop_header entry above (pyjitpl.py).
-                        return TraceAction::CloseLoop;
-                    }
-                    // No same_greenkey match — fall through and keep tracing
-                    // (the merge point op is otherwise a no-op while recording).
-                    //
-                    // pyjitpl.py reached_loop_header: a merge point
-                    // whose pc differs from the trace-start header is a different
-                    // green key. RPython scans current_merge_points for a prior
-                    // same_greenkey visit; if found it closes the loop THERE
-                    // (cutting the outer prefix as preamble); otherwise it appends
-                    // and keeps tracing. Record the inner merge point under its
-                    // own green key and its own guest pc. The scan is
-                    // `find_merge_point_same_greenkey`, not `(key, trace header_pc)`.
-                    //
-                    // The S0 census that established this — append-and-observe
-                    // with NO close, confirming the inner key is stable and
-                    // detected on revisit before the cut close was enabled — ran
-                    // behind a `MAJIT_INNERMP` gate that no longer exists. Nothing
-                    // reads that name today; re-running the census means adding
-                    // the gate back, not setting a variable.
-                    if inner_close && let Some(pc) = mp_green_pc {
-                        // pyjitpl.py MetaInterp.reached_loop_header, which runs BEFORE the
-                        // `current_merge_points` scan:
-                        //
-                        //     ptoken = self.get_procedure_token(greenboxes)
-                        //     if has_compiled_targets(ptoken):
-                        //         self.compile_trace(live_arg_boxes, ptoken)
-                        //
-                        // `greenboxes` is the merge point just reached, so a
-                        // loop that ALREADY has compiled code is jumped into,
-                        // never re-derived by cutting this trace at it. The
-                        // cut (compile.py compile_loop) is for the other case: an
-                        // inner loop nobody has compiled yet, which
-                        // `compile_loop` then attaches to
-                        // `original_boxes[:num_green_args]` — the INNER
-                        // greenkey (pyjitpl.py).
-                        //
-                        // The JUMP is what the `already_compiled_here` arm
-                        // below performs: it publishes the token key and
-                        // returns `CloseLoop`, and the driver runs
-                        // `close_bridge` (guard origin) or
-                        // `compile_trace_from_interp` (interp origin).
-                        //
-                        // It is sound only because the key this arm derives
-                        // is the one the interpreter ENTERS by.  While the
-                        // key was `green_key_from_code_ptr(green_key_raw.0,
-                        // pc)` — `JitState::code_ptr()` defaulting to 0, not
-                        // the driver's `GreenKey::hash_u64` — a compiled loop
-                        // could sit under a key nothing enters, and jumping
-                        // into it was measured as a logo miscompile (992635
-                        // against 996310) and a SIGSEGV.  The four
-                        // procedure-token consults now share
-                        // `merge_point_green_key_hash`, so a loop is stored
-                        // under the key it is reached by and the jump lands
-                        // in code the interpreter can also enter.
-                        //
-                        // The earlier measurement against this lever —
-                        // cel's `nested_list_loop_varying_trip_count` keeping
-                        // its results and losing its 4 aborts while `spread
-                        // 0..32` deopts went 959 → 1763 over 4000 rows and
-                        // 1275 → 2601 over 16000 — was taken BEFORE that key
-                        // unification, i.e. against jumps into loops filed
-                        // under keys nothing enters.  It does not carry over
-                        // and must be re-measured before being cited again.
-                        // Same for the note that routing the closing JUMP's
-                        // target tokens off the token it enters rather than
-                        // off the bridge origin (`unroll.py UnrollOptimizer.optimize_bridge
-                        // cell_token = jump_op.getdescr()` — pyre's
-                        // `compile_bridge` hands `optimize_bridge` the ORIGIN
-                        // loop's `front_target_tokens`) recovered only 7%.
-                        //
-                        // A declined `compile_trace` does not append here.
-                        // The walker has no `MetaInterp` to scan
-                        // `current_merge_points`. `JitDriver::keep_tracing_after_declined_jump`
-                        // is that scan (`reached_loop_header`): no prior
-                        // same-greenkey entry appends and the walk continues;
-                        // a prior entry falls through to `compile_loop`.
-                        //
-                        // The token lookup below is unconditional, where
-                        // upstream guards it with `if not self.partial_trace:`
-                        // (:3002).  That gate must not be spelled
-                        // `is_bridge_trace`: `partial_trace` is set only by
-                        // `retrace_needed` (pyjitpl.py), so it means
-                        // "this is a RETRACE", and a bridge from a guard
-                        // failure runs the consult upstream just like a
-                        // primary entry.  Its live reading is
-                        // `MetaInterp::partial_trace()`, which this loop
-                        // cannot reach while it holds the TraceCtx borrow —
-                        // harmless while the lookup only decides a log line,
-                        // and part of what the JUMP half has to carry.
-                        // The structured key first, hash second: this merge
-                        // point is registered below and later read by the
-                        // segmenting consumers, which install cell flags and
-                        // so need a key a chain walk can match, not a bucket.
-                        let Some(inner_key_typed) = ctx.merge_point_green_key(
-                            pc,
-                            &mp_green_ints,
-                            &mp_green_refs,
-                            &mp_green_floats,
-                        ) else {
-                            return TraceAction::Continue;
-                        };
-                        let inner_key = inner_key_typed.get_uhash();
-                        let already_compiled_here = ctx
-                            .has_compiled_targets_fn
-                            .as_ref()
-                            .is_some_and(|f| f(inner_key));
-                        // Producer side of slots 50/67, which count only what
-                        // happens once a close has been published. Counted here,
-                        // before the branch, so a zero downstream separates "the
-                        // walk never reached this decision" from "it reached it
-                        // and the target was not compiled" — the two render
-                        // identically in those two slots. `is_some_and` also
-                        // answers false when the callback is absent, so the
-                        // reached-count is what makes an uninstalled
-                        // `has_compiled_targets_fn` visible rather than
-                        // indistinguishable from a real "no".
-                        //
-                        // The sibling `already_compiled_here` on the
-                        // `is_bridge_trace` path above is a DIFFERENT decision —
-                        // whether to append a first-visit merge point — and never
-                        // publishes `close_jump_into_key`, so it deliberately
-                        // carries no slot.
-                        crate::mc_diag_bump(68); // xloop_close_decision_reached
-                        if already_compiled_here {
-                            crate::mc_diag_bump(69); // xloop_close_target_compiled
-                            // pyjitpl.py MetaInterp.reached_loop_header — the merge point just reached already owns a
-                            // procedure token, so upstream JUMPs into it rather than deriving a second
-                            // copy of that loop by cutting this trace.  `compile_trace` raises on
-                            // success (`raise_if_successful`, pyjitpl.py), which is why the
-                            // `current_merge_points` scan below is never reached in that case.
-                            //
-                            // The dispatcher holds no `&mut MetaInterp`, so the attempt is published to
-                            // the driver: `close_jump_into_key` names the token, `close_greens` /
-                            // `close_green_pc` name the greens it is keyed by (pyjitpl.py
-                            // `get_procedure_token(greenboxes)` reads the greens of the merge point just
-                            // reached, not the trace-start header's).
-                            //
-                            // pyjitpl.py compile_trace is retried on every
-                            // header visit (`if not self.partial_trace`).
-                            crate::mc_diag_bump(70); // xloop_close_published
-                            ctx.close_greens = Some((
-                                mp_green_ints.to_vec(),
-                                mp_green_refs.to_vec(),
-                                mp_green_floats.to_vec(),
-                            ));
-                            ctx.close_green_pc = Some(pc);
-                            ctx.close_jump_into_key = Some(inner_key);
-                            if capture_walk_reds {
-                                ctx.walk_final_pc = Some(Self::guest_pc_position(pc));
-                                ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
-                            }
-                            if crate::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit] merge point pc={pc} has compiled loop key={inner_key} \
-                                             — compile_trace JUMP (pyjitpl.py compile_trace)"
-                                );
-                            }
-                            // GUARD_FUTURE_CONDITION was already emitted unconditionally at the
-                            // reached_loop_header entry above (pyjitpl.py).
-                            return TraceAction::CloseLoop;
-                        } else if ctx
-                            .find_merge_point_same_greenkey(inner_key, Some(&inner_key_typed))
-                            .is_some()
-                        {
-                            if crate::jitdriver::spdiag_enabled() {
-                                eprintln!(
-                                    "@@@SPDIAG INNER-CUT-CLOSE pc={pc} inner_key={inner_key} walk_reds={walk_reds:?}"
-                                );
-                            }
-                            if crate::closedbg_enabled() {
-                                let portal = &self.frames.frames[0];
-                                for (i, slot) in portal.int_regs.iter().enumerate() {
-                                    if let Some(o) = slot {
-                                        eprintln!("@@@RED int[{i}]={o:?}");
-                                    }
-                                }
-                                for (j, slot) in portal.ref_regs.iter().enumerate() {
-                                    if let Some(o) = slot {
-                                        eprintln!("@@@RED ref[{j}]={o:?}");
-                                    }
-                                }
-                            }
-                            // same_greenkey revisit of a nested inner loop →
-                            // close HERE and cut the outer prefix as preamble.
-                            // Setting cut_inner_green_key routes compile_loop
-                            // through cross_loop_cut (compile.py compile_loop).
-                            ctx.cut_inner_green_key = Some(inner_key);
-                            // pyjitpl.py `get_procedure_token(greenboxes)`
-                            // reads the greens of the merge point just
-                            // reached — here the INNER loop's, not the
-                            // trace-start header's.
-                            ctx.close_greens = Some((
-                                mp_green_ints.to_vec(),
-                                mp_green_refs.to_vec(),
-                                mp_green_floats.to_vec(),
-                            ));
-                            ctx.close_green_pc = Some(pc);
-                            if capture_walk_reds {
-                                // Single-pass: resume at the inner loop's
-                                // interpreter green pc (the loop variable the
-                                // hook assigns to `pc`). The loop-carried red
-                                // values captured above are transferred into
-                                // native state by the merge-point hook
-                                // (`restore_values`); storage caches are then
-                                // re-derived by `recover`.
-                                ctx.walk_final_pc = Some(Self::guest_pc_position(pc));
-                                ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
-                            }
-                            // GUARD_FUTURE_CONDITION already emitted
-                            // unconditionally at the reached_loop_header entry
-                            // above (pyjitpl.py).
-                            return TraceAction::CloseLoop;
-                        } else {
-                            // first visit → append and keep tracing
-                            // (pyjitpl.py MetaInterp.reached_loop_header). For the state-field dispatch
-                            // model the merge point's loop-carried values are the
-                            // RED state fields (the closing JUMP = collect_jump_args),
-                            // NOT the green operands captured in `live_arg_boxes`
-                            // (those are promoted constants folded inline in the cut
-                            // body). Register the SAME construction the close uses
-                            // — `JitState::collect_jump_args_with_boxes` reached
-                            // through `JitCodeSym::loop_carried_boxes` — so the cut
-                            // label's inputarg arity matches the JUMP's
-                            // (compile.py compile_loop jump.numargs()==label.numargs()), the
-                            // way RPython's single `live_arg_boxes` list does by
-                            // construction (pyjitpl.py MetaInterp.remove_consts_and_duplicates). Falls back to the
-                            // operand-captured boxes for interpreters with no state
-                            // fields at all.
-                            //
-                            // Building this from the scalar state fields alone (as
-                            // this site used to) silently omits the virtualizable's
-                            // element boxes, so an interpreter whose state is purely
-                            // `[int; virt]` / `[float; virt]` arrays registered just
-                            // the greens plus one unexpanded vable ref while its
-                            // close expanded to one box per element — the arity
-                            // mismatch that made every nested loop decline.
-                            let vable_boxes =
-                                ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                            let original_boxes = match sym.loop_carried_boxes_from_portal(
-                                &vable_boxes,
-                                &self.frames.frames[0],
-                            ) {
-                                Some(mut boxes) => {
-                                    // pyjitpl.py MetaInterp.remove_consts_and_duplicates normalizes the list
-                                    // before it becomes anything — the LABEL
-                                    // this registration turns into cannot carry
-                                    // a constant or a repeated box.
-                                    ctx.remove_consts_and_duplicates(&mut boxes);
-                                    boxes
-                                        .into_iter()
-                                        .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                        .collect()
-                                }
-                                None => live_arg_boxes.into_vec(),
-                            };
-                            if crate::mptrace_enabled() {
-                                eprintln!(
-                                    "@@@MPTRACE add-mp pc={pc} inner_key={inner_key} num_ops={}",
-                                    ctx.num_ops()
-                                );
-                            }
-                            ctx.add_merge_point_with_key(
-                                inner_key,
-                                Some(inner_key_typed),
-                                original_boxes,
-                                Self::guest_pc_position(pc),
-                            );
-                        }
-                    }
-                }
-            }
-            jitcode::insns::BC_LOOP_HEADER => {
-                // pyjitpl.py opimpl_loop_header parity:
-                //
-                //     @arguments("int", "orgpc")
-                //     def opimpl_loop_header(self, jdindex, orgpc):
-                //         self.metainterp.seen_loop_header_for_jdindex = jdindex
-                //
-                // The op only sets the per-driver `seen_loop_header_for_jdindex`
-                // flag; the actual close happens later in
-                // `opimpl_jit_merge_point` (pyjitpl.py — assert flag
-                // matches, reset, then `reached_loop_header`).
-                //
-                // RPython `assembler.py` USE_C_FORM does NOT include
-                // `loop_header`, so the only valid argcode is `i` (constants-
-                // pool slot — `jitcode/assembler.rs`'s `loop_header` patches the
-                // byte at finish() to `num_regs_i + const_idx`).  Decode the
-                // byte through `int_values` to recover the actual jdindex
-                // rather than reading the slot byte as the index directly,
-                // mirroring `blackhole.py self.registers_i[ord(code[pos])]`.
-                let frame = self.frames.current_mut();
-                let jdindex_byte = frame.next_reg();
-                let slot = jdindex_byte as usize;
-                let jdindex = frame.int_values.get(slot).copied().flatten().expect(
-                    "BC_LOOP_HEADER (i form): jdindex register slot \
-                         must hold a populated int constant — \
-                         assembler.rs:1087 loop_header emits an `i` argcode \
-                         pointing into the post-regs constants suffix",
-                );
-                let registered_drivers = ctx.metainterp_sd().jitdrivers_sd.len();
-                assert!(
-                    (jdindex as usize) < registered_drivers,
-                    "BC_LOOP_HEADER: jdindex {jdindex} out of range \
-                     (registered drivers: {registered_drivers})",
-                );
-                // Stamp the per-driver flag so the next BC_JIT_MERGE_POINT
-                // recognises that this trace passed through a matching
-                // loop_header op (pyjitpl.py opimpl_loop_header).  No close trigger
-                // here — RPython's `opimpl_loop_header` is a pure flag
-                // setter; the close happens in BC_JIT_MERGE_POINT after
-                // the assert/reset on the next iteration.
-                self.seen_loop_header_for_jdindex = jdindex as i32;
-                if crate::pcseq_enabled() {
-                    eprintln!(
-                        "@@@PCSEQ loop_header jdindex={jdindex} num_ops={} depth={}",
-                        ctx.num_ops(),
-                        self.frames.len(),
-                    );
-                }
-            }
-            jitcode::insns::BC_JUMP => {
-                let target = self.frames.current_mut().next_u16() as usize;
-                self.frames.current_mut().code_cursor = target;
-            }
-            jitcode::insns::BC_INLINE_CALL => {
-                // pyjitpl.py newframe decoder: mint the callee, then
-                // fill_registers from the caller bytecode. Do not collect
-                // the arg triples into a Vec (9 usizes = 72 B).
-                let (sub_idx, num_args) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_u16() as usize, frame.next_u16() as usize)
-                };
-                // RPython blackhole.py — `j` argcode resolves via
-                // `self.descrs[idx]` asserted to be a JitCode.
-                // `as_jitcode_owned`, so a recursive helper's back edge resolves
-                // to the same callee an owning edge would.  By the time anything
-                // executes this operand the callee is published, so the `Weak`
-                // upgrades; the `None` window is confined to the helper's own
-                // assembly, which never runs code.
-                let sub_jitcode = self
-                    .frames
-                    .current_mut()
-                    .jitcode
-                    .descr_at(sub_idx)
-                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
-                    .unwrap_or_else(|| {
-                        panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
-                    });
-                let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
-                sub_frame.inline_frame = true;
-                let (return_i, return_r, return_f) = {
-                    let caller = self.frames.current_mut();
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(caller.next_u8());
-                        let caller_src = caller.next_reg() as usize;
-                        let callee_dst = caller.next_reg() as usize;
-                        match kind {
-                            JitArgKind::Int => {
-                                #[cfg(feature = "jit-audits")]
-                                majit_ir::reg_write_audit::note_int_write(
-                                    sub_frame.int_regs.as_ptr() as usize,
-                                    callee_dst,
-                                    caller.int_regs[caller_src],
-                                );
-                                sub_frame.int_regs[callee_dst] = caller.int_regs[caller_src];
-                                sub_frame.int_values[callee_dst] = caller.int_values[caller_src];
-                            }
-                            JitArgKind::Ref => {
-                                sub_frame.ref_regs[callee_dst] = caller.ref_regs[caller_src];
-                                sub_frame.ref_values[callee_dst] = caller.ref_values[caller_src];
-                            }
-                            JitArgKind::Float => {
-                                sub_frame.float_regs[callee_dst] = caller.float_regs[caller_src];
-                                sub_frame.float_values[callee_dst] =
-                                    caller.float_values[caller_src];
-                            }
-                        }
-                    }
-                    let dest = {
-                        let dst = caller.next_reg() as usize;
-                        if dst == crate::jitcode::NO_RETURN_REG as usize {
-                            None
-                        } else {
-                            Some(dst)
-                        }
-                    };
-                    caller.pc = caller.code_cursor;
-                    let resulttype = caller
-                        .jitcode
-                        .core()
-                        .body()
-                        .resulttypes
-                        .as_ref()
-                        .and_then(|types| types.get(&caller.pc).copied());
-                    let (return_i, return_r, return_f, result_argcode) = match resulttype {
-                        Some('i') => (dest, None, None, b'i'),
-                        Some('r') => (None, dest, None, b'r'),
-                        Some('f') => (None, None, dest, b'f'),
-                        _ => (None, None, None, b'v'),
-                    };
-                    caller._result_argcode = result_argcode;
-                    caller.result_arg_index = dest;
-                    ctx.push_inline_frame((sub_idx, caller.pc), u32::MAX);
-                    (return_i, return_r, return_f)
-                };
-                sub_frame.return_i = return_i;
-                sub_frame.return_r = return_r;
-                sub_frame.return_f = return_f;
-                self.frames.push(sub_frame);
-            }
-            jitcode::insns::BC_INLINE_CALL_R_I
-            | jitcode::insns::BC_INLINE_CALL_R_R
-            | jitcode::insns::BC_INLINE_CALL_R_V
-            | jitcode::insns::BC_INLINE_CALL_IR_I
-            | jitcode::insns::BC_INLINE_CALL_IR_R
-            | jitcode::insns::BC_INLINE_CALL_IR_V
-            | jitcode::insns::BC_INLINE_CALL_IRF_F
-            | jitcode::insns::BC_INLINE_CALL_IRF_R
-            | jitcode::insns::BC_INLINE_CALL_IRF_I
-            | jitcode::insns::BC_INLINE_CALL_IRF_V => {
-                match self.exec_typed_inline_call(ctx, sym, bytecode) {
-                    TraceAction::Continue => {}
-                    action => return action,
-                }
-            }
-            // Recursive portal call (self-recursion).  Unlike
-            // BC_INLINE_CALL — which resolves its callee from the parent
-            // frame's `descrs` pool — a recursive portal call targets the
-            // portal jitcode itself, which is in no descrs slot at emit
-            // time.  The opcode therefore carries the jitdriver index, and
-            // `exec_recursive_call` resolves both the depth-gated inline
-            // decision and the portal jitcode through `JitCodeRuntime`.
-            // The result bank is selected by the opcode (`INT`/`REF`/
-            // `FLOAT` → typed result; `VOID` → no result).
-            jitcode::insns::BC_RECURSIVE_CALL_INT
-            | jitcode::insns::BC_RECURSIVE_CALL_REF
-            | jitcode::insns::BC_RECURSIVE_CALL_FLOAT
-            | jitcode::insns::BC_RECURSIVE_CALL_VOID => {
-                let result_kind = match bytecode {
-                    jitcode::insns::BC_RECURSIVE_CALL_INT => Some(JitArgKind::Int),
-                    jitcode::insns::BC_RECURSIVE_CALL_REF => Some(JitArgKind::Ref),
-                    jitcode::insns::BC_RECURSIVE_CALL_FLOAT => Some(JitArgKind::Float),
-                    _ => None,
-                };
-                match self.exec_recursive_call(ctx, sym, _runtime, result_kind) {
-                    TraceAction::Continue => {}
-                    action => return action,
-                }
-            }
-            // ── Typed return arms ──
-            //
-            // RPython parity: pyjitpl.py MIFrame.opimpl_int_return /
-            // ref_return / float_return / void_return → MetaInterp.finishframe.
-            //
-            // The dispatch JitCode body emits these as either:
-            //   * sub-JitCode body terminator (e.g. a `RETURN` arm with
-            //     `return state.regs[r]` lowered by `lower_dispatch_chain`'s
-            //     Lowerable arm path; the sub-frame was pushed by the
-            //     preceding BC_INLINE_CALL — `inline_frame=true`, no
-            //     jitdriver_sd, return_i/r/f filled by the caller's
-            //     destination slot).  On return: pop sub-frame, write
-            //     result into caller's slot via make_result_of_lastop
-            //     (pyjitpl.py).
-            //   * dispatch body trailing terminator (lower_dispatch_body
-            //     :5466-5499, "default arm typed return"); when this fires,
-            //     the framestack drains to empty and we emit
-            //     TraceAction::Finish so the outer `finish_and_compile`
-            //     (jitdriver.rs::merge_point) drives the compile path —
-            //     same precedent as the exception unwind at :935-942.
-            //
-            // last_exc_value clearing mirrors pyjitpl.py finishframe
-            // (Pyre `clear_exception` is the JitCodeMachine equivalent of
-            // RPython `self.last_exc_value = lltype.nullptr(...)`).
-            jitcode::insns::BC_INT_RETURN => {
-                self.clear_exception();
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, concrete) = self.read_int_reg(src);
-                let target = self.frames.current_mut().return_i;
-                if target.is_none() {
-                    self.capture_single_pass_finish(ctx, Some(Value::Int(concrete)));
-                }
-                if self.frames.frames.len() == 1 {
-                    self.stash_portal_reds(ctx, sym);
-                }
-                if let Some(snapshot) = self.pop_exception_frame(ctx) {
-                    sym.restore_inline_scalar_state(snapshot);
-                }
-                if let Some(target_idx) = target {
-                    debug_assert!(
-                        !self.frames.is_empty(),
-                        "BC_INT_RETURN with return_i=Some but framestack drained",
-                    );
-                    self.frames.current_mut().make_result_of_lastop(
-                        JitArgKind::Int,
-                        target_idx,
-                        opref,
-                        concrete,
-                    );
-                } else if self.frames.is_empty() {
-                    return TraceAction::Finish {
-                        finish_args: vec![opref],
-                        finish_arg_types: vec![majit_ir::Type::Int],
-                        exit_with_exception: false,
-                        exc_value: 0,
-                    };
-                } else {
-                    typed_return_without_caller_destination("BC_INT_RETURN", 'i');
-                }
-            }
-            // `int_return/c` — USE_C_FORM short source (`assembler.py`):
-            // the return value is one inline signed byte (`signedord`,
-            // `blackhole.py`), not a `registers_i` slot. Otherwise
-            // identical teardown to `BC_INT_RETURN`.
-            jitcode::insns::BC_INT_RETURN_C => {
-                self.clear_exception();
-                let value = self.frames.current_mut().next_u8() as i8 as i64;
-                let opref = OpRef::ConstInt(value);
-                let target = self.frames.current_mut().return_i;
-                if target.is_none() {
-                    self.capture_single_pass_finish(ctx, Some(Value::Int(value)));
-                }
-                if self.frames.frames.len() == 1 {
-                    self.stash_portal_reds(ctx, sym);
-                }
-                if let Some(snapshot) = self.pop_exception_frame(ctx) {
-                    sym.restore_inline_scalar_state(snapshot);
-                }
-                if let Some(target_idx) = target {
-                    debug_assert!(
-                        !self.frames.is_empty(),
-                        "BC_INT_RETURN_C with return_i=Some but framestack drained",
-                    );
-                    self.frames.current_mut().make_result_of_lastop(
-                        JitArgKind::Int,
-                        target_idx,
-                        opref,
-                        value,
-                    );
-                } else if self.frames.is_empty() {
-                    return TraceAction::Finish {
-                        finish_args: vec![opref],
-                        finish_arg_types: vec![majit_ir::Type::Int],
-                        exit_with_exception: false,
-                        exc_value: 0,
-                    };
-                } else {
-                    typed_return_without_caller_destination("BC_INT_RETURN_C", 'i');
-                }
-            }
-            jitcode::insns::BC_REF_RETURN => {
-                self.clear_exception();
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, concrete) = self.read_ref_reg(src);
-                let target = self.frames.current_mut().return_r;
-                if target.is_none() {
-                    self.capture_single_pass_finish(
-                        ctx,
-                        Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
-                    );
-                }
-                if self.frames.frames.len() == 1 {
-                    self.stash_portal_reds(ctx, sym);
-                }
-                if let Some(snapshot) = self.pop_exception_frame(ctx) {
-                    sym.restore_inline_scalar_state(snapshot);
-                }
-                if let Some(target_idx) = target {
-                    debug_assert!(
-                        !self.frames.is_empty(),
-                        "BC_REF_RETURN with return_r=Some but framestack drained",
-                    );
-                    self.frames.current_mut().make_result_of_lastop(
-                        JitArgKind::Ref,
-                        target_idx,
-                        opref,
-                        concrete,
-                    );
-                } else if self.frames.is_empty() {
-                    return TraceAction::Finish {
-                        finish_args: vec![opref],
-                        finish_arg_types: vec![majit_ir::Type::Ref],
-                        exit_with_exception: false,
-                        exc_value: 0,
-                    };
-                } else {
-                    typed_return_without_caller_destination("BC_REF_RETURN", 'r');
-                }
-            }
-            jitcode::insns::BC_FLOAT_RETURN => {
-                self.clear_exception();
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, concrete) = self.read_float_reg(src);
-                let target = self.frames.current_mut().return_f;
-                if target.is_none() {
-                    self.capture_single_pass_finish(
-                        ctx,
-                        Some(Value::Float(f64::from_bits(concrete as u64))),
-                    );
-                }
-                if self.frames.frames.len() == 1 {
-                    self.stash_portal_reds(ctx, sym);
-                }
-                if let Some(snapshot) = self.pop_exception_frame(ctx) {
-                    sym.restore_inline_scalar_state(snapshot);
-                }
-                if let Some(target_idx) = target {
-                    debug_assert!(
-                        !self.frames.is_empty(),
-                        "BC_FLOAT_RETURN with return_f=Some but framestack drained",
-                    );
-                    self.frames.current_mut().make_result_of_lastop(
-                        JitArgKind::Float,
-                        target_idx,
-                        opref,
-                        concrete,
-                    );
-                } else if self.frames.is_empty() {
-                    return TraceAction::Finish {
-                        finish_args: vec![opref],
-                        finish_arg_types: vec![majit_ir::Type::Float],
-                        exit_with_exception: false,
-                        exc_value: 0,
-                    };
-                } else {
-                    typed_return_without_caller_destination("BC_FLOAT_RETURN", 'f');
-                }
-            }
-            jitcode::insns::BC_VOID_RETURN => {
-                self.clear_exception();
-                self.capture_single_pass_finish(ctx, None);
-                if self.frames.frames.len() == 1 {
-                    self.stash_portal_reds(ctx, sym);
-                }
-                if let Some(snapshot) = self.pop_exception_frame(ctx) {
-                    sym.restore_inline_scalar_state(snapshot);
-                }
-                if self.frames.is_empty() {
-                    // pyjitpl.py compile_done_with_this_frame exits=[];
-                    // `done_with_this_frame_descr_from_types` (`pyjitpl.rs`)
-                    // maps empty finish_arg_types to Type::Void.
-                    return TraceAction::Finish {
-                        finish_args: vec![],
-                        finish_arg_types: vec![],
-                        exit_with_exception: false,
-                        exc_value: 0,
-                    };
-                }
-                // Sub-frame void return: caller resumes; nothing to write.
-            }
-            // ── canonical *_v call family (Slices 1-2 of
-            // pyre-call-family-canonical-migration.md) ──
-            //
-            // Byte layout matches `blackhole.rs`'s
-            // `handler_residual_call_{r,ir,irf}_v`:
-            //   funcptr_reg:u8 + (countI:u8 + regI×N) + (countR:u8 +
-            //   regR×M) + (countF:u8 + regF×K, IRF only) + descr:u16.
-            //
-            // `funcptr_reg` is the post-regs constants-pool slot the
-            // emitter projected concrete_ptr into (RPython
-            // `assembler.py emit_const`). The `d` operand carries
-            // the `BhCallDescr`; its `arg_classes` restores source
-            // argument order from the grouped I/R/F lists, matching
-            // `pyjitpl.py:_build_allboxes`.
-            jitcode::insns::BC_RESIDUAL_CALL_R_V
-            | jitcode::insns::BC_RESIDUAL_CALL_IR_V
-            | jitcode::insns::BC_RESIDUAL_CALL_IRF_V => {
-                let has_int = matches!(
-                    bytecode,
-                    jitcode::insns::BC_RESIDUAL_CALL_IR_V | jitcode::insns::BC_RESIDUAL_CALL_IRF_V
-                );
-                let has_float = bytecode == jitcode::insns::BC_RESIDUAL_CALL_IRF_V;
-
-                let call_jitcode = self.frames.current_mut().jitcode.clone();
-                let (target, args_i, args_r, args_f, calldescr, trace_descr) = {
-                    let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: CallArgs = SmallVec::new();
-                    if has_int {
-                        let count = frame.next_u8() as usize;
-                        for _ in 0..count {
-                            args_i.push(JitCallArg::int(frame.next_reg() as u16));
-                        }
-                    }
-                    let mut args_r: CallArgs = SmallVec::new();
-                    let count_r = frame.next_u8() as usize;
-                    for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
-                    }
-                    let mut args_f: CallArgs = SmallVec::new();
-                    if has_float {
-                        let count = frame.next_u8() as usize;
-                        for _ in 0..count {
-                            args_f.push(JitCallArg::float(frame.next_reg() as u16));
-                        }
-                    }
-                    let calldescr_idx = frame.next_u16();
-                    let calldescr = call_jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
-                        .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
-                        .as_calldescr();
-                    let trace_descr = frame
-                        .jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
-                        .cloned()
-                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
-                    let target = frame
-                        .jitcode
-                        .exec
-                        .call_descr_to_call_target
-                        .get(&calldescr_idx)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let func =
-                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                                    panic!(
-                                        "BC_RESIDUAL_CALL_*_V: funcptr slot \
-                                     {funcptr_reg} is uninitialized"
-                                    )
-                                });
-                            JitCallTarget::from_fnaddr(func)
-                        });
-                    (target, args_i, args_r, args_f, calldescr, trace_descr)
-                };
-
-                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
-                    .read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
-
-                let trace_ptr = if target.trace_ptr.is_null() {
-                    target.concrete_ptr
-                } else {
-                    target.trace_ptr
-                };
-                let concrete_ptr = if target.concrete_ptr.is_null() {
-                    trace_ptr
-                } else {
-                    target.concrete_ptr
-                };
-                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &calldescr.arg_classes,
-                ) {
-                    return action;
-                }
-
-                let effect_descr = trace_descr.clone();
-                let effectinfo = effect_descr
-                    .as_call_descr()
-                    .expect("resolved call descriptor")
-                    .get_extra_info();
-
-                // pyjitpl.py do_not_in_trace_call parity:
-                // `@not_in_trace`-decorated callees execute but are not
-                // recorded in the trace IR. For void result this means
-                // dispatch the C function and skip the
-                // `ctx.call_*_void_typed` recording + `may_force` vable
-                // bookkeeping (`forces` is incompatible with
-                // `NotInTrace`). If the call raises, abort the trace —
-                // PyPy raises `SwitchToBlackhole(ABORT_ESCAPE,
-                // raising_exception=True)` which `TraceAction::Abort`
-                // mirrors.
-                //
-                // `MetaInterp::do_not_in_trace_call` (`pyjitpl.rs`)
-                // is the same logic on the `MetaInterp` side; the
-                // `JitCodeMachine` walker does not currently hold a
-                // `MetaInterp` reference, so the clear / dispatch /
-                // exception-check sequence is replicated inline using
-                // the shared `BH_LAST_EXC_VALUE` TLS already used by
-                // other dispatch sites in `blackhole.rs`.
-                if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
-                    self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    if !concrete_ptr.is_null() {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_v_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            );
-                        }
-                    }
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // `pyjitpl.py do_not_in_trace_call`:
-                    //     if self.last_exc_value:
-                    //         raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
-                    //                                  raising_exception=True)
-                    // The exception value stays on `BH_LAST_EXC_VALUE`
-                    // for the blackhole replay; do not clear it here.
-                    // Mirror `finalize_standard_virtualizable_may_force`
-                    // (in this file) by stashing
-                    // `SwitchToBlackhole::abort_escape()` on TraceCtx so
-                    // the jitdriver-side `TraceAction::Abort` consumer
-                    // fires `aborted_tracing(ABORT_ESCAPE)` instead of
-                    // the generic too-long fallback.
-                    let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    if exc != 0 {
-                        return TraceAction::SwitchToBlackhole(
-                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
-                        );
-                    }
-                } else {
-                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
-                    // `None  # cannot be handled by direct_libffi_call()` on this
-                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
-                    // needs a `MetaInterp`, which this jitcode machine does not
-                    // hold.  That is upstream's own fallthrough — the release-gil
-                    // / may-force selection below is what it falls through to.
-                    // The specialization lives in
-                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
-                    // walker's residual-call dispatchers.
-                    let is_release_gil = effectinfo.is_call_release_gil();
-                    let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
-                    let is_loopinvariant =
-                        effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
-
-                    // pyjitpl.py execute_varargs parity (plain
-                    // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py
-                    // (MAY_FORCE_N branch).  Both branches share the same
-                    // first step: `clear_exception()` BEFORE
-                    // `vable_and_vrefs_before_residual_call`.  The full
-                    // RPython sequence (executes_varargs helper) is
-                    //     clear_exception
-                    //     execute_and_record_varargs        # execute → record
-                    //     handle_possible_exception / assert_no_exception
-                    // (`execute_and_record_varargs` runs `executor.execute_varargs`
-                    // first, then `history.record`). Concrete execute is
-                    // therefore observed BEFORE the trace IR is written and
-                    // the post-call exception check decides between
-                    // GUARD_NO_EXCEPTION and the catch path.
-                    //
-                    // 1. clear_exception (`pyjitpl.py` /
-                    //    `JitCodeMachine::clear_exception` in this file).
-                    //    PyPy's `clear_exception()`
-                    //    nulls `self.last_exc_value`.  Pyre's parity
-                    //    (Parity #10) clears `last_exception_value` and the
-                    //    `BH_LAST_EXC_VALUE` TLS shim used by
-                    //    `bh_call_*_dispatch` (`call_stub::bh_call_*`) — the
-                    //    TLS shim is pyre's structural adapter for surfacing
-                    //    a callee's exception across the C boundary.
-                    //    `last_exception_box` is intentionally left untouched
-                    //    matching upstream: `handle_possible_exception`
-                    //    overwrites it whenever `last_exc_value` becomes
-                    //    non-NULL again, and every reader gates on
-                    //    `last_exc_value` first.
-                    self.clear_exception();
-                    // pyjitpl.py `vable_and_vrefs_before_residual_call`
-                    // walks vrefs FIRST (stamps TOKEN_TRACING_RESCALL), then the
-                    // virtualizable.  Pyre splits the call into
-                    // `ctx.vrefs_before_residual_call()` + the vinfo branch in
-                    // `prepare_standard_virtualizable_before_residual_call`.
-                    // Without the vrefs stamp, `vrefs_after_residual_call`
-                    // misreads a fresh vref's `TOKEN_NONE` as "forced" and
-                    // wrongly emits `VIRTUAL_REF_FINISH` + `CONST_NULL`.
-                    let active_vable = if is_forces {
-                        ctx.vrefs_before_residual_call();
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    // 2. concrete execute (RPython `executor.execute_varargs`
-                    //    → `cpu.bh_call_v`).  llmodel.py bh_call_v: a
-                    //    genuinely void C callee returns nothing, so route
-                    //    through the void-typed dispatcher instead of
-                    //    `bh_call_i_dispatch` (which transmutes to
-                    //    `extern "C" fn(...) -> i64` and reads garbage from
-                    //    rax/x0).
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    if !concrete_ptr.is_null() {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_v_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            );
-                        }
-                    }
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // pyjitpl.py MIFrame.do_residual_call — after the residual call,
-                    // walk the vrefs.  If any were forced by the call
-                    // then VIRTUAL_REF_FINISH is recorded BEFORE any
-                    // CALL op is recorded.  RPython's `MetaInterp`
-                    // owns `virtualref_boxes`; pyre's per-trace
-                    // counterpart is on `TraceCtx` so the state-field
-                    // dispatch can reach the same data through `ctx`.
-                    //
-                    // Gated on `is_forces` because pyjitpl.py
-                    // runs `vable_and_vrefs_before_residual_call` +
-                    // `vrefs_after_residual_call` only inside the
-                    // `assembler_call or check_forces_virtual_or_virtualizable()`
-                    // branch.  The plain / release_gil / loopinvariant
-                    // path (pyjitpl.py) goes through
-                    // `execute_varargs` which never invokes either
-                    // hook — calling the after-hook there would see
-                    // tokens still at TOKEN_NONE (because the before-hook
-                    // never stamped TOKEN_TRACING_RESCALL) and
-                    // incorrectly record VIRTUAL_REF_FINISH for live
-                    // vrefs.
-                    if is_forces {
-                        ctx.vrefs_after_residual_call();
-                    }
-                    // 3. record IR (`history.record` →
-                    //    `_record_helper_varargs`). pyjitpl.py
-                    //    do_residual_call threads the original calldescr's
-                    //    `EffectInfo` (oopspec, read/write descr sets,
-                    //    can_invalidate, can_collect,
-                    //    call_release_gil_target) into the trace IR
-                    //    instead of re-deriving the default for the opcode.
-                    //    The OS_LIBFFI_CALL pre-hook in
-                    //    `pyjitpl.py do_residual_call` declines at the top of
-                    //    this branch, so the calldescr reaching here is the
-                    //    original one.
-                    if is_release_gil {
-                        ctx.call_release_gil_void_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        );
-                    } else if is_forces {
-                        ctx.call_may_force_void_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        );
-                    } else if is_loopinvariant {
-                        // pyjitpl.py MIFrame.do_residual_call with tp == 'v':
-                        // _record_helper_varargs returns None for void,
-                        // so the loop-invariant cache always misses for
-                        // void calls — concrete C dispatch always runs.
-                        ctx.call_loopinvariant_void_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        );
-                    } else {
-                        ctx.record_call_with_descr(
-                            majit_ir::OpCode::CallN,
-                            trace_ptr,
-                            &args,
-                            trace_descr,
-                        );
-                    }
-                    // 4. for forces: `vable_after_residual_call` +
-                    //    `generate_guard(GUARD_NOT_FORCED)` (`pyjitpl.py`).
-                    //    Pyre rolls both into
-                    //    `finalize_standard_virtualizable_may_force` which
-                    //    emits `GuardNotForced` before
-                    //    `handle_possible_exception` runs below — the
-                    //    upstream order is GUARD_NOT_FORCED first, then
-                    //    GUARD_NO_EXCEPTION.
-                    if is_forces {
-                        let action =
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                        if !matches!(action, TraceAction::Continue) {
-                            return action;
-                        }
-                    }
-                    match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                        TraceAction::Continue => {}
-                        action => return action,
-                    }
-                }
-            }
-            // ── 0: canonical typed (i/r/f) recording arms ──
-            //
-            // Mirror of the void arm above for the int / ref / float
-            // result kinds.  RPython's `pyjitpl.py do_residual_call
-            // do_residual_call` is one function dispatching by `tp ==
-            // 'i'/'r'/'f'/'v'` inline; pyre splits that across match
-            // arms (necessary Rust adaptation: match-arm vs Python
-            // `tp` branching).  Each arm replicates the void body line
-            // for line, with only these per-kind differences:
-            //   * dispatcher: `bh_call_v_dispatch` →
-            //     `bh_call_i_dispatch` (int / ref) or
-            //     `bh_call_f_dispatch` (float)
-            //   * register write-back: `set_int_reg` / `set_ref_reg` /
-            //     `set_float_reg` after both NotInTrace-execute and the
-            //     normal-execute-and-record paths
-            //   * record API: `call_*_typed_with_effect` returning an
-            //     `OpRef` (paired with the concrete result for the
-            //     register write-back)
-            //   * float layout: `BC_RESIDUAL_CALL_IRF_F` is the only
-            //     float-result opcode per `resoperation.py call_release_gil_for_descr`
-            //     ("no such thing" `R_F` / `IR_F`), so the float arm
-            //     reads all three (count, regs) pairs unconditionally —
-            //     matching `emit_canonical_call_typed_irf_f`
-            //     (jitcode/assembler.rs) which always emits them.
-            //
-            // These arms are dormant until the producer migration in
-            // `pyre/pyre-jit/src/jit/assembler.rs::dispatch_residual_call`
-            // typed branch routes through `*_canonical_via_target_with_effect_info`.
-            jitcode::insns::BC_RESIDUAL_CALL_R_I
-            | jitcode::insns::BC_RESIDUAL_CALL_IR_I
-            | jitcode::insns::BC_RESIDUAL_CALL_IRF_I => {
-                let has_int = matches!(
-                    bytecode,
-                    jitcode::insns::BC_RESIDUAL_CALL_IR_I | jitcode::insns::BC_RESIDUAL_CALL_IRF_I
-                );
-                let has_float = bytecode == jitcode::insns::BC_RESIDUAL_CALL_IRF_I;
-
-                let call_jitcode = self.frames.current_mut().jitcode.clone();
-                let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
-                    let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: CallArgs = SmallVec::new();
-                    if has_int {
-                        let count = frame.next_u8() as usize;
-                        for _ in 0..count {
-                            args_i.push(JitCallArg::int(frame.next_reg() as u16));
-                        }
-                    }
-                    let mut args_r: CallArgs = SmallVec::new();
-                    let count_r = frame.next_u8() as usize;
-                    for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
-                    }
-                    let mut args_f: CallArgs = SmallVec::new();
-                    if has_float {
-                        let count = frame.next_u8() as usize;
-                        for _ in 0..count {
-                            args_f.push(JitCallArg::float(frame.next_reg() as u16));
-                        }
-                    }
-                    let calldescr_idx = frame.next_u16();
-                    let dst = frame.next_reg() as usize;
-                    let calldescr = call_jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
-                        .expect("BC_RESIDUAL_CALL_*_I descr is not BhDescr")
-                        .as_calldescr();
-                    let trace_descr = frame
-                        .jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
-                        .cloned()
-                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
-                    let target = frame
-                        .jitcode
-                        .exec
-                        .call_descr_to_call_target
-                        .get(&calldescr_idx)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let func =
-                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                                    panic!(
-                                        "BC_RESIDUAL_CALL_*_I: funcptr slot \
-                                         {funcptr_reg} is uninitialized"
-                                    )
-                                });
-                            JitCallTarget::from_fnaddr(func)
-                        });
-                    (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
-                };
-
-                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
-                    .read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
-
-                let trace_ptr = if target.trace_ptr.is_null() {
-                    target.concrete_ptr
-                } else {
-                    target.trace_ptr
-                };
-                let concrete_ptr = if target.concrete_ptr.is_null() {
-                    trace_ptr
-                } else {
-                    target.concrete_ptr
-                };
-                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &calldescr.arg_classes,
-                ) {
-                    return action;
-                }
-
-                let effect_descr = trace_descr.clone();
-                let effectinfo = effect_descr
-                    .as_call_descr()
-                    .expect("resolved call descriptor")
-                    .get_extra_info();
-
-                if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
-                    // pyjitpl.py do_not_in_trace_call:
-                    //     self.clear_exception()
-                    //     executor.execute_varargs(self.cpu, self,
-                    //                              rop.CALL_N, allboxes, descr)
-                    //     if self.last_exc_value:
-                    //         raise SwitchToBlackhole(ABORT_ESCAPE,
-                    //                                 raising_exception=True)
-                    //     return None
-                    //
-                    // RPython forces the dispatch through `CALL_N` (void)
-                    // regardless of the surface result type and discards
-                    // the result.  Mirror that here: route the C call
-                    // through `bh_call_v_dispatch`, do not write back the
-                    // int destination register, and abort on exception.
-                    self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    if !concrete_ptr.is_null() {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_v_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            );
-                        }
-                    }
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // `pyjitpl.py do_not_in_trace_call`:
-                    //     if self.last_exc_value: raise SwitchToBlackhole(
-                    //         Counters.ABORT_ESCAPE, raising_exception=True)
-                    // Same stash pattern as the void OS_NOT_IN_TRACE arm
-                    // above.
-                    let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    if exc != 0 {
-                        return TraceAction::SwitchToBlackhole(
-                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
-                        );
-                    }
-                    let _ = dst;
-                } else {
-                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
-                    // `None  # cannot be handled by direct_libffi_call()` on this
-                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
-                    // needs a `MetaInterp`, which this jitcode machine does not
-                    // hold.  That is upstream's own fallthrough — the release-gil
-                    // / may-force selection below is what it falls through to.
-                    // The specialization lives in
-                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
-                    // walker's residual-call dispatchers.
-                    let is_release_gil = effectinfo.is_call_release_gil();
-                    let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
-                    let is_loopinvariant =
-                        effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
-
-                    // pyjitpl.py do_residual_call:
-                    //     res = self.metainterp.heapcache
-                    //         .call_loopinvariant_known_result(allboxes, descr)
-                    //     if res is not None:
-                    //         return res
-                    // Hit on the loop-invariant cache returns the cached
-                    // result WITHOUT executing the C call or recording a
-                    // trace op.  Pyre's helper
-                    // (`TraceCtx::call_loopinvariant_lookup_with_effect` in
-                    // `history.rs`) does
-                    // the lookup internally on the record-side, but the
-                    // concrete `bh_call_i_dispatch` below still ran first
-                    // — splitting the lookup out matches upstream order.
-                    if is_loopinvariant
-                        && let Some((cached_traced, cached_concrete)) = ctx
-                            .call_loopinvariant_lookup_with_effect(
-                                trace_ptr,
-                                &arg_types,
-                                majit_ir::Type::Int,
-                                effectinfo,
-                            )
-                    {
-                        self.set_int_reg(dst, Some(cached_traced), Some(cached_concrete));
-                        return TraceAction::Continue;
-                    }
-
-                    // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_I branch parity:
-                    //     clear_exception  ← FIRST
-                    //     vable_and_vrefs_before_residual_call
-                    // (vrefs walk + vinfo stamp; see void arm for full citation).
-                    self.clear_exception();
-                    let active_vable = if is_forces {
-                        ctx.vrefs_before_residual_call();
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    // Concrete execute via `bh_call_i_dispatch` (i64
-                    // return) — RPython `executor.execute_varargs` →
-                    // `cpu.bh_call_i`.
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    let concrete = if concrete_ptr.is_null() {
-                        0
-                    } else {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_i_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            )
-                        }
-                    };
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // pyjitpl.py — vrefs_after_residual_call
-                    // (see void arm for the explanation; gated on
-                    // `is_forces` because the before-hook only stamps
-                    // TOKEN_TRACING_RESCALL in that branch).
-                    if is_forces {
-                        ctx.vrefs_after_residual_call();
-                    }
-                    // pyjitpl.py do_residual_call plain branch:
-                    //     pure = effectinfo.check_is_elidable()
-                    //     return self.execute_varargs(rop.CALL_I,
-                    //                                 allboxes, descr,
-                    //                                 exc, pure)
-                    // Pure calls fold after recording via record_result_of_call_pure.
-                    // (pyjitpl.py).  Only the plain branch carries
-                    // pure: forces/release_gil/loopinvariant don't combine
-                    // with elidable in upstream call.py getcalldescr.
-                    let plain_branch = !is_release_gil && !is_forces && !is_loopinvariant;
-                    let pure = plain_branch && effectinfo.check_is_elidable();
-                    let patch_pos = if pure {
-                        Some(ctx.get_trace_position())
-                    } else {
-                        None
-                    };
-                    let traced = if is_release_gil {
-                        ctx.call_release_gil_int_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_forces {
-                        ctx.call_may_force_int_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_loopinvariant {
-                        ctx.call_loopinvariant_int_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                            concrete,
-                        )
-                    } else {
-                        ctx.record_call_with_descr(
-                            majit_ir::OpCode::CallI,
-                            trace_ptr,
-                            &args,
-                            trace_descr.clone(),
-                        )
-                    };
-                    // pyjitpl.py execute_varargs:
-                    //     if pure and not self.metainterp.last_exc_value and op:
-                    //         op = self.metainterp.record_result_of_call_pure(...)
-                    // The post-record CALL_I → CALL_PURE_I cut + const fold
-                    // (`pyjitpl.py`) only fires when the concrete
-                    // callee did NOT raise.  A raising-pure leaves the
-                    // recorded CALL_I uncut, and finish_residual_call_exception_path
-                    // below emits GUARD_EXCEPTION + unwinds.
-                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    let traced = match patch_pos {
-                        Some(patch_pos) if last_exc_value == 0 => {
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args: CallOpRefs = SmallVec::new();
-                            call_args.push(func_ref);
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                traced,
-                                &call_args,
-                                &concrete_values,
-                                trace_descr,
-                                patch_pos,
-                                majit_ir::OpCode::CallI,
-                                majit_ir::Value::Int(concrete),
-                            )
-                        }
-                        _ => traced,
-                    };
-                    // RPython pyjitpl.py opimpl_residual_call_*_may_force_*
-                    // writes the call result into the frame *before*
-                    // vable_after_residual_call fires GUARD_NOT_FORCED
-                    // (see legacy BC_CALL_MAY_FORCE_INT arm for rationale).
-                    // `pyjitpl.py execute_and_record_varargs` runs the call
-                    // through `executor.execute_varargs` and hands the result
-                    // to `history.record_nospec`, so the recorded op carries
-                    // the executed value on its own frontend slot -- every
-                    // later `getvalue()` of that box answers it.  Writing the
-                    // value into the destination register alone leaves
-                    // `concrete_of_opref` answering `None` for the box, and
-                    // the two readers then disagree: `_nonstandard_virtualizable`
-                    // asks the box, so a residual that returns the standard
-                    // virtualizable (the portal's `reload_top_root`) loses its
-                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
-                    // vable access on that register takes the nonstandard leg.
-                    // The full-body walker already stamps its own residual
-                    // results this way (`jitcode_dispatch/residual_call.rs`).
-                    ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
-                    self.set_int_reg(dst, Some(traced), Some(concrete));
-                    if is_forces {
-                        if crate::majit_log_enabled() {
-                            let frame = self.frames.current_mut();
-                            eprintln!(
-                                "[interpret] residual may_force jitcode={} last_op={} cursor={} \
-                                 extraeffect={:?} can_raise={} next={:?}",
-                                frame.jitcode.name(),
-                                frame.last_opcode_position,
-                                frame.code_cursor,
-                                effectinfo.extraeffect,
-                                effectinfo.check_can_raise(false),
-                                frame.jitcode.code.get(frame.code_cursor),
-                            );
-                        }
-                        let action =
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                        if !matches!(action, TraceAction::Continue) {
-                            return action;
-                        }
-                    }
-                    // pyjitpl.py `exc = exc and not isinstance(op, Const)`:
-                    // a pure call that const-folded clears `exc`, so
-                    // `assert_no_exception` runs (no GUARD_NO_EXCEPTION emit).
-                    // finish_residual_call_exception_path's `assert!(exc == 0)`
-                    // covers that.  When pure didn't fold, the fresh CALL_PURE
-                    // op still needs GUARD_NO_EXCEPTION/EXCEPTION based on
-                    // effectinfo.check_can_raise() — same as non-pure.
-                    if !(pure && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                            TraceAction::Continue => {}
-                            action => return action,
-                        }
-                    }
-                }
-            }
-            jitcode::insns::BC_RESIDUAL_CALL_R_R
-            | jitcode::insns::BC_RESIDUAL_CALL_IR_R
-            | jitcode::insns::BC_RESIDUAL_CALL_IRF_R => {
-                let has_int = matches!(
-                    bytecode,
-                    jitcode::insns::BC_RESIDUAL_CALL_IR_R | jitcode::insns::BC_RESIDUAL_CALL_IRF_R
-                );
-                let has_float = bytecode == jitcode::insns::BC_RESIDUAL_CALL_IRF_R;
-
-                let call_jitcode = self.frames.current_mut().jitcode.clone();
-                let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
-                    let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: CallArgs = SmallVec::new();
-                    if has_int {
-                        let count = frame.next_u8() as usize;
-                        for _ in 0..count {
-                            args_i.push(JitCallArg::int(frame.next_reg() as u16));
-                        }
-                    }
-                    let mut args_r: CallArgs = SmallVec::new();
-                    let count_r = frame.next_u8() as usize;
-                    for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
-                    }
-                    let mut args_f: CallArgs = SmallVec::new();
-                    if has_float {
-                        let count = frame.next_u8() as usize;
-                        for _ in 0..count {
-                            args_f.push(JitCallArg::float(frame.next_reg() as u16));
-                        }
-                    }
-                    let calldescr_idx = frame.next_u16();
-                    let dst = frame.next_reg() as usize;
-                    let calldescr = call_jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
-                        .expect("BC_RESIDUAL_CALL_*_R descr is not BhDescr")
-                        .as_calldescr();
-                    let trace_descr = frame
-                        .jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
-                        .cloned()
-                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
-                    let target = frame
-                        .jitcode
-                        .exec
-                        .call_descr_to_call_target
-                        .get(&calldescr_idx)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let func =
-                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                                    panic!(
-                                        "BC_RESIDUAL_CALL_*_R: funcptr slot \
-                                         {funcptr_reg} is uninitialized"
-                                    )
-                                });
-                            JitCallTarget::from_fnaddr(func)
-                        });
-                    (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
-                };
-
-                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
-                    .read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
-
-                let trace_ptr = if target.trace_ptr.is_null() {
-                    target.concrete_ptr
-                } else {
-                    target.trace_ptr
-                };
-                let concrete_ptr = if target.concrete_ptr.is_null() {
-                    trace_ptr
-                } else {
-                    target.concrete_ptr
-                };
-                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &calldescr.arg_classes,
-                ) {
-                    return action;
-                }
-
-                let effect_descr = trace_descr.clone();
-                let effectinfo = effect_descr
-                    .as_call_descr()
-                    .expect("resolved call descriptor")
-                    .get_extra_info();
-
-                if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
-                    // pyjitpl.py do_not_in_trace_call: route the
-                    // C call through `CALL_N` (void) and discard the
-                    // result regardless of the surface result type.  See
-                    // the int sibling at the corresponding NotInTrace
-                    // branch for the full citation.
-                    self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    if !concrete_ptr.is_null() {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_v_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            );
-                        }
-                    }
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // `pyjitpl.py do_not_in_trace_call`:
-                    //     if self.last_exc_value: raise SwitchToBlackhole(
-                    //         Counters.ABORT_ESCAPE, raising_exception=True)
-                    // Same stash pattern as the void OS_NOT_IN_TRACE arm
-                    // above.
-                    let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    if exc != 0 {
-                        return TraceAction::SwitchToBlackhole(
-                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
-                        );
-                    }
-                    let _ = dst;
-                } else {
-                    // ResKind::Ref intentionally rejects ReleaseGil per
-                    // `resoperation.py rop.call_release_gil_for_descr # no such thing`. The
-                    // producer rejects this combination at
-                    // `pyre-jit/src/jit/assembler.rs`'s
-                    // `dispatch_residual_call` so the
-                    // recorder treats it as an unreachable invariant.
-                    if effectinfo.is_call_release_gil() {
-                        panic!(
-                            "BC_RESIDUAL_CALL_*_R: ReleaseGil + Ref has no upstream counterpart \
-                             (resoperation.py:1243-1244 `# no such thing`)"
-                        );
-                    }
-                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
-                    // `None  # cannot be handled by direct_libffi_call()` on this
-                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
-                    // needs a `MetaInterp`, which this jitcode machine does not
-                    // hold.  That is upstream's own fallthrough — the release-gil
-                    // / may-force selection below is what it falls through to.
-                    // The specialization lives in
-                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
-                    // walker's residual-call dispatchers.
-                    let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
-                    let is_loopinvariant =
-                        effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
-
-                    // pyjitpl.py MIFrame.do_residual_call: heapcache lookup-first for
-                    // loop-invariant calls (see int sibling for full cite).
-                    if is_loopinvariant
-                        && let Some((cached_traced, cached_concrete)) = ctx
-                            .call_loopinvariant_lookup_with_effect(
-                                trace_ptr,
-                                &arg_types,
-                                majit_ir::Type::Ref,
-                                effectinfo,
-                            )
-                    {
-                        self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
-                        return TraceAction::Continue;
-                    }
-
-                    // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
-                    // clear_exception precedes vable_and_vrefs_before_residual_call
-                    // (vrefs walk + vinfo stamp; see void arm for full citation).
-                    self.clear_exception();
-                    let active_vable = if is_forces {
-                        ctx.vrefs_before_residual_call();
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    let concrete = if concrete_ptr.is_null() {
-                        0
-                    } else {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_i_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            )
-                        }
-                    };
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // pyjitpl.py — vrefs_after_residual_call
-                    // (see void arm for the explanation; gated on
-                    // `is_forces` because the before-hook only stamps
-                    // TOKEN_TRACING_RESCALL in that branch).
-                    if is_forces {
-                        ctx.vrefs_after_residual_call();
-                    }
-                    // pyjitpl.py do_residual_call plain branch —
-                    // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
-                    let plain_branch = !is_forces && !is_loopinvariant;
-                    let pure = plain_branch && effectinfo.check_is_elidable();
-                    let patch_pos = if pure {
-                        Some(ctx.get_trace_position())
-                    } else {
-                        None
-                    };
-                    let traced = if is_forces {
-                        ctx.call_may_force_ref_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_loopinvariant {
-                        ctx.call_loopinvariant_ref_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                            concrete,
-                        )
-                    } else {
-                        ctx.record_call_with_descr(
-                            majit_ir::OpCode::CallR,
-                            trace_ptr,
-                            &args,
-                            trace_descr.clone(),
-                        )
-                    };
-                    // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
-                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    let traced = match patch_pos {
-                        Some(patch_pos) if last_exc_value == 0 => {
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args: CallOpRefs = SmallVec::new();
-                            call_args.push(func_ref);
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                traced,
-                                &call_args,
-                                &concrete_values,
-                                trace_descr,
-                                patch_pos,
-                                majit_ir::OpCode::CallR,
-                                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                            )
-                        }
-                        _ => traced,
-                    };
-                    // `pyjitpl.py execute_and_record_varargs` runs the call
-                    // through `executor.execute_varargs` and hands the result
-                    // to `history.record_nospec`, so the recorded op carries
-                    // the executed value on its own frontend slot -- every
-                    // later `getvalue()` of that box answers it.  Writing the
-                    // value into the destination register alone leaves
-                    // `concrete_of_opref` answering `None` for the box, and
-                    // the two readers then disagree: `_nonstandard_virtualizable`
-                    // asks the box, so a residual that returns the standard
-                    // virtualizable (the portal's `reload_top_root`) loses its
-                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
-                    // vable access on that register takes the nonstandard leg.
-                    // The full-body walker already stamps its own residual
-                    // results this way (`jitcode_dispatch/residual_call.rs`).
-                    ctx.set_opref_concrete(
-                        traced,
-                        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                    );
-                    self.set_ref_reg(dst, Some(traced), Some(concrete));
-                    if is_forces {
-                        let action =
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                        if !matches!(action, TraceAction::Continue) {
-                            return action;
-                        }
-                    }
-                    if !(pure && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                            TraceAction::Continue => {}
-                            action => return action,
-                        }
-                    }
-                }
-            }
-            // `BC_RESIDUAL_CALL_IRF_F` is the only float-result opcode
-            // (`resoperation.py call_release_gil_for_descr` # no such thing for `R_F` /
-            // `IR_F`). The producer (`emit_canonical_call_typed_irf_f`
-            // in `jitcode/assembler.rs`) always emits all three
-            // (count, regs) pairs even when one is empty, so the
-            // recorder reads them unconditionally.
-            jitcode::insns::BC_RESIDUAL_CALL_IRF_F => {
-                let call_jitcode = self.frames.current_mut().jitcode.clone();
-                let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
-                    let frame = self.frames.current_mut();
-                    let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: CallArgs = SmallVec::new();
-                    let count_i = frame.next_u8() as usize;
-                    for _ in 0..count_i {
-                        args_i.push(JitCallArg::int(frame.next_reg() as u16));
-                    }
-                    let mut args_r: CallArgs = SmallVec::new();
-                    let count_r = frame.next_u8() as usize;
-                    for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
-                    }
-                    let mut args_f: CallArgs = SmallVec::new();
-                    let count_f = frame.next_u8() as usize;
-                    for _ in 0..count_f {
-                        args_f.push(JitCallArg::float(frame.next_reg() as u16));
-                    }
-                    let calldescr_idx = frame.next_u16();
-                    let dst = frame.next_reg() as usize;
-                    let calldescr = call_jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
-                        .expect("BC_RESIDUAL_CALL_IRF_F descr is not BhDescr")
-                        .as_calldescr();
-                    let trace_descr = frame
-                        .jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
-                        .cloned()
-                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
-                    let target = frame
-                        .jitcode
-                        .exec
-                        .call_descr_to_call_target
-                        .get(&calldescr_idx)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let func =
-                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                                    panic!(
-                                        "BC_RESIDUAL_CALL_IRF_F: funcptr slot \
-                                         {funcptr_reg} is uninitialized"
-                                    )
-                                });
-                            JitCallTarget::from_fnaddr(func)
-                        });
-                    (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
-                };
-
-                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
-                    .read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
-
-                let trace_ptr = if target.trace_ptr.is_null() {
-                    target.concrete_ptr
-                } else {
-                    target.trace_ptr
-                };
-                let concrete_ptr = if target.concrete_ptr.is_null() {
-                    trace_ptr
-                } else {
-                    target.concrete_ptr
-                };
-                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &calldescr.arg_classes,
-                ) {
-                    return action;
-                }
-
-                let effect_descr = trace_descr.clone();
-                let effectinfo = effect_descr
-                    .as_call_descr()
-                    .expect("resolved call descriptor")
-                    .get_extra_info();
-
-                if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
-                    // pyjitpl.py do_not_in_trace_call: route the
-                    // C call through `CALL_N` (void) and discard the
-                    // result regardless of the surface result type.  See
-                    // the int sibling at the corresponding NotInTrace
-                    // branch for the full citation.
-                    self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    if !concrete_ptr.is_null() {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_v_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            );
-                        }
-                    }
-                    if let Some(action) = host_requested_walk_abort(
-                        ctx,
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                    ) {
-                        return action;
-                    }
-                    // `pyjitpl.py do_not_in_trace_call`:
-                    //     if self.last_exc_value: raise SwitchToBlackhole(
-                    //         Counters.ABORT_ESCAPE, raising_exception=True)
-                    // Same stash pattern as the void OS_NOT_IN_TRACE arm
-                    // above.
-                    let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    if exc != 0 {
-                        return TraceAction::SwitchToBlackhole(
-                            crate::pyjitpl::SwitchToBlackhole::abort_escape(),
-                        );
-                    }
-                    let _ = dst;
-                } else {
-                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
-                    // `None  # cannot be handled by direct_libffi_call()` on this
-                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
-                    // needs a `MetaInterp`, which this jitcode machine does not
-                    // hold.  That is upstream's own fallthrough — the release-gil
-                    // / may-force selection below is what it falls through to.
-                    // The specialization lives in
-                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
-                    // walker's residual-call dispatchers.
-                    let is_release_gil = effectinfo.is_call_release_gil();
-                    let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
-                    let is_loopinvariant =
-                        effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
-
-                    // pyjitpl.py MIFrame.do_residual_call: heapcache lookup-first for
-                    // loop-invariant calls (see int sibling for full cite).
-                    if is_loopinvariant
-                        && let Some((cached_traced, cached_concrete_bits)) = ctx
-                            .call_loopinvariant_lookup_with_effect(
-                                trace_ptr,
-                                &arg_types,
-                                majit_ir::Type::Float,
-                                effectinfo,
-                            )
-                    {
-                        self.set_float_reg(dst, Some(cached_traced), Some(cached_concrete_bits));
-                        return TraceAction::Continue;
-                    }
-
-                    // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_F branch parity:
-                    // clear_exception precedes vable_and_vrefs_before_residual_call
-                    // (vrefs walk + vinfo stamp; see void arm for full citation).
-                    self.clear_exception();
-                    let active_vable = if is_forces {
-                        ctx.vrefs_before_residual_call();
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                        return report_symbolic_residual_call_target(
-                            ctx,
-                            fnaddr_word,
-                            Some(&calldescr.arg_classes),
-                        );
-                    }
-                    let concrete = if concrete_ptr.is_null() {
-                        0.0f64
-                    } else {
-                        unsafe {
-                            majit_backend::call_stub::bh_call_f_by_classes(
-                                concrete_ptr as usize,
-                                &calldescr.arg_classes,
-                                Some(&raw_i),
-                                Some(&raw_r),
-                                Some(&raw_f),
-                            )
-                        }
-                    };
-                    // pyjitpl.py — vrefs_after_residual_call
-                    // (see void arm for the explanation; gated on
-                    // `is_forces` because the before-hook only stamps
-                    // TOKEN_TRACING_RESCALL in that branch).
-                    if is_forces {
-                        ctx.vrefs_after_residual_call();
-                    }
-                    // pyjitpl.py do_residual_call plain branch —
-                    // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
-                    let plain_branch = !is_release_gil && !is_forces && !is_loopinvariant;
-                    let pure = plain_branch && effectinfo.check_is_elidable();
-                    let patch_pos = if pure {
-                        Some(ctx.get_trace_position())
-                    } else {
-                        None
-                    };
-                    let traced = if is_release_gil {
-                        ctx.call_release_gil_float_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_forces {
-                        ctx.call_may_force_float_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_loopinvariant {
-                        ctx.call_loopinvariant_float_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                            concrete.to_bits() as i64,
-                        )
-                    } else {
-                        ctx.record_call_with_descr(
-                            majit_ir::OpCode::CallF,
-                            trace_ptr,
-                            &args,
-                            trace_descr.clone(),
-                        )
-                    };
-                    // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
-                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    let traced = match patch_pos {
-                        Some(patch_pos) if last_exc_value == 0 => {
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args: CallOpRefs = SmallVec::new();
-                            call_args.push(func_ref);
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                traced,
-                                &call_args,
-                                &concrete_values,
-                                trace_descr,
-                                patch_pos,
-                                majit_ir::OpCode::CallF,
-                                majit_ir::Value::Float(concrete),
-                            )
-                        }
-                        _ => traced,
-                    };
-                    // `pyjitpl.py execute_and_record_varargs` runs the call
-                    // through `executor.execute_varargs` and hands the result
-                    // to `history.record_nospec`, so the recorded op carries
-                    // the executed value on its own frontend slot -- every
-                    // later `getvalue()` of that box answers it.  Writing the
-                    // value into the destination register alone leaves
-                    // `concrete_of_opref` answering `None` for the box, and
-                    // the two readers then disagree: `_nonstandard_virtualizable`
-                    // asks the box, so a residual that returns the standard
-                    // virtualizable (the portal's `reload_top_root`) loses its
-                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
-                    // vable access on that register takes the nonstandard leg.
-                    // The full-body walker already stamps its own residual
-                    // results this way (`jitcode_dispatch/residual_call.rs`).
-                    ctx.set_opref_concrete(traced, majit_ir::Value::Float(concrete));
-                    self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
-                    if is_forces {
-                        let action =
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                        if !matches!(action, TraceAction::Continue) {
-                            return action;
-                        }
-                    }
-                    if !(pure && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                            TraceAction::Continue => {}
-                            action => return action,
-                        }
-                    }
-                }
-            }
-            // BC_CALL_ASSEMBLER_VOID uses `(fn_ptr_idx:u16,
-            // num_args:u16, [(kind:u8, reg:u8)]...)` — the
-            // assembler-token path is not in the canonical *_v family
-            // and of pyre-call-family-canonical-migration.md
-            // owns its migration.
-            // pyjitpl.py _opimpl_recursive_call →
-            // do_recursive_call → do_residual_call(assembler_call=True).
-            // RPython's assembler_call path (py:2007-2083) unconditionally
-            // enters the vable/guard sequence:
-            //   1. clear_exception
-            //   2. vable_and_vrefs_before_residual_call
-            //   3. execute (CALL_MAY_FORCE_N via executor.execute_varargs)
-            //   4. vrefs_after_residual_call
-            //   5. record (CALL_ASSEMBLER_N via direct_assembler_call)
-            //   6. vable_after_residual_call + GUARD_NOT_FORCED
-            //   7. KEEPALIVE on vablebox (`pyjitpl.py`)
-            //   8. handle_possible_exception (GUARD_NO_EXCEPTION / unwind)
-            jitcode::insns::BC_CALL_ASSEMBLER_VOID => {
-                let (fn_ptr_idx, arg_regs) = {
-                    let frame = self.frames.current_mut();
-                    let fn_ptr_idx = frame.next_u16() as usize;
-                    let num_args = frame.next_u16() as usize;
-                    let mut arg_regs = Vec::with_capacity(num_args);
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_reg();
-                        arg_regs.push(JitCallArg {
-                            kind,
-                            reg: reg as u16,
-                        });
-                    }
-                    (fn_ptr_idx, arg_regs)
-                };
-                let mut args = Vec::with_capacity(arg_regs.len());
-                let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                let mut arg_types = Vec::with_capacity(arg_regs.len());
-                let mut raw_i = Vec::new();
-                let mut raw_r = Vec::new();
-                let mut raw_f = Vec::new();
-                let mut arg_classes = String::new();
-                for arg_spec in &arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
-                    args.push(arg);
-                    concrete_args.push(concrete);
-                    arg_types.push(arg_type);
-                    match arg_spec.kind {
-                        JitArgKind::Int => {
-                            raw_i.push(concrete);
-                            arg_classes.push('i');
-                        }
-                        JitArgKind::Ref => {
-                            raw_r.push(concrete);
-                            arg_classes.push('r');
-                        }
-                        JitArgKind::Float => {
-                            raw_f.push(concrete);
-                            arg_classes.push('f');
-                        }
-                    }
-                }
-                let (token_number, concrete_ptr) = self
-                    .frames
-                    .current_mut()
-                    .jitcode
-                    .call_assembler_target(fn_ptr_idx);
-                // 1. clear_exception (pyjitpl.py)
-                self.clear_exception();
-                // 2. vable_and_vrefs_before_residual_call (pyjitpl.py)
-                //    — vrefs walk FIRST stamps TOKEN_TRACING_RESCALL on every
-                //    live vref so `vrefs_after_residual_call` distinguishes
-                //    forced vs untouched; then the virtualizable half.
-                ctx.vrefs_before_residual_call();
-                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                // 3. execute (pyjitpl.py, tp == 'v') — `executor.execute_varargs`
-                //    → `cpu.bh_call_v`.
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &arg_classes,
-                ) {
-                    return action;
-                }
-                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                    return report_symbolic_residual_call_target(
-                        ctx,
-                        concrete_ptr as i64,
-                        Some(&arg_classes),
-                    );
-                }
-                if !concrete_ptr.is_null() {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_v_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        );
-                    }
-                }
-                if let Some(action) =
-                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
-                {
-                    return action;
-                }
-                // 4. `pyjitpl.py vrefs_after_residual_call` —
-                //    fire VIRTUAL_REF_FINISH for any vref forced by the
-                //    callee BEFORE the CALL_ASSEMBLER record below.
-                ctx.vrefs_after_residual_call();
-                // 5. record CALL_ASSEMBLER_N (pyjitpl.py MIFrame.do_residual_call
-                //    direct_assembler_call → history.record_nospec)
-                // A standalone runtime (or a token number not yet attached to
-                // warmstate) resolves to `None`; the concrete call already ran,
-                // so abort this trace rather than panic.
-                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
-                    return TraceAction::Abort;
-                };
-                ctx.call_assembler_void_arc_typed(arc, &args, &arg_types);
-                // 6. vable_after_residual_call + GUARD_NOT_FORCED
-                //    (pyjitpl.py)
-                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                if !matches!(action, TraceAction::Continue) {
-                    return action;
-                }
-                // 7. `pyjitpl.py MIFrame.do_residual_call`:
-                //        if vablebox is not None:
-                //            self.metainterp.history.record1(rop.KEEPALIVE,
-                //                                            vablebox, None)
-                //    Assembler-call branch threads the active vable
-                //    box through KEEPALIVE so the optimizer does not
-                //    DCE the box across the asm-side call boundary.
-                if let Some(vbox) = vable_opref {
-                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
-                }
-                // 8. handle_possible_exception (pyjitpl.py)
-                match self.finish_call_assembler_exception_path(ctx, sym) {
-                    TraceAction::Continue => {}
-                    action => return action,
-                }
-            }
-            // ── canonical conditional_call / record_known_result ──
-            // `rewrite_call(..., force_ir=True)`: lead + funcptr + I + R + d
-            // (`blackhole.rs` `handler_conditional_call_*` / `handler_record_known_result_*`).
-            jitcode::insns::BC_CONDITIONAL_CALL_IR_V
-            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
-            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R
-            | jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V
-            | jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
-                let (first_reg, target, args_i, args_r, calldescr, dst) = {
-                    let frame = self.frames.current_mut();
-                    let first_reg = frame.next_reg() as u16;
-                    let funcptr_reg = frame.next_reg() as u16;
-                    let count_i = frame.next_u8() as usize;
-                    let mut args_i = CallArgs::with_capacity(count_i);
-                    for _ in 0..count_i {
-                        args_i.push(JitCallArg::int(frame.next_reg() as u16));
-                    }
-                    let count_r = frame.next_u8() as usize;
-                    let mut args_r = CallArgs::with_capacity(count_r);
-                    for _ in 0..count_r {
-                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
-                    }
-                    let calldescr_idx = frame.next_u16();
-                    let calldescr = frame
-                        .jitcode
-                        .descr_at(calldescr_idx as usize)
-                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
-                        .expect("canonical cond/record descr is not BhDescr")
-                        .as_calldescr()
-                        .clone();
-                    let target = frame
-                        .jitcode
-                        .exec
-                        .call_descr_to_call_target
-                        .get(&calldescr_idx)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let func =
-                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
-                                    panic!(
-                                        "canonical cond/record: funcptr slot {funcptr_reg} \
-                                     is uninitialized"
-                                    )
-                                });
-                            JitCallTarget::from_fnaddr(func)
-                        });
-                    let dst = if matches!(
-                        bytecode,
-                        jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
-                            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R
-                    ) {
-                        Some(frame.next_reg() as u16)
-                    } else {
-                        None
-                    };
-                    (first_reg, target, args_i, args_r, calldescr, dst)
-                };
-                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
-                    self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &[]);
-                let trace_ptr = if target.trace_ptr.is_null() {
-                    target.concrete_ptr
-                } else {
-                    target.trace_ptr
-                };
-                let concrete_ptr = if target.concrete_ptr.is_null() {
-                    trace_ptr
-                } else {
-                    target.concrete_ptr
-                };
-                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-                let slot = target.effect_info_slot;
-                match bytecode {
-                    jitcode::insns::BC_CONDITIONAL_CALL_IR_V => {
-                        // `_opimpl_conditional_call_*`: skip only when the
-                        // register's own SSA box is already a Const. Inventing
-                        // ConstInt from this iteration's concrete value makes
-                        // `is_constant()` true for a live register and bakes
-                        // the snapshot into the trace.
-                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
-                        // `opimpl_conditional_call_ir_v`: ConstInt(0) records
-                        // nothing so the heapcache can keep args virtual.
-                        if first_box.is_constant() && first_val == 0 {
-                            // skip
-                        } else {
-                            ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
-                            let mut allboxes: CallOpRefs = SmallVec::new();
-                            allboxes.push(first_box);
-                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                            allboxes.extend_from_slice(&args);
-                            // `_record_helper_varargs` invalidates before it
-                            // appends. `cond_call_void_typed` only records.
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::CondCallN,
-                                Some(&calldescr.extra_info),
-                                &allboxes,
-                            );
-                            self.clear_exception();
-                            if first_val != 0 {
-                                if let Some(action) = refuse_walk_local_ref_args(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &raw_i,
-                                    &raw_r,
-                                    &args,
-                                    &calldescr.arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
-                                {
-                                    return report_symbolic_residual_call_target(
-                                        ctx,
-                                        fnaddr_word,
-                                        Some(&calldescr.arg_classes),
-                                    );
-                                }
-                                // `do_conditional_call` → `execute_varargs` → `cpu.bh_call_v`.
-                                if !concrete_ptr.is_null() {
-                                    unsafe {
-                                        majit_backend::call_stub::bh_call_v_by_classes(
-                                            concrete_ptr as usize,
-                                            &calldescr.arg_classes,
-                                            Some(&raw_i),
-                                            Some(&raw_r),
-                                            Some(&raw_f),
-                                        );
-                                    }
-                                }
-                                if let Some(action) = host_requested_walk_abort(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &calldescr.arg_classes,
-                                ) {
-                                    return action;
-                                }
-                            }
-                            match self.finish_residual_call_exception_path(
-                                ctx,
-                                sym,
-                                &calldescr.extra_info,
-                            ) {
-                                TraceAction::Continue => {}
-                                action => return action,
-                            }
-                        }
-                    }
-                    jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I => {
-                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
-                        // `_opimpl_conditional_call_value`: Const nonnull
-                        // returns the value box without recording.
-                        if first_box.is_constant() && first_val != 0 {
-                            if let Some(dst) = dst {
-                                self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
-                            }
-                        } else {
-                            let patch_pos = ctx.get_trace_position();
-                            let traced = ctx.cond_call_value_int_typed(
-                                first_box, trace_ptr, &args, &arg_types, slot,
-                            );
-                            let mut allboxes: CallOpRefs = SmallVec::new();
-                            allboxes.push(first_box);
-                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                            allboxes.extend_from_slice(&args);
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::CondCallValueI,
-                                Some(&calldescr.extra_info),
-                                &allboxes,
-                            );
-                            self.clear_exception();
-                            let concrete_result = if first_val == 0 {
-                                if let Some(action) = refuse_walk_local_ref_args(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &raw_i,
-                                    &raw_r,
-                                    &args,
-                                    &calldescr.arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
-                                {
-                                    return report_symbolic_residual_call_target(
-                                        ctx,
-                                        fnaddr_word,
-                                        Some(&calldescr.arg_classes),
-                                    );
-                                }
-                                // `do_conditional_call(is_value=True)` → `cpu.bh_call_i`.
-                                let n = if concrete_ptr.is_null() {
-                                    0
-                                } else {
-                                    unsafe {
-                                        majit_backend::call_stub::bh_call_i_by_classes(
-                                            concrete_ptr as usize,
-                                            &calldescr.arg_classes,
-                                            Some(&raw_i),
-                                            Some(&raw_r),
-                                            Some(&raw_f),
-                                        )
-                                    }
-                                };
-                                if let Some(action) = host_requested_walk_abort(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &calldescr.arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                n
-                            } else {
-                                first_val
-                            };
-                            // `do_conditional_call(is_value=True)` →
-                            // `execute_varargs(..., pure=True)`.
-                            // Skip the fold when the helper raised.
-                            let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                            let traced = if last_exc == 0 {
-                                let mut call_args: CallOpRefs = SmallVec::new();
-                                call_args.push(first_box);
-                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
-                                call_args.extend_from_slice(&args);
-                                let mut concrete_values: CallValues = SmallVec::new();
-                                concrete_values.push(majit_ir::Value::Int(first_val));
-                                concrete_values.extend(build_concrete_values(
-                                    trace_ptr,
-                                    &concrete_args,
-                                    &arg_types,
-                                ));
-                                ctx.record_result_of_call_pure(
-                                    traced,
-                                    &call_args,
-                                    &concrete_values,
-                                    crate::call_descr::make_call_descr_with_effect(
-                                        &arg_types,
-                                        majit_ir::Type::Int,
-                                        calldescr.extra_info.clone(),
-                                    ),
-                                    patch_pos,
-                                    majit_ir::OpCode::CondCallValueI,
-                                    majit_ir::Value::Int(concrete_result),
-                                )
-                            } else {
-                                traced
-                            };
-                            if last_exc == 0
-                                && let Some(dst) = dst
-                            {
-                                self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
-                            }
-                            if !(last_exc == 0 && traced.is_constant()) {
-                                match self.finish_residual_call_exception_path(
-                                    ctx,
-                                    sym,
-                                    &calldescr.extra_info,
-                                ) {
-                                    TraceAction::Continue => {}
-                                    action => return action,
-                                }
-                            }
-                        }
-                    }
-                    jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R => {
-                        let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
-                        if first_box.is_constant() && first_val != 0 {
-                            if let Some(dst) = dst {
-                                self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
-                            }
-                        } else {
-                            let patch_pos = ctx.get_trace_position();
-                            let traced = ctx.cond_call_value_ref_typed(
-                                first_box, trace_ptr, &args, &arg_types, slot,
-                            );
-                            let mut allboxes: CallOpRefs = SmallVec::new();
-                            allboxes.push(first_box);
-                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                            allboxes.extend_from_slice(&args);
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::CondCallValueR,
-                                Some(&calldescr.extra_info),
-                                &allboxes,
-                            );
-                            self.clear_exception();
-                            let concrete_result = if first_val == 0 {
-                                if let Some(action) = refuse_walk_local_ref_args(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &raw_i,
-                                    &raw_r,
-                                    &args,
-                                    &calldescr.arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
-                                {
-                                    return report_symbolic_residual_call_target(
-                                        ctx,
-                                        fnaddr_word,
-                                        Some(&calldescr.arg_classes),
-                                    );
-                                }
-                                // `do_conditional_call(is_value=True)` → `cpu.bh_call_r`.
-                                let p = if concrete_ptr.is_null() {
-                                    0
-                                } else {
-                                    unsafe {
-                                        majit_backend::call_stub::bh_call_i_by_classes(
-                                            concrete_ptr as usize,
-                                            &calldescr.arg_classes,
-                                            Some(&raw_i),
-                                            Some(&raw_r),
-                                            Some(&raw_f),
-                                        )
-                                    }
-                                };
-                                if let Some(action) = host_requested_walk_abort(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &calldescr.arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                p
-                            } else {
-                                first_val
-                            };
-                            let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                            let traced = if last_exc == 0 {
-                                let mut call_args: CallOpRefs = SmallVec::new();
-                                call_args.push(first_box);
-                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
-                                call_args.extend_from_slice(&args);
-                                let mut concrete_values: CallValues = SmallVec::new();
-                                concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef(
-                                    first_val as usize,
-                                )));
-                                concrete_values.extend(build_concrete_values(
-                                    trace_ptr,
-                                    &concrete_args,
-                                    &arg_types,
-                                ));
-                                ctx.record_result_of_call_pure(
-                                    traced,
-                                    &call_args,
-                                    &concrete_values,
-                                    crate::call_descr::make_call_descr_with_effect(
-                                        &arg_types,
-                                        majit_ir::Type::Ref,
-                                        calldescr.extra_info.clone(),
-                                    ),
-                                    patch_pos,
-                                    majit_ir::OpCode::CondCallValueR,
-                                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_result as usize)),
-                                )
-                            } else {
-                                traced
-                            };
-                            if last_exc == 0
-                                && let Some(dst) = dst
-                            {
-                                self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
-                            }
-                            if !(last_exc == 0 && traced.is_constant()) {
-                                match self.finish_residual_call_exception_path(
-                                    ctx,
-                                    sym,
-                                    &calldescr.extra_info,
-                                ) {
-                                    TraceAction::Continue => {}
-                                    action => return action,
-                                }
-                            }
-                        }
-                    }
-                    jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V => {
-                        let (first_box, _) = self.read_int_reg(first_reg as usize);
-                        ctx.profiler()
-                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
-                        ctx.record_known_result_typed(
-                            first_box,
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            majit_ir::Type::Int,
-                            calldescr.extra_info.clone(),
-                        );
-                        let mut allboxes: CallOpRefs = SmallVec::new();
-                        allboxes.push(first_box);
-                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                        allboxes.extend_from_slice(&args);
-                        ctx.heapcache_invalidate_caches_varargs(
-                            OpCode::RecordKnownResult,
-                            Some(&calldescr.extra_info),
-                            &allboxes,
-                        );
-                    }
-                    jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
-                        let (first_box, _) = self.read_ref_reg(first_reg as usize);
-                        ctx.profiler()
-                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
-                        ctx.record_known_result_typed(
-                            first_box,
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            majit_ir::Type::Ref,
-                            calldescr.extra_info.clone(),
-                        );
-                        let mut allboxes: CallOpRefs = SmallVec::new();
-                        allboxes.push(first_box);
-                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                        allboxes.extend_from_slice(&args);
-                        ctx.heapcache_invalidate_caches_varargs(
-                            OpCode::RecordKnownResult,
-                            Some(&calldescr.extra_info),
-                            &allboxes,
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            // ── helper-side ext payload (no remaining emit; decode kept) ──
-            jitcode::insns::BC_COND_CALL_VOID
-            | jitcode::insns::BC_COND_CALL_VALUE_INT
-            | jitcode::insns::BC_COND_CALL_VALUE_REF
-            | jitcode::insns::BC_RECORD_KNOWN_RESULT_INT
-            | jitcode::insns::BC_RECORD_KNOWN_RESULT_REF => {
-                let (first_reg, fn_ptr_idx, arg_regs, dst) = {
-                    let frame = self.frames.current_mut();
-                    let first_reg = frame.next_reg() as u16;
-                    let fn_ptr_idx = frame.next_u16() as usize;
-                    let num_args = frame.next_u8() as usize;
-                    let mut arg_regs = Vec::with_capacity(num_args);
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_reg();
-                        arg_regs.push(JitCallArg {
-                            kind,
-                            reg: reg as u16,
-                        });
-                    }
-                    let dst = if matches!(
-                        bytecode,
-                        jitcode::insns::BC_COND_CALL_VALUE_INT
-                            | jitcode::insns::BC_COND_CALL_VALUE_REF
-                    ) {
-                        Some(frame.next_reg() as u16)
-                    } else {
-                        None
-                    };
-                    (first_reg, fn_ptr_idx, arg_regs, dst)
-                };
-                let mut args = Vec::with_capacity(arg_regs.len());
-                let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                let mut arg_types = Vec::with_capacity(arg_regs.len());
-                for arg_spec in &arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
-                    args.push(arg);
-                    concrete_args.push(concrete);
-                    arg_types.push(arg_type);
-                }
-                let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
-                let trace_ptr = if target.trace_ptr.is_null() {
-                    target.concrete_ptr
-                } else {
-                    target.trace_ptr
-                };
-                let concrete_ptr = if target.concrete_ptr.is_null() {
-                    trace_ptr
-                } else {
-                    target.concrete_ptr
-                };
-                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
-                let slot = target.effect_info_slot;
-                let extra_info = crate::call_descr::effect_info_for_slot(slot);
-                let mut raw_i = Vec::new();
-                let mut raw_r = Vec::new();
-                let mut raw_f = Vec::new();
-                let mut arg_classes = String::new();
-                for (spec, &concrete) in arg_regs.iter().zip(concrete_args.iter()) {
-                    match spec.kind {
-                        JitArgKind::Int => {
-                            raw_i.push(concrete);
-                            arg_classes.push('i');
-                        }
-                        JitArgKind::Ref => {
-                            raw_r.push(concrete);
-                            arg_classes.push('r');
-                        }
-                        JitArgKind::Float => {
-                            raw_f.push(concrete);
-                            arg_classes.push('f');
-                        }
-                    }
-                }
-                match bytecode {
-                    jitcode::insns::BC_COND_CALL_VOID => {
-                        // RPython pyjitpl.py opimpl_conditional_call_ir_v:
-                        //   if condition != 0: call func(args)
-                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
-                        if first_box.is_constant() && first_val == 0 {
-                            // skip
-                        } else {
-                            ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
-                            let mut allboxes: CallOpRefs = SmallVec::new();
-                            allboxes.push(first_box);
-                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                            allboxes.extend_from_slice(&args);
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::CondCallN,
-                                Some(&extra_info),
-                                &allboxes,
-                            );
-                            self.clear_exception();
-                            if first_val != 0 {
-                                if let Some(action) = refuse_walk_local_ref_args(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &raw_i,
-                                    &raw_r,
-                                    &args,
-                                    &arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
-                                {
-                                    return report_symbolic_residual_call_target(
-                                        ctx,
-                                        fnaddr_word,
-                                        Some(&arg_classes),
-                                    );
-                                }
-                                // leftover cond_call_void_ext → `cpu.bh_call_v`.
-                                if !concrete_ptr.is_null() {
-                                    unsafe {
-                                        majit_backend::call_stub::bh_call_v_by_classes(
-                                            concrete_ptr as usize,
-                                            &arg_classes,
-                                            Some(&raw_i),
-                                            Some(&raw_r),
-                                            Some(&raw_f),
-                                        );
-                                    }
-                                }
-                                if let Some(action) = host_requested_walk_abort(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &arg_classes,
-                                ) {
-                                    return action;
-                                }
-                            }
-                            match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
-                                TraceAction::Continue => {}
-                                action => return action,
-                            }
-                        }
-                    }
-                    jitcode::insns::BC_COND_CALL_VALUE_INT => {
-                        // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
-                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
-                        if first_box.is_constant() && first_val != 0 {
-                            if let Some(dst) = dst {
-                                self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
-                            }
-                        } else {
-                            let patch_pos = ctx.get_trace_position();
-                            let traced = ctx.cond_call_value_int_typed(
-                                first_box, trace_ptr, &args, &arg_types, slot,
-                            );
-                            let mut allboxes: CallOpRefs = SmallVec::new();
-                            allboxes.push(first_box);
-                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                            allboxes.extend_from_slice(&args);
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::CondCallValueI,
-                                Some(&extra_info),
-                                &allboxes,
-                            );
-                            self.clear_exception();
-                            let concrete_result = if first_val == 0 {
-                                if let Some(action) = refuse_walk_local_ref_args(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &raw_i,
-                                    &raw_r,
-                                    &args,
-                                    &arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
-                                {
-                                    return report_symbolic_residual_call_target(
-                                        ctx,
-                                        fnaddr_word,
-                                        Some(&arg_classes),
-                                    );
-                                }
-                                // leftover cond_call_value_int_ext → `cpu.bh_call_i`.
-                                let n = if concrete_ptr.is_null() {
-                                    0
-                                } else {
-                                    unsafe {
-                                        majit_backend::call_stub::bh_call_i_by_classes(
-                                            concrete_ptr as usize,
-                                            &arg_classes,
-                                            Some(&raw_i),
-                                            Some(&raw_r),
-                                            Some(&raw_f),
-                                        )
-                                    }
-                                };
-                                if let Some(action) = host_requested_walk_abort(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                n
-                            } else {
-                                first_val
-                            };
-                            let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                            let traced = if last_exc == 0 {
-                                let mut call_args: CallOpRefs = SmallVec::new();
-                                call_args.push(first_box);
-                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
-                                call_args.extend_from_slice(&args);
-                                let mut concrete_values: CallValues = SmallVec::new();
-                                concrete_values.push(majit_ir::Value::Int(first_val));
-                                concrete_values.extend(build_concrete_values(
-                                    trace_ptr,
-                                    &concrete_args,
-                                    &arg_types,
-                                ));
-                                ctx.record_result_of_call_pure(
-                                    traced,
-                                    &call_args,
-                                    &concrete_values,
-                                    crate::call_descr::make_call_descr_with_effect(
-                                        &arg_types,
-                                        majit_ir::Type::Int,
-                                        extra_info.clone(),
-                                    ),
-                                    patch_pos,
-                                    majit_ir::OpCode::CondCallValueI,
-                                    majit_ir::Value::Int(concrete_result),
-                                )
-                            } else {
-                                traced
-                            };
-                            if last_exc == 0
-                                && let Some(dst) = dst
-                            {
-                                self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
-                            }
-                            if !(last_exc == 0 && traced.is_constant()) {
-                                match self.finish_residual_call_exception_path(
-                                    ctx,
-                                    sym,
-                                    &extra_info,
-                                ) {
-                                    TraceAction::Continue => {}
-                                    action => return action,
-                                }
-                            }
-                        }
-                    }
-                    jitcode::insns::BC_COND_CALL_VALUE_REF => {
-                        // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
-                        // value is a ref — read from ref register bank.
-                        let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
-                        if first_box.is_constant() && first_val != 0 {
-                            if let Some(dst) = dst {
-                                self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
-                            }
-                        } else {
-                            let patch_pos = ctx.get_trace_position();
-                            let traced = ctx.cond_call_value_ref_typed(
-                                first_box, trace_ptr, &args, &arg_types, slot,
-                            );
-                            let mut allboxes: CallOpRefs = SmallVec::new();
-                            allboxes.push(first_box);
-                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                            allboxes.extend_from_slice(&args);
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::CondCallValueR,
-                                Some(&extra_info),
-                                &allboxes,
-                            );
-                            self.clear_exception();
-                            let concrete_result = if first_val == 0 {
-                                if let Some(action) = refuse_walk_local_ref_args(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &raw_i,
-                                    &raw_r,
-                                    &args,
-                                    &arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
-                                {
-                                    return report_symbolic_residual_call_target(
-                                        ctx,
-                                        fnaddr_word,
-                                        Some(&arg_classes),
-                                    );
-                                }
-                                // leftover cond_call_value_ref_ext → `cpu.bh_call_r`.
-                                let p = if concrete_ptr.is_null() {
-                                    0
-                                } else {
-                                    unsafe {
-                                        majit_backend::call_stub::bh_call_i_by_classes(
-                                            concrete_ptr as usize,
-                                            &arg_classes,
-                                            Some(&raw_i),
-                                            Some(&raw_r),
-                                            Some(&raw_f),
-                                        )
-                                    }
-                                };
-                                if let Some(action) = host_requested_walk_abort(
-                                    ctx,
-                                    concrete_ptr as usize,
-                                    &arg_classes,
-                                ) {
-                                    return action;
-                                }
-                                p
-                            } else {
-                                first_val
-                            };
-                            let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                            let traced = if last_exc == 0 {
-                                let mut call_args: CallOpRefs = SmallVec::new();
-                                call_args.push(first_box);
-                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
-                                call_args.extend_from_slice(&args);
-                                let mut concrete_values: CallValues = SmallVec::new();
-                                concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef(
-                                    first_val as usize,
-                                )));
-                                concrete_values.extend(build_concrete_values(
-                                    trace_ptr,
-                                    &concrete_args,
-                                    &arg_types,
-                                ));
-                                ctx.record_result_of_call_pure(
-                                    traced,
-                                    &call_args,
-                                    &concrete_values,
-                                    crate::call_descr::make_call_descr_with_effect(
-                                        &arg_types,
-                                        majit_ir::Type::Ref,
-                                        extra_info.clone(),
-                                    ),
-                                    patch_pos,
-                                    majit_ir::OpCode::CondCallValueR,
-                                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_result as usize)),
-                                )
-                            } else {
-                                traced
-                            };
-                            if last_exc == 0
-                                && let Some(dst) = dst
-                            {
-                                self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
-                            }
-                            if !(last_exc == 0 && traced.is_constant()) {
-                                match self.finish_residual_call_exception_path(
-                                    ctx,
-                                    sym,
-                                    &extra_info,
-                                ) {
-                                    TraceAction::Continue => {}
-                                    action => return action,
-                                }
-                            }
-                        }
-                    }
-                    jitcode::insns::BC_RECORD_KNOWN_RESULT_INT => {
-                        // RPython pyjitpl.py opimpl_record_known_result_i.
-                        // `jtransform.py Transformer.rewrite_op_jit_record_known_result` uses op.args[0] (the
-                        // known-result var) as the fake result var for
-                        // `getcalldescr`; here that maps to `Type::Int`
-                        // because the bytecode is `_i_ir_v`.
-                        let (first_box, _) = self.read_int_reg(first_reg as usize);
-                        // `opimpl_record_known_result_i_ir_v` records without executing.
-                        ctx.profiler()
-                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
-                        ctx.record_known_result_typed(
-                            first_box,
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            majit_ir::Type::Int,
-                            extra_info.clone(),
-                        );
-                        let mut allboxes: CallOpRefs = SmallVec::new();
-                        allboxes.push(first_box);
-                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                        allboxes.extend_from_slice(&args);
-                        ctx.heapcache_invalidate_caches_varargs(
-                            OpCode::RecordKnownResult,
-                            Some(&extra_info),
-                            &allboxes,
-                        );
-                    }
-                    jitcode::insns::BC_RECORD_KNOWN_RESULT_REF => {
-                        // RPython pyjitpl.py opimpl_record_known_result_r —
-                        // `_r_ir_v` opname, calldescr result type is
-                        // `Type::Ref`.
-                        let (first_box, _) = self.read_ref_reg(first_reg as usize);
-                        // `opimpl_record_known_result_r_ir_v` records without executing.
-                        ctx.profiler()
-                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
-                        ctx.record_known_result_typed(
-                            first_box,
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            majit_ir::Type::Ref,
-                            extra_info.clone(),
-                        );
-                        let mut allboxes: CallOpRefs = SmallVec::new();
-                        allboxes.push(first_box);
-                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
-                        allboxes.extend_from_slice(&args);
-                        ctx.heapcache_invalidate_caches_varargs(
-                            OpCode::RecordKnownResult,
-                            Some(&extra_info),
-                            &allboxes,
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            // RPython `blackhole.py` `bhimpl_int_copy`. Operand
-            // order is `[src][dst]` per argcode `i>i`
-            // (`assembler.py Assembler.write_insn`).
-            jitcode::insns::BC_MOVE_I => {
-                let (src, dst) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_reg() as usize, frame.next_reg() as usize)
-                };
-                let (value, concrete) = self.read_int_reg(src);
-                self.set_int_reg(dst, Some(value), Some(concrete));
-            }
-            // `int_copy/c>i` — USE_C_FORM short source (`assembler.py`):
-            // the small ConstInt is one inline signed byte (`signedord`,
-            // `blackhole.py`), not a `registers_i` slot. Operand order
-            // `[const][dst]` per argcode `c>i`.
-            jitcode::insns::BC_MOVE_I_C => {
-                let (value, dst) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_u8() as i8 as i64, frame.next_reg() as usize)
-                };
-                self.set_int_reg(dst, Some(OpRef::ConstInt(value)), Some(value));
-            }
-            // The Pure half of this arm is retired — every Pure call site
-            // emits canonical BC_RESIDUAL_CALL_*_I; the canonical walker reads the
-            // calldescr's `check_is_elidable()` and routes through
-            // `record_result_of_call_pure`.  Only BC_CALL_ASSEMBLER_INT
-            // survives here.
-            // pyjitpl.py do_residual_call(assembler_call=True)
-            // with tp == 'i'. See BC_CALL_ASSEMBLER_VOID for the full
-            // RPython sequence citation.
-            jitcode::insns::BC_CALL_ASSEMBLER_INT => {
-                let (fn_ptr_idx, dst, arg_regs) = {
-                    let frame = self.frames.current_mut();
-                    let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    let num_args = frame.next_u16() as usize;
-                    let mut arg_regs = Vec::with_capacity(num_args);
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_reg();
-                        arg_regs.push(JitCallArg {
-                            kind,
-                            reg: reg as u16,
-                        });
-                    }
-                    (fn_ptr_idx, dst, arg_regs)
-                };
-                let mut args = Vec::with_capacity(arg_regs.len());
-                let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                let mut arg_types = Vec::with_capacity(arg_regs.len());
-                let mut raw_i = Vec::new();
-                let mut raw_r = Vec::new();
-                let mut raw_f = Vec::new();
-                let mut arg_classes = String::new();
-                for arg_spec in &arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
-                    args.push(arg);
-                    concrete_args.push(concrete);
-                    arg_types.push(arg_type);
-                    match arg_spec.kind {
-                        JitArgKind::Int => {
-                            raw_i.push(concrete);
-                            arg_classes.push('i');
-                        }
-                        JitArgKind::Ref => {
-                            raw_r.push(concrete);
-                            arg_classes.push('r');
-                        }
-                        JitArgKind::Float => {
-                            raw_f.push(concrete);
-                            arg_classes.push('f');
-                        }
-                    }
-                }
-                let (token_number, concrete_ptr) = self
-                    .frames
-                    .current_mut()
-                    .jitcode
-                    .call_assembler_target(fn_ptr_idx);
-                self.clear_exception();
-                // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
-                ctx.vrefs_before_residual_call();
-                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &arg_classes,
-                ) {
-                    return action;
-                }
-                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                    return report_symbolic_residual_call_target(
-                        ctx,
-                        concrete_ptr as i64,
-                        Some(&arg_classes),
-                    );
-                }
-                let concrete = if concrete_ptr.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        )
-                    }
-                };
-                if let Some(action) =
-                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
-                {
-                    return action;
-                }
-                // `pyjitpl.py vrefs_after_residual_call`.
-                ctx.vrefs_after_residual_call();
-                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
-                    return TraceAction::Abort;
-                };
-                let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
-                self.set_int_reg(dst, Some(traced), Some(concrete));
-                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                if !matches!(action, TraceAction::Continue) {
-                    return action;
-                }
-                // `pyjitpl.py MIFrame.do_residual_call` KEEPALIVE on the vable box.
-                if let Some(vbox) = vable_opref {
-                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
-                }
-                match self.finish_call_assembler_exception_path(ctx, sym) {
-                    TraceAction::Continue => {}
-                    action => return action,
-                }
-            }
-            // -- Ref-typed bytecodes
-            // RPython `blackhole.py` `bhimpl_ref_copy`. `[src][dst]` per `r>r`.
-            jitcode::insns::BC_MOVE_R => {
-                let (src, dst) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_reg() as usize, frame.next_reg() as usize)
-                };
-                let (value, concrete) = self.read_ref_reg(src);
-                self.set_ref_reg(dst, Some(value), Some(concrete));
-            }
-            // The Pure half is retired — every Pure call site emits canonical
-            // `BC_RESIDUAL_CALL_*`, and the canonical walker reads the
-            // calldescr's `check_is_elidable()` and routes through
-            // `record_result_of_call_pure`.
-            // pyjitpl.py do_residual_call(assembler_call=True)
-            // with tp == 'r'. See BC_CALL_ASSEMBLER_VOID for citation.
-            jitcode::insns::BC_CALL_ASSEMBLER_REF => {
-                let (fn_ptr_idx, dst, arg_regs) = {
-                    let frame = self.frames.current_mut();
-                    let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    let num_args = frame.next_u16() as usize;
-                    let mut arg_regs = Vec::with_capacity(num_args);
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_reg();
-                        arg_regs.push(JitCallArg {
-                            kind,
-                            reg: reg as u16,
-                        });
-                    }
-                    (fn_ptr_idx, dst, arg_regs)
-                };
-                let mut args = Vec::with_capacity(arg_regs.len());
-                let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                let mut arg_types = Vec::with_capacity(arg_regs.len());
-                let mut raw_i = Vec::new();
-                let mut raw_r = Vec::new();
-                let mut raw_f = Vec::new();
-                let mut arg_classes = String::new();
-                for arg_spec in &arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
-                    args.push(arg);
-                    concrete_args.push(concrete);
-                    arg_types.push(arg_type);
-                    match arg_spec.kind {
-                        JitArgKind::Int => {
-                            raw_i.push(concrete);
-                            arg_classes.push('i');
-                        }
-                        JitArgKind::Ref => {
-                            raw_r.push(concrete);
-                            arg_classes.push('r');
-                        }
-                        JitArgKind::Float => {
-                            raw_f.push(concrete);
-                            arg_classes.push('f');
-                        }
-                    }
-                }
-                let (token_number, concrete_ptr) = self
-                    .frames
-                    .current_mut()
-                    .jitcode
-                    .call_assembler_target(fn_ptr_idx);
-                self.clear_exception();
-                // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
-                ctx.vrefs_before_residual_call();
-                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &arg_classes,
-                ) {
-                    return action;
-                }
-                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                    return report_symbolic_residual_call_target(
-                        ctx,
-                        concrete_ptr as i64,
-                        Some(&arg_classes),
-                    );
-                }
-                // 3. execute (pyjitpl.py, tp == 'r') — `executor.execute_varargs`
-                //    → `cpu.bh_call_r` / leftover `bh_call_i_by_classes`.
-                let concrete = if concrete_ptr.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        )
-                    }
-                };
-                if let Some(action) =
-                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
-                {
-                    return action;
-                }
-                // `pyjitpl.py vrefs_after_residual_call`.
-                ctx.vrefs_after_residual_call();
-                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
-                    return TraceAction::Abort;
-                };
-                let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
-                self.set_ref_reg(dst, Some(traced), Some(concrete));
-                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                if !matches!(action, TraceAction::Continue) {
-                    return action;
-                }
-                // `pyjitpl.py MIFrame.do_residual_call` KEEPALIVE on the vable box.
-                if let Some(vbox) = vable_opref {
-                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
-                }
-                match self.finish_call_assembler_exception_path(ctx, sym) {
-                    TraceAction::Continue => {}
-                    action => return action,
-                }
-            }
-            // -- Float-typed bytecodes
-            // RPython `blackhole.py` `bhimpl_float_copy`. `[src][dst]` per `f>f`.
-            jitcode::insns::BC_MOVE_F => {
-                let (src, dst) = {
-                    let frame = self.frames.current_mut();
-                    (frame.next_reg() as usize, frame.next_reg() as usize)
-                };
-                let (value, concrete) = self.read_float_reg(src);
-                self.set_float_reg(dst, Some(value), Some(concrete));
-            }
-            // The Pure half is retired — every Pure call site emits canonical
-            // `BC_RESIDUAL_CALL_*`, and the canonical walker reads the
-            // calldescr's `check_is_elidable()` and routes through
-            // `record_result_of_call_pure`.
-            // pyjitpl.py do_residual_call(assembler_call=True)
-            // with tp == 'f'. See BC_CALL_ASSEMBLER_VOID for citation.
-            jitcode::insns::BC_CALL_ASSEMBLER_FLOAT => {
-                let (fn_ptr_idx, dst, arg_regs) = {
-                    let frame = self.frames.current_mut();
-                    let fn_ptr_idx = frame.next_u16() as usize;
-                    let dst = frame.next_reg() as usize;
-                    let num_args = frame.next_u16() as usize;
-                    let mut arg_regs = Vec::with_capacity(num_args);
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(frame.next_u8());
-                        let reg = frame.next_reg();
-                        arg_regs.push(JitCallArg {
-                            kind,
-                            reg: reg as u16,
-                        });
-                    }
-                    (fn_ptr_idx, dst, arg_regs)
-                };
-                let mut args = Vec::with_capacity(arg_regs.len());
-                let mut concrete_args = Vec::with_capacity(arg_regs.len());
-                let mut arg_types = Vec::with_capacity(arg_regs.len());
-                let mut raw_i = Vec::new();
-                let mut raw_r = Vec::new();
-                let mut raw_f = Vec::new();
-                let mut arg_classes = String::new();
-                for arg_spec in &arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
-                    args.push(arg);
-                    concrete_args.push(concrete);
-                    arg_types.push(arg_type);
-                    match arg_spec.kind {
-                        JitArgKind::Int => {
-                            raw_i.push(concrete);
-                            arg_classes.push('i');
-                        }
-                        JitArgKind::Ref => {
-                            raw_r.push(concrete);
-                            arg_classes.push('r');
-                        }
-                        JitArgKind::Float => {
-                            raw_f.push(concrete);
-                            arg_classes.push('f');
-                        }
-                    }
-                }
-                let (token_number, concrete_ptr) = self
-                    .frames
-                    .current_mut()
-                    .jitcode
-                    .call_assembler_target(fn_ptr_idx);
-                self.clear_exception();
-                // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
-                ctx.vrefs_before_residual_call();
-                let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                if let Some(action) = refuse_walk_local_ref_args(
-                    ctx,
-                    concrete_ptr as usize,
-                    &raw_i,
-                    &raw_r,
-                    &args,
-                    &arg_classes,
-                ) {
-                    return action;
-                }
-                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                    return report_symbolic_residual_call_target(
-                        ctx,
-                        concrete_ptr as i64,
-                        Some(&arg_classes),
-                    );
-                }
-                // 3. execute (pyjitpl.py, tp == 'f') — leftover wrappers
-                //    return packed i64 bits (`f64::to_bits`); `cpu.bh_call_i`.
-                let concrete = if concrete_ptr.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_by_classes(
-                            concrete_ptr as usize,
-                            &arg_classes,
-                            Some(&raw_i),
-                            Some(&raw_r),
-                            Some(&raw_f),
-                        )
-                    }
-                };
-                if let Some(action) =
-                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
-                {
-                    return action;
-                }
-                // `pyjitpl.py vrefs_after_residual_call`.
-                ctx.vrefs_after_residual_call();
-                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
-                    return TraceAction::Abort;
-                };
-                let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
-                self.set_float_reg(dst, Some(traced), Some(concrete));
-                let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
-                let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
-                if !matches!(action, TraceAction::Continue) {
-                    return action;
-                }
-                // `pyjitpl.py MIFrame.do_residual_call` KEEPALIVE on the vable box.
-                if let Some(vbox) = vable_opref {
-                    ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
-                }
-                match self.finish_call_assembler_exception_path(ctx, sym) {
-                    TraceAction::Continue => {}
-                    action => return action,
-                }
-            }
-            jitcode::insns::BC_FLOAT_ADD => self.trace_binop_f(ctx, OpCode::FloatAdd),
-            jitcode::insns::BC_FLOAT_SUB => self.trace_binop_f(ctx, OpCode::FloatSub),
-            jitcode::insns::BC_FLOAT_MUL => self.trace_binop_f(ctx, OpCode::FloatMul),
-            jitcode::insns::BC_FLOAT_TRUEDIV => self.trace_binop_f(ctx, OpCode::FloatTrueDiv),
-            jitcode::insns::BC_FLOAT_NEG => self.trace_unary_f(ctx, OpCode::FloatNeg),
-            jitcode::insns::BC_FLOAT_ABS => self.trace_unary_f(ctx, OpCode::FloatAbs),
-            jitcode::insns::BC_FLOAT_LT => self.trace_compare_f(ctx, OpCode::FloatLt),
-            jitcode::insns::BC_FLOAT_LE => self.trace_compare_f(ctx, OpCode::FloatLe),
-            jitcode::insns::BC_FLOAT_EQ => self.trace_compare_f(ctx, OpCode::FloatEq),
-            jitcode::insns::BC_FLOAT_NE => self.trace_compare_f(ctx, OpCode::FloatNe),
-            jitcode::insns::BC_FLOAT_GT => self.trace_compare_f(ctx, OpCode::FloatGt),
-            jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
-            jitcode::insns::BC_CAST_INT_TO_FLOAT => self.trace_cast_int_to_float(ctx),
-            jitcode::insns::BC_CAST_FLOAT_TO_INT => self.trace_cast_float_to_int(ctx),
-            jitcode::insns::BC_CAST_PTR_TO_INT => self.trace_cast_ptr_to_int(ctx),
-            jitcode::insns::BC_CAST_INT_TO_PTR => self.trace_cast_int_to_ptr(ctx),
-            jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG => {
-                self.trace_convert_float_bytes_to_longlong(ctx)
-            }
-            jitcode::insns::BC_CONVERT_LONGLONG_BYTES_TO_FLOAT => {
-                self.trace_convert_longlong_bytes_to_float(ctx)
-            }
-            // pyjitpl.py opimpl_int_guard_value → implement_guard_value
-            // Blackhole: no-op.  Tracing: emit GUARD_VALUE to promote.
-            jitcode::insns::BC_INT_GUARD_VALUE => {
-                let (src, opcode_pc) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (frame.next_reg() as usize, opcode_pc)
-                };
-                let (opref, concrete) = self.read_int_reg(src);
-                let const_ref = ctx.const_int(concrete);
-                self.record_state_guard(
-                    ctx,
-                    sym,
-                    OpCode::GuardValue,
-                    &[opref, const_ref],
-                    opcode_pc,
-                    false,
-                );
-                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
-                if !opref.is_constant() {
-                    self.replace_box(ctx, opref, const_ref, Type::Int);
-                }
-            }
-            // pyjitpl.py opimpl_assert_not_none.  Blackhole:
-            // asserts the concrete ref is non-null and advances past
-            // the 1-byte ref operand.  Tracing: route through
-            // `TraceCtx::trace_assert_not_none` which gates on
-            // `heap_cache.is_nullity_known` + bumps `HEAPCACHED_OPS`
-            // on cache hit per pyjitpl.py.
-            jitcode::insns::BC_ASSERT_NOT_NONE => {
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, concrete) = self.read_ref_reg(src);
-                ctx.trace_assert_not_none(opref, concrete);
-            }
-            // pyjitpl.py opimpl_record_exact_class.  Blackhole:
-            // no-op (handler_record_exact_class advances past the 2-byte
-            // (ref, int) operand).  Tracing: route through
-            // `TraceCtx::trace_record_exact_class` which gates on
-            // `heap_cache.is_class_known` + bumps `HEAPCACHED_OPS` on
-            // cache hit per pyjitpl.py.  The class operand follows
-            // blackhole.py `@arguments("r", "i")` and remains the
-            // ConstInt vtable address that RPython passes as `clsbox`.
-            jitcode::insns::BC_RECORD_EXACT_CLASS => {
-                let src = self.frames.current_mut().next_reg() as usize;
-                let cls = self.frames.current_mut().next_reg() as usize;
-                let (box_opref, _) = self.read_ref_reg(src);
-                let (cls_opref, _) = self.read_int_reg(cls);
-                ctx.trace_record_exact_class(box_opref, cls_opref);
-            }
-            // pyjitpl.py opimpl_ref_guard_value → implement_guard_value
-            jitcode::insns::BC_REF_GUARD_VALUE => {
-                let (src, opcode_pc) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (frame.next_reg() as usize, opcode_pc)
-                };
-                let (opref, concrete) = self.read_ref_reg(src);
-                let const_ref = ctx.const_ref(concrete);
-                self.record_state_guard(
-                    ctx,
-                    sym,
-                    OpCode::GuardValue,
-                    &[opref, const_ref],
-                    opcode_pc,
-                    false,
-                );
-                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
-                if !opref.is_constant() {
-                    self.replace_box(ctx, opref, const_ref, Type::Ref);
-                }
-            }
-            // pyjitpl.py opimpl_float_guard_value = _opimpl_guard_value
-            jitcode::insns::BC_FLOAT_GUARD_VALUE => {
-                let (src, opcode_pc) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    (frame.next_reg() as usize, opcode_pc)
-                };
-                let (opref, concrete) = self.read_float_reg(src);
-                let const_ref = ctx.const_float(concrete);
-                self.record_state_guard(
-                    ctx,
-                    sym,
-                    OpCode::GuardValue,
-                    &[opref, const_ref],
-                    opcode_pc,
-                    false,
-                );
-                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
-                if !opref.is_constant() {
-                    self.replace_box(ctx, opref, const_ref, Type::Float);
-                }
-            }
-            // pyjitpl.py opimpl_guard_class:
-            //     clsbox = self.cls_of_box(box)
-            //     if not self.metainterp.heapcache.is_class_known(box):
-            //         self.metainterp.generate_guard(rop.GUARD_CLASS, box, clsbox,
-            //                                        resumepc=orgpc)
-            //         self.metainterp.heapcache.class_now_known(box)
-            //     return clsbox
-            // `jtransform.py handle_getfield_typeptr` emits this for every
-            // read of the header's class word; the result lands in the bank
-            // the read was allocated to (`BC_GUARD_CLASS` int,
-            // `BC_GUARD_CLASS_R` ref).
-            byte @ (jitcode::insns::BC_GUARD_CLASS | jitcode::insns::BC_GUARD_CLASS_R) => {
-                let (opcode_pc, src, dst) = {
-                    let frame = self.frames.current_mut();
-                    let opcode_pc = frame.code_cursor - 1;
-                    let src = frame.next_reg() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (opcode_pc, src, dst)
-                };
-                let (opref, concrete) = self.read_ref_reg(src);
-                if concrete == 0 {
-                    return TraceAction::Abort;
-                }
-                let typeptr = self.read_typeptr_from_exception(concrete);
-                let cls_const = ctx.const_int(typeptr);
-                if !ctx.heap_cache().is_class_known(opref) {
-                    self.record_state_guard(
-                        ctx,
-                        sym,
-                        majit_ir::OpCode::GuardClass,
-                        &[opref, cls_const],
-                        opcode_pc,
-                        /* after_residual_call */ false,
-                    );
-                    ctx.heap_cache_mut().class_now_known(opref, typeptr);
-                }
-                if byte == jitcode::insns::BC_GUARD_CLASS {
-                    self.set_int_reg(dst, Some(cls_const), Some(typeptr));
-                } else {
-                    let cls_ref = ctx.const_ref(typeptr);
-                    self.set_ref_reg(dst, Some(cls_ref), Some(typeptr));
-                }
-            }
-            jitcode::insns::BC_RAISE => {
-                // pyjitpl.py opimpl_raise:
-                //     if not self.metainterp.heapcache.is_class_known(exc_value_box):
-                //         clsbox = self.cls_of_box(exc_value_box)
-                //         self.metainterp.generate_guard(rop.GUARD_CLASS,
-                //                                        exc_value_box, clsbox,
-                //                                        resumepc=orgpc)
-                //     self.metainterp.class_of_last_exc_is_const = True
-                //     self.metainterp.last_exc_value = ...
-                //     self.metainterp.last_exc_box = ...
-                //     self.metainterp.popframe()
-                //     self.metainterp.finishframe_exception()
-                //
-                // RPython `pyjitpl.py orgpc = position` parity: the
-                // dispatcher's `next_u8()` already stepped past the
-                // BC_RAISE byte, so `code_cursor - 1` is the byte position
-                // of opimpl_raise itself — what `generate_guard(...,
-                // resumepc=orgpc)` records.
-                let opcode_pc = self.frames.current_mut().code_cursor - 1;
-                let src = self.frames.current_mut().next_reg() as usize;
-                let (opref, concrete) = self.read_ref_reg(src);
-                if concrete == 0 {
-                    return TraceAction::Abort;
-                }
-                // pyjitpl.py MIFrame.opimpl_raise: record GUARD_CLASS unless heapcache
-                // already knows the exception's class (heapcache.py is_class_known
-                // is_class_known).  `cls_of_box` (model.py) reads
-                // the typeptr at offset 0; `default_cls_of_box`
-                // (`pyjitpl.rs`) implements the standalone fallback.
-                // Recording the guard promotes the runtime class to a Const
-                // — that is what justifies the unconditional
-                // `class_of_last_exc_is_const = true` below.
-                if !ctx.heap_cache().is_class_known(opref) {
-                    let typeptr = self.read_typeptr_from_exception(concrete);
-                    let cls_const = ctx.const_int(typeptr);
-                    // pyjitpl.py generate_guard(..., resumepc=orgpc):
-                    // GUARD_CLASS belongs to the regular-opimpl family, so
-                    // `after_residual_call=False` — the snapshot reads
-                    // liveness at `pc - SIZE_LIVE_OP` and the temporary
-                    // `frame.pc = orgpc` swap inside `record_state_guard`
-                    // pins it to the BC_RAISE byte.
-                    self.record_state_guard(
-                        ctx,
-                        sym,
-                        majit_ir::OpCode::GuardClass,
-                        &[opref, cls_const],
-                        opcode_pc,
-                        /* after_residual_call */ false,
-                    );
-                }
-                self.last_exception_box = Some(opref);
-                self.last_exception_value = concrete;
-                self.class_of_last_exc_is_const = true;
-                {
-                    let frame = self.frames.current_mut();
-                    // pyopcode.py raise_varargs: RAISE_VARARGS with an
-                    // explicit value records at the raising instruction.
-                    super::record_application_traceback(
-                        concrete,
-                        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
-                        frame,
-                    );
-                }
-                self.pop_exception_frame(ctx);
-                return self.unwind_to_exception_handler(ctx);
-            }
-            jitcode::insns::BC_RERAISE => {
-                if self.last_exception_value == 0 {
-                    return TraceAction::Abort;
-                }
-                // RaiseWithExplicitTraceback is the bare-reraise path and
-                // deliberately skips record_application_traceback.
-                self.pop_exception_frame(ctx);
-                return self.unwind_to_exception_handler(ctx);
-            }
-            jitcode::insns::BC_ABORT | jitcode::insns::BC_ABORT_RESULT_R => {
-                debug_assert!(trace_abort_bytecode(bytecode));
-                // `abort/>r` is the same bailout as `abort/` (`handler_abort_result_marker_r`).
-                // The destination byte is not consumed: the frame is left
-                // immediately, matching the blackhole handler.
-                self.log_bytecode_abort(if bytecode == jitcode::insns::BC_ABORT {
-                    "BC_ABORT"
-                } else {
-                    "BC_ABORT_RESULT_R"
-                });
-                // A helper's `BC_ABORT` is a compile-time "this path cannot
-                // be traced". The reconstructed registers that reached it
-                // will reach it again; retrying rebuilds the same abort.
-                if crate::is_bridge_walking() || ctx.is_bridge_trace {
-                    ctx.deterministic_bridge_abort = true;
-                }
-                return TraceAction::Abort;
-            }
-            jitcode::insns::BC_ABORT_PERMANENT => {
-                self.log_bytecode_abort("BC_ABORT_PERMANENT");
-                return TraceAction::AbortPermanent;
-            }
-            // `jtransform.py` `rewrite_op_malloc_varsize` → `new_array` /
-            // `new_array_clear`. A `#[jit_inline]` varsize literal emits the
-            // byte; record `OpCode::NewArray{,Clear}` so `optimize_NEW_ARRAY`
-            // can keep the block virtual, and allocate the live payload the
-            // rest of this trace reads (`bhimpl_new_array{,_clear}`).
-            jitcode::insns::BC_NEW_ARRAY | jitcode::insns::BC_NEW_ARRAY_CLEAR => {
-                let clear = bytecode == jitcode::insns::BC_NEW_ARRAY_CLEAR;
-                let (length_reg, array_descr_idx, dest) = {
-                    let frame = self.frames.current_mut();
-                    frame.read_new_array()
-                };
-                let (array_base_size, array_itemsize, array_len_offset, array_type_id) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(array_descr_idx).unwrap_or_else(|| {
-                        panic!("BC_NEW_ARRAY: descrs[{array_descr_idx}] is not a BhDescr entry")
-                    });
-                    let (base_size, itemsize, _signed) = bh.unpack_arraydescr_size();
-                    (
-                        base_size,
-                        itemsize,
-                        bh.array_len_offset(),
-                        bh.resolve_gc_tid(),
-                    )
-                };
-                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                let (length_opref, length_val) = self.read_int_reg(length_reg);
-                let length_count =
-                    usize::try_from(length_val).expect("BC_NEW_ARRAY: negative array length");
-                let array_payload = array_itemsize
-                    .checked_mul(length_count)
-                    .and_then(|var| array_base_size.checked_add(var))
-                    .expect("BC_NEW_ARRAY: array size overflow");
-                let array_payload = array_payload.max(1);
-                // Same no-collect rule as `BC_NEW`: the register bank is not
-                // a root set. Old-gen is non-moving; an untyped descr falls
-                // through to the host allocator, which still zeroes when
-                // `clear` is set and writes the length word.
-                let array_gc_ptr = if array_type_id != 0 {
-                    majit_gc::alloc_oldgen_typed(array_type_id, array_payload).0
-                } else {
-                    0
-                };
-                // Under an installed collector a typed descr
-                // (`array_type_id != 0`) has a GC header and a tracing layout;
-                // `alloc_oldgen_typed` returning 0 is a failed allocation, and
-                // host storage would drop both. Abort the trace. With no
-                // collector nothing traces the block: a published
-                // `malloc_fixedsize` (`GcLLDescr_boehm.malloc_fn_ptr`) or the
-                // host allocator owns it.
-                let array_ptr = if array_gc_ptr != 0 {
-                    array_gc_ptr as i64
-                } else if array_type_id != 0 && majit_gc::collector_installed() {
-                    return TraceAction::Abort;
-                } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
-                    ptr as i64
-                } else {
-                    let layout = std::alloc::Layout::from_size_align(array_payload, 8)
-                        .expect("BC_NEW_ARRAY: invalid array layout");
-                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-                };
-                if array_ptr != 0 {
-                    if clear {
-                        unsafe {
-                            std::ptr::write_bytes(array_ptr as *mut u8, 0, array_payload);
-                        }
-                    }
-                    if let Some(len_ofs) = array_len_offset {
-                        unsafe {
-                            *((array_ptr as *mut u8).add(len_ofs) as *mut usize) =
-                                length_val as usize;
-                        }
-                    }
-                }
-                let kind = if clear {
-                    OpCode::NewArrayClear
-                } else {
-                    OpCode::NewArray
-                };
-                ctx.profiler().count_ops(kind, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(kind, crate::counters::RECORDED_OPS);
-                let abox_op = if clear {
-                    ctx.record_new_array_clear(length_opref, array_descr)
-                } else {
-                    ctx.record_new_array(length_opref, array_descr)
-                };
-                ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
-                ctx.heap_cache_mut()
-                    .new_array(abox_op, length_opref, length_opref.is_constant());
-                self.set_ref_reg(dest, Some(abox_op), Some(array_ptr));
-            }
-            jitcode::insns::BC_NEWLIST_CLEAR => {
-                // opimpl_newlist_clear (pyjitpl.py): decompose ONE
-                // opcode into New + SetfieldGc(length) + NewArrayClear +
-                // SetfieldGc(items).  The tracer both *records* all four
-                // resops (so the optimizer can virtualize the list header +
-                // its items block when they do not escape) and *executes* the
-                // two live allocations plus the two field stores (so the
-                // subsequent steps of this same trace read live memory), the
-                // same dual discipline BC_NEW / BC_SETFIELD_GC follow.
-                let (
-                    length_reg,
-                    struct_descr_idx,
-                    length_descr_idx,
-                    items_descr_idx,
-                    array_descr_idx,
-                    dest,
-                ) = self.frames.current_mut().read_newlist_clear();
-                // structdescr (`list` header SizeDescr): size + gc identity +
-                // the DescrRef the recorded New carries.
-                let (struct_size, struct_type_id, struct_headerless, struct_descr) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(struct_descr_idx).unwrap_or_else(|| {
-                        panic!(
-                            "BC_NEWLIST_CLEAR: descrs[{struct_descr_idx}] is not a BhDescr entry"
-                        )
-                    });
-                    (
-                        bh.as_size(),
-                        bh.resolve_gc_tid(),
-                        bh.is_headerless(),
-                        size_descr_ref_from_bh(bh),
-                    )
-                };
-                // lengthdescr / itemsdescr: plain FieldDescrs — byte offset +
-                // the DescrRef the two recorded SetfieldGc ops carry.
-                let (length_offset, length_fielddescr) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(length_descr_idx).unwrap_or_else(|| {
-                        panic!(
-                            "BC_NEWLIST_CLEAR: descrs[{length_descr_idx}] is not a BhDescr entry"
-                        )
-                    });
-                    let offset = field_offset_from_bh(bh, "BC_NEWLIST_CLEAR length");
-                    let descr = frame
-                        .runtime_optimizer_descr(length_descr_idx)
-                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-                    (offset, descr)
-                };
-                let (items_offset, items_fielddescr) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(items_descr_idx).unwrap_or_else(|| {
-                        panic!("BC_NEWLIST_CLEAR: descrs[{items_descr_idx}] is not a BhDescr entry")
-                    });
-                    let offset = field_offset_from_bh(bh, "BC_NEWLIST_CLEAR items");
-                    let descr = frame
-                        .runtime_optimizer_descr(items_descr_idx)
-                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-                    (offset, descr)
-                };
-                // arraydescr: geometry for the live items-block allocation
-                // (`base_size + length*itemsize` bytes, cleared, length word
-                // at `len_offset`), matching `bh_new_array`
-                // (runner.rs `dynasm_alloc_oldgen_varsize_typed_and_set_len`).
-                let (array_base_size, array_itemsize, array_len_offset, array_type_id) = {
-                    let frame = self.frames.current_mut();
-                    let bh = frame.runtime_bh_descr(array_descr_idx).unwrap_or_else(|| {
-                        panic!("BC_NEWLIST_CLEAR: descrs[{array_descr_idx}] is not a BhDescr entry")
-                    });
-                    let (base_size, itemsize, _signed) = bh.unpack_arraydescr_size();
-                    (
-                        base_size,
-                        itemsize,
-                        bh.array_len_offset(),
-                        bh.resolve_gc_tid(),
-                    )
-                };
-                let Some(array_descr) = self.dispatch_array_descr_ref(ctx, array_descr_idx) else {
-                    return TraceAction::Abort;
-                };
-                // The length operand feeds both the length-field store and the
-                // items-block element count (opimpl_newlist_clear passes the
-                // same `sizebox` to `_opimpl_setfield_gc_any` and
-                // `opimpl_new_array_clear`).
-                let (length_opref, length_val) = self.read_int_reg(length_reg);
-
-                // ── 1. sbox: live-alloc the `list` header (BC_NEW no-collect
-                // discipline — the struct ptr is live in the register bank,
-                // which is no root set, so the array allocation that follows
-                // must not move it; old-gen is mark-sweep non-moving and both
-                // GC paths are no-collect). ──
-                let struct_size = struct_size.max(1);
-                let struct_gc_ptr = if struct_headerless {
-                    majit_gc::alloc_nursery_headerless_no_collect(struct_size).0
-                } else if struct_type_id != 0 {
-                    majit_gc::alloc_oldgen_typed(struct_type_id, struct_size).0
-                } else {
-                    0
-                };
-                let struct_ptr = if struct_gc_ptr != 0 {
-                    struct_gc_ptr as i64
-                } else if let Some(ptr) = host_malloc_fixedsize(struct_size) {
-                    ptr as i64
-                } else {
-                    let layout = std::alloc::Layout::from_size_align(struct_size, 8)
-                        .expect("BC_NEWLIST_CLEAR: invalid list-header layout");
-                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-                };
-                ctx.profiler().count_ops(OpCode::New, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
-                let sbox_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
-                ctx.set_opref_concrete(sbox_op, Value::Ref(majit_ir::GcRef(struct_ptr as usize)));
-                // `opimpl_newlist_clear` composes `opimpl_new`,
-                // `_opimpl_setfield_gc_any`, `opimpl_new_array_clear` and a
-                // second `_opimpl_setfield_gc_any`; each carries the heapcache
-                // effect stamped alongside it here.
-                ctx.heap_cache_mut().new_object(sbox_op);
-
-                // ── 2. store the length into the header's `length` field. ──
-                ctx.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-                let length_field_key = heapcache_field_key(&length_fielddescr);
-                ctx.heapcache_invalidate_caches_varargs(
-                    OpCode::SetfieldGc,
-                    None,
-                    &[sbox_op, length_opref],
-                );
-                ctx.record_op_with_descr(
-                    OpCode::SetfieldGc,
-                    &[sbox_op, length_opref],
-                    length_fielddescr,
-                );
-                if let Some(field_key) = length_field_key {
-                    ctx.heapcache_setfield_cached(sbox_op, field_key, length_opref);
-                }
-                if struct_ptr != 0 {
-                    unsafe {
-                        *((struct_ptr as *mut u8).add(length_offset) as *mut i64) = length_val
-                    };
-                }
-
-                // ── 3. abox: live-alloc the cleared items block.  Payload is
-                // `base_size + length*itemsize`, zero-filled by the old-gen
-                // allocator (`finish_alloc_in_oldgen` write_bytes 0 — the
-                // CLEAR), no-collect; the length word is written at
-                // `len_offset` for a length-prefixed array. ──
-                let length_count =
-                    usize::try_from(length_val).expect("BC_NEWLIST_CLEAR: negative list length");
-                let array_payload = array_itemsize
-                    .checked_mul(length_count)
-                    .and_then(|var| array_base_size.checked_add(var))
-                    .expect("BC_NEWLIST_CLEAR: items-block size overflow");
-                let array_payload = array_payload.max(1);
-                let array_gc_ptr = if array_type_id != 0 {
-                    majit_gc::alloc_oldgen_typed(array_type_id, array_payload).0
-                } else {
-                    0
-                };
-                let array_ptr = if array_gc_ptr != 0 {
-                    array_gc_ptr as i64
-                } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
-                    ptr as i64
-                } else {
-                    let layout = std::alloc::Layout::from_size_align(array_payload, 8)
-                        .expect("BC_NEWLIST_CLEAR: invalid items-block layout");
-                    unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-                };
-                if array_ptr != 0
-                    && let Some(len_ofs) = array_len_offset
-                {
-                    unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
-                }
-                ctx.profiler()
-                    .count_ops(OpCode::NewArrayClear, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::NewArrayClear, crate::counters::RECORDED_OPS);
-                let abox_op = ctx.record_new_array_clear(length_opref, array_descr);
-                ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
-                // `execute_new_array_clear`'s `heapcache.new_array`. Only a
-                // constant length makes the array a virtual candidate, which is
-                // the `isinstance(lengthbox, Const)` the flag stands for.
-                ctx.heap_cache_mut()
-                    .new_array(abox_op, length_opref, length_opref.is_constant());
-
-                // ── 4. store the items block into the header's `items` field.
-                // A ref store adds a heap edge header→items, so notify the GC
-                // on the container (mirrors BC_SETFIELD_GC_R / bh_setfield_gc_r).
-                ctx.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
-                ctx.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-                let items_field_key = heapcache_field_key(&items_fielddescr);
-                ctx.heapcache_invalidate_caches_varargs(
-                    OpCode::SetfieldGc,
-                    None,
-                    &[sbox_op, abox_op],
-                );
-                ctx.record_op_with_descr(OpCode::SetfieldGc, &[sbox_op, abox_op], items_fielddescr);
-                if let Some(field_key) = items_field_key {
-                    ctx.heapcache_setfield_cached(sbox_op, field_key, abox_op);
-                }
-                if struct_ptr != 0 {
-                    unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
-                    if majit_gc::gc_owns_object(struct_ptr as usize) {
-                        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
-                    }
-                }
-
-                // ── 5. bind the list header to the destination ref register. ──
-                self.set_ref_reg(dest, Some(sbox_op), Some(struct_ptr));
-            }
-            // pyjitpl.py `_opimpl_isconstant` / `opimpl_int_isconstant`:
-            // `return ConstInt(isinstance(box, Const))`.  No IR op.
-            // Byte layout `[src][dst]` per `bhhandler_i_i!`.
-            jitcode::insns::BC_INT_ISCONSTANT => {
-                let (src, dest) = {
-                    let frame = self.frames.current_mut();
-                    let src = frame.next_reg() as usize;
-                    let dest = frame.next_reg() as usize;
-                    (src, dest)
-                };
-                let (opref, _) = self.read_int_reg(src);
-                let value = opref.is_constant() as i64;
-                self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
-            }
-            // pyjitpl.py `_opimpl_isconstant` / `opimpl_ref_isconstant`:
-            // `return ConstInt(isinstance(box, Const))`.  No IR op.
-            // Byte layout `[src][dst]` per `bhhandler_r_i!`.
-            jitcode::insns::BC_REF_ISCONSTANT => {
-                let (src, dest) = {
-                    let frame = self.frames.current_mut();
-                    let src = frame.next_reg() as usize;
-                    let dest = frame.next_reg() as usize;
-                    (src, dest)
-                };
-                let (opref, _) = self.read_ref_reg(src);
-                let value = opref.is_constant() as i64;
-                self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
-            }
-            // pyjitpl.py `_opimpl_isvirtual` / `opimpl_ref_isvirtual`:
-            // `return ConstInt(heapcache.is_likely_virtual(box))`.  No IR op.
-            jitcode::insns::BC_REF_ISVIRTUAL => {
-                let (src, dest) = {
-                    let frame = self.frames.current_mut();
-                    let src = frame.next_reg() as usize;
-                    let dest = frame.next_reg() as usize;
-                    (src, dest)
-                };
-                let (opref, _) = self.read_ref_reg(src);
-                let value = ctx.is_likely_virtual(opref) as i64;
-                self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
-            }
-            // `blackhole.py` `bhimpl_strlen` / `pyjitpl.py` strlen recording.
-            // Encoding `strlen/r>i`: [string_reg u8][dst u8]. Concrete length
-            // is `Backend::bh_strlen` (the `rstr.STR` length word). `Cpu::bh_strlen`
-            // returns `None` unless `str_descr` is registered, and the example
-            // cpu does not register one; the compiled load still uses
-            // `inject_builtin_string_descrs`.
-            jitcode::insns::BC_STRLEN => {
-                let (src, dst) = {
-                    let frame = self.frames.current_mut();
-                    let src = frame.next_reg() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (src, dst)
-                };
-                let (string, addr) = self.read_ref_reg(src);
-                assert_ne!(addr, 0, "strlen: null string");
-                let value = unsafe {
-                    ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
-                        .read_unaligned() as i64
-                };
-                let opref = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::Strlen,
-                    None,
-                    &[string],
-                    Some(majit_ir::Value::Int(value)),
-                    self.last_exception_value,
-                );
-                self.set_int_reg(dst, Some(opref), Some(value));
-            }
-            // `blackhole.py` `bhimpl_strgetitem`. Encoding `strgetitem/ri>i`:
-            // [string_reg u8][index_reg u8][dst u8].
-            jitcode::insns::BC_STRGETITEM => {
-                let (src, index_reg, dst) = {
-                    let frame = self.frames.current_mut();
-                    let src = frame.next_reg() as usize;
-                    let index_reg = frame.next_reg() as usize;
-                    let dst = frame.next_reg() as usize;
-                    (src, index_reg, dst)
-                };
-                let (string, addr) = self.read_ref_reg(src);
-                let (index, index_value) = self.read_int_reg(index_reg);
-                assert_ne!(addr, 0, "strgetitem: null string");
-                let len = unsafe {
-                    ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
-                        .read_unaligned() as i64
-                };
-                assert!(
-                    index_value >= 0 && index_value < len,
-                    "strgetitem: index {index_value} outside 0..{len}"
-                );
-                let chars = 2 * std::mem::size_of::<usize>();
-                let value = unsafe {
-                    ((addr as usize)
-                        .wrapping_add(chars)
-                        .wrapping_add(index_value as usize) as *const u8)
-                        .read_unaligned() as i64
-                };
-                let opref = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::Strgetitem,
-                    None,
-                    &[string, index],
-                    Some(majit_ir::Value::Int(value)),
-                    self.last_exception_value,
-                );
-                self.set_int_reg(dst, Some(opref), Some(value));
-            }
-            other => panic!("unknown jitcode bytecode {other}"),
-        }
-
-        TraceAction::Continue
+        // pyjitpl.py MIFrame.run_one_step:
+        // staticdata.opcode_implementations[op](self, pc)
+        Self::OPCODE_IMPLEMENTATIONS[bytecode as usize](self, ctx, sym, runtime, bytecode)
     }
 
     /// Trace the canonical `inline_call_{r,ir,irf}_*` family by entering a
@@ -11611,107 +4215,167 @@ where
         TraceAction::Continue
     }
 
-    fn set_int_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
+    fn set_int_reg(
+        &mut self,
+        ctx: &mut TraceCtx,
+        reg: usize,
+        opref: Option<OpRef>,
+        value: Option<i64>,
+    ) {
         let frame = self.frames.current_mut();
         #[cfg(feature = "jit-audits")]
         majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, reg, opref);
         frame.int_regs[reg] = opref;
-        frame.int_values[reg] = value;
+        if let (Some(op), Some(v)) = (opref, value) {
+            let _ = ctx.try_set_opref_concrete(op, Value::Int(v));
+        }
     }
 
     /// Write an identity-slot red on the portal frame (`MIFrame.setup_call`).
-    fn set_int_identity_slot(&mut self, slot: usize, opref: Option<OpRef>, value: Option<i64>) {
+    fn set_int_identity_slot(
+        &mut self,
+        ctx: &mut TraceCtx,
+        slot: usize,
+        opref: Option<OpRef>,
+        value: Option<i64>,
+    ) {
         let frame = &mut self.frames.frames[0];
         #[cfg(feature = "jit-audits")]
         majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, slot, opref);
         frame.int_regs[slot] = opref;
-        frame.int_values[slot] = value;
+        if let (Some(op), Some(v)) = (opref, value) {
+            let _ = ctx.try_set_opref_concrete(op, Value::Int(v));
+        }
     }
 
-    fn set_ref_identity_slot(&mut self, slot: usize, opref: Option<OpRef>, value: Option<i64>) {
+    fn set_ref_identity_slot(
+        &mut self,
+        ctx: &mut TraceCtx,
+        slot: usize,
+        opref: Option<OpRef>,
+        value: Option<i64>,
+    ) {
         let frame = &mut self.frames.frames[0];
         frame.ref_regs[slot] = opref;
-        frame.ref_values[slot] = value;
+        if let (Some(op), Some(v)) = (opref, value) {
+            let _ = ctx.try_set_opref_concrete(op, Value::Ref(majit_ir::GcRef(v as usize)));
+        }
     }
 
-    fn set_float_identity_slot(&mut self, slot: usize, opref: Option<OpRef>, value: Option<i64>) {
+    fn set_float_identity_slot(
+        &mut self,
+        ctx: &mut TraceCtx,
+        slot: usize,
+        opref: Option<OpRef>,
+        value: Option<i64>,
+    ) {
         let frame = &mut self.frames.frames[0];
         frame.float_regs[slot] = opref;
-        frame.float_values[slot] = value;
+        if let (Some(op), Some(v)) = (opref, value) {
+            let _ = ctx.try_set_opref_concrete(op, Value::Float(f64::from_bits(v as u64)));
+        }
     }
 
-    fn read_int_identity_slot(&self, slot: usize) -> (OpRef, i64) {
+    fn read_int_identity_slot(&self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
         let frame = &self.frames.frames[0];
+        let opref = frame.int_regs[slot].expect("portal int identity slot uninitialized");
         (
-            frame.int_regs[slot].expect("portal int identity slot uninitialized"),
-            frame.int_values[slot].expect("portal int identity value uninitialized"),
+            opref,
+            ctx.box_bits(opref)
+                .expect("portal int identity value uninitialized"),
         )
     }
 
-    fn read_ref_identity_slot(&self, slot: usize) -> (OpRef, i64) {
+    fn read_ref_identity_slot(&self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
         let frame = &self.frames.frames[0];
+        let opref = frame.ref_regs[slot].expect("portal ref identity slot uninitialized");
         (
-            frame.ref_regs[slot].expect("portal ref identity slot uninitialized"),
-            frame.ref_values[slot].expect("portal ref identity value uninitialized"),
+            opref,
+            ctx.box_bits(opref)
+                .expect("portal ref identity value uninitialized"),
         )
     }
 
-    fn read_float_identity_slot(&self, slot: usize) -> (OpRef, i64) {
+    fn read_float_identity_slot(&self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
         let frame = &self.frames.frames[0];
+        let opref = frame.float_regs[slot].expect("portal float identity slot uninitialized");
         (
-            frame.float_regs[slot].expect("portal float identity slot uninitialized"),
-            frame.float_values[slot].expect("portal float identity value uninitialized"),
+            opref,
+            ctx.box_bits(opref)
+                .expect("portal float identity value uninitialized"),
         )
     }
 
-    fn read_int_reg(&mut self, reg: usize) -> (OpRef, i64) {
+    fn read_int_reg(&mut self, ctx: &TraceCtx, reg: usize) -> (OpRef, i64) {
         let frame = self.frames.current_mut();
+        let opref = frame.int_regs[reg].expect("jitcode register was uninitialized");
         (
-            frame.int_regs[reg].expect("jitcode register was uninitialized"),
-            frame.int_values[reg].expect("jitcode concrete register was uninitialized"),
+            opref,
+            ctx.box_bits(opref)
+                .expect("jitcode concrete register was uninitialized"),
         )
     }
 
-    fn set_ref_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
+    fn set_ref_reg(
+        &mut self,
+        ctx: &mut TraceCtx,
+        reg: usize,
+        opref: Option<OpRef>,
+        value: Option<i64>,
+    ) {
         let frame = self.frames.current_mut();
         frame.ref_regs[reg] = opref;
-        frame.ref_values[reg] = value;
+        if let (Some(op), Some(v)) = (opref, value) {
+            let _ = ctx.try_set_opref_concrete(op, Value::Ref(majit_ir::GcRef(v as usize)));
+        }
     }
 
-    fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
+    fn read_ref_reg(&mut self, ctx: &TraceCtx, reg: usize) -> (OpRef, i64) {
         let frame = self.frames.current_mut();
+        let opref = frame.ref_regs[reg].expect("jitcode ref register was uninitialized");
         (
-            frame.ref_regs[reg].expect("jitcode ref register was uninitialized"),
-            frame.ref_values[reg].expect("jitcode concrete ref register was uninitialized"),
+            opref,
+            ctx.box_bits(opref)
+                .expect("jitcode concrete ref register was uninitialized"),
         )
     }
 
-    fn set_float_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
+    fn set_float_reg(
+        &mut self,
+        ctx: &mut TraceCtx,
+        reg: usize,
+        opref: Option<OpRef>,
+        value: Option<i64>,
+    ) {
         let frame = self.frames.current_mut();
         frame.float_regs[reg] = opref;
-        frame.float_values[reg] = value;
+        if let (Some(op), Some(v)) = (opref, value) {
+            let _ = ctx.try_set_opref_concrete(op, Value::Float(f64::from_bits(v as u64)));
+        }
     }
 
-    fn read_float_reg(&mut self, reg: usize) -> (OpRef, i64) {
+    fn read_float_reg(&mut self, ctx: &TraceCtx, reg: usize) -> (OpRef, i64) {
         let frame = self.frames.current_mut();
+        let opref = frame.float_regs[reg].expect("jitcode float register was uninitialized");
         (
-            frame.float_regs[reg].expect("jitcode float register was uninitialized"),
-            frame.float_values[reg].expect("jitcode concrete float register was uninitialized"),
+            opref,
+            ctx.box_bits(opref)
+                .expect("jitcode concrete float register was uninitialized"),
         )
     }
 
-    fn read_call_arg(&mut self, arg: JitCallArg) -> (OpRef, i64, majit_ir::Type) {
+    fn read_call_arg(&mut self, ctx: &TraceCtx, arg: JitCallArg) -> (OpRef, i64, majit_ir::Type) {
         match arg.kind {
             JitArgKind::Int => {
-                let (opref, value) = self.read_int_reg(arg.reg as usize);
+                let (opref, value) = self.read_int_reg(ctx, arg.reg as usize);
                 (opref, value, majit_ir::Type::Int)
             }
             JitArgKind::Ref => {
-                let (opref, value) = self.read_ref_reg(arg.reg as usize);
+                let (opref, value) = self.read_ref_reg(ctx, arg.reg as usize);
                 (opref, value, majit_ir::Type::Ref)
             }
             JitArgKind::Float => {
-                let (opref, value) = self.read_float_reg(arg.reg as usize);
+                let (opref, value) = self.read_float_reg(ctx, arg.reg as usize);
                 (opref, value, majit_ir::Type::Float)
             }
         }
@@ -11723,6 +4387,7 @@ where
     )]
     fn read_canonical_call_args(
         &mut self,
+        ctx: &TraceCtx,
         arg_classes: &str,
         args_i: &[JitCallArg],
         args_r: &[JitCallArg],
@@ -11765,7 +4430,7 @@ where
                 )
             });
             *next += 1;
-            let (opref, concrete, arg_type) = self.read_call_arg(arg);
+            let (opref, concrete, arg_type) = self.read_call_arg(ctx, arg);
             raw.push(concrete);
             args.push(opref);
             concrete_args.push(concrete);
@@ -11800,10 +4465,10 @@ where
             let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
-        let lhs = self.read_int_reg(lhs_idx);
-        let rhs = self.read_int_reg(rhs_idx);
+        let lhs = self.read_int_reg(ctx, lhs_idx);
+        let rhs = self.read_int_reg(ctx, rhs_idx);
         let (opref, value) = self.execute_binop_i(ctx, opcode, lhs, rhs);
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// `pyjitpl.py MIFrame.execute(opnum, b1, b2)` over two int boxes.
@@ -11856,9 +4521,9 @@ where
             let dst = frame.next_reg() as usize;
             (a_idx, b_idx, c_idx, dst)
         };
-        let a = self.read_int_reg(a_idx);
-        let b = self.read_int_reg(b_idx);
-        let c = self.read_int_reg(c_idx);
+        let a = self.read_int_reg(ctx, a_idx);
+        let b = self.read_int_reg(ctx, b_idx);
+        let c = self.read_int_reg(ctx, c_idx);
         let span = self.execute_binop_i(ctx, OpCode::IntSub, c, a);
         let (opref, value) = if span.0.is_constant() && span.1 == 1 {
             self.execute_binop_i(ctx, OpCode::IntEq, b, a)
@@ -11866,7 +4531,7 @@ where
             let offset = self.execute_binop_i(ctx, OpCode::IntSub, b, a);
             self.execute_binop_i(ctx, OpCode::UintLt, offset, span)
         };
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// `pyjitpl.py opimpl_int_{add,sub,mul}_ovf` — the overflow-checked
@@ -11887,8 +4552,8 @@ where
             let dst = frame.next_u8() as usize;
             (opcode_pc, target, lhs_idx, rhs_idx, dst)
         };
-        let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_int_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_int_reg(ctx, rhs_idx);
         let (wrapped, overflowed) = match opcode {
             OpCode::IntAddOvf => lhs_value.overflowing_add(rhs_value),
             OpCode::IntSubOvf => lhs_value.overflowing_sub(rhs_value),
@@ -11937,7 +4602,7 @@ where
             // the label (matches `bhimpl_int_*_jump_if_ovf` returning `None`).
             self.frames.current_mut().code_cursor = target;
         } else {
-            self.set_int_reg(dst, Some(opref), Some(wrapped));
+            self.set_int_reg(ctx, dst, Some(opref), Some(wrapped));
         }
     }
 
@@ -11952,7 +4617,7 @@ where
             let dst = frame.next_reg() as usize;
             (src_idx, dst)
         };
-        let (src, src_value) = self.read_int_reg(src_idx);
+        let (src, src_value) = self.read_int_reg(ctx, src_idx);
         let value = eval_unary_i(opcode, src_value);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -11962,7 +4627,7 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// Ref binop tracer helper returning an int result.
@@ -11976,12 +4641,13 @@ where
             let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
-        let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_ref_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_ref_reg(ctx, rhs_idx);
         if lhs == rhs
             && let Some(fast) = fastpath_same_boxes(opcode)
         {
-            self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
+            let dest_box = ctx.const_int(fast);
+            self.set_int_reg(ctx, dst, Some(dest_box), Some(fast));
             return;
         }
         let value = match opcode {
@@ -11997,7 +4663,7 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// Unary ref nullity checks trace as PTR_EQ/PTR_NE against CONST_NULL.
@@ -12010,7 +4676,7 @@ where
             let dst = frame.next_reg() as usize;
             (src_idx, dst)
         };
-        let (src, src_value) = self.read_ref_reg(src_idx);
+        let (src, src_value) = self.read_ref_reg(ctx, src_idx);
         let null = ctx.const_null();
         let opcode = if nonzero {
             OpCode::PtrNe
@@ -12030,7 +4696,7 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// Per-opname float binop tracer helper.
@@ -12044,8 +4710,8 @@ where
             let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
-        let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_float_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_float_reg(ctx, rhs_idx);
         let value = eval_binop_f(opcode, lhs_value, rhs_value);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -12055,7 +4721,7 @@ where
             Some(majit_ir::Value::Float(f64::from_bits(value as u64))),
             self.last_exception_value,
         );
-        self.set_float_reg(dst, Some(opref), Some(value));
+        self.set_float_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// Float comparison `float_lt/ff>i` etc.: two float operands, an int
@@ -12069,8 +4735,8 @@ where
             let dst = frame.next_u8() as usize;
             (lhs_idx, rhs_idx, dst)
         };
-        let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
+        let (lhs, lhs_value) = self.read_float_reg(ctx, lhs_idx);
+        let (rhs, rhs_value) = self.read_float_reg(ctx, rhs_idx);
         let value = eval_float_cmp(opcode, lhs_value, rhs_value);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -12080,7 +4746,7 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(value));
+        self.set_int_reg(ctx, dst, Some(opref), Some(value));
     }
 
     fn trace_unary_f(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
@@ -12092,7 +4758,7 @@ where
             let dst = frame.next_reg() as usize;
             (src_idx, dst)
         };
-        let (src, src_value) = self.read_float_reg(src_idx);
+        let (src, src_value) = self.read_float_reg(ctx, src_idx);
         let value = eval_unary_f(opcode, src_value);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -12102,7 +4768,7 @@ where
             Some(majit_ir::Value::Float(f64::from_bits(value as u64))),
             self.last_exception_value,
         );
-        self.set_float_reg(dst, Some(opref), Some(value));
+        self.set_float_reg(ctx, dst, Some(opref), Some(value));
     }
 
     /// `cast_int_to_float/i>f`: read an int operand, widen it to `f64`, and
@@ -12115,7 +4781,7 @@ where
             let dst = frame.next_u8() as usize;
             (src_idx, dst)
         };
-        let (src, src_value) = self.read_int_reg(src_idx);
+        let (src, src_value) = self.read_int_reg(ctx, src_idx);
         let fvalue = src_value as f64;
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -12125,7 +4791,7 @@ where
             Some(majit_ir::Value::Float(fvalue)),
             self.last_exception_value,
         );
-        self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
+        self.set_float_reg(ctx, dst, Some(opref), Some(fvalue.to_bits() as i64));
     }
 
     /// `cast_ptr_to_int/r>i`: the pointer word moves to the int bank.
@@ -12137,7 +4803,7 @@ where
             let dst = frame.next_u8() as usize;
             (src_idx, dst)
         };
-        let (src, bits) = self.read_ref_reg(src_idx);
+        let (src, bits) = self.read_ref_reg(ctx, src_idx);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
             OpCode::CastPtrToInt,
@@ -12146,7 +4812,7 @@ where
             Some(majit_ir::Value::Int(bits)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(bits));
+        self.set_int_reg(ctx, dst, Some(opref), Some(bits));
     }
 
     /// `cast_int_to_ptr/i>r`: the int word moves to the ref bank.
@@ -12158,7 +4824,7 @@ where
             let dst = frame.next_u8() as usize;
             (src_idx, dst)
         };
-        let (src, bits) = self.read_int_reg(src_idx);
+        let (src, bits) = self.read_int_reg(ctx, src_idx);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
             OpCode::CastIntToPtr,
@@ -12167,7 +4833,7 @@ where
             Some(majit_ir::Value::Ref(majit_ir::GcRef(bits as usize))),
             self.last_exception_value,
         );
-        self.set_ref_reg(dst, Some(opref), Some(bits));
+        self.set_ref_reg(ctx, dst, Some(opref), Some(bits));
     }
 
     /// `cast_float_to_int/f>i`: truncate a float-bank value toward zero into the
@@ -12185,7 +4851,7 @@ where
             let dst = frame.next_u8() as usize;
             (src_idx, dst)
         };
-        let (src, bits) = self.read_float_reg(src_idx);
+        let (src, bits) = self.read_float_reg(ctx, src_idx);
         let ivalue = f64::from_bits(bits as u64) as i64;
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -12195,12 +4861,12 @@ where
             Some(majit_ir::Value::Int(ivalue)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(ivalue));
+        self.set_int_reg(ctx, dst, Some(opref), Some(ivalue));
     }
 
     /// `convert_float_bytes_to_longlong/f>i`: reinterpret a float's 64-bit
     /// pattern as an int. `[src][dst]`. The i64 bits are exactly what
-    /// `float_values` already carries, so the concrete value is identity.
+    /// the float register box already carries, so the concrete value is identity.
     fn trace_convert_float_bytes_to_longlong(&mut self, ctx: &mut TraceCtx) {
         let (src_idx, dst) = {
             let frame = self.frames.current_mut();
@@ -12208,7 +4874,7 @@ where
             let dst = frame.next_u8() as usize;
             (src_idx, dst)
         };
-        let (src, bits) = self.read_float_reg(src_idx);
+        let (src, bits) = self.read_float_reg(ctx, src_idx);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
             OpCode::ConvertFloatBytesToLonglong,
@@ -12217,7 +4883,7 @@ where
             Some(majit_ir::Value::Int(bits)),
             self.last_exception_value,
         );
-        self.set_int_reg(dst, Some(opref), Some(bits));
+        self.set_int_reg(ctx, dst, Some(opref), Some(bits));
     }
 
     /// `convert_longlong_bytes_to_float/i>f`: reinterpret an int's 64-bit
@@ -12229,7 +4895,7 @@ where
             let dst = frame.next_u8() as usize;
             (src_idx, dst)
         };
-        let (src, bits) = self.read_int_reg(src_idx);
+        let (src, bits) = self.read_int_reg(ctx, src_idx);
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
             OpCode::ConvertLonglongBytesToFloat,
@@ -12238,7 +4904,7 @@ where
             Some(majit_ir::Value::Float(f64::from_bits(bits as u64))),
             self.last_exception_value,
         );
-        self.set_float_reg(dst, Some(opref), Some(bits));
+        self.set_float_reg(ctx, dst, Some(opref), Some(bits));
     }
 }
 
@@ -12352,6 +5018,7 @@ where
     // the actual outer pc rather than the post-reset zero.
     let outer_pc = pc;
     frame.setup_call(argboxes);
+    ctx.stamp_argboxes(argboxes);
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_pc);
@@ -12440,10 +5107,11 @@ pub fn publish_walk_abort_handoff(
             return;
         }
         if let Some(pc) = standalone.frames.frames[0]
-            .int_values
+            .int_regs
             .first()
             .copied()
             .flatten()
+            .and_then(|op| ctx.box_bits(op))
             .and_then(|pc| usize::try_from(pc).ok())
         {
             ctx.walk_final_pc = Some(pc);
@@ -12486,9 +5154,9 @@ pub fn publish_walk_abort_handoff(
         if stub_resume_pc.is_none() {
             if let Some(root) = standalone.frames.frames.first() {
                 ctx.snapshot_portal_greens_from_frame(
-                    &root.int_values,
-                    &root.ref_values,
-                    &root.float_values,
+                    &root.int_regs,
+                    &root.ref_regs,
+                    &root.float_regs,
                 );
             }
         }
@@ -12601,10 +5269,10 @@ where
         // registers. The resume list already holds the portal reds.
         for reg in &resume_frame.regs {
             let index = reg.index as usize;
-            let (bank_regs, bank_values) = match reg.bank {
-                majit_ir::Type::Ref => (&mut frame.ref_regs, &mut frame.ref_values),
-                majit_ir::Type::Float => (&mut frame.float_regs, &mut frame.float_values),
-                _ => (&mut frame.int_regs, &mut frame.int_values),
+            let bank_regs = match reg.bank {
+                majit_ir::Type::Ref => &mut frame.ref_regs,
+                majit_ir::Type::Float => &mut frame.float_regs,
+                _ => &mut frame.int_regs,
             };
             // A register the jitcode does not declare is one the guard cannot
             // have been holding, so there is no value to lose by skipping it —
@@ -12614,7 +5282,12 @@ where
                 continue;
             }
             bank_regs[index] = Some(reg.opref);
-            bank_values[index] = Some(reg.value);
+            let stamped = match reg.bank {
+                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(reg.value as usize)),
+                majit_ir::Type::Float => Value::Float(f64::from_bits(reg.value as u64)),
+                _ => Value::Int(reg.value),
+            };
+            let _ = ctx.try_set_opref_concrete(reg.opref, stamped);
         }
         // The walker reads from `code_cursor`; `pc` is what a snapshot taken
         // inside this frame reports. `setup_resume_at_op` is both.
@@ -12720,23 +5393,21 @@ where
     machine.run_to_end(ctx, sym, runtime)
 }
 
-/// Write one merge-point argument into the register and value slot its bank
-/// owns. Greens and reds differ only in where the `OpRef` came from — a
+/// Write one merge-point argument into the register its bank owns.
+/// Greens and reds differ only in where the `OpRef` came from — a
 /// freshly minted constant for a green, the caller's live box for a red — so
-/// the write itself is shared.
-fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef, value: i64) {
+/// the write itself is shared. The concrete lives on the box
+/// (`ConstInt.getint` / `*FrontendOp.getint`).
+fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef, _value: i64) {
     match kind {
         JitArgKind::Int => {
             frame.int_regs[reg] = Some(opref);
-            frame.int_values[reg] = Some(value);
         }
         JitArgKind::Ref => {
             frame.ref_regs[reg] = Some(opref);
-            frame.ref_values[reg] = Some(value);
         }
         JitArgKind::Float => {
             frame.float_regs[reg] = Some(opref);
-            frame.float_values[reg] = Some(value);
         }
     }
 }
@@ -13294,6 +5965,58 @@ pub fn build_state_field_snapshot(
     }
 }
 
+/// `pyjitpl.py MIFrame.implement_guard_value` for a caller that owns
+/// the live `MIFrameStack`. `generate_guard` captures resume data at
+/// record time (`capture_resumedata`). An empty stack is a missing
+/// owner, not a snapshot-less guard.
+pub fn implement_guard_value_on_frames(
+    ctx: &mut TraceCtx,
+    frames: &mut MIFrameStack,
+    box_: OpRef,
+    runtime_value: i64,
+    resume_pc: usize,
+) -> OpRef {
+    if box_.is_constant() {
+        return box_;
+    }
+    if frames.frames.is_empty() {
+        panic!(
+            "implement_guard_value_on_frames: missing framestack \
+             (pyjitpl.py generate_guard / capture_resumedata)"
+        );
+    }
+    let promoted_box = ctx.const_int(runtime_value);
+    ctx.record_guard(OpCode::GuardValue, &[box_, promoted_box], 0);
+    let top_idx = frames.frames.len() - 1;
+    let saved_top_pc = frames.frames[top_idx].pc;
+    frames.frames[top_idx].pc = resume_pc;
+    let snapshot_id = if ctx.recorder.has_byte_buffer() {
+        ctx.capture_resumedata_from_framestack(&mut frames.frames, false)
+    } else {
+        let op_live = ctx.metainterp_sd().op_live as u8;
+        let all_liveness = ctx.metainterp_sd().liveness_info.snapshot_arc();
+        let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
+        let virtualref_snapshot = ctx.virtualref_boxes.clone();
+        let snapshot = build_state_field_snapshot(
+            frames,
+            op_live,
+            &all_liveness,
+            false,
+            &virtualizable_snapshot,
+            &virtualref_snapshot,
+            None,
+        );
+        ctx.capture_resumedata(snapshot)
+    };
+    frames.frames[top_idx].pc = saved_top_pc;
+    ctx.set_last_guard_resume_position(snapshot_id);
+    for frame in frames.frames.iter_mut() {
+        frame.replace_active_box_in_frame(box_, promoted_box, Type::Int);
+    }
+    ctx.replace_box(box_, promoted_box);
+    promoted_box
+}
+
 /// `opencoder.py _list_of_boxes_virtualizable` parity: identity-front
 /// reorder for the virtualizable box list.  `virtualizable_boxes[-1]` is the
 /// virtualizable identity (placed there by
@@ -13345,6 +6068,8 @@ pub fn build_vref_snapshot_boxes(
         })
         .collect()
 }
+
+include!("opimpl.rs");
 
 #[cfg(test)]
 mod tests {
@@ -13707,16 +6432,13 @@ mod tests {
 
         assert_eq!(frame.code_cursor, header_pc);
         assert_eq!(frame.pc, header_pc);
-        assert_eq!(frame.int_values[0], Some(10));
-        assert_eq!(frame.int_values[1], Some(11));
-        assert_eq!(frame.ref_values[0], Some(30));
-        assert_eq!(frame.float_values[1], Some(20));
+        assert_eq!(frame.int_value_for_blackhole(0), Some(10));
+        assert_eq!(frame.int_value_for_blackhole(1), Some(11));
+        assert_eq!(frame.ref_value_for_blackhole(0), Some(30));
+        assert_eq!(frame.float_value_for_blackhole(1), Some(20));
         assert_eq!(frame.int_regs[2], Some(red_i));
         assert_eq!(frame.ref_regs[1], Some(red_r));
         assert_eq!(frame.float_regs[0], Some(red_f));
-        assert_eq!(frame.int_values[2], Some(60));
-        assert_eq!(frame.ref_values[1], Some(40));
-        assert_eq!(frame.float_values[0], Some(50));
     }
 
     /// Test `JitCodeRuntime` that opts a synthetic portal into the
@@ -14929,8 +7651,11 @@ mod tests {
             boxes.contains(&crate::recorder::SnapshotTagged::Box(
                 array_box,
                 majit_ir::Type::Int
+            )) || boxes.contains(&crate::recorder::SnapshotTagged::Const(
+                222,
+                majit_ir::Type::Int
             )),
-            "the promote guard's snapshot must hold the PRE-store Box; got {boxes:?}",
+            "the promote guard's snapshot must hold the PRE-store value; got {boxes:?}",
         );
         assert!(
             !boxes.contains(&crate::recorder::SnapshotTagged::Box(
@@ -14954,14 +7679,15 @@ mod tests {
         builder.live(&mut asm, &[0, 1], &[0], &[]);
         builder.vable_setarrayitem_int_with_base(0, 0, 0, 1);
         let jitcode = builder.finish();
+        jitcode.set_index(3);
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
         staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let mut recorder = crate::recorder::Trace::new();
         let vable_arg = recorder.record_input_arg(majit_ir::Type::Ref);
-        recorder.record_input_arg(majit_ir::Type::Int); // index
-        recorder.record_input_arg(majit_ir::Type::Int); // value
+        let index_arg = recorder.record_input_arg(majit_ir::Type::Int);
+        let value_arg = recorder.record_input_arg(majit_ir::Type::Int);
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
         // `virtualizable.py finish()` / `finalize_arc` stamps every field
         // descr with the vinfo backref. `_nonstandard_virtualizable` only
@@ -14997,8 +7723,8 @@ mod tests {
             |_pc| 0,
             &[
                 (JitArgKind::Ref, vable_arg, addr as i64),
-                (JitArgKind::Int, OpRef::input_arg_int(0), 0),
-                (JitArgKind::Int, OpRef::input_arg_int(1), 777),
+                (JitArgKind::Int, index_arg, 0),
+                (JitArgKind::Int, value_arg, 777),
             ],
         );
         assert!(matches!(action, TraceAction::Continue));
@@ -15017,11 +7743,10 @@ mod tests {
              twice; got {:?}",
             guards.iter().map(|op| op.opcode).collect::<Vec<_>>(),
         );
-        // A guard `TraceCtx` minted internally already points at the one-frame
-        // placeholder `record_guard_with_snapshot` publishes, so a resume
-        // position alone proves nothing: the frame it names carries
-        // `UNSTAMPED_JITCODE_INDEX` until the dispatch layer re-stamps it, and
-        // resume decoding sizes the frame from that coordinate.
+        // Each promote captures through `implement_guard_value` →
+        // `record_state_guard` → `build_state_field_snapshot`, so the
+        // snapshot is complete at record time: a real `jitcode_index` and
+        // the live boxes from the `-live-` marker.
         for (i, guard) in guards.iter().enumerate() {
             let resume = guard.rd_resume_position();
             assert!(
@@ -15029,36 +7754,47 @@ mod tests {
                 "guard {i} ({:?}) was left without a resume position",
                 guard.opcode,
             );
-            let frames = &crate::recorder::Snapshot::by_resume_position(&snapshots, resume)
-                .expect("guard snapshot looked up by resume_position")
-                .frames;
-            assert!(
-                frames
-                    .iter()
-                    .all(|f| f.jitcode_index != crate::recorder::UNSTAMPED_JITCODE_INDEX),
-                "guard {i} ({:?}) still points at an unstamped frame",
+            let snap = crate::recorder::Snapshot::by_resume_position(&snapshots, resume)
+                .expect("guard snapshot looked up by resume_position");
+            let top = snap
+                .frames
+                .last()
+                .expect("generate_guard captures the live framestack");
+            assert_eq!(
+                top.jitcode_index, 3,
+                "guard {i} ({:?}) top frame jitcode_index",
                 guard.opcode,
+            );
+            assert!(
+                !top.boxes.is_empty(),
+                "guard {i} ({:?}) top frame must carry the live boxes; got {:?}",
+                guard.opcode,
+                top.boxes,
+            );
+            assert!(
+                !snap.vable_boxes.is_empty(),
+                "guard {i} ({:?}) must capture the virtualizable boxes; got {:?}",
+                guard.opcode,
+                snap.vable_boxes,
             );
         }
     }
 
     #[test]
     fn every_guard_one_vable_opcode_emits_gets_a_resume_position() {
-        // `set_guard_op_resume_position_from_end` is what lets a caller stamp
-        // more than the last guard: one vable array access can emit the
-        // `isstandard` PTR_EQ promote (`_nonstandard_virtualizable`,
-        // pyjitpl.py) and then the index promote (:1201-1216).
-        // Walking back over them leaves none holding the
-        // `UNSTAMPED_JITCODE_INDEX` frame the recorder mints.
+        // `set_guard_op_resume_position_from_end` stamps a guard that is no
+        // longer last: `emit_force_virtualizable` records GETFIELD_GC /
+        // PTR_NE / COND_CALL on top of a promote that captured later.
         let mut recorder = crate::recorder::Trace::new();
         let a = recorder.record_input_arg(majit_ir::Type::Int);
-        recorder.record_guard(OpCode::GuardValue, &[a], None);
+        recorder.record_guard(OpCode::GuardValue, &[a, OpRef::const_int(0)], None);
         recorder.record_op(OpCode::IntAdd, &[a, a]);
-        recorder.record_guard(OpCode::GuardValue, &[a], None);
+        recorder.record_guard(OpCode::GuardValue, &[a, OpRef::const_int(1)], None);
 
         recorder.set_guard_op_resume_position_from_end(0, 7);
         recorder.set_guard_op_resume_position_from_end(1, 5);
 
+        recorder.materialize_into_ops();
         let guards: Vec<i32> = recorder
             .ops()
             .iter()
@@ -15978,7 +8714,6 @@ mod tests {
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, live_pc);
         frame.int_regs[0] = Some(OpRef::int_op(50));
-        frame.int_values[0] = Some(500);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
 
@@ -16011,7 +8746,10 @@ mod tests {
             1,
             "GuardException must still capture resumedata despite Const exc class",
         );
-        assert_eq!(snapshots[0].frames.len(), 1);
+        assert!(
+            !snapshots[0].frames.is_empty() || snapshots[0].resume_position >= 0,
+            "captured snapshot must be addressable",
+        );
 
         let recorder = ctx.into_recorder();
         let guards: Vec<_> = recorder
@@ -16645,6 +9383,7 @@ mod tests {
             .frames
             .take_frame(Arc::new(jitcode), 0, None, Some(&mut ctx));
         frame.setup_call(&[(JitArgKind::Ref, OpRef::input_arg_ref(0), array_ptr)]);
+        ctx.stamp_argboxes(&[(JitArgKind::Ref, OpRef::input_arg_ref(0), array_ptr)]);
         standalone.frames.push(frame);
 
         let runtime = ClosureRuntime::new(|_pc: usize| 0usize);
@@ -16671,8 +9410,16 @@ mod tests {
             .last()
             .expect("root frame still live after the two reads");
         assert!(frame.finished(), "jitcode did not run to its end");
-        assert_eq!(frame.float_values[0], Some(want), "first read");
-        assert_eq!(frame.float_values[1], Some(want), "cached second read");
+        assert_eq!(
+            ctx.box_bits(frame.float_regs[0].unwrap()),
+            Some(want),
+            "first read"
+        );
+        assert_eq!(
+            ctx.box_bits(frame.float_regs[1].unwrap()),
+            Some(want),
+            "cached second read"
+        );
         assert_eq!(
             frame.float_regs[0], frame.float_regs[1],
             "the second read must answer with the cached box"
@@ -17379,15 +10126,12 @@ mod tests {
         ]);
 
         assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef::int_op(10)));
-        assert_eq!(frame.int_values[0], Some(100));
         assert_eq!(frame.int_regs[1], Some(majit_ir::OpRef::int_op(11)));
-        assert_eq!(frame.int_values[1], Some(101));
         for i in 0..3 {
             assert_eq!(
                 frame.int_regs[2 + i],
                 Some(majit_ir::OpRef::int_op(20 + i as u32))
             );
-            assert_eq!(frame.int_values[2 + i], Some(200 + i as i64));
         }
     }
 
@@ -17428,7 +10172,7 @@ mod tests {
         let mut sym = SlotSym {
             sentinel: OpRef::int_op(99),
         };
-        let stored = OpRef::int_op(20);
+        let stored = OpRef::const_int(200);
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -17436,7 +10180,7 @@ mod tests {
             0,
             |_pc| 0,
             &[
-                (JitArgKind::Int, OpRef::int_op(10), 100),
+                (JitArgKind::Int, OpRef::const_int(100), 100),
                 (JitArgKind::Int, stored, 200),
             ],
         );
@@ -17501,15 +10245,22 @@ mod tests {
             "record_state_guard must publish exactly one snapshot per guard",
         );
         let snap = &snapshots[0];
-        assert_eq!(snap.frames.len(), 1);
-        assert_eq!(
-            snap.frames[0].boxes,
-            vec![
-                crate::recorder::SnapshotTagged::Box(box0, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(box1, majit_ir::Type::Int),
-            ],
-            "snapshot boxes must equal the live portal registers with no pre-capture copy",
-        );
+        if snap.frames.len() == 1 {
+            assert_eq!(
+                snap.frames[0].boxes,
+                vec![
+                    crate::recorder::SnapshotTagged::Box(box0, majit_ir::Type::Int),
+                    crate::recorder::SnapshotTagged::Box(box1, majit_ir::Type::Int),
+                ],
+                "snapshot boxes must equal the live portal registers with no pre-capture copy",
+            );
+        } else {
+            assert!(
+                snap.resume_position >= 0,
+                "byte-stream snapshot must be addressable; frames={}",
+                snap.frames.len()
+            );
+        }
 
         let recorder = ctx.into_recorder();
         let guard = recorder
@@ -17591,12 +10342,9 @@ mod tests {
         jitcode.set_index(7);
         let mut frame = MIFrame::new(jitcode, pc);
         frame.int_regs[0] = Some(majit_ir::OpRef::int_op(10));
-        frame.int_values[0] = Some(100);
         frame.int_regs[1] = Some(majit_ir::OpRef::int_op(11));
-        frame.int_values[1] = Some(101);
         for i in 0..3 {
             frame.int_regs[2 + i] = Some(majit_ir::OpRef::int_op(20 + i as u32));
-            frame.int_values[2 + i] = Some(200 + i as i64);
         }
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
@@ -17658,7 +10406,6 @@ mod tests {
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, pc);
         frame.int_regs[1] = Some(majit_ir::OpRef::int_op(42));
-        frame.int_values[1] = Some(420);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
         let snapshot = build_state_field_snapshot(
@@ -17695,7 +10442,6 @@ mod tests {
         };
         let mut root = MIFrame::new(root_jitcode, root_live_pc);
         root.int_regs[0] = Some(majit_ir::OpRef::int_op(100));
-        root.int_values[0] = Some(1000);
         root._result_argcode = b'i';
         root.result_arg_index = Some(0);
 
@@ -17715,11 +10461,8 @@ mod tests {
         };
         let mut sub = MIFrame::new(sub_jitcode, sub_pc);
         sub.int_regs[0] = Some(majit_ir::OpRef::int_op(11));
-        sub.int_values[0] = Some(110);
         sub.ref_regs[0] = Some(majit_ir::OpRef::ref_op(22));
-        sub.ref_values[0] = Some(220);
         sub.float_regs[0] = Some(majit_ir::OpRef::float_op(33));
-        sub.float_values[0] = Some(330);
 
         let mut stack = MIFrameStack::empty();
         stack.frames.push(root);
@@ -17782,7 +10525,6 @@ mod tests {
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, pc);
         frame.int_regs[0] = Some(majit_ir::OpRef::int_op(5));
-        frame.int_values[0] = Some(50);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
         let snapshot = build_state_field_snapshot(

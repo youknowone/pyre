@@ -2766,10 +2766,12 @@ mod tests {
 
         let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
         let descr: DescrRef = Arc::new(TestFailDescr(0));
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
+        let g = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
+        rec.materialize_into_ops();
+        rec.set_op_fail_args(g, &[i0, i1]);
 
         let trace = rec.get_trace();
         let guards: Vec<_> = trace.iter_guards().collect();
@@ -2977,7 +2979,7 @@ impl TraceCtx {
             }
         }
         // pyjitpl.py self.heapcache.replace_box(oldbox, newbox).
-        self.heap_cache.replace_box(oldbox, newbox);
+        self.heap_cache_mut().replace_box(oldbox, newbox);
     }
 
     /// Record a regular IR operation.
@@ -3023,9 +3025,9 @@ impl TraceCtx {
         let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
         let resbox =
             Self::do_record_op_with_descr(&mut self.recorder, OpCode::NewWithVtable, &[], descr);
-        self.heap_cache.new_object(resbox);
-        if let Some(class) = known_class {
-            self.heap_cache.class_now_known(resbox, class);
+        self.heap_cache_mut().new_object(resbox);
+        if known_class.is_some() {
+            self.heap_cache_mut().class_now_known(resbox);
         }
         resbox
     }
@@ -3076,7 +3078,9 @@ impl TraceCtx {
     }
 
     /// Look up a captured snapshot by `rd_resume_position` (byte offset).
-    pub fn get_snapshot(&self, id: i32) -> Option<&crate::recorder::Snapshot> {
+    /// Decodes `_snapshot_data` first (`opencoder.py get_snapshot_iter`).
+    pub fn get_snapshot(&mut self, id: i32) -> Option<&crate::recorder::Snapshot> {
+        self.ensure_snapshots_materialized();
         crate::recorder::Snapshot::by_resume_position(&self.snapshots, id)
     }
 
@@ -3569,11 +3573,11 @@ impl TraceCtx {
         &self.snapshots
     }
 
-    /// Op slice accessor — returns the raw recorded operations. After the
-    /// `TraceRecordBuffer` swap this materializes via `ByteTraceIter::next`
-    /// walking the byte stream. Call [`Self::ensure_ops_materialized`] first
-    /// when the live recorder is still in byte form.
-    pub fn ops(&self) -> &[majit_ir::OpRc] {
+    /// Op slice accessor — returns the recorded operations.
+    /// Walks `opencoder.Trace.get_iter` (`ByteTraceIter`) into `ops` so
+    /// a live byte recorder is readable without a parallel `Vec<Op>`.
+    pub fn ops(&mut self) -> &[majit_ir::OpRc] {
+        self.ensure_ops_materialized();
         self.recorder.ops()
     }
 
@@ -3738,7 +3742,13 @@ impl TraceCtx {
         if opref.is_constant() {
             return opref;
         }
-        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, promoted_box], num_live);
+        // Recorder-layer primitive only — `history.record2(rop.GUARD_VALUE,
+        // box, promoted_box, None)`. The snapshot is `generate_guard`'s
+        // `capture_resumedata` (`pyjitpl.py`), which lives on the MIFrame
+        // owner: dispatch `record_state_guard` / `implement_guard_value`,
+        // walker `walker_implement_guard_value`. Callers without a
+        // framestack record the op and leave `rd_resume_position == -1`.
+        self.record_guard(OpCode::GuardValue, &[opref, promoted_box], num_live);
         promoted_box
     }
 
@@ -3768,111 +3778,6 @@ impl TraceCtx {
     pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_float(runtime_value);
         self.implement_guard_value(opref, const_ref, num_live)
-    }
-
-    /// `pyjitpl.py generate_guard` + `:2610 capture_resumedata`:
-    /// record a guard AND attach a resume snapshot so the optimizer's
-    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) reads a
-    /// valid `rd_resume_position >= 0` — `resume.py:396-397` asserts that,
-    /// and the pyre port hard-panics a guard that reaches finish() with
-    /// neither a snapshot nor a patchguardop ancestor (`optimizeopt/mod.rs`). The
-    /// single-frame snapshot here is therefore **load-bearing**: removing
-    /// it (reverting to a bare `record_guard`, as on main) panics the
-    /// optimizer for these interpreter-side promotes.
-    ///
-    /// The frame `boxes` / `vable_boxes` / `vref_boxes` are empty because
-    /// `capture_resumedata` (`pyjitpl.py`) walks
-    /// `self.framestack` + `self.virtualizable_boxes` +
-    /// `self.virtualref_boxes`, and `TraceCtx` is the recorder-side trace
-    /// buffer — it holds no `MIFrameStack`, so the live boxes are not
-    /// reachable at this layer. The parity-complete capture lives at the
-    /// dispatch layer: `record_state_guard`
-    /// (`pyjitpl/dispatch.rs`) builds a full snapshot via
-    /// `build_state_field_snapshot(frames, …, virtualizable_boxes,
-    /// virtualref_boxes)` for the state-field JIT guards.
-    ///
-    /// The frame therefore carries no coordinate of its own: its
-    /// `jitcode_index` is [`crate::recorder::UNSTAMPED_JITCODE_INDEX`], the
-    /// reserved value meaning "the dispatch layer has not re-stamped this
-    /// yet". The callers of this path are the interpreter-side vable
-    /// promotes — `get_arrayitem_vable_index` (`trace_ctx.rs`) and the
-    /// `is_nonstandard_virtualizable` `isstandard` PTR_EQ (`trace_ctx.rs`,
-    /// `pyjitpl.rs`) — and the walker re-stamps the position of each guard
-    /// that survives (`walker_capture_inline_nonstandard_vable_guard`,
-    /// `resume_snapshot.rs`). A guard whose frame reaches the resume decoder
-    /// still holding the reserved index is a missed re-stamp, and
-    /// `frame_value_count_at` (`pyre-jit-trace`) names it there.
-    ///
-    /// This doc used to claim the empty boxes were safe, on the grounds
-    /// that every guard reaching here is constant-narrowed at optimization
-    /// time — "the array index is a function of the already-promoted-constant
-    /// `stackpos`" — so `optimize_guard_value` removes it (`optimizeopt/rewrite.rs`,
-    /// `actual == expected → Remove`) and it "never reaches the backend, so
-    /// these empty boxes are never numbered or consumed". **That was false,
-    /// and it is why the empty `vable_boxes` shipped as a defect.** It holds
-    /// for an index derived from a promoted-constant `stackpos`, which does
-    /// fold; it does not hold for a `[T; virt]` array subscripted by a
-    /// mutable runtime scalar (`state.tape[state.pointer]`), where the
-    /// `GUARD_VALUE` survives, is numbered, and encodes a **0-length vable
-    /// section**. Measured across the example crates: five shipped that
-    /// record and three of them had green suites, because a malformed resume
-    /// record is only observable through a guard that actually deopts.
-    ///
-    /// The vable-array index is now promoted at the walker instead, by
-    /// `implement_guard_value` (`pyjitpl/dispatch.rs`,
-    /// `pyjitpl.py`), which routes through `record_state_guard` and
-    /// therefore captures the live framestack AND the per-trace
-    /// virtualizable / virtualref boxes.
-    ///
-    /// That hoist narrows this path, it does not close it, and the
-    /// difference is worth stating because the doc above was already once
-    /// wrong in exactly this direction. `get_arrayitem_vable_index` still
-    /// carries its `promote_int` call; `implement_guard_value`'s Const arm
-    /// makes it fire only for an index that did not arrive constant. What the
-    /// hoist bought is that the `pyjitpl/dispatch.rs` family is const *by
-    /// construction* at all of its index reads. The
-    /// `jitcode_dispatch/vable_ops.rs` family is gated only on the index
-    /// having a recorded concrete value (`concrete_of_opref`), which a
-    /// non-constant `OpRef` can satisfy — and `MAJIT_VABLE_IDX_PROBE`'s own
-    /// caveat, beside that call, says a `NONCONST == 0` reading cannot
-    /// separate "that family is constant" from "that family was never
-    /// reached", because the const-by-construction callers dilute it.
-    ///
-    /// The minimal snapshot is load-bearing only for the
-    /// `rd_resume_position >= 0` invariant above. Do not read that as "the
-    /// contents do not matter": they matter to any guard that survives
-    /// optimization, and whether one survives is a property of the traced
-    /// program, not of this function. A promote whose argument might not
-    /// fold belongs at the dispatch layer, not here.
-    ///
-    /// The genuinely load-bearing promote (`state.<scalar> = promote(...)`)
-    /// does NOT use this path — it lowers to `BC_*_GUARD_VALUE →
-    /// record_state_guard → build_state_field_snapshot`
-    /// (`pyjitpl/dispatch.rs`), the full-framestack capture already at parity
-    /// with `generate_guard`. Threading the live framestack into this recorder
-    /// would only matter at framestack depth > 1 (inlined frames), which
-    /// cannot arise until the trace-into machinery exists; a partial box list
-    /// would otherwise positionally misalign the resume reader's per-frame
-    /// register layout, so the snapshot stays minimal.
-    fn record_guard_with_snapshot(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        num_live: usize,
-    ) -> OpRef {
-        let opref = self.record_guard(opcode, args, num_live);
-        let snapshot_idx = self.capture_resumedata(crate::recorder::Snapshot {
-            resume_position: -1,
-            frames: vec![crate::recorder::SnapshotFrame {
-                jitcode_index: crate::recorder::UNSTAMPED_JITCODE_INDEX,
-                pc: self.last_traced_pc as u32,
-                boxes: Vec::new(),
-            }],
-            vable_boxes: Vec::new(),
-            vref_boxes: Vec::new(),
-        });
-        self.recorder.set_last_op_resume_position(snapshot_idx);
-        opref
     }
 
     /// Record a call to an elidable (pure) function.
@@ -4017,7 +3922,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4233,7 +4138,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4625,7 +4530,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4683,7 +4588,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4841,7 +4746,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 OpCode::call_may_force_for_type(ret_type),
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -4892,7 +4797,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -5141,7 +5046,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -5381,7 +5286,7 @@ impl TraceCtx {
                 Some(majit_ir::Value::Int(n)) => Some(n),
                 _ => None,
             };
-            self.heap_cache.invalidate_caches_varargs(
+            self.heap_cache_mut().invalidate_caches_varargs(
                 opcode,
                 Some(call_descr.get_extra_info()),
                 &call_args,
@@ -5455,7 +5360,7 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
-        self.heap_cache.invalidate_caches_varargs(
+        self.heap_cache_mut().invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,
             args,
@@ -5534,7 +5439,7 @@ impl TraceCtx {
             _ => None,
         };
         let allboxes = call_arg_boxes(func_ref, args);
-        self.heap_cache.invalidate_caches_varargs(
+        self.heap_cache_mut().invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,
             &allboxes,

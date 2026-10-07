@@ -15,7 +15,7 @@
 
 use crate::jitexc::JitException;
 use indexmap::IndexMap;
-use majit_ir::{GcRef, OpCode};
+use majit_ir::{GcRef, OpCode, OpRef};
 
 /// blackhole.py:1068 parity: typed payload decoded from merge-point
 /// bytecode operands. Corresponds to the 6 lists in
@@ -1104,7 +1104,7 @@ impl BlackholeInterpreter {
         self.setposition(miframe.jitcode.clone(), miframe.pc);
         for i in 0..self.jitcode.num_regs_i() {
             expect_box_bank(miframe, i, majit_ir::Type::Int, &miframe.int_regs);
-            if let Some(val) = miframe.int_values.get(i).copied().flatten() {
+            if let Some(val) = miframe.int_value_for_blackhole(i) {
                 self.setarg_i(i, val);
             }
         }
@@ -1116,7 +1116,7 @@ impl BlackholeInterpreter {
         }
         for i in 0..self.jitcode.num_regs_f() {
             expect_box_bank(miframe, i, majit_ir::Type::Float, &miframe.float_regs);
-            if let Some(val) = miframe.float_values.get(i).copied().flatten() {
+            if let Some(val) = miframe.float_value_for_blackhole(i) {
                 self.setarg_f(i, val);
             }
         }
@@ -4691,8 +4691,8 @@ mod tests {
 
             // test_blackhole.py `pc = 1`, `registers_i = [40, 2, None]`.
             let mut frame = MIFrame::new(jitcode, second);
-            frame.int_values[0] = Some(40);
-            frame.int_values[1] = Some(2);
+            frame.int_regs[0] = Some(OpRef::const_int(40));
+            frame.int_regs[1] = Some(OpRef::const_int(2));
             let framestack = MIFrameStack::new(frame);
 
             let mut builder = BlackholeInterpBuilder::new();
@@ -4727,7 +4727,6 @@ mod tests {
             let jitcode = std::sync::Arc::new(jitcode);
             let mut frame = MIFrame::new(jitcode, 7);
             frame.ref_regs[0] = Some(OpRef::const_int(0x60));
-            frame.ref_values[0] = Some(0x60);
 
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
@@ -4747,7 +4746,6 @@ mod tests {
             let jitcode = std::sync::Arc::new(b.finish());
             let mut frame = MIFrame::new(jitcode, 0);
             frame.ref_regs[0] = Some(OpRef::const_ptr(GcRef(0xBEEF)));
-            frame.ref_values[0] = Some(0xDEAD);
 
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();

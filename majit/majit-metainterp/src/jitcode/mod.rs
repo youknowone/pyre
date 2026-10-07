@@ -764,8 +764,10 @@ impl JitCode {
     /// `blackhole.py bhimpl_jit_merge_point` reads the same lists off the
     /// opcode and raises `jitexc.ContinueRunningNormally` with those
     /// values, not with the raw register file. `None` when this body has
-    /// no portal marker (a helper or a test loop).
-    pub fn merge_point_green_regs(&self) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    /// no portal marker (a helper or a test loop). The slices are into
+    /// `self.code`; `assembler.py` encodes the same shape
+    /// `bhimpl_jit_merge_point` decodes.
+    pub fn merge_point_green_regs(&self) -> Option<(&[u8], &[u8], &[u8])> {
         let offset = self.exec.jit_merge_point_offset?;
         Some(decode_merge_point_green_regs(&self.code, offset))
     }
@@ -939,9 +941,9 @@ pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolic
 /// Green register bytes of `BC_JIT_MERGE_POINT(_C)`, in declaration order.
 ///
 /// The payload is `jdindex` then six `[len][reg…]` lists; only the three
-/// green lists are returned. `assembler.py` encodes the same shape
-/// `bhimpl_jit_merge_point` decodes.
-fn decode_merge_point_green_regs(code: &[u8], merge_offset: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+/// green lists are returned, as slices of `code`. `assembler.py` encodes
+/// the same shape `bhimpl_jit_merge_point` decodes.
+fn decode_merge_point_green_regs(code: &[u8], merge_offset: usize) -> (&[u8], &[u8], &[u8]) {
     use majit_jitcode::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
     let opcode = *code.get(merge_offset).unwrap_or_else(|| {
         panic!("jit_merge_point_offset {merge_offset} is outside the JitCode body")
@@ -951,24 +953,24 @@ fn decode_merge_point_green_regs(code: &[u8], merge_offset: usize) -> (Vec<u8>, 
         "jit_merge_point_offset {merge_offset} is not BC_JIT_MERGE_POINT(_C)"
     );
     let mut q = merge_offset + 2;
-    let mut read_list = || -> Vec<u8> {
-        let n = *code
-            .get(q)
-            .unwrap_or_else(|| panic!("BC_JIT_MERGE_POINT green list length is truncated at {q}"))
-            as usize;
-        q += 1;
-        let end = q + n;
+    let mut read_list = |q: &mut usize| -> &[u8] {
+        let offset = *q;
+        let n = *code.get(offset).unwrap_or_else(|| {
+            panic!("BC_JIT_MERGE_POINT green list length is truncated at {offset}")
+        }) as usize;
+        *q = offset + 1;
+        let end = *q + n;
         assert!(
             end <= code.len(),
-            "BC_JIT_MERGE_POINT green list is truncated at {q}+{n}"
+            "BC_JIT_MERGE_POINT green list is truncated at {offset}+{n}"
         );
-        let regs = code[q..end].to_vec();
-        q = end;
+        let regs = &code[*q..end];
+        *q = end;
         regs
     };
-    let gi = read_list();
-    let gr = read_list();
-    let gf = read_list();
+    let gi = read_list(&mut q);
+    let gr = read_list(&mut q);
+    let gf = read_list(&mut q);
     (gi, gr, gf)
 }
 

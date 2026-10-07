@@ -1517,7 +1517,7 @@ pub fn seed_bridge_virtualizable_boxes(
         }
     }
 
-    let Some((identity, slots)) = resume_data.virtualizable_values.split_first() else {
+    let Some((identity, slots)) = resume_data.virtualizable_boxes.split_first() else {
         return false;
     };
     // `resume.py virtualizable = self.next_ref()` — the first entry is a
@@ -1647,7 +1647,7 @@ mod tests {
         let num_failargs = fail_arg_types.len() as i32;
         crate::jit_state::ResumeDataResult {
             frames: Vec::new(),
-            virtualizable_values: Vec::new(),
+            virtualizable_boxes: Vec::new(),
             virtualref_values: Vec::new(),
             storage: None,
             num_failargs,
@@ -1736,7 +1736,7 @@ mod tests {
         let fail_values = [obj_ptr as usize as i64];
         let resume_data = crate::jit_state::ResumeDataResult {
             frames: Vec::new(),
-            virtualizable_values: vec![majit_ir::resumedata::RebuiltValue::Box(0, Type::Ref)],
+            virtualizable_boxes: vec![majit_ir::resumedata::RebuiltValue::Box(0, Type::Ref)],
             virtualref_values: Vec::new(),
             storage: None,
             num_failargs: 1,

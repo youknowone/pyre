@@ -10433,9 +10433,7 @@ fn emit_walker_instance<Sym: WalkSym>(
         instance,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
     );
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(instance, typeptr as *const _ as i64);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(instance);
     (instance, concrete_instance)
 }
 
@@ -10720,9 +10718,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[result, str_type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(result, str_type);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(result);
     }
     Ok(Some(inlined))
 }
@@ -13455,9 +13451,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         spec_census_record_instance_next_route_guard_keyed();
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(iter_op, iter_layout);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(iter_op);
 
     let next_const = ctx.trace_ctx.const_ref(w_next as i64);
     let executed_effects_before = fbw_executed_effect_count();
@@ -15968,9 +15962,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[result, result_type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(result, result_type);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(result);
     }
     Ok(Some(inlined))
 }
@@ -17915,7 +17907,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         // CALL.  The outer driver pushes it without another Rust `walk()`
         // activation.
         let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
-        snapshot_residual_heap_before_suspend::<Sym>(ctx.trace_ctx.heap_cache());
+        snapshot_residual_heap_before_suspend::<Sym>(&*ctx.trace_ctx.heap_cache());
         assert!(exchange.pending.replace(frame).is_none());
         return Err(DispatchError::SubWalkSuspended { pc });
     }

@@ -1707,23 +1707,25 @@ fn emit_traceback_node<Sym: WalkSym>(
         .ok_or_else(unavailable)?;
     let last_instr_descr = vinfo.static_field_descr(last_instr_index);
     // A traceback node names an inlined callee's frame as often as the walk's
-    // own, and a frame that is not `virtualizable_boxes[-1]` sends
-    // `vable_setfield` down the `_nonstandard_virtualizable` path, which mints
-    // a PTR_EQ promote `GuardValue` internally with no resume snapshot.  Every
-    // other vable emit site pairs the call with this capture for that reason;
-    // without it the promote reaches the decoder holding
-    // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
-    let guards_before = ctx.trace_ctx.num_guards();
+    // own. Promote the `_nonstandard_virtualizable` `isstandard` PTR_EQ
+    // through the walker `implement_guard_value` so the snapshot is complete
+    // when recorded.
     let write = vable_ops::with_replace_frames(ctx, |ctx| {
-        ctx.trace_ctx.vable_setfield(
+        let nonstandard = vable_ops::walker_nonstandard_virtualizable(
+            ctx,
             opcode_position,
             site.frame,
-            last_instr_descr,
+            &last_instr_descr,
+        )?;
+        Ok(ctx.trace_ctx.vable_setfield_checked(
+            nonstandard,
+            site.frame,
+            last_instr_descr.clone(),
             last_instr_value,
             Some(Value::Int(i64::from(site.last_instruction))),
-        )
-    });
-    walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
+        ))
+    })?;
+    let _ = write;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr_for(kind, user);
     ctx.trace_ctx.record_op_with_descr(
@@ -3116,7 +3118,7 @@ pub enum DispatchError {
     /// virtualizable frame box. Pyre's walker initializes Ref register
     /// slots to `OpRef::None`; an inlined callee frame may leave the vable
     /// register unseeded (documented walker arg-seeding gap). Both vable
-    /// accessors route through `is_nonstandard_virtualizable` →
+    /// accessors route through `begin_nonstandard_virtualizable` →
     /// `heapcache.nonstandard_virtualizables_now_known(box)`, which would
     /// feed `OpRef::None` (`raw() == u32::MAX`) into the dense heapcache
     /// flag `Vec<u32>`, resizing it to `u32::MAX + 1` (16 GiB). Surface as
@@ -3262,7 +3264,7 @@ pub enum DispatchError {
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
     /// `add_const_i` + patch at `finish()`), so an unresolved slot is a
     /// structural encoding bug, mirroring the `expect` on
-    /// `frame.int_values[slot]` in majit's `BC_LOOP_HEADER` arm
+    /// `frame.getint(ctx, slot)` in majit's `BC_LOOP_HEADER` arm
     /// (`pyjitpl/dispatch.rs`).
     LoopHeaderJdIndexUnresolved { pc: usize },
     /// An `inline_call_*` sub-walk surfaced `DispatchOutcome::CloseLoop`.
@@ -6479,9 +6481,7 @@ pub(crate) fn pin_nonconst_standing_exception_class<Sym: WalkSym>(
     ctx.trace_ctx
         .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(exc, exc_class_ptr as usize as i64);
+    ctx.trace_ctx.heap_cache_mut().class_now_known(exc);
     ctx.fbw_mode.class_of_last_exc_is_const = true;
     Ok(())
 }
@@ -9224,19 +9224,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // handler takes the latch. The adopters bridge the pre-drive publication
     // window and the blackhole drivers then install their own packed roots.
     //
-    // A `MIFrame` stores each Ref register twice — the `OpRef` box and the
-    // `ref_values` concrete mirror — and the two are kept fresh by two
-    // different walkers.  `MetaInterp::walk_active_trace_refs` forwards the
-    // boxes while a trace is being recorded; once the frames are latched here
-    // that walker no longer reaches them, so both halves are forwarded below.
-    // Forwarding only the mirror leaves whichever half a future reader picks
-    // deciding whether it sees a moved object, which is not a property a
-    // reader can check.
+    // A `MIFrame` stores each Ref register as the box itself. Once the
+    // frames are latched here, `MetaInterp::walk_active_trace_refs` no
+    // longer reaches them, so ConstPtr gcrefs are forwarded below.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
-        for value in latched.miframe.ref_values.iter_mut().flatten() {
-            visitor(unsafe { &mut *(value as *mut i64).cast() });
-        }
         for slot in latched.miframe.ref_regs.iter_mut() {
             if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                 visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
@@ -9260,10 +9252,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
         for frame in latched.framestack.frames.iter_mut() {
-            for value in frame.ref_values.iter_mut().flatten() {
-                visitor(unsafe { &mut *(value as *mut i64).cast() });
-            }
-            // Both halves, for the reason the single-frame arm gives.
             for slot in frame.ref_regs.iter_mut() {
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
@@ -10874,17 +10862,13 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
                     )
             });
         if already_this_class {
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj, type_addr);
+            ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
         } else {
             let type_const = ctx.trace_ctx.const_int(type_addr);
             ctx.trace_ctx
                 .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
             walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj, type_addr);
+            ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
         }
     }
     Ok(crate::trace_unbox_int(
@@ -10921,9 +10905,7 @@ fn walker_unbox_long<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, long_type_addr);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     let obj_concrete = walker_concrete_ref_object(ctx, obj);
     let fits_fn = pyre_object::longobject::jit_w_long_fits_int as *const ();
@@ -10974,9 +10956,7 @@ fn walker_unbox_float<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, float_type_addr);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     Ok(crate::trace_unbox_float(
         ctx.trace_ctx,
@@ -11127,20 +11107,14 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         _ => None,
     };
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
-        && ctx
-            .trace_ctx
-            .heap_cache()
-            .is_nullity_known(subject, walker_inline_const_word)
-            == Some(is_nonnull)
+        && ctx.trace_ctx.heapcache_nullity_known(subject) == Some(is_nonnull)
     {
         return Ok(());
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .nullity_now_known(subject, is_nonnull);
+        ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
@@ -11217,11 +11191,7 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
         return Ok(true);
     }
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
-        && ctx
-            .trace_ctx
-            .heap_cache()
-            .is_nullity_known(subject, walker_inline_const_word)
-            == Some(is_nonnull)
+        && ctx.trace_ctx.heapcache_nullity_known(subject) == Some(is_nonnull)
     {
         return Ok(true);
     }
@@ -11256,9 +11226,7 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .nullity_now_known(subject, is_nonnull);
+        ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
     walker_capture_snapshot_for_last_guard_scoped(
         ctx,
@@ -11391,7 +11359,8 @@ fn walker_guard_class<Sym: WalkSym>(
     // payload path: `jit_bigint_int_eq` then treats the intval as a
     // `*const BigInt`.  Skip only when the known class is this one, the
     // same compare `walker_guard_mapdict_instance_shape` already does.
-    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(type_addr) {
+    let known_cls = walker_concrete_ref_object(ctx, obj).map(|o| unsafe { (*o).ob_type as i64 });
+    if !(ctx.trace_ctx.heap_cache().is_class_known(obj) && known_cls == Some(type_addr)) {
         // `GuardClass` reads `ob_type` off `obj` (rpython/jit/backend/x86/
         // assembler.py `_cmp_guard_class` derefs the pointer with no tag
         // test), so the frontend must not hand it a tagged immediate. `obj`
@@ -11411,9 +11380,7 @@ fn walker_guard_class<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, type_addr);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     Ok(())
 }
@@ -11446,12 +11413,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // a contradictory pair is folded out by the optimizer's constant-class
     // handling, which discards the trace rather than reading a wild slot.
     let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
-    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(layout_type_addr) {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, layout_type_addr);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
 
     // `typedef.py _getusercls` gives a builtin user subclass a generated payload
@@ -11555,9 +11520,7 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(physical_type);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, physical_type);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     // The `GuardClass` above pins the payload, and for a receiver whose payload
     // determines its class there is nothing left for the `w_class` pin to
@@ -13213,9 +13176,7 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
         ctx.trace_ctx
             .set_opref_concrete(armed, Value::Ref(majit_ir::GcRef(0)));
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[armed])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .nullity_now_known(armed, false);
+        ctx.trace_ctx.heap_cache_mut().nullity_now_known(armed);
         return Ok(());
     }
     read_portal_debugdata(ctx, op_pc, frame_box, &info, field_index, 0)?;
@@ -13260,9 +13221,7 @@ fn read_portal_debugdata<Sym: WalkSym>(
         OpCode::GuardNonnull
     };
     walker_emit_guard_with_snapshot(ctx, op_pc, opcode, &[read])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .nullity_now_known(read, concrete != 0);
+    ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
     Ok(read)
 }
 
@@ -13376,9 +13335,7 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .nullity_now_known(read, false);
+    ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
     Ok(())
 }
 
@@ -13459,13 +13416,7 @@ fn establish_nullity<Sym: WalkSym>(
     // without reading the pointer. This is consulted before the concrete
     // shadow so a box whose nullity a prior guard proved still resolves even
     // when its Ref shadow is absent.
-    let known = ctx.trace_ctx.heap_cache().is_nullity_known(boxref, |op| {
-        op.inline_const_to_value().and_then(|v| match v {
-            Value::Int(n) => Some(n),
-            Value::Ref(gc) => Some(gc.0 as i64),
-            _ => None,
-        })
-    });
+    let known = ctx.trace_ctx.heapcache_nullity_known(boxref);
     if let Some(value) = known {
         ctx.trace_ctx.profiler().count_ops(
             OpCode::GuardNonnull,
@@ -13495,9 +13446,7 @@ fn establish_nullity<Sym: WalkSym>(
         let promoted = ctx.trace_ctx.const_ref(0);
         vable_ops::walker_replace_box(ctx, boxref, promoted);
     }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .nullity_now_known(boxref, value);
+    ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
     Ok(value)
 }
 
@@ -14368,13 +14317,7 @@ fn handle<Sym: WalkSym>(
         // Operand layout `r`: 1B ref reg.
         "assert_not_none/r" => {
             let opref = read_ref_reg(code, op, 0, ctx)?;
-            let known_nonnull = ctx.trace_ctx.heap_cache().is_nullity_known(opref, |op| {
-                op.inline_const_to_value().and_then(|value| match value {
-                    Value::Int(value) => Some(value),
-                    Value::Ref(value) => Some(value.0 as i64),
-                    _ => None,
-                })
-            }) == Some(true);
+            let known_nonnull = ctx.trace_ctx.heapcache_nullity_known(opref) == Some(true);
             let concrete = if known_nonnull {
                 0
             } else {
@@ -15085,9 +15028,7 @@ fn handle<Sym: WalkSym>(
                         ctx.trace_ctx
                             .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
                         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-                        ctx.trace_ctx
-                            .heap_cache_mut()
-                            .class_now_known(exc, exc_class_ptr as usize as i64);
+                        ctx.trace_ctx.heap_cache_mut().class_now_known(exc);
                     }
                 }
             }
@@ -15216,22 +15157,16 @@ fn handle<Sym: WalkSym>(
             let exc = ctx
                 .last_exc_value()
                 .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
-            let typeptr = if let Some(cls) = ctx.trace_ctx.heap_cache().get_known_class(exc) {
-                cls
-            } else {
-                let exc_ptr = match ctx.last_exc_value_concrete() {
-                    ConcreteValue::Ref(p) if !p.is_null() => p,
-                    _ => {
-                        return Err(DispatchError::LastExceptionWithoutActiveException {
-                            pc: op.pc,
-                        });
-                    }
-                };
-                unsafe {
-                    (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
-                        .ob_header
-                        .ob_type as i64
+            let exc_ptr = match ctx.last_exc_value_concrete() {
+                ConcreteValue::Ref(p) if !p.is_null() => p,
+                _ => {
+                    return Err(DispatchError::LastExceptionWithoutActiveException { pc: op.pc });
                 }
+            };
+            let typeptr = unsafe {
+                (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
+                    .ob_header
+                    .ob_type as i64
             };
             let dst = code[op.pc + 1] as usize;
             let cls_const = ctx.trace_ctx.const_int(typeptr);

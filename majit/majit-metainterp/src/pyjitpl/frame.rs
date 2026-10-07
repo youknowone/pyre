@@ -14,51 +14,20 @@ use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
 use crate::recorder::SnapshotTagged;
 
-/// Map an int register (OpRef, concrete value) to an `OpBox`.
-/// Constant OpRefs materialize as `ConstInt(value)`; real trace slots
-/// materialize as `ResOp(opref.raw())`. `OpRef.raw()` of a value op *is*
-/// the TAGBOX `_index` (`FrontendOp.get_position()`). Mirrors RPython's
-/// implicit isinstance dispatch in `_encode(box)` when the caller passes
-/// `self.registers_i[index]` (which is already a `ConstInt` /
-/// `InputArg` / `AbstractResOp`).
+/// Encode one register box for `_encode`. Constants carry their value
+/// inline (`ConstInt.getint` / `ConstPtr.getref_base` /
+/// `ConstFloat.getfloat_storage`); a value op / inputarg is TAGBOX
+/// (`FrontendOp.get_position()`).
 #[inline]
-fn register_to_box_int(opref: OpRef, value: i64) -> OpBox {
-    if opref.is_constant() {
-        OpBox::ConstInt(value)
-    } else {
-        OpBox::ResOp(opref.raw())
-    }
-}
-
-/// Map a ref register (OpRef, concrete address) to an `OpBox`.
-/// `value` stores the raw address of the GC ref (cast to i64 at write
-/// time).
-#[inline]
-fn register_to_box_ref(opref: OpRef, value: i64) -> OpBox {
-    if opref.is_constant() {
-        // history.py `ConstPtr.value` is the single object field. The
-        // forwarded gcref lives in the inline `OpRef::ConstPtr` payload
-        // (`ref_regs[i]`, updated in place by `walk_active_trace_refs`), so
-        // read it from `opref` rather than the unforwarded `ref_values`
-        // mirror, which is stale after a moving collection.
-        let bits = match opref {
-            OpRef::ConstPtr(gcref) => gcref.0 as u64,
-            _ => value as u64,
-        };
-        OpBox::ConstPtr(bits)
-    } else {
-        OpBox::ResOp(opref.raw())
-    }
-}
-
-/// Map a float register (OpRef, raw bits) to an `OpBox`.
-/// `value` stores the bit-casted `f64` payload.
-#[inline]
-fn register_to_box_float(opref: OpRef, value: i64) -> OpBox {
-    if opref.is_constant() {
-        OpBox::ConstFloat(value as u64)
-    } else {
-        OpBox::ResOp(opref.raw())
+fn register_to_box(opref: OpRef) -> OpBox {
+    match opref.inline_const_to_value() {
+        Some(majit_ir::Value::Int(v)) => OpBox::ConstInt(v),
+        Some(majit_ir::Value::Float(f)) => OpBox::ConstFloat(f.to_bits()),
+        Some(majit_ir::Value::Ref(g)) => OpBox::ConstPtr(g.as_usize() as u64),
+        Some(majit_ir::Value::Void) => {
+            panic!("register_to_box: constant {opref:?} has Void type")
+        }
+        None => OpBox::ResOp(opref.raw()),
     }
 }
 
@@ -89,11 +58,8 @@ pub struct MIFrame {
     /// the host records the Python traceback for this frame.
     pub last_opcode_position: usize,
     pub int_regs: Vec<Option<OpRef>>,
-    pub int_values: Vec<Option<i64>>,
     pub ref_regs: Vec<Option<OpRef>>,
-    pub ref_values: Vec<Option<i64>>,
     pub float_regs: Vec<Option<OpRef>>,
-    pub float_values: Vec<Option<i64>>,
     pub inline_frame: bool,
     /// \[FR\] Saved caller sym scalar/fixed-array state for a recursive-portal
     /// INLINE frame; restored into the shared sym when the frame returns so the
@@ -190,11 +156,8 @@ impl MIFrame {
             code_cursor: 0,
             last_opcode_position: pc,
             int_regs: vec![None; regs_and_consts_i],
-            int_values: vec![None; regs_and_consts_i],
             ref_regs: vec![None; regs_and_consts_r],
-            ref_values: vec![None; regs_and_consts_r],
             float_regs: vec![None; regs_and_consts_f],
-            float_values: vec![None; regs_and_consts_f],
             inline_frame: false,
             portal_scalar_state: None,
             portal_entered: false,
@@ -217,29 +180,105 @@ impl MIFrame {
     ///
     /// The symbolic register is the owner, just as the Box is upstream.  A
     /// `ConstPtr` carries its GC-traced value inline and
-    /// `MetaInterp::walk_active_trace_refs` forwards that field in place;
-    /// `ref_values` is only pyre's concrete execution mirror and may still
-    /// contain the from-space address.  Non-constant frontend boxes keep
-    /// using the mirror, which the active-trace walker refreshes from the
-    /// Box-attached concrete value after every collection.
-    pub(crate) fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
-        match self.ref_regs.get(index).copied().flatten() {
-            Some(OpRef::ConstPtr(gcref)) => Some(gcref.0 as i64),
-            Some(_) | None => self.ref_values.get(index).copied().flatten(),
-        }
+    /// `MetaInterp::walk_active_trace_refs` forwards that field in place.
+    /// Non-constant boxes are rewritten to `ConstPtr` at abort
+    /// (`freeze_values_into_const_boxes`) so this read does not need the
+    /// recorder after `abort_trace`.
+    pub fn int_value_for_blackhole(&self, index: usize) -> Option<i64> {
+        self.int_regs
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|op| op.inline_const_to_value())
+            .map(|v| v.as_raw_i64())
     }
 
-    /// Publish a forwarding update into both halves of a Ref register.
+    pub fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
+        self.ref_regs
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|op| op.inline_const_to_value())
+            .map(|v| v.as_raw_i64())
+    }
+
+    pub fn float_value_for_blackhole(&self, index: usize) -> Option<i64> {
+        self.float_regs
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|op| op.inline_const_to_value())
+            .map(|v| v.as_raw_i64())
+    }
+
+    /// Publish a forwarding update into a Ref register's ConstPtr box.
     ///
     /// The packed blackhole-entry root array can itself be forwarded before
-    /// `_copy_data_from_miframe` runs.  Updating only `ref_values` would leave
-    /// the authoritative inline `ConstPtr.value` stale, so keep the Box owner
-    /// and the execution mirror in lockstep.
-    pub(crate) fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
-        self.ref_values[index] = Some(value);
+    /// `_copy_data_from_miframe` runs.  `ConstPtr.value` is the owner.
+    pub fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
         if let Some(OpRef::ConstPtr(gcref)) = self.ref_regs[index].as_mut() {
             *gcref = majit_ir::GcRef(value as usize);
         }
+    }
+
+    /// Rewrite non-constant register boxes to inline Consts so
+    /// `getint()` / `getref_base()` survive `abort_trace` dropping the
+    /// recorder. `IntOp.getint` lives on the FrontendOp; blackhole
+    /// copies after abort need that value on the box that remains in
+    /// the register (`pyjitpl.py` `registers_i[i]` is that object).
+    pub fn freeze_values_into_const_boxes(&mut self, ctx: &crate::trace_ctx::TraceCtx) {
+        for slot in &mut self.int_regs {
+            if let Some(op) = *slot
+                && !op.is_constant()
+                && let Some(v) = ctx.box_bits(op)
+            {
+                *slot = Some(OpRef::const_int(v));
+            }
+        }
+        for slot in &mut self.ref_regs {
+            if let Some(op) = *slot
+                && !op.is_constant()
+                && let Some(v) = ctx.box_bits(op)
+            {
+                *slot = Some(OpRef::const_ptr(majit_ir::GcRef(v as usize)));
+            }
+        }
+        for slot in &mut self.float_regs {
+            if let Some(op) = *slot
+                && !op.is_constant()
+                && let Some(v) = ctx.box_bits(op)
+            {
+                *slot = Some(OpRef::const_float(f64::from_bits(v as u64)));
+            }
+        }
+    }
+
+    /// `IntOp.getint` / `ConstInt.getint` / `InputArgInt.getint` for one
+    /// int register.
+    pub fn getint(&self, ctx: &crate::trace_ctx::TraceCtx, index: usize) -> Option<i64> {
+        self.int_regs
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|op| ctx.box_bits(op))
+    }
+
+    /// `RefOp.getref_base` / `ConstPtr.getref_base` / `InputArgRef.getref_base`.
+    pub fn getref_base(&self, ctx: &crate::trace_ctx::TraceCtx, index: usize) -> Option<i64> {
+        self.ref_regs
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|op| ctx.box_bits(op))
+    }
+
+    /// `FloatOp.getfloat_storage` / `ConstFloat.getfloat_storage`.
+    pub fn getfloat_storage(&self, ctx: &crate::trace_ctx::TraceCtx, index: usize) -> Option<i64> {
+        self.float_regs
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|op| ctx.box_bits(op))
     }
 
     /// RPython `pyjitpl.py` `MIFrame.setup(jitcode, greenkey=None)`.
@@ -295,16 +334,10 @@ impl MIFrame {
         self.last_opcode_position = pc;
         self.int_regs.resize(regs_and_consts_i, None);
         self.int_regs.fill(None);
-        self.int_values.resize(regs_and_consts_i, None);
-        self.int_values.fill(None);
         self.ref_regs.resize(regs_and_consts_r, None);
         self.ref_regs.fill(None);
-        self.ref_values.resize(regs_and_consts_r, None);
-        self.ref_values.fill(None);
         self.float_regs.resize(regs_and_consts_f, None);
         self.float_regs.fill(None);
-        self.float_values.resize(regs_and_consts_f, None);
-        self.float_values.fill(None);
         self.inline_frame = false;
         self.portal_scalar_state = None;
         self.portal_entered = false;
@@ -618,9 +651,9 @@ impl MIFrame {
     /// this inline right after sizing the register arrays to
     /// `num_regs_and_consts_X`.
     ///
-    /// pyre stores an `OpRef` + concrete `i64` pair per slot; `ctx` is
-    /// needed to intern the const into the trace context's constant pool
-    /// before the opref is written into the register file.
+    /// pyre stores the Const box in the register; `ctx` interns it into
+    /// the trace context's constant pool. The value lives on the box
+    /// (`ConstInt.value`).
     pub fn copy_constants(&mut self, ctx: &mut crate::trace_ctx::TraceCtx) {
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
         for (i, &value) in self.jitcode.constants_i.iter().enumerate() {
@@ -628,20 +661,17 @@ impl MIFrame {
             #[cfg(feature = "jit-audits")]
             majit_ir::reg_write_audit::note_int_write(self.int_regs.as_ptr() as usize, slot, None);
             self.int_regs[slot] = Some(ctx.const_int(value));
-            self.int_values[slot] = Some(value);
         }
         let num_regs_r = self.jitcode.c_num_regs_r as usize;
         for i in 0..self.jitcode.constants_r.len() {
             let value = self.jitcode.constants_r[i].get();
             let slot = num_regs_r + i;
             self.ref_regs[slot] = Some(ctx.const_ref(value));
-            self.ref_values[slot] = Some(value);
         }
         let num_regs_f = self.jitcode.c_num_regs_f as usize;
         for (i, &value) in self.jitcode.constants_f.iter().enumerate() {
             let slot = num_regs_f + i;
             self.float_regs[slot] = Some(ctx.const_float(value));
-            self.float_values[slot] = Some(value);
         }
     }
 
@@ -661,13 +691,10 @@ impl MIFrame {
     /// Iterates `0..num_regs_r()` (RPython skips the constants area
     /// that lives past `num_regs_r`); pyre's `ref_regs` is sized
     /// exactly to `num_regs_r` so the loop scans the same slots.
-    /// `ref_values` is cleared in lockstep — it is the pyre-only
-    /// concrete-value mirror that lives next to each box.
     pub fn cleanup_registers(&mut self) {
         let num_regs_r = self.jitcode.num_regs_r();
         for i in 0..num_regs_r {
             self.ref_regs[i] = None;
-            self.ref_values[i] = None;
         }
         self.pushed_box = None;
     }
@@ -693,18 +720,24 @@ impl MIFrame {
             opcode = code[position];
         }
         if op_rvmprof_code >= 0 && opcode == op_rvmprof_code as u8 {
-            let arg1 = self.int_values[code[position + 1] as usize].unwrap_or_else(|| {
-                panic!(
-                    "handle_rvmprof_enter_on_resume: registers_i[{}] has no int",
-                    code[position + 1]
-                )
-            });
-            let arg2 = self.int_values[code[position + 2] as usize].unwrap_or_else(|| {
-                panic!(
-                    "handle_rvmprof_enter_on_resume: registers_i[{}] has no int",
-                    code[position + 2]
-                )
-            });
+            let arg1 = self.int_regs[code[position + 1] as usize]
+                .and_then(|op| op.inline_const_to_value())
+                .map(|v| v.as_raw_i64())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "handle_rvmprof_enter_on_resume: registers_i[{}] has no int",
+                        code[position + 1]
+                    )
+                });
+            let arg2 = self.int_regs[code[position + 2] as usize]
+                .and_then(|op| op.inline_const_to_value())
+                .map(|v| v.as_raw_i64())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "handle_rvmprof_enter_on_resume: registers_i[{}] has no int",
+                        code[position + 2]
+                    )
+                });
             if arg1 == 1 {
                 // pyjitpl.py `cintf.jit_rvmprof_code(0, arg2)`.
                 majit_rlib::rvmprof::cintf::jit_rvmprof_code(0, arg2);
@@ -723,7 +756,7 @@ impl MIFrame {
         kind: JitArgKind,
         target_index: usize,
         opref: OpRef,
-        concrete: i64,
+        _concrete: i64,
     ) {
         #[cfg(debug_assertions)]
         {
@@ -767,15 +800,12 @@ impl MIFrame {
                     Some(opref),
                 );
                 self.int_regs[target_index] = Some(opref);
-                self.int_values[target_index] = Some(concrete);
             }
             JitArgKind::Ref => {
                 self.ref_regs[target_index] = Some(opref);
-                self.ref_values[target_index] = Some(concrete);
             }
             JitArgKind::Float => {
                 self.float_regs[target_index] = Some(opref);
-                self.float_values[target_index] = Some(concrete);
             }
         }
     }
@@ -835,9 +865,9 @@ impl MIFrame {
         // well-defined placeholder instead of pre-call stale data.
         //
         // When `clear_result_register` is set we mirror RPython exactly:
-        // mint the zero constant, write it into the register slot (and
-        // the parallel `*_values` mirror), and let the bank loop below
-        // emit it through the normal register → OpBox path.  This makes
+        // mint the zero constant, write it into the register slot, and
+        // let the bank loop below emit it through the normal register →
+        // OpBox path.  This makes
         // a subsequent `get_list_of_active_boxes` (e.g. a re-snapshot
         // of the same in-flight call before `make_result_of_lastop`)
         // see the cleared slot rather than the pre-call stale contents.
@@ -867,19 +897,16 @@ impl MIFrame {
                             Some(opref),
                         );
                         self.int_regs[index] = Some(opref);
-                        self.int_values[index] = Some(0);
                         (None, None, None)
                     }
                     b'r' => {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
-                        self.ref_values[index] = Some(0);
                         (None, None, None)
                     }
                     b'f' => {
                         let opref = OpRef::const_float(0.0);
                         self.float_regs[index] = Some(opref);
-                        self.float_values[index] = Some(0);
                         (None, None, None)
                     }
                     _ => (None, None, None),
@@ -945,9 +972,7 @@ impl MIFrame {
                 } else if idx < num_regs_i {
                     let opref = self.int_regs[idx]
                         .expect("get_list_of_active_boxes: int register uninitialized");
-                    let value = self.int_values[idx]
-                        .expect("get_list_of_active_boxes: int value uninitialized");
-                    register_to_box_int(opref, value)
+                    register_to_box(opref)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_i, ...,
                     // ConstInt)` — constants live in the `[num_regs_i ..
@@ -974,9 +999,7 @@ impl MIFrame {
                     // pyjitpl.py `add_box_to_storage(self.registers_r[index])`
                     let opref = self.ref_regs[idx]
                         .expect("get_list_of_active_boxes: ref register uninitialized");
-                    let value = self.ref_values[idx]
-                        .expect("get_list_of_active_boxes: ref value uninitialized");
-                    register_to_box_ref(opref, value)
+                    register_to_box(opref)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
@@ -999,9 +1022,7 @@ impl MIFrame {
                 } else if idx < num_regs_f {
                     let opref = self.float_regs[idx]
                         .expect("get_list_of_active_boxes: float register uninitialized");
-                    let value = self.float_values[idx]
-                        .expect("get_list_of_active_boxes: float value uninitialized");
-                    register_to_box_float(opref, value)
+                    register_to_box(opref)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_f,
                     // ..., ConstFloat)` — `constants_f[i]` stores the
@@ -1052,17 +1073,14 @@ impl MIFrame {
                             Some(opref),
                         );
                         self.int_regs[index] = Some(opref);
-                        self.int_values[index] = Some(0);
                     }
                     b'r' => {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
-                        self.ref_values[index] = Some(0);
                     }
                     b'f' => {
                         let opref = OpRef::const_float(0.0);
                         self.float_regs[index] = Some(opref);
-                        self.float_values[index] = Some(0);
                     }
                     _ => {}
                 }
@@ -1195,10 +1213,8 @@ impl MIFrame {
                         idx,
                         opref,
                     );
-                    let value = self.int_values[idx]
-                        .expect("get_list_of_active_snapshot_boxes: int value uninitialized");
-                    if opref.is_constant() {
-                        SnapshotTagged::Const(value, Type::Int)
+                    if let Some(v) = opref.inline_const_to_value() {
+                        SnapshotTagged::Const(v.as_raw_i64(), Type::Int)
                     } else {
                         SnapshotTagged::Box(opref, Type::Int)
                     }
@@ -1223,17 +1239,8 @@ impl MIFrame {
                         "get_list_of_active_snapshot_boxes: ref register {idx} uninitialized in {} (pc={}, cursor={}, in_a_call={in_a_call}, after_residual_call={after_residual_call}, refs={:?})",
                         self.jitcode.name(), self.pc, self.code_cursor, self.ref_regs,
                     ));
-                    let value = self.ref_values[idx]
-                        .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
-                    if opref.is_constant() {
-                        // history.py `ConstPtr.value` — take the forwarded
-                        // gcref from the inline `OpRef::ConstPtr`, not the
-                        // unforwarded `ref_values` mirror (stale after a move).
-                        let bits = match opref {
-                            OpRef::ConstPtr(gcref) => gcref.0 as i64,
-                            _ => value,
-                        };
-                        SnapshotTagged::Const(bits, Type::Ref)
+                    if let Some(v) = opref.inline_const_to_value() {
+                        SnapshotTagged::Const(v.as_raw_i64(), Type::Ref)
                     } else {
                         SnapshotTagged::Box(opref, Type::Ref)
                     }
@@ -1257,10 +1264,8 @@ impl MIFrame {
                 } else if idx < num_regs_f {
                     let opref = self.float_regs[idx]
                         .expect("get_list_of_active_snapshot_boxes: float register uninitialized");
-                    let value = self.float_values[idx]
-                        .expect("get_list_of_active_snapshot_boxes: float value uninitialized");
-                    if opref.is_constant() {
-                        SnapshotTagged::Const(value, Type::Float)
+                    if let Some(v) = opref.inline_const_to_value() {
+                        SnapshotTagged::Const(v.as_raw_i64(), Type::Float)
                     } else {
                         SnapshotTagged::Box(opref, Type::Float)
                     }
@@ -1352,11 +1357,9 @@ impl MIFrame {
                         self.int_regs[index],
                     );
                     callee.int_regs[i] = self.int_regs[index];
-                    callee.int_values[i] = self.int_values[index];
                 }
                 b'R' => {
                     callee.ref_regs[i] = self.ref_regs[index];
-                    callee.ref_values[i] = self.ref_values[index];
                 }
                 b'F' => {
                     if i >= callee.float_regs.len() || index >= self.float_regs.len() {
@@ -1369,7 +1372,6 @@ impl MIFrame {
                         );
                     }
                     callee.float_regs[i] = self.float_regs[index];
-                    callee.float_values[i] = self.float_values[index];
                 }
                 other => panic!("fill_registers: argcode {other} is not I, R, or F"),
             }
@@ -1391,20 +1393,17 @@ impl MIFrame {
         }
         if self.int_regs.len() < need_i {
             self.int_regs.resize(need_i, None);
-            self.int_values.resize(need_i, None);
         }
         if self.ref_regs.len() < need_r {
             self.ref_regs.resize(need_r, None);
-            self.ref_values.resize(need_r, None);
         }
         if self.float_regs.len() < need_f {
             self.float_regs.resize(need_f, None);
-            self.float_values.resize(need_f, None);
         }
         let mut count_i = 0;
         let mut count_r = 0;
         let mut count_f = 0;
-        for (kind, value, concrete) in argboxes {
+        for (kind, value, _concrete) in argboxes {
             match kind {
                 JitArgKind::Int => {
                     #[cfg(feature = "jit-audits")]
@@ -1414,17 +1413,14 @@ impl MIFrame {
                         Some(*value),
                     );
                     self.int_regs[count_i] = Some(*value);
-                    self.int_values[count_i] = Some(*concrete);
                     count_i += 1;
                 }
                 JitArgKind::Ref => {
                     self.ref_regs[count_r] = Some(*value);
-                    self.ref_values[count_r] = Some(*concrete);
                     count_r += 1;
                 }
                 JitArgKind::Float => {
                     self.float_regs[count_f] = Some(*value);
-                    self.float_values[count_f] = Some(*concrete);
                     count_f += 1;
                 }
             }
@@ -1545,19 +1541,16 @@ mod tests {
     }
 
     #[test]
-    fn ref_value_for_blackhole_prefers_forwarded_constptr_over_stale_mirror() {
+    fn ref_value_for_blackhole_reads_constptr_owner() {
         let jitcode = make_jitcode_with_regs(0, 2, 0);
         let mut frame = MIFrame::new(jitcode, 0);
         frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xBEEF)));
-        frame.ref_values[0] = Some(0xDEAD);
         frame.ref_regs[1] = Some(OpRef::ref_op(7));
-        frame.ref_values[1] = Some(0xCAFE);
 
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
-        assert_eq!(frame.ref_value_for_blackhole(1), Some(0xCAFE));
+        assert_eq!(frame.ref_value_for_blackhole(1), None);
 
         frame.set_forwarded_ref_value(0, 0xF00D);
-        assert_eq!(frame.ref_values[0], Some(0xF00D));
         assert_eq!(
             frame.ref_regs[0],
             Some(OpRef::const_ptr(majit_ir::GcRef(0xF00D)))
@@ -1580,15 +1573,10 @@ mod tests {
 
         assert_eq!(frame.pc, 0);
         assert_eq!(frame.int_regs[0], Some(OpRef::int_op(10)));
-        assert_eq!(frame.int_values[0], Some(100));
         assert_eq!(frame.int_regs[1], Some(OpRef::int_op(11)));
-        assert_eq!(frame.int_values[1], Some(101));
         assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(20)));
-        assert_eq!(frame.ref_values[0], Some(200));
         assert_eq!(frame.ref_regs[1], Some(OpRef::ref_op(21)));
-        assert_eq!(frame.ref_values[1], Some(201));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(30)));
-        assert_eq!(frame.float_values[0], Some(300));
     }
 
     #[test]
@@ -1659,10 +1647,8 @@ mod tests {
         let mut frame = MIFrame::new(jitcode, 0);
         // int_regs[0] non-constant OpRef::int_op(5) → Box::ResOp(5).
         frame.int_regs[0] = Some(OpRef::int_op(5));
-        frame.int_values[0] = Some(0);
         // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
         frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xdead_beef)));
-        frame.ref_values[0] = Some(0xdead_beef);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(16, sd);
@@ -1742,7 +1728,6 @@ mod tests {
         frame._result_argcode = b'i';
         // Pre-call stale contents — must NOT leak into the snapshot.
         frame.int_regs[0] = Some(OpRef::int_op(777));
-        frame.int_values[0] = Some(666);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(1, sd);
@@ -1797,7 +1782,6 @@ mod tests {
         let mut frame = MIFrame::new(jitcode_arc, live_pc);
         frame._result_argcode = b'i';
         frame.int_regs[0] = Some(OpRef::int_op(777));
-        frame.int_values[0] = Some(666);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(1, sd);
@@ -1818,7 +1802,7 @@ mod tests {
             cleared.is_constant(),
             "cleared register must be a constant OpRef"
         );
-        assert_eq!(frame.int_values[0], Some(0));
+        assert_eq!(frame.int_value_for_blackhole(0), Some(0));
         assert_eq!(frame._result_argcode, b'?');
     }
 
@@ -1849,9 +1833,7 @@ mod tests {
         let mut frame = MIFrame::new(jitcode_arc, live_pc);
         frame._result_argcode = b'i';
         frame.int_regs[0] = Some(OpRef::int_op(10)); // cleared — not listed.
-        frame.int_values[0] = Some(999);
         frame.int_regs[1] = Some(OpRef::int_op(11)); // live — recorded as ResOp(11).
-        frame.int_values[1] = Some(42);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(2, sd);
@@ -1911,7 +1893,6 @@ mod tests {
 
         let mut frame = MIFrame::new(jitcode_arc, current_pc);
         frame.int_regs[0] = Some(OpRef::int_op(5)); // real register — not referenced.
-        frame.int_values[0] = Some(99);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut trace = TraceRecordBuffer::new(1, sd);
@@ -1941,23 +1922,17 @@ mod tests {
         let jitcode = make_jitcode_with_regs(2, 2, 1);
         let mut frame = MIFrame::new(jitcode.clone(), 0);
         frame.int_regs[0] = Some(OpRef::int_op(1));
-        frame.int_values[0] = Some(11);
         frame.ref_regs[0] = Some(OpRef::ref_op(2));
-        frame.ref_values[0] = Some(22);
         frame.float_regs[0] = Some(OpRef::float_op(3));
-        frame.float_values[0] = Some(33);
         frame.pushed_box = Some(OpRef::int_op(99));
 
         frame.cleanup_registers();
 
         // pyjitpl.py cleanup_registers: int and float slots are untouched.
         assert_eq!(frame.int_regs[0], Some(OpRef::int_op(1)));
-        assert_eq!(frame.int_values[0], Some(11));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(3)));
-        assert_eq!(frame.float_values[0], Some(33));
         // pyjitpl.py:124-126: ref slots [0, num_regs_r()) are cleared.
         assert!(frame.ref_regs.iter().all(|r| r.is_none()));
-        assert!(frame.ref_values.iter().all(|v| v.is_none()));
         // pyjitpl.py:127: pushed_box is reset to None.
         assert_eq!(frame.pushed_box, None);
     }
@@ -1979,12 +1954,10 @@ mod tests {
         let mut callee = MIFrame::new(callee_jc, 0);
         for i in 0..9 {
             caller.int_regs[i] = Some(OpRef::int_op(10 + i as u32));
-            caller.int_values[i] = Some(100 + i as i64);
         }
         caller.fill_registers(&mut callee, 9, b'I');
         for i in 0..9 {
             assert_eq!(callee.int_regs[i], Some(OpRef::int_op(10 + i as u32)));
-            assert_eq!(callee.int_values[i], Some(100 + i as i64));
         }
         assert_eq!(caller.code_cursor, 9);
     }
@@ -2047,17 +2020,14 @@ mod tests {
         frame.pc = 0;
         frame.make_result_of_lastop(JitArgKind::Int, 1, OpRef::int_op(7), 77);
         assert_eq!(frame.int_regs[1], Some(OpRef::int_op(7)));
-        assert_eq!(frame.int_values[1], Some(77));
 
         frame.pc = 1;
         frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef::ref_op(8), 88);
         assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(8)));
-        assert_eq!(frame.ref_values[0], Some(88));
 
         frame.pc = 2;
         frame.make_result_of_lastop(JitArgKind::Float, 0, OpRef::float_op(9), 99);
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(9)));
-        assert_eq!(frame.float_values[0], Some(99));
     }
 
     #[test]
@@ -2154,9 +2124,12 @@ mod tests {
         assert_eq!(frame._result_argcode, b'v');
         assert_eq!(frame.parent_snapshot, -1);
         assert_eq!(frame.unroll_iterations, 1);
-        assert_eq!(frame.int_values[1], Some(123));
-        assert_eq!(frame.ref_values[1], Some(0x1234));
-        assert_eq!(frame.float_values[1], Some(1.5f64.to_bits() as i64));
+        assert_eq!(frame.int_value_for_blackhole(1), Some(123));
+        assert_eq!(frame.ref_value_for_blackhole(1), Some(0x1234));
+        assert_eq!(
+            frame.float_value_for_blackhole(1),
+            Some(1.5f64.to_bits() as i64)
+        );
         assert!(frame.int_regs[1].is_some());
         assert!(frame.ref_regs[1].is_some());
         assert!(frame.float_regs[1].is_some());
