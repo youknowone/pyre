@@ -374,6 +374,31 @@ fn p2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
+fn p3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: fn(A1, A2, A3) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn p5<
+    A1: ResidualSlot,
+    A2: ResidualSlot,
+    A3: ResidualSlot,
+    A4: ResidualSlot,
+    A5: ResidualSlot,
+    R: ResidualRet,
+>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: fn(A1, A2, A3, A4, A5) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
 fn pa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     module_path: &'static str,
@@ -1428,6 +1453,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::opcode_ops::list_extend_value",
         crate::opcode_ops::jit_opcode_ops_list_extend_value,
+    );
+    // BUILD_MAP's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+    // The graph is `dict_display_setitem`; this bridge is the one-word address
+    // blackhole calls.
+    cp3(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::dict_display_setitem",
+        crate::opcode_ops::jit_baseobjspace_dict_display_setitem,
     );
     cp1(
         &mut entries,
@@ -5028,6 +5061,82 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::ll_int_py_mod",
         crate::objspace::descroperation::ll_int_py_mod,
     );
+    // `dict_count_py_div` carries `#[oopspec("int.py_div(x, y)")]`.
+    // `register_macro_helper_trace_fnaddr` binds the crate-qualified
+    // path `target_to_path` emits, and the stripped / `crate::`
+    // spellings beside it. The blackhole executes this pointer to
+    // learn the quotient before `optimize_call_int_py_div` removes
+    // the call.
+    p2(
+        &mut entries,
+        "pyre_object::rordereddict::dict_count_py_div",
+        pyre_object::rordereddict::dict_count_py_div,
+    );
+    // `ll_dict_resize.oopspec = 'odict.resize(d)'` residual. The int-key
+    // monomorph is `IntDictStorage`.
+    p1(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_resize",
+        pyre_object::rordereddict::ll_dict_resize
+            as fn(&mut pyre_object::dictmultiobject::IntDictStorage),
+    );
+    p1(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_remove_deleted_items",
+        pyre_object::rordereddict::ll_dict_remove_deleted_items
+            as fn(&mut pyre_object::dictmultiobject::IntDictStorage),
+    );
+    // `look_inside_iff` trampolines for the IntDictStorage monomorph.
+    // Generic + receiver forms skip HELPER_FNADDRS; bind the free-function
+    // trampolines the dispatch residualizes when the dict is not virtual.
+    p3(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_lookup_trampoline",
+        pyre_object::rordereddict::ll_dict_lookup_trampoline
+            as fn(&pyre_object::dictmultiobject::IntDictStorage, u64, &i64) -> isize,
+    );
+    p3(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_contains_trampoline",
+        pyre_object::rordereddict::ll_dict_contains_trampoline
+            as fn(&pyre_object::dictmultiobject::IntDictStorage, u64, &i64) -> bool,
+    );
+    p3(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_del_trampoline",
+        pyre_object::rordereddict::ll_dict_del_trampoline
+            as fn(&mut pyre_object::dictmultiobject::IntDictStorage, u64, usize),
+    );
+    p5(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_setitem_lookup_done_trampoline",
+        pyre_object::rordereddict::ll_dict_setitem_lookup_done_trampoline
+            as fn(
+                &mut pyre_object::dictmultiobject::IntDictStorage,
+                u64,
+                isize,
+                i64,
+                pyre_object::PyObjectRef,
+            ),
+    );
+    p1(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_len_trampoline",
+        pyre_object::rordereddict::ll_dict_len_trampoline
+            as fn(&pyre_object::dictmultiobject::IntDictStorage) -> usize,
+    );
+    p1(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dict_grow_trampoline",
+        pyre_object::rordereddict::ll_dict_grow_trampoline
+            as fn(&mut pyre_object::dictmultiobject::IntDictStorage) -> bool,
+    );
+    p2(
+        &mut entries,
+        "pyre_object::rordereddict::ll_dictnext_trampoline",
+        pyre_object::rordereddict::ll_dictnext_trampoline
+            as fn(&pyre_object::dictmultiobject::IntDictStorage, usize) -> isize,
+    );
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
     // residual-call targets emitted by
@@ -6310,6 +6419,11 @@ mod tests {
             (
                 "pyre_interpreter::runtime_ops::convert_value",
                 crate::opcode_ops::jit_runtime_ops_convert_value as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::baseobjspace::dict_display_setitem",
+                crate::opcode_ops::jit_baseobjspace_dict_display_setitem as *const () as usize
+                    as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");

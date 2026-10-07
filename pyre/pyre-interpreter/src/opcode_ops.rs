@@ -1286,6 +1286,21 @@ pub extern "C" fn jit_baseobjspace_delitem(obj: PyObjectRef, key: PyObjectRef) -
     }
 }
 
+// BUILD_MAP's void `inline_call_r_v` calls this address. The recorded graph
+// is `dict_display_setitem`; its Rust `Result` is a different ABI, so the
+// two must not share an address.
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_dict_display_setitem(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> i64 {
+    match crate::baseobjspace::dict_display_setitem(obj, key, value) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
 #[inline(never)]
 pub extern "C" fn jit_opcode_ops_list_extend_value(
     list: PyObjectRef,

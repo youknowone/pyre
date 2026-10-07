@@ -8325,6 +8325,129 @@ fn dict_or_new(base: PyObjectRef, overlay: PyObjectRef) -> PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(dst_slot)
 }
 
+/// dictmultiobject.py `descr_fromkeys` gateway. Named so the CALL has
+/// jitcode; a closure gateway is not a named `descr_fromkeys`.
+fn descr_fromkeys(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
+    let (iterable, value) = if args.len() >= 3 {
+        (args[1], args[2])
+    } else if args.len() == 2 {
+        (args[1], pyre_object::w_none())
+    } else {
+        return Err(crate::PyError::type_error(
+            "fromkeys expected at least 1 argument, got 0",
+        ));
+    };
+    dict_fromkeys_impl(cls, iterable, value)
+}
+
+/// dictmultiobject.py `descr_fromkeys`. No JIT hint: upstream is only
+/// `@staticmethod`, so `codewriter/policy.py` `look_inside_graph` decides.
+fn dict_fromkeys_impl(
+    mut cls: PyObjectRef,
+    mut iterable: PyObjectRef,
+    value: PyObjectRef,
+) -> crate::PyResult {
+    // dictmultiobject.py descr_fromkeys — for `dict` itself,
+    // fill a fresh dict through the dict's own setitem, which hashes
+    // each key; for a dict subclass, construct an instance via `cls()`
+    // and route through `space.setitem` so the result is an instance
+    // of the subclass.
+    let mut value = value;
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if cls.is_null()
+        || pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_dict_type))
+    {
+        let mut d = pyre_object::w_dict_new();
+        // Python 3.14's exact-set/frozenset fast path carries each
+        // entry's cached hash into the new exact dict.  This is the
+        // reverse of `set_update_dict_lock_held` and avoids a
+        // second observable `__hash__` call.  Subclasses still go
+        // through their iterator below.
+        if unsafe {
+            pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
+                || pyre_object::is_exact_type(iterable, &pyre_object::setobject::FROZENSET_TYPE)
+        } {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::pin_roots(&[d, value, iterable]);
+            let mut index = 0usize;
+            loop {
+                let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+                let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) }) else {
+                    break;
+                };
+                let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
+                    break;
+                };
+                let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
+                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
+                index = slot + 1;
+            }
+            return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
+        }
+        let items = {
+            // descr_fromkeys: `for w_key in space.listview(w_keys)`.
+            // listview unwraps an exact list or a tuple that still uses
+            // the builtin iterator; other iterables fall through to
+            // unpackiterable. `d` is a fresh dict with no heap edge yet
+            // and dicts are nursery-allocated, so it is rooted and read
+            // back here — the loop below re-roots what it is handed,
+            // which cannot cover this window.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[d, value]);
+            let items = crate::baseobjspace::listview(iterable, -1)?;
+            d = pyre_object::gc_roots::shadow_stack_get(base);
+            value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            items
+        };
+        // `w_dict.setitem` hashes the key (may run user `__hash__`) and
+        // may grow the dict; `d`, the shared fill value, and every
+        // not-yet-added key stay rooted and are reloaded after each store.
+        let d = unsafe {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::publish_roots(&[d, value]);
+            let key_base = pyre_object::gc_roots::publish_roots(&items);
+            pyre_object::gc_roots::normalize_roots(sp, 2 + items.len());
+            let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+            for i in 0..key_len {
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                pyre_object::w_dict_store_checked(d, key, value)
+                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
+            }
+            pyre_object::gc_roots::shadow_stack_get(sp)
+        };
+        Ok(d)
+    } else {
+        // dictmultiobject.py — `space.call_function(w_type)` runs
+        // before `space.listview(w_keys)`, so the subclass constructor
+        // observes the iterable unconsumed.  That constructor and each
+        // `setitem` can execute Python and move objects, so the iterable,
+        // the fill value, the new dict and every collected key ride the
+        // shadow stack rather than a raw `Vec`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::pin_roots(&[iterable, value]);
+        let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        let d = crate::call::call_function_impl_result(cls, &[])?;
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let d = pyre_object::gc_roots::pin_root(d);
+        let items = crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(sp), -1)?;
+        let key_base = pyre_object::gc_roots::pin_roots(&items);
+        let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+        for i in 0..key_len {
+            let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+            let d = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+            crate::baseobjspace::setitem(d, key, value)?;
+        }
+        Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+    }
+}
+
 fn init_dict_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -8890,22 +9013,7 @@ fn init_dict_type(ns: PyObjectRef) {
     // dict.fromkeys(iterable, value=None) — classmethod
     let fromkeys = crate::gateway::make_builtin_function_with_text_signature(
         "fromkeys",
-        |args| {
-            // classmethod: args[0] is the bound cls; the user arguments are
-            // fromkeys(iterable, value=None).
-            let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
-            let (iterable, value) = if args.len() >= 3 {
-                (args[1], args[2])
-            } else if args.len() == 2 {
-                (args[1], pyre_object::w_none())
-            } else {
-                return Err(crate::PyError::type_error(
-                    "fromkeys expected at least 1 argument, got 0",
-                ));
-            };
-            dict_fromkeys_impl(cls, iterable, value)
-        },
+        descr_fromkeys,
         "($type, iterable, value=None, /)",
     );
     unsafe {
@@ -8951,115 +9059,6 @@ fn init_dict_type(ns: PyObjectRef) {
         let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
             .expect("dict TypeDef callable was just installed");
         unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
-    }
-    fn dict_fromkeys_impl(
-        mut cls: PyObjectRef,
-        mut iterable: PyObjectRef,
-        value: PyObjectRef,
-    ) -> crate::PyResult {
-        // dictmultiobject.py descr_fromkeys — for `dict` itself,
-        // fill a fresh dict through the dict's own setitem, which hashes
-        // each key; for a dict subclass, construct an instance via `cls()`
-        // and route through `space.setitem` so the result is an instance
-        // of the subclass.
-        let mut value = value;
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if cls.is_null()
-            || pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_dict_type))
-        {
-            let mut d = pyre_object::w_dict_new();
-            // Python 3.14's exact-set/frozenset fast path carries each
-            // entry's cached hash into the new exact dict.  This is the
-            // reverse of `set_update_dict_lock_held` and avoids a
-            // second observable `__hash__` call.  Subclasses still go
-            // through their iterator below.
-            if unsafe {
-                pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
-                    || pyre_object::is_exact_type(iterable, &pyre_object::setobject::FROZENSET_TYPE)
-            } {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let sp = pyre_object::gc_roots::pin_roots(&[d, value, iterable]);
-                let mut index = 0usize;
-                loop {
-                    let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
-                    let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) })
-                    else {
-                        break;
-                    };
-                    let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
-                        break;
-                    };
-                    let d = pyre_object::gc_roots::shadow_stack_get(sp);
-                    let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                    unsafe {
-                        pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash)
-                    }
-                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
-                    index = slot + 1;
-                }
-                return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
-            }
-            let items = {
-                // Draining the iterable runs Python. `d` is a fresh dict with
-                // no heap edge yet and dicts are nursery-allocated, so it is
-                // rooted and read back here — the loop below re-roots what it
-                // is handed, which cannot cover this window.
-                let _roots = pyre_object::gc_roots::push_roots();
-                let base = pyre_object::gc_roots::pin_roots(&[d, value]);
-                let items = crate::builtins::collect_iterable(iterable)?;
-                d = pyre_object::gc_roots::shadow_stack_get(base);
-                value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-                items
-            };
-            // `try_hash_value` may run a user `__hash__` that allocates
-            // and triggers a moving minor collection; `d`, the shared
-            // `value` (reused across every key), and every not-yet-added
-            // key are rooted for the whole loop and reloaded after each
-            // hash.
-            let d = unsafe {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let sp = pyre_object::gc_roots::publish_roots(&[d, value]);
-                let key_base = pyre_object::gc_roots::publish_roots(&items);
-                pyre_object::gc_roots::normalize_roots(sp, 2 + items.len());
-                let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
-                for i in 0..key_len {
-                    let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                    let hash = crate::builtins::try_hash_value(key)
-                        .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
-                    let d = pyre_object::gc_roots::shadow_stack_get(sp);
-                    let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                    let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                    pyre_object::w_dict_store_hashed_checked(d, key, value, hash)
-                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
-                }
-                pyre_object::gc_roots::shadow_stack_get(sp)
-            };
-            Ok(d)
-        } else {
-            // dictmultiobject.py — `space.call_function(w_type)` runs
-            // before `space.listview(w_keys)`, so the subclass constructor
-            // observes the iterable unconsumed.  That constructor and each
-            // `setitem` can execute Python and move objects, so the iterable,
-            // the fill value, the new dict and every collected key ride the
-            // shadow stack rather than a raw `Vec`.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::pin_roots(&[iterable, value]);
-            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-            let d = crate::call::call_function_impl_result(cls, &[])?;
-            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-            let d = pyre_object::gc_roots::pin_root(d);
-            let items =
-                crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(sp))?;
-            let key_base = pyre_object::gc_roots::pin_roots(&items);
-            let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
-            for i in 0..key_len {
-                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                let d = pyre_object::gc_roots::shadow_stack_get(dict_slot);
-                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                crate::baseobjspace::setitem(d, key, value)?;
-            }
-            Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
-        }
     }
 }
 
