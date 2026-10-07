@@ -13582,11 +13582,11 @@ fn materialize_virtual_from_rd(
     num_failargs: i32,
     rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
 ) -> Value {
     // resume.py: v = self.virtuals_cache.get_ptr(index)
     if let Some(cached) = virtuals_cache.get(&vidx) {
-        return cached.clone();
+        return cached;
     }
     // resume.py:953: assert self.rd_virtuals is not None
     let virtuals = rd_virtuals.expect("resume.py:953 getvirtual_ptr: rd_virtuals is not None");
@@ -13601,7 +13601,7 @@ fn materialize_virtual_from_rd(
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
     ) -> Option<Value> {
         if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
             return None;
@@ -13664,7 +13664,7 @@ fn materialize_virtual_from_rd(
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
     ) -> i64 {
         match decode_tagged_fieldnum(
             tagged,
@@ -13689,7 +13689,7 @@ fn materialize_virtual_from_rd(
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
     ) -> f64 {
         match decode_tagged_fieldnum(
             tagged,
@@ -14452,7 +14452,7 @@ fn decode_tagged_value(
     num_failargs: i32,
     rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
 ) -> Value {
     let (val, tagbits) = majit_metainterp::resume::untag(tagged);
     match tagbits {
@@ -14524,20 +14524,6 @@ fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) ->
         .collect()
 }
 
-/// The objects the direct reader allocated for this guard's virtuals, by
-/// virtual number: the `all_virtuals` the recording reader that follows is
-/// constructed with (`BridgeVirtualCache::recording`).
-fn direct_virtual_objects(cache: &HashMap<usize, Value>) -> Vec<Option<majit_ir::GcRef>> {
-    let n = cache.keys().copied().max().map(|m| m + 1).unwrap_or(0);
-    let mut slots = vec![None; n];
-    for (&vidx, value) in cache {
-        if let Value::Ref(gcref) = *value {
-            slots[vidx] = Some(gcref);
-        }
-    }
-    slots
-}
-
 /// What the direct reader of a guard failure decoded, for the bridge entry
 /// that follows it.
 pub(crate) struct DecodedGuardFailure {
@@ -14546,8 +14532,10 @@ pub(crate) struct DecodedGuardFailure {
     pub resume_pc: usize,
     pub num_resume_frames: usize,
     pub coords: Vec<(usize, usize)>,
-    /// `ResumeDataDirectReader.virtuals_cache` objects by virtual number.
-    pub direct_virtuals: Vec<Option<majit_ir::GcRef>>,
+    /// `ResumeDataDirectReader.virtuals_cache`, still rooted, so
+    /// `start_bridge_tracing` can seed the recording reader from live
+    /// addresses (`BridgeVirtualCache::recording`).
+    pub direct_virtuals: majit_metainterp::DirectVirtualsCache,
 }
 
 /// Phase A: decode rd_numb + materialize virtuals + restore frame state.
@@ -14600,7 +14588,10 @@ pub(crate) fn decode_and_restore_guard_failure(
         let empty_consts: Vec<majit_ir::Const> = Vec::new();
         let rd_consts: &[majit_ir::Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
         if rd_numb.is_empty() {
-            (dead_frame_typed.clone(), HashMap::new())
+            (
+                dead_frame_typed.clone(),
+                majit_metainterp::DirectVirtualsCache::new(0),
+            )
         } else {
             let (t, virtuals_cache) =
                 rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout);
@@ -14677,7 +14668,7 @@ pub(crate) fn decode_and_restore_guard_failure(
         }
     }
 
-    let direct_virtuals = direct_virtual_objects(&pending_virtuals_cache);
+    let direct_virtuals = pending_virtuals_cache;
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -14792,7 +14783,7 @@ fn rebuild_typed_from_rd_numb(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
-) -> (Vec<Value>, HashMap<usize, Value>) {
+) -> (Vec<Value>, majit_metainterp::DirectVirtualsCache) {
     use majit_ir::resumedata::rebuild_from_numbering;
 
     // resume.py:1049-1055 parity: bound each frame's box section by jitcode
@@ -14828,7 +14819,7 @@ fn rebuild_typed_from_rd_numb(
     }
 
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
-    let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
+    let mut virtuals_cache = majit_metainterp::DirectVirtualsCache::new(num_virtuals);
 
     // resume.py consume_virtualizable_boxes + pyjitpl.py:3400-3428 parity:  allow-line-citation
     // Decode vable_values into typed prefix [frame_ptr, ni, code, vsd, ns, locals..., stack...].
@@ -14839,7 +14830,7 @@ fn rebuild_typed_from_rd_numb(
         raw_values: &[i64],
         dead_frame_typed: &[Value],
         exit_layout: &CompiledExitLayout,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
@@ -15239,7 +15230,7 @@ fn build_resumed_frames(
     vable_mode: ResumeVableMode,
     // resume.py `virtuals_cache`: shared with the typed rebuild that ran
     // before this walk, so a virtual both consume is one object.
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
@@ -15277,7 +15268,7 @@ fn build_resumed_frames(
         raw_values: &[i64],
         dead_frame_typed: &[Value],
         exit_layout: &CompiledExitLayout,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
@@ -15598,7 +15589,7 @@ fn _prepare_next_section(
     dead_frame_typed: &[Value],
     exit_layout: &CompiledExitLayout,
     typed: &mut Vec<Value>,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
 ) {
     use majit_ir::resumedata::RebuiltValue;
     let storage = exit_layout.storage.as_deref();
@@ -15646,7 +15637,7 @@ fn replay_pending_fields(
     dead_frame_typed: &[Value],
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut majit_metainterp::DirectVirtualsCache,
 ) {
     let num_failargs = exit_layout.exit_types.len() as i32;
     // `resume.py _prepare_pendingfields` reads the list off the guard's
@@ -16434,7 +16425,12 @@ mod tests {
             array_target.as_mut_ptr() as i64,
             42,
         ];
-        replay_pending_fields(&values, &raw_values, &layout, &mut HashMap::new());
+        replay_pending_fields(
+            &values,
+            &raw_values,
+            &layout,
+            &mut majit_metainterp::DirectVirtualsCache::new(0),
+        );
 
         assert_eq!(field_target.value, 41);
         assert_eq!(array_target, [2, 42]);

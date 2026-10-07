@@ -10966,7 +10966,7 @@ impl<S: JitState> JitDriver<S> {
         // The objects the direct reader that preceded a recording-only entry
         // allocated, by virtual number (`ResumeDataDirectReader`'s
         // `all_virtuals`). Empty for an applying entry.
-        all_virtuals: &[Option<majit_ir::GcRef>],
+        all_virtuals: &[i64],
     ) -> bool {
         // Same close as `force_start_tracing`: bridge codegen reads
         // `type_info_group` (`gctypelayout.py encode_type_shapes_now`).

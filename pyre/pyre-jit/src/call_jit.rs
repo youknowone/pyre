@@ -3931,7 +3931,7 @@ pub fn trace_and_compile_from_bridge(
             // the virtualizable — so the replay owes recording only, seeded
             // with the objects that reader allocated.
             false,
-            &direct_virtuals,
+            direct_virtuals.as_ptrs(),
         )
     };
     if !started {

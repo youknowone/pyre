@@ -30,6 +30,63 @@ pub fn default_bridge_array_descr(
     majit_ir::descr::make_array_descr_signed(base_size, item_size, item_type, signed)
 }
 
+/// resume.py `ResumeDataDirectReader.virtuals_cache`: a fixed GCREF slice
+/// the collector walks. `HashMap<usize, Value>` copies are not roots;
+/// `bh_new` results live here before setfields, and stay here until the
+/// recording reader seeds `BridgeVirtualCache.concrete_roots`.
+pub struct DirectVirtualsCache {
+    map: std::collections::HashMap<usize, majit_ir::Value>,
+    ptrs: Vec<i64>,
+    roots_depth: usize,
+}
+
+impl Drop for DirectVirtualsCache {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.roots_depth);
+    }
+}
+
+impl DirectVirtualsCache {
+    pub fn new(n_virtuals: usize) -> Self {
+        let mut ptrs = vec![0i64; n_virtuals];
+        let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        if n_virtuals > 0 {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut ptrs);
+            }
+        }
+        Self {
+            map: std::collections::HashMap::new(),
+            ptrs,
+            roots_depth,
+        }
+    }
+
+    /// resume.py `virtuals_cache.get_ptr`: re-read the rooted slot.
+    pub fn get(&self, vidx: &usize) -> Option<majit_ir::Value> {
+        if let Some(&addr) = self.ptrs.get(*vidx)
+            && addr != 0
+        {
+            return Some(majit_ir::Value::Ref(majit_ir::GcRef(addr as usize)));
+        }
+        self.map.get(vidx).copied()
+    }
+
+    /// resume.py `virtuals_cache.set_ptr` before setfields.
+    pub fn insert(&mut self, vidx: usize, value: majit_ir::Value) {
+        if let majit_ir::Value::Ref(gcref) = value
+            && vidx < self.ptrs.len()
+        {
+            self.ptrs[vidx] = gcref.0 as i64;
+        }
+        self.map.insert(vidx, value);
+    }
+
+    pub fn as_ptrs(&self) -> &[i64] {
+        &self.ptrs
+    }
+}
+
 /// resume.py VirtualCache — per-virtual-number `OpRef` banks the box
 /// reader probes before allocating, plus the concrete `GcRef`/int shadows a
 /// consumer may seed for branch-fold parity. `mint_raw_array_descr` is the
@@ -156,13 +213,15 @@ impl<'a> BridgeVirtualCache<'a> {
             majit_ir::Type,
             bool,
         ) -> majit_ir::DescrRef,
-        all_virtuals: &[Option<majit_ir::GcRef>],
+        all_virtuals: &[i64],
     ) -> Self {
         // Recording-only still allocates concrete shadows
         // (`materialize_concrete_virtual_ptr`). resume.py keeps each virtual
         // in `virtuals_cache` before filling its fields, because the next
         // allocation can collect. Register the same fixed slice the applying
-        // reader uses; `Drop` unregisters it.
+        // reader uses; `Drop` unregisters it. Seed from `all_virtuals` after
+        // that registration: this `vec!` can collect, and the source slice
+        // is the direct reader's rooted cache (`DirectVirtualsCache`).
         let mut cache = Self {
             virtuals_ptr_cache: vec![None; size],
             virtuals_int_cache: vec![None; size],
@@ -181,9 +240,9 @@ impl<'a> BridgeVirtualCache<'a> {
                 majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
             }
         }
-        for (vidx, slot) in all_virtuals.iter().enumerate() {
-            if let Some(gcref) = *slot {
-                cache.set_concrete_ptr(vidx, gcref);
+        for (vidx, &addr) in all_virtuals.iter().enumerate() {
+            if addr != 0 {
+                cache.set_concrete_ptr(vidx, majit_ir::GcRef(addr as usize));
             }
         }
         cache
@@ -288,7 +347,8 @@ impl<'a> BridgeVirtualCache<'a> {
 
     /// The address a ref failarg currently lives at, read back through the
     /// rooted copy so a collection since the guard failed is accounted for.
-    fn fail_ref_root(&self, index: usize) -> Option<i64> {
+    /// `resume.py` `cpu.get_ref_value(self.deadframe, num)`.
+    pub fn fail_ref_root(&self, index: usize) -> Option<i64> {
         self.fail_ref_roots.get(index).copied()
     }
 
@@ -624,6 +684,44 @@ fn apply_setarrayitem(
     true
 }
 
+/// resume.py `virtuals_cache.set_ptr`: fill the cache as soon as the object
+/// exists, before filling its fields. The `bh_new` result is a raw local
+/// until the root slot holds it; `record_op*` can collect (Trace-pool
+/// append). Record with no stamp, then stamp from the root the collector
+/// maintains — a copy taken before `record_op*` is a from-space address.
+fn publish_new_virtual(
+    ctx: &mut crate::TraceCtx,
+    cache: &mut BridgeVirtualCache<'_>,
+    vidx: usize,
+    allocated: Option<i64>,
+    opcode: majit_ir::OpCode,
+    args: &[OpRef],
+    descr: majit_ir::DescrRef,
+) -> OpRef {
+    if let Some(ptr) = allocated.filter(|&p| p != 0) {
+        cache.set_concrete_root(vidx, ptr);
+    }
+    let pin = cache.get_concrete_ptr(vidx).and_then(|g| {
+        if g.is_null() || g == majit_ir::GcRef::NO_CONCRETE {
+            None
+        } else {
+            Some(majit_gc::shadow_stack::OwnerRootGuard::new(g))
+        }
+    });
+    let new_op = ctx.record_op_with_descr_value(opcode, args, descr, None);
+    ctx.heap_cache_mut().new_object(new_op);
+    cache.set_ptr(vidx, new_op);
+    ctx.remember_bridge_virtual_op(vidx, new_op);
+    let live = pin
+        .as_ref()
+        .map(|g| g.get())
+        .or_else(|| cache.get_concrete_ptr(vidx));
+    if let Some(gcref) = live {
+        ctx.try_set_opref_concrete(new_op, majit_ir::Value::Ref(gcref));
+    }
+    new_op
+}
+
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
@@ -777,25 +875,18 @@ pub fn materialize_bridge_virtual(
                 }
                 None => None,
             };
-            let value = allocated
-                .filter(|&ptr| ptr != 0)
-                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            let new_op = ctx.record_op_with_descr_value(
+            if allocated == Some(0) {
+                return OpRef::NONE;
+            }
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
                 OpCode::NewWithVtable,
                 &[],
                 size_descr.clone(),
-                value,
             );
-            ctx.heap_cache_mut().new_object(new_op);
-            // resume.py decoder.virtuals_cache.set_ptr(index, struct)
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(ptr) = allocated {
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-            }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -841,24 +932,22 @@ pub fn materialize_bridge_virtual(
                 Some(allocator) => Some(allocator.bh_new(&struct_descr)),
                 None => None,
             };
-            let value = allocated
-                .filter(|&ptr| ptr != 0)
-                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            let new_op =
-                ctx.record_op_with_descr_value(OpCode::New, &[], struct_descr.clone(), value);
-            ctx.heap_cache_mut().new_object(new_op);
+            if allocated == Some(0) {
+                return OpRef::NONE;
+            }
             // resume.py decoder.virtuals_cache.set_ptr(index, struct), which
             // its own comment requires BEFORE the fields are filled: the cache
             // is what keeps the object reachable across the allocations
             // `setfields` may itself perform.
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(ptr) = allocated {
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-            }
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
+                OpCode::New,
+                &[],
+                struct_descr.clone(),
+            );
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -923,25 +1012,19 @@ pub fn materialize_bridge_virtual(
                 }),
                 None => None,
             };
-            let value = allocated
-                .filter(|&ptr| ptr != 0)
-                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            let new_op = ctx.record_op_with_descr_value(
+            if allocated == Some(0) {
+                return OpRef::NONE;
+            }
+            // resume.py decoder.virtuals_cache.set_ptr(index, array)
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
                 alloc_opcode,
                 &[len_ref],
                 array_descr.clone(),
-                value,
             );
-            ctx.heap_cache_mut().new_object(new_op);
-            // resume.py decoder.virtuals_cache.set_ptr(index, array)
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(ptr) = allocated {
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-            }
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop
             let set_opcode = match kind {
@@ -1826,11 +1909,7 @@ mod tests {
     /// after a collection, not from the unrooted `concrete_ptr_cache` copy.
     #[test]
     fn seed_direct_virtuals_rereads_concrete_roots_after_collect() {
-        let mut cache = BridgeVirtualCache::recording(
-            1,
-            default_bridge_array_descr,
-            &[Some(majit_ir::GcRef(0x1000))],
-        );
+        let mut cache = BridgeVirtualCache::recording(1, default_bridge_array_descr, &[0x1000]);
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1000)));
         majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
             if root.0 == 0x1000 {

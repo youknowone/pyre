@@ -14,7 +14,7 @@
 use crate::opencoder::{Box as OcBox, TraceRecordBuffer};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Compact stand-in for `history.py FrontendOp` while the live recorder
 /// writes `TraceRecordBuffer` bytes. The 240-byte `Op` is materialized
@@ -47,6 +47,24 @@ struct ValueSlot {
     /// `history.py` `RefFrontendOp._heapc_flags` / `_heapc_deps` and
     /// `FrontendOp.position_and_flags & FO_REPLACED_WITH_CONST`.
     heapc: majit_trace::heapcache::HeapcRecord,
+}
+
+/// Extra-area walk target for `history.py` `*FrontendOp._resref`.
+/// Pointers name `Trace` fields and are refreshed before each collection.
+struct FrontendOpValueRoots {
+    pins: Cell<*const RefCell<Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>>>>,
+    slots: Cell<*const Vec<ValueSlot>>,
+    inputargs: Cell<*const Vec<InputArgRc>>,
+}
+
+impl FrontendOpValueRoots {
+    fn empty() -> Self {
+        Self {
+            pins: Cell::new(std::ptr::null()),
+            slots: Cell::new(std::ptr::null()),
+            inputargs: Cell::new(std::ptr::null()),
+        }
+    }
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -279,6 +297,28 @@ pub struct Trace {
     /// FrontendOp heapc records for inputargs at positions `0.._start`
     /// (`warmstate.py` `wrap` builds `RefFrontendOp(position, value)`).
     inputarg_heapc: Vec<majit_trace::heapcache::HeapcRecord>,
+    /// Owner-root for each stamped `Value::Ref`. `history.py` `*FrontendOp.value`
+    /// is a GCREF field the translated GC traces with the box. `record_bytes`
+    /// holds `&mut Trace` across a Trace-pool append, so `walk_const_ptr_refs`
+    /// cannot borrow this recorder then. The pin is an owner-root, which
+    /// `walk_roots` still visits. The extra-area walk below also rewrites the
+    /// pin and `FrontendSlot.concrete`: a Trace-pool collection cannot borrow
+    /// this recorder the way `walk_active_trace_refs` does.
+    concrete_ref_pins: Box<RefCell<Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>>>>,
+    /// Heap target of [`Self::concrete_area`]. Pointers name fields of this
+    /// `Trace`; they are refreshed in [`Self::ensure_concrete_area`].
+    concrete_roots: Box<FrontendOpValueRoots>,
+    /// Dropped before [`Self::concrete_roots`] so the extra area
+    /// unregisters while the walk target is still valid.
+    concrete_area: RefCell<Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>>,
+    /// Dropped before [`Self::const_ptr_indexes`] (declaration order) so the
+    /// extra area unregisters while the index list is still valid.
+    const_ptr_area: RefCell<Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>>,
+    /// `history.py` `ConstPtr` table indexes this recorder still holds.
+    /// `record_bytes` borrows `&mut Trace`, so `walk_const_ptr_refs` cannot
+    /// visit `const_ptrs` then. This list is a separate extra-area root of
+    /// those table slots (`const_ptr_table::trace_index`).
+    const_ptr_indexes: Box<RefCell<Vec<u32>>>,
 }
 
 /// TAGBOX index to the recording `OpRef`, without borrowing the whole
@@ -453,6 +493,11 @@ impl Trace {
             slots: Vec::new(),
             value_slots: Vec::new(),
             inputarg_heapc: Vec::new(),
+            concrete_ref_pins: Box::new(RefCell::new(Vec::new())),
+            concrete_roots: Box::new(FrontendOpValueRoots::empty()),
+            concrete_area: RefCell::new(None),
+            const_ptr_area: RefCell::new(None),
+            const_ptr_indexes: Box::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -523,6 +568,8 @@ impl Trace {
         self.slots.reserve(128);
         self.value_slots.reserve(128);
         self.trb = Some(Box::new(trb));
+        self.ensure_const_ptr_area();
+        self.ensure_concrete_area();
     }
 
     fn byte_mode(&self) -> bool {
@@ -581,7 +628,7 @@ impl Trace {
             let Some(p) = slot.descr_pos else {
                 continue;
             };
-            let (idx, _) = crate::opencoder::decode_varint_signed(&trb._ops[p..]);
+            let (idx, _) = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[p..]);
             if idx >= 0 {
                 let u = idx as usize;
                 if u < data_len && out.last().copied() != Some(u) {
@@ -712,7 +759,23 @@ impl Trace {
     /// `_list_of_boxes` from tagged snapshot values, encoding each box
     /// into `_snapshot_array_data` the way `opencoder.py _add_box_to_storage`
     /// does — no intermediate `Vec<i64>`.
+    ///
+    /// Hold each `ConstPtr` index across `new_array` / `_encode` the way
+    /// `record_bytes` holds argument indexes across `reserve_ops_bytes`.
+    /// `history.py` `ConstPtr.value` is a GCREF local; a prebuilt
+    /// `Box::ConstPtr` is not. Resolve after the previous box's encode.
     fn write_tagged_array(&mut self, boxes: &[SnapshotTagged]) -> i64 {
+        let mut const_refs = Vec::new();
+        for tagged in boxes {
+            match tagged {
+                SnapshotTagged::Const(v, Type::Ref) if *v != 0 => {
+                    const_refs.push(OpRef::ConstPtr(*v as u32));
+                }
+                SnapshotTagged::Box(r, _) => const_refs.push(*r),
+                _ => {}
+            }
+        }
+        let held = self.hold_const_indexes(&const_refs);
         let res = self
             .trb
             .as_mut()
@@ -725,6 +788,7 @@ impl Trace {
                 .expect("write_tagged_array requires attach_byte_buffer")
                 ._add_box_to_storage_box(b);
         }
+        self.release_const_indexes(held);
         res
     }
 
@@ -989,10 +1053,12 @@ impl Trace {
             Some(Value::Ref(r))
                 if r != GcRef::NO_CONCRETE && !r.is_null() && majit_gc::gc_owns_object(r.0) =>
             {
+                majit_gc::assert_stamped_ref_is_live_object(r.0);
                 Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
             }
             _ => None,
         };
+        self.ensure_concrete_area();
         let held = self.hold_const_indexes(args);
         // `quasiimmut.py QuasiImmutDescr` stores raw `struct` and
         // `constantfieldbox` words. Argument indexes do not rewrite
@@ -1307,6 +1373,15 @@ impl Trace {
     /// the real box object — `MIFrame.registers_r` holds these in `pyjitpl.py` —
     /// so consumers can key by box identity instead of flat `OpRef`.
     pub(crate) fn box_for_operand(&mut self, r: OpRef) -> Operand {
+        if let Some(index) = r.const_ptr_index()
+            && index != 0
+        {
+            // Publish the table index before `from_opref` allocate.
+            // `history.py` `ConstPtr.value` is the table slot; this list is
+            // the holder `walk_const_ptr_refs` cannot borrow during
+            // `record_bytes`.
+            self.hold_const_ptr_index(index);
+        }
         if r.is_none() || r.is_constant() {
             return Operand::from_opref(r);
         }
@@ -1466,9 +1541,9 @@ impl Trace {
                 .and_then(|s| s.descr_pos);
             if let Some(pos) = descr_pos {
                 let trb = self.trb.as_mut().expect("byte buffer");
-                let old_len = crate::opencoder::decode_varint_signed(&trb._ops[pos..]).1;
+                let old_len = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[pos..]).1;
                 trb.patch_descr_slot_at(pos, snapshot_id as i64);
-                let new_len = crate::opencoder::decode_varint_signed(&trb._ops[pos..]).1;
+                let new_len = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[pos..]).1;
                 if new_len != old_len {
                     let delta = new_len as isize - old_len as isize;
                     let mut seen = 0;
@@ -1552,7 +1627,7 @@ impl Trace {
                 .filter(|s| s.opcode.is_guard())
                 .nth(from_end)?;
             let p = slot.descr_pos?;
-            let (idx, _) = crate::opencoder::decode_varint_signed(&trb._ops[p..]);
+            let (idx, _) = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[p..]);
             return Some(idx as i32);
         }
         self.ops
@@ -1749,6 +1824,9 @@ impl Trace {
             self.slots.truncate(nops);
             let nvalues = pos._index.saturating_sub(n) as usize;
             self.value_slots.truncate(nvalues);
+            self.concrete_ref_pins
+                .borrow_mut()
+                .truncate(pos._index as usize);
             self.op_count = pos._count;
             self.box_count = pos._index;
             self.ops.clear();
@@ -1758,6 +1836,9 @@ impl Trace {
         let n = self.max_num_inputargs;
         self.value_slots
             .truncate(pos._index.saturating_sub(n) as usize);
+        self.concrete_ref_pins
+            .borrow_mut()
+            .truncate(pos._index as usize);
         self.op_count = pos._count;
         self.box_count = pos._index;
     }
@@ -1858,18 +1939,9 @@ impl Trace {
         }
 
         if let Some(trb) = self.trb.as_mut() {
+            // `_refs` is a GcArray of GCREF the collector traces itself;
+            // rekey `_refs_dict` by the forwarded addresses.
             trb.refresh_from_gc();
-            for r in trb._refs.iter_mut().skip(1) {
-                let mut gcref = GcRef(*r as usize);
-                visitor(&mut gcref);
-                *r = gcref.0 as u64;
-            }
-            if !trb._refs_dict.is_empty() {
-                trb._refs_dict.clear();
-                for (index, &reference) in trb._refs.iter().enumerate().skip(1) {
-                    trb._refs_dict.insert(reference, index as u32);
-                }
-            }
             trb.walk_descr_const_ptr_refs(visitor);
         }
         if self.trb.is_some() {
@@ -1965,10 +2037,12 @@ impl Trace {
         });
         let (args_pos, descr_index) = found?;
         let descr = trb.resolve_descr_index(descr_index)?;
-        let tagged = crate::opencoder::TraceRecordBuffer::encoded_arg_at(&trb._ops, args_pos, 0);
+        let tagged =
+            crate::opencoder::TraceRecordBuffer::encoded_arg_at(trb.ops_bytes(), args_pos, 0);
         let obj = match self.untag_snapshot(tagged) {
             SnapshotTagged::Box(r, _) => r,
-            SnapshotTagged::Const(v, Type::Ref) => OpRef::const_ptr(GcRef(v as usize)),
+            // A ref Const payload is a `const_ptr_table` index.
+            SnapshotTagged::Const(v, Type::Ref) => OpRef::ConstPtr(v as u32),
             SnapshotTagged::Const(v, Type::Int) => OpRef::const_int(v),
             SnapshotTagged::Const(v, Type::Float) => OpRef::const_float(f64::from_bits(v as u64)),
             SnapshotTagged::Const(_, Type::Void) => return None,
@@ -2003,7 +2077,9 @@ impl Trace {
     /// their original `get_position()`, later indices are value-producing
     /// ops. Void ops have no value slot. Returns `false` if `position` is
     /// past the recorded range or a dead failarg hole.
+    #[track_caller]
     pub(crate) fn set_concrete_at(&self, position: u32, value: Value) -> bool {
+        let value = self.pin_concrete_ref(position as usize, value);
         if let Some(ia) = self.inputarg_at(position) {
             ia.set_value(value);
             true
@@ -2036,6 +2112,15 @@ impl Trace {
     /// `position` is `_index`. `None` when never stamped, a dead failarg
     /// hole, or out of range.
     pub(crate) fn concrete_at(&self, position: u32) -> Option<Value> {
+        let pos = position as usize;
+        if let Some(pin) = self
+            .concrete_ref_pins
+            .borrow()
+            .get(pos)
+            .and_then(|slot| slot.as_ref())
+        {
+            return Some(Value::Ref(pin.get()));
+        }
         if let Some(ia) = self.inputarg_at(position) {
             ia.get_value()
         } else if position < self.max_num_inputargs {
@@ -2047,6 +2132,157 @@ impl Trace {
                 .iter()
                 .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
                 .and_then(|op| op.get_value())
+        }
+    }
+
+    #[track_caller]
+    fn pin_concrete_ref(&self, position: usize, value: Value) -> Value {
+        let Value::Ref(r) = value else {
+            if let Some(slot) = self.concrete_ref_pins.borrow_mut().get_mut(position) {
+                *slot = None;
+            }
+            return value;
+        };
+        if r.is_null() || r == GcRef::NO_CONCRETE {
+            if let Some(slot) = self.concrete_ref_pins.borrow_mut().get_mut(position) {
+                *slot = None;
+            }
+            return value;
+        }
+        majit_gc::assert_stamped_ref_is_live_object(r.0);
+        if !majit_gc::gc_owns_object(r.0) {
+            if let Some(slot) = self.concrete_ref_pins.borrow_mut().get_mut(position) {
+                *slot = None;
+            }
+            return value;
+        }
+        let pin = majit_gc::shadow_stack::OwnerRootGuard::new(r);
+        let forwarded = Value::Ref(pin.get());
+        let mut pins = self.concrete_ref_pins.borrow_mut();
+        if pins.len() <= position {
+            pins.resize_with(position + 1, || None);
+        }
+        pins[position] = Some(pin);
+        self.ensure_concrete_area();
+        forwarded
+    }
+
+    pub(crate) fn hold_live_const_ptr(&self, opref: OpRef) {
+        if let Some(index) = opref.const_ptr_index() {
+            self.hold_const_ptr_index(index);
+        }
+    }
+
+    fn hold_const_ptr_index(&self, index: u32) {
+        if index == 0 {
+            return;
+        }
+        self.const_ptr_indexes.borrow_mut().push(index);
+        self.ensure_const_ptr_area();
+    }
+
+    fn ensure_const_ptr_area(&self) {
+        if self.const_ptr_area.borrow().is_some() {
+            return;
+        }
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            return;
+        }
+        let data = (&*self.const_ptr_indexes) as *const RefCell<Vec<u32>> as *const ();
+        let area = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_recorder_const_ptr_indexes,
+                data,
+                "recorder_const_ptrs",
+            )
+        };
+        *self.const_ptr_area.borrow_mut() = Some(area);
+    }
+
+    fn ensure_concrete_area(&self) {
+        self.concrete_roots.pins.set(&*self.concrete_ref_pins);
+        self.concrete_roots.slots.set(&self.value_slots);
+        self.concrete_roots.inputargs.set(&self.inputargs);
+        if self.concrete_area.borrow().is_some() {
+            return;
+        }
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            return;
+        }
+        let data = (&*self.concrete_roots) as *const FrontendOpValueRoots as *const ();
+        let area = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_recorder_frontend_op_values,
+                data,
+                "recorder_frontend_op_values",
+            )
+        };
+        *self.concrete_area.borrow_mut() = Some(area);
+    }
+}
+
+/// Extra-area holder for `history.py` `ConstPtr.value` table slots this
+/// recorder interned. `walk_active_trace_refs` needs `&mut Trace` and
+/// cannot run while `record_bytes` holds that borrow.
+unsafe fn walk_recorder_const_ptr_indexes(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let indexes = unsafe { &*(data as *const RefCell<Vec<u32>>) };
+    let list = indexes
+        .try_borrow()
+        .expect("recorder const_ptr_indexes borrow held across collection");
+    let mut i = 0;
+    while i < list.len() {
+        majit_ir::const_ptr_table::trace_index(list[i], visitor);
+        i += 1;
+    }
+}
+
+/// Extra-area holder for `history.py` `*FrontendOp._resref`. `record_bytes`
+/// cannot run `walk_const_ptr_refs`. Rewrite each pin and each
+/// `ValueSlot.concrete` / inputarg value in place.
+unsafe fn walk_recorder_frontend_op_values(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let roots = unsafe { &*(data as *const FrontendOpValueRoots) };
+    fn visit_ref(value: Option<Value>, visitor: &mut dyn FnMut(&mut GcRef)) -> Option<Value> {
+        let Some(Value::Ref(mut r)) = value else {
+            return value;
+        };
+        if r.is_null() || r == GcRef::NO_CONCRETE {
+            return Some(Value::Ref(r));
+        }
+        visitor(&mut r);
+        Some(Value::Ref(r))
+    }
+    let pins = roots.pins.get();
+    if !pins.is_null() {
+        let pins = unsafe { &*pins };
+        let pins = pins
+            .try_borrow()
+            .expect("recorder concrete_ref_pins borrow held across collection");
+        let mut i = 0;
+        while i < pins.len() {
+            if let Some(pin) = pins[i].as_ref() {
+                let mut r = pin.get();
+                if !r.is_null() && r != GcRef::NO_CONCRETE {
+                    visitor(&mut r);
+                    pin.set(r);
+                }
+            }
+            i += 1;
+        }
+    }
+    let slots = roots.slots.get();
+    if !slots.is_null() {
+        let slots = unsafe { &*slots };
+        for slot in slots {
+            slot.concrete.set(visit_ref(slot.concrete.get(), visitor));
+        }
+    }
+    let inputargs = roots.inputargs.get();
+    if !inputargs.is_null() {
+        let inputargs = unsafe { &*inputargs };
+        for ia in inputargs {
+            if let Some(updated) = visit_ref(ia.get_value(), visitor) {
+                ia.set_value(updated);
+            }
         }
     }
 }
@@ -2780,11 +3016,9 @@ mod tests {
             }
         });
         assert_eq!(cptr.as_const_ptr(), Some(GcRef(0x91_00B1_2000)));
+        // Materialized args come from the stream's `_refs` GcArray, which
+        // the collector forwards itself; this walk only moves the table.
         rec.materialize_into_ops();
-        assert_eq!(
-            rec.ops()[0].arg(0).to_opref().as_const_ptr(),
-            Some(GcRef(0x91_00B1_2000))
-        );
         assert!(rec.ops()[1].guard_fail_args().is_none());
     }
 

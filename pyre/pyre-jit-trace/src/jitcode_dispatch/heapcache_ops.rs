@@ -1286,6 +1286,9 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
     let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
+    // The cache-miss record below appends to `opencoder.py Trace._ops` and can
+    // minor-collect before the sanity load reads the receiver.
+    let obj_pin = concrete_obj_ptr.and_then(|p| residual_call::owner_root_if_gc(p as usize));
 
     // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
@@ -1441,9 +1444,14 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
             OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
             _ => None,
         };
+        let concrete_obj_ptr =
+            concrete_obj_ptr.map(|p| obj_pin.as_ref().map_or(p, |pin| pin.get().0 as i64));
         if let (Some(ty), Some(struct_ptr)) = (load_type, concrete_obj_ptr)
             && let Some(live_value) = ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
         {
+            if let majit_ir::Value::Ref(reference) = live_value {
+                majit_gc::assert_stamped_ref_is_live_object(reference.0);
+            }
             ctx.trace_ctx.try_set_opref_concrete(result, live_value);
             concrete_for_shadow = match live_value {
                 majit_ir::Value::Int(value) => ConcreteValue::Int(value),

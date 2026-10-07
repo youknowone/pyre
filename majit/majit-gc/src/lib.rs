@@ -322,6 +322,36 @@ pub fn stress_trace_pool_alloc(roots: *mut GcRef, root_count: usize) {
     gc_sync::gc_op(|gc| gc.stress_trace_alloc_minor(roots, root_count));
 }
 
+/// Panic when `addr` is a nursery word that is not a live object start
+/// allocated since the last minor.
+///
+/// Recorder stamp sites (`history.py` `*FrontendOp.value`) call this
+/// before writing a `Value::Ref`. A Rust `Copy` held across
+/// `record_bytes` / `stress_trace_pool_alloc` is already from-space
+/// when it is stamped; no later extra-area walk can repair it.
+/// [`gc_stress_trace_alloc_enabled`] is the gate, read once: unset is
+/// one cached bool load.
+#[inline]
+#[track_caller]
+pub fn assert_stamped_ref_is_live_object(addr: usize) {
+    if !gc_stress_trace_alloc_enabled() {
+        return;
+    }
+    assert_stamped_ref_is_live_object_slow(addr, std::panic::Location::caller());
+}
+
+#[cold]
+#[inline(never)]
+fn assert_stamped_ref_is_live_object_slow(addr: usize, location: &'static std::panic::Location) {
+    if addr == 0 {
+        return;
+    }
+    if !gc_sync::is_initialized() || !rgil::am_i_holding_the_gil() {
+        return;
+    }
+    gc_sync::gc_query_reentrant(|gc| gc.assert_stamped_ref_is_live_object(addr, location));
+}
+
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
 /// sites: a collection opens no debug section of its own, so the section
 /// ready bit would silence them under a `gc` prefix filter.

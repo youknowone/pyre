@@ -33,6 +33,9 @@ struct Table {
     hashes: Vec<u64>,
     /// `(identity hash, index)`, sorted by hash then index.
     by_hash: Vec<(u64, u32)>,
+    /// `(current address, index)`, sorted by address then index.
+    /// `history.py` `ConstPtr.value` after a move is this word.
+    by_addr: Vec<(u64, u32)>,
     /// `begin_wave` generation that last traced this slot. Wave 0 does
     /// not dedup: a unit test that never opens a wave still forwards.
     marks: Vec<u32>,
@@ -59,6 +62,7 @@ impl Table {
             slots: vec![GcRef::NULL],
             hashes: vec![0],
             by_hash: Vec::new(),
+            by_addr: Vec::new(),
             marks: vec![0],
             live: vec![0],
             free: Vec::new(),
@@ -70,6 +74,7 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     slots: Vec::new(),
     hashes: Vec::new(),
     by_hash: Vec::new(),
+    by_addr: Vec::new(),
     marks: Vec::new(),
     live: Vec::new(),
     free: Vec::new(),
@@ -215,15 +220,17 @@ pub fn intern(addr: GcRef) -> u32 {
     let hash = gc_id_or_identityhash(addr.0) as u64;
     let mut guard = table();
     if let Some(idx) = find(&guard, hash, addr.0) {
-        // A new holder of an existing slot is still a holder. Stamp
-        // `live` on the find-hit too: between `begin_major_live` and
-        // `sweep_untraced` a dropped holder can leave the slot unstamped
-        // and a later intern of the same referent must keep it.
-        let i = idx as usize;
-        if i >= guard.live.len() {
-            guard.live.resize(i + 1, 0);
-        }
-        guard.live[i] = current_live();
+        stamp_reuse(&mut guard, idx, addr, hash);
+        return idx;
+    }
+    // `find` keys `by_hash`. A nursery intern that hashed the nursery
+    // word (`id_or_identityhash_reentrant` / a busy allocator box)
+    // records a different key than the old-gen intern of the same
+    // object. `history.py` `ConstPtr` is one object: the live word
+    // already in a slot is that intern (`same_constant` compares
+    // `value`).
+    if let Some(idx) = find_by_addr(&guard, addr.0) {
+        stamp_reuse(&mut guard, idx, addr, hash);
         return idx;
     }
     let live = current_live();
@@ -242,10 +249,8 @@ pub fn intern(addr: GcRef) -> u32 {
         guard.live.push(live);
         idx
     };
-    let pos = guard
-        .by_hash
-        .partition_point(|&(h, i)| (h, i) < (hash, idx));
-    guard.by_hash.insert(pos, (hash, idx));
+    insert_pair(&mut guard.by_hash, hash, idx);
+    insert_pair(&mut guard.by_addr, addr.0 as u64, idx);
     // Publish before releasing the intern lock so another thread that
     // finds this index cannot `resolve` a still-zero mirror.
     publish_slot(idx as usize, addr);
@@ -334,7 +339,13 @@ pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
     set_walking(true);
     let _clear = Clear;
+    let old = guard.slots[idx].0 as u64;
     visitor(&mut guard.slots[idx]);
+    let new = guard.slots[idx].0 as u64;
+    if old != new {
+        remove_pair(&mut guard.by_addr, old, index);
+        insert_pair(&mut guard.by_addr, new, index);
+    }
     publish_slot(idx, guard.slots[idx]);
 }
 
@@ -363,12 +374,17 @@ pub fn set_slot(index: u32, addr: GcRef) {
         return;
     }
     let mut guard = table();
-    if let Some(slot) = guard.slots.get_mut(index as usize) {
-        *slot = addr;
-    } else {
+    let i = index as usize;
+    let Some(slot) = guard.slots.get_mut(i) else {
         return;
+    };
+    let old = slot.0 as u64;
+    *slot = addr;
+    if old != addr.0 as u64 {
+        remove_pair(&mut guard.by_addr, old, index);
+        insert_pair(&mut guard.by_addr, addr.0 as u64, index);
     }
-    publish_slot(index as usize, addr);
+    publish_slot(i, addr);
 }
 
 /// Current address of index `index`.
@@ -435,7 +451,13 @@ pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {
             idx += 1;
             continue;
         }
+        let old = guard.slots[idx].0 as u64;
         visitor(&mut guard.slots[idx]);
+        let new = guard.slots[idx].0 as u64;
+        if old != new {
+            remove_pair(&mut guard.by_addr, old, idx as u32);
+            insert_pair(&mut guard.by_addr, new, idx as u32);
+        }
         publish_slot(idx, guard.slots[idx]);
         idx += 1;
     }
@@ -457,7 +479,8 @@ pub fn sweep_untraced() {
 
 fn free_slot(guard: &mut Table, idx: usize) {
     let hash = guard.hashes[idx];
-    remove_hash(&mut guard.by_hash, hash, idx as u32);
+    remove_pair(&mut guard.by_hash, hash, idx as u32);
+    remove_pair(&mut guard.by_addr, guard.slots[idx].0 as u64, idx as u32);
     guard.slots[idx] = GcRef::NULL;
     guard.hashes[idx] = 0;
     guard.marks[idx] = 0;
@@ -466,21 +489,73 @@ fn free_slot(guard: &mut Table, idx: usize) {
     guard.free.push(idx as u32);
 }
 
-fn remove_hash(by_hash: &mut Vec<(u64, u32)>, hash: u64, idx: u32) {
-    let start = by_hash.partition_point(|&(h, _)| h < hash);
-    for i in start..by_hash.len() {
-        if by_hash[i].0 != hash {
+fn insert_pair(pairs: &mut Vec<(u64, u32)>, key: u64, idx: u32) {
+    let pos = pairs.partition_point(|&(k, i)| (k, i) < (key, idx));
+    pairs.insert(pos, (key, idx));
+}
+
+fn remove_pair(pairs: &mut Vec<(u64, u32)>, key: u64, idx: u32) {
+    let start = pairs.partition_point(|&(k, _)| k < key);
+    for i in start..pairs.len() {
+        if pairs[i].0 != key {
             break;
         }
-        if by_hash[i].1 == idx {
-            by_hash.remove(i);
+        if pairs[i].1 == idx {
+            pairs.remove(i);
             return;
         }
     }
 }
 
+fn stamp_reuse(guard: &mut Table, idx: u32, addr: GcRef, hash: u64) {
+    let i = idx as usize;
+    if i >= guard.live.len() {
+        guard.live.resize(i + 1, 0);
+    }
+    guard.live[i] = current_live();
+    // The slot may still hold the from-space address when no holder
+    // traced it this wave. The interned word is the live one.
+    if guard.slots[i] != addr {
+        let old = guard.slots[i].0 as u64;
+        guard.slots[i] = addr;
+        publish_slot(i, addr);
+        if old != addr.0 as u64 {
+            remove_pair(&mut guard.by_addr, old, idx);
+            insert_pair(&mut guard.by_addr, addr.0 as u64, idx);
+        }
+    }
+    if guard.hashes.get(i).copied() != Some(hash) {
+        retarget_hash(guard, idx, hash);
+    }
+}
+
+fn retarget_hash(guard: &mut Table, idx: u32, new_hash: u64) {
+    let i = idx as usize;
+    let old = guard.hashes[i];
+    if old == new_hash {
+        return;
+    }
+    remove_pair(&mut guard.by_hash, old, idx);
+    guard.hashes[i] = new_hash;
+    insert_pair(&mut guard.by_hash, new_hash, idx);
+}
+
+fn find_by_addr(table: &Table, addr: usize) -> Option<u32> {
+    let key = addr as u64;
+    let start = table.by_addr.partition_point(|&(a, _)| a < key);
+    for &(a, idx) in &table.by_addr[start..] {
+        if a != key {
+            break;
+        }
+        return Some(idx);
+    }
+    None
+}
+
 fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
     let start = table.by_hash.partition_point(|&(h, _)| h < hash);
+    let mut identity_hit = None;
+    let mut identity_hits = 0u32;
     for &(h, idx) in &table.by_hash[start..] {
         if h != hash {
             break;
@@ -488,8 +563,17 @@ fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
         if table.slots.get(idx as usize).map(|s| s.0) == Some(addr) {
             return Some(idx);
         }
+        identity_hits += 1;
+        identity_hit = Some(idx);
     }
-    None
+    // `id_or_identityhash` is unique per object. After a move the
+    // live address misses the slot, but the recorded hash still names
+    // the one intern. Several hits would be a hash collision.
+    if identity_hits == 1 {
+        identity_hit
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +600,58 @@ mod tests {
         assert_eq!(resolve(i), a);
         let b = GcRef(0x2222_0000);
         assert_ne!(intern(b), i);
+    }
+
+    #[test]
+    fn intern_reuses_the_slot_when_the_referent_moved() {
+        let _serial = TEST_SERIAL.lock();
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                crate::set_gc_id_or_identityhash(None);
+            }
+        }
+        let _reset = ResetHook;
+        fn stable_id(addr: usize) -> usize {
+            if addr == 0x5555_0000 || addr == 0x5555_0080 {
+                0x1D_0001
+            } else {
+                addr
+            }
+        }
+        crate::set_gc_id_or_identityhash(Some(stable_id));
+        let idx = intern(GcRef(0x5555_0000));
+        assert_eq!(intern(GcRef(0x5555_0080)), idx);
+        assert_eq!(resolve(idx), GcRef(0x5555_0080));
+    }
+
+    #[test]
+    fn intern_reuses_the_slot_when_the_identity_hash_is_the_address() {
+        let _serial = TEST_SERIAL.lock();
+        // Default hook: identity is the address. A nursery intern then
+        // an intern of the forwarded word must be one ConstPtr.
+        let from = GcRef(0x5555_1000);
+        let to = GcRef(0x5555_1080);
+        let idx = intern(from);
+        set_slot(idx, to);
+        assert_eq!(intern(to), idx);
+        assert_eq!(resolve(idx), to);
+        assert_ne!(intern(GcRef(0x5555_2000)), idx);
+    }
+
+    #[test]
+    fn intern_reuses_the_slot_after_walk_when_hashes_differ() {
+        let _serial = TEST_SERIAL.lock();
+        let from = GcRef(0x5555_3000);
+        let to = GcRef(0x5555_3080);
+        let idx = intern(from);
+        walk(&mut |slot| {
+            if slot.0 == from.0 {
+                *slot = to;
+            }
+        });
+        assert_eq!(intern(to), idx);
+        assert_eq!(resolve(idx), to);
     }
 
     #[test]

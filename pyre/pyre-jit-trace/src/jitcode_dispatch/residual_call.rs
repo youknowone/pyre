@@ -342,9 +342,80 @@ impl EscapeFlushUndo {
     }
 }
 
-fn owner_root_if_gc(addr: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
-    (addr != 0 && majit_gc::gc_owns_object(addr))
-        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)))
+#[track_caller]
+pub(crate) fn owner_root_if_gc(addr: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    if addr == 0 || !majit_gc::gc_owns_object(addr) {
+        return None;
+    }
+    Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+        majit_ir::GcRef(addr),
+    ))
+}
+
+/// One [`owner_root_if_gc`] per `Ref` concrete, for a fold that carries an
+/// operand list across the Trace-pool appends of its guards and sub-walk.
+pub(crate) fn owner_roots_for_concretes(
+    values: &[ConcreteValue],
+) -> Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>> {
+    values
+        .iter()
+        .map(|value| match *value {
+            ConcreteValue::Ref(obj) => owner_root_if_gc(obj as usize),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rewrite each pinned `Ref` in `values` to the address its root tracks now.
+pub(crate) fn refresh_pinned_concretes(
+    values: &mut [ConcreteValue],
+    pins: &[Option<majit_gc::shadow_stack::OwnerRootGuard>],
+) {
+    for (value, pin) in values.iter_mut().zip(pins) {
+        if let Some(pin) = pin {
+            *value = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+        }
+    }
+}
+
+/// [`owner_roots_for_concretes`] for a list the fold also rewrites: an entry
+/// replaced since it was pinned keeps its replacement.
+pub(crate) struct PinnedConcretes {
+    pins: Vec<
+        Option<(
+            pyre_object::PyObjectRef,
+            majit_gc::shadow_stack::OwnerRootGuard,
+        )>,
+    >,
+}
+
+impl PinnedConcretes {
+    pub(crate) fn new(values: &[ConcreteValue]) -> Self {
+        let pins = values
+            .iter()
+            .map(|value| match *value {
+                ConcreteValue::Ref(obj) => owner_root_if_gc(obj as usize).map(|pin| (obj, pin)),
+                _ => None,
+            })
+            .collect();
+        Self { pins }
+    }
+
+    /// Rewrite each entry still holding its pinned object to the address the
+    /// root tracks now.
+    pub(crate) fn refresh(&mut self, values: &mut [ConcreteValue]) {
+        for (value, pin) in values.iter_mut().zip(self.pins.iter_mut()) {
+            let Some((seen, root)) = pin else {
+                continue;
+            };
+            if !matches!(*value, ConcreteValue::Ref(obj) if obj == *seen) {
+                continue;
+            }
+            let live = root.get().0 as pyre_object::PyObjectRef;
+            *value = ConcreteValue::Ref(live);
+            *seen = live;
+        }
+    }
 }
 
 /// Owner-root for the walk's live frame across one residual.
@@ -4839,6 +4910,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         roots.normalize(base, snapshot.len());
         (roots, base, snapshot.len())
     });
+    // The `last_instr` publish above appends to `opencoder.py Trace._ops` and
+    // can minor-collect after `args` was read. The boxes are
+    // `history.py *FrontendOp.value` and are forwarded; re-read the Refs.
+    for (slot, &arg) in args.iter_mut().zip(&allboxes[1..]) {
+        if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(arg)
+            && r != majit_ir::GcRef::NO_CONCRETE
+        {
+            *slot = r.as_usize() as i64;
+        }
+    }
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
@@ -5630,11 +5711,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // consumed value into TLS as well.  An
             // uncaught raise is carried by the trace's exception FINISH; an
             // aborted walk re-executes the live opcode.
-            let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
-            ctx.set_last_exc_value(
-                bh_exc_box,
-                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
-            );
+            let (bh_exc_box, bh_exc_concrete) = intern_live_exc(ctx.trace_ctx, bh_exc as usize);
+            ctx.set_last_exc_value(bh_exc_box, bh_exc_concrete);
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
@@ -10065,9 +10143,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             if let Some(boxed_ptr) = walker_execute_may_force_boxed(ctx, &allboxes, call_descr) {
                 let intval =
                     unsafe { pyre_object::w_int_get_value(boxed_ptr as pyre_object::PyObjectRef) };
+                // `walker_box_int` records `wrapint` and can minor-collect.
+                // Pin the executed box across that append; stamp the
+                // forwarded address (`history.py` `*FrontendOp.value`).
+                let boxed_pin = owner_root_if_gc(boxed_ptr as usize);
                 let boxed = walker_box_int(ctx, op.pc, raw_arg, intval)?;
-                // wrapint allocates; the concrete is that heap box,
-                // not the LOAD_SMALL_INT intern table.
+                let boxed_ptr = boxed_pin
+                    .as_ref()
+                    .map(|pin| pin.get().0 as i64)
+                    .unwrap_or(boxed_ptr);
                 ctx.trace_ctx
                     .set_opref_concrete(boxed, box_int_concrete(intval, boxed_ptr));
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
@@ -10880,11 +10964,8 @@ fn cond_record_handle_exception<Sym: WalkSym>(
         v
     });
     if bh_exc != 0 {
-        let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
-        ctx.set_last_exc_value(
-            bh_exc_box,
-            ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
-        );
+        let (bh_exc_box, bh_exc_concrete) = intern_live_exc(ctx.trace_ctx, bh_exc as usize);
+        ctx.set_last_exc_value(bh_exc_box, bh_exc_concrete);
         ctx.fbw_mode.class_of_last_exc_is_const = false;
         if let Some(cb) = crate::callbacks::try_get() {
             (cb.drain_backend_jit_exc)();
