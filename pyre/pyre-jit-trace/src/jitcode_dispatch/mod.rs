@@ -7899,11 +7899,6 @@ pub(crate) enum GuardStampTarget {
     /// The last recorded op — the guard IS that op.
     #[default]
     LastOp,
-    /// The guard op `from_end` guards back from the most recent one
-    /// (`0` == the most recent). Needed when a guard is emitted inside a
-    /// helper that records further ops before the caller can capture, and
-    /// when one opcode emits more than one guard.
-    GuardFromEnd(usize),
 }
 
 /// Fallback for `rlib/jit.py` `max_unroll_recursion` when a skeleton walk has
@@ -11124,17 +11119,6 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
-}
-
-/// The word a constant `OpRef` stands for, in the shape
-/// `heapcache::is_nullity_known` wants: RPython reads `box.getref_base()` off
-/// the box itself, and the Rust constant namespace needs the pool consulted.
-fn walker_inline_const_word(op: OpRef) -> Option<i64> {
-    op.inline_const_to_value().and_then(|v| match v {
-        majit_ir::Value::Int(n) => Some(n),
-        majit_ir::Value::Ref(gc) => Some(gc.0 as i64),
-        _ => None,
-    })
 }
 
 /// A recording-path `GUARD_VALUE(box, const)` has already observed equality.

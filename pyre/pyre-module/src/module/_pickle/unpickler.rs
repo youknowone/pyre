@@ -626,7 +626,7 @@ mod memo_proxy {
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(w_memo);
             let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let w_dict = pyre_object::gc_roots::pin_root(w_dict);
+            let _ = pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let len = unsafe {
                 pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
@@ -1634,7 +1634,7 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<PyO
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_dict);
-    let items = pyre_object::gc_roots::pin_root(items);
+    let _ = pyre_object::gc_roots::pin_root(items);
     let n = unsafe {
         pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(base + 1))
     };

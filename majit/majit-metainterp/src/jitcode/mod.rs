@@ -559,13 +559,6 @@ pub trait RuntimeDescrTable: Sync {
 static GLOBAL_BUILD_DESCR_POOL: std::sync::OnceLock<&'static dyn RuntimeDescrTable> =
     std::sync::OnceLock::new();
 
-/// Runtime PyCode entries that share the `jitcodes[jitcode_pos]` index space
-/// above the build-time reservation. The descr-table `OnceLock` keeps the
-/// first installer, so this hook is the path a later installer uses to
-/// publish those slots (`resume.py rebuild_from_resumedata`).
-static RUNTIME_JITCODE_AT: std::sync::OnceLock<fn(usize) -> Option<std::sync::Arc<JitCode>>> =
-    std::sync::OnceLock::new();
-
 /// Install the process-global build-time descr pool.  Idempotent: the first
 /// call wins and later calls are ignored (the pool is a frozen build artifact,
 /// identical across callers).  See `GLOBAL_BUILD_DESCR_POOL`.
@@ -587,28 +580,6 @@ pub(crate) fn global_build_descr_pool() -> Option<&'static dyn RuntimeDescrTable
 /// that is already assigned, so any numbering done at run time starts above it.
 pub(crate) fn global_build_jitcodes() -> &'static [std::sync::Arc<JitCode>] {
     global_build_descr_pool().map_or(&[], |pool| pool.jitcodes())
-}
-
-/// Install the runtime half of `jitcodes[jitcode_pos]`. Idempotent: the first
-/// function wins.
-pub fn set_runtime_jitcode_at(lookup: fn(usize) -> Option<std::sync::Arc<JitCode>>) {
-    let _ = RUNTIME_JITCODE_AT.set(lookup);
-}
-
-/// `resume.py rebuild_from_resumedata` `jitcodes[jitcode_pos]` over the unified index space.
-///
-/// Tries the runtime PyCode hook first, then [`RuntimeDescrTable::jitcode_at`],
-/// then the frozen build-time prefix.
-pub(crate) fn resume_jitcode_at(index: usize) -> Option<std::sync::Arc<JitCode>> {
-    if let Some(lookup) = RUNTIME_JITCODE_AT.get() {
-        if let Some(jitcode) = lookup(index) {
-            return Some(jitcode);
-        }
-    }
-    if let Some(jitcode) = global_build_descr_pool().and_then(|pool| pool.jitcode_at(index)) {
-        return Some(jitcode);
-    }
-    global_build_jitcodes().get(index).cloned()
 }
 
 /// Per-`JitCode` descrs.  Pyre's analog of

@@ -523,9 +523,9 @@ macro_rules! majit_math2_gateway {
 }
 
 use pyre_interpreter::objspace::descroperation::{
-    _float_atan2, _float_copysign, _float_fmod, _float_isclose, _float_ldexp, _float_pos,
-    _float_pow, _float_remainder, _int_abs, _int_frexp_exponent_raw, _int_from_ceil,
-    _int_from_floor, _int_from_trunc, _int_isqrt,
+    _float_atan2, _float_copysign, _float_fmod, _float_isclose, _float_ldexp, _float_pow,
+    _float_remainder, _int_abs, _int_frexp_exponent_raw, _int_from_ceil, _int_from_floor,
+    _int_from_trunc, _int_isqrt,
 };
 
 // ll_math.py `ll_math_pow` on the arm where the C call can neither overflow

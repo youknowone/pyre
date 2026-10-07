@@ -5886,52 +5886,6 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, mut frame: usize) -> 
     true
 }
 
-/// Write the virtualizable locals the shadow can answer, and leave the rest.
-///
-/// [`flush_locals_region_to_frame`] declines the whole region when any slot is
-/// `Void` or `NO_CONCRETE`, because writing that sentinel would destroy a
-/// value the walk still holds. A traceback `f_locals` on the portal frame
-/// still has to publish the slots the trace did assign (`e`, `k`, `seen`);
-/// an untouched slot keeps the heap value the except binder already stored.
-pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> Vec<i64> {
-    if frame == 0 {
-        return Vec::new();
-    }
-    let Some(nlocals) = concrete_nlocals(frame) else {
-        return Vec::new();
-    };
-    let Some(info) = ctx.virtualizable_info() else {
-        return Vec::new();
-    };
-    let base = info.num_static_extra_boxes;
-    let frame_ptr = frame as *const u8;
-    let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *mut pyre_object::FixedObjectArray)
-    };
-    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
-        return Vec::new();
-    }
-    let mut written = Vec::new();
-    let mut frame = frame;
-    for abs in 0..nlocals {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            continue;
-        };
-        if matches!(value, Value::Void) {
-            continue;
-        }
-        if matches!(value, Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE) {
-            continue;
-        }
-        if let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) {
-            frame = frame_now;
-            written.push(abs as i64);
-        }
-    }
-    written
-}
-
 /// Write one local when its concrete value is a real object.
 ///
 /// `Value::Void` and `Ref(NO_CONCRETE)` are skipped: boxing either would

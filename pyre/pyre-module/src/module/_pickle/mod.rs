@@ -281,7 +281,7 @@ fn pickle_state() -> Option<*const PickleState> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let compat = import_module("_compat_pickle").ok()?;
-    let compat = pyre_object::gc_roots::pin_root(compat);
+    let _ = pyre_object::gc_roots::pin_root(compat);
     for attr in [
         "NAME_MAPPING",
         "IMPORT_MAPPING",
@@ -800,10 +800,10 @@ pyre_interpreter::py_module! {
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(data);
-            let fix_imports = pyre_object::gc_roots::pin_root(fix_imports);
-            let encoding = pyre_object::gc_roots::pin_root(encoding);
-            let errors = pyre_object::gc_roots::pin_root(errors);
-            let buffers = pyre_object::gc_roots::pin_root(buffers);
+            let _ = pyre_object::gc_roots::pin_root(fix_imports);
+            let _ = pyre_object::gc_roots::pin_root(encoding);
+            let _ = pyre_object::gc_roots::pin_root(errors);
+            let _ = pyre_object::gc_roots::pin_root(buffers);
             let io = import_module("io")?;
             let bytesio_cls = pyre_interpreter::baseobjspace::getattr_str(io, "BytesIO")?;
             let file = call_fn(

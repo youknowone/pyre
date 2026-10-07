@@ -172,16 +172,10 @@ pub unsafe fn convert_from_object(
                     // shadow-stack slot. The converting arm still pins,
                     // because the overflow message names the object after
                     // `__index__`.
-                    let (value, w_overflow) = if unsafe { pyre_object::pyobject::is_bool(w_ob) } {
-                        (
-                            unsafe { pyre_object::boolobject::w_bool_get_value(w_ob) } as i64,
-                            w_ob,
-                        )
-                    } else if unsafe { pyre_object::pyobject::is_int(w_ob) } {
-                        (
-                            unsafe { pyre_object::intobject::w_int_get_value(w_ob) },
-                            w_ob,
-                        )
+                    let (value, w_overflow) = if pyre_object::pyobject::is_bool(w_ob) {
+                        (pyre_object::boolobject::w_bool_get_value(w_ob) as i64, w_ob)
+                    } else if pyre_object::pyobject::is_int(w_ob) {
+                        (pyre_object::intobject::w_int_get_value(w_ob), w_ob)
                     } else {
                         let roots = pyre_object::gc_roots::push_roots();
                         let ob_slot = roots.base();

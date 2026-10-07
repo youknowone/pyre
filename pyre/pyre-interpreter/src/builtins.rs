@@ -22367,7 +22367,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
     if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
-        if fileio.fd() >= 0 {
+        if !fileio.closed() {
             return false;
         }
         // W_FileIO._closed is `fd < 0`. A wasm path open has no descriptor

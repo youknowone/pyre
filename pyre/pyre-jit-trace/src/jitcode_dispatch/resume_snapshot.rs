@@ -214,20 +214,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // can-raise residual inside it brings its `GuardNotForced` /
             // `GuardNoException` through here, and the stamp is what
             // `store_final_boxes_in_guard` finds instead of inventing.
-            let opcode = match scope.guard_stamp {
-                GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
-                GuardStampTarget::GuardFromEnd(from_end) => {
-                    ctx.trace_ctx.guard_op_opcode_from_end(from_end)
-                }
-            };
+            let opcode = ctx.trace_ctx.last_op_opcode();
             let descr =
                 majit_metainterp::make_resume_guard_descr_instance_next_foriter(opcode, green_key);
-            match scope.guard_stamp {
-                GuardStampTarget::LastOp => ctx.trace_ctx.set_last_op_descr(descr),
-                GuardStampTarget::GuardFromEnd(from_end) => {
-                    ctx.trace_ctx.set_guard_op_descr_from_end(from_end, descr)
-                }
-            }
+            ctx.trace_ctx.set_last_op_descr(descr);
             true
         } else {
             false
@@ -585,12 +575,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // Do publish last_instr first: the walker does not maintain
                 // that scalar at each opcode, and callers inspecting this
                 // frame must see the current call, not the last merge point.
-                let guard_opcode = match scope.guard_stamp {
-                    GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
-                    GuardStampTarget::GuardFromEnd(from_end) => {
-                        ctx.trace_ctx.guard_op_opcode_from_end(from_end)
-                    }
-                };
+                let guard_opcode = ctx.trace_ctx.last_op_opcode();
                 if matches!(guard_opcode, Some(OpCode::GuardNotForced)) {
                     async_force_vable_boxes =
                         Some(ctx.trace_ctx.build_snapshot_vable_vref_boxes().0);
@@ -1238,12 +1223,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // so both guards carry the post-merge `-live-`. Their boxes were
     // collected at that pc. Every other guard keeps the preamble marker.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let guard_opcode = match scope.guard_stamp {
-        GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
-        GuardStampTarget::GuardFromEnd(from_end) => {
-            ctx.trace_ctx.guard_op_opcode_from_end(from_end)
-        }
-    };
+    let guard_opcode = ctx.trace_ctx.last_op_opcode();
     let class_guard_pc = if matches!(
         guard_opcode,
         Some(OpCode::GuardNonnull | OpCode::GuardClass)
@@ -1335,9 +1315,6 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
     if guard_resume_pc_probe_enabled() {
         let opcode = match guard_stamp {
             GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
-            GuardStampTarget::GuardFromEnd(from_end) => {
-                ctx.trace_ctx.guard_op_opcode_from_end(from_end)
-            }
         };
         eprintln!(
             "[guard-pc] {origin} {opcode:?} op_pc={op_pc} jc={jitcode_index} \
@@ -1355,17 +1332,6 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
                 py_pc,
                 vable_boxes,
                 vref_boxes,
-            ),
-        GuardStampTarget::GuardFromEnd(from_end) => ctx
-            .trace_ctx
-            .capture_snapshot_for_last_guard_op_with_vable_vref(
-                active,
-                jitcode_index,
-                pc,
-                py_pc,
-                vable_boxes,
-                vref_boxes,
-                from_end,
             ),
     }
 }
@@ -3234,14 +3200,6 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         frames.push((frame.jitcode_index, pc_word, py_pc, frame.boxes.as_slice()));
     }
     match guard_stamp {
-        GuardStampTarget::GuardFromEnd(from_end) => ctx
-            .trace_ctx
-            .capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
-                &frames,
-                &vable_boxes,
-                &vref_boxes,
-                from_end,
-            ),
         GuardStampTarget::LastOp => ctx
             .trace_ctx
             .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
@@ -3618,14 +3576,6 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     ));
 
     match guard_stamp {
-        GuardStampTarget::GuardFromEnd(from_end) => ctx
-            .trace_ctx
-            .capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
-                &frames,
-                &vable_boxes,
-                &vref_boxes,
-                from_end,
-            ),
         GuardStampTarget::LastOp => ctx
             .trace_ctx
             .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(

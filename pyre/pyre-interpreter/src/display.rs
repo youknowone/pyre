@@ -1560,47 +1560,6 @@ pub(crate) unsafe fn exception_kind_str(
     Ok(unsafe { exception_kind_str_wtf8(obj) }?.map(|w| w.to_string_lossy().into_owned()))
 }
 
-fn wtf8_nth_code_point(bytes: &[u8], index: usize) -> Option<u32> {
-    let mut i = 0;
-    let mut n = 0usize;
-    while i < bytes.len() {
-        let b0 = bytes[i];
-        let len = if b0 < 0x80 {
-            1
-        } else if b0 < 0xE0 {
-            2
-        } else if b0 < 0xF0 {
-            3
-        } else {
-            4
-        };
-        if i + len > bytes.len() {
-            return None;
-        }
-        if n == index {
-            let cp = match len {
-                1 => b0 as u32,
-                2 => ((b0 as u32 & 0x1F) << 6) | (bytes[i + 1] as u32 & 0x3F),
-                3 => {
-                    ((b0 as u32 & 0x0F) << 12)
-                        | ((bytes[i + 1] as u32 & 0x3F) << 6)
-                        | (bytes[i + 2] as u32 & 0x3F)
-                }
-                _ => {
-                    ((b0 as u32 & 0x07) << 18)
-                        | ((bytes[i + 1] as u32 & 0x3F) << 12)
-                        | ((bytes[i + 2] as u32 & 0x3F) << 6)
-                        | (bytes[i + 3] as u32 & 0x3F)
-                }
-            };
-            return Some(cp);
-        }
-        i += len;
-        n += 1;
-    }
-    None
-}
-
 pub(crate) unsafe fn exception_kind_str_wtf8(
     obj: PyObjectRef,
 ) -> Result<Option<Wtf8Buf>, crate::PyError> {
@@ -1835,6 +1794,7 @@ pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, _fallback: &str) -> String 
 ///
 /// A stray continuation byte answers 1: the buffer is malformed, and stepping
 /// one byte keeps the scan in bounds.
+#[cfg(test)]
 fn wtf8_sequence_len(lead: u8) -> usize {
     match lead {
         0x00..=0x7f => 1,
@@ -1855,6 +1815,7 @@ fn wtf8_sequence_len(lead: u8) -> usize {
 /// rooted relative path with no drive. Otherwise a colon as the SECOND
 /// CHARACTER makes those two characters the drive, which is not two bytes
 /// unless the first character is single-byte.
+#[cfg(test)]
 fn nt_drive_len(path: &[u8]) -> usize {
     const UNC_PREFIX: &[u8] = br"\\?\UNC\";
     let is_sep = |b: u8| b == b'/' || b == b'\\';
@@ -1920,6 +1881,7 @@ fn syntax_error_basename_start(path: &[u8]) -> usize {
 ///
 /// A separator is ASCII and no continuation byte can collide with one, so the
 /// remainder scan is safe over encoded bytes.
+#[cfg(test)]
 fn basename_start(path: &[u8]) -> usize {
     let windows = cfg!(windows);
     let drive = if windows { nt_drive_len(path) } else { 0 };

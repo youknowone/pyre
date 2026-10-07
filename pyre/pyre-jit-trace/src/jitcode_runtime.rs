@@ -2346,10 +2346,6 @@ static LAZY_RUNTIME_DESCR_TABLE: LazyRuntimeDescrTable = LazyRuntimeDescrTable;
 
 pub fn install_global_build_descr_pool() {
     majit_metainterp::init_global_build_descr_pool(&LAZY_RUNTIME_DESCR_TABLE);
-    majit_metainterp::jitcode::set_runtime_jitcode_at(|index| {
-        crate::state::ensure_build_time_jitcode_at(index)
-            .map(|payload| std::sync::Arc::clone(&payload.jitcode))
-    });
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's

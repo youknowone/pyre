@@ -7143,10 +7143,6 @@ fn with_w_exception_group_for<R>(
     f(cache[idx].as_ref().unwrap())
 }
 
-fn with_w_exception_group<R>(kind: ExcKind, f: impl FnOnce(&PyreObjectDescrGroup) -> R) -> R {
-    with_w_exception_group_for(kind, exc_kind_canonical_is_user_layout(kind), f)
-}
-
 /// Map or storage field of a `_getusercls` exception, looked up by offset on
 /// the user SizeDescr (`ValueError` for the slim layout, `FileNotFoundError`
 /// for the extended one). Both share one struct identity per layout.

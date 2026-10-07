@@ -5293,7 +5293,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         };
     }
     let fnaddr = if type_query {
-        pyre_interpreter::call::__majit_wrap_type_query as usize
+        pyre_interpreter::call::__majit_wrap_type_query as *const () as usize
     } else {
         if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
             builtin_inline_decline!("not is_function", 0usize);

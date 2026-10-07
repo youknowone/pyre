@@ -278,6 +278,7 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
 /// tombstones to paint (this artefact's and `cross_tombstoned_leaves`),
 /// its named-const folds merged into the invocation table, and its
 /// eval-hook graph list. Returns the tombstones.
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn prelink_crate(
     llbc: &Llbc,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
@@ -1392,6 +1393,7 @@ impl CrateLoweringState {
     /// Union `other`'s harvested rows into this crate's registry. Later
     /// crates see earlier ones so an Opaque projection can name a field
     /// the defining crate registered. `or_insert` keeps the first row.
+    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn absorb_struct_fields(
         &mut self,
         other: &crate::front::semantic::StructFieldRegistry,
@@ -1404,6 +1406,7 @@ impl CrateLoweringState {
         }
     }
 
+    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn struct_fields(&self) -> &crate::front::semantic::StructFieldRegistry {
         &self.struct_fields
     }
@@ -1629,6 +1632,7 @@ impl<'l> CrateLowering<'l> {
     /// body: the startblock the body lowering starts from and the
     /// `FUNC.RESULT` it stamps, under the header's `stamp`. `None` without
     /// an `Unstructured` body.
+    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn decl_header_graph(
         &self,
         fd: &FunDecl,
@@ -1822,6 +1826,7 @@ impl<'l> CrateLowering<'l> {
 
     /// The header graph of the declared clause specialization `spec`: its
     /// startblock over the substituted locals and its header fields.
+    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn spec_header_graph(&self, spec: &DeclaredSpec) -> crate::model::FunctionGraph {
         let fd = self
             .llbc
@@ -1944,6 +1949,7 @@ impl DeclaredSpec {
 impl DeclaredSpec {
     /// The funcobj under the path the specialization's call sites name,
     /// with the stamps its registration carries.
+    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn into_declared(
         self,
         graph: crate::model::LazyGraph,
@@ -2353,6 +2359,7 @@ fn unresolved_trait_const_needs_residual(hints: &[String], graph: &FunctionGraph
 /// Stamp `residualize_unresolved_trait_const` onto a body whose header
 /// was snapshotted before the body existed. `policy.py`
 /// `look_inside_graph` reads the hint off the built graph.
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn stamp_unresolved_trait_const_residual(graph: &mut FunctionGraph) {
     if unresolved_trait_const_needs_residual(&graph.hints, graph) {
         graph.push_hint("dont_look_inside");
@@ -4334,6 +4341,7 @@ pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<
 /// `elidable_cannot_raise`, `elidable_or_memerror`) emits
 /// `_elidable_function_` alongside its own marker, so the single `"elidable"`
 /// token covers all three.
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn hints_reject_body(hints: &[String]) -> bool {
     if hints.iter().any(|h| h == "jit_look_inside") {
         return false;
@@ -4346,6 +4354,7 @@ pub(crate) fn hints_reject_body(hints: &[String]) -> bool {
 /// The set of paths in this LLBC whose bodies [`hints_reject_body`] keeps out
 /// of the JitCode closure, keyed `strip_crate_prefix(name_path())` — the same
 /// derivation [`dont_look_inside_set_of`] uses for its narrower question.
+#[cfg(any(test, feature = "mir-frontend"))]
 fn policy_opaque_fn_set_of(llbc: &Llbc) -> std::collections::HashSet<String> {
     crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
         .into_iter()
@@ -4365,7 +4374,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Result<FunctionGraph, LowerError> {
-    let mut u = fd.unstructured().ok_or_else(|| {
+    let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
             fd.item_meta.name_path()
@@ -8059,6 +8068,7 @@ struct Lowering<'a> {
 /// declared function, one named inputarg per formal parameter, built from
 /// the code object's locals alone. Returns the local-to-Variable table
 /// with the parameters bound.
+#[cfg(any(test, feature = "mir-frontend"))]
 fn pygraph_initial_block(
     graph: &mut FunctionGraph,
     locals: &majit_charon_reader::ullbc::Locals,
@@ -41319,23 +41329,6 @@ fn captured_local_reaches_field_uses(
     true
 }
 
-fn offsetof_bytes(llbc: &Llbc, parts: &[serde_json::Value]) -> Option<u64> {
-    let adt = parts.first()?.get("id")?.as_u64()?;
-    let variant = parts
-        .get(1)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize;
-    let field = parts.get(2)?.as_u64()? as usize;
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let layout = llbc.type_by_id(adt)?.layout_for_target(llbc, &target)?;
-    layout
-        .variant_layouts
-        .get(variant)?
-        .field_offsets
-        .get(field)
-        .copied()
-}
-
 #[allow(dead_code)]
 fn result_value_is_branched_or_returned(body: &Unstructured, llbc: &Llbc, dest: usize) -> bool {
     for bb in &body.body {
@@ -42370,7 +42363,7 @@ fn body_returns_owned_scope(
     // enters the aggregate.
     let mut guards = guards;
     loop {
-        let before = guards.len();
+        let before = guards.count();
         for bb in &body.body {
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
@@ -42383,7 +42376,7 @@ fn body_returns_owned_scope(
                 }
             }
         }
-        if guards.len() == before {
+        if guards.count() == before {
             break;
         }
     }
@@ -46494,6 +46487,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
 /// off the lowered body is what `_reject_function` already implies: the body
 /// was never going to be compiled, so whether it could be lowered must not
 /// decide whether the call site can be annotated.
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -50070,6 +50064,7 @@ fn collect_fn_stubs_from_llbc_if(
 /// Reuses the [`CallControl::unsafe_fn_stubs`] carrier + `register_unsafe_fn_stubs`
 /// registration path (both feed `(segments, Signature, return-token)` specs
 /// through the same annotator-only `residual_return_shell`).
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
@@ -50155,6 +50150,7 @@ pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
 ///   an `Option<i64>` return as a bare integer or as `Ref(None)` would
 ///   mis-type the value and only migrate the failure to a deeper wall, so
 ///   those methods stay residual until their result type can be modeled.
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_foreign_opaque_method_externals(
     llbc: &Llbc,
 ) -> Vec<(
@@ -50214,6 +50210,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
 /// directly from its `<Impl>` NameSeg, the free-function twin of
 /// [`Lowering::resolve_impl_owner_adt_def_id`] over the `<Impl>` segment.
+#[cfg(any(test, feature = "mir-frontend"))]
 fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -50232,6 +50229,7 @@ fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
 /// Free-function twin of [`Lowering::first_input_is_adt`]: true when the
 /// method's first input (`self`, possibly behind `&`/`&mut`/`*`) is the
 /// owner ADT.
+#[cfg(any(test, feature = "mir-frontend"))]
 fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
     fd.signature
         .inputs
@@ -50247,6 +50245,7 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
 /// A scalar literal output keeps its `ValueType`; an opaque-ADT output
 /// projects to `Ref(None)`; every other shape (`Option`, enum, tuple,
 /// reference, non-opaque ADT) is declined.
+#[cfg(any(test, feature = "mir-frontend"))]
 fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
     // stub models; decline.
@@ -53380,6 +53379,7 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose someshell ignores
 /// the payload. A `repr(transparent)` scalar wrapper keeps its inner register
 /// class, as it does at ordinary value sites.
+#[cfg(test)]
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
     tyref_to_attr_value_type_with(ty, llbc, no_tombstoned_leaves(), &gc_struct_ids)
@@ -54476,6 +54476,7 @@ pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)>
 
 /// Impl associated consts share one `name_path` (`<Impl>`). Register each
 /// by its defining global's `def_id` instead of that path.
+#[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn register_ambiguous_impl_foldable_const_lits(llbc: &Llbc) {
     let mut paths: Vec<String> = llbc
         .iter_global_decls()
