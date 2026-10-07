@@ -2161,6 +2161,15 @@ impl UnrollOptimizer {
                     body_ops = replace_terminal_jump(&body_ops, end_jump);
                 }
             } else {
+                if let Some(end_jump) = body_ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
+                    if jump_and_preamble_slot_kinds_disagree(end_jump, &exported_renamed_inputargs)
+                    {
+                        crate::mc_diag_bump(57);
+                        return Err(crate::optimize::InvalidLoop(
+                            "jump_to_preamble: JUMP/LABEL slot kinds disagree",
+                        ));
+                    }
+                }
                 body_ops = Self::jump_to_preamble(
                     &body_ops,
                     &preamble_target,
