@@ -284,6 +284,21 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "longlongmask",
             rtype_longlongmask,
         ),
+        (
+            "rpython.rlib.rarithmetic",
+            "ulonglongmask",
+            rtype_ulonglongmask,
+        ),
+        (
+            "rpython.rlib.rarithmetic",
+            "longlonglongmask",
+            rtype_longlonglongmask,
+        ),
+        (
+            "rpython.rlib.rarithmetic",
+            "ulonglonglongmask",
+            rtype_ulonglonglongmask,
+        ),
         // `rarithmetic.r_uint` dispatches via
         // `ExtRegistryEntry::ForType::specialize_call`
         // (rarithmetic.py), routed through
@@ -1442,6 +1457,31 @@ pub fn rtype_longlongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
     hop.exception_cannot_occur()?;
     let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
         &LowLevelType::SignedLongLong,
+    )])?;
+    Ok(vlist.into_iter().next())
+}
+
+/// `inputargs` coerces the machine word to `SignedLongLongLong`.
+pub fn rtype_longlonglongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
+        &LowLevelType::SignedLongLongLong,
+    )])?;
+    Ok(vlist.into_iter().next())
+}
+
+pub fn rtype_ulonglonglongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
+        &LowLevelType::UnsignedLongLongLong,
+    )])?;
+    Ok(vlist.into_iter().next())
+}
+
+pub fn rtype_ulonglongmask(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(
+        &LowLevelType::UnsignedLongLong,
     )])?;
     Ok(vlist.into_iter().next())
 }
@@ -3838,6 +3878,32 @@ pub fn rtype_cast_instance_intrinsic(
     hop.exception_cannot_occur()?;
     if r_arg0.lowleveltype() == &result_lltype {
         return Ok(Some(v_ptr));
+    }
+    // Unrelated raw owners share one address word. `cast_pointer` requires
+    // a parent chain (`lltype.castable`); `llmemory.cast_ptr_to_adr` then
+    // `cast_adr_to_ptr` is the retype that does not change gc status.
+    if let (LowLevelType::Ptr(cur), LowLevelType::Ptr(dest)) =
+        (r_arg0.lowleveltype(), &result_lltype)
+        && cur._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        && dest._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        && crate::translator::rtyper::lltypesystem::lltype::castable(dest, cur).is_err()
+    {
+        let v_adr = hop
+            .genop(
+                "cast_ptr_to_adr",
+                vec![v_ptr.clone()],
+                GenopResult::LLType(LowLevelType::Address),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "rtype_cast_instance_intrinsic: cast_ptr_to_adr produced no value".to_string(),
+                )
+            })?;
+        return Ok(hop.genop(
+            "cast_adr_to_ptr",
+            vec![v_adr],
+            GenopResult::LLType(result_lltype),
+        ));
     }
     // RPython `rmodel.externalvsinternal(..., gcref=True)` converts a
     // concrete GC pointer to/from llmemory.GCREF with `cast_opaque_ptr`

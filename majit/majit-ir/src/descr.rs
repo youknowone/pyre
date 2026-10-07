@@ -4478,6 +4478,25 @@ pub trait FailDescr: Descr {
         );
     }
 
+    /// This guard's bridge was rejected for a deterministic structural
+    /// reason, so later failures resume in the blackhole instead of
+    /// rebuilding the same bridge. Default false; resume-guard descrs
+    /// override. Nearest upstream owner is `AbstractResumeGuardDescr.status`
+    /// (`compile.py`).
+    fn bridge_declined_terminally(&self) -> bool {
+        false
+    }
+
+    /// Mark [`FailDescr::bridge_declined_terminally`]. Default panics
+    /// because only resume-guard descriptors participate in bridge
+    /// compilation.
+    fn set_bridge_declined_terminally(&self) {
+        panic!(
+            "set_bridge_declined_terminally invoked on a FailDescr that is \
+             not an AbstractResumeGuardDescr"
+        );
+    }
+
     /// `compile.py` `descr.rd_loop_token = clt` line-by-line port.
     ///
     /// Returns the owning `Arc<CompiledLoopToken>` typed as `&dyn Any`

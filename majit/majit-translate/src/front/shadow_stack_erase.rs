@@ -610,7 +610,18 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             },
             Ok(TermKind::Return) => {
                 if depth != 0 {
-                    return Err("returns-with-published-slots");
+                    // 10.04 `Drop` of the guard lives in an `is_cleanup`
+                    // block; `unstructured` leaves those out and appends
+                    // one `UnwindResume`. Return is then the normal closer.
+                    if body
+                        .body
+                        .last()
+                        .is_some_and(|bb| matches!(bb.term(llbc), Ok(TermKind::UnwindResume)))
+                    {
+                        depth = 0;
+                    } else {
+                        return Err("returns-with-published-slots");
+                    }
                 }
             }
             Ok(

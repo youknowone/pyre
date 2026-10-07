@@ -2151,10 +2151,12 @@ fn decode_term_kind(kind: &RawValue, llbc: &crate::Llbc) -> Result<TermKind, Str
 /// `Switch { data: {scrutinee, branches, fallback}, branches }` decodes
 /// straight into [`TermKind::Switch`]. Arm constants may be
 /// `{"Deduplicated": id}` and are read from [`crate::Llbc::dedup_const_body`].
-/// A pointer-identity arm is a `Ref` / `DynTrait` place, not a
-/// `ConstantExpr` literal. Drop it and take the fallback so the
-/// function stays in the program; `SwitchInt` cannot close on a
-/// non-scalar case.
+/// A scalar ConstantExpr folds through `const_expr_literal`. A
+/// pointer/vtable arm is a bare `Ref`+`DynTrait` kind rather than
+/// `[kind, ty]`; keep that JSON so the terminator decodes as
+/// `SwitchInt` (`rptr.py`/`rclass.py` `ptr_nonzero` If via
+/// `lower_niche_option_switch`). Any other non-scalar arm is dropped;
+/// if none remain, take the fallback so the function stays in the program.
 fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
     let data = sw.get("data").ok_or("switch missing data")?;
     let bbs = sw
@@ -2181,8 +2183,23 @@ fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
             .and_then(bb_of)
             .ok_or("switch arm target")?;
         let const_v = pair.first().ok_or("switch arm const")?;
-        let Some(lit) = llbc.const_expr_literal(const_v) else {
-            continue;
+        // A scalar ConstantExpr folds through `const_expr_literal`. A
+        // pointer/vtable arm is a bare `Ref`+`DynTrait` kind rather than
+        // `[kind, ty]`; keep that JSON so the terminator decodes as
+        // `SwitchInt`. Other non-scalars are dropped (fallback Goto if
+        // nothing remains).
+        let lit = match llbc.const_expr_literal(const_v) {
+            Some(lit) => lit,
+            None => {
+                let kept = llbc
+                    .const_expr_kind(const_v)
+                    .unwrap_or_else(|| const_v.clone());
+                if kept.get("Ref").is_some() || const_v.get("Ref").is_some() {
+                    kept
+                } else {
+                    continue;
+                }
+            }
         };
         let flag = lit.get("Bool").and_then(Value::as_bool);
         decoded.push((lit, target, flag));
@@ -2897,8 +2914,10 @@ mod tests {
     }
 
     /// Darwin Charon 0.1.281 emits a pointer-identity Switch arm as a
-    /// `Ref` / `DynTrait` place, not a ConstantExpr literal. Drop that
-    /// arm and take the fallback so the function stays in the program.
+    /// `Ref` / `DynTrait` place, not a ConstantExpr literal. Keep that
+    /// JSON as `SwitchInt` so `lower_niche_option_switch` can close it
+    /// as a `ptr_nonzero` If (`rptr.py` `rtype_bool`); decode must not
+    /// fail and drop the function.
     #[test]
     fn a_pointer_identity_switch_arm_decodes() {
         let doc = r#"{"charon_version":"t","has_errors":false,
@@ -2925,8 +2944,16 @@ mod tests {
         )
         .expect("Ref arm decodes");
         match term {
-            TermKind::Goto { target } => assert_eq!(target, 2),
-            other => panic!("expected Goto fallback: {other:?}"),
+            TermKind::Switch {
+                targets: SwitchTargets::SwitchInt(_, arms, default),
+                ..
+            } => {
+                assert_eq!(default, 2, "fallback maps through branches[0]");
+                assert_eq!(arms.len(), 1);
+                assert!(arms[0].0.get("Ref").is_some(), "Ref arm is kept");
+                assert_eq!(arms[0].1, 5, "arm target maps through branches[1]");
+            }
+            other => panic!("expected SwitchInt Ref arm: {other:?}"),
         }
     }
 }

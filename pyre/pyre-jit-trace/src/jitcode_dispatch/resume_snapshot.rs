@@ -30,6 +30,41 @@ pub(crate) fn branch_not_taken_stays_in_guard_opcode(
         && matches!((guard_py_pc, other_py_pc), (Some(guard), Some(other)) if guard == other)
 }
 
+/// The JitCode `op_pc` is an offset into — the body currently being walked.
+///
+/// `fbw_mode.snapshot_sym.jitcode()` is the eval-loop portal. Pairing that
+/// identity with a per-function or inlined-callee offset invents a coordinate
+/// `can_decode_live_vars` rejects (`resume.py` `jitcodes[jitcode_pos]`).
+/// Inline callees already name their body through [`InlineCalleeConsts`]; a
+/// top-level per-function walk stamps [`WalkSession::recording_jitcode_index`].
+fn walked_snapshot_jitcode<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<crate::state::JitCode> {
+    let index = if let Some(consts) = ctx.inline_callee_consts {
+        consts.jitcode_index
+    } else {
+        let rec = ctx.session.borrow().recording_jitcode_index;
+        if rec >= 0 {
+            rec
+        } else {
+            let snapshot_sym = ctx.fbw_mode.snapshot_sym;
+            if snapshot_sym.is_null() {
+                return None;
+            }
+            let sym = unsafe { &*snapshot_sym };
+            if sym.jitcode().is_null() {
+                return None;
+            }
+            unsafe { (*sym.jitcode()).index as i32 }
+        }
+    };
+    if index < 0 {
+        return None;
+    }
+    let payload = crate::state::pyjitcode_for_jitcode_index(index)?;
+    Some(crate::state::JitCode { index, payload })
+}
+
 /// Exact `jtransform.py handle_residual_call` trailing `-live-` marker.
 ///
 /// The codewriter emits this immediately after every may-force/can-raise
@@ -258,12 +293,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // walker never crosses `set_orgpc`, so the scalar is otherwise
     // stale at the loop-header pc — see the publish below).
 
-    // Full-body walk (Phase 7): the walk processes the outer
-    // `sym.jitcode` directly, so `op_pc` is a real resume coordinate.
-    // Map it back to the containing Python opcode (the blackhole resumes
-    // and re-executes that opcode — `orgpc` parity) and read liveness
-    // from the live walk register banks at that pc, instead of the
-    // static entry-time coordinate the per-opcode arm path uses.
+    // Full-body walk (Phase 7): `op_pc` is an offset into the body being
+    // walked (`recording_jitcode_index` / inlined callee), which is the
+    // per-CodeObject jitcode for a portal-shaped Python function. Map it
+    // back to the containing Python opcode (the blackhole resumes and
+    // re-executes that opcode — `orgpc` parity) and read liveness from
+    // the live walk register banks at that pc. `snapshot_sym.jitcode()` is
+    // the eval-loop portal and does not own this offset.
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
     // does not exist in the outer (`full_body_sym`) jitcode's py_pc→jitcode
@@ -303,17 +339,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // resuming through the single-frame collapse, whose caller-boundary
             // re-execute both mis-sizes the resumed frame (a decode/`LOAD_FAST`
             // out-of-bounds) and re-applies the callee's committed side effect.
-            // The caller names the guard (`GuardFromEnd` when the guard is
-            // not the last op). Overwriting that with `LastOp` attaches the
-            // snapshot to a later op and leaves the guard at `resume_pos == -1`.
-            let guard_stamp = scope.guard_stamp;
             return walker_capture_multi_frame_inline_snapshot(
                 ctx,
                 op_pc,
                 after_residual_call,
                 parent_frames,
                 scope,
-                guard_stamp,
+                GuardStampTarget::LastOp,
             );
         }
     }
@@ -326,12 +358,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // (fresh `top_regs`), not in `sym.registers_*`.
         let sym = unsafe { &*full_body_sym };
         if !sym.jitcode().is_null() {
+            let walked_owned = walked_snapshot_jitcode(ctx).unwrap_or_else(|| {
+                let jc = unsafe { &*sym.jitcode() };
+                crate::state::JitCode {
+                    index: jc.index,
+                    payload: std::sync::Arc::clone(&jc.payload),
+                }
+            });
             // Set when an after-residual-call guard's residual call sits inside
             // a try-block (its per-CodeObject jitcode emitted a post-call
             // catch); the JitCode resume coordinate then selects that catch.
             let mut marker_call_jit_pc: Option<usize> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
-                let jc = &*sym.jitcode();
+                let jc = &walked_owned;
                 // Forward py twin first (#73 phase-3): equals the containing
                 // coordinate plus trivia normalization by construction; the
                 // containing lookup survives for the empty-twin class.
@@ -446,7 +485,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // no corresponding op_pc-derived twin, so it retains the legacy
             // Python-PC lookup below.
             let resume_depth_twin: Option<u16> = unsafe {
-                let jc = &*sym.jitcode();
+                let jc = &walked_owned;
                 if loop_close_overshoot {
                     None
                 } else if scope.carried_resume_jit_pc.is_some() {
@@ -491,7 +530,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // slots it exchanged keep their pre-swap order for the rest of the
             // walk and every later guard snapshot publishes them crossed.
             if after_residual_call && ctx.vstack_valid && py_pc != ctx.vstack_cur_pypc {
-                let jc = unsafe { &*sym.jitcode() };
+                let jc = &walked_owned;
                 let code_ptr = jc.payload.code_ptr;
                 if !code_ptr.is_null() {
                     let resume_depth = match resume_depth_twin {
@@ -579,7 +618,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // symmetric with the active-box layout.  Fall back to
                 // `sym.valuestackdepth` only when liveness is unavailable.
                 let vsd_value = unsafe {
-                    let jc = &*sym.jitcode();
+                    let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
                         sym.valuestackdepth() as i64
                     } else {
@@ -624,7 +663,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let has_branch_guard = scope.branch_guard_jitcode_pc.is_some();
             let stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
-                    let jc = &*sym.jitcode();
+                    let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
                         0usize
                     } else {
@@ -709,11 +748,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 let nlocals = sym.nlocals();
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 let depth = unsafe {
-                    let jc = &*sym.jitcode();
+                    let jc = &walked_owned;
                     jc.payload.depth_for_jitcode_pc_pred(gjc).unwrap_or(0) as usize
                 };
                 let pcdep: Vec<(u8, u16, u16)> = unsafe {
-                    let jc = &*sym.jitcode();
+                    let jc = &walked_owned;
                     jc.payload.pcdep_for_jitcode_pc(gjc).unwrap_or_default()
                 };
                 let mut covered: std::collections::HashSet<usize> =
@@ -839,11 +878,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // ordinary marker would name a different resume point.
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
-                let marker = unsafe {
-                    (&*sym.jitcode())
-                        .payload
-                        .resume_marker_for_jitcode_pc(op_pc)
-                };
+                let marker = unsafe { (&walked_owned).payload.resume_marker_for_jitcode_pc(op_pc) };
                 // A specialization guard (`GuardValue`/`GuardClass`) sources its
                 // resume coordinate from the walk cursor's per-op `-live-`
                 // BEFORE anchor (`ctx.live_before_jit_pc`, `pyjitpl.py`)
@@ -881,7 +916,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // trampoline can share the guard's Python opcode and must
                 // still take `encode_branch_orgpc` / kept-slot recovery.
                 let (guard_py, other_py, guard_is_jump_backward) = unsafe {
-                    let jc = &*sym.jitcode();
+                    let jc = &walked_owned;
                     let table = &jc.payload.metadata.py_exact_by_jit_pc;
                     let guard_py = scope
                         .branch_guard_jitcode_pc
@@ -909,7 +944,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 if same_opcode_poll
                     && ctx.live_before_jit_pc != usize::MAX
                     && unsafe {
-                        (&*sym.jitcode())
+                        (&walked_owned)
                             .payload
                             .jitcode
                             .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
@@ -927,7 +962,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             ctx.live_before_jit_pc,
                             flavor_true,
                         );
-                        let jc = unsafe { &*sym.jitcode() };
+                        let jc = &walked_owned;
                         expand_branch_carried(&jc.payload, tagged)
                             == marker
                                 .map(|m| m as i32)
@@ -941,7 +976,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         Some(OpCode::GuardValue | OpCode::GuardClass)
                     )
                     && unsafe {
-                        (&*sym.jitcode())
+                        (&walked_owned)
                             .payload
                             .jitcode
                             .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
@@ -985,7 +1020,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // stay symmetric, and both pass `can_decode_live_vars` (a
                 // `-live-` marker). Fall back to the sentinel on a map miss.
                 let marker = unsafe {
-                    let jc = &*sym.jitcode();
+                    let jc = &walked_owned;
                     // RPython `pyjitpl.py capture_resumedata(
                     // after_residual_call=True)` snapshots the `-live-`
                     // immediately following the residual call.  Read that
@@ -1005,11 +1040,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
                 // twin at the guard's own `op_pc`.
-                let twin = unsafe {
-                    (&*sym.jitcode())
-                        .payload
-                        .resume_marker_for_jitcode_pc(op_pc)
-                };
+                let twin = unsafe { (&walked_owned).payload.resume_marker_for_jitcode_pc(op_pc) };
                 match twin {
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
@@ -1024,7 +1055,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // when `has_branch_guard` is false — so this is always the merge
             // `py_pc`.
             let liveness_py_pc = py_pc;
-            let payload = unsafe { &(&*sym.jitcode()).payload };
+            let payload = &walked_owned.payload;
             let resolved = payload
                 .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live());
             let Some(resolved_offset) = resolved else {
@@ -1100,7 +1131,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             }
             let (entry_jitcode_pc, entry_twin, entry_caller) = if has_branch_guard {
                 let entry_jitcode_pc = unsafe {
-                    let metadata = &(&*sym.jitcode()).payload.metadata;
+                    let metadata = &walked_owned.payload.metadata;
                     (guard_jitcode_pc >= 0)
                         .then(|| {
                             crate::pyjitcode::floor_segment_for_jitcode_pc(
@@ -1119,7 +1150,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             } else {
                 let entry = unsafe {
                     crate::py_coord::first_floor_boundary_for_py(
-                        &(&*sym.jitcode()).payload.metadata,
+                        &walked_owned.payload.metadata,
                         liveness_py_pc,
                     )
                     .map(|(pc, _)| pc)

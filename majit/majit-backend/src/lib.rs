@@ -3246,6 +3246,18 @@ pub trait Backend: Send {
         caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
+    /// Whether a `BackendError::Unsupported` returned by `compile_bridge`
+    /// is a deterministic structural decline that re-tracing the same guard
+    /// would reproduce identically (a compile storm). When `true`, the
+    /// metainterp records the guard so `must_compile_with_values` stops
+    /// re-firing it and the guard falls back to blackhole resume. The
+    /// default is `false`: backends that patch machine code in place never
+    /// decline structurally, so a transient failure is retried after the
+    /// jitcounter ticks again (`compile.py done_compiling`).
+    fn bridge_decline_is_terminal(&self) -> bool {
+        false
+    }
+
     /// Register a freshly-compiled JitCellToken as still reachable from
     /// the frontend.  Backends that need to resolve `jf_descr` pointers
     /// across token boundaries (dynasm's `find_descr_by_ptr` cross-token
@@ -4784,13 +4796,18 @@ pub enum BackendError {
     CompilationFailed(String),
     /// Unsupported operation.
     Unsupported(String),
+    /// A decline that is a property of this trace's ops. `must_compile`
+    /// keeps ticking so a later trace of the same guard can compile.
+    RetryableUnsupported(String),
 }
 
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BackendError::CompilationFailed(s) => write!(f, "compilation failed: {s}"),
-            BackendError::Unsupported(s) => write!(f, "unsupported: {s}"),
+            BackendError::Unsupported(s) | BackendError::RetryableUnsupported(s) => {
+                write!(f, "unsupported: {s}")
+            }
         }
     }
 }

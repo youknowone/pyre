@@ -4364,6 +4364,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
     };
+    session.borrow_mut().recording_jitcode_index = pjc.jitcode.index() as i32;
     // The green stays in Python-bytecode coordinates for merge-point matching;
     // the codewrite-time trace-entry sidecar carries its JitCode coordinate for
     // plain-portal function entries and loop headers. A bridge starts at its

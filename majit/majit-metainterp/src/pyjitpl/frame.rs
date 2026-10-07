@@ -996,10 +996,14 @@ impl MIFrame {
                     // pyjitpl.py:186-187 CONST_NULL clearing.
                     OpBox::ConstPtr(0)
                 } else if idx < num_regs_r {
-                    // pyjitpl.py `add_box_to_storage(self.registers_r[index])`
-                    let opref = self.ref_regs[idx]
-                        .expect("get_list_of_active_boxes: ref register uninitialized");
-                    register_to_box(opref)
+                    // pyjitpl.py `add_box_to_storage(self.registers_r[index])`.
+                    // A raising residual leaves the result slot empty. The
+                    // in-call clear stores CONST_NULL there; record the same
+                    // null when the slot was never written.
+                    match self.ref_regs[idx] {
+                        Some(opref) => register_to_box(opref),
+                        None => OpBox::ConstPtr(0),
+                    }
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
@@ -1235,10 +1239,10 @@ impl MIFrame {
                 let tagged = if Some(idx) == clear_ref_idx {
                     SnapshotTagged::Const(0, Type::Ref)
                 } else if idx < num_regs_r {
-                    let opref = self.ref_regs[idx].unwrap_or_else(|| panic!(
-                        "get_list_of_active_snapshot_boxes: ref register {idx} uninitialized in {} (pc={}, cursor={}, in_a_call={in_a_call}, after_residual_call={after_residual_call}, refs={:?})",
-                        self.jitcode.name(), self.pc, self.code_cursor, self.ref_regs,
-                    ));
+                    let Some(opref) = self.ref_regs[idx] else {
+                        boxes.push(SnapshotTagged::Const(0, Type::Ref));
+                        continue;
+                    };
                     if let Some(v) = opref.inline_const_to_value() {
                         SnapshotTagged::Const(v.as_raw_i64(), Type::Ref)
                     } else {

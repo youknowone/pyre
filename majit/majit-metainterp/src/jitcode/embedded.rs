@@ -273,6 +273,10 @@ impl RuntimeDescrTable for EmbeddedJitCodeTable {
     fn jitcodes(&self) -> &'static [Arc<JitCode>] {
         self.jitcodes
     }
+
+    fn jitcode_at(&self, index: usize) -> Option<Arc<JitCode>> {
+        self.jitcodes.get(index).cloned()
+    }
 }
 
 #[cfg(test)]

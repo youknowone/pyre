@@ -217,7 +217,7 @@ impl From<i64> for ConstSlotR {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct JitCodeBody {
     /// RPython `jitcode.py` `self.calldescr = calldescr`. RPython sets
     /// this at construction because rtyper has resolved the function's
@@ -327,6 +327,31 @@ pub struct JitCodeBody {
     /// upstream's `Variable.concretetype` carrier shape.
     #[serde(skip)]
     pub _ssarepr: Option<Arc<dyn SsaReprDump>>,
+}
+
+impl std::fmt::Debug for JitCodeBody {
+    /// `_ssarepr` holds the flattened ops, and a call op holds the callee
+    /// `JitCode`. Printing it follows that arc (`body` → ops → callee body)
+    /// and overflows the stack.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitCodeBody")
+            .field("calldescr", &self.calldescr)
+            .field("code", &self.code)
+            .field("constants_i", &self.constants_i)
+            .field("constants_r", &self.constants_r)
+            .field("constants_f", &self.constants_f)
+            .field("str_consts", &self.str_consts)
+            .field("unit_variant_consts", &self.unit_variant_consts)
+            .field("exc_instance_consts", &self.exc_instance_consts)
+            .field("c_num_regs_i", &self.c_num_regs_i)
+            .field("c_num_regs_r", &self.c_num_regs_r)
+            .field("c_num_regs_f", &self.c_num_regs_f)
+            .field("startpoints", &self.startpoints)
+            .field("jit_merge_point_offset", &self.jit_merge_point_offset)
+            .field("alllabels", &self.alllabels)
+            .field("resulttypes", &self.resulttypes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -837,13 +862,14 @@ impl JitCode {
     /// `jitcode.py` `JitCode.get_live_vars_info`: `if not
     /// we_are_translated(): assert pc in self._startpoints`.
     fn assert_startpoint(&self, pc: usize) {
-        debug_assert!(
-            self.startpoints
-                .as_ref()
-                .expect("get_live_vars_info: _startpoints is None on a non-assembled jitcode")
-                .contains(&pc),
-            "pc not in startpoints",
-        );
+        // `jitcode.py get_live_vars_info`: `if not we_are_translated():
+        // assert pc in self._startpoints`. A body whose `_startpoints`
+        // was never installed has nothing to assert against; the byte
+        // test in `get_live_vars_info` is then the whole gate.
+        let Some(points) = self.startpoints.as_ref() else {
+            return;
+        };
+        debug_assert!(points.contains(&pc), "pc not in startpoints");
     }
 
     /// `True` when `pc` is a recorded resume startpoint (`jitcode.py:85`
@@ -874,11 +900,19 @@ impl JitCode {
     pub fn can_decode_live_vars(&self, pc: usize, op_live: u8) -> bool {
         // Match both instruction-boundary checks in get_live_vars_info.
         // An argument byte equal to op_live is not a liveness instruction.
-        if !self.is_valid_startpoint(pc) || pc >= self.code.len() {
+        if pc >= self.code.len() {
             return false;
         }
         if self.code.get(pc) == Some(&op_live) {
-            return true;
+            // `jitcode.py get_live_vars_info`: if this byte is `-live-`,
+            // decode it. The startpoint assert is untranslated-only, so a
+            // body whose `_startpoints` was never installed still resumes
+            // at a real `-live-` marker. A recorded startpoint set still
+            // rejects an operand byte that happens to equal `op_live`.
+            return self.startpoints.is_none() || self.is_valid_startpoint(pc);
+        }
+        if !self.is_valid_startpoint(pc) {
+            return false;
         }
         match pc.checked_sub(super::liveness::OFFSET_SIZE + 1) {
             Some(back) => self.is_valid_startpoint(back) && self.code.get(back) == Some(&op_live),

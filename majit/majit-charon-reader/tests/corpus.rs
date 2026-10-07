@@ -115,7 +115,17 @@ fn loads_fixture_corpus() {
     //
     // Measured on Charon 0.1.281 (nightly-2026.10.04): drop glue is no
     // longer its own local item, and this artefact holds 99.
-    assert_eq!(local_count, 99, "99 local fns expected");
+    //
+    // + 6 for the three `majit_gc::GcType` impls (`ClassObject`,
+    // `ObjectHeader`, `TypeOnlyHeader`): each `type_id` and each `SIZE`
+    // associated const is a function body.
+    //
+    // + 2 for the `Option<*mut T>` pair, `option_raw_c_void_from_int` and
+    // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
+    // contributes no body.
+    //
+    // Regenerated from the merged corpus sources on nightly-2026.10.04.
+    assert_eq!(local_count, 107, "107 local fns expected");
 }
 
 #[test]

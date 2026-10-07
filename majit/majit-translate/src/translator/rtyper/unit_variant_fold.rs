@@ -530,6 +530,8 @@ mod tests {
                 reds_i: Vec::new(),
                 reds_r: Vec::new(),
                 reds_f: Vec::new(),
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             false,
         );

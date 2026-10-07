@@ -1522,9 +1522,20 @@ pub struct CompiledWasmLoop {
     /// slot.
     pub bridge_owned_label_targets: RefCell<Vec<(majit_ir::DescrRef, u32)>>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
-    /// bridge (`PYRE_WASM_CA`) for this loop. `redirect_call_assembler`
-    /// copies it onto the replacement target.
+    /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
+    /// declines chaining any FURTHER bridge into this recursion (the guard
+    /// falls back to host round-trips): a chained bridge deopting inside the
+    /// CA recursion trips a resume seam that reads a clobbered class — see
+    /// the decline site for the failing suite shapes.
     pub ca_active: Cell<bool>,
+    /// A guard reached through this loop as a wasm CALL_ASSEMBLER callee was
+    /// structurally declined by `compile_bridge`.  Admission refuses this
+    /// target, because entering it from compiled wasm would only blackhole.
+    pub ca_terminal_declined: Cell<bool>,
+    /// Compiled callers that baked this loop as their CALL_ASSEMBLER target.
+    /// A terminal callee decline invalidates them for a no-CA retrace.
+    /// Weak, so a retired caller artifact is not kept alive by this list.
+    pub ca_callers: RefCell<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>,
 }
 
 // Compiled loop metadata is transferred through the token's `Any + Send`

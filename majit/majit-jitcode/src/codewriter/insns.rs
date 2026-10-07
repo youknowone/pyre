@@ -114,6 +114,14 @@ pub const BC_SETINTERIORFIELD_GC_F: u8 = 247;
 /// `blackhole.py` `bhimpl_int_signext`. Lowest free byte at or above 248.
 pub const BC_INT_SIGNEXT: u8 = 248;
 
+/// `blackhole.py` `bhimpl_setfield_raw_i` / `bhimpl_setfield_raw_f` /
+/// `bhimpl_getfield_raw_f`. Int-bank siblings of the GC field stores, and
+/// the float twin of `getfield_raw_i`. High-water bytes above
+/// [`BC_INT_SIGNEXT`]; 249 is [`BC_ABORT_RESULT_I`].
+pub const BC_SETFIELD_RAW_I: u8 = 252;
+pub const BC_SETFIELD_RAW_F: u8 = 250;
+pub const BC_GETFIELD_RAW_F: u8 = 251;
+
 /// "This cached control opcode is absent" sentinel for the
 /// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
 /// `op_rvmprof_code`).
@@ -423,6 +431,11 @@ pub const BC_SETFIELD_GC_R: u8 = 173;
 // always int-classified, so the index operand always lands in the `i`
 // register bank.
 pub const BC_GETARRAYITEM_GC_R_RID: u8 = 174;
+// `getfield_raw_i/id>i` — `blackhole.py bhimpl_getfield_raw_i`
+// (`@arguments("cpu", "i", "d", returns="i")`).  Int-bank sibling of
+// `bhimpl_getfield_gc_i`.  Byte 175 is the gap between the GC array
+// load and the store family.
+pub const BC_GETFIELD_RAW_I: u8 = 175;
 pub const BC_SETARRAYITEM_GC_I: u8 = 176;
 pub const BC_SETARRAYITEM_GC_R: u8 = 177;
 pub const BC_SETARRAYITEM_GC_F: u8 = 178;
@@ -1057,6 +1070,13 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("getfield_gc_i_pure/rd>i", BC_GETFIELD_GC_I_PURE);
     m.insert("getfield_gc_r_pure/rd>r", BC_GETFIELD_GC_R_PURE);
     m.insert("getfield_gc_f_pure/rd>f", BC_GETFIELD_GC_F_PURE);
+    // `blackhole.py bhimpl_getfield_raw_i`: raw struct field, int base.
+    m.insert("getfield_raw_i/id>i", BC_GETFIELD_RAW_I);
+    m.insert("getfield_raw_f/id>f", BC_GETFIELD_RAW_F);
+    // `blackhole.py bhimpl_setfield_raw_{i,f}`: int-bank store, not in
+    // USE_C_FORM (`assembler.py`).
+    m.insert("setfield_raw_i/iid", BC_SETFIELD_RAW_I);
+    m.insert("setfield_raw_f/ifd", BC_SETFIELD_RAW_F);
 
     // GC heap array element load/store — `blackhole.py bhimpl_getarrayitem_gc_i`.
     // `bhimpl_getarrayitem_gc_{i,r,f}` register only the canonical `rid`

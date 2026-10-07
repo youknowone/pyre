@@ -47,6 +47,9 @@ pub(crate) struct IsNoneSite {
     /// the same bank as the function pointer. `null_mut` is a GC ref and
     /// would emit `is_` on mixed `ir` operands.
     pub fn_ptr: bool,
+    /// `Option<NonZero<_>>`: the word itself is the tag. `None` is 0, so
+    /// the predicate compares that integer and does not read `__discriminant`.
+    pub scalar_niche: bool,
 }
 
 /// Rewrite every recorded `is_none`/`is_some` call into the discriminant
@@ -156,6 +159,24 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
             });
         }
         ops
+    } else if site.scalar_niche {
+        let op = if site.is_some { "ne" } else { "eq" };
+        let zero = graph.alloc_value_var();
+        vec![
+            SpaceOperation {
+                result: Some(zero.clone()),
+                kind: crate::front::mir::nonzero_option_zero(&site.option_owner),
+            },
+            SpaceOperation {
+                result: Some(site.result_var.clone()),
+                kind: OpKind::BinOp {
+                    op: op.to_string(),
+                    lhs: opt.into_variable(),
+                    rhs: zero,
+                    result_ty: ValueType::Int,
+                },
+            },
+        ]
     } else {
         let op = if site.is_some { "ne" } else { "eq" };
         let disc = graph.alloc_value_var();
@@ -173,6 +194,8 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     ty: ValueType::Int,
@@ -216,6 +239,7 @@ mod tests {
             niche: false,
             niche_null_cast: None,
             fn_ptr: false,
+            scalar_niche: false,
         }
     }
 
@@ -321,6 +345,7 @@ mod tests {
                 niche: true,
                 niche_null_cast: None,
                 fn_ptr: false,
+                scalar_niche: false,
             }],
         );
         assert_eq!(rewritten, 1);

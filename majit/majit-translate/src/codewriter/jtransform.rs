@@ -1187,10 +1187,12 @@ fn split_args_by_kind(
     Vec<crate::flowspace::model::Variable>,
     Vec<crate::flowspace::model::Variable>,
     Vec<crate::flowspace::model::Variable>,
+    String,
 ) {
     let mut ints = Vec::new();
     let mut refs = Vec::new();
     let mut floats = Vec::new();
+    let mut classes = String::new();
     for v in args {
         let kind = match FunctionGraph::concretetype_of(v) {
             crate::codewriter::type_state::ConcreteType::Signed => 'i',
@@ -1200,14 +1202,17 @@ fn split_args_by_kind(
             crate::codewriter::type_state::ConcreteType::GcRef
             | crate::codewriter::type_state::ConcreteType::Unknown => 'r',
         };
+        if kind == 'v' {
+            continue;
+        }
+        classes.push(kind);
         match kind {
             'i' => ints.push(v.clone()),
             'f' => floats.push(v.clone()),
-            'v' => {}
             _ => refs.push(v.clone()),
         }
     }
-    (ints, refs, floats)
+    (ints, refs, floats, classes)
 }
 
 /// `jtransform.py _rewrite_cmp_ptrs` (`rewrite_op_ptr_eq` /
@@ -2039,17 +2044,20 @@ fn getsubstruct_offset_for_access(
     }
 }
 
-/// Address of a borrow of an inline aggregate wider than one word.
+/// Address of an inline aggregate wider than one word.
 ///
-/// `jtransform.py rewrite_op_getsubstruct` turns that borrow into
+/// `jtransform.py rewrite_op_getsubstruct` turns that field into
 /// `int_add(ptr, offsetof)` when the container's `_gckind` is `raw`, and
 /// raises otherwise. A one-word field is an ordinary load. `vec_part`
 /// already names one word of the aggregate, so it is not this address.
-fn wide_inline_borrow_offset(
+/// `taken_by_address` is not required: a place projection
+/// `(*raw).inline.field` reads the aggregate as the next base, and the
+/// rtyper still emits `getsubstruct` for it. `getfield_raw_r` is refused.
+fn inline_aggregate_offset(
     field: &FieldDescriptor,
     cc: Option<&crate::call::CallControl>,
 ) -> Option<Result<usize, ()>> {
-    if !field.taken_by_address || field.vec_part.is_some() {
+    if field.vec_part.is_some() {
         return None;
     }
     let owner = field.owner_root.as_deref()?;
@@ -2077,6 +2085,382 @@ fn wide_inline_borrow_offset(
         Some(row) => Ok(row.offset),
         None => Err(()),
     })
+}
+
+/// Offset of an inline struct field, including a one-word struct.
+///
+/// A later field read through this result needs the interior address.
+/// A by-value copy of the same one-word struct stays an ordinary load.
+fn inline_struct_field_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<usize> {
+    if field.vec_part.is_some() {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    let layout = cc.and_then(|cc| cc.struct_layout_for(owner))?;
+    let row = layout.fields.iter().find(|row| row.name == field.name)?;
+    if row.flag != majit_ir::descr::ArrayFlag::Struct {
+        return None;
+    }
+    Some(row.offset)
+}
+
+/// Inputargs that receive `root` on every incoming edge. A join fed by only
+/// one such edge is not this word on the other edge, so it stays a phi.
+///
+/// A multi-block loop forwards the header phi through the latch phi and
+/// back. Those two variables are one cycle: admit the whole cycle once an
+/// edge from outside it already carries an alias.
+fn phi_aliases(
+    graph: &FunctionGraph,
+    root: &crate::flowspace::model::Variable,
+) -> std::collections::HashSet<crate::flowspace::model::Variable> {
+    use crate::flowspace::model::Variable;
+    let mut aliases = std::collections::HashSet::new();
+    aliases.insert(root.clone());
+    let mut incoming: Vec<Vec<&crate::model::Link>> = vec![Vec::new(); graph.blocks.len()];
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if let Some(slot) = incoming.get_mut(link.target.0) {
+                slot.push(link);
+            }
+        }
+    }
+    let mut phis: Vec<(usize, usize, Variable)> = Vec::new();
+    for (index, block) in graph.blocks.iter().enumerate() {
+        if incoming[index].is_empty() {
+            continue;
+        }
+        for (slot, input) in block.inputargs.iter().enumerate() {
+            phis.push((index, slot, input.clone()));
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        let mut pending: Vec<Variable> = phis
+            .iter()
+            .filter(|(_, _, input)| !aliases.contains(input))
+            .map(|(_, _, input)| input.clone())
+            .collect();
+        let mut live = vec![true; pending.len()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for index in 0..pending.len() {
+                if !live[index] {
+                    continue;
+                }
+                let Some((block, slot, _)) = phis.iter().find(|(_, _, phi)| phi == &pending[index])
+                else {
+                    live[index] = false;
+                    changed = true;
+                    continue;
+                };
+                let explained = incoming[*block].iter().all(|link| {
+                    match link
+                        .args
+                        .get(*slot)
+                        .and_then(crate::model::LinkArg::as_variable)
+                    {
+                        Some(var)
+                            if aliases.contains(var)
+                                || pending
+                                    .iter()
+                                    .zip(live.iter())
+                                    .any(|(phi, kept)| *kept && phi == var) =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+                if !explained {
+                    live[index] = false;
+                    changed = true;
+                }
+            }
+        }
+        pending = pending
+            .into_iter()
+            .zip(live)
+            .filter_map(|(phi, kept)| kept.then_some(phi))
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        let mut index_of = std::collections::HashMap::new();
+        for (index, phi) in pending.iter().enumerate() {
+            index_of.insert(phi.clone(), index);
+        }
+        let mut edges = vec![Vec::new(); pending.len()];
+        for (index, phi) in pending.iter().enumerate() {
+            let Some((block, slot, _)) = phis.iter().find(|(_, _, input)| input == phi) else {
+                continue;
+            };
+            for link in &incoming[*block] {
+                let Some(var) = link
+                    .args
+                    .get(*slot)
+                    .and_then(crate::model::LinkArg::as_variable)
+                else {
+                    continue;
+                };
+                if let Some(&next) = index_of.get(var) {
+                    edges[index].push(next);
+                }
+            }
+        }
+        let sccs = phi_alias_sccs(&edges);
+        for scc in sccs {
+            let members: std::collections::HashSet<usize> = scc.iter().copied().collect();
+            let mut external = false;
+            let mut closed = true;
+            for &member in &scc {
+                let (block, slot) = phis
+                    .iter()
+                    .find(|(_, _, input)| input == &pending[member])
+                    .map(|(block, slot, _)| (*block, *slot))
+                    .expect("pending phi");
+                for link in &incoming[block] {
+                    match link
+                        .args
+                        .get(slot)
+                        .and_then(crate::model::LinkArg::as_variable)
+                    {
+                        Some(var) if aliases.contains(var) => external = true,
+                        Some(var)
+                            if index_of.get(var).is_some_and(|next| members.contains(next)) => {}
+                        _ => closed = false,
+                    }
+                }
+            }
+            if closed && external {
+                for member in scc {
+                    if aliases.insert(pending[member].clone()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    aliases
+}
+
+/// Strongly connected components of the pending-phi graph, in dependency order.
+fn phi_alias_sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let mut index = 0usize;
+    let mut indices = vec![None; n];
+    let mut low = vec![0usize; n];
+    let mut stack = Vec::new();
+    let mut on_stack = vec![false; n];
+    let mut sccs = Vec::new();
+    fn walk(
+        node: usize,
+        edges: &[Vec<usize>],
+        index: &mut usize,
+        indices: &mut [Option<usize>],
+        low: &mut [usize],
+        stack: &mut Vec<usize>,
+        on_stack: &mut [bool],
+        sccs: &mut Vec<Vec<usize>>,
+    ) {
+        indices[node] = Some(*index);
+        low[node] = *index;
+        *index += 1;
+        stack.push(node);
+        on_stack[node] = true;
+        for &next in &edges[node] {
+            if indices[next].is_none() {
+                walk(next, edges, index, indices, low, stack, on_stack, sccs);
+                low[node] = low[node].min(low[next]);
+            } else if on_stack[next] {
+                low[node] = low[node].min(indices[next].unwrap_or(0));
+            }
+        }
+        if low[node] == indices[node].unwrap_or(0) {
+            let mut scc = Vec::new();
+            while let Some(member) = stack.pop() {
+                on_stack[member] = false;
+                scc.push(member);
+                if member == node {
+                    break;
+                }
+            }
+            sccs.push(scc);
+        }
+    }
+    for node in 0..n {
+        if indices[node].is_none() {
+            walk(
+                node,
+                edges,
+                &mut index,
+                &mut indices,
+                &mut low,
+                &mut stack,
+                &mut on_stack,
+                &mut sccs,
+            );
+        }
+    }
+    sccs
+}
+
+fn field_read_result_is_later_base(
+    graph: &FunctionGraph,
+    result: &crate::flowspace::model::Variable,
+) -> bool {
+    let aliases = phi_aliases(graph, result);
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => {
+                aliases.contains(base)
+            }
+            _ => false,
+        })
+    })
+}
+
+/// `OpKind` has no operand walker. `Variable`'s `Debug` includes its
+/// identity, so a second copy of that text is another use.
+fn kind_mentions_var(kind: &OpKind, var: &crate::flowspace::model::Variable) -> bool {
+    format!("{kind:?}").contains(&format!("{var:?}"))
+}
+
+fn op_uses_var_as_value(op: &SpaceOperation, var: &crate::flowspace::model::Variable) -> bool {
+    if !kind_mentions_var(&op.kind, var) {
+        return false;
+    }
+    match &op.kind {
+        OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } if base == var => {
+            let rendered = format!("{:?}", op.kind);
+            let rest = rendered.replacen(&format!("{base:?}"), "", 1);
+            rest.contains(&format!("{var:?}"))
+        }
+        _ => true,
+    }
+}
+
+/// `input` is a pure forward when a later field base reads it, or another
+/// link carries it to such a base. A return link's argument never reaches
+/// a field base.
+fn alias_reaches_field_base(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    seen: &mut std::collections::HashSet<crate::flowspace::model::Variable>,
+) -> bool {
+    if !seen.insert(var.clone()) {
+        return false;
+    }
+    if graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base == var,
+            _ => false,
+        })
+    }) {
+        return true;
+    }
+    for block in &graph.blocks {
+        for link in &block.exits {
+            let Some(target) = graph.blocks.get(link.target.0) else {
+                continue;
+            };
+            for (index, arg) in link.args.iter().enumerate() {
+                if arg.as_variable() != Some(var) {
+                    continue;
+                }
+                if let Some(input) = target.inputargs.get(index)
+                    && alias_reaches_field_base(graph, input, seen)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn field_read_result_has_value_use(
+    graph: &FunctionGraph,
+    result: &crate::flowspace::model::Variable,
+) -> bool {
+    let aliases = phi_aliases(graph, result);
+    let op_or_switch = graph.blocks.iter().any(|block| {
+        block.exitswitch.as_ref().is_some_and(|switch| {
+            let rendered = format!("{switch:?}");
+            aliases
+                .iter()
+                .any(|var| rendered.contains(&format!("{var:?}")))
+        }) || block
+            .operations
+            .iter()
+            .any(|op| aliases.iter().any(|var| op_uses_var_as_value(op, var)))
+    });
+    if op_or_switch {
+        return true;
+    }
+    // A link argument is a value use unless it only forwards the word to a
+    // phi that reaches a field base. Returns are link args with no such base.
+    graph.blocks.iter().any(|block| {
+        block.exits.iter().any(|link| {
+            link.args.iter().enumerate().any(|(index, arg)| {
+                let Some(carried) = arg.as_variable() else {
+                    return false;
+                };
+                if !aliases.contains(carried) {
+                    return false;
+                }
+                let Some(target) = graph.blocks.get(link.target.0) else {
+                    return true;
+                };
+                match target.inputargs.get(index) {
+                    Some(input) if aliases.contains(input) => !alias_reaches_field_base(
+                        graph,
+                        input,
+                        &mut std::collections::HashSet::new(),
+                    ),
+                    _ => true,
+                }
+            })
+        })
+    })
+}
+
+fn retarget_field_bases(
+    graph: &mut FunctionGraph,
+    from: &crate::flowspace::model::Variable,
+    to: &crate::flowspace::model::Variable,
+) {
+    // Every alias here is carried on all incoming edges, so the interior
+    // address computed from that one word dominates the join.
+    let aliases = phi_aliases(graph, from);
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            match &mut op.kind {
+                OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. }
+                    if aliases.contains(base) =>
+                {
+                    *base = to.clone();
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `Rvalue::Ref` / `RawPtr` borrow of [`inline_aggregate_offset`].
+fn wide_inline_borrow_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<Result<usize, ()>> {
+    if !field.taken_by_address {
+        return None;
+    }
+    inline_aggregate_offset(field, cc)
 }
 
 /// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
@@ -2810,6 +3194,7 @@ impl<'a> Transformer<'a> {
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
+        String,
     ) {
         self.check_no_vable_array(args.iter(), graph_name, via);
         self.make_three_lists_from_vars(args)
@@ -4822,21 +5207,32 @@ impl<'a> Transformer<'a> {
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
+        String,
     ) {
         let mut args_i = Vec::new();
         let mut args_r = Vec::new();
         let mut args_f = Vec::new();
+        // Positional kind chars, void args omitted. `rebucket_kind_lists`
+        // replays this string so a promoted int stays in its original slot
+        // among the refs instead of being appended in bank order.
+        let mut arg_classes = String::new();
         for var in args {
             let kind = self.get_value_kind_var(var);
-            match kind {
+            let placed = match kind {
+                'i' => 'i',
+                'r' => 'r',
+                'f' => 'f',
+                'v' => continue,
+                _ => 'r',
+            };
+            arg_classes.push(placed);
+            match placed {
                 'i' => args_i.push(var.clone()),
-                'r' => args_r.push(var.clone()),
                 'f' => args_f.push(var.clone()),
-                'v' => {}                      // void — skip (RPython jtransform.py:449)
-                _ => args_r.push(var.clone()), // unknown → ref
+                _ => args_r.push(var.clone()),
             }
         }
-        (args_i, args_r, args_f)
+        (args_i, args_r, args_f, arg_classes)
     }
 
     /// RPython: `getkind(v.concretetype)` — get the kind of a value.
@@ -5684,6 +6080,21 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
+        // `jtransform.py rewrite_op_getfield`:
+        //     RESULT = op.result.concretetype
+        //     if RESULT is lltype.Void: return
+        if op
+            .result
+            .as_ref()
+            .is_some_and(|r| self.get_value_kind_var(r) == 'v')
+            || matches!(ty, ValueType::Void)
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: getfield({}) → dropped (void)", field.name),
+            });
+            return RewriteResult::Replace(Vec::new());
+        }
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
         // raw_store through it keeps that int base (`_gckind == 'raw'`).
@@ -5712,6 +6123,89 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
+        // A place read of the same aggregate (`(*raw).inline.field`) does
+        // not set `taken_by_address`. On a raw container that read is still
+        // `rewrite_op_getsubstruct`: the result is the interior address.
+        // Leaving it as `getfield` asks the assembler for `getfield_raw_r`,
+        // which `rewrite_op_getfield` refuses. A GC container keeps the
+        // value read; an interior pointer there is the refusal above.
+        let cc = self.callcontrol.as_deref();
+        let word_offset = if inline_aggregate_offset(field, cc).is_none() {
+            inline_struct_field_offset(field, cc)
+        } else {
+            None
+        };
+        let later_base = op
+            .result
+            .as_ref()
+            .is_some_and(|result| field_read_result_is_later_base(graph, result));
+        let value_use = op
+            .result
+            .as_ref()
+            .is_some_and(|result| field_read_result_has_value_use(graph, result));
+        // One variable, two uses: the copy keeps the loaded word and the
+        // later field read gets its own interior address.
+        if let Some(offset) = word_offset
+            && later_base
+            && value_use
+            && !field.taken_by_address
+            && !crate::codewriter::type_state::field_owner_is_gc(field, cc)
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            let base = base.clone();
+            let result = op.result.clone().expect("mixed field read has a result");
+            let mut addr_op = op.clone();
+            let addr = self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            addr_op.result = Some(addr.clone());
+            let address = self.rewrite_raw_substruct_address(&addr_op, &base, offset, graph);
+            let mut ops = vec![op.clone()];
+            match address {
+                RewriteResult::Replace(extra) => {
+                    retarget_field_bases(graph, &result, &addr);
+                    ops.extend(extra);
+                }
+                RewriteResult::Identity(addr) => {
+                    retarget_field_bases(graph, &result, &addr);
+                }
+                RewriteResult::Keep => {}
+            }
+            return RewriteResult::Replace(ops);
+        }
+        let nested_word = word_offset.is_some() && later_base && !value_use;
+        let found = inline_aggregate_offset(field, cc).or_else(|| {
+            if !nested_word {
+                return None;
+            }
+            inline_struct_field_offset(field, cc).map(Ok)
+        });
+        if !field.taken_by_address
+            && let Some(found) = found
+            && !crate::codewriter::type_state::field_owner_is_gc(field, cc)
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return match found {
+                Ok(offset) => self.rewrite_raw_substruct_address(op, base, offset, graph),
+                // Same abort as `wide_inline_borrow_offset` when the host
+                // layout has no row (`StructLayout::from_type_strings` can
+                // drop nested by-value fields). `llmemory.offsetof` is
+                // total only when the layout is complete.
+                Err(()) => RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]),
+            };
+        }
         // A by-value Rust field can itself have an inline-struct
         // layout (notably a `#[repr(transparent)]` newtype) while the operation
         // is still an ordinary load.  Treating every offset-zero Struct field
@@ -5724,20 +6218,21 @@ impl<'a> Transformer<'a> {
                 .as_deref()
                 .and_then(|cc| crate::assembler::inline_substruct_field_offset(cc, field))
         });
-        if let Some(0) = inline_substruct_offset {
+        if let Some(offset) = inline_substruct_offset {
             let OpKind::FieldRead { base, .. } = &op.kind else {
                 unreachable!("rewrite_op_getfield called on non-FieldRead op")
             };
-            return RewriteResult::Identity(base.clone());
-        }
-        if inline_substruct_offset.is_some() {
-            // `jtransform.py rewrite_op_getsubstruct` refuses GC
-            // substructures during translation.  A nonzero-offset interior
-            // address cannot enter the Ref bank even when it is only carried
-            // across blocks: the GC map would treat it as an independently
-            // movable object and lose the owning allocation. Pyre must still
-            // resolve the portal graph, so defer the same refusal to a
-            // result-less runtime abort; the enclosing call remains residual.
+            if offset == 0 {
+                return RewriteResult::Identity(base.clone());
+            }
+            // `rewrite_op_getsubstruct` is `int_add` for `_gckind == 'raw'`.
+            // The GC refusal stays: a nonzero interior address cannot enter
+            // the Ref bank. The original read stays so the result is defined
+            // for the residual call.
+            if !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+            {
+                return self.rewrite_raw_substruct_address(op, base, offset, graph);
+            }
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
@@ -7495,11 +7990,46 @@ impl<'a> Transformer<'a> {
                         OpKind::Call { target, .. } => target,
                         _ => target,
                     };
-                    let call_args = self
+                    let mut call_args = self
                         .callcontrol
                         .as_deref()
                         .unwrap()
                         .non_void_actual_args_for_target(target, args);
+                    // A `Result` payload read of a ref-banked aggregate
+                    // (`FrameBox::new`'s `PyFrame`, `pyerror_to_exc_object`'s
+                    // `PyError`) is the raw address (`int`). The parameter
+                    // stays a ref. Retype that word before the signature check.
+                    let mut ptr_retypes = Vec::new();
+                    if let Some(classes) = self
+                        .callcontrol
+                        .as_deref()
+                        .and_then(|cc| cc.target_to_path(target))
+                        .and_then(|path| {
+                            self.callcontrol
+                                .as_deref()
+                                .unwrap()
+                                .declared_non_void_arg_classes(&path)
+                        })
+                        && classes.len() == call_args.len()
+                    {
+                        for (arg, class) in call_args.iter_mut().zip(classes.chars()) {
+                            if class != 'r' || self.get_value_kind_var(arg) != 'i' {
+                                continue;
+                            }
+                            let casted = graph.alloc_value_var_with_type(
+                                crate::codewriter::type_state::ConcreteType::GcRef,
+                            );
+                            ptr_retypes.push(SpaceOperation {
+                                result: Some(casted.clone()),
+                                kind: OpKind::UnaryOp {
+                                    op: "cast_int_to_ptr".into(),
+                                    operand: arg.clone(),
+                                    result_ty: ValueType::Ref(None),
+                                },
+                            });
+                            *arg = casted;
+                        }
+                    }
                     let non_void_args = resolve_non_void_arg_types_from_vars(&call_args);
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
@@ -7534,7 +8064,7 @@ impl<'a> Transformer<'a> {
                     if let Some((declared, _, true)) = classified {
                         descriptor.extra_info = declared.extra_info;
                     }
-                    self.handle_residual_call(
+                    let rewritten = self.handle_residual_call(
                         graph,
                         op,
                         target,
@@ -7542,7 +8072,14 @@ impl<'a> Transformer<'a> {
                         &call_args,
                         &effective_result_ty,
                         graph_name,
-                    )
+                    );
+                    match rewritten {
+                        RewriteResult::Replace(mut ops) if !ptr_retypes.is_empty() => {
+                            ptr_retypes.append(&mut ops);
+                            RewriteResult::Replace(ptr_retypes)
+                        }
+                        other => other,
+                    }
                 }
                 crate::call::CallKind::Builtin => {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name, graph)
@@ -7854,6 +8391,14 @@ impl<'a> Transformer<'a> {
             let [p, ofs] = args else {
                 return None;
             };
+            // `rewrite_op_direct_ptradd` keeps the address in the int bank.
+            // An unstamped result whose concretetype is still a GC pointer
+            // makes `getkind` emit `int_add/ii>r`.
+            self.stamp_value_kind(
+                graph,
+                op.result.clone(),
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
             // `op_kind_to_opname` prefixes plain `BinOp` spellings with
             // `int_`, so the short spelling lands on `int_add`.
             return Some(RewriteResult::Replace(vec![SpaceOperation {
@@ -9850,7 +10395,7 @@ impl<'a> Transformer<'a> {
         };
         // RPython jtransform.py: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
-        let (args_i, args_r, args_f) =
+        let (args_i, args_r, args_f, arg_classes) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
@@ -9870,6 +10415,7 @@ impl<'a> Transformer<'a> {
                     args_r,
                     args_f,
                     result_kind,
+                    arg_classes,
                 },
             },
             SpaceOperation {
@@ -9918,8 +10464,9 @@ impl<'a> Transformer<'a> {
         } else {
             &[]
         };
-        let (greens_i, greens_r, greens_f) = self.make_three_lists_from_vars(green_args);
-        let (reds_i, reds_r, reds_f) = self.make_three_lists_from_vars(red_args);
+        let (greens_i, greens_r, greens_f, green_classes) =
+            self.make_three_lists_from_vars(green_args);
+        let (reds_i, reds_r, reds_f, red_classes) = self.make_three_lists_from_vars(red_args);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
@@ -9947,6 +10494,8 @@ impl<'a> Transformer<'a> {
                 reds_r,
                 reds_f,
                 result_kind,
+                green_classes,
+                red_classes,
             },
         });
         ops.push(SpaceOperation {
@@ -10280,7 +10829,7 @@ impl<'a> Transformer<'a> {
              graph={graph_name} callee={func_target} op={op:?}"
         );
         // jtransform.py: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(
+        let (args_i, args_r, args_f, _) = self.rewrite_call_three_lists(
             func_args,
             graph_name,
             "call argument (conditional_call)",
@@ -10541,11 +11090,18 @@ impl<'a> Transformer<'a> {
                     );
                 }
                 let mut ops = self.promote_greens(graph, greens_raw);
-                let (greens_i, greens_r, greens_f) = split_args_by_kind(greens_raw);
-                let (reds_i, reds_r, reds_f) = split_args_by_kind(reds_raw);
+                let (greens_i, greens_r, greens_f, green_classes) = split_args_by_kind(greens_raw);
+                let (reds_i, reds_r, reds_f, red_classes) = split_args_by_kind(reds_raw);
                 // jtransform.py final shape is `ops + [op3, op1, op2]`.
                 ops.extend(self.handle_jit_marker__jit_merge_point(
-                    greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+                    greens_i,
+                    greens_r,
+                    greens_f,
+                    green_classes,
+                    reds_i,
+                    reds_r,
+                    reds_f,
+                    red_classes,
                 ));
                 Some(ops)
             }
@@ -10610,9 +11166,11 @@ impl<'a> Transformer<'a> {
         greens_i: Vec<crate::flowspace::model::Variable>,
         greens_r: Vec<crate::flowspace::model::Variable>,
         greens_f: Vec<crate::flowspace::model::Variable>,
+        green_classes: String,
         reds_i: Vec<crate::flowspace::model::Variable>,
         reds_r: Vec<crate::flowspace::model::Variable>,
         reds_f: Vec<crate::flowspace::model::Variable>,
+        red_classes: String,
     ) -> Vec<SpaceOperation> {
         // jtransform.py `assert self.portal_jd is not None`
         let jitdriver_index = self
@@ -10655,6 +11213,8 @@ impl<'a> Transformer<'a> {
                 reds_i,
                 reds_r,
                 reds_f,
+                green_classes,
+                red_classes,
             },
         };
         // jtransform.py:1708-1712 — `op2` live for `do_recursive_call()`,
@@ -10734,7 +11294,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:302-307: record_known_result_{i|r}
         let opname = format!("record_known_result_{result_kind}");
         // jtransform.py: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(
+        let (args_i, args_r, args_f, _) = self.rewrite_call_three_lists(
             func_args,
             graph_name,
             "call argument (record_known_result)",
@@ -10828,7 +11388,7 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         // RPython jtransform.py: rewrite_call(op, 'residual_call', ...)
-        let (args_i, args_r, args_f) =
+        let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         // RPython reads `op.result.concretetype` directly because rtyper
         // has typed every Variable. Pyre's front-end can leave a callee's
@@ -10917,7 +11477,7 @@ impl<'a> Transformer<'a> {
             .map(|cc| cc.non_void_actual_args_for_graphs(graphs, args))
             .unwrap_or_else(|| args.to_vec());
         let args = filtered_args.as_slice();
-        let (args_i, args_r, args_f) =
+        let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, "call argument (indirect)");
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
@@ -11062,7 +11622,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → elidable"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) =
+        let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
@@ -11107,7 +11667,7 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → may_force"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) =
+        let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
@@ -12203,6 +12763,8 @@ fn remap_op(
             reds_i,
             reds_r,
             reds_f,
+            green_classes,
+            red_classes,
         } => {
             let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::JitMergePoint {
@@ -12213,6 +12775,8 @@ fn remap_op(
                 reds_i: reds_i.iter().map(remap_var).collect(),
                 reds_r: reds_r.iter().map(remap_var).collect(),
                 reds_f: reds_f.iter().map(remap_var).collect(),
+                green_classes: green_classes.clone(),
+                red_classes: red_classes.clone(),
             }
         }
         OpKind::IndirectCall {
@@ -12544,6 +13108,7 @@ fn remap_op(
             args_r,
             args_f,
             result_kind,
+            arg_classes,
         } => {
             let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::InlineCall {
@@ -12552,6 +13117,7 @@ fn remap_op(
                 args_r: args_r.iter().map(remap_var).collect(),
                 args_f: args_f.iter().map(remap_var).collect(),
                 result_kind: *result_kind,
+                arg_classes: arg_classes.clone(),
             }
         }
         OpKind::RecursiveCall {
@@ -12563,6 +13129,8 @@ fn remap_op(
             reds_r,
             reds_f,
             result_kind,
+            green_classes,
+            red_classes,
         } => {
             let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
             OpKind::RecursiveCall {
@@ -12574,6 +13142,8 @@ fn remap_op(
                 reds_r: reds_r.iter().map(remap_var).collect(),
                 reds_f: reds_f.iter().map(remap_var).collect(),
                 result_kind: *result_kind,
+                green_classes: green_classes.clone(),
+                red_classes: red_classes.clone(),
             }
         }
         OpKind::ConditionalCall {
@@ -13485,6 +14055,55 @@ mod tests {
     }
 
     #[test]
+    fn phi_aliases_close_a_two_block_cycle() {
+        let mut graph = FunctionGraph::new("cycle");
+        let root = graph.alloc_value_var();
+        let (header, header_args) = graph.create_block_with_arg_vars(1);
+        let (latch, latch_args) = graph.create_block_with_arg_vars(1);
+        let h = header_args[0].clone();
+        let l = latch_args[0].clone();
+        let preheader =
+            crate::model::Link::from_variables(&graph, vec![root.clone()], header, None);
+        let to_latch = crate::model::Link::from_variables(&graph, vec![h.clone()], latch, None);
+        let to_header = crate::model::Link::from_variables(&graph, vec![l.clone()], header, None);
+        graph.blocks[graph.startblock.0].exits.push(preheader);
+        graph.blocks[header.0].exits.push(to_latch);
+        graph.blocks[latch.0].exits.push(to_header);
+        let aliases = phi_aliases(&graph, &root);
+        assert!(aliases.contains(&h), "header phi joins the preheader alias");
+        assert!(aliases.contains(&l), "latch phi joins the same cycle");
+    }
+
+    #[test]
+    fn phi_aliases_keep_a_self_edge_and_reject_a_partial_join() {
+        let mut graph = FunctionGraph::new("self");
+        let root = graph.alloc_value_var();
+        let (header, header_args) = graph.create_block_with_arg_vars(1);
+        let h = header_args[0].clone();
+        let preheader =
+            crate::model::Link::from_variables(&graph, vec![root.clone()], header, None);
+        let backedge = crate::model::Link::from_variables(&graph, vec![h.clone()], header, None);
+        graph.blocks[graph.startblock.0].exits.push(preheader);
+        graph.blocks[header.0].exits.push(backedge);
+        let aliases = phi_aliases(&graph, &root);
+        assert!(aliases.contains(&h));
+
+        let mut partial = FunctionGraph::new("partial");
+        let root = partial.alloc_value_var();
+        let other = partial.alloc_value_var();
+        let (header, header_args) = partial.create_block_with_arg_vars(1);
+        let h = header_args[0].clone();
+        let (side, _) = partial.create_block_with_arg_vars(0);
+        let preheader =
+            crate::model::Link::from_variables(&partial, vec![root.clone()], header, None);
+        let foreign = crate::model::Link::from_variables(&partial, vec![other], header, None);
+        partial.blocks[partial.startblock.0].exits.push(preheader);
+        partial.blocks[side.0].exits.push(foreign);
+        let aliases = phi_aliases(&partial, &root);
+        assert!(!aliases.contains(&h), "one foreign edge keeps the phi");
+    }
+
+    #[test]
     fn integer_bounds_matches_rpython_helper() {
         assert_eq!(integer_bounds(1, true), (0, 256));
         assert_eq!(integer_bounds(1, false), (-128, 128));
@@ -13564,6 +14183,8 @@ mod tests {
                     },
                 ],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
         cc.set_struct_layout(
@@ -13591,6 +14212,8 @@ mod tests {
                     },
                 ],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
 
@@ -13665,6 +14288,328 @@ mod tests {
         );
     }
 
+    /// `(*raw).tags.buf` reads `tags` by place, without `taken_by_address`.
+    /// On a raw holder that is still `rewrite_op_getsubstruct` (`int_add`).
+    /// A GC holder keeps the value read.
+    #[test]
+    fn raw_inline_struct_value_read_is_interior_address() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        fn holder(owner: &str, gc: bool) -> CallControl {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            let mut cc = CallControl::new();
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 32,
+                    align: 8,
+                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    fields: vec![
+                        StructFieldLayout {
+                            name: "word".into(),
+                            offset: 0,
+                            size: 8,
+                            flag: majit_ir::descr::ArrayFlag::Signed,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                        StructFieldLayout {
+                            name: "tags".into(),
+                            offset: 8,
+                            size: 24,
+                            flag: majit_ir::descr::ArrayFlag::Struct,
+                            field_type: majit_ir::value::Type::Ref,
+                            rank: None,
+                        },
+                    ],
+                    host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+                },
+            );
+            let storage = if gc {
+                crate::StructStorageDescriptor::headerless(owner)
+            } else {
+                crate::StructStorageDescriptor::raw(owner)
+            };
+            cc.set_struct_storage(&[storage]);
+            cc
+        }
+
+        fn graph_for(owner: &str) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("read_tags");
+            let s = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "s".into(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&s, ConcreteType::Signed);
+            graph.push_inputarg_var(graph.startblock, s.clone());
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: s,
+                        field: FieldDescriptor::new("tags", Some(owner.into())),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+        }
+
+        let owner = "raw_value_read::TagHolder";
+        let gc_owner = "gc_value_read::TagHolder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let gc_id = majit_ir::descr::StructId::from_canonical(gc_owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (gc_owner.to_string(), Some(gc_id)),
+            ]));
+        let mut cc = holder(owner, false);
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph_for(owner));
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, rhs, .. } if op == "add" && matches!(
+                    ops.iter().find(|c| c.result.as_ref() == Some(rhs)).map(|c| &c.kind),
+                    Some(OpKind::ConstInt(8))
+                )
+            )),
+            "by-value inline struct on a raw holder is base + offset; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags"
+            )),
+            "the inline struct is not loaded as a ref word; ops={ops:?}"
+        );
+
+        let mut gc_cc = holder(gc_owner, true);
+        let gc_out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut gc_cc)
+            .transform(&graph_for(gc_owner));
+        let gc_ops: Vec<_> = gc_out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            gc_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "tags"
+            )),
+            "a GC holder keeps the by-value read; ops={gc_ops:?}"
+        );
+    }
+
+    /// `(*p).inner.x` on a raw `&mut S`. `rewrite_op_getsubstruct` is
+    /// `int_add` of `offsetof(S, inner)`, then `getfield_raw_i` at
+    /// `offsetof(Inner, x)`.
+    #[test]
+    fn raw_inline_field_read_is_int_add_then_getfield_raw_i() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerDescr, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let outer = "raw_inline_field::S";
+        let inner = "raw_inline_field::Inner";
+        let outer_id = majit_ir::descr::StructId::from_canonical(outer);
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (outer.to_string(), Some(outer_id)),
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let inner_offset: usize = 16;
+        let field_offset: usize = 8;
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            outer_id,
+            StructLayout {
+                size: 32,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "word".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "inner".into(),
+                        offset: inner_offset,
+                        size: 16,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            inner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "x".into(),
+                    offset: field_offset,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[
+            crate::StructStorageDescriptor::raw(outer),
+            crate::StructStorageDescriptor::raw(inner),
+        ]);
+
+        let mut graph = FunctionGraph::new("read_inner_x");
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&p, ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, p.clone());
+        let place = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: p,
+                    field: FieldDescriptor::new("inner", Some(outer.into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let x = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: place,
+                    field: FieldDescriptor::new("x", Some(inner.into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(x.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter().cloned())
+            .collect();
+        let add = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp { op, rhs, .. }
+                    if op == "add"
+                        && ops.iter().any(|c| {
+                            c.result.as_ref() == Some(rhs)
+                                && matches!(c.kind, OpKind::ConstInt(n) if n == inner_offset as i64)
+                        })
+            )
+        });
+        let add = add.expect("int_add of offsetof(S, inner)");
+        let addr = add.result.clone().expect("int_add result");
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { base, field, .. }
+                    if base == &addr
+                        && field.name == "x"
+                        && field.owner_root.as_deref() == Some(inner)
+            )),
+            "x is read off the interior address; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&addr),
+            ConcreteType::Signed,
+            "the interior address stays int"
+        );
+
+        let x_var = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "x" => op.result.clone(),
+                _ => None,
+            })
+            .expect("x read");
+        FunctionGraph::set_concretetype_of_inline(&x_var, ConcreteType::Signed);
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.contains_key("getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let mut offsets = Vec::new();
+        for descr in &asm.descrs {
+            if let AssemblerDescr::Ready(ready) = descr
+                && let crate::jitcode::BhDescr::Field { offset, .. } = ready.as_ref()
+            {
+                offsets.push(*offset);
+            }
+        }
+        assert_eq!(
+            offsets,
+            vec![field_offset],
+            "getfield_raw_i uses offsetof(Inner, x)"
+        );
+    }
+
     /// A scalar wider than a word (an `i64` on a 32-bit target, an `i128`
     /// here) borrowed by address is `FLAG_SIGNED`, not an inline aggregate,
     /// so it is not a substructure address.
@@ -13692,6 +14637,8 @@ mod tests {
                     rank: None,
                 }],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
         let field = FieldDescriptor::new("count", Some(owner.into())).with_taken_by_address(true);
@@ -13734,6 +14681,8 @@ mod tests {
                         },
                     ],
                     host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
                 },
             );
             let storage = if gc {
@@ -13924,6 +14873,8 @@ mod tests {
                     },
                 ],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
         cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
@@ -14115,6 +15066,8 @@ mod tests {
                     },
                 ],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
 
@@ -18660,6 +19613,8 @@ mod tests {
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
         let rewritten = Transformer::new(&GraphTransformConfig::default())
@@ -19988,9 +20943,11 @@ mod tests {
             vec![green_i.clone()],
             vec![],
             vec![],
+            "i".to_string(),
             vec![red_i_a.clone(), red_i_b.clone()],
             vec![red_r.clone()],
             vec![],
+            "iir".to_string(),
         );
         assert_eq!(ops.len(), 3, "expect live + merge + live");
         assert!(matches!(ops[0].kind, OpKind::Live));
@@ -20561,9 +21518,11 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            String::new(),
             vec![],
             vec![],
             vec![],
+            String::new(),
         );
     }
 
@@ -20582,9 +21541,11 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            String::new(),
             vec![r.clone(), r],
             vec![],
             vec![],
+            String::new(),
         );
     }
 
@@ -20687,6 +21648,7 @@ mod tests {
                 reds_i,
                 reds_r,
                 reds_f,
+                ..
             } => {
                 assert_eq!(*jitdriver_index, 0);
                 assert_eq!(greens_i, &vec![g1_var.clone(), g2_var.clone()]);
@@ -24487,6 +25449,33 @@ mod tests {
                 .operations
                 .iter()
                 .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. }))
+        }));
+    }
+
+    /// `rewrite_op_getfield` drops a void result (`RESULT is lltype.Void`),
+    /// so a unit field never reaches the assembler uncolored.
+    #[test]
+    fn getfield_of_void_result_is_dropped() {
+        let mut graph = FunctionGraph::new("void_getfield");
+        let bb = graph.startblock;
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Void);
+        graph.block_mut(bb).operations.push(SpaceOperation {
+            result: Some(result),
+            kind: OpKind::FieldRead {
+                base,
+                field: crate::model::FieldDescriptor::new("payload", None),
+                ty: ValueType::Void,
+                pure: true,
+            },
+        });
+        graph.set_return(bb, None);
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(transformed.graph.blocks.iter().all(|block| {
+            block
+                .operations
+                .iter()
+                .all(|op| !matches!(op.kind, OpKind::FieldRead { .. }))
         }));
     }
 

@@ -12783,35 +12783,15 @@ fn guarded_branch_core<Sym: WalkSym>(
                 return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { pc: op.pc });
             }
         }
-        // A depth > 1 kept operand stack is recoverable on resume from
-        // the per-slot sources of a VALID walk mirror: every on-stack
-        // kept slot from `ctx.vstack_boxes`, and an edge-materialized
-        // merge slot (a NONE hole in an otherwise valid mirror) from the
-        // decoded trampoline recovery (`resolved_recovered`).  Only an
-        // INVALID mirror (an undermodeled walk: inline sub-walk /
-        // Unmodeled opcode) leaves the kept slots without a reliable
-        // per-slot source, so decline → interpreter (correct).
-        if depth_gt_1 && !ctx.vstack_valid {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[decline-why] UNSUPPORTED pc={} other_target={} vstack_valid={} \
-                     subwalk={} depth_gt_1={} kept_stack={} kept_stack_any_leg={}",
-                    op.pc,
-                    other_target,
-                    ctx.vstack_valid,
-                    ctx.fbw_mode.inline_subwalk,
-                    depth_gt_1,
-                    kept_stack,
-                    kept_stack_any_leg,
-                );
-            }
-            // Stamp the abort coordinate at the raise point so the
-            // walk-end branch-flush gate cannot flush the outer frame
-            // from a callee-coordinate abort.
-            latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
-            ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
-            return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
-        }
+        // Depth > 1 with an unseeded overlay used to decline
+        // (`BranchGuardKeptStackUnsupported`).  `generate_guard` has no
+        // such gate: it snapshots the `-live-` int/ref/float set at this
+        // pc, which is how a raw-address walk (`getfield_raw_i` /
+        // `int_add` substruct) keeps an int-bank address live across a
+        // `goto_if_not` whose Python operand stack is also live (the
+        // nested FOR_ITER iterators in `searches()`).  Capture below
+        // reads those banks; `BranchGuardKeptSlotUnsourced` still
+        // declines a kept Ref with no per-slot source.
         ctx.trace_ctx.record_guard(guard_opcode, guard_operands, 0);
         // Publish the guard's own jitcode coordinate ONLY for the
         // kept-stack case so the snapshot encoder recovers the kept
@@ -13931,6 +13911,175 @@ fn handle<Sym: WalkSym>(
             // context is gone when the top-level driver reads the out-channel.
             ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
             Err(DispatchError::AbortPermanentMarkerReached { pc: op.pc })
+        }
+        // `pyjitpl.py opimpl_getfield_raw_i`: `execute_with_descr(
+        // GETFIELD_RAW_I, fielddescr, box)`. Operand layout `id>i`:
+        // 1B int base + 2B descr + 1B dest. The base is a raw address
+        // in the int bank (`blackhole.py bhimpl_getfield_raw_i`).
+        "getfield_raw_i/id>i" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let concrete = match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                descr.as_field_descr(),
+            ) {
+                (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                    .trace_ctx
+                    .field_sanity_load(ptr, &descr, majit_ir::Type::Int)
+                    .and_then(|v| match v {
+                        majit_ir::Value::Int(n) => Some(ConcreteValue::Int(n)),
+                        _ => None,
+                    })
+                    .unwrap_or(ConcreteValue::Null),
+                _ => ConcreteValue::Null,
+            };
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::GetfieldRawI, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::GetfieldRawI,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            let result = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::GetfieldRawI, &[base], descr);
+            if let ConcreteValue::Int(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(result, Value::Int(value));
+            }
+            let dst = code[op.pc + 4] as usize;
+            write_int_reg(ctx, op.pc, dst, result, concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // pyjitpl.py `opimpl_getfield_raw_f`: `execute_with_descr(
+        // GETFIELD_RAW_F, fielddescr, box)`. Operand layout `id>f`.
+        "getfield_raw_f/id>f" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let concrete = match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                descr.as_field_descr(),
+            ) {
+                (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                    .trace_ctx
+                    .field_sanity_load(ptr, &descr, majit_ir::Type::Float)
+                    .and_then(|v| match v {
+                        majit_ir::Value::Float(n) => Some(ConcreteValue::Float(n)),
+                        _ => None,
+                    })
+                    .unwrap_or(ConcreteValue::Null),
+                _ => ConcreteValue::Null,
+            };
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::GetfieldRawF, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::GetfieldRawF,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            let result = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::GetfieldRawF, &[base], descr);
+            if let ConcreteValue::Float(value) = concrete {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, Value::Float(value));
+            }
+            let dst = code[op.pc + 4] as usize;
+            let len = ctx.registers_f.len();
+            let _ = ctx
+                .registers_f
+                .get(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            ctx.registers_f.set(dst, result);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // pyjitpl.py `_opimpl_setfield_raw_any` / `opimpl_setfield_raw_i`:
+        // `execute_with_descr(rop.SETFIELD_RAW, fielddescr, box, valuebox)`.
+        // `blackhole.py bhimpl_setfield_raw_i` (`iid`). The walk is the
+        // execution, same as `raw_store_i`: a non-concrete operand declines
+        // rather than continue past a lost write. No heapcache.
+        "setfield_raw_i/iid" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let value = read_int_reg(code, op, 1, ctx)?;
+            let descr = read_descr(code, op, 2, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                descr.as_field_descr(),
+            ) {
+                (ConcreteValue::Int(ptr), ConcreteValue::Int(v), Some(fd)) if ptr != 0 => {
+                    let addr = (ptr as usize).wrapping_add(fd.offset()) as *mut u8;
+                    // SAFETY: the walk executed the residuals that produced
+                    // `ptr`; `fd.offset()` / `fd.field_size()` are the field
+                    // descr (`bhimpl_setfield_raw_i`).
+                    unsafe { raw_store_int(addr, fd.field_size(), v) };
+                }
+                (ConcreteValue::Int(0), _, Some(_)) => {}
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "setfield_raw_i/iid non-concrete operand",
+                    });
+                }
+            }
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::SetfieldRaw, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::SetfieldRaw,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+                OpCode::SetfieldRaw,
+                None,
+                &[base, value],
+            );
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::SetfieldRaw, &[base, value], descr);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // pyjitpl.py `opimpl_setfield_raw_f` / `blackhole.py
+        // bhimpl_setfield_raw_f` (`ifd`).
+        "setfield_raw_f/ifd" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let value = read_float_reg(code, op, 1, ctx)?;
+            let descr = read_descr(code, op, 2, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_float_reg_concrete(code, op, 1, ctx),
+                descr.as_field_descr(),
+            ) {
+                (ConcreteValue::Int(ptr), ConcreteValue::Float(v), Some(fd)) if ptr != 0 => {
+                    let addr = (ptr as usize).wrapping_add(fd.offset()) as *mut u8;
+                    unsafe { raw_store_float(addr, fd.field_size(), v) };
+                }
+                (ConcreteValue::Int(0), _, Some(_)) => {}
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "setfield_raw_f/ifd non-concrete operand",
+                    });
+                }
+            }
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::SetfieldRaw, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::SetfieldRaw,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+                OpCode::SetfieldRaw,
+                None,
+                &[base, value],
+            );
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::SetfieldRaw, &[base, value], descr);
+            Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // Heapcache-aware getfield reads. RPython
         // `pyjitpl.py opimpl_getfield_gc_<i|r|f>` →

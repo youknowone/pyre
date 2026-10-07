@@ -31,6 +31,10 @@ pub fn layout_for_word(word: usize) -> FatPtrLayout {
 
 /// `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>` occupy two words:
 /// the data pointer and the vtable (metadata) pointer.
+///
+/// `get_type_flag` uses this arm. Raw `*mut dyn` / `Option<*mut dyn>` stay
+/// off it: those spellings are two-word `lltype.Struct` fields in the
+/// bookkeeper, not FLAG_POINTER descrs of size two words.
 pub fn spelling_is_dyn_fat_ptr(s: &str) -> bool {
     let s = s.trim();
     let inner = s
@@ -43,6 +47,86 @@ pub fn spelling_is_dyn_fat_ptr(s: &str) -> bool {
         .unwrap_or(s)
         .trim();
     inner.starts_with("dyn ")
+}
+
+/// A pointer to an unsized pointee (`dyn Trait`, `[T]`, `str`) is two
+/// words: data then metadata (`lltype` models that as a struct).
+/// `Option` of such a pointer keeps the same two-word value.
+pub fn spelling_is_fat_ptr(s: &str) -> bool {
+    unsized_pointee(s).is_some()
+}
+
+fn unsized_pointee(s: &str) -> Option<&str> {
+    let s = s.trim();
+    let inner = wrapper_inner(s, &["Option"]).unwrap_or(s);
+    let pointee = pointer_pointee(inner)?;
+    is_unsized_pointee(pointee).then_some(pointee)
+}
+
+fn wrapper_inner<'a>(s: &'a str, leaves: &[&str]) -> Option<&'a str> {
+    let (head, rest) = s.split_once('<')?;
+    if !rest.ends_with('>') {
+        return None;
+    }
+    let leaf = head.trim().rsplit("::").next().unwrap_or(head.trim());
+    if !leaves.iter().any(|name| *name == leaf) {
+        return None;
+    }
+    let inner = &rest[..rest.len() - 1];
+    if top_level_comma(inner) {
+        return None;
+    }
+    Some(inner.trim())
+}
+
+fn pointer_pointee(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if let Some(rest) = s
+        .strip_prefix("*const ")
+        .or_else(|| s.strip_prefix("*mut "))
+    {
+        return Some(rest.trim());
+    }
+    if let Some(rest) = s.strip_prefix("&mut ") {
+        return Some(rest.trim());
+    }
+    if let Some(rest) = s.strip_prefix('&') {
+        let rest = rest.trim();
+        if let Some(after_life) = rest.strip_prefix('\'') {
+            return Some(
+                after_life
+                    .split_once(char::is_whitespace)
+                    .map(|(_, rhs)| rhs.trim())
+                    .unwrap_or(after_life),
+            );
+        }
+        return Some(rest);
+    }
+    wrapper_inner(s, &["Box", "NonNull"])
+}
+
+fn is_unsized_pointee(inner: &str) -> bool {
+    let inner = inner.trim();
+    if inner == "str" || inner.ends_with("::str") || inner.starts_with("dyn ") {
+        return true;
+    }
+    inner
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|body| !body.contains(';'))
+}
+
+fn top_level_comma(s: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn component_indices() -> (usize, usize) {
@@ -86,8 +170,27 @@ mod tests {
         assert!(super::spelling_is_dyn_fat_ptr("&dyn Storage"));
         assert!(super::spelling_is_dyn_fat_ptr("&mut dyn Storage"));
         assert!(super::spelling_is_dyn_fat_ptr("Box<dyn Storage>"));
+        assert!(!super::spelling_is_dyn_fat_ptr("*mut dyn Storage"));
+        assert!(!super::spelling_is_dyn_fat_ptr(
+            "Option<*mut dyn AsyncActionOps>"
+        ));
         assert!(!super::spelling_is_dyn_fat_ptr("&Holder"));
         assert!(!super::spelling_is_dyn_fat_ptr("Box<Holder>"));
+    }
+
+    #[test]
+    fn unsized_raw_pointers_are_fat() {
+        assert!(super::spelling_is_fat_ptr("*const [u8]"));
+        assert!(super::spelling_is_fat_ptr("&[String]"));
+        assert!(super::spelling_is_fat_ptr("Box<[u8]>"));
+        assert!(super::spelling_is_fat_ptr("*mut dyn Storage"));
+        assert!(super::spelling_is_fat_ptr(
+            "Option<*mut dyn AsyncActionOps>"
+        ));
+        assert!(super::spelling_is_fat_ptr("Option<&dyn Storage>"));
+        assert!(!super::spelling_is_fat_ptr("*mut u8"));
+        assert!(!super::spelling_is_fat_ptr("Option<*mut u8>"));
+        assert!(!super::spelling_is_fat_ptr("&Holder"));
     }
 
     #[test]

@@ -532,3 +532,35 @@ fn shadow_stack_erase_census() {
         }
     }
 }
+
+/// `slice_unpack` pins with free `pin_root` onto a `shadow_stack_len` base.
+/// Scalar replacement refuses it (`calls-stack-sensitive-fn`: `__index__`),
+/// and [`RootBracketPlan`] erases the bracket, including the len call.
+#[test]
+fn slice_unpack_erases_the_len_named_free_pin_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let graph = lower_named(&interpreter, "slice_unpack");
+    for leaf in [
+        "push_roots",
+        "pin_root",
+        "pin_roots",
+        "shadow_stack_len",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "slice_unpack still calls {leaf} after the len-named free pins were erased"
+        );
+    }
+}

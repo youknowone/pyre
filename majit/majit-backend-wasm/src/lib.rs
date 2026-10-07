@@ -568,6 +568,49 @@ fn record_last_compile_err(err: &majit_backend::BackendError) {
     *LAST_COMPILE_ERR.lock() = err.to_string();
 }
 
+/// These declines are a property of the ops in this trace. A later
+/// trace of the same guard can omit them, so the bridge decline stays
+/// retryable. Other `Unsupported` shapes stay terminal.
+fn bridge_codegen_error(err: majit_backend::BackendError) -> majit_backend::BackendError {
+    match err {
+        majit_backend::BackendError::RetryableUnsupported(reason) => {
+            majit_backend::BackendError::CompilationFailed(reason)
+        }
+        majit_backend::BackendError::Unsupported(reason)
+            if bridge_unsupported_is_retryable(&reason) =>
+        {
+            majit_backend::BackendError::CompilationFailed(reason)
+        }
+        other => other,
+    }
+}
+
+fn bridge_unsupported_is_retryable(reason: &str) -> bool {
+    (reason.contains("COND_CALL")
+        && (reason.contains("no direct residual signature")
+            || reason.contains("no web trampoline")))
+        || reason.contains("residual call has")
+        || reason.contains("CallMallocNurseryVarsizeHeaderless")
+        || reason.contains("read with no producing op")
+        || reason.contains("GuardFutureCondition")
+        || reason.contains("VirtualRef")
+        || reason.contains("RawLoad")
+        || reason.contains("RawStore")
+        || reason.contains("GuardAlwaysFails")
+        || reason.contains("GetinteriorfieldGc")
+        || reason.contains("SetinteriorfieldRaw")
+        || reason.contains("Strlen")
+        || reason.contains("Unicodelen")
+        || reason.contains("Strgetitem")
+        || reason.contains("Unicodegetitem")
+        || reason.contains("Strsetitem")
+        || reason.contains("Unicodesetitem")
+        || reason.contains("Strhash")
+        || reason.contains("Unicodehash")
+        || reason.contains("Copystrcontent")
+        || reason.contains("Copyunicodecontent")
+}
+
 // Snapshot of `last_compile_err` for the host's byte-at-index read.
 // `last_compile_err_len` refreshes it so each byte load does not re-lock
 // and re-clone the live string.
@@ -2910,6 +2953,11 @@ pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
 /// makes `compile_bridge` decline the CA lift, since the arm would have no way
 /// to complete a deopt. Stored as `u64` to reuse the imported atomics.
 static CA_DEOPT_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Dormant runtime-regression selector. The wasm runner writes this through a
+/// guest export before executing a test program; zero keeps production runs
+/// unchanged. `1` selects the first admitted target, otherwise the value is a
+/// `JitCellToken` number.
+static FORCE_CA_TERMINAL_DECLINE: AtomicU64 = AtomicU64::new(0);
 
 /// `__indirect_function_table` index of the deferred-merge trip callback,
 /// published from pyre-jit the way [`CA_DEOPT_HELPER_SLOT`] is. Zero keeps
@@ -3382,6 +3430,11 @@ unsafe impl Sync for ResidualCallScratch {}
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 static RESIDUAL_CALL_SCRATCH: ResidualCallScratch =
     ResidualCallScratch(core::cell::UnsafeCell::new([0; codegen::MIN_FRAME_BYTES]));
+
+/// Configure the dormant terminal-decline regression hook.
+pub fn set_force_ca_terminal_decline(selector: u64) {
+    FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);
+}
 
 /// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
 /// without a value in the constants pool. `set_constants_pool` runs before
@@ -4763,6 +4816,18 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
             diag_bump(62);
             return None;
         }
+        // A successfully compiled loop is retained by its token while it is
+        // registered. It can subsequently become terminally declined, so read
+        // the live state before baking every CA entry.
+        let live = unsafe {
+            (registered.compiled_ptr as *const CompiledWasmLoop)
+                .as_ref()
+                .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
+        };
+        if !live {
+            diag_bump(63);
+            return None;
+        }
         // The same target may occur in several operations; each operation was
         // validated above, while the codegen map needs one geometry per token.
         if !resolved
@@ -4811,18 +4876,63 @@ fn ca_max_frame_bytes(targets: &[(u64, CallAssemblerTarget)]) -> u32 {
         .expect("admitted CALL_ASSEMBLER targets must be non-empty")
 }
 
-fn mark_call_assembler_target_active(target: &CallAssemblerTarget) {
+fn mark_call_assembler_target_active(
+    target: &CallAssemblerTarget,
+    caller_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    // `caller_flag` is the invalidation flag the calling artifact's
+    // `GUARD_NOT_INVALIDATED` reads — the token flag for a loop, the
+    // bridge-generation flag for a bridge — so a terminal decline of the
+    // callee invalidates exactly the artifact embedding the CA edge.
     // The target metadata is removed by `CompiledWasmLoop::drop`; compilation
     // is single-threaded, and callers only retain the pointer while the token
     // remains compiled. This is the same lifetime used by the deopt helper.
-    unsafe {
+    let force_terminal_decline = unsafe {
         if let Some(loop_) = (target.compiled_ptr as *const CompiledWasmLoop).as_ref() {
             loop_.ca_active.set(true);
+            {
+                let mut callers = loop_.ca_callers.borrow_mut();
+                callers.retain(|known| known.strong_count() > 0);
+                let incoming = std::sync::Arc::downgrade(&caller_flag);
+                if !callers
+                    .iter()
+                    .any(|known| std::sync::Weak::ptr_eq(known, &incoming))
+                {
+                    callers.push(incoming);
+                }
+            }
+
+            // Runtime-regression hook for the terminal-decline CA path.  It
+            // is dormant unless explicitly selected, and runs only after this
+            // caller has already admitted and compiled a CA edge.  `1` selects
+            // the first such target; a decimal JitCellToken number selects a
+            // particular target.  The caller's invalidation bit still makes
+            // this a bounded window, exactly like a real terminal bridge
+            // decline.
+            let selector = FORCE_CA_TERMINAL_DECLINE.load(Ordering::Relaxed);
+            if selector != 0 && (selector == 1 || selector == target.token_number) {
+                // One forced target per guest run. A real terminal decline
+                // also transitions its target just once.
+                FORCE_CA_TERMINAL_DECLINE.store(0, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    if force_terminal_decline {
+        // `mark_call_assembler_terminal_decline` reads `ca_callers`; release
+        // the registration borrow above before invalidating those callers.
+        mark_call_assembler_terminal_decline(target.compiled_ptr as usize);
+        diag_bump(16);
     }
 }
 
-/// Carry `ca_active` onto a redirected CALL_ASSEMBLER target.
+/// Move the movable-CA caller census from a redirected target to its
+/// replacement. Existing callers retain the old dispatch entry, but terminal
+/// decline of the replacement must still invalidate those callers.
 fn transfer_call_assembler_target_activity(
     old_target: &CallAssemblerTarget,
     new_target: &CallAssemblerTarget,
@@ -4838,7 +4948,61 @@ fn transfer_call_assembler_target_activity(
         new_loop
             .ca_active
             .set(new_loop.ca_active.get() || old_loop.ca_active.get());
+        let old_callers = old_loop.ca_callers.borrow().clone();
+        let mut new_callers = new_loop.ca_callers.borrow_mut();
+        new_callers.retain(|known| known.strong_count() > 0);
+        for caller in old_callers {
+            if caller.strong_count() == 0 {
+                continue;
+            }
+            if !new_callers
+                .iter()
+                .any(|known| std::sync::Weak::ptr_eq(known, &caller))
+            {
+                new_callers.push(caller);
+            }
+        }
     }
+}
+
+/// Mark a CA target whose callee guard was structurally declined.
+/// `compile_bridge` calls this on a terminal `Unsupported` so callers
+/// that baked this loop as CALL_ASSEMBLER retrace without the CA edge.
+pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
+    unsafe {
+        let Some(loop_) = (compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+        if loop_.ca_terminal_declined.replace(true) {
+            return;
+        }
+        let mut callers = loop_.ca_callers.borrow_mut();
+        callers.retain(|known| known.strong_count() > 0);
+        for caller in callers.iter() {
+            if let Some(flag) = caller.upgrade() {
+                flag.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn note_call_assembler_terminal_decline_for_token(original_token: &JitCellToken) {
+    let Some(loop_) = original_token
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+    else {
+        return;
+    };
+    mark_call_assembler_terminal_decline(loop_ as *const CompiledWasmLoop as usize);
+}
+
+fn terminal_bridge_unsupported(
+    original_token: &JitCellToken,
+    reason: impl Into<String>,
+) -> BackendError {
+    note_call_assembler_terminal_decline_for_token(original_token);
+    BackendError::Unsupported(reason.into())
 }
 
 /// Exit slots to decode out of a returned frame for `fail_descr`.
@@ -5599,6 +5763,8 @@ impl majit_backend::Backend for WasmBackend {
             reemit: std::cell::RefCell::new(entry_bridge_target.is_none().then_some(module_inputs)),
             bridge_owned_label_targets: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
+            ca_terminal_declined: std::cell::Cell::new(false),
+            ca_callers: std::cell::RefCell::new(Vec::new()),
         };
 
         token.set_compiled(Box::new(compiled));
@@ -5656,7 +5822,7 @@ impl majit_backend::Backend for WasmBackend {
         );
         if let Some(targets) = ca_targets.as_ref() {
             for (_, target) in targets {
-                mark_call_assembler_target_active(target);
+                mark_call_assembler_target_active(target, token.invalidation_flag());
             }
         }
 
@@ -5715,6 +5881,24 @@ impl majit_backend::Backend for WasmBackend {
         self.next_header_pc = header_pc;
     }
 
+    fn bridge_decline_is_terminal(&self) -> bool {
+        // A structural `Unsupported` from `compile_bridge` is a shape
+        // this backend rejects again. Trace-specific declines
+        // (unpublished `CALL_ASSEMBLER`, an unchainable closing `JUMP`,
+        // a loop-closing bridge that does not advance state, a
+        // `COND_CALL` without a direct residual signature, a residual
+        // call with more arguments than the call area, a headerless
+        // nursery allocation, a read of an unproduced value, a
+        // `GuardFutureCondition`, a `VirtualRef` the optimizer did
+        // not lower, a raw load or store that missed the GC rewrite,
+        // `GuardAlwaysFails`, an interior-field or string op the GC
+        // rewrite did not consume) return
+        // `CompilationFailed` so a later trace of the same guard can
+        // still compile. `MetaInterp::compile_bridge` records the
+        // guard only when this returns true and the error is `Unsupported`.
+        true
+    }
+
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
@@ -5738,7 +5922,9 @@ impl majit_backend::Backend for WasmBackend {
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
             diag_bump(1);
-            return Err(BackendError::Unsupported(reason));
+            // This trace's callee locs are unpublished. A later trace of
+            // the same guard may publish them or omit CALL_ASSEMBLER.
+            return Err(BackendError::CompilationFailed(reason));
         }
         // A bridge gets its own table, like `compile_loop`'s.
         let (ops_owned, gc_table) = self.rewrite_ops_for_gc(ops_owned);
@@ -5874,8 +6060,9 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_entry_arity = if source_bridge_param_dispatch {
             if source_fail_arg_count != Some(inputargs.len()) {
                 diag_bump(46);
-                return Err(BackendError::Unsupported(
-                    "wasm backend: guard and bridge input arities differ".into(),
+                return Err(terminal_bridge_unsupported(
+                    original_token,
+                    "wasm backend: guard and bridge input arities differ",
                 ));
             }
             Some(inputargs.len())
@@ -5885,10 +6072,10 @@ impl majit_backend::Backend for WasmBackend {
             // order, so frame entry input k reads physical slot k.
             if !codegen::frame_entry_reads_live_positions(fail_descr, inputargs.len()) {
                 diag_bump(46);
-                return Err(BackendError::Unsupported(
+                return Err(terminal_bridge_unsupported(
+                    original_token,
                     "wasm backend: frame-entry bridge cannot address the source guard's \
-                     live fail-arg slots"
-                        .into(),
+                     live fail-arg slots",
                 ));
             }
             None
@@ -5896,7 +6083,9 @@ impl majit_backend::Backend for WasmBackend {
         let allow_ca = ca_candidate;
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
-            return Err(BackendError::Unsupported(reason));
+            // The unresolved callee is a property of these ops, not of
+            // every future trace from the source guard.
+            return Err(BackendError::CompilationFailed(reason));
         }
         if allow_ca {
             diag_bump(14); // accepted CALL_ASSEMBLER bridge
@@ -5924,8 +6113,8 @@ impl majit_backend::Backend for WasmBackend {
         // accepted when its JUMP's target label is recoverable from the descr,
         // the arities match, and the label's args are the complete live set of
         // the trace remainder (`label_resume_safe`); otherwise decline — the
-        // guard then falls back to blackhole resume for this failure.
-        // `jitcounter.tick` resets the guard, so the next failure traces again.
+        // guard then falls back to blackhole resume and
+        // the guard descriptor's terminal bit stops the metainterp re-tracing it.
         // Non-peeled loops (entry == LABEL) re-enter correctly and keep
         // chaining.
         let bridge_is_loop_closing = has_cross_loop_terminal_jump(ops);
@@ -5952,7 +6141,9 @@ impl majit_backend::Backend for WasmBackend {
             }
             if target.is_none() {
                 diag_bump(2); // declined: JUMP target not chainable
-                return Err(BackendError::Unsupported(
+                // The closing JUMP's target depends on the ops this trace
+                // recorded. A later fail value can take a chainable path.
+                return Err(BackendError::CompilationFailed(
                     "wasm backend: loop-closing bridge JUMP target is not a \
                      chainable published label"
                         .into(),
@@ -5970,8 +6161,8 @@ impl majit_backend::Backend for WasmBackend {
         // livelock at constant stack depth and heap state). Such a bridge is a
         // guard side-trace that omits the loop body's advancing arithmetic; it
         // has no correct in-module resume, so decline it — the guard falls back
-        // to blackhole resume for this failure, and `jitcounter.tick` leaves
-        // the next failure to trace again. A genuinely advancing loop-closing bridge (an `i += 1`
+        // to blackhole resume and the guard descriptor's terminal bit stops the metainterp
+        // re-tracing it. A genuinely advancing loop-closing bridge (an `i += 1`
         // counter feeding a JUMP arg) passes and keeps chaining.
         //
         // The check only concerns a bridge that lands directly AT the loop
@@ -6035,10 +6226,10 @@ impl majit_backend::Backend for WasmBackend {
             // orbit does have a finite period, but the shield is a static
             // approximation of the bridge alone — it does not model the loop
             // body that runs between two passes, which is where such a bridge's
-            // advance actually comes from. Refusing one returns
-            // `BackendError::Unsupported` for this attempt; the guard resumes
-            // through the blackhole, and `AbstractResumeGuardDescr.must_compile`
-            // traces the next failure after `jitcounter.tick`.
+            // advance actually comes from. Refusing one is not local to the
+            // bridge either: the decline registers the guard in
+            // `declined_bridge_guards`, which sends every later failure of it
+            // to blackhole resume.
             let permutes_inputs = ops
                 .iter()
                 .rev()
@@ -6080,7 +6271,9 @@ impl majit_backend::Backend for WasmBackend {
             });
             if !advances && !permutes_inputs && !mutates_heap {
                 diag_bump(11); // declined: loop-closing bridge advances no loop-carried value
-                return Err(BackendError::Unsupported(
+                // Whether this bridge advances state depends on the traced
+                // path. Another fail value can still compile.
+                return Err(BackendError::CompilationFailed(
                     "wasm backend: loop-closing bridge advances no loop-carried value \
                      (guard side-trace would livelock the chained loop)"
                         .into(),
@@ -6237,10 +6430,10 @@ impl majit_backend::Backend for WasmBackend {
                         || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
                     // The `is_none` arm above already declined, so this holds.
                     let Some(merged_fail_index) = merged_source_fail_index else {
-                        return Err(BackendError::Unsupported(
+                        return Err(terminal_bridge_unsupported(
+                            original_token,
                             "wasm backend: inline candidate without a merged-stream exit \
-                             ordinal"
-                                .into(),
+                             ordinal",
                         ));
                     };
                     self.collect_constants_from_ops(ops);
@@ -6483,7 +6676,11 @@ impl majit_backend::Backend for WasmBackend {
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
+                    let err = bridge_codegen_error(err);
                     record_last_compile_err(&err);
+                    if matches!(err, BackendError::Unsupported(_)) {
+                        note_call_assembler_terminal_decline_for_token(original_token);
+                    }
                     return Err(err);
                 }
             };
@@ -6532,7 +6729,9 @@ impl majit_backend::Backend for WasmBackend {
         // keeps its host round-trip (correct, unaccelerated).
         #[cfg(target_arch = "wasm32")]
         if bridge_slot == 0 {
-            return Err(BackendError::Unsupported(
+            // The host rejected this trace's module. A later failure can
+            // record a smaller bridge, so the guard stays retryable.
+            return Err(BackendError::CompilationFailed(
                 "wasm host rejected the compiled bridge module (oversized function body \
                  or invalid module)"
                     .to_string(),
@@ -6633,7 +6832,7 @@ impl majit_backend::Backend for WasmBackend {
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
                 for (_, target) in targets {
-                    mark_call_assembler_target_active(target);
+                    mark_call_assembler_target_active(target, bridge_flag.clone());
                 }
             }
         }
@@ -7238,6 +7437,34 @@ impl majit_backend::Backend for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_rewrite_interior_field_decline_stays_retryable() {
+        let reason = "wasm codegen: GetinteriorfieldGcI reached codegen without the GC rewrite";
+        assert!(bridge_unsupported_is_retryable(reason));
+        assert!(bridge_unsupported_is_retryable(
+            "wasm codegen: Copyunicodecontent reached codegen without the GC rewrite"
+        ));
+        assert!(!bridge_unsupported_is_retryable(
+            "wasm codegen: some other unsupported shape"
+        ));
+    }
+
+    #[test]
+    fn nonconstant_gc_memory_decline_kind_is_retryable() {
+        let err = bridge_codegen_error(BackendError::RetryableUnsupported(
+            "wasm codegen: GcLoadIndexedI scale is not constant".into(),
+        ));
+        assert!(
+            matches!(err, BackendError::CompilationFailed(_)),
+            "got {err}"
+        );
+        let err = bridge_codegen_error(BackendError::RetryableUnsupported(
+            "wasm codegen: GcLoadI item size is not constant".into(),
+        ));
+        assert!(matches!(err, BackendError::CompilationFailed(_)));
+    }
+
     use failguard::{ca_entry, ca_mark_entry, ca_publish, mark_cells_holding};
     use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;

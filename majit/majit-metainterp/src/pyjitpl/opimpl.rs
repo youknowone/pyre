@@ -38,6 +38,8 @@ where
         table[jitcode::insns::BC_SETFIELD_GC_I_C as usize] = Self::opimpl_setfield_gc_i;
         table[jitcode::insns::BC_SETFIELD_GC_R as usize] = Self::opimpl_setfield_gc_i;
         table[jitcode::insns::BC_SETFIELD_GC_F as usize] = Self::opimpl_setfield_gc_i;
+        table[jitcode::insns::BC_SETFIELD_RAW_I as usize] = Self::opimpl_setfield_raw_i;
+        table[jitcode::insns::BC_SETFIELD_RAW_F as usize] = Self::opimpl_setfield_raw_i;
         table[jitcode::insns::BC_RAW_STORE_I as usize] = Self::opimpl_raw_store_i;
         table[jitcode::insns::BC_RAW_LOAD_I as usize] = Self::opimpl_raw_load_i;
         table[jitcode::insns::BC_RAW_LOAD_F as usize] = Self::opimpl_raw_load_f;
@@ -47,6 +49,8 @@ where
         table[jitcode::insns::BC_GETFIELD_GC_R_PURE as usize] = Self::opimpl_getfield_gc_i;
         table[jitcode::insns::BC_GETFIELD_GC_F as usize] = Self::opimpl_getfield_gc_f;
         table[jitcode::insns::BC_GETFIELD_GC_F_PURE as usize] = Self::opimpl_getfield_gc_f;
+        table[jitcode::insns::BC_GETFIELD_RAW_I as usize] = Self::opimpl_getfield_raw_i;
+        table[jitcode::insns::BC_GETFIELD_RAW_F as usize] = Self::opimpl_getfield_raw_f;
         table[jitcode::insns::BC_SETFIELD_VABLE_I_IMM as usize] = Self::opimpl_setfield_vable_i_imm;
         table[jitcode::insns::BC_SETFIELD_VABLE_I as usize] = Self::opimpl_setfield_vable_i;
         table[jitcode::insns::BC_SETFIELD_VABLE_R as usize] = Self::opimpl_setfield_vable_r;
@@ -779,6 +783,74 @@ where
 
     #[inline(never)]
     #[allow(unused_variables)]
+    fn opimpl_setfield_raw_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py `_opimpl_setfield_raw_any`:
+        // `execute_with_descr(rop.SETFIELD_RAW, fielddescr, box, valuebox)`.
+        // `blackhole.py bhimpl_setfield_raw_{i,f}` (`iid` / `ifd`).
+        // The struct address lives in the int bank (`history.getkind` Signed
+        // for a raw pointer), not the ref bank.
+        let is_float = bytecode == jitcode::insns::BC_SETFIELD_RAW_F;
+        let (struct_reg, value_reg, descr_idx) = {
+            let frame = self.frames.current_mut();
+            frame.read_setfield_gc()
+        };
+        let (offset, field_size, fielddescr) = {
+            let frame = self.frames.current_mut();
+            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
+                panic!("BC_SETFIELD_RAW: descrs[{descr_idx}] is not a BhDescr entry")
+            });
+            let field_size = match bh {
+                crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
+                _ => 8,
+            };
+            let offset = field_offset_from_bh(bh, "BC_SETFIELD_RAW");
+            let fielddescr = frame
+                .runtime_optimizer_descr(descr_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+            (offset, field_size, fielddescr)
+        };
+        let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        let (value_opref, concrete) = if is_float {
+            self.read_float_reg(ctx, value_reg)
+        } else {
+            self.read_int_reg(ctx, value_reg)
+        };
+        ctx.heapcache_invalidate_caches_varargs(
+            OpCode::SetfieldRaw,
+            None,
+            &[struct_opref, value_opref],
+        );
+        ctx.profiler()
+            .count_ops(OpCode::SetfieldRaw, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::SetfieldRaw, crate::counters::RECORDED_OPS);
+        ctx.record_op_with_descr(
+            OpCode::SetfieldRaw,
+            &[struct_opref, value_opref],
+            fielddescr,
+        );
+        if struct_ptr != 0 {
+            let addr = (struct_ptr as usize).wrapping_add(offset);
+            unsafe {
+                match field_size {
+                    1 => core::ptr::write_unaligned(addr as *mut u8, concrete as u8),
+                    2 => core::ptr::write_unaligned(addr as *mut u16, concrete as u16),
+                    4 => core::ptr::write_unaligned(addr as *mut u32, concrete as u32),
+                    _ => core::ptr::write_unaligned(addr as *mut i64, concrete),
+                }
+            }
+        }
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
     fn opimpl_raw_store_i(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1195,6 +1267,68 @@ where
 
     #[inline(never)]
     #[allow(unused_variables)]
+    fn opimpl_getfield_raw_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py `opimpl_getfield_raw_i`:
+        // `execute_with_descr(rop.GETFIELD_RAW_I, fielddescr, box)`.
+        // `blackhole.py bhimpl_getfield_raw_i` (`id>i`).
+        let (struct_reg, descr_idx, dest) = {
+            let frame = self.frames.current_mut();
+            frame.read_getfield_gc()
+        };
+        let (offset, field_size, is_field_signed, fielddescr) = {
+            let frame = self.frames.current_mut();
+            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
+                panic!("BC_GETFIELD_RAW_I: descrs[{descr_idx}] is not a BhDescr entry")
+            });
+            let (field_size, is_field_signed) = match bh {
+                crate::blackhole::BhDescr::Field {
+                    field_size,
+                    is_field_signed,
+                    ..
+                } => (*field_size, *is_field_signed),
+                _ => (8, false),
+            };
+            let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_I");
+            let fielddescr = frame
+                .runtime_optimizer_descr(descr_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+            (offset, field_size, is_field_signed, fielddescr)
+        };
+        let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        let loaded = if struct_ptr == 0 {
+            0
+        } else {
+            let addr = (struct_ptr as usize).wrapping_add(offset);
+            unsafe {
+                match (field_size, is_field_signed) {
+                    (1, true) => core::ptr::read_unaligned(addr as *const i8) as i64,
+                    (1, false) => core::ptr::read_unaligned(addr as *const u8) as i64,
+                    (2, true) => core::ptr::read_unaligned(addr as *const i16) as i64,
+                    (2, false) => core::ptr::read_unaligned(addr as *const u16) as i64,
+                    (4, true) => core::ptr::read_unaligned(addr as *const i32) as i64,
+                    (4, false) => core::ptr::read_unaligned(addr as *const u32) as i64,
+                    _ => core::ptr::read_unaligned(addr as *const i64),
+                }
+            }
+        };
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawI, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawI, crate::counters::RECORDED_OPS);
+        let op = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[struct_opref], fielddescr);
+        ctx.set_opref_concrete(op, Value::Int(loaded));
+        self.set_int_reg(ctx, dest, Some(op), Some(loaded));
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
     fn opimpl_getfield_gc_f(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1286,6 +1420,50 @@ where
             (op, loaded)
         };
         self.set_float_reg(ctx, dest, Some(op), Some(reg_concrete));
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_getfield_raw_f(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py `opimpl_getfield_raw_f`:
+        // `execute_with_descr(rop.GETFIELD_RAW_F, fielddescr, box)`.
+        // `blackhole.py bhimpl_getfield_raw_f` (`id>f`).
+        let (struct_reg, descr_idx, dest) = {
+            let frame = self.frames.current_mut();
+            frame.read_getfield_gc()
+        };
+        let (offset, fielddescr) = {
+            let frame = self.frames.current_mut();
+            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
+                panic!("BC_GETFIELD_RAW_F: descrs[{descr_idx}] is not a BhDescr entry")
+            });
+            let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_F");
+            let fielddescr = frame
+                .runtime_optimizer_descr(descr_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+            (offset, fielddescr)
+        };
+        let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        let loaded_bits = if struct_ptr == 0 {
+            0
+        } else {
+            let addr = (struct_ptr as usize).wrapping_add(offset);
+            unsafe { core::ptr::read_unaligned(addr as *const i64) }
+        };
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawF, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawF, crate::counters::RECORDED_OPS);
+        let op = ctx.record_op_with_descr(OpCode::GetfieldRawF, &[struct_opref], fielddescr);
+        ctx.set_opref_concrete(op, Value::Float(f64::from_bits(loaded_bits as u64)));
+        self.set_float_reg(ctx, dest, Some(op), Some(loaded_bits));
         TraceAction::Continue
     }
 

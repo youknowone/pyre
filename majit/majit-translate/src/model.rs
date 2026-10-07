@@ -725,6 +725,19 @@ pub struct FieldDescriptor {
     /// `FatData` / `FatLen` add `fat_ptr_layout::probe`'s offset. The add
     /// sits on top of the field's own offset.
     pub vec_part: Option<VecFieldPart>,
+    /// Declared `Struct._gckind` of the owning struct or enum, recorded
+    /// where the container type is still in hand. `Some(false)` is Raw:
+    /// a Signed base stays an address (`getfield_raw`). `None` means the
+    /// producer did not record it and the codewriter falls back to the
+    /// layout registry. Excluded from `PartialEq` / `Hash` like `owner_id`.
+    pub owner_declared_gc: Option<bool>,
+    /// `(variant, field)` in the owner's host `variant_field_offsets`.
+    /// A struct is variant 0. `fielddescrof` reads that byte offset when
+    /// the base is a raw address; the explicit sum shell's `8 + i * 8`
+    /// payload slots stay the gc representation. Excluded from
+    /// `PartialEq` / `Hash` like `owner_declared_gc`.
+    #[serde(default)]
+    pub host_index: Option<(u32, u32)>,
     /// Layout word of a scalar field on an opaque dependency struct.
     /// `None` when the type registry can name the field. Part of equality:
     /// the offset is the access.
@@ -777,6 +790,8 @@ impl FieldDescriptor {
             taken_by_address: false,
             inline_vec: false,
             vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
             scalar_word: None,
         }
     }
@@ -784,6 +799,18 @@ impl FieldDescriptor {
     /// Builder-style setter for the owning-type identity token.
     pub fn with_owner_id(mut self, owner_id: Option<majit_ir::descr::StructId>) -> Self {
         self.owner_id = owner_id;
+        self
+    }
+
+    /// `Some(true)` when the owning struct or enum is a declared Gc type.
+    pub fn with_owner_declared_gc(mut self, declared_gc: Option<bool>) -> Self {
+        self.owner_declared_gc = declared_gc;
+        self
+    }
+
+    /// `(variant, field)` into the owner's host layout. A struct is variant 0.
+    pub fn with_host_index(mut self, host_index: Option<(u32, u32)>) -> Self {
+        self.host_index = host_index;
         self
     }
 
@@ -1484,6 +1511,10 @@ pub enum OpKind {
         args_f: Vec<crate::flowspace::model::Variable>,
         /// Result kind: 'i', 'r', 'f', or 'v'
         result_kind: char,
+        /// Source-order kind chars of `args_i`/`args_r`/`args_f` (`i`/`r`/`f`).
+        /// `rebucket_kind_lists` replays this so a promoted int does not jump
+        /// ahead of a ref that preceded it.
+        arg_classes: String,
     },
     /// Recursive call — back to the portal entry point.
     /// RPython: `recursive_call_{reskind}(jd_index, [green_i], [green_r], [green_f], [red_i], [red_r], [red_f])`
@@ -1501,6 +1532,9 @@ pub enum OpKind {
         reds_f: Vec<crate::flowspace::model::Variable>,
         /// Result kind
         result_kind: char,
+        /// Source-order kind chars of the green lists, then the red lists.
+        green_classes: String,
+        red_classes: String,
     },
 
     //
@@ -1634,6 +1668,9 @@ pub enum OpKind {
         reds_i: Vec<crate::flowspace::model::Variable>,
         reds_r: Vec<crate::flowspace::model::Variable>,
         reds_f: Vec<crate::flowspace::model::Variable>,
+        /// Source-order kind chars of the green lists, then the red lists.
+        green_classes: String,
+        red_classes: String,
     },
 
     /// JitDriver loop-header marker — RPython `loop_header` opname.
@@ -10067,6 +10104,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     value: LinkArg::Value(v),
@@ -10127,6 +10166,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(b0),
@@ -10182,6 +10223,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -10281,6 +10324,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::from(ConstValue::Int(7)),
@@ -10375,6 +10420,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::from(ConstValue::Int(7)),
@@ -11298,6 +11345,8 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
                 scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
@@ -11391,6 +11440,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(header),
@@ -11410,6 +11461,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(v.clone()),
@@ -11572,6 +11625,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(header),
@@ -11591,6 +11646,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(v.clone()),
@@ -11722,6 +11779,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     value: LinkArg::Value(header),
@@ -11741,6 +11800,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     value: LinkArg::Value(v),
@@ -11863,6 +11924,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(header),
@@ -11882,6 +11945,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(v),
@@ -11960,6 +12025,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(header),
@@ -11980,6 +12047,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                         scalar_word: None,
                     },
                     value: LinkArg::Value(v),
@@ -12145,6 +12214,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -12349,6 +12420,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -12620,6 +12693,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -12884,6 +12959,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -13074,6 +13151,8 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
                 scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
@@ -13278,6 +13357,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value,
@@ -13450,6 +13531,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -13682,6 +13765,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
@@ -13915,6 +14000,8 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
                 scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
@@ -13996,6 +14083,8 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
                 scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
@@ -14179,6 +14268,8 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
                 scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
@@ -14994,6 +15085,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                     scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),

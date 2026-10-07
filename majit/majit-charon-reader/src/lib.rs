@@ -96,6 +96,10 @@ pub struct Llbc {
     /// the bodies among them that can leave the shadow stack changed.
     /// Empty until the translator publishes them.
     root_stack_effects: parking_lot::RwLock<(Vec<String>, Vec<String>)>,
+    /// Qualified path of the interpreter's exception carrier, published by
+    /// the translator. A pointer to that ADT is the exception value `raise`
+    /// stores, not a raw address. Empty until published.
+    exception_carrier: parking_lot::RwLock<String>,
     /// Dedup id of `register_eval_override`'s first parameter, resolved
     /// once from every `FunDecl` this artefact carries (local and
     /// external). `None` once the scan has finished without a match.
@@ -296,6 +300,7 @@ impl Llbc {
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
+            exception_carrier: parking_lot::RwLock::new(String::new()),
             eval_fn_type_id: std::sync::OnceLock::new(),
             stack_sensitive_fns: parking_lot::RwLock::new(Vec::new()),
             stack_sensitive_ready: std::sync::atomic::AtomicBool::new(false),
@@ -354,6 +359,16 @@ impl Llbc {
     /// Publish the root-stack effects harvested from other artefacts of the
     /// same translation input: `crates` names every crate whose bodies were
     /// analysed, `touching` the paths of those that can change the stack.
+    /// Publish the exception carrier's qualified ADT path. Empty clears it.
+    pub fn set_exception_carrier(&self, path: &str) {
+        *self.exception_carrier.write() = path.to_string();
+    }
+
+    /// The published exception carrier path, or empty when none is named.
+    pub fn exception_carrier(&self) -> String {
+        self.exception_carrier.read().clone()
+    }
+
     pub fn set_root_stack_effects(&self, crates: Vec<String>, mut touching: Vec<String>) {
         touching.sort();
         touching.dedup();

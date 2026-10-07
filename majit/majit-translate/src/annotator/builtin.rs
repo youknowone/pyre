@@ -283,6 +283,17 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // semantics.
     analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
+    analyzer_for(&mut reg, "rarithmetic.ulonglongmask", rarith_ulonglongmask);
+    analyzer_for(
+        &mut reg,
+        "rarithmetic.longlonglongmask",
+        rarith_longlonglongmask,
+    );
+    analyzer_for(
+        &mut reg,
+        "rarithmetic.ulonglonglongmask",
+        rarith_ulonglonglongmask,
+    );
     // `lltype.cast_pointer` (ann_cast_pointer, lltype.py) —
     // keyed under the `HostObject::new_builtin_callable` qualname the
     // lltype HOST_ENV module assigns (`flowspace/model.rs`'s
@@ -1365,6 +1376,40 @@ pub fn rarith_longlongmask(
     )))
 }
 
+/// `r_longlonglong` (`SignedLongLongLong`).
+pub fn rarith_longlonglongmask(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        false,
+        crate::annotator::model::KnownType::LongLongLong,
+    )))
+}
+
+pub fn rarith_ulonglonglongmask(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        true,
+        crate::annotator::model::KnownType::ULongLongLong,
+    )))
+}
+
+pub fn rarith_ulonglongmask(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        true,
+        crate::annotator::model::KnownType::ULongLong,
+    )))
+}
+
 /// `longlong2float.float2longlong(floatval)` — upstream
 /// `Float2LongLongEntry.compute_result_annotation` returns
 /// `SomeInteger(knowntype=r_int64)` (== `r_longlong`).
@@ -1719,6 +1764,20 @@ fn cast_instance_intrinsic(
             | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for tuple root {root:?}: {other:?}"
+            ))),
+        };
+    }
+    // A pointer to a declared-Raw ADT is an int-bank `SomePtr`. Retargeting
+    // `*mut A as *mut B` must replace that pointee, not mint a GC instance.
+    // An operand that is already the instance (`push_roots()` → `RootScope`)
+    // is that class, not an address word, so it keeps the classdef arm.
+    if let Some(raw_ptr) = bk.raw_struct_ptr_annotation(&root)
+        && !matches!(operand, SomeValue::Instance(_))
+    {
+        return match operand {
+            SomeValue::Ptr(_) | SomeValue::Address(_) | SomeValue::Integer(_) => Ok(raw_ptr),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-address operand for raw root {root:?}: {other:?}"
             ))),
         };
     }
@@ -3754,6 +3813,9 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("rpython.rlib.rarithmetic", "intmask"),
             ("rpython.rlib.rarithmetic", "longlongmask"),
+            ("rpython.rlib.rarithmetic", "ulonglongmask"),
+            ("rpython.rlib.rarithmetic", "longlonglongmask"),
+            ("rpython.rlib.rarithmetic", "ulonglonglongmask"),
             // `rarithmetic.r_uint` is intentionally absent from
             // BUILTIN_ANALYZERS — `immutablevalue_hostobject` misses,
             // then falls through to its own extregistry path

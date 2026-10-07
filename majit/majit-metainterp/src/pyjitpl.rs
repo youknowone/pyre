@@ -11658,6 +11658,11 @@ impl<M: Clone> MetaInterp<M> {
                 // did not compile already had its jitcounter reset by
                 // `jitcounter.tick`. The caller's `done_compiling` clears
                 // `ST_BUSY_FLAG`, and the next failure ticks again.
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
+                    fail_descr.set_bridge_declined_terminally();
+                }
                 self.stats.loops_aborted += 1;
                 let msg = format!("Retrace bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
@@ -15405,6 +15410,14 @@ impl<M: Clone> MetaInterp<M> {
         if descr_fd.loop_version() {
             panic!("CompileLoopVersionDescr.handle_fail: this guard must never fail");
         }
+        // A structural `compile_bridge` decline stamps the descr so later
+        // failures resume in the blackhole. Read it with the `ST_BUSY_FLAG`
+        // skip (`compile.py ResumeGuardDescr.must_compile`): do not tick
+        // a guard that will never compile.
+        if descr_fd.bridge_declined_terminally() {
+            crate::mc_diag_bump(83); // terminal-decline skip
+            return (false, owning_key);
+        }
         // `compile.py:741` `status = self.status` — direct field read on
         // the resume-guard descr.  `descr_fd` is the live `FailDescr`
         // we already resolved above; no backend round-trip.
@@ -17211,6 +17224,11 @@ impl<M: Clone> MetaInterp<M> {
                 // did not compile already had its jitcounter reset by
                 // `jitcounter.tick`. The caller's `done_compiling` clears
                 // `ST_BUSY_FLAG`, and the next failure ticks again.
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
+                    fail_descr.set_bridge_declined_terminally();
+                }
                 let msg = format!("Bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
@@ -31269,6 +31287,28 @@ mod tests {
         assert!(
             meta.must_compile_with_values(&descr, &[], None, 1).0,
             "later failures tick until the threshold again"
+        );
+    }
+
+    #[test]
+    fn terminally_declined_bridge_is_not_ticked_again() {
+        // `compile.py ResumeGuardDescr.must_compile` returns False for
+        // ST_BUSY_FLAG without ticking. A structurally declined descr is
+        // the same skip: later failures blackhole instead of retracing.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.set_trace_eagerness(2);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let hash = meta.warm_state.fetch_next_hash();
+        fd.store_hash(hash);
+        fd.set_bridge_declined_terminally();
+
+        assert!(fd.bridge_declined_terminally());
+        assert!(!meta.must_compile_with_values(&descr, &[], None, 1).0);
+        assert!(
+            !meta.must_compile_with_values(&descr, &[], None, 1).0,
+            "a terminal decline must not fire must_compile"
         );
     }
 

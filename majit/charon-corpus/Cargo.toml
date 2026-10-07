@@ -10,3 +10,6 @@ path = "src/lib.rs"
 # Isolate from the parent workspace so this fixture never participates in
 # the main build. Charon runs against this crate directly.
 [workspace]
+
+[dependencies]
+majit-gc = { path = "../majit-gc" }

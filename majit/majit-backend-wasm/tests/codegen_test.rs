@@ -579,6 +579,112 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
 #[test]
 #[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
+fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
+    let root = workspace_root();
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
+    let wasm_module = wasm_host_module(&root);
+    let script = root.join("pyre/oracle/ca_terminal_decline.py");
+
+    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
+        assert!(
+            artifact.exists(),
+            "runtime CA regression needs {}; build the requested dynasm and wasm-host artifacts first",
+            artifact.display()
+        );
+    }
+
+    let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
+    assert_ran_ok("dynasm terminal-decline", &dynasm_run);
+    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
+    let wasm_run = run_runtime_program(
+        &wasm_runner,
+        &script,
+        &[
+            ("PYRE_WASM_MODULE", module),
+            ("PYRE_WASM_ENGINE", "wasmtime"),
+            ("PYRE_WASM_JIT_STATS", "1"),
+            ("PYRE_WASM_FORCE_CA_TERMINAL_DECLINE", "1"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&wasm_run.stderr);
+    assert_ran_ok("wasm terminal-decline", &wasm_run);
+    assert_same_stdout("forced terminal-decline wasm", &wasm_run, &dynasm_run);
+    assert!(
+        stderr.contains("accepted_ca=") && !stderr.contains("accepted_ca=0"),
+        "fixture did not compile its outer CALL_ASSEMBLER trace:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("forced_ca_terminal_decline=1"),
+        "terminal-decline hook did not run after CA admission:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_bridge_terminal_decline_invalidates_ca_callers() {
+    use majit_backend::Backend;
+    use majit_backend_wasm::failguard::CompiledWasmLoop;
+
+    let _serialized = HOST_COMPILE_LOCK.lock();
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = std::sync::Arc::new(majit_backend::JitCellToken::new(1));
+    let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(1));
+    clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+    token.set_compiled_loop_token(Some(clt));
+    let label_descr = majit_ir::make_loop_target_descr(70, false);
+    backend
+        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .expect("owner loop compiles");
+
+    let caller_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let loop_ = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+            .expect("compiled wasm loop");
+        loop_
+            .ca_callers
+            .borrow_mut()
+            .push(std::sync::Arc::downgrade(&caller_flag));
+        assert!(!loop_.ca_terminal_declined.get());
+    }
+
+    // One bridge input against two fail-arg types: `frame_entry_reads_live_positions`
+    // declines this shape, which is a structural `Unsupported`.
+    let fail_descr = HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    };
+    let err = backend
+        .compile_bridge(
+            &fail_descr,
+            &[InputArg::from_type_rc(Type::Int, 40)],
+            &host_bridge_ops(&label_descr),
+            &token,
+            &[],
+            None,
+        )
+        .expect_err("arity mismatch is a terminal decline");
+    assert!(
+        matches!(err, majit_backend::BackendError::Unsupported(_)),
+        "got {err}"
+    );
+    assert!(
+        caller_flag.load(std::sync::atomic::Ordering::Acquire),
+        "CALL_ASSEMBLER callers of a terminally declined callee must be invalidated"
+    );
+    let loop_ = token
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        .expect("compiled wasm loop");
+    assert!(loop_.ca_terminal_declined.get());
+}
+
+#[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     let root = workspace_root();
     let dynasm = runtime_binary(&root, "pyre-dynasm");

@@ -723,6 +723,16 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             seed_vstack_mirror(&mut wc, sym, position);
             position
         };
+        // `opimpl_goto_if_not` / `generate_guard` snapshot live boxes from
+        // per-pc liveness with no extra seed, but the walker overlay still
+        // needs an on-entry mirror so a later depth>1 branch can name those
+        // boxes.  The prepared exception-resume arm used to skip this when
+        // `catch_exception` was absent (no standing exception on the
+        // no-match bridge), leaving `vstack_valid=false` through the
+        // handler-adjacent Python loop in `searches()`.
+        if !wc.vstack_valid && !carrier_raise_escapes {
+            seed_vstack_mirror(&mut wc, sym, walk_position);
+        }
         let outcome = if carrier_raise_escapes {
             let (finish_arg, finish_arg_type) = wc
                 .session

@@ -99,6 +99,7 @@ fn unit_result_callee_declares_void_return() {
     // and the tail-forward `f(...)?` (`store_fast` / `store_fast_store_fast`).
     for name in [
         "pyre_interpreter::eval::<Impl>::store_local_value",
+        "pyre_interpreter::eval::<Impl>::send_value",
         "pyre_interpreter::pyopcode::OpcodeStepExecutor::store_fast",
         "pyre_interpreter::pyopcode::OpcodeStepExecutor::store_fast_store_fast",
     ] {
@@ -471,6 +472,22 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         "pyre_interpreter::baseobjspace::unpackiterable_portal",
     )
     .expect("lower unpackiterable_portal");
+    assert!(
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method {
+                        name,
+                        receiver_root: Some(root),
+                        ..
+                    },
+                    ..
+                } if name == "jit_merge_point" && root == "UnpackIterableJitDriver"
+            )
+        }),
+        "jit_merge_point must stay a Method on the driver receiver"
+    );
 
     // (block, caught value) for every `except OperationError as e` handler.
     let handlers: Vec<(usize, majit_translate::flowspace::model::Variable)> = graph
