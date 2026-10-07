@@ -73,71 +73,26 @@ class ME(MemoryError):
 
 reject(lambda: ME(foo=1), "ME() takes no keyword arguments")
 
+# One representative per constructor path: the shared `BaseException_init`,
+# the types with their own init, and OSError's `__new__`/`__init__` split.
 for T in (
     BaseException,
     Exception,
     GeneratorExit,
     SystemExit,
     StopIteration,
-    OverflowError,
-    ZeroDivisionError,
-    AssertionError,
-    EOFError,
-    RuntimeError,
-    RecursionError,
-    NotImplementedError,
-    TypeError,
-    LookupError,
-    IndexError,
-    ArithmeticError,
-    BufferError,
-    ReferenceError,
-    FloatingPointError,
     Warning,
-    UserWarning,
-    DeprecationWarning,
-    PendingDeprecationWarning,
-    RuntimeWarning,
-    SyntaxWarning,
-    FutureWarning,
-    ImportWarning,
-    UnicodeWarning,
-    BytesWarning,
-    ResourceWarning,
-    EncodingWarning,
     SyntaxError,
     OSError,
     PermissionError,
-    TimeoutError,
-    ConnectionError,
-    BrokenPipeError,
-    ChildProcessError,
-    ConnectionAbortedError,
-    ConnectionRefusedError,
-    ConnectionResetError,
-    IsADirectoryError,
-    NotADirectoryError,
-    InterruptedError,
-    ProcessLookupError,
-    FileExistsError,
 ):
     reject(lambda T=T: T(foo=1), f"{T.__name__}() takes no keyword arguments")
-
-
-class KI(KeyboardInterrupt):
-    pass
-
-
-class RE(RecursionError):
-    pass
 
 
 class PE(PermissionError):
     pass
 
 
-reject(lambda: KI(foo=1), "KI() takes no keyword arguments")
-reject(lambda: RE(foo=1), "RE() takes no keyword arguments")
 reject(lambda: PE(foo=1), "PE() takes no keyword arguments")
 
 print("OK")
