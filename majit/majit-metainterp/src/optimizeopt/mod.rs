@@ -12230,6 +12230,67 @@ mod rd_virtual_info_builder_tests {
     }
 
     #[test]
+    fn pointer_field_snapshot_kind_matches_stored_box_type() {
+        // virtualize.py optimize_SETFIELD_GC stores
+        // get_box_replacement(arg1) as-is. resume.py decoder.setfield
+        // classifies by is_pointer_field; decode_box asserts
+        // box.type == kind. A FLAG_POINTER field's SETFIELD value is
+        // already a Ref box (descr.py get_type_flag maps a GC Ptr to
+        // FLAG_POINTER). snapshot_field_descr_info writes that same
+        // split, so the snapshot kind and the stored opref type agree.
+        let (_parent, _int_fd, ref_fd) = reversed_parent_int_ref_fields();
+        assert!(ref_fd.is_pointer_field());
+
+        let visitor_sd = Arc::new(PairingSizeDescr {
+            index: 0x3000_0102,
+            type_id: 23,
+            is_object: true,
+            fields: std::sync::OnceLock::new(),
+        });
+        visitor_sd
+            .fields
+            .set(vec![ref_fd.clone() as Arc<dyn FieldDescr>])
+            .unwrap();
+        let visitor: DescrRef = visitor_sd;
+
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let ref_val = ctx.materialize_operand_at(majit_ir::OpRef::ref_op(51));
+        let virtual_op = majit_ir::OpRef::ref_op(8);
+        let virtual_box = ctx.materialize_operand_at(virtual_op);
+        let mut fields = majit_ir::ptr_info::VirtualFieldList::new();
+        fields.push((0, ref_val.clone()));
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::Virtual(crate::optimizeopt::info::VirtualInfo {
+                descr: visitor.clone(),
+                known_class: None,
+                ob_type_descr: None,
+                fields,
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let env = OptBoxEnv { ctx: &ctx };
+        let vf = env
+            .get_virtual_fields(virtual_op)
+            .expect("virtual must expose fields");
+        let mut builder = RdVirtualInfoBuilder;
+        let visitor_descrs: Vec<DescrRef> = vec![ref_fd.clone() as DescrRef];
+        let Some(majit_ir::RdVirtualInfo::VirtualInfo { fielddescrs, .. }) =
+            builder.visit_virtual(&visitor, &[], &visitor_descrs)
+        else {
+            panic!("expected VirtualInfo");
+        };
+        assert_eq!(fielddescrs[0].field_type, Type::Ref);
+        assert_eq!(env.get_type(vf.field_oprefs[0]), Type::Ref);
+        assert_eq!(
+            super::snapshot_field_descr_info(&(ref_fd as DescrRef)).field_type,
+            Type::Ref
+        );
+    }
+
+    #[test]
     fn get_virtual_fields_pairs_varraystruct_interior_by_parent_list_slot() {
         // Interior visitor list [int, ref]; inner FieldDescr parent list
         // [ref, int]. ArrayStructInfo._compute_index uses

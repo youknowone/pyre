@@ -1850,6 +1850,89 @@ mod tests {
         );
     }
 
+    /// resume.py decode_box asserts `box.type == kind`. kind comes from
+    /// decoder.setfield (`is_pointer_field` → REF). The stored box is the
+    /// SETFIELD value optimize_SETFIELD_GC kept as-is, already REF for a
+    /// FLAG_POINTER field. apply_setfield therefore sees
+    /// `(Type::Ref, Value::Ref)` and writes through bh_setfield_gc_r.
+    #[test]
+    fn materialize_pointer_field_ref_operand_matches_snapshot_kind() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::{
+            ArrayFlag, Const, Descr, FieldDescr, FieldDescrInfo, GcRef, SimpleFieldDescr,
+        };
+        use std::cell::RefCell;
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct RecAllocator {
+            refs: RefCell<Vec<i64>>,
+            ints: RefCell<Vec<i64>>,
+        }
+        impl crate::resume::BlackholeAllocator for RecAllocator {
+            fn allocate_with_vtable(&self, _descr: &majit_ir::DescrRef, _vtable: usize) -> i64 {
+                0xBEEF
+            }
+            fn bh_setfield_gc_r(&self, _struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+                self.refs.borrow_mut().push(value);
+            }
+            fn bh_setfield_gc_i(&self, _struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+                self.ints.borrow_mut().push(value);
+            }
+        }
+
+        let ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abc, 16, 8, Type::Ref, false)
+                .with_flag(ArrayFlag::Pointer)
+                .with_index_in_parent(0),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0001, 32, 1)
+                .with_all_fielddescrs(vec![ptr_fd.clone() as Arc<dyn FieldDescr>]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        assert!(ptr_fd.is_pointer_field());
+
+        let tagged = ((majit_ir::resumedata::TAG_CONST_OFFSET << 2)
+            | majit_ir::resumedata::TAGCONST as i32) as i16;
+        let storage = crate::resume::ResumeStorage::new(
+            Vec::new(),
+            vec![Const::Ref(GcRef(0x1111))],
+            Vec::new(),
+            Vec::new(),
+        );
+        let resume_data = crate::jit_state::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_boxes: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: Vec::new(),
+        };
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(parent),
+            type_id: 1,
+            known_class: None,
+            fielddescrs: vec![FieldDescrInfo {
+                index: ptr_fd.index(),
+                offset: ptr_fd.offset(),
+                field_type: Type::Ref,
+                field_size: ptr_fd.field_size(),
+            }],
+            fieldnums: vec![tagged],
+            descr_size: 32,
+        })];
+        let alloc = RecAllocator::default();
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let mut cache =
+            BridgeVirtualCache::executing(1, default_bridge_array_descr, &alloc, &[], &[]);
+        let result =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        assert!(!result.is_none(), "pointer-field virtual must materialize");
+        assert_eq!(*alloc.refs.borrow(), vec![0x1111]);
+        assert!(alloc.ints.borrow().is_empty());
+    }
+
     /// pyjitpl.py `MetaInterp.rebuild_state_after_failure` /
     /// resume.py `ResumeDataDirectReader.consume_vable_info`: leaving
     /// compiled code with `vable_token` still the jitframe (CALL_MAY_FORCE
