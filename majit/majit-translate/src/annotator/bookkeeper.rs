@@ -2953,6 +2953,13 @@ impl Bookkeeper {
     /// `canonical_struct_name` resolves the leaf through
     /// `STRUCT_ORIGIN_REGISTRY` — the same normalisation the base itself
     /// went through.
+    ///
+    /// `enum_root` must carry the LLBC instantiation suffix when the ADT
+    /// is generic (`Option<i64>`, not `Option`). `canonical_struct_name`
+    /// reattaches a `<…>` that is already on the spelling and otherwise
+    /// leaves the name ungeneric, so two instantiations interned under
+    /// the bare template share one `ClassDef` and their payloads union
+    /// (`bookkeeper.py` `getuniqueclassdef(cls)` — one class per class).
     pub fn intern_enum_variant_host(
         self: &Rc<Self>,
         enum_root: &str,
@@ -6723,6 +6730,123 @@ mod tests {
         assert!(
             crate::annotator::model::union(&s_variant, &s_short).is_ok(),
             "setattr of Continue onto the unsuffixed enum must union"
+        );
+    }
+
+    #[test]
+    fn generic_enum_instantiations_keep_distinct_payload_classdefs() {
+        // Two Rust instantiations of one generic enum are two classes
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`). Their `Some.__pos_0`
+        // attrs must not share one Attribute: a shared ClassDef unions
+        // `r_uint` with `int`.
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        for (root, payload) in [
+            ("option::Option<usize>", "usize"),
+            ("option::Option<i64>", "i64"),
+        ] {
+            reg.fields.insert(
+                root.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+            reg.fields.insert(
+                format!("{root}::Some"),
+                vec![("__pos_0".to_string(), payload.to_string())],
+            );
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        let some_usize = bk
+            .getuniqueclassdef_for_enum_variant("option::Option<usize>", "Some")
+            .expect("Option<usize>::Some");
+        let some_i64 = bk
+            .getuniqueclassdef_for_enum_variant("option::Option<i64>", "Some")
+            .expect("Option<i64>::Some");
+        assert!(
+            !Rc::ptr_eq(&some_usize, &some_i64),
+            "Option<usize>::Some and Option<i64>::Some must be distinct ClassDefs, got {}",
+            some_usize.borrow().name
+        );
+        assert_ne!(some_usize.borrow().name, some_i64.borrow().name);
+        assert!(
+            some_usize.borrow().name.contains("<usize>"),
+            "usize instantiation must keep its suffix, got {}",
+            some_usize.borrow().name
+        );
+        assert!(
+            some_i64.borrow().name.contains("<i64>"),
+            "i64 instantiation must keep its suffix, got {}",
+            some_i64.borrow().name
+        );
+
+        let unsigned = SomeValue::Integer(SomeInteger::new(true, true));
+        let signed = SomeValue::Integer(SomeInteger::new(true, false));
+        ClassDef::generalize_attr(&some_usize, "__pos_0", Some(unsigned.clone()))
+            .expect("usize Some payload");
+        ClassDef::generalize_attr(&some_i64, "__pos_0", Some(signed.clone()))
+            .expect("i64 Some payload");
+        match &some_usize.borrow().attrs["__pos_0"].s_value {
+            SomeValue::Integer(si) => assert!(si.unsigned, "usize payload must stay r_uint"),
+            other => panic!("expected unsigned Integer, got {other:?}"),
+        }
+        match &some_i64.borrow().attrs["__pos_0"].s_value {
+            SomeValue::Integer(si) => assert!(!si.unsigned, "i64 payload must stay signed"),
+            other => panic!("expected signed Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intern_enum_variant_host_keeps_suffix_after_template_some() {
+        // A template `Option::Some` interned first must not steal the
+        // `Option<usize>::Some` key (`bookkeeper.py` `getuniqueclassdef(cls)`).
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option::Some".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<usize>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<usize>::Some".to_string(),
+            vec![("__pos_0".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let template = bk.intern_enum_variant_host("Option", "Some");
+        let suffixed = bk.intern_enum_variant_host("core::option::Option<usize>", "Some");
+        assert_ne!(
+            template,
+            suffixed,
+            "template Some must not be the usize instantiation, template={} suffixed={}",
+            template.qualname(),
+            suffixed.qualname()
+        );
+        assert!(
+            suffixed.qualname().contains("<usize>"),
+            "ctor intern of Option<usize>::Some must keep the suffix, got {}",
+            suffixed.qualname()
+        );
+        let cd = bk
+            .getuniqueclassdef_for_enum_variant("core::option::Option<usize>", "Some")
+            .expect("Option<usize>::Some classdef");
+        assert!(
+            cd.borrow().name.contains("<usize>"),
+            "ClassDef name must keep the suffix, got {}",
+            cd.borrow().name
         );
     }
 

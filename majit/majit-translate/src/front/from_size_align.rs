@@ -1,9 +1,10 @@
-//! `Layout::from_size_align(size, const_align).ok()` → a native power-of-two
-//! bound check + a virtualized `Option<Layout>` (nested transparent ctors), and
-//! the sibling `Layout::from_size_align(size, const_align).expect(msg)` → the
-//! same bound check + a by-value virtualized `Layout` (no `Option` wrapper),
-//! branching to an implicit raise on the overflowed (`Err`) case
-//! ([`rewire_from_size_align_expect_sites`]).
+//! `Layout::from_size_align(size, align)` → int arithmetic/compare plus a
+//! virtualized `Result<Layout, LayoutError>` ([`rewire_from_size_align_call_sites`]),
+//! matching [`crate::front::checked_arith_uint`]'s producer-side rewrite of
+//! `checked_mul`.  The `.ok()` / `.expect(msg)` pair rewrites remain for
+//! graphs that still carry those combinator residuals, and `Layout::size` /
+//! `Layout::align` become `__pos_0` / `__pos_1` field reads of the two-word
+//! `{size, align}` aggregate ([`rewire_layout_accessor_sites`]).
 //!
 //! ## Positioning
 //!
@@ -51,7 +52,8 @@
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{
-    close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+    close_goto_mixed, emit_option_variant, emit_sum_variant_dynamic, map_source,
+    reproduce_exit_args,
 };
 use crate::front::checked_arith_uint::{push_binop, push_const_int};
 use crate::model::{
@@ -90,6 +92,44 @@ pub(crate) struct FromSizeAlignExpectSite {
     pub result_var: Variable,
     /// The `Layout` ADT `name_path` — the transparent-ctor owner and its
     /// `__pos_0`/`__pos_1` field owner.
+    pub layout_owner: String,
+}
+
+/// A recorded `Layout::from_size_align(size, align)` call whose result is a
+/// `Result<Layout, LayoutError>`.  Unlike the `.ok()` / `.expect()` pair
+/// rewrites this does not wait on a combinator residual: it replaces the
+/// opaque `from_size_align` itself with int arithmetic plus a virtualized
+/// `Result`, the same producer-side shape [`crate::front::checked_arith_uint`]
+/// uses for `checked_mul`.  Downstream `Result::ok` / `expect` / `unwrap`
+/// then consume that `Result` through the existing combinator passes.
+/// RPython has no Layout object (`lltype.malloc(..., flavor='raw')` /
+/// `llmemory.raw_malloc(size)`); the `Ok` payload is the two-word
+/// `{size, align}` aggregate those helpers would have taken as a size word.
+#[derive(Clone)]
+pub(crate) struct FromSizeAlignCallSite {
+    /// The `from_size_align` call result (`Result<Layout, LayoutError>`).
+    pub result_var: Variable,
+    /// The `Result` enum root `name_path` (instantiation-suffixed).
+    pub result_owner: String,
+    /// The `Result::Ok` variant `name_path` — the `__pos_0` payload owner.
+    pub ok_owner: String,
+    /// The `Layout` ADT `name_path`.
+    pub layout_owner: String,
+    /// The `Ok` payload `Layout` as a [`ValueType`].
+    pub payload_ty: ValueType,
+}
+
+/// A recorded `Layout::size` / `Layout::align` call.  Both are opaque core
+/// field accessors (`Layout` is `{size, align}`); the rewrite is a
+/// `__pos_0` / `__pos_1` [`OpKind::FieldRead`] on the virtualized aggregate
+/// [`rewire_from_size_align_call_sites`] builds.
+#[derive(Clone)]
+pub(crate) struct LayoutAccessorSite {
+    /// The accessor call result (`usize`).
+    pub result_var: Variable,
+    /// `__pos_0` (`size`) or `__pos_1` (`align`).
+    pub field: &'static str,
+    /// The `Layout` ADT `name_path` — the FieldRead owner.
     pub layout_owner: String,
 }
 
@@ -143,7 +183,26 @@ pub(crate) fn is_layout_adt_owner(path: &str) -> bool {
 ///   (`core::alloc::layout::<Impl>::from_size_align`), used when the Method hint
 ///   is declined and the raw declaration path is kept.
 fn is_layout_from_size_align(segments: &[String]) -> bool {
-    if segments.last().map(String::as_str) != Some("from_size_align") {
+    is_layout_method_leaf(segments, "from_size_align")
+}
+
+pub(crate) fn is_layout_from_size_align_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => is_layout_from_size_align(segments),
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "from_size_align" && receiver_root.as_deref() == Some("Layout"),
+        _ => false,
+    }
+}
+
+/// `true` iff `segments` names a `Layout` inherent method `leaf`
+/// (`size` / `align` / `from_size_align`).  Same two Charon spellings as
+/// [`is_layout_from_size_align`].
+fn is_layout_method_leaf(segments: &[String], leaf: &str) -> bool {
+    if segments.last().map(String::as_str) != Some(leaf) {
         return false;
     }
     match segments
@@ -161,15 +220,28 @@ fn is_layout_from_size_align(segments: &[String]) -> bool {
     }
 }
 
-fn is_layout_from_size_align_target(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::FunctionPath { segments, .. } => is_layout_from_size_align(segments),
+/// `Some("__pos_0")` for `Layout::size`, `Some("__pos_1")` for `Layout::align`.
+pub(crate) fn layout_accessor_field(target: &CallTarget) -> Option<&'static str> {
+    let leaf = match target {
+        CallTarget::FunctionPath { segments, .. } => segments.last()?.as_str(),
         CallTarget::Method {
             name,
             receiver_root,
             ..
-        } => name == "from_size_align" && receiver_root.as_deref() == Some("Layout"),
-        _ => false,
+        } if receiver_root.as_deref() == Some("Layout") => name.as_str(),
+        _ => return None,
+    };
+    let field = match leaf {
+        "size" => "__pos_0",
+        "align" => "__pos_1",
+        _ => return None,
+    };
+    match target {
+        CallTarget::FunctionPath { segments, .. } if is_layout_method_leaf(segments, leaf) => {
+            Some(field)
+        }
+        CallTarget::Method { .. } => Some(field),
+        _ => None,
     }
 }
 
@@ -324,6 +396,264 @@ fn from_size_align_operands(kind: &OpKind) -> Option<(Variable, Variable)> {
         }
         _ => None,
     }
+}
+
+/// Rewrite every recorded `from_size_align` producer into int arithmetic plus
+/// a virtualized `Result<Layout, LayoutError>`.  Returns the number of sites
+/// rewritten; declined sites keep the residual call (census Skip).
+pub(crate) fn rewire_from_size_align_call_sites(
+    graph: &mut FunctionGraph,
+    sites: &[FromSizeAlignCallSite],
+) -> usize {
+    rewire_from_size_align_call_sites_for(graph, sites, crate::layout::target_word_size())
+}
+
+pub(crate) fn rewire_from_size_align_call_sites_for(
+    graph: &mut FunctionGraph,
+    sites: &[FromSizeAlignCallSite],
+    word_bytes: usize,
+) -> usize {
+    let mut rewritten = 0;
+    for site in sites {
+        match rewire_one_from_size_align_call_site(graph, site, word_bytes) {
+            Ok(()) => rewritten += 1,
+            Err(_decline) => {
+                if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
+                    eprintln!(
+                        "[from_size_align call] {} decline at {:?}: {_decline}",
+                        graph.name, site.result_var
+                    );
+                }
+            }
+        }
+    }
+    rewritten
+}
+
+/// Rewrite every recorded `Layout::size` / `Layout::align` residual into a
+/// field read of the virtualized `{size, align}` aggregate.
+pub(crate) fn rewire_layout_accessor_sites(
+    graph: &mut FunctionGraph,
+    sites: &[LayoutAccessorSite],
+) -> usize {
+    let mut rewritten = 0;
+    for site in sites {
+        if rewire_one_layout_accessor_site(graph, site).is_ok() {
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+fn rewire_one_layout_accessor_site(
+    graph: &mut FunctionGraph,
+    site: &LayoutAccessorSite,
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let result = &site.result_var;
+    let (block_idx, op_idx) = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(bi, block)| {
+            block
+                .operations
+                .iter()
+                .position(|op| op.result.as_ref() == Some(result))
+                .map(|oi| (bi, oi))
+        })
+        .ok_or_else(|| format!("{name}: Layout accessor result has no producer"))?;
+    let recv = match &graph.blocks[block_idx].operations[op_idx].kind {
+        OpKind::Call { target, args, .. }
+            if args.len() == 1 && layout_accessor_field(target) == Some(site.field) =>
+        {
+            args[0].clone().into_variable()
+        }
+        _ => {
+            return Err(format!(
+                "{name}: block {block_idx} op {op_idx} is not Layout::{}",
+                if site.field == "__pos_0" {
+                    "size"
+                } else {
+                    "align"
+                }
+            ));
+        }
+    };
+    graph.blocks[block_idx].operations[op_idx].kind = OpKind::FieldRead {
+        base: recv,
+        field: FieldDescriptor {
+            name: site.field.to_string(),
+            owner_root: Some(site.layout_owner.clone()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        },
+        ty: ValueType::Unsigned,
+        pure: true,
+    };
+    Ok(())
+}
+
+fn rewire_one_from_size_align_call_site(
+    graph: &mut FunctionGraph,
+    site: &FromSizeAlignCallSite,
+    word_bytes: usize,
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let result = &site.result_var;
+
+    let a = graph
+        .blocks
+        .iter()
+        .position(|b| {
+            b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(result))
+        })
+        .ok_or_else(|| format!("{name}: from_size_align result var has no producer block"))?;
+
+    crate::front::result_exc::collapse_trailing_recasts_onto(graph, a, result);
+
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| {
+            op.result.as_ref() == Some(result) && from_size_align_operands(&op.kind).is_some()
+        })
+        .ok_or_else(|| format!("{name}: no 2-arg Layout::from_size_align producing {result:?}"))?;
+    if call_idx + 1 != graph.blocks[a].operations.len() {
+        return Err(format!(
+            "{name}: block {a} last op is not the 2-arg Layout::from_size_align call"
+        ));
+    }
+    let (size, align_arg) = from_size_align_operands(&graph.blocks[a].operations[call_idx].kind)
+        .expect("gated on from_size_align_operands");
+
+    crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
+    // `emit_sum_variant_dynamic` keys the Ok payload on `{result_owner}::Ok`
+    // (`bool_then::emit_sum_variant_dynamic`); decline before truncating so a
+    // mismatched owner leaves the residual Call (census Skip).
+    let expected_ok = format!("{}::Ok", site.result_owner);
+    if site.ok_owner != expected_ok {
+        return Err(format!(
+            "{name}: Ok owner {} is not {expected_ok}",
+            site.ok_owner
+        ));
+    }
+    if let Ok(align) = folded_align_const(graph, &align_arg, &name) {
+        signed_layout_bound(align, word_bytes).ok_or_else(|| {
+            format!("{name}: from_size_align align {align} exceeds the target Signed max")
+        })?;
+    }
+
+    let a_id = graph.blocks[a].id;
+    graph.blocks[a].operations.truncate(call_idx);
+
+    let err_disc = emit_layout_err_disc(graph, a_id, &size, &align_arg, word_bytes, &name)?;
+    let layout = graph.alloc_value_var();
+    build_layout_aggregate(
+        graph,
+        a_id,
+        &site.layout_owner,
+        layout.clone(),
+        size,
+        align_arg,
+    );
+    emit_sum_variant_dynamic(
+        graph,
+        a_id,
+        result.clone(),
+        &site.result_owner,
+        err_disc,
+        ["Ok", "Err"],
+        Some((site.ok_owner.as_str(), layout, site.payload_ty.clone())),
+    );
+    Ok(())
+}
+
+/// `Err` discriminant (`1`) when `align` is not a power of two or when
+/// `size > Signed max - (align - 1)`; `0` (`Ok`) otherwise.
+/// `Layout::from_size_align` (`core::alloc::layout`).
+fn emit_layout_err_disc(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    size: &Variable,
+    align_arg: &Variable,
+    word_bytes: usize,
+    name: &str,
+) -> Result<Variable, String> {
+    if let Ok(align) = folded_align_const(graph, align_arg, name) {
+        let bound = signed_layout_bound(align, word_bytes).ok_or_else(|| {
+            format!("{name}: from_size_align align {align} exceeds the target Signed max")
+        })?;
+        let bound_var = push_const_int(graph, block, bound);
+        return Ok(push_binop(
+            graph,
+            block,
+            "uint_lt",
+            bound_var,
+            size.clone(),
+            ValueType::Int,
+        ));
+    }
+    let one = push_const_int(graph, block, 1);
+    let zero = push_const_int(graph, block, 0);
+    let align_m1 = push_binop(
+        graph,
+        block,
+        "sub",
+        align_arg.clone(),
+        one,
+        ValueType::Unsigned,
+    );
+    let masked = push_binop(
+        graph,
+        block,
+        "bitand",
+        align_arg.clone(),
+        align_m1.clone(),
+        ValueType::Unsigned,
+    );
+    let is_pow2_mask = push_binop(graph, block, "eq", masked, zero.clone(), ValueType::Int);
+    let is_nonzero = push_binop(
+        graph,
+        block,
+        "uint_lt",
+        zero.clone(),
+        align_arg.clone(),
+        ValueType::Int,
+    );
+    let is_pow2 = push_binop(
+        graph,
+        block,
+        "bitand",
+        is_pow2_mask,
+        is_nonzero,
+        ValueType::Int,
+    );
+    let signed_max = push_const_int(
+        graph,
+        block,
+        crate::front::checked_arith_uint::signed_word_max(word_bytes),
+    );
+    let bound = push_binop(
+        graph,
+        block,
+        "sub",
+        signed_max,
+        align_m1,
+        ValueType::Unsigned,
+    );
+    let too_big = push_binop(graph, block, "uint_lt", bound, size.clone(), ValueType::Int);
+    let not_too_big = push_binop(graph, block, "eq", too_big, zero.clone(), ValueType::Int);
+    let ok = push_binop(graph, block, "bitand", is_pow2, not_too_big, ValueType::Int);
+    Ok(push_binop(graph, block, "eq", ok, zero, ValueType::Int))
 }
 
 fn rewire_one_from_size_align_site(
@@ -1499,6 +1829,210 @@ mod tests {
             !residual_from_size_align_survives(&g),
             "from_size_align residual must be gone when .ok() is a FunctionPath"
         );
+    }
+
+    fn call_site_for(result_var: &Variable) -> FromSizeAlignCallSite {
+        FromSizeAlignCallSite {
+            result_var: result_var.clone(),
+            result_owner: "core::result::Result<Layout, LayoutError>".to_string(),
+            ok_owner: "core::result::Result<Layout, LayoutError>::Ok".to_string(),
+            layout_owner: "core::alloc::layout::Layout".to_string(),
+            payload_ty: ValueType::Ref(Some("core::alloc::layout::Layout".to_string())),
+        }
+    }
+
+    /// Build a lone `from_size_align(size, align)` producer closed by a goto
+    /// to the returnblock — the residual the rtyper census still sees after
+    /// `Result::ok` has already become a disc combinator diamond.
+    fn build_call_site(align_kind: OpKind) -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_from_size_align_call");
+        let p = g.startblock;
+        let size = g.push_op_var(p, OpKind::ConstInt(64), true).unwrap();
+        let align = g.push_op_var(p, align_kind, true).unwrap();
+        let fsa = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: fsa_target(),
+                    args: crate::model::call_args(vec![size, align]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(p, cont, vec![fsa.clone()]);
+        (g, fsa)
+    }
+
+    fn size_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["alloc", "layout", "Layout", "size"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            fun_decl_id: None,
+        }
+    }
+
+    fn align_target() -> CallTarget {
+        CallTarget::Method {
+            name: "align".to_string(),
+            receiver_root: Some("Layout".to_string()),
+            resolved_path: None,
+            fun_decl_id: None,
+            branch_payloads: None,
+        }
+    }
+
+    #[test]
+    fn from_size_align_call_lowers_to_result_bound_check() {
+        let (mut g, fsa) = build_call_site(OpKind::ConstInt(8));
+        let rewritten = rewire_from_size_align_call_sites(&mut g, &[call_site_for(&fsa)]);
+        assert_eq!(rewritten, 1, "the from_size_align producer must rewrite");
+        assert!(
+            !residual_from_size_align_survives(&g),
+            "from_size_align residual must be gone"
+        );
+        let binops: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => Some(op.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(binops.contains(&"uint_lt".to_string()));
+        let ctor_owners: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(ctor_owners.contains(&"Layout".to_string()));
+        assert!(ctor_owners.contains(&"Ok".to_string()));
+        assert!(ctor_owners.contains(&"Err".to_string()));
+        assert!(!ctor_owners.contains(&"Some".to_string()));
+        assert_eq!(uint_lt_bound(&g), i64::MAX - (8 - 1));
+    }
+
+    #[test]
+    fn from_size_align_call_lowers_when_align_is_runtime() {
+        let (mut g, fsa) = build_call_site(OpKind::Input {
+            name: "a".to_string(),
+            ty: ValueType::Unsigned,
+            class_root: None,
+        });
+        let rewritten = rewire_from_size_align_call_sites(&mut g, &[call_site_for(&fsa)]);
+        assert_eq!(
+            rewritten, 1,
+            "a runtime align must still rewrite via the power-of-two test"
+        );
+        assert!(!residual_from_size_align_survives(&g));
+        let binops: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => Some(op.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(binops.contains(&"bitand".to_string()));
+        assert!(binops.contains(&"uint_lt".to_string()));
+        assert!(binops.contains(&"sub".to_string()));
+    }
+
+    #[test]
+    fn layout_size_and_align_lower_to_field_reads() {
+        let mut g = FunctionGraph::new("test_layout_accessors");
+        let p = g.startblock;
+        let layout = g
+            .push_op_var(
+                p,
+                OpKind::Input {
+                    name: "layout".to_string(),
+                    ty: ValueType::Ref(Some("core::alloc::layout::Layout".to_string())),
+                    class_root: Some("core::alloc::layout::Layout".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let size = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: size_target(),
+                    args: crate::model::call_args(vec![layout.clone()]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let align = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: align_target(),
+                    args: crate::model::call_args(vec![layout.clone()]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(2);
+        g.set_return(cont, None);
+        g.set_goto(p, cont, vec![size.clone(), align.clone()]);
+
+        let rewritten = rewire_layout_accessor_sites(
+            &mut g,
+            &[
+                LayoutAccessorSite {
+                    result_var: size.clone(),
+                    field: "__pos_0",
+                    layout_owner: "core::alloc::layout::Layout".to_string(),
+                },
+                LayoutAccessorSite {
+                    result_var: align.clone(),
+                    field: "__pos_1",
+                    layout_owner: "core::alloc::layout::Layout".to_string(),
+                },
+            ],
+        );
+        assert_eq!(rewritten, 2);
+        let fields: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(field.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, vec!["__pos_0", "__pos_1"]);
+        assert!(
+            !g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { .. } | CallTarget::Method { .. },
+                        ..
+                    }
+                )
+            }),
+            "Layout::size / Layout::align residuals must be gone"
+        );
+        assert_eq!(layout_accessor_field(&size_target()), Some("__pos_0"));
+        assert_eq!(layout_accessor_field(&align_target()), Some("__pos_1"));
+        assert_eq!(layout_accessor_field(&fsa_target()), None);
     }
 
     /// The four census callers must consume their `from_size_align` residual.

@@ -704,6 +704,20 @@ pub fn canonical_struct_name(name: &str) -> String {
     }
 }
 
+/// Attach a `<…>` instantiation suffix to an ADT name that does not
+/// already carry one. A name that already has `<` is returned unchanged
+/// so a leaf (`Option<i64>`) and a qualified (`core::option::Option<i64>`)
+/// spelling stay one key after [`canonical_struct_name`]. An empty suffix
+/// leaves the name unsuffixed — the caller has no concrete instantiation
+/// to record.
+pub fn with_instantiation_suffix(name: &str, suffix: &str) -> String {
+    if suffix.is_empty() || name.contains('<') {
+        name.to_string()
+    } else {
+        format!("{name}{suffix}")
+    }
+}
+
 /// Drop a trailing generic-argument suffix (`Foo<bar>` → `Foo`,
 /// `m::Foo<a, b>` → `m::Foo`), returning the ungeneric root.
 /// Truncates at the first `<`, so a nested argument's own `::` / `<`
@@ -9066,6 +9080,23 @@ mod tests {
             canonical_struct_name(&canonical_struct_name("Result<Tuple>")),
             canonical_struct_name("Result<Tuple>")
         );
+        assert_ne!(
+            canonical_struct_name("Option<usize>"),
+            canonical_struct_name("Option<i64>")
+        );
+        assert_ne!(
+            canonical_struct_name("Option<usize>::Some"),
+            canonical_struct_name("Option<i64>::Some")
+        );
+        assert_eq!(
+            with_instantiation_suffix("Option", "<usize>"),
+            "Option<usize>"
+        );
+        assert_eq!(
+            with_instantiation_suffix("Option<i64>", "<usize>"),
+            "Option<i64>"
+        );
+        assert_eq!(with_instantiation_suffix("Option", ""), "Option");
     }
 
     // ── FFI call surface parity tests (rpython/jit/metainterp/test/test_fficall.py) ──

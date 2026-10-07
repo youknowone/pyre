@@ -181,7 +181,15 @@ fn rewire_one_option_try_site(
             ));
         }
     };
-    assert_block_pure_besides(graph, b, &[branch_idx], "branch", &name)?;
+    // `tyref_to_value_type` paints split-eligible `ControlFlow<B, C>` as
+    // `Ref(Some(root))`, so `lower_call` recasts the `branch` result to
+    // that instantiation. The diamond reads the recast; peel it so the
+    // rewrite still matches (`result_exc::peel_recast_chain_from`).
+    let (cf_forwarded, recast_b) =
+        crate::front::result_exc::peel_recast_chain_from(graph, b, &site.branch_result_var);
+    let mut recognized_b = vec![branch_idx];
+    recognized_b.extend(&recast_b);
+    assert_block_pure_besides(graph, b, &recognized_b, "branch", &name)?;
 
     // One predecessor: A produced `opt` and forwarded it into B. Several
     // predecessors: `checked_*` already built Some and None and joined them
@@ -212,9 +220,8 @@ fn rewire_one_option_try_site(
         ));
     };
 
-    let cf = site.branch_result_var.clone();
-    let (c, cf_c) =
-        follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
+    let (c, cf_c) = follow_single_exit(graph, b, &cf_forwarded)
+        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
     assert_single_pred(graph, c, &name)?;
 
     // Block C: `d = cf.__discriminant`; switch d {0 -> Continue, 1 -> Break}.
@@ -282,9 +289,16 @@ fn rewire_one_option_try_site(
     // All structural validation passed; mutate the graph.
 
     // The joined case switches in the branch block, so the residual call
-    // would otherwise stay on the live path.
+    // (and the ControlFlow instantiation recast of its result) would
+    // otherwise stay on the live path.
     if a == b {
-        graph.blocks[b].operations.remove(branch_idx);
+        let mut drop_idx = recast_b;
+        drop_idx.push(branch_idx);
+        drop_idx.sort_unstable();
+        drop_idx.dedup();
+        for i in drop_idx.into_iter().rev() {
+            graph.blocks[b].operations.remove(i);
+        }
     }
 
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());

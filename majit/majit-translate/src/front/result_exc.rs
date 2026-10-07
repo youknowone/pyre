@@ -3591,6 +3591,7 @@ fn recognize_fused_question(
         .get(branch_op_idx)?
         .result
         .clone()?;
+    let (cf, _recast) = peel_recast_chain_from(graph, block, &cf);
     let (disc_idx, disc_var) =
         graph.blocks[block]
             .operations
@@ -3990,7 +3991,8 @@ fn rewire_question_site(
         )?;
         let (continue_link, break_link) =
             split_diamond_exits(&graph.blocks[site.branch_block].exits, &name)?;
-        (cf, disc_var, continue_link, break_link)
+        let (cf_forwarded, _) = peel_recast_chain_from(graph, site.branch_block, &cf);
+        (cf_forwarded, disc_var, continue_link, break_link)
     } else {
         assert_block_pure_besides(
             graph,
@@ -3999,7 +4001,8 @@ fn rewire_question_site(
             "branch",
             &name,
         )?;
-        let (disc_block, cf_c) = follow_single_exit(graph, site.branch_block, &cf)
+        let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, site.branch_block, &cf);
+        let (disc_block, cf_c) = follow_single_exit(graph, site.branch_block, &cf_forwarded)
             .map_err(|err| format!("{name}: branch block exit: {err}"))?;
         if assert_single_pred(graph, disc_block, &name).is_err() {
             return rewrap(
@@ -4270,8 +4273,9 @@ fn rewire_one_call_site(
         separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
-    let (b, r_b) =
-        follow_single_exit(graph, a, r).map_err(|e| format!("{name}: call block exit: {e}"))?;
+    let (r_forwarded, _recast_a) = peel_recast_chain_from(graph, a, r);
+    let (b, r_b) = follow_single_exit(graph, a, &r_forwarded)
+        .map_err(|e| format!("{name}: call block exit: {e}"))?;
     // Block B: `cf = Result::branch(r)`.  A block without the branch
     // call is a custom-match consumer (hand-written `match` on the
     // Result, possibly behind a multi-predecessor merge) — handled by
@@ -4413,8 +4417,12 @@ fn rewire_one_call_site(
         .result
         .clone()
         .ok_or_else(|| format!("{name}: branch() without result var"))?;
-    let (c, cf_c) =
-        follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
+    // `tyref_to_value_type` paints split-eligible `ControlFlow` as
+    // `Ref(Some(root))`, so `lower_call` recasts the `branch` result.
+    // The diamond reads the recast; peel it so the exit still matches.
+    let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, b, &cf);
+    let (c, cf_c) = follow_single_exit(graph, b, &cf_forwarded)
+        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
     if assert_single_pred(graph, c, &name).is_err() {
         if !allow_fallback {
             return Err(format!(
@@ -7895,6 +7903,13 @@ pub(crate) fn assert_block_pure_besides(
         if recognized.contains(&i) {
             continue;
         }
+        // `__cast_instance_intrinsic` is `cast_pointer` (a pure alias) that
+        // paints the ControlFlow / Option instantiation on a `branch`
+        // result. It is a Call, so `can_remove_op` is false, but bypassing
+        // it is identity — the `?` rewrite peels the same chain.
+        if is_recast_narrow(&op.kind) {
+            continue;
+        }
         if !crate::inline::can_remove_op(&op.kind) {
             return Err(format!(
                 "{name}: {role} block {block} carries a side-effecting operation \
@@ -7966,6 +7981,55 @@ pub(crate) fn peel_recast_chain_from(
         }
         indices.push(idx);
         cur = result;
+    }
+}
+
+/// Drop trailing `__cast_instance_intrinsic` recasts of `start` in `block`
+/// and retarget any exit that carried the recast dest back onto `start`.
+///
+/// `tyref_to_value_type` paints a split-eligible `Option<T>` as
+/// `Ref(Some(root))`, so `lower_call` recasts the `checked_*` result onto
+/// that instantiation. The checked-arith rewrites need the residual call
+/// as the block's last op (`raising_op` / the virtualized Option producer);
+/// the recast is identity (`cast_pointer`) and the instantiated `Some`
+/// payload is rebuilt from the recorded owners.
+pub(crate) fn collapse_trailing_recasts_onto(
+    graph: &mut FunctionGraph,
+    block: usize,
+    start: &Variable,
+) {
+    let (forwarded, recast_idx) = peel_recast_chain_from(graph, block, start);
+    if recast_idx.is_empty() || forwarded == *start {
+        return;
+    }
+    let rewrite = |arg: &mut LinkArg| {
+        if let LinkArg::Value(v) = arg
+            && *v == forwarded
+        {
+            *v = start.clone();
+        }
+    };
+    if let Some(ExitSwitch::Value(v)) = &mut graph.blocks[block].exitswitch
+        && *v == forwarded
+    {
+        *v = start.clone();
+    }
+    for exit in &mut graph.blocks[block].exits {
+        for arg in &mut exit.args {
+            rewrite(arg);
+        }
+        if let Some(arg) = exit.last_exception.as_mut() {
+            rewrite(arg);
+        }
+        if let Some(arg) = exit.last_exc_value.as_mut() {
+            rewrite(arg);
+        }
+    }
+    let mut recast_idx = recast_idx;
+    recast_idx.sort_unstable();
+    recast_idx.dedup();
+    for i in recast_idx.into_iter().rev() {
+        graph.blocks[block].operations.remove(i);
     }
 }
 
@@ -8600,7 +8664,8 @@ fn plan_question_diamond(
         .find(|(result, _, _)| *result == r)
         .map(|(_, _, ty)| ty.clone())
         .ok_or_else(|| format!("{name}: merged continue call result is not a scoped Result"))?;
-    let (disc_target, cf_c) = follow_single_exit(graph, branch_block, &cf)
+    let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, branch_block, &cf);
+    let (disc_target, cf_c) = follow_single_exit(graph, branch_block, &cf_forwarded)
         .map_err(|err| format!("{name}: branch block exit: {err}"))?;
     if disc_target != disc_block {
         return Err(format!(

@@ -346,6 +346,11 @@ pub(crate) fn register_struct_fields_with_layout(
                 // field's type, not the generic `ValueType` of `T`.
                 // Seeding Unsigned from the type parameter made
                 // `Option<i64>::Some.__pos_0` disagree with the annotator.
+                // A fieldless enum's physical tag may spell `u8` while
+                // the value is Signed (`isize` discriminant). Keep
+                // `ValueType::Int` as that annotation
+                // (`tyref_to_attr_value_type`); the layout string is the
+                // tag width for `get_type_flag`, not the integer kind.
                 if let Some(s_value) = someshell_from_primitive_layout(ty) {
                     // Keep the signed shell: rint.py
                     // `_rtype_compare_template` refuses Signed vs
@@ -3459,6 +3464,31 @@ mod tests {
                 Some(SomeValue::Integer(i)) => assert!(
                     !i.unsigned,
                     "fieldless-enum-typed field Int + u8 layout must seed Signed, got unsigned"
+                ),
+                other => panic!("expected Signed Integer, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn fieldless_enum_int_force_keeps_signed_over_unsigned_tag_layout() {
+        // Physical tag width may be `u8`; the discriminant annotation is
+        // Signed (`isize`). `strategy_is` compares `current.kind` with the
+        // `expected` parameter; both must be Signed.
+        register_struct_fields_with_layout(
+            "dictmultiobject::DictStrategyRef",
+            &[("kind".into(), crate::model::ValueType::Int)],
+            Some(&[("kind".into(), "u8".into())]),
+        );
+        FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+            let table = cell.borrow();
+            let entry = table
+                .get("dictmultiobject::DictStrategyRef")
+                .expect("FORCE row for DictStrategyRef");
+            match entry.get("kind") {
+                Some(SomeValue::Integer(i)) => assert!(
+                    !i.unsigned,
+                    "fieldless enum kind must stay Signed, got unsigned"
                 ),
                 other => panic!("expected Signed Integer, got {other:?}"),
             }
