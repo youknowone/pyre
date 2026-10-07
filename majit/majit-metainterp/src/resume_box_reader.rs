@@ -680,23 +680,37 @@ pub fn materialize_bridge_virtual(
                 return OpRef::NONE;
             };
             // resume.py decoder.allocate_with_vtable(descr=self.descr)
+            // is `metainterp.execute_new_with_vtable` → `execute_and_record`,
+            // which allocates then `history.record(..., resvalue)`.
             ctx.profiler()
                 .count_ops(OpCode::NewWithVtable, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::NewWithVtable, crate::counters::RECORDED_OPS);
-            let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
+            let allocated = match cache.allocator() {
+                Some(allocator) => {
+                    let vtable = size_descr.as_size_descr().map_or(0, |sd| sd.vtable());
+                    Some(allocator.allocate_with_vtable(&size_descr, vtable))
+                }
+                None => None,
+            };
+            let value = allocated
+                .filter(|&ptr| ptr != 0)
+                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            let new_op = ctx.record_op_with_descr_value(
+                OpCode::NewWithVtable,
+                &[],
+                size_descr.clone(),
+                value,
+            );
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py decoder.virtuals_cache.set_ptr(index, struct)
             cache.set_ptr(vidx, new_op);
             ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(allocator) = cache.allocator() {
-                let vtable = size_descr.as_size_descr().map_or(0, |sd| sd.vtable());
-                let ptr = allocator.allocate_with_vtable(&size_descr, vtable);
+            if let Some(ptr) = allocated {
                 if ptr == 0 {
                     return OpRef::NONE;
                 }
                 cache.set_concrete_root(vidx, ptr);
-                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
             }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
@@ -731,41 +745,35 @@ pub fn materialize_bridge_virtual(
                 return OpRef::NONE;
             };
             // resume.py decoder.allocate_struct(self.typedescr)
+            // is `metainterp.execute_new` → `execute_and_record`, which
+            // allocates then `history.record(..., resvalue)`. The concrete
+            // lives on the recorded OpRef (`History._make_op`) so the object
+            // the trace names and the object the interpreter resumes against
+            // are the same one, and `walk_active_trace_refs` forwards it.
             ctx.profiler().count_ops(OpCode::New, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
-            let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr.clone());
+            let allocated = match cache.allocator() {
+                Some(allocator) => Some(allocator.bh_new(&struct_descr)),
+                None => None,
+            };
+            let value = allocated
+                .filter(|&ptr| ptr != 0)
+                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            let new_op =
+                ctx.record_op_with_descr_value(OpCode::New, &[], struct_descr.clone(), value);
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py `allocate_struct` is `metainterp.execute_new(typedescr)`
-            // for the box reader and `cpu.bh_new(typedescr)` for the direct one:
-            // both allocate, and only the first also records. Stamping the
-            // concrete onto the recorded OpRef is what makes the object the
-            // trace names and the object the interpreter resumes against the
-            // same one.
             // resume.py decoder.virtuals_cache.set_ptr(index, struct), which
             // its own comment requires BEFORE the fields are filled: the cache
             // is what keeps the object reachable across the allocations
             // `setfields` may itself perform.
             cache.set_ptr(vidx, new_op);
             ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(allocator) = cache.allocator() {
-                let ptr = allocator.bh_new(&struct_descr);
+            if let Some(ptr) = allocated {
                 if ptr == 0 {
                     return OpRef::NONE;
                 }
                 cache.set_concrete_root(vidx, ptr);
-                // `allocate_struct` is `metainterp.execute_new(typedescr)` for
-                // this reader, and `execute_and_record` stamps the value onto
-                // the `RefFrontendOp` it returns. Recording the NEW without it
-                // leaves the only OpRef that names this object carrying no
-                // concrete, and the cache that does carry one dies with this
-                // walk: a field of one virtual holding another is then read
-                // back during the resumed walk as an address-less box.
-                //
-                // Stamped on the recorded op rather than kept beside it
-                // because `walk_active_trace_refs` walks `recorder.ops()`, so
-                // a concrete parked there is forwarded when the object moves.
-                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
             }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
@@ -821,22 +829,34 @@ pub fn materialize_bridge_virtual(
             ctx.profiler().count_ops(alloc_opcode, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(alloc_opcode, crate::counters::RECORDED_OPS);
-            let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
+            // resume.py decoder.allocate_array → execute_new_array[_clear]
+            // → `execute_and_record` allocates then records with resvalue.
+            let allocated = match cache.allocator() {
+                Some(allocator) => Some(if clear {
+                    allocator.bh_new_array_clear(length, &array_descr)
+                } else {
+                    allocator.bh_new_array(length, &array_descr)
+                }),
+                None => None,
+            };
+            let value = allocated
+                .filter(|&ptr| ptr != 0)
+                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            let new_op = ctx.record_op_with_descr_value(
+                alloc_opcode,
+                &[len_ref],
+                array_descr.clone(),
+                value,
+            );
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
             ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(allocator) = cache.allocator() {
-                let ptr = if clear {
-                    allocator.bh_new_array_clear(length, &array_descr)
-                } else {
-                    allocator.bh_new_array(length, &array_descr)
-                };
+            if let Some(ptr) = allocated {
                 if ptr == 0 {
                     return OpRef::NONE;
                 }
                 cache.set_concrete_root(vidx, ptr);
-                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
             }
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop

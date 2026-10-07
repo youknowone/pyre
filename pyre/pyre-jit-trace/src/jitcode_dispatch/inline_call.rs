@@ -17565,7 +17565,6 @@ mod subwalk_checkpoint_tests {
             _index: 0,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
-            guard_count: Some(0),
         };
         let heap_cache = majit_metainterp::heapcache::HeapCache::new();
         for (opname, keeps_checkpoint) in [
@@ -17627,7 +17626,6 @@ mod subwalk_checkpoint_tests {
             _index: 0,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
-            guard_count: Some(0),
         };
         note_subwalk_driver_step::<crate::state::PyreSym>("residual_call_ir_r", 7, position);
         assert_eq!(exchange.completed_cursor, 0);

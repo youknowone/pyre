@@ -17080,7 +17080,7 @@ mod tests {
             state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
 
             // Production guard recording goes through
-            // `record_guard_typed` + `capture_resumedata` —
+            // `record_guard` + `capture_resumedata` —
             // `op.fail_args` stays None until the optimizer's
             // `store_final_boxes_in_guard` writes it back from the
             // snapshot.  Inspect the snapshot directly (the canonical

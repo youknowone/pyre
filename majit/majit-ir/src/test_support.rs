@@ -35,7 +35,7 @@ impl Trace {
 
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guards");
-        self.push_op(opcode, args, None, None)
+        self.push_op(opcode, args, None)
     }
 
     pub fn record_op_with_descr(
@@ -45,7 +45,7 @@ impl Trace {
         descr: DescrRef,
     ) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guards");
-        self.push_op(opcode, args, Some(descr), None)
+        self.push_op(opcode, args, Some(descr))
     }
 
     pub fn record_guard(
@@ -55,26 +55,15 @@ impl Trace {
         descr: Option<DescrRef>,
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode is not a guard");
-        self.push_op(opcode, args, descr, None)
-    }
-
-    pub fn record_guard_with_fail_args(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: Option<DescrRef>,
-        fail_args: &[OpRef],
-    ) -> OpRef {
-        assert!(opcode.is_guard(), "opcode is not a guard");
-        self.push_op(opcode, args, descr, Some(fail_args))
+        self.push_op(opcode, args, descr)
     }
 
     pub fn close_loop(&mut self, args: &[OpRef]) {
-        self.push_op(OpCode::Jump, args, None, None);
+        self.push_op(OpCode::Jump, args, None);
     }
 
     pub fn finish(&mut self, args: &[OpRef], descr: DescrRef) {
-        self.push_op(OpCode::Finish, args, Some(descr), None);
+        self.push_op(OpCode::Finish, args, Some(descr));
     }
 
     pub fn get_trace(self) -> RecordedTrace {
@@ -84,13 +73,7 @@ impl Trace {
         }
     }
 
-    fn push_op(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: Option<DescrRef>,
-        fail_args: Option<&[OpRef]>,
-    ) -> OpRef {
+    fn push_op(&mut self, opcode: OpCode, args: &[OpRef], descr: Option<DescrRef>) -> OpRef {
         let position = self.next_position;
         let opref = OpRef::op_typed(position, opcode.result_type());
         let args = self.bind_operands(args);
@@ -99,9 +82,6 @@ impl Trace {
             None => Op::new(opcode, &args),
         };
         op.pos().set(opref);
-        if let Some(fail_args) = fail_args {
-            op.setfailargs(self.bind_operands(fail_args).into_iter().collect());
-        }
         self.ops.push(OpRc::new(op));
         self.next_position += 1;
         opref

@@ -1114,6 +1114,48 @@ impl TraceCtx {
         }
     }
 
+    /// Address a box names when it carries a live GC pointer, else `None`.
+    fn live_ptr_of(&self, opref: OpRef) -> Option<i64> {
+        match self.concrete_of_opref(opref) {
+            Some(Value::Ref(r)) => live_gc_ptr(r),
+            _ => None,
+        }
+    }
+
+    /// `executor.execute` for a GETFIELD: the explicit struct pointer when
+    /// one was passed, otherwise the live pointer on `base`. Declines when
+    /// neither is a real non-null concrete, matching
+    /// `pyjitpl.py MetaInterp.execute_and_record` which only has a value
+    /// after `cpu.bh_getfield_gc_*` runs on a real object.
+    fn field_live_value(
+        &self,
+        struct_ptr: i64,
+        base: OpRef,
+        descr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let ptr = if struct_ptr != 0 {
+            struct_ptr
+        } else {
+            self.live_ptr_of(base)?
+        };
+        self.field_sanity_load(ptr, descr, kind)
+    }
+
+    /// `executor.execute` for a GETARRAYITEM: the live pointer on the
+    /// array box, then `array_sanity_load`. Declines when the box has no
+    /// real non-null concrete.
+    fn array_live_value(
+        &self,
+        array_opref: OpRef,
+        item_index: i64,
+        adescr: &DescrRef,
+        kind: Type,
+    ) -> Option<Value> {
+        let ptr = self.live_ptr_of(array_opref)?;
+        self.array_sanity_load(ptr, item_index, adescr, kind)
+    }
+
     /// `executor.py do_setfield_gc(cpu, _, structbox, itembox,
     /// fielddescr)` analog — the store half of [`Self::field_sanity_load`].
     /// `_opimpl_setfield_gc_any` reaches it through `execute_and_record`
@@ -2814,13 +2856,6 @@ impl TraceCtx {
     /// (`history.py AbstractResOp.getopnum`).
     pub fn opcode_of(&self, opref: OpRef) -> Option<OpCode> {
         self.recorder.opcode_of(opref)
-    }
-
-    /// Monotonic counterpart to [`Self::num_ops`].  `history.cut` can restore
-    /// the current length, but cannot make a body walk that already ran into a
-    /// setup-time abort again.
-    pub fn recorded_ops_total(&self) -> usize {
-        self.recorder.recorded_ops_total()
     }
 
     /// Diagnostic: dump every recorded op (result OpRef = pos, opcode, args)
@@ -4968,10 +5003,9 @@ impl TraceCtx {
     ) -> OpRef {
         // pyjitpl.py `MetaInterp.execute_and_record`: execute then
         // `_record_helper(opnum, resvalue, descr, *argboxes)`. The box
-        // carries the result (`*FrontendOp(pos, value)`).
-        let live = (dest_ptr != 0)
-            .then(|| self.field_sanity_load(dest_ptr as i64, &descr, kind))
-            .flatten();
+        // carries the result (`*FrontendOp(pos, value)`). `dest_ptr == 0`
+        // still loads when `vbox` itself carries a live pointer.
+        let live = self.field_live_value(dest_ptr as i64, vbox, &descr, kind);
         self.execute_and_record(None, opcode, Some(descr), &[vbox], live, 0)
     }
 
@@ -4983,17 +5017,16 @@ impl TraceCtx {
         array_descr: DescrRef,
         item_type: Type,
     ) -> OpRef {
+        let live = self.array_live_value(array_op, index, &array_descr, item_type);
         let const_idx = self.const_int(index);
-        let op = self.execute_and_record(
+        self.execute_and_record(
             None,
             opcode,
-            Some(array_descr.clone()),
+            Some(array_descr),
             &[array_op, const_idx],
-            None,
+            live,
             0,
-        );
-        self.stamp_vable_array_item(op, array_op, index, &array_descr, item_type);
-        op
+        )
     }
 
     fn record_vable_field_reads(
@@ -5242,22 +5275,42 @@ impl TraceCtx {
                 .expect("emit_force_virtualizable: clear_vable_descr not set");
             (token_descr, clear_ptr, clear_descr)
         };
+        // pyjitpl.py `MetaInterp.execute_and_record`: `executor.execute`
+        // then `history.record(..., resvalue)`. When `box` carries a live
+        // pointer, `field_sanity_load` reads the token through
+        // `vable_token_descr` (`history.py _make_op`).
+        let token_live = self
+            .live_ptr_of(vable_opref)
+            .and_then(|ptr| self.field_sanity_load(ptr, &token_descr, Type::Ref));
         //     tokenbox = mi.execute_and_record(rop.GETFIELD_GC_R, token_descr, box)
-        // pyjitpl.py `emit_force_virtualizable`. Neither read carries a
-        // trace-time concrete, so both pass `resvalue: None` — which closes
-        // the fold and leaves no reader for a cpu to be.
         let tokenbox = self.execute_and_record(
             None,
             OpCode::GetfieldGcR,
             Some(token_descr),
             &[vable_opref],
-            None,
+            token_live,
             0,
         );
         //     condbox = mi.execute_and_record(rop.PTR_NE, None, tokenbox, CONST_NULL)
         let null_ref = self.const_null();
-        let condbox =
-            self.execute_and_record(None, OpCode::PtrNe, None, &[tokenbox, null_ref], None, 0);
+        let cond_live = token_live.map(|v| {
+            Value::Int(match v {
+                Value::Ref(r) if !r.is_null() => 1,
+                _ => 0,
+            })
+        });
+        // PTR_NE is always-pure; a Some resvalue needs a cpu. The comparison
+        // reads no memory, so the default one stands in (same as PTR_EQ in
+        // `_nonstandard_virtualizable`).
+        let cpu = crate::cpu::default_cpu();
+        let condbox = self.execute_and_record(
+            Some(cpu.as_ref()),
+            OpCode::PtrNe,
+            None,
+            &[tokenbox, null_ref],
+            cond_live,
+            0,
+        );
         let funcbox = self.const_int(clear_ptr as i64);
         //     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
         //                          calldescr, False, False)
@@ -5679,13 +5732,9 @@ impl TraceCtx {
             // executor-returned payload (RPython `IntFrontendOp(pos,
             // intval)` construction-time field assignment).  It is the
             // funnel's `resvalue`, so the load runs before the record;
-            // `None` — no struct pointer, or an unwired backend — records
-            // without folding.
-            let live = if vable_struct_ptr != 0 {
-                self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
-            } else {
-                None
-            };
+            // `None` — no live pointer on the box either, or an unwired
+            // backend — records without folding.
+            let live = self.field_live_value(vable_struct_ptr, vable_opref, &fielddescr, Type::Int);
             // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
             // the standard heap operation.  GETFIELD_GC_I is not an OVF
             // opcode, so the funnel never reads `last_exc_value` and 0 names
@@ -6042,11 +6091,7 @@ impl TraceCtx {
             // recorded opref so subsequent `box_value(op)` matches
             // RPython's executor-returned Box.  It is the funnel's
             // `resvalue`, so the load runs before the record.
-            let live = if vable_struct_ptr != 0 {
-                self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
-            } else {
-                None
-            };
+            let live = self.field_live_value(vable_struct_ptr, vable_opref, &fielddescr, Type::Ref);
             let op = self.execute_and_record(
                 Some(cpu),
                 OpCode::GetfieldGcR,
@@ -6161,11 +6206,8 @@ impl TraceCtx {
             // float payload with the recorded opref so subsequent
             // `box_value(op)` matches RPython's executor-returned Box.  It is
             // the funnel's `resvalue`, so the load runs before the record.
-            let live = if vable_struct_ptr != 0 {
-                self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
-            } else {
-                None
-            };
+            let live =
+                self.field_live_value(vable_struct_ptr, vable_opref, &fielddescr, Type::Float);
             let op = self.execute_and_record(
                 Some(cpu),
                 OpCode::GetfieldGcF,
@@ -6216,21 +6258,19 @@ impl TraceCtx {
             return (op, value);
         }
         let index = self.const_int(item_index as i64);
-        // pyjitpl.py:1218-1230 vable fallback uses standard array access.
-        // The element is stamped afterwards by `stamp_vable_array_item`, so
-        // there is no `resvalue` here; `GETARRAYITEM_GC_*` is not descr-pure
-        // either, so nothing would consult a cpu.
+        // pyjitpl.py execute_and_record: execute the load then record with
+        // resvalue. `GETARRAYITEM_GC_*` is not descr-pure, so the funnel
+        // does not consult a cpu for the fold.
+        let live = self.array_live_value(array_opref, item_index as i64, &adescr, Type::Int);
         let op = self.execute_and_record(
             None,
             OpCode::GetarrayitemGcI,
-            Some(adescr.clone()),
+            Some(adescr),
             &[array_opref, index],
-            None,
+            live,
             0,
         );
-        let value =
-            self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Int);
-        (op, value)
+        (op, live)
     }
 
     /// pyjitpl.py `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
@@ -6448,30 +6488,6 @@ impl TraceCtx {
         }
     }
 
-    /// `executor.execute` for a recorded virtualizable element read.
-    ///
-    /// pyjitpl.py reaches the element with `opimpl_getarrayitem_gc_*`,
-    /// which executes the load and attaches the result to the box it returns
-    /// (`history.py *FrontendOp(pos, value)`). The fallback legs below
-    /// record the op directly and must execute it the same way: an element box
-    /// left symbolic reaches a residual call as an unbound argument, and the
-    /// trace aborts there with the walk's heap effects already live.
-    fn stamp_vable_array_item(
-        &mut self,
-        op: OpRef,
-        array_opref: OpRef,
-        item_index: i64,
-        adescr: &DescrRef,
-        kind: Type,
-    ) -> Option<Value> {
-        let Some(Value::Ref(array_ref)) = self.concrete_of_opref(array_opref) else {
-            return None;
-        };
-        let value = self.array_sanity_load(live_gc_ptr(array_ref)?, item_index, adescr, kind)?;
-        self.set_opref_concrete(op, value);
-        Some(value)
-    }
-
     /// Standard virtualizable array item read (ref).
     pub fn vable_getarrayitem_ref_vable(
         &mut self,
@@ -6486,20 +6502,19 @@ impl TraceCtx {
             return (op, value);
         }
         let index = self.const_int(item_index as i64);
-        // The element is stamped afterwards by `stamp_vable_array_item`, so
-        // there is no `resvalue` here; `GETARRAYITEM_GC_*` is not descr-pure
-        // either, so nothing would consult a cpu.
+        // pyjitpl.py execute_and_record: execute the load then record with
+        // resvalue. `GETARRAYITEM_GC_*` is not descr-pure, so the funnel
+        // does not consult a cpu for the fold.
+        let live = self.array_live_value(array_opref, item_index as i64, &adescr, Type::Ref);
         let op = self.execute_and_record(
             None,
             OpCode::GetarrayitemGcR,
-            Some(adescr.clone()),
+            Some(adescr),
             &[array_opref, index],
-            None,
+            live,
             0,
         );
-        let value =
-            self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Ref);
-        (op, value)
+        (op, live)
     }
 
     /// pyjitpl.py `_opimpl_getarrayitem_vable` — ref variant.
@@ -6643,20 +6658,19 @@ impl TraceCtx {
             return (op, value);
         }
         let index = self.const_int(item_index as i64);
-        // The element is stamped afterwards by `stamp_vable_array_item`, so
-        // there is no `resvalue` here; `GETARRAYITEM_GC_*` is not descr-pure
-        // either, so nothing would consult a cpu.
+        // pyjitpl.py execute_and_record: execute the load then record with
+        // resvalue. `GETARRAYITEM_GC_*` is not descr-pure, so the funnel
+        // does not consult a cpu for the fold.
+        let live = self.array_live_value(array_opref, item_index as i64, &adescr, Type::Float);
         let op = self.execute_and_record(
             None,
             OpCode::GetarrayitemGcF,
-            Some(adescr.clone()),
+            Some(adescr),
             &[array_opref, index],
-            None,
+            live,
             0,
         );
-        let value =
-            self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Float);
-        (op, value)
+        (op, live)
     }
 
     /// pyjitpl.py `_opimpl_getarrayitem_vable` — float variant.
@@ -6820,16 +6834,15 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> OpRef {
         let index = self.const_int(item_index);
-        let op = self.execute_and_record(
+        let live = self.array_live_value(array_opref, item_index, &adescr, Type::Ref);
+        self.execute_and_record(
             None,
             OpCode::GetarrayitemGcR,
-            Some(adescr.clone()),
+            Some(adescr),
             &[array_opref, index],
-            None,
+            live,
             0,
-        );
-        let _ = self.stamp_vable_array_item(op, array_opref, item_index, &adescr, Type::Ref);
-        op
+        )
     }
 
     /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`
@@ -7144,18 +7157,20 @@ impl TraceCtx {
         // descr says — an immutable GC array read is spelled with the
         // dedicated `_PURE` opcode — so the fold gate is shut and no cpu is
         // consulted.
-        let op = self.execute_and_record(
+        let live = match self.concrete_of_opref(index) {
+            Some(Value::Int(item_index)) => {
+                self.array_live_value(array_opref, item_index, &descr, Type::Int)
+            }
+            _ => None,
+        };
+        self.execute_and_record(
             None,
             OpCode::GetarrayitemGcI,
-            Some(descr.clone()),
+            Some(descr),
             &[array_opref, index],
-            None,
+            live,
             0,
-        );
-        if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
-            self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Int);
-        }
-        op
+        )
     }
 
     /// Record a virtualizable array item read with an explicit array descriptor.
@@ -7169,18 +7184,20 @@ impl TraceCtx {
         // descr says — an immutable GC array read is spelled with the
         // dedicated `_PURE` opcode — so the fold gate is shut and no cpu is
         // consulted.
-        let op = self.execute_and_record(
+        let live = match self.concrete_of_opref(index) {
+            Some(Value::Int(item_index)) => {
+                self.array_live_value(array_opref, item_index, &descr, Type::Ref)
+            }
+            _ => None,
+        };
+        self.execute_and_record(
             None,
             OpCode::GetarrayitemGcR,
-            Some(descr.clone()),
+            Some(descr),
             &[array_opref, index],
-            None,
+            live,
             0,
-        );
-        if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
-            self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Ref);
-        }
-        op
+        )
     }
 
     /// Record a virtualizable array item read with an explicit array descriptor.
@@ -7194,18 +7211,20 @@ impl TraceCtx {
         // descr says — an immutable GC array read is spelled with the
         // dedicated `_PURE` opcode — so the fold gate is shut and no cpu is
         // consulted.
-        let op = self.execute_and_record(
+        let live = match self.concrete_of_opref(index) {
+            Some(Value::Int(item_index)) => {
+                self.array_live_value(array_opref, item_index, &descr, Type::Float)
+            }
+            _ => None,
+        };
+        self.execute_and_record(
             None,
             OpCode::GetarrayitemGcF,
-            Some(descr.clone()),
+            Some(descr),
             &[array_opref, index],
-            None,
+            live,
             0,
-        );
-        if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
-            self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Float);
-        }
-        op
+        )
     }
 
     /// Record a virtualizable array item write with an explicit array descriptor.
@@ -8532,6 +8551,57 @@ mod tests {
             ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
             "nonstandard getfield still records the heap load, got {ops:?}"
         );
+    }
+
+    /// `pyjitpl.py MIFrame.emit_force_virtualizable`:
+    /// `execute_and_record(GETFIELD_GC_R, token_descr, box)` then
+    /// `execute_and_record(PTR_NE, None, tokenbox, CONST_NULL)`. A wired
+    /// `SanityTestCpu` makes `field_sanity_load` return the token, and
+    /// the recorded boxes carry that value (`history.py _make_op`).
+    #[test]
+    fn emit_force_virtualizable_stamps_token_getfield_and_ptr_ne() {
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info.static_field_descr(0);
+
+        let storage = [0usize; 8];
+        let token = 0x1234_0000usize;
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef(token),
+            float_value: 0.0,
+        };
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.install_virtualizable_info(info);
+        ctx.set_cpu(Some(&cpu));
+        ctx.set_opref_concrete(
+            vable,
+            Value::Ref(majit_ir::GcRef(storage.as_ptr() as usize)),
+        );
+        ctx.emit_force_virtualizable(&fd, vable);
+
+        let tokenbox = OpRef::ref_op(1);
+        assert_eq!(ctx.opcode_of(tokenbox), Some(OpCode::GetfieldGcR));
+        assert_eq!(
+            ctx.box_value(tokenbox),
+            Some(Value::Ref(majit_ir::GcRef(token))),
+        );
+        let condbox = OpRef::int_op(2);
+        assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
+        assert_eq!(ctx.box_value(condbox), Some(Value::Int(1)));
     }
 
     #[test]

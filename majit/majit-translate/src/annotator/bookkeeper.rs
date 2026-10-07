@@ -5774,7 +5774,8 @@ mod tests {
             .filter(|(key, _)| key.ends_with("FixedObjectArray"))
             .map(|(key, rows)| (key.clone(), rows.clone()))
             .collect();
-        majit_ir::descr::register_struct_origins(program.struct_origins);
+        let _registry =
+            crate::test_support::register_struct_origins_serialized(program.struct_origins);
 
         let bk = bk();
         bk.set_struct_fields(Rc::new(program.struct_fields));
@@ -5874,7 +5875,8 @@ mod tests {
             rows,
             &vec![("__pos_0".to_string(), "*mut PyObject".to_string())]
         );
-        majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+        let _registry =
+            crate::test_support::register_struct_origins_serialized(program.struct_origins.clone());
         for (qualified, fields) in &program.struct_field_attrs {
             crate::annotator::classdesc::register_struct_fields(qualified, fields);
         }

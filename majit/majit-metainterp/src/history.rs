@@ -2802,7 +2802,7 @@ mod tests {
 
         let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
         let descr: DescrRef = Arc::new(TestFailDescr(0));
-        let g = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
+        let g = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(descr));
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
@@ -3405,7 +3405,7 @@ impl TraceCtx {
     /// Mutate `op.fail_args` on a recorded op identified by `opref`.
     ///
     /// Port of `resoperation.Op.setfailargs`. Production guard recording uses
-    /// the snapshot path (`record_guard_typed` + `capture_resumedata`
+    /// the snapshot path (`record_guard` + `capture_resumedata`
     /// + `set_last_guard_resume_position`); the optimizer's
     /// `OptContext::store_final_boxes_in_guard`, which derives `op.fail_args`
     /// from the snapshot through `Op::store_final_boxes`. This setter serves
@@ -3464,18 +3464,6 @@ impl TraceCtx {
         descr: DescrRef,
     ) -> OpRef {
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr));
-        // pyjitpl.py:2581 — see record_guard.
-        self.profiler().count_ops(opcode, crate::counters::GUARDS);
-        opref
-    }
-
-    /// `pyjitpl.py generate_guard()`: tracer-stage typed guards carry
-    /// `descr=None` and no fail args. The caller attaches a snapshot via
-    /// `capture_resumedata` + `set_last_guard_resume_position`;
-    /// `store_final_boxes_in_guard` (`optimizer.py`) derives liveboxes
-    /// and types from those boxes (`compile.py` `store_final_boxes`).
-    pub fn record_guard_typed(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
-        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
         // pyjitpl.py:2581 — see record_guard.
         self.profiler().count_ops(opcode, crate::counters::GUARDS);
         opref
@@ -4183,9 +4171,13 @@ impl TraceCtx {
             );
         }
         // pyjitpl.py: op = execute_and_record_varargs(opnum, ...)
-        let op = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+        let op = self.recorder.record_op_with_descr_value(
+            opcode,
+            &call_args,
+            descr.clone(),
+            Some(concrete_result),
+        );
         // pyjitpl.py: record_result_of_call_pure patches CALL → CALL_PURE
         // and populates call_pure_results.
         self.record_result_of_call_pure(
@@ -4259,8 +4251,14 @@ impl TraceCtx {
         };
         let pure_opcode = OpCode::call_pure_for_type(ret_type);
         self.recorder.cut(patch_pos);
-        self.recorder
-            .record_op_with_descr(pure_opcode, argboxes, descr)
+        // pyjitpl.py MetaInterp.record_result_of_call_pure →
+        // history.record_nospec(opnum, argboxes, resbox_as_const, descr)
+        self.recorder.record_op_with_descr_value(
+            pure_opcode,
+            argboxes,
+            descr,
+            Some(resbox_as_const),
+        )
     }
 
     // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call, 292) ──
