@@ -4379,9 +4379,13 @@ impl CallControl {
             rows.sort();
             rows
         });
-        rows.iter()
-            .filter(|(inner, outer, fname)| {
-                inner == owner && crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
+        // Sorted by `inner`, so `owner`'s rows are one contiguous run.
+        let start = rows.partition_point(|(inner, _, _)| inner.as_str() < owner);
+        rows[start..]
+            .iter()
+            .take_while(|(inner, _, _)| inner == owner)
+            .filter(|(_, outer, fname)| {
+                crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
             })
             .map(|(_, outer, fname)| (outer.clone(), format!("{fname}.{path}")))
             .collect()
