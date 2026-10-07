@@ -74,16 +74,10 @@ pub struct TracePosition {
     /// opencoder.py:498 `self._index` — count of box-yielding (non-void)
     /// ops; equals `_count` in `recorder::Trace`.
     pub _index: u32,
-    /// opencoder.py cut_point `len(self._snapshot_data)`.
+    /// opencoder.py `Trace.cut_point` `len(self._snapshot_data)`.
     pub snapshot_data_len: usize,
-    /// opencoder.py cut_point `len(self._snapshot_array_data)`.
+    /// opencoder.py `Trace.cut_point` `len(self._snapshot_array_data)`.
     pub snapshot_array_data_len: usize,
-    /// pyre-only: `Trace::guard_count` at the cut point, so
-    /// [`Trace::cut`] restores it without rescanning `ops`.  RPython keeps
-    /// no guard counter, so this has no slot in opencoder.py's 5-tuple;
-    /// `None` marks a position minted by a producer that does not track
-    /// one (`TraceRecordBuffer::cut_point`) and makes `cut` recompute.
-    pub guard_count: Option<usize>,
 }
 
 impl TracePosition {
@@ -248,22 +242,9 @@ pub struct Trace {
     inputarg_live: Vec<bool>,
     /// Next OpRef index to assign.
     op_count: u32,
-    /// Running count of recorded guards, kept in sync by the two
-    /// `record_guard*` entry points (the only producers — `record_op` /
-    /// `record_op_with_descr` assert the opcode is not a guard) and
-    /// restored by [`Self::cut`] from `TracePosition::guard_count`.
-    /// `num_guards` is consulted once per traced vable op, so counting by
-    /// scanning `ops` made tracing quadratic in trace length.
-    guard_count: usize,
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
-    /// Monotonic count of operations appended during this recording session.
-    /// Unlike `ops.len()`, this is not rewound by [`Self::cut`].  The bridge
-    /// driver uses it to distinguish an abort before the body walk from a
-    /// body abort whose speculative operations were cut back to the setup
-    /// position (`history.cut` in `pyjitpl.py`).
-    recorded_ops_total: usize,
     /// Live JIT path: `History.trace` is `opencoder.Trace`. `record_*`
     /// appends bytes and a [`FrontendSlot`]. `into_parts` / `get_iter`
     /// materializes through `ByteTraceIter` (`cls()`). Tests that
@@ -428,9 +409,7 @@ impl Trace {
             inputargs: Vec::new(),
             inputarg_live: Vec::new(),
             op_count: 0,
-            guard_count: 0,
             box_count: 0,
-            recorded_ops_total: 0,
             trb: None,
             slots: Vec::new(),
             value_slots: Vec::new(),
@@ -939,9 +918,6 @@ impl Trace {
         };
         let box_index = trb.record_op(opcode, &boxes, stream_descr);
         let ty = opcode.result_type();
-        if opcode.is_guard() {
-            self.guard_count += 1;
-        }
         // Guard `record_op` writes a 2-byte 0 placeholder; later
         // `create_top_snapshot` / a delayed restamp overwrite it.
         let descr_pos = if opcode.is_guard() && opcode.has_descr() {
@@ -972,7 +948,6 @@ impl Trace {
             // the coordinate `TraceIterator._count` assigns to a void `cls()`.
             OpRef::void_op(void_seq)
         };
-        self.recorded_ops_total += 1;
         self.op_count += 1;
         opref
     }
@@ -1635,7 +1610,6 @@ impl Trace {
                 _index: self.box_count,
                 snapshot_data_len: trb._snapshot_data.len(),
                 snapshot_array_data_len: trb._snapshot_array_data.len(),
-                guard_count: Some(self.guard_count),
             };
         }
         TracePosition {
@@ -1644,7 +1618,6 @@ impl Trace {
             _index: self.box_count,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
-            guard_count: Some(self.guard_count),
         }
     }
 
@@ -1663,7 +1636,6 @@ impl Trace {
                 _index: pos._index,
                 snapshot_data_len: 0,
                 snapshot_array_data_len: 0,
-                guard_count: pos.guard_count,
             });
             let nops = pos._count.saturating_sub(n) as usize;
             self.slots.truncate(nops);
@@ -1671,9 +1643,6 @@ impl Trace {
             self.value_slots.truncate(nvalues);
             self.op_count = pos._count;
             self.box_count = pos._index;
-            self.guard_count = pos
-                .guard_count
-                .unwrap_or_else(|| self.slots.iter().filter(|s| s.opcode.is_guard()).count());
             self.ops.clear();
             return;
         }
@@ -1683,12 +1652,6 @@ impl Trace {
             .truncate(pos._index.saturating_sub(n) as usize);
         self.op_count = pos._count;
         self.box_count = pos._index;
-        // `record_result_of_call_pure` cuts back after every speculative
-        // pure-call record, so this runs on a hot path — restore from the
-        // saved position instead of rescanning `ops`.
-        self.guard_count = pos
-            .guard_count
-            .unwrap_or_else(|| self.ops.iter().filter(|op| op.opcode.is_guard()).count());
     }
 
     /// history.py `length`: number of non-inputarg ops recorded so far.
@@ -1699,12 +1662,6 @@ impl Trace {
             return self.slots.len();
         }
         self.ops.len()
-    }
-
-    /// Number of operations ever appended to this recorder, including
-    /// speculative operations subsequently discarded by [`Self::cut`].
-    pub fn recorded_ops_total(&self) -> usize {
-        self.recorded_ops_total
     }
 
     /// Number of input arguments registered.
@@ -1718,8 +1675,15 @@ impl Trace {
     }
 
     /// Number of guards recorded so far.
+    ///
+    /// `opencoder.py Trace` keeps no guard counter; scan recorded opcodes
+    /// (`slots` in byte mode, `ops` otherwise) with `OpCode::is_guard`.
     pub fn num_guards(&self) -> usize {
-        self.guard_count
+        if self.byte_mode() {
+            self.slots.iter().filter(|s| s.opcode.is_guard()).count()
+        } else {
+            self.ops.iter().filter(|op| op.opcode.is_guard()).count()
+        }
     }
 
     /// Access the recorded operations.
@@ -1832,9 +1796,6 @@ impl Trace {
     /// without driving the full record path.
     #[cfg(test)]
     pub fn push_op_for_test(&mut self, op: Op) {
-        if op.opcode.is_guard() {
-            self.guard_count += 1;
-        }
         self.ops.push(OpRc::new(op));
     }
 
@@ -2061,7 +2022,6 @@ mod tests {
         assert_eq!(rec.num_ops(), 2);
         rec.cut(saved);
         assert_eq!(rec.num_ops(), 0);
-        assert_eq!(rec.recorded_ops_total(), 2);
         assert_eq!(rec.num_inputargs(), 1);
     }
 
@@ -2578,7 +2538,6 @@ mod tests {
             _index: 5,
             snapshot_data_len: 0,
             snapshot_array_data_len: 0,
-            guard_count: None,
         };
         assert!(pos.has_prefix_ops(2));
         assert_eq!(pos.tree_loop_op_index(2), 3);
@@ -2589,7 +2548,6 @@ mod tests {
                 _index: 2,
                 snapshot_data_len: 0,
                 snapshot_array_data_len: 0,
-                guard_count: None,
             }
             .has_prefix_ops(2)
         );
