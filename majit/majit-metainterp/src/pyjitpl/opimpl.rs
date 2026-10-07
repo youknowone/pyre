@@ -4265,6 +4265,13 @@ where
                 //     caller frame in the walker dispatch loop.
                 return TraceAction::Continue;
             }
+            if ctx.portal_slot_missing {
+                // Inside `reached_loop_header`: a declared red is empty.
+                // pyjitpl.py never skips those slots.
+                return TraceAction::SwitchToBlackhole(
+                    crate::pyjitpl::SwitchToBlackhole::bad_loop(),
+                );
+            }
             // pyjitpl.py reached_loop_header, its FIRST statement:
             //
             //     def reached_loop_header(self, greenboxes, redboxes):
@@ -4488,12 +4495,17 @@ where
                         let original_boxes = match sym
                             .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
                         {
-                            Some(mut boxes) => {
+                            Some(crate::PortalCarriedBoxes::Boxes(mut boxes)) => {
                                 ctx.remove_consts_and_duplicates(&mut boxes);
                                 boxes
                                     .into_iter()
                                     .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
                                     .collect()
+                            }
+                            Some(crate::PortalCarriedBoxes::MissingRequiredSlot) => {
+                                return TraceAction::SwitchToBlackhole(
+                                    crate::pyjitpl::SwitchToBlackhole::bad_loop(),
+                                );
                             }
                             None => live_arg_boxes.to_vec(),
                         };
@@ -4774,7 +4786,7 @@ where
                     let original_boxes = match sym
                         .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
                     {
-                        Some(mut boxes) => {
+                        Some(crate::PortalCarriedBoxes::Boxes(mut boxes)) => {
                             // pyjitpl.py MetaInterp.remove_consts_and_duplicates normalizes the list
                             // before it becomes anything — the LABEL
                             // this registration turns into cannot carry
@@ -4784,6 +4796,11 @@ where
                                 .into_iter()
                                 .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
                                 .collect()
+                        }
+                        Some(crate::PortalCarriedBoxes::MissingRequiredSlot) => {
+                            return TraceAction::SwitchToBlackhole(
+                                crate::pyjitpl::SwitchToBlackhole::bad_loop(),
+                            );
                         }
                         None => live_arg_boxes.into_vec(),
                     };

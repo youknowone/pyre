@@ -2287,8 +2287,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 &self,
                 __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
                 __frame: &majit_metainterp::MIFrame,
-            ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
-                #loop_carried_boxes_fn_name(self, __frame, __boxes)
+            ) -> Option<majit_metainterp::PortalCarriedBoxes> {
+                match #loop_carried_boxes_fn_name(self, __frame, __boxes) {
+                    Some(args) => Some(majit_metainterp::PortalCarriedBoxes::Boxes(args)),
+                    None => Some(majit_metainterp::PortalCarriedBoxes::MissingRequiredSlot),
+                }
             }
 
             #[allow(clippy::reversed_empty_ranges)]

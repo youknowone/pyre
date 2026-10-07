@@ -761,6 +761,18 @@ pub fn residual_write_effect_info(
     ei
 }
 
+/// Portal-frame loop-carried boxes for `reached_loop_header`.
+///
+/// `loop_carried_boxes` still uses `None` for "no state-field construction".
+/// A generated hook that found an empty required identity slot must not
+/// reuse that `None`; PyPy never skips a declared red, and treating the
+/// miss as "no construction" registers `live_arg_boxes` instead of aborting.
+#[derive(Debug, Clone)]
+pub enum PortalCarriedBoxes {
+    Boxes(Vec<(OpRef, Type)>),
+    MissingRequiredSlot,
+}
+
 pub trait JitCodeSym {
     fn begin_portal_op(&mut self, _pc: usize) {}
     fn commit_portal_op(&mut self) {}
@@ -802,12 +814,16 @@ pub trait JitCodeSym {
 
     /// `pyjitpl.py reached_loop_header`: loop-carried boxes from the live
     /// portal frame's identity slots plus `virtualizable_boxes`.
+    ///
+    /// `None` is still "no state-field construction". A generated hook
+    /// reports a missing required slot as `Some(MissingRequiredSlot)`.
     fn loop_carried_boxes_from_portal(
         &self,
         vable_boxes: &[(OpRef, majit_ir::Type)],
         _portal: &MIFrame,
-    ) -> Option<Vec<(OpRef, majit_ir::Type)>> {
+    ) -> Option<PortalCarriedBoxes> {
         self.loop_carried_boxes(vable_boxes)
+            .map(PortalCarriedBoxes::Boxes)
     }
 
     /// Walk-final int+float scalar values in `collect_scalar_state_field_values`
@@ -3225,12 +3241,27 @@ where
     }
 
     fn stash_portal_reds(&self, ctx: &mut TraceCtx, sym: &S) {
+        // `reached_loop_header` builds a fresh `live_arg_boxes` each visit.
+        // Drop every earlier header snapshot before this collect so a miss
+        // cannot leave a packed or stale seed for CloseLoop / blackhole.
+        ctx.close_jump_boxes = None;
+        ctx.close_scalar_values = None;
+        ctx.close_ref_scalar_values = None;
+        ctx.portal_slot_missing = false;
         let Some(root) = self.frames.frames.first() else {
             return;
         };
         let vable = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-        if let Some(boxes) = sym.loop_carried_boxes_from_portal(&vable, root) {
-            ctx.close_jump_boxes = Some(boxes);
+        match sym.loop_carried_boxes_from_portal(&vable, root) {
+            Some(PortalCarriedBoxes::Boxes(boxes)) => ctx.close_jump_boxes = Some(boxes),
+            Some(PortalCarriedBoxes::MissingRequiredSlot) => {
+                // `blackhole.py convert_and_run_from_pyjitpl` copies the live
+                // MIFrame registers. Do not pack a shortened scalar vector
+                // that `run_pending_abort_blackhole` would write back by index.
+                ctx.portal_slot_missing = true;
+                return;
+            }
+            None => {}
         }
         let scalars = sym.collect_portal_scalar_values(root, ctx);
         if !scalars.is_empty() {

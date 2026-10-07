@@ -631,6 +631,10 @@ pub struct TraceCtx {
     /// Loop-carried boxes collected from the portal frame at walk end,
     /// the `pyjitpl.py reached_loop_header` `live_arg_boxes` list.
     pub close_jump_boxes: Option<Vec<(OpRef, Type)>>,
+    /// Generated `loop_carried_boxes_from_portal` found an empty required
+    /// identity slot. CloseLoop must abort (`ABORT_BAD_LOOP`) instead of
+    /// compiling a short JUMP or consuming a stale `close_jump_boxes`.
+    pub portal_slot_missing: bool,
     /// Walk-final int+float scalar identity values, in
     /// `collect_scalar_state_field_values` order.
     pub close_scalar_values: Option<Vec<i64>>,
@@ -2213,6 +2217,7 @@ impl TraceCtx {
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
+            portal_slot_missing: false,
             close_scalar_values: None,
             close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
@@ -2306,6 +2311,7 @@ impl TraceCtx {
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
+            portal_slot_missing: false,
             close_scalar_values: None,
             close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),

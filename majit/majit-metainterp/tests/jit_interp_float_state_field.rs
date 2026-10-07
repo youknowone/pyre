@@ -402,7 +402,7 @@ mod scalar_float_slot_reserve {
 mod virt_array_with_float_scalar {
     use super::Bytecode;
     use majit_metainterp::virt_array::VirtArray;
-    use majit_metainterp::{JitDriver, JitState};
+    use majit_metainterp::{JitCodeSym, JitDriver, JitState, PortalCarriedBoxes};
 
     struct MixedState {
         sp: i64,
@@ -580,6 +580,13 @@ mod virt_array_with_float_scalar {
         assert!(
             <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes).is_none(),
             "a missing declared identity slot must not emit a short JUMP"
+        );
+        assert!(
+            matches!(
+                JitCodeSym::loop_carried_boxes_from_portal(&sym, &boxes, &frame),
+                Some(PortalCarriedBoxes::MissingRequiredSlot)
+            ),
+            "generated portal collect must not collapse a missing slot into no-construction"
         );
     }
 

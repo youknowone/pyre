@@ -4259,6 +4259,21 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 }
                 TraceAction::CloseLoop => {
+                    if self
+                        .meta
+                        .trace_ctx()
+                        .is_some_and(|ctx| ctx.portal_slot_missing)
+                    {
+                        // `pyjitpl.py reached_loop_header` never skips a
+                        // declared red. Abort before capturing walk-final
+                        // scalars so blackhole keeps the live MIFrame.
+                        self.meta
+                            .stage_abort_reason(crate::pyjitpl::counters::ABORT_BAD_LOOP);
+                        self.meta.abort_trace(false);
+                        self.sym = None;
+                        self.meta.clear_trace_session();
+                        return;
+                    }
                     // Snapshot the walk-final (pc, reds) off the active TraceCtx
                     // BEFORE `compile_loop` (below) drains it, stashing onto the
                     // MetaInterp so the `__merge` wrapper can read it after the
@@ -4364,18 +4379,23 @@ impl<S: JitState> JitDriver<S> {
                             // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
                             // into the list as well (owned clone releases the
                             // trace-ctx borrow before the consumers below).
-                            let (vable_boxes, stashed) = match self.meta.trace_ctx() {
-                                Some(ctx) => (
-                                    ctx.collect_virtualizable_typed_boxes(),
-                                    ctx.close_jump_boxes.take(),
-                                ),
-                                None => (None, None),
-                            };
+                            let (vable_boxes, stashed, stashed_missing) =
+                                match self.meta.trace_ctx() {
+                                    Some(ctx) => (
+                                        ctx.collect_virtualizable_typed_boxes(),
+                                        ctx.close_jump_boxes.take(),
+                                        ctx.portal_slot_missing,
+                                    ),
+                                    None => (None, None, false),
+                                };
+                            portal_slot_missing = stashed_missing;
                             // `reached_loop_header` / `compile_trace` build
                             // JUMP from the live portal boxes
                             // (`original_boxes`-shaped), never the vable-only
                             // subset `collect_jump_args_with_boxes` emits.
-                            let mut boxes = if let Some(typed) = stashed {
+                            let mut boxes = if portal_slot_missing {
+                                Vec::new()
+                            } else if let Some(typed) = stashed {
                                 typed.into_iter().map(|(o, _)| o).collect()
                             } else if let Some(root) = self.meta.framestack.frames.first() {
                                 match S::collect_jump_args_from_portal(
