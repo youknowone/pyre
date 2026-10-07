@@ -1041,6 +1041,14 @@ pub trait GcAllocator: Send {
     /// object is set to `size` before the collection threshold is adjusted.
     fn add_memory_pressure(&mut self, _size: isize, _object: GcRef) {}
 
+    /// `incminimark.external_malloc`: when `threshold_reached(totalsize)`,
+    /// run `minor_collection_with_major_progress(force_enabled=False)` with
+    /// extrasize `totalsize + nursery_size/2`. Automatic major progress
+    /// stays gated on `enabled`; explicit `collect(0)` is the forcing path.
+    fn maybe_collect_for_external_malloc(&mut self, _totalsize: usize) -> bool {
+        false
+    }
+
     /// `inspector.count_memory_pressure`: sum the pressure fields on all
     /// root-reachable objects. Collectors without translated type metadata
     /// report zero.
@@ -1866,6 +1874,9 @@ impl GcAllocator for GcHandle {
         } else {
             gc_sync::gc_op_with_root(object, |gc, object| gc.add_memory_pressure(size, object));
         }
+    }
+    fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) -> bool {
+        gc_sync::gc_op(|gc| gc.maybe_collect_for_external_malloc(totalsize))
     }
     fn total_memory_pressure(&mut self) -> isize {
         gc_sync::gc_op(|gc| gc.total_memory_pressure())
@@ -3534,6 +3545,24 @@ pub fn add_memory_pressure(size: isize, object: GcRef) {
     if let Some(hook) = ACTIVE_ADD_MEMORY_PRESSURE.get() {
         hook(size, object);
     }
+}
+
+/// Active-backend trampoline for `incminimark.external_malloc`'s
+/// `threshold_reached` collection (`force_enabled=False`).
+pub type MaybeCollectForExternalMallocFn = fn(usize) -> bool;
+
+global_hook!(
+    static ACTIVE_MAYBE_COLLECT_FOR_EXTERNAL_MALLOC: MaybeCollectForExternalMallocFn
+);
+
+pub fn set_active_maybe_collect_for_external_malloc(hook: Option<MaybeCollectForExternalMallocFn>) {
+    ACTIVE_MAYBE_COLLECT_FOR_EXTERNAL_MALLOC.set(hook);
+}
+
+pub fn maybe_collect_for_external_malloc(totalsize: usize) -> bool {
+    ACTIVE_MAYBE_COLLECT_FOR_EXTERNAL_MALLOC
+        .get()
+        .map_or(false, |hook| hook(totalsize))
 }
 
 pub fn total_memory_pressure() -> isize {

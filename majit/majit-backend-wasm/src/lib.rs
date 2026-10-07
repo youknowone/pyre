@@ -1340,6 +1340,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_get_typeids_text(Some(wasm_get_typeids_text));
     majit_gc::set_active_get_typeids_list(Some(wasm_get_typeids_list));
     majit_gc::set_active_add_memory_pressure(Some(wasm_add_memory_pressure));
+    majit_gc::set_active_maybe_collect_for_external_malloc(Some(
+        wasm_maybe_collect_for_external_malloc,
+    ));
     majit_gc::set_active_total_memory_pressure(Some(wasm_total_memory_pressure));
     majit_gc::set_active_collect_generation(Some(wasm_collect_generation));
     majit_gc::set_active_collect_step(Some(wasm_collect_step));
@@ -1701,6 +1704,10 @@ fn wasm_get_typeids_list() -> Option<Vec<usize>> {
 
 fn wasm_add_memory_pressure(size: isize, object: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.add_memory_pressure(size, object));
+}
+
+fn wasm_maybe_collect_for_external_malloc(totalsize: usize) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.maybe_collect_for_external_malloc(totalsize)).unwrap_or(false)
 }
 
 fn wasm_total_memory_pressure() -> isize {

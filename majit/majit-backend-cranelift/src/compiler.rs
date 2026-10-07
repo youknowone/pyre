@@ -397,6 +397,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_get_typeids_text(Some(get_typeids_text_via_active_runtime));
     majit_gc::set_active_get_typeids_list(Some(get_typeids_list_via_active_runtime));
     majit_gc::set_active_add_memory_pressure(Some(add_memory_pressure_via_active_runtime));
+    majit_gc::set_active_maybe_collect_for_external_malloc(Some(
+        maybe_collect_for_external_malloc_via_active_runtime,
+    ));
     majit_gc::set_active_total_memory_pressure(Some(total_memory_pressure_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
@@ -1820,6 +1823,10 @@ fn add_memory_pressure_via_active_runtime(size: isize, object: GcRef) {
             });
         }
     }
+}
+
+fn maybe_collect_for_external_malloc_via_active_runtime(totalsize: usize) -> bool {
+    with_cranelift_gc(|gc| gc.maybe_collect_for_external_malloc(totalsize)).unwrap_or(false)
 }
 
 fn total_memory_pressure_via_active_runtime() -> isize {
