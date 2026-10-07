@@ -6335,8 +6335,12 @@ pub unsafe fn w_list_install_bytes_items(
             BytesArray::from_vec(live)
         })
     };
-    let fresh_slot = crate::with_roots!(obj => fresh.pin_block());
-    let _guard = crate::with_roots!(obj => w_list_lock(obj));
+    // Pin the items block before any later root query. A nested
+    // `with_roots!(obj)` around `pin_block` can collect first and
+    // reclaim `fresh.block`. Same order as `w_list_install_int_items`.
+    let fresh_slot = fresh.pin_block();
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let _guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(base);
     if !list_strategy_is_empty_or_size(obj) {
         return false;
