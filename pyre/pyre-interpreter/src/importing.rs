@@ -4983,14 +4983,17 @@ fn load_source_module(
     let mut timestamp_cpathname: Option<String> = None;
     #[cfg(not(feature = "sandbox"))]
     let cached = if cache_ok {
-        cache_key
-            .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname))
-            .or_else(|| {
-                let code = crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?;
-                timestamp_cpathname = crate::module::imp::interp_imp::timestamp_pyc_path(pathname)
-                    .map(|p| p.to_string_lossy().into_owned());
-                Some(code)
-            })
+        let frozen = cache_key
+            .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname));
+        match frozen {
+            Some(code) => Some(code),
+            None => crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?.map(
+                |(code, cpathname)| {
+                    timestamp_cpathname = Some(cpathname.to_string_lossy().into_owned());
+                    code
+                },
+            ),
+        }
     } else {
         None
     };

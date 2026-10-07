@@ -711,18 +711,36 @@ pub(crate) fn timestamp_pyc_path(source: &std::path::Path) -> Option<std::path::
 }
 
 /// `read_compiled_module` when `check_compiled_module` accepts the `.pyc`.
-/// A miss returns `None` and the caller parses the source.
+/// A header miss returns `None` and the caller parses the source; once the
+/// header matches, a bad payload raises instead of falling back.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-pub(crate) fn try_load_timestamp_pyc(source: &std::path::Path) -> Option<pyre_object::PyObjectRef> {
-    let (mtime_ns, size) = source_mtime_size(source)?;
+pub(crate) fn try_load_timestamp_pyc(
+    source: &std::path::Path,
+) -> Result<Option<(pyre_object::PyObjectRef, std::path::PathBuf)>, crate::PyError> {
+    let Some((mtime_ns, size)) = source_mtime_size(source) else {
+        return Ok(None);
+    };
     let mtime_sec = (mtime_ns / 1_000_000_000) as u32;
-    let bytes = std::fs::read(timestamp_pyc_path(source)?).ok()?;
-    let payload = timestamp_pyc_payload(&bytes, mtime_sec, size as u32)?;
+    let Some(cpathname) = timestamp_pyc_path(source) else {
+        return Ok(None);
+    };
+    let Ok(bytes) = std::fs::read(&cpathname) else {
+        return Ok(None);
+    };
+    let Some(payload) = timestamp_pyc_payload(&bytes, mtime_sec, size as u32) else {
+        return Ok(None);
+    };
     // `importing.py` `read_compiled_module` unmarshals under the
     // transformer's `push_roots` around `marshal.loads`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let code = crate::module::marshal::loads_bytes(payload).ok()?;
-    unsafe { crate::is_code(code) }.then_some(code)
+    let code = crate::module::marshal::loads_bytes(payload)?;
+    if !unsafe { crate::is_code(code) } {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ImportError,
+            format!("Non-code object in {}", cpathname.display()),
+        ));
+    }
+    Ok(Some((code, cpathname)))
 }
 
 /// Bytecode/marshal version token stamped into the frozen cache header and
@@ -1647,7 +1665,7 @@ mod tests {
         let path = stdlib.join("encodings/utf_8.py");
         // A clean checkout has no generated `.pyc`. The header parser is
         // covered by `timestamp_pyc_payload_accepts_only_a_matching_timestamp_header`.
-        let Some(code) = super::try_load_timestamp_pyc(&path) else {
+        let Ok(Some((code, _cpathname))) = super::try_load_timestamp_pyc(&path) else {
             return;
         };
         assert!(unsafe { crate::is_code(code) });
