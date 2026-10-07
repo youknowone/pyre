@@ -1388,6 +1388,100 @@ pub extern "C" fn bh_portal_runner_c(
     }
 }
 
+/// `get_portal_runner` table for a Python-portal blackhole convert.
+///
+/// `bhimpl_jit_merge_point`'s recursive-portal arm calls
+/// `portal_runner_adr`. The static table copies `ll_portal_runner_shim`,
+/// which is `execute_frame` for a fresh activation (`compile_tmp_callback`).
+/// Convert walks an already-entered chain, so the runner is
+/// [`bh_portal_runner_c`] (`portal_ptr` = `PyFrame.dispatch` inside the
+/// open enter/leave), the same jd0 `resume_in_blackhole` installs.
+fn python_portal_bh_jitdrivers_sd(
+    driver: &majit_metainterp::JitDriver<pyre_jit_trace::state::PyreJitState>,
+) -> std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> {
+    let mut table = driver.meta_interp().staticdata.bh_jitdrivers_sd().to_vec();
+    let extra_info = table
+        .first()
+        .map(|jd| jd.mainjitcode_calldescr.extra_info.clone())
+        .unwrap_or_default();
+    let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
+        result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+        portal_runner_ptr: Some(bh_portal_runner_c),
+        handle_jitexc_from_bh: driver
+            .meta_interp()
+            .staticdata
+            .jitdrivers_sd
+            .first()
+            .and_then(|jd| jd.handle_jitexc_from_bh),
+        mainjitcode_calldescr: majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
+            "iirrr".to_string(),
+            'r',
+            extra_info,
+        ),
+    };
+    match table.first_mut() {
+        Some(slot) => *slot = jd0,
+        None => table.push(jd0),
+    }
+    std::sync::Arc::from(table)
+}
+
+/// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` for the Python
+/// portal: convert the abort framestack with the recursive-portal runner
+/// and each level's own red frame.
+fn run_python_portal_abort_blackhole(
+    driver: &mut majit_metainterp::JitDriver<pyre_jit_trace::state::PyreJitState>,
+    jit_state: &mut pyre_jit_trace::state::PyreJitState,
+    env: &pyre_jit_trace::state::PyreEnv,
+) -> Option<majit_metainterp::jitexc::PortalResume> {
+    let per_frame = {
+        let pending = driver.pending_abort_blackhole_mut()?;
+        // `blackhole.py _copy_data_from_miframe` copies a box only when
+        // it is not None. The walker writes the portal frame red at
+        // `setup_call` / `dispatch_via_miframe` argboxes; a `newframe`
+        // that never received that write is dropped before convert.
+        pyre_jit_trace::state::per_frame_vables_from_framestack(&pending.framestack)
+    };
+    let jitdrivers_sd = python_portal_bh_jitdrivers_sd(driver);
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    let saved_top = if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec).topframeref }
+    };
+    let set_topframeref = |frame_ptr: i64| {
+        if ec.is_null() || frame_ptr == 0 {
+            return;
+        }
+        unsafe {
+            (*ec).topframeref = frame_ptr as *mut PyFrame;
+        }
+    };
+    let finish_level = |frame_ptr: i64| {
+        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+        if !ec.is_null() && frame_ptr != 0 {
+            unsafe {
+                (*ec).topframeref = (*(frame_ptr as *mut PyFrame)).f_backref;
+            }
+        }
+    };
+    let resume = driver.run_pending_abort_blackhole_configured(
+        jit_state,
+        env,
+        Some(jitdrivers_sd),
+        Some(per_frame.as_slice()),
+        Some(&set_topframeref as &dyn Fn(i64)),
+        Some(&finish_level as &dyn Fn(i64)),
+    );
+    if !ec.is_null() {
+        unsafe {
+            (*ec).topframeref = saved_top;
+        }
+    }
+    resume
+}
+
 /// jitexc.py JitException hierarchy — structural parity with RPython.
 ///
 /// `_run_forever` must exit via exactly one of these variants.
@@ -3735,6 +3829,46 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
     }
 }
 
+/// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` →
+/// `convert_and_run_from_pyjitpl` on the live framestack. `compile.py
+/// handle_fail`'s `must_compile` arm never falls through to
+/// `resume_in_blackhole` from the deadframe; this mapping is that raise.
+fn bridge_resolution_from_abort_blackhole(
+    resume: majit_metainterp::jitexc::PortalResume,
+    driver: &mut majit_metainterp::JitDriver<pyre_jit_trace::state::PyreJitState>,
+    frame: &mut PyFrame,
+) -> BridgeResolution {
+    use majit_metainterp::jitexc::PortalResume;
+    match resume {
+        PortalResume::DoneWithThisFrame(_) => {
+            let cv = match driver.take_single_pass_finish_ref() {
+                Some(ptr) => pyre_jit_trace::state::ConcreteValue::Ref(ptr as PyObjectRef),
+                None => pyre_jit_trace::state::ConcreteValue::Null,
+            };
+            let _ = driver.take_single_pass_finish();
+            BridgeResolution::Finished(cv)
+        }
+        PortalResume::ContinueRunningNormally(args) => {
+            if let Some(&ni) = args.green_int.first()
+                && let Some(pc) = crate::eval::green_pc_position(ni)
+            {
+                frame.set_last_instr_from_next_instr(pc);
+                crate::eval::correct_resume_vsd(frame, pc);
+            }
+            BridgeResolution::CompiledContinue
+        }
+        PortalResume::ExitFrameWithException { .. } => {
+            let exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+            BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+                exc as PyObjectRef,
+            ))
+        }
+        PortalResume::BailToInterpreter(_) | PortalResume::ResumeAt(_) => {
+            BridgeResolution::CompiledContinue
+        }
+    }
+}
+
 /// `MAJIT_BRIDGE_BAIL=<stage>` (diagnostic): resume in the blackhole from a
 /// chosen point inside the guard-failure entry, so a wrong answer that appears
 /// only with bridges on can be attributed to one prefix of what the attempt
@@ -4334,6 +4468,14 @@ pub fn trace_and_compile_from_bridge(
     // any-frame-count arming.  Only the guard-state blackhole fallback below it
     // rebuilds frames, and a kept stash never reaches that path.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(true);
+    // `pyjitpl.py handle_guard_failure` walks from the guard, so
+    // `SwitchToBlackhole` converts the live framestack
+    // (`run_blackhole_interp_to_cancel_tracing`). `start_bridge_tracing`
+    // does not raise this flag; raise it only for this walk.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.set_bridge_entered_at_guard_resume(true);
+    }
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
         driver.jit_merge_point_keyed(
@@ -4385,6 +4527,10 @@ pub fn trace_and_compile_from_bridge(
             },
         )
     };
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.set_bridge_entered_at_guard_resume(false);
+    }
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
@@ -4453,6 +4599,35 @@ pub fn trace_and_compile_from_bridge(
             return BridgeResolution::FinishedException(cv);
         }
         None => {}
+    }
+    // `pyjitpl.py handle_guard_failure` `except SwitchToBlackhole`:
+    // `run_blackhole_interp_to_cancel_tracing` then
+    // `convert_and_run_from_pyjitpl` on the live framestack. Restore
+    // would rewind `last_instr` to the guard (the snapshot taken
+    // before the walk) while residual calls have already mutated the
+    // failarg objects — `resume_in_blackhole` from that deadframe then
+    // rebuilds the innermost frame on the mutated heap. Convert first
+    // and skip the rewind; `compile.py handle_fail`'s must_compile arm
+    // never falls through to that deadframe path.
+    //
+    // A walk that already adopted (`try_adopt_blackhole`) ran that
+    // convert during the epilogue. Staging leftover portal frames
+    // and converting again would re-execute the abort chain.
+    // `pyjitpl.py handle_guard_failure` converts once; drop a pending
+    // convert when the live frame already holds the walk-end state.
+    if adopted_walk_end_state {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.discard_pending_abort_blackhole();
+    } else {
+        jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
+        let (driver, _) = crate::eval::driver_pair();
+        if let Some(resume) = run_python_portal_abort_blackhole(driver, &mut jit_state, &env) {
+            return bridge_resolution_from_abort_blackhole(
+                resume,
+                driver,
+                bridge_frame_root.frame(),
+            );
+        }
     }
     if !adopted_walk_end_state {
         let frame = bridge_frame_root.frame();

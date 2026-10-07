@@ -2300,22 +2300,33 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         !trace_too_long,
     );
     if !adopted {
-        // No blackhole terminal belongs to this walk.  Clear any sub-walk
-        // payload before the guard-state replay, as the old unconditional
-        // reset did.
-        crate::jitcode_dispatch::fbw_finish_payload_reset();
-        // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
-        // callee, and the blackhole replays it from the guard, so restore the
-        // pre-walk heap rather than dropping the journals (which would leave every
-        // eager store standing to be applied a second time).  The replay
-        // re-executes the sub-walk's FOR_ITER consumes too, so put their
-        // cursors back on the same condition.
-        crate::jitcode_dispatch::fbw_store_journal_rollback();
-        crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
-        if let Some(slot) = entry_topframeref_slot {
-            unsafe {
-                (*(root_ec as *mut pyre_interpreter::PyExecutionContext)).topframeref =
-                    pyre_object::gc_roots::shadow_stack_get(slot) as *mut pyre_interpreter::PyFrame;
+        // `dispatch_via_miframe` does not publish `aborted_framestack`.
+        // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` converts the
+        // live walker frames (`MIFrame.run_one_step` keeps `pc` current).
+        // A carrier sub-walk latches that image (`bridge1361`) even when
+        // the odometer gate skips adopt; publish it so convert-before-rewind
+        // copies the walk's current pc rather than the GUARD rebuild.
+        if crate::jitcode_dispatch::publish_latched_abort_framestack(ctx) {
+            crate::jitcode_dispatch::fbw_finish_payload_reset();
+        } else {
+            // No blackhole terminal belongs to this walk.  Clear any sub-walk
+            // payload before the guard-state replay, as the old unconditional
+            // reset did.
+            crate::jitcode_dispatch::fbw_finish_payload_reset();
+            // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
+            // callee, and the blackhole replays it from the guard, so restore the
+            // pre-walk heap rather than dropping the journals (which would leave every
+            // eager store standing to be applied a second time).  The replay
+            // re-executes the sub-walk's FOR_ITER consumes too, so put their
+            // cursors back on the same condition.
+            crate::jitcode_dispatch::fbw_store_journal_rollback();
+            crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+            if let Some(slot) = entry_topframeref_slot {
+                unsafe {
+                    (*(root_ec as *mut pyre_interpreter::PyExecutionContext)).topframeref =
+                        pyre_object::gc_roots::shadow_stack_get(slot)
+                            as *mut pyre_interpreter::PyFrame;
+                }
             }
         }
     }
@@ -3072,10 +3083,11 @@ fn try_adopt_single_frame_blackhole(
     // `convert_and_run_from_pyjitpl`. An error that crossed an inline
     // sub-walk still names the callee pc, while the latched image is the
     // caller at the call and its banks were not written for that call.
-    // Decline into entry replay before anything runs.
+    // Do not adopt that image here. Leave it on the TLS latch so the
+    // abort epilogue can publish it onto `aborted_framestack` for
+    // `run_blackhole_interp_to_cancel_tracing`.
     if crossed_inline_subwalk {
         sfdbg!("decline leg={commit_leg:?} crossed-inline-subwalk");
-        crate::jitcode_dispatch::reset_single_frame_blackhole();
         return false;
     }
     // A zero-effect overlong walk deliberately permits entry replay even when
@@ -3130,6 +3142,7 @@ fn try_adopt_single_frame_blackhole(
                 !preflighted,
                 "preflighted blackhole jitcode index no longer fits i32"
             );
+            crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
             return false;
         }
     };
@@ -3138,6 +3151,7 @@ fn try_adopt_single_frame_blackhole(
             !preflighted,
             "preflighted blackhole virtualizable info disappeared"
         );
+        crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
         return false;
     }
     // The resumed jitcodes operate on `PyFrame`, regardless of which
@@ -3151,6 +3165,7 @@ fn try_adopt_single_frame_blackhole(
             !preflighted,
             "preflighted blackhole frame lost its concrete locals base"
         );
+        crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
         return false;
     };
     // Two gates used to sit here, and both were scaffolding around a decline
@@ -3218,6 +3233,7 @@ fn try_adopt_single_frame_blackhole(
             !preflighted,
             "preflighted blackhole frame identity changed before adoption"
         );
+        crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
         return false;
     }
     let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
@@ -3225,6 +3241,7 @@ fn try_adopt_single_frame_blackhole(
             !preflighted,
             "preflighted blackhole frame locals became uncapturable"
         );
+        crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
         return false;
     };
     let mut captured_stack = if publishes_root_stack {
@@ -3288,6 +3305,7 @@ fn try_adopt_single_frame_blackhole(
                          (leg={commit_leg:?}) — legacy replay kept"
                     );
                 }
+                crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
                 return false;
             }
         }
@@ -3340,6 +3358,7 @@ fn try_adopt_single_frame_blackhole(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] single-frame locals publish declined — legacy replay kept");
         }
+        crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
         return false;
     }
     for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
@@ -3361,6 +3380,7 @@ fn try_adopt_single_frame_blackhole(
                 !preflighted,
                 "preflighted blackhole operand-stack publication declined"
             );
+            crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
             return false;
         }
     }
@@ -3642,12 +3662,14 @@ fn try_adopt_multi_frame_blackhole(
     let depth = latched.framestack.len();
     if ctx.virtualizable_info().is_none() {
         mfdbg!("no virtualizable_info");
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     }
     let pyframe_vinfo = crate::frame_layout::build_pyframe_virtualizable_info();
     let virtualizable_info = std::sync::Arc::as_ptr(&pyframe_vinfo);
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         mfdbg!("cf_addr {cf_addr:#x} has no concrete nlocals");
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     };
     // Recover each level's concrete PyFrame ptr and its own fastlocals base.
@@ -3658,13 +3680,15 @@ fn try_adopt_multi_frame_blackhole(
     // into — that intermediate frame.  Any level whose frame register is not
     // a concrete PyFrame declines the adopt (legacy replay handles it).
     let mut per_frame: Vec<(i64, usize)> = Vec::with_capacity(latched.framestack.frames.len());
+    let mut recovery_declined = false;
     for (index, frame) in latched.framestack.frames.iter().enumerate() {
         let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
             mfdbg!(
                 "frame {index}: jitcode index {} out of range",
                 frame.jitcode.index()
             );
-            return false;
+            recovery_declined = true;
+            break;
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
         if frame_reg == u16::MAX {
@@ -3680,17 +3704,24 @@ fn try_adopt_multi_frame_blackhole(
         }
         let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
             mfdbg!("frame {index}: reg {frame_reg} unstamped");
-            return false;
+            recovery_declined = true;
+            break;
         };
         if frame_ptr == 0 {
             mfdbg!("frame {index}: reg {frame_reg} is null");
-            return false;
+            recovery_declined = true;
+            break;
         }
         let Some(frame_stack_base) = crate::state::concrete_nlocals(frame_ptr as usize) else {
             mfdbg!("frame {index}: {frame_ptr:#x} has no concrete nlocals");
-            return false;
+            recovery_declined = true;
+            break;
         };
         per_frame.push((frame_ptr, frame_stack_base));
+    }
+    if recovery_declined {
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
+        return false;
     }
     // A level whose frame a residual forced WITHOUT writing cannot be resumed.
     // `flush_active_frame_escape` matches two disjuncts — the traced
@@ -3717,6 +3748,7 @@ fn try_adopt_multi_frame_blackhole(
             .position(|&(frame_ptr, _)| frame_ptr as usize == unflushed)
     {
         mfdbg!("frame {index}: {unflushed:#x} was forced without a locals write");
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     }
     // The walked frame has two representations here: `cf_addr` is the
@@ -3746,6 +3778,7 @@ fn try_adopt_multi_frame_blackhole(
         }
         if i > 0 && per_frame[i].0 == root_addr as i64 {
             mfdbg!("frame {i}: is the walked frame {root_addr:#x}");
+            crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
             return false;
         }
         if per_frame[..i]
@@ -3753,6 +3786,7 @@ fn try_adopt_multi_frame_blackhole(
             .any(|&(ptr, _)| ptr != 0 && ptr == per_frame[i].0)
         {
             mfdbg!("frame {i}: {:#x} repeats an earlier level", per_frame[i].0);
+            crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
             return false;
         }
     }
@@ -3797,6 +3831,7 @@ fn try_adopt_multi_frame_blackhole(
             "chain rooted at {:#x}, not the walked frame {root_addr:#x}",
             first_pyframe.unwrap_or(0),
         );
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     }
     // `ExecutionContext::enter` parity for the resumed chain:
@@ -3897,6 +3932,7 @@ fn try_adopt_multi_frame_blackhole(
     let Some(mut locals_undo) = crate::state::capture_frame_locals(frame_ptrs[0] as usize) else {
         mfdbg!("frame 0: {:#x} locals not capturable", frame_ptrs[0]);
         restore_links(&saved_links);
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     };
     // Same split as the single-frame arm: a root walk never writes the
@@ -3927,6 +3963,7 @@ fn try_adopt_multi_frame_blackhole(
     let Some(mut root_stack) = captured else {
         mfdbg!("frame 0: active stack not capturable (leg={commit_leg:?})");
         restore_links(&saved_links);
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     };
     // Taking the latch removes it from the TLS extra-root walker.  Root every
@@ -3974,6 +4011,7 @@ fn try_adopt_multi_frame_blackhole(
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
         mfdbg!("frame 0: {:#x} locals publish declined", frame_ptrs[0]);
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     }
     for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
@@ -3988,6 +4026,7 @@ fn try_adopt_multi_frame_blackhole(
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
         mfdbg!("frame 0: active stack publish declined");
+        crate::jitcode_dispatch::relatch_multi_frame_blackhole(latched);
         return false;
     }
     // As in the single-frame path, locals publication is the final recoverable
@@ -4121,6 +4160,7 @@ fn try_adopt_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64)),
+        None,
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
     // reading the root back so an in-place forward during the drive is kept.
@@ -6116,6 +6156,27 @@ fn run_perfn_walk<Sym: WalkSym>(
             *finish_arg = arg;
             *finish_arg_type = ty;
         }
+    }
+
+    // `dispatch_via_miframe` does not publish `aborted_framestack`.
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` converts the
+    // live walker frames. A declined adopt used to drop the TLS latch,
+    // so convert-before-rewind copied the GUARD-rebuilt meta.framestack
+    // (`read@guard-pc`) instead. Relatch on decline keeps the image;
+    // publish it here for the Abort arm. CloseLoop / Terminate / a
+    // compiled segment already have their own handoff.
+    let aborting_walk = !matches!(
+        &walk_result,
+        Ok((
+            crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. }
+                | crate::jitcode_dispatch::DispatchOutcome::Terminate { .. }
+                | crate::jitcode_dispatch::DispatchOutcome::CompileTracePending { .. }
+                | crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. },
+            _
+        ))
+    );
+    if !flush_committed.get() && aborting_walk {
+        let _ = crate::jitcode_dispatch::publish_latched_abort_framestack(ctx);
     }
 
     Some((entry, code_len, walk_result))
