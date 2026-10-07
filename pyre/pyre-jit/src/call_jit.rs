@@ -2670,7 +2670,7 @@ pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: 
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
 pub fn blackhole_resume_via_rd_numb<'df>(
-    rd_numb: &[u8],
+    rd_numb: &majit_ir::NumberingRef,
     rd_consts: &[majit_ir::Const],
     deadframe: majit_backend::FailArgSource<'df>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
@@ -2796,7 +2796,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         resume::blackhole_from_resumedata(
             builder,
             &resolve_jitcode,
-            rd_numb,
+            rd_numb.as_slice(),
             rd_consts,
             &all_liveness,
             deadframe.clone(),
@@ -2808,6 +2808,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             None,      // resume.py blackhole_from_resumedata greenfield_info unused in pyre
             all_virtuals, // resume.py blackhole_from_resumedata GUARD_NOT_FORCED cache
             &allocator,
+            Some(rd_numb),
         )
     });
 

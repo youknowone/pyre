@@ -99,3 +99,67 @@ pub fn layout_for_fail_descr(
 // `DynasmFailDescr` all went away with the struct.  The metainterp
 // `AbstractFailDescr` Arc carries the canonical `FailDescr` impl now
 // reached through `op.descr` and `DescrRef::as_fail_descr`.
+
+/// `BaseAssembler.store_info_on_descr`.
+///
+/// Encode `fail_locs` once. When every position equals
+/// `_previous_rd_locs`, return that vector instead of a new one.
+pub(crate) fn store_info_on_descr(
+    previous: &mut majit_ir::RdLocs,
+    frame_depth: &mut usize,
+    faillocs: &[Option<crate::regloc::Loc>],
+    slot_for_loc: fn(&crate::regloc::Loc) -> Option<u16>,
+) -> (majit_ir::RdLocs, Vec<(usize, i64)>) {
+    let mut const_stores: Vec<(usize, i64)> = Vec::new();
+    let mut shared = previous.len() == faillocs.len();
+    let mut positions = if shared {
+        None
+    } else {
+        let mut fresh = majit_ir::RdLocs::new();
+        fresh.resize(faillocs.len(), 0);
+        Some(fresh)
+    };
+    for (i, fl) in faillocs.iter().enumerate() {
+        let position = match fl {
+            None => 0xFFFF,
+            Some(crate::regloc::Loc::Immed(imm) | crate::regloc::Loc::ImmedFloat(imm)) => {
+                let slot = *frame_depth;
+                *frame_depth += 1;
+                const_stores.push((slot, imm.value));
+                slot as u16
+            }
+            Some(crate::regloc::Loc::ConstFloat(c)) => {
+                // `locs_for_fail` → `self.loc`: a float constant is
+                // `ConstFloatLoc`. Upstream `store_info_on_descr` encodes
+                // `loc.is_float()` as `len(gen_regs) + loc.value * coeff`,
+                // and `ConstFloatLoc.value` is the pool address, not an xmm
+                // index. Copy the bits into the same const-store slot an
+                // `ImmedFloat` uses so `rd_locs` stays a jitframe position
+                // (`_decode_pos`).
+                let bits = unsafe { (c.value as *const i64).read_unaligned() };
+                let slot = *frame_depth;
+                *frame_depth += 1;
+                const_stores.push((slot, bits));
+                slot as u16
+            }
+            Some(loc) => slot_for_loc(loc).unwrap_or(0xFFFF),
+        };
+        if shared {
+            if previous[i] == position {
+                continue;
+            }
+            let mut owned = previous.clone();
+            owned[i] = position;
+            positions = Some(owned);
+            shared = false;
+            continue;
+        }
+        positions.as_mut().expect("rd_locs buffer")[i] = position;
+    }
+    if shared {
+        return (previous.clone(), const_stores);
+    }
+    let positions = positions.expect("rd_locs buffer");
+    *previous = positions.clone();
+    (positions, const_stores)
+}

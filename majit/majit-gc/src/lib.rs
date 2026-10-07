@@ -278,6 +278,19 @@ pub fn gc_nursery_poison_enabled() -> bool {
     *ENABLED
 }
 
+/// `MAJIT_GC_STRESS_TRACE_ALLOC` — minor-collect before every
+/// `alloc_fast_nursery_collecting_typed_rooted`.
+///
+/// Read once. The gate sits on the Trace pool allocator (`opencoder.py`
+/// `Trace._ops` and the other pools in `trace_bufs`), and
+/// `std::env::var_os` takes the environment lock on every call. Presence,
+/// matching [`gc_lifetime_log_enabled`]: any value, including empty, opts in.
+pub fn gc_stress_trace_alloc_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_STRESS_TRACE_ALLOC").is_some());
+    *ENABLED
+}
+
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
 /// sites: a collection opens no debug section of its own, so the section
 /// ready bit would silence them under a `gc` prefix filter.
@@ -2857,6 +2870,17 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 /// (`rpython/memory/gc/incminimark.py`), which raises MemoryError.
 pub fn gc_allocator_installed() -> bool {
     ACTIVE_ALLOC_NURSERY_TYPED.get().is_some()
+}
+
+static MINOR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped once at the end of each minor (`minor_collection_body`).
+pub fn minor_epoch() -> u64 {
+    MINOR_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn bump_minor_epoch() {
+    MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.

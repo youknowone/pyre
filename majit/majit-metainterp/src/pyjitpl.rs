@@ -50,6 +50,8 @@ use majit_ir::operand::Operand;
 pub fn register_active_backend_jitframe_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
     let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     gc.set_jitframe_type_id(id);
+    // `opencoder.py` `Trace._ops`, same registration pass as `JITFRAME`.
+    crate::opencoder::register_trace_ops_gc_type(gc);
     id
 }
 
@@ -3509,7 +3511,60 @@ impl<M: Clone> MetaInterp<M> {
     /// the same Arc, so walking the `exit_layouts` /
     /// `terminal_exit_layouts` storage slots once updates the pool for
     /// every observer.
+    /// `NUMBERING` payload addresses. A minor moves the array until it is
+    /// promoted, so this walk is not gated on the const-pool scan bit.
+    pub fn walk_rd_numb_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        for entry in self.compiled_loops.values_mut() {
+            for trace in entry.traces.values_mut() {
+                for layout in trace
+                    .exit_layouts
+                    .values_mut()
+                    .chain(trace.terminal_exit_layouts.values_mut())
+                {
+                    if let Some(storage) = layout.storage.as_ref() {
+                        storage.visit_rd_numb(&mut visitor);
+                    }
+                    if let Some(fd) = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                    {
+                        fd.visit_rd_numb(&mut visitor);
+                    }
+                }
+            }
+            let tokens = entry.live_token().into_iter().chain(
+                entry
+                    .previous_tokens
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade),
+            );
+            for token in tokens {
+                let Some(clt) = token.compiled_loop_token() else {
+                    continue;
+                };
+                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                        if let Some(fd) = descr.as_fail_descr() {
+                            fd.visit_rd_numb(&mut visitor);
+                        }
+                    };
+                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                        for cell in store.iter() {
+                            visit_descr(&*cell.descr);
+                        }
+                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                        for descr in descrs {
+                            visit_descr(&**descr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        self.walk_rd_numb_refs(&mut visitor);
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
             generation: u64,
@@ -3784,6 +3839,22 @@ impl<M: Clone> MetaInterp<M> {
         // forwards them.
         for snapshot in trace_ctx.snapshots.iter_mut() {
             snapshot.walk_const_ptr_refs(&mut visitor);
+        }
+        // `pyjitpl.py` `self.virtualref_boxes` is a list of boxes. The
+        // `usize` beside each box is the address pushed at
+        // `opimpl_virtual_ref`; a minor between the push and
+        // `virtual_ref_finish` forwards the box and leaves that copy.
+        // `virtualref_entry_ptr` re-reads a stamped box. The raw word is
+        // still what a later intern stores when the stamp is absent.
+        for pair in trace_ctx.virtualref_boxes.iter_mut() {
+            if let OpRef::ConstPtr(gcref) = &mut pair.0 {
+                visitor(gcref);
+            }
+            if pair.1 != 0 {
+                let mut gcref = GcRef(pair.1);
+                visitor(&mut gcref);
+                pair.1 = gcref.0;
+            }
         }
         // `initialize_state_from_start` `self.virtualizable_boxes` stores
         // ordinary BoxPtr objects whose concrete refs the GC traces through
@@ -24796,7 +24867,7 @@ mod portal_resume_rebuild_tests {
 
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::ResumeStorage::new(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(majit_ir::descr::make_size_descr(16)),
@@ -24885,7 +24956,7 @@ mod portal_resume_rebuild_tests {
 
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::ResumeStorage::new(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(majit_ir::descr::make_size_descr(16)),
@@ -24963,7 +25034,7 @@ mod portal_resume_rebuild_tests {
         );
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::ResumeStorage::new(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(size_descr),
@@ -31001,7 +31072,7 @@ mod tests {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
         let storage = crate::resume::ResumeStorage::new(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![majit_ir::Const::Ref(GcRef(0x1000))],
             Vec::new(),
             Vec::new(),
@@ -31197,7 +31268,12 @@ mod tests {
             vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
-            storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
+            storage: crate::resume::ResumeStorage::new(
+                majit_ir::NumberingRef::from_bytes(&[1, 2, 3]),
+                vec![],
+                vec![],
+                vec![],
+            ),
             frontend_boxes: vec![11, 22],
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
@@ -31823,7 +31899,7 @@ mod tests {
                 recovery_layout: Some(std::sync::Arc::new(recovery_layout)),
                 resume_layout: None,
                 storage: Some(crate::resume::ResumeStorage::new(
-                    vec![7, 8, 9],
+                    majit_ir::NumberingRef::from_bytes(&[7, 8, 9]),
                     vec![majit_ir::Const::Int(11)],
                     vec![],
                     vec![],
@@ -31992,7 +32068,7 @@ mod tests {
                 recovery_layout: None,
                 resume_layout: None,
                 storage: Some(crate::resume::ResumeStorage::new(
-                    rd_numb,
+                    rd_numb.clone(),
                     vec![],
                     vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawBufferInfo {
                         func: 77,
@@ -32066,7 +32142,7 @@ mod tests {
         backend: &majit_backend_dynasm::runner::DynasmBackend,
         token: &std::sync::Weak<JitCellToken>,
         fail_index: u32,
-        rd_numb: Vec<u8>,
+        rd_numb: majit_ir::NumberingRef,
         rd_consts: Vec<majit_ir::Const>,
     ) {
         // `CompiledEntry.token` is `Weak`; upgrade for the
@@ -32108,7 +32184,7 @@ mod tests {
         let descr_fd = descr_ref
             .as_fail_descr()
             .expect("descr must implement FailDescr");
-        descr_fd.set_rd_numb(Some(rd_numb));
+        descr_fd.set_rd_numb_arc(Some(rd_numb));
         descr_fd.set_rd_consts(Some(rd_consts));
         descr_fd.set_rd_virtuals(Some(vec![]));
         descr_fd.set_rd_pendingfields(Some(vec![]));

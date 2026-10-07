@@ -5178,6 +5178,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     ));
     deque_lock_descr.gc_type_id.set(deque_lock_tid);
 
+    // `opencoder.py` `Trace._ops`: one `GcArray(Char)`. Registered at the
+    // tail so the literal type ids above keep their positions. The regex
+    // example registers the same shape from
+    // `register_active_backend_jitframe_gc_type`.
+    majit_metainterp::opencoder::register_trace_ops_gc_type(&mut gc);
+
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type registers its descriptor into the
     // whole-program registry. A type with inline managed children must
@@ -16090,7 +16096,7 @@ mod tests {
             recovery_layout: None,
             resume_layout: None,
             storage: Some(majit_metainterp::resume::ResumeStorage::new(
-                Vec::new(),
+                majit_ir::NumberingRef::from_bytes(&[]),
                 Vec::new(),
                 Vec::new(),
                 pending,

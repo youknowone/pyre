@@ -702,6 +702,8 @@ pub struct AssemblerARM64<'a> {
     pending_malloc_nursery_gcmap: Option<usize>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
+    /// `BaseAssembler._previous_rd_locs`.
+    previous_rd_locs: majit_ir::RdLocs,
     /// assembler.py:94 setup() `self.frame_depth_to_patch = []` — buffer
     /// offsets of the `gen_load_int` depth placeholders emitted by
     /// `emit_check_frame_depth`, rewritten by `patch_stack_checks` once the
@@ -1038,6 +1040,7 @@ impl<'a> AssemblerARM64<'a> {
             pending_guard_tokens: Vec::new(),
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
+            previous_rd_locs: majit_ir::RdLocs::new(),
             frame_depth_to_patch: Vec::new(),
             jump_target_frame_depth: 0,
             fail_descrs: FailDescrStore::default(),
@@ -5032,31 +5035,17 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
 
-        // `llsupport/assembler.py store_info_on_descr` parity.
-        // PyPy encodes each fail-arg location as a USHORT in `rd_locs`;
-        // pyre allocates a const-store slot for `Loc::Immed` and writes
-        // the slot into rd_locs so the deopt path reads it via PyPy's
-        // stack-position decode (`llmodel.py _decode_pos`).
-        let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let rd_locs: majit_ir::RdLocs = faillocs
-            .iter()
-            .map(|fl| match fl {
-                None => 0xFFFF,
-                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    slot as u16
-                }
-                Some(Loc::ConstFloat(c)) => {
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, Self::const_float_bits(*c)));
-                    slot as u16
-                }
-                Some(loc) => deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
-            })
-            .collect();
+        // `BaseAssembler.store_info_on_descr`: one encode, and the
+        // previous vector when it matches. An immediate still takes a
+        // fresh const-store slot, so that position will not match.
+        // `Loc::ConstFloat` is parked in the helper the way this assembler
+        // used `const_float_bits` (`ConstFloatLoc.value` is the pool address).
+        let (rd_locs, const_stores) = crate::guard::store_info_on_descr(
+            &mut self.previous_rd_locs,
+            &mut self.frame_depth,
+            faillocs,
+            deadframe_slot_for_loc,
+        );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
         // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
@@ -5769,6 +5758,11 @@ impl<'a> AssemblerARM64<'a> {
     /// stack `SmallVec` so the compiled path (`store_final_boxes_in_guard`
     /// already wrote the list) does not `to_vec()` a 32 B copy per guard.
     fn ensure_fail_arg_types(&self, op: &Op, op_index: Option<usize>, fd: &dyn FailDescr) {
+        let expected_len = op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0);
+        let have = fd.fail_arg_types();
+        if !have.is_empty() && have.len() == expected_len {
+            return;
+        }
         let inferred = self.infer_fail_arg_types(op, op_index);
         if fd.fail_arg_types() != inferred.as_slice() {
             fd.set_fail_arg_types(inferred.into_vec());

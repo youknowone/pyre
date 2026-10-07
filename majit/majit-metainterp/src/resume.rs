@@ -243,11 +243,11 @@ impl NumberingState {
     pub fn patch_current_size(&mut self, index: usize) {
         self.writer.patch_current_size(index);
     }
-    pub fn create_numbering(&self) -> Vec<u8> {
+    pub fn create_numbering(&self) -> majit_ir::NumberingRef {
         self.writer.create_numbering()
     }
     pub fn create_numbering_arc(&self) -> majit_ir::NumberingRef {
-        self.writer.create_numbering_arc()
+        self.create_numbering()
     }
 }
 
@@ -805,13 +805,13 @@ impl std::fmt::Debug for ResumeStorage {
 
 impl ResumeStorage {
     pub fn new(
-        rd_numb: Vec<u8>,
+        rd_numb: majit_ir::NumberingRef,
         rd_consts: Vec<Const>,
         rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) -> Arc<Self> {
         Arc::new(ResumeStorage {
-            rd_numb: majit_ir::NumberingRef::from_bytes(&rd_numb),
+            rd_numb,
             rd_consts: majit_ir::SharedConstPool::new(rd_consts),
             rd_virtuals: rd_virtuals.into(),
             rd_pendingfields: rd_pendingfields.into(),
@@ -821,7 +821,12 @@ impl ResumeStorage {
 
     /// Empty storage (pre-finalization placeholder).
     pub fn empty() -> Arc<Self> {
-        Self::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        Self::new(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     /// Snapshot the constant pool (for readers that need an owned
@@ -835,6 +840,10 @@ impl ResumeStorage {
     /// the only writer and runs during GC, outside of reader scope.
     pub fn rd_consts(&self) -> &[Const] {
         self.rd_consts.as_slice()
+    }
+
+    pub fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.rd_numb.visit_gc(visitor);
     }
 
     /// `resume.py ResumeDataReader._prepare_virtuals`: `None` is the
@@ -6154,6 +6163,7 @@ mod tests {
             None,
             None, // all_virtuals
             &NullAllocator,
+            None,
         );
 
         assert_eq!(virtualizable_ptr, 0);
@@ -6258,6 +6268,7 @@ mod tests {
                 None,
                 all_virtuals,
                 &NullAllocator,
+                None,
             )
         };
 
@@ -6331,6 +6342,7 @@ mod tests {
             None, // ginfo
             None, // all_virtuals
             &NullAllocator,
+            None,
         );
         (virtualizable_ptr, bh.registers_r[0])
     }
@@ -9403,6 +9415,7 @@ pub fn prepare_resume_heap<'a>(
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     allocator: &'a dyn BlackholeAllocator,
+    numb_root: Option<&'a majit_ir::NumberingRef>,
 ) {
     let Some(guard_pf) = rd_guard_pendingfields else {
         return;
@@ -9419,6 +9432,9 @@ pub fn prepare_resume_heap<'a>(
         None,
         allocator,
     );
+    if let Some(numb) = numb_root {
+        resumereader.resumecodereader.bind_numbering(numb);
+    }
     let _resume_roots =
         prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, Some(guard_pf));
 }
@@ -9448,6 +9464,7 @@ pub fn blackhole_from_resumedata<'a>(
     // the already-forced virtualizable alone.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
+    numb_root: Option<&'a majit_ir::NumberingRef>,
 ) -> (Box<BlackholeInterpreter>, i64) {
     // resume.py:1315-1327 The initialization is stack-critical code: it
     // must not be interrupted by StackOverflow, otherwise the
@@ -9469,6 +9486,9 @@ pub fn blackhole_from_resumedata<'a>(
         all_virtuals,
         allocator,
     );
+    if let Some(numb) = numb_root {
+        resumereader.resumecodereader.bind_numbering(numb);
+    }
 
     // resume.py: `_prepare` — and so both `_prepare_virtuals` and
     // `_prepare_pendingfields` — runs only in the `all_virtuals is None`
