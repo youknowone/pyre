@@ -729,6 +729,35 @@ jobs:
         cargo test --all --no-default-features --features dynasm,cpyext,pyre-module \
           --test llbc_fingerprint_format_test -- --ignored
 
+    - name: Only frame construction accesses PyFrame virtualizable fields without a pointer (Linux only)
+      # A red here means a virtualizable field of `PyFrame` is now reached off
+      # a non-dereferenced local aggregate somewhere the census does not expect
+      # — or that frame construction stopped doing so. The codewriter treats
+      # that shape as not reaching a live virtualizable and keeps it off the
+      # `getfield_vable_*` / `setfield_vable_*` path, so the set of places with
+      # that shape is a soundness-relevant invariant rather than a style rule.
+      # `FrameBox::new` taking its frame by value is what puts its twelve
+      # projections there; `pyframe.rs` carries a compile-time guard on that
+      # signature, and this is the corpus-level half.
+      #
+      # Reads the extracted LLBC that the steps above already downloaded — no
+      # corpus build, and no `charon pretty-print`. The test is `#[ignore]`d
+      # out of `cargo test --all` so the artefact walk does not share a
+      # process with the parallel suite; this step is the one run. Named
+      # under the same `--all` feature set as the steps above so it reuses
+      # what they compiled.
+      #
+      # The Linux gate is not an extraction limit: the property is
+      # platform-independent, and so is the LLBC it reads. Running once is
+      # sufficient, so it rides the Linux cargo-test job rather than every
+      # OS and every backend.
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        cargo test --all --no-default-features --features dynasm,cpyext,pyre-module \
+          --test vable_projection_census -- --ignored --exact \
+          framebox_new_is_the_only_non_deref_pyframe_vable_projection
+
     - name: Build test binaries (cranelift)
       shell: bash
       # Keep this package list identical to the cranelift test step below.
@@ -1151,30 +1180,6 @@ jobs:
           # where the cause is still visible.
           test -s "build/llbc/${crate}.ullbc.readfiles"
         done
-    - name: Only frame construction accesses PyFrame virtualizable fields without a pointer (Linux only)
-      # A red here means a virtualizable field of `PyFrame` is now reached off
-      # a non-dereferenced local aggregate somewhere the census does not expect
-      # — or that frame construction stopped doing so. The codewriter treats
-      # that shape as not reaching a live virtualizable and keeps it off the
-      # `getfield_vable_*` / `setfield_vable_*` path, so the set of places with
-      # that shape is a soundness-relevant invariant rather than a style rule.
-      # `FrameBox::new` taking its frame by value is what puts its twelve
-      # projections there; `pyframe.rs` carries a compile-time guard on that
-      # signature, and this is the corpus-level half.
-      #
-      # Reads the extracted LLBC that the steps above already downloaded — no
-      # corpus build.
-      #
-      # The Linux gate is required, not an optimization. This step sits in
-      # `&pyre-check-steps`, which the macOS and Windows legs alias, so it is
-      # copied into all three jobs; the census resolves charon per platform and
-      # has no Windows mapping, and would hard-fail that leg ungated. Running
-      # once is also sufficient — the property is platform-independent, and
-      # so is the LLBC it reads, so it rides the dynasm leg of the backend
-      # matrix instead of running once per backend.
-      if: runner.os == 'Linux' && matrix.backend == 'dynasm'
-      shell: bash
-      run: python3 pyre/scripts/vable-projection-census.py build/llbc/pyre-object.ullbc build/llbc/pyre-interpreter.ullbc build/llbc/pyre-jit.ullbc
     - name: Add wasm32 target (Linux only)
       # check.py adds wasm to its default backends when this target is
       # installed, so this is what makes the Linux leg build and run the wasm

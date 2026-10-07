@@ -10411,10 +10411,7 @@ impl<'a> Lowering<'a> {
         }
         // Container shape, captured before `inner` is consumed below —
         // the write-side counterpart of the `resolve_place` Field arm.
-        let base_is_deref = matches!(
-            &inner.kind,
-            PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
-        );
+        let base_is_deref = inner.is_deref_projection();
         // `(*dest).field` where `dest` was bound by `ptr::add`. Captured
         // before `resolve_place` collapses the deref to the item pointer:
         // the interior base is the GcArray header, not that pointer.
@@ -17043,10 +17040,7 @@ impl<'a> Lowering<'a> {
                     // a *raw-pointer* deref whose pointee class resolves —
                     // a `&self` deref leaves it `None`, so it cannot stand
                     // in for this test.
-                    let base_is_deref = matches!(
-                        &inner.kind,
-                        PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
-                    );
+                    let base_is_deref = inner.is_deref_projection();
                     // Whether this read projects an enum variant's payload,
                     // read off the container before the base resolve
                     // consumes `inner`.  It selects the payload projection
@@ -17747,10 +17741,7 @@ impl<'a> Lowering<'a> {
                     // `(*p).field` of an opaque dependency struct. The
                     // declaration has no field list, and the place type is
                     // the scalar, so the load is that layout word.
-                    let base_is_deref = matches!(
-                        &inner.kind,
-                        PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
-                    );
+                    let base_is_deref = inner.is_deref_projection();
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let res = self

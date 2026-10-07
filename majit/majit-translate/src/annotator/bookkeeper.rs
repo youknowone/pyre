@@ -374,9 +374,8 @@ pub struct Bookkeeper {
     /// (`pypy/interpreter/error.py`).
     exception_carrier: RefCell<Option<String>>,
     /// Canonical key of the transparent handle (`carrier_path`) when it
-    /// differs from [`Self::exception_carrier`]. Intern and struct-root
-    /// lookup redirect this spelling to the object class so the two
-    /// names share one `ClassDef`.
+    /// differs from [`Self::exception_carrier`]. The handle intern's as
+    /// a subclass of the object class so each keeps its own layout.
     exception_carrier_handle: RefCell<Option<String>>,
     /// TODO: no upstream equivalent.  Qualified trait path → owner
     /// root of its only concrete impl in the analyzed LLBC world
@@ -628,10 +627,13 @@ impl Bookkeeper {
         });
     }
 
-    /// Redirect the transparent handle spelling to the object class so
-    /// `intern_class_by_qualname` and `getuniqueclassdef_for_struct_root`
-    /// share one `ClassDef`. No-op when no object class is named or the
-    /// handle is the same key.
+    /// Intern the transparent handle as a subclass of the object class.
+    /// Identity-aliasing the two spellings onto one `ClassDef` made
+    /// getattr of the handle's `.0` / a `MutRef<Handle>.value` resolve
+    /// on the payload, which has no such field. The handle keeps its
+    /// own layout (`ClassDesc._init_classdef`); `issubclass` still
+    /// reaches `Exception` through the object. No-op when no object
+    /// class is named or the handle is the same key.
     pub fn alias_exception_carrier_handle(self: &Rc<Self>, handle_path: &str) {
         if handle_path.is_empty() {
             return;
@@ -646,9 +648,7 @@ impl Bookkeeper {
             return;
         }
         *self.exception_carrier_handle.borrow_mut() = Some(handle_key.clone());
-        self.struct_root_classes
-            .borrow_mut()
-            .insert(handle_key, class_host);
+        let _ = self.intern_class_by_qualname_with_bases(&handle_key, vec![class_host]);
     }
 
     /// The error carrier's class object, minted on first request.  `None`
@@ -664,13 +664,6 @@ impl Bookkeeper {
         self.exception_carrier_handle.borrow().as_deref() == Some(key.as_str())
     }
 
-    fn redirect_exception_carrier_handle(&self, root: &str) -> Option<String> {
-        if !self.exception_carrier_handle_key(root) {
-            return None;
-        }
-        self.exception_carrier.borrow().clone()
-    }
-
     /// The `__bases__` a first mint of class `key` receives when nothing
     /// else supplies one: `Exception` for the error carrier, none otherwise.
     fn default_class_bases(&self, key: &str) -> Vec<HostObject> {
@@ -678,10 +671,15 @@ impl Bookkeeper {
             let exception = crate::flowspace::model::HOST_ENV
                 .lookup_exception_class("Exception")
                 .expect("HOST_ENV missing builtin Exception");
-            vec![exception]
-        } else {
-            Vec::new()
+            return vec![exception];
         }
+        if self.exception_carrier_handle.borrow().as_deref() == Some(key)
+            && let Some(object_key) = self.exception_carrier.borrow().clone()
+            && let Some(host) = self.struct_root_classes.borrow().get(&object_key)
+        {
+            return vec![host.clone()];
+        }
+        Vec::new()
     }
 
     /// TODO: no upstream equivalent.  Wire the enum
@@ -1918,9 +1916,7 @@ impl Bookkeeper {
         if determinism_trace {
             eprintln!("[DTRACE-CLASS] struct_root root={trace_root}");
         }
-        let redirected = self
-            .redirect_exception_carrier_handle(root)
-            .or_else(|| self.redirect_withdrawn_struct_leaf(root));
+        let redirected = self.redirect_withdrawn_struct_leaf(root);
         let root: &str = redirected.as_deref().unwrap_or(root);
         // Pass 1 — traverse the registry's struct-field graph from `root`,
         // registering an identity-keyed `ClassDef` in `descs` for every
@@ -4843,6 +4839,22 @@ mod tests {
         bk.set_exception_carrier("error::PyErrorObject");
         let other = bk.intern_class_by_qualname("pyre_object::pyobject::PyObject");
         assert!(other.class_bases().map_or(true, |b| b.is_empty()));
+    }
+
+    #[test]
+    fn the_error_carrier_handle_is_a_subclass_not_an_alias() {
+        let bk = bk();
+        bk.set_exception_carrier("error::PyErrorObject");
+        bk.alias_exception_carrier_handle("error::PyError");
+        let object = bk.exception_carrier_class().expect("object class");
+        let handle = bk.intern_class_by_qualname("error::PyError");
+        let handle_cd = bk.getuniqueclassdef(&handle).expect("handle classdef");
+        let object_cd = bk.getuniqueclassdef(&object).expect("object classdef");
+        assert!(
+            !Rc::ptr_eq(&handle_cd, &object_cd),
+            "the handle keeps its own ClassDef"
+        );
+        assert!(handle_cd.borrow().issubclass(&object_cd));
     }
 
     #[test]

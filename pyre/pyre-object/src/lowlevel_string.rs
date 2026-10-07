@@ -4,7 +4,7 @@
 //! RPython's `GcStruct('rpy_string', ...)`.  Before the GC registry is installed
 //! (principally unit tests), allocation falls back to an identically laid-out
 //! raw block.  Both forms are laid out
-//! as `{ hash: usize @0, len: usize @8, chars: [item; len] @16.. }`. The `len`
+//! as `{ hash: Signed @0, len: usize @8, chars: [item; len] @16.. }`. The `len`
 //! word is the RPython varsize length and, for the raw fallback only, also the
 //! allocation capacity used to reconstruct its freeing `Layout`.
 //!
@@ -17,7 +17,7 @@
 /// `LLHelpers.ll_strlen` reads that word as `len(s.chars)`.
 #[repr(C)]
 struct LowlevelStringHeader {
-    hash: usize,
+    hash: isize,
     length: usize,
 }
 

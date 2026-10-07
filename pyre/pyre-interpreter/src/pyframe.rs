@@ -1756,7 +1756,7 @@ pub struct FrameBox {
 /// withdraws that suppression silently — nothing fails where the edit is made.
 ///
 /// Changing this signature is therefore a decision, not a refactor.
-/// `pyre/scripts/vable-projection-census.py` is the corpus-level check.
+/// `pyre-jit-trace`'s `vable_projection_census` test is the corpus-level check.
 const _: fn(PyFrame) -> FrameBox = FrameBox::new;
 
 /// First published-root index [`FrameBox::new`] gives to the interior of a
@@ -2303,7 +2303,7 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
 
 /// Write `locals_cells_stack_w` through a pointer. A by-value
 /// `frame.locals_cells_stack_w =` is a non-deref virtualizable-field
-/// projection, which `vable-projection-census` allows only on
+/// projection, which `vable_projection_census` allows only on
 /// `FrameBox::new`. `inline(never)` keeps the deref in this function's
 /// LLBC so the census does not attribute it to the caller.
 #[inline(never)]
@@ -6514,7 +6514,7 @@ impl PyFrame {
         // `bind_unoptimized_locals_scope` allocates the class-body mapping, and
         // this aggregate's fields are native copies no collection rewrites.
         // Store through a pointer so the write is not a non-deref
-        // virtualizable-field projection (`vable-projection-census` allows
+        // virtualizable-field projection (`vable_projection_census` allows
         // those only on `FrameBox::new`).
         unsafe {
             store_locals_cells_stack_w(&mut frame, _roots.get(locals_idx) as *mut FixedObjectArray);

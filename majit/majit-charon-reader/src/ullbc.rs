@@ -1989,6 +1989,28 @@ impl ProjectionElem {
             }
         }
     }
+
+    /// The `Field` payload of this projection element, if it is one.
+    pub fn field_payload(&self) -> Option<&Value> {
+        match self {
+            ProjectionElem::Tagged(v) => v.as_object().and_then(|m| m.get("Field")),
+            ProjectionElem::Atom(_) => None,
+        }
+    }
+}
+
+impl Place {
+    /// Whether this place is a `Deref` projection.
+    ///
+    /// `front/mir.rs` records this as `FieldDescriptor::base_is_deref` on the
+    /// inner of a field projection. `true` is `(*p).f`; `false` is a
+    /// projection off a local aggregate (`local.f`).
+    pub fn is_deref_projection(&self) -> bool {
+        matches!(
+            &self.kind,
+            PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
