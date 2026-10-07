@@ -6322,19 +6322,21 @@ pub unsafe fn w_list_install_bytes_items(
     }
     let base = crate::gc_roots::publish_roots(&published);
     crate::gc_roots::normalize_roots(base, published.len());
+    let mut obj = crate::gc_roots::shadow_stack_get(base);
     let fresh = if values.is_empty() {
         BytesArray::empty()
     } else {
-        let mut live = Vec::with_capacity(values.len());
-        for index in 0..values.len() {
-            live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
-                as *const crate::bytesobject::BytesBlock);
-        }
-        BytesArray::from_vec(live)
+        crate::with_roots!(obj => {
+            let mut live = Vec::with_capacity(values.len());
+            for index in 0..values.len() {
+                live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
+                    as *const crate::bytesobject::BytesBlock);
+            }
+            BytesArray::from_vec(live)
+        })
     };
-    let fresh_slot = fresh.pin_block();
-    let obj = crate::gc_roots::shadow_stack_get(base);
-    let _guard = w_list_lock(obj);
+    let fresh_slot = crate::with_roots!(obj => fresh.pin_block());
+    let _guard = crate::with_roots!(obj => w_list_lock(obj));
     let obj = crate::gc_roots::shadow_stack_get(base);
     if !list_strategy_is_empty_or_size(obj) {
         return false;
