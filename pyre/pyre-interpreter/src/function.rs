@@ -4143,11 +4143,16 @@ fn funccall_flat_from_args(
     // Same arm as `_flat_pycall`: transfer the owned `FrameBox`, do not
     // snapshot through `run_with_jit` / `initialize_as_generator`. Re-read
     // `func` off the live publish the way `_flat_pycall_defaults` does.
+    let mut func = _roots.get(root_base);
     if new_frame._is_generator_or_coroutine() {
-        crate::call::frame_into_generator_for_function(new_frame, _roots.get(root_base))
+        pyre_object::with_roots!(func => {
+            crate::call::frame_into_generator_for_function(new_frame, func)
+        })
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        eval_fn(&mut new_frame, None)
+        pyre_object::with_roots!(func => {
+            let eval_fn = crate::call::get_eval_fn();
+            eval_fn(&mut new_frame, None)
+        })
     }
 }
 
