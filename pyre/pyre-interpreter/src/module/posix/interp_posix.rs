@@ -4884,17 +4884,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     /// (`rposix.py` `_listdir`/`fdlistdir`).
     ///
     /// `fdopendir` takes the descriptor over and `closedir` closes it, so the
-    /// caller's own is duplicated first — `interp_posix.py:1118` spells that
-    /// `rposix.dup(fd, inheritable=False)`, which is `F_DUPFD_CLOEXEC`.  The
-    /// duplicate shares its file description — and so its directory offset —
-    /// with the caller's descriptor, which would be left at the end of the
+    /// caller's own is duplicated first — `interp_posix.listdir` spells that
+    /// `rposix.dup(fd, inheritable=False)`, which is `c_dup_noninheritable`.
+    /// The duplicate shares its file description — and so its directory offset
+    /// — with the caller's descriptor, which would be left at the end of the
     /// directory and read as empty next time; `_listdir`'s `rewind=True`
     /// (`rposix.py`) puts it back before the close.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn fd_readdir(fd: i32, f: impl FnMut(&[u8], i64, u8)) -> Result<(), i32> {
-        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        let dup = unsafe { majit_rlib::rposix::c_dup_noninheritable(fd) };
         if dup < 0 {
-            return Err(crate::builtins::crt_errno());
+            return Err(majit_rlib::rposix::get_saved_errno());
         }
         // `rposix.c_fdopendir` releases the GIL and saves errno. Capture
         // that errno before `c_close`, which saves errno of its own.
@@ -5002,7 +5002,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         crate::host_seam::ops::isatty(fd).unwrap_or(false),
                     ));
                 }
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                {
+                    // `rposix.isatty`: `c_isatty(fd) != 0` (`save_err` is `RFFI_ERR_NONE`).
+                    let mut w_fd = args[0];
+                    let res = pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_isatty(fd)
+                    });
+                    Ok(pyre_object::w_bool_from(res != 0))
+                }
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,
@@ -5161,11 +5170,37 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Some(w) => crate::baseobjspace::c_int_w(w)?,
                 None => 1,
             };
-            #[cfg(all(unix, feature = "host_env"))]
+            #[cfg(unix)]
             {
-                let (columns, lines) = rustpython_host_env::posix::get_terminal_size(fd)
-                    .map_err(|e| errno_err(e.raw_os_error().unwrap_or(0), ""))?;
-                Ok(make_terminal_size(columns as i64, lines as i64))
+                // `interp_posix._get_terminal_size`: Unix arm is
+                // `rposix.c_ioctl_voidp(fd, rposix.TIOCGWINSZ, winsize)`;
+                // nonzero is `exception_from_saved_errno`. Columns/lines are
+                // `ws_col`/`ws_row`.
+                let mut winsize: libc::winsize = unsafe { core::mem::zeroed() };
+                let failed = if let Some(mut w_fd) = bound[0] {
+                    pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_ioctl_voidp(
+                            fd,
+                            majit_rlib::rposix::TIOCGWINSZ as majit_rlib::rffi::UINT,
+                            &mut winsize as *mut libc::winsize as majit_rlib::rffi::VOIDP,
+                        )
+                    })
+                } else {
+                    unsafe {
+                        majit_rlib::rposix::c_ioctl_voidp(
+                            fd,
+                            majit_rlib::rposix::TIOCGWINSZ as majit_rlib::rffi::UINT,
+                            &mut winsize as *mut libc::winsize as majit_rlib::rffi::VOIDP,
+                        )
+                    }
+                };
+                if failed != 0 {
+                    return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
+                }
+                Ok(make_terminal_size(
+                    winsize.ws_col as i64,
+                    winsize.ws_row as i64,
+                ))
             }
             #[cfg(all(windows, feature = "host_env"))]
             {
@@ -5175,7 +5210,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(make_terminal_size(columns as i64, lines as i64))
             }
             // A target with neither call has no terminal to measure.
-            #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
+            #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
             {
                 let _ = fd;
                 Ok(make_terminal_size(80, 24))
@@ -7348,6 +7383,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // stat_result type — structseq (tuple subclass). Exported so that
     // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
     crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    // `interp_posix.getcwdb` is `os.getcwd()` bytes; Unix `getcwd` is
+    // `space.fsdecode(getcwdb(space))`. `rposix.getcwd` returns those bytes.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn getcwdb_bytes() -> Result<Vec<u8>, crate::PyError> {
+        match majit_rlib::rposix::getcwd() {
+            Ok(cwd) => Ok(cwd),
+            Err(_) => Err(errno_err(majit_rlib::rposix::get_saved_errno(), "")),
+        }
+    }
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::module_ns_store(
         ns,
@@ -7367,7 +7411,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
                 }
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                {
+                    let cwd = getcwdb_bytes()?;
+                    Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
+                }
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 {
                     #[cfg(feature = "host_env")]
                     {
@@ -7394,7 +7443,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     Ok(pyre_object::w_bytes_from_bytes(&cwd))
                 }
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                {
+                    let cwd = getcwdb_bytes()?;
+                    Ok(pyre_object::w_bytes_from_bytes(&cwd))
+                }
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 {
                     #[cfg(feature = "host_env")]
                     {
@@ -8797,6 +8851,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         bound[1].unwrap_or(pyre_object::PY_NULL),
                     )
                 };
+                // `interp_posix.memfd_create` unwraps `name='text'` then
+                // `flags=int`; default flags stay `MFD_CLOEXEC`.
+                let name = pyre_object::with_roots!(w_name, w_flags => {
+                    crate::baseobjspace::text_w(w_name)
+                })?;
                 let flags = if w_flags.is_null() {
                     libc::MFD_CLOEXEC as majit_rlib::rffi::UINT
                 } else {
@@ -8804,9 +8863,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         crate::baseobjspace::int_w(w_flags)
                     })? as majit_rlib::rffi::UINT
                 };
-                let name = pyre_object::with_roots!(w_name, w_flags => {
-                    crate::baseobjspace::text_w(w_name)
-                })?;
                 let c_name = std::ffi::CString::new(name)
                     .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                 let fd = pyre_object::with_roots!(w_name, w_flags => unsafe {
@@ -8835,7 +8891,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "getxattr",
                 crate::make_builtin_function("getxattr", |args| {
-                    let (mut w_path, mut w_attribute, follow_symlinks) = {
+                    let (mut w_path, mut w_attribute, mut w_follow) = {
                         let (bound, kwargs) = bind_path_args(
                             args,
                             "getxattr",
@@ -8843,23 +8899,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             2,
                             &["follow_symlinks"],
                         )?;
-                        let mut w_path = bound[0].expect("path is required");
-                        let mut w_attribute = bound[1].expect("attribute is required");
+                        let w_path = bound[0].expect("path is required");
+                        let w_attribute = bound[1].expect("attribute is required");
                         drop(bound);
-                        let follow_symlinks =
-                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => {
-                                    let mut v = v;
-                                    pyre_object::with_roots!(w_path, w_attribute, v => {
-                                        crate::baseobjspace::is_true(v)
-                                    })?
-                                }
-                                None => true,
-                            };
-                        (w_path, w_attribute, follow_symlinks)
+                        let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            .unwrap_or(pyre_object::PY_NULL);
+                        (w_path, w_attribute, w_follow)
                     };
+                    // `interp_posix.getxattr` unwraps path, attribute, then
+                    // follow_symlinks. Path then attribute share one root
+                    // scope (`fsencode_path_then_attribute`); follow stays
+                    // pinned across that encoding.
+                    let follow_roots = pyre_object::gc_roots::push_roots();
+                    let follow_base = follow_roots.pin_roots(&[w_follow]);
                     let (_path_roots, path, attribute) =
                         fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "getxattr")?;
+                    w_follow = follow_roots.get(follow_base);
+                    let follow_symlinks = if w_follow.is_null() {
+                        true
+                    } else {
+                        pyre_object::with_roots!(w_path, w_attribute, w_follow => {
+                            crate::baseobjspace::is_true(w_follow)
+                        })?
+                    };
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "getxattr: cannot use fd and follow_symlinks together",
@@ -8873,7 +8935,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     for size in XATTR_BUF_SIZES {
                         let mut buf = vec![0u8; size];
                         let res = if path.is_fd {
-                            pyre_object::with_roots!(w_path, w_attribute => unsafe {
+                            pyre_object::with_roots!(w_path, w_attribute, w_follow => unsafe {
                                 majit_rlib::rposix::c_fgetxattr(
                                     path.as_fd,
                                     c_attr.as_ptr(),
@@ -8882,7 +8944,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 )
                             })
                         } else if follow_symlinks {
-                            pyre_object::with_roots!(w_path, w_attribute => unsafe {
+                            pyre_object::with_roots!(w_path, w_attribute, w_follow => unsafe {
                                 majit_rlib::rposix::c_getxattr(
                                     c_path.as_ptr(),
                                     c_attr.as_ptr(),
@@ -8891,7 +8953,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 )
                             })
                         } else {
-                            pyre_object::with_roots!(w_path, w_attribute => unsafe {
+                            pyre_object::with_roots!(w_path, w_attribute, w_follow => unsafe {
                                 majit_rlib::rposix::c_lgetxattr(
                                     c_path.as_ptr(),
                                     c_attr.as_ptr(),
@@ -8914,7 +8976,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         }
                     }
                     match got {
-                        Some(buf) => Ok(pyre_object::with_roots!(w_path, w_attribute => {
+                        Some(buf) => Ok(pyre_object::with_roots!(w_path, w_attribute, w_follow => {
                             pyre_object::bytesobject::w_bytes_from_bytes(&buf)
                         })),
                         None => Err(io_err_with_filename(
@@ -8929,7 +8991,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "setxattr",
                 crate::make_builtin_function("setxattr", |args| {
-                    let (mut w_path, mut w_attribute, mut w_value, mut w_flags, follow_symlinks) = {
+                    let (mut w_path, mut w_attribute, mut w_value, mut w_flags, mut w_follow) = {
                         let (bound, kwargs) = bind_path_args(
                             args,
                             "setxattr",
@@ -8937,27 +8999,35 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             3,
                             &["follow_symlinks"],
                         )?;
-                        let mut w_path = bound[0].expect("path is required");
-                        let mut w_attribute = bound[1].expect("attribute is required");
-                        let mut w_value = bound[2].expect("value is required");
-                        let mut w_flags = bound[3].unwrap_or(pyre_object::PY_NULL);
+                        let w_path = bound[0].expect("path is required");
+                        let w_attribute = bound[1].expect("attribute is required");
+                        let w_value = bound[2].expect("value is required");
+                        let w_flags = bound[3].unwrap_or(pyre_object::PY_NULL);
                         drop(bound);
-                        let follow_symlinks =
-                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => {
-                                    let mut v = v;
-                                    pyre_object::with_roots!(
-                                        w_path,
-                                        w_attribute,
-                                        w_value,
-                                        w_flags,
-                                        v => crate::baseobjspace::is_true(v)
-                                    )?
-                                }
-                                None => true,
-                            };
-                        (w_path, w_attribute, w_value, w_flags, follow_symlinks)
+                        let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            .unwrap_or(pyre_object::PY_NULL);
+                        (w_path, w_attribute, w_value, w_flags, w_follow)
                     };
+                    // `interp_posix.setxattr` unwraps path, attribute, flags,
+                    // follow_symlinks, then `space.bufferstr_w(w_value)`.
+                    let path = pyre_object::with_roots!(
+                        w_path,
+                        w_attribute,
+                        w_value,
+                        w_flags,
+                        w_follow => crate::gateway::fsencode_path_or_fd_w(w_path, "setxattr", true)
+                    )?;
+                    let attribute = pyre_object::with_roots!(
+                        w_path,
+                        w_attribute,
+                        w_value,
+                        w_flags,
+                        w_follow => crate::gateway::fsencode_path_named_w(
+                            w_attribute,
+                            "setxattr",
+                            "attribute",
+                        )
+                    )?;
                     let flags = if w_flags.is_null() {
                         0
                     } else {
@@ -8965,36 +9035,28 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             w_path,
                             w_attribute,
                             w_value,
-                            w_flags => crate::baseobjspace::c_int_w(w_flags)
+                            w_flags,
+                            w_follow => crate::baseobjspace::c_int_w(w_flags)
+                        )?
+                    };
+                    let follow_symlinks = if w_follow.is_null() {
+                        true
+                    } else {
+                        pyre_object::with_roots!(
+                            w_path,
+                            w_attribute,
+                            w_value,
+                            w_flags,
+                            w_follow => crate::baseobjspace::is_true(w_follow)
                         )?
                     };
                     let value = pyre_object::with_roots!(
                         w_path,
                         w_attribute,
                         w_value,
-                        w_flags => crate::baseobjspace::charbuf_w(w_value)
+                        w_flags,
+                        w_follow => crate::baseobjspace::charbuf_w(w_value)
                     )?;
-                    // The path and attribute each own a bracket of their own,
-                    // above this one; this one stays open until they are gone.
-                    let path_roots = pyre_object::gc_roots::push_roots();
-                    let path_base = path_roots.pin_roots(&[w_path, w_attribute, w_value, w_flags]);
-                    let path = crate::gateway::fsencode_path_or_fd_w(
-                        path_roots.get(path_base),
-                        "setxattr",
-                        true,
-                    );
-                    w_path = path_roots.get(path_base);
-                    w_attribute = path_roots.get(path_base + 1);
-                    w_value = path_roots.get(path_base + 2);
-                    w_flags = path_roots.get(path_base + 3);
-                    let path = path?;
-                    let attribute =
-                        crate::gateway::fsencode_path_named_w(w_attribute, "setxattr", "attribute");
-                    w_path = path_roots.get(path_base);
-                    w_attribute = path_roots.get(path_base + 1);
-                    w_value = path_roots.get(path_base + 2);
-                    w_flags = path_roots.get(path_base + 3);
-                    let attribute = attribute?;
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "setxattr: cannot use fd and follow_symlinks together",
@@ -9005,7 +9067,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let ret = if path.is_fd {
-                        pyre_object::with_roots!(w_path, w_attribute, w_value, w_flags => unsafe {
+                        pyre_object::with_roots!(
+                            w_path,
+                            w_attribute,
+                            w_value,
+                            w_flags,
+                            w_follow => unsafe {
                             majit_rlib::rposix::c_fsetxattr(
                                 path.as_fd,
                                 c_attr.as_ptr(),
@@ -9015,7 +9082,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             )
                         })
                     } else if follow_symlinks {
-                        pyre_object::with_roots!(w_path, w_attribute, w_value, w_flags => unsafe {
+                        pyre_object::with_roots!(
+                            w_path,
+                            w_attribute,
+                            w_value,
+                            w_flags,
+                            w_follow => unsafe {
                             majit_rlib::rposix::c_setxattr(
                                 c_path.as_ptr(),
                                 c_attr.as_ptr(),
@@ -9025,7 +9097,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             )
                         })
                     } else {
-                        pyre_object::with_roots!(w_path, w_attribute, w_value, w_flags => unsafe {
+                        pyre_object::with_roots!(
+                            w_path,
+                            w_attribute,
+                            w_value,
+                            w_flags,
+                            w_follow => unsafe {
                             majit_rlib::rposix::c_lsetxattr(
                                 c_path.as_ptr(),
                                 c_attr.as_ptr(),
@@ -9051,7 +9128,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "removexattr",
                 crate::make_builtin_function("removexattr", |args| {
-                    let (mut w_path, mut w_attribute, follow_symlinks) = {
+                    let (mut w_path, mut w_attribute, mut w_follow) = {
                         let (bound, kwargs) = bind_path_args(
                             args,
                             "removexattr",
@@ -9059,23 +9136,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             2,
                             &["follow_symlinks"],
                         )?;
-                        let mut w_path = bound[0].expect("path is required");
-                        let mut w_attribute = bound[1].expect("attribute is required");
+                        let w_path = bound[0].expect("path is required");
+                        let w_attribute = bound[1].expect("attribute is required");
                         drop(bound);
-                        let follow_symlinks =
-                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => {
-                                    let mut v = v;
-                                    pyre_object::with_roots!(w_path, w_attribute, v => {
-                                        crate::baseobjspace::is_true(v)
-                                    })?
-                                }
-                                None => true,
-                            };
-                        (w_path, w_attribute, follow_symlinks)
+                        let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            .unwrap_or(pyre_object::PY_NULL);
+                        (w_path, w_attribute, w_follow)
                     };
+                    // `interp_posix.removexattr` unwraps path, attribute, then
+                    // follow_symlinks.
+                    let follow_roots = pyre_object::gc_roots::push_roots();
+                    let follow_base = follow_roots.pin_roots(&[w_follow]);
                     let (_path_roots, path, attribute) =
                         fsencode_path_then_attribute(&mut w_path, &mut w_attribute, "removexattr")?;
+                    w_follow = follow_roots.get(follow_base);
+                    let follow_symlinks = if w_follow.is_null() {
+                        true
+                    } else {
+                        pyre_object::with_roots!(w_path, w_attribute, w_follow => {
+                            crate::baseobjspace::is_true(w_follow)
+                        })?
+                    };
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "removexattr: cannot use fd and follow_symlinks together",
@@ -9086,15 +9167,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     let ret = if path.is_fd {
-                        pyre_object::with_roots!(w_path, w_attribute => unsafe {
+                        pyre_object::with_roots!(w_path, w_attribute, w_follow => unsafe {
                             majit_rlib::rposix::c_fremovexattr(path.as_fd, c_attr.as_ptr())
                         })
                     } else if follow_symlinks {
-                        pyre_object::with_roots!(w_path, w_attribute => unsafe {
+                        pyre_object::with_roots!(w_path, w_attribute, w_follow => unsafe {
                             majit_rlib::rposix::c_removexattr(c_path.as_ptr(), c_attr.as_ptr())
                         })
                     } else {
-                        pyre_object::with_roots!(w_path, w_attribute => unsafe {
+                        pyre_object::with_roots!(w_path, w_attribute, w_follow => unsafe {
                             majit_rlib::rposix::c_lremovexattr(c_path.as_ptr(), c_attr.as_ptr())
                         })
                     };
@@ -9114,34 +9195,35 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ns,
                 "listxattr",
                 crate::make_builtin_function("listxattr", |args| {
-                    let (mut w_path, follow_symlinks) = {
+                    let (mut w_path, mut w_follow) = {
                         let (bound, kwargs) =
                             bind_path_args(args, "listxattr", &["path"], 1, &["follow_symlinks"])?;
-                        let mut w_path = bound[0].expect("path is required");
+                        let w_path = bound[0].expect("path is required");
                         drop(bound);
-                        let follow_symlinks =
-                            match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
-                                Some(v) => {
-                                    let mut v = v;
-                                    pyre_object::with_roots!(w_path, v => {
-                                        crate::baseobjspace::is_true(v)
-                                    })?
-                                }
-                                None => true,
-                            };
-                        (w_path, follow_symlinks)
+                        let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            .unwrap_or(pyre_object::PY_NULL);
+                        (w_path, w_follow)
                     };
+                    // `interp_posix.listxattr` unwraps path, then follow_symlinks.
                     // The path owns a bracket of its own, above this one; this
                     // one stays open until the path is gone.
                     let path_roots = pyre_object::gc_roots::push_roots();
-                    let path_base = path_roots.pin_roots(&[w_path]);
+                    let path_base = path_roots.pin_roots(&[w_path, w_follow]);
                     let path = crate::gateway::fsencode_path_or_fd_w(
                         path_roots.get(path_base),
                         "listxattr",
                         true,
                     );
                     w_path = path_roots.get(path_base);
+                    w_follow = path_roots.get(path_base + 1);
                     let path = path?;
+                    let follow_symlinks = if w_follow.is_null() {
+                        true
+                    } else {
+                        pyre_object::with_roots!(w_path, w_follow => {
+                            crate::baseobjspace::is_true(w_follow)
+                        })?
+                    };
                     if path.is_fd && !follow_symlinks {
                         return Err(crate::PyError::value_error(
                             "listxattr: cannot use fd and follow_symlinks together",
@@ -9153,7 +9235,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     for size in XATTR_BUF_SIZES {
                         let mut buf = vec![0u8; size];
                         let res = if path.is_fd {
-                            pyre_object::with_roots!(w_path => unsafe {
+                            pyre_object::with_roots!(w_path, w_follow => unsafe {
                                 majit_rlib::rposix::c_flistxattr(
                                     path.as_fd,
                                     buf.as_mut_ptr() as *mut libc::c_char,
@@ -9161,7 +9243,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 )
                             })
                         } else if follow_symlinks {
-                            pyre_object::with_roots!(w_path => unsafe {
+                            pyre_object::with_roots!(w_path, w_follow => unsafe {
                                 majit_rlib::rposix::c_listxattr(
                                     c_path.as_ptr(),
                                     buf.as_mut_ptr() as *mut libc::c_char,
@@ -9169,7 +9251,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                                 )
                             })
                         } else {
-                            pyre_object::with_roots!(w_path => unsafe {
+                            pyre_object::with_roots!(w_path, w_follow => unsafe {
                                 majit_rlib::rposix::c_llistxattr(
                                     c_path.as_ptr(),
                                     buf.as_mut_ptr() as *mut libc::c_char,
@@ -9204,7 +9286,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if !names.is_empty() {
                         names.pop();
                     }
-                    Ok(pyre_object::with_roots!(w_path => {
+                    Ok(pyre_object::with_roots!(w_path, w_follow => {
                         let mut items = pyre_object::gc_roots::RootedItems::new();
                         for name in names {
                             items.push(crate::gateway::fsdecode_filename_bytes(name));
@@ -12665,18 +12747,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             fn collect_spawn_env(
                 mapping: pyre_object::PyObjectRef,
             ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
-                // CPython's posix_spawn accepts None as "inherit environ";
-                // subprocess._posix_spawn uses exactly this form when Popen
-                // was called without an explicit env mapping.
+                // Inherit snapshot is `rposix_environ.envitems_llimpl` so it
+                // shares the keepalive mutex with `putenv_llimpl`.
                 let entries = if unsafe { pyre_object::is_none(mapping) } {
-                    host_os::vars_os()
+                    majit_rlib::rposix_environ::envitems_llimpl()
+                        .into_iter()
                         .map(|(key, value)| {
-                            let key = key.as_encoded_bytes();
-                            let value = value.as_encoded_bytes();
                             let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
-                            entry.extend_from_slice(key);
+                            entry.extend_from_slice(&key);
                             entry.push(b'=');
-                            entry.extend_from_slice(value);
+                            entry.extend_from_slice(&value);
                             entry
                         })
                         .collect()
