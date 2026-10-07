@@ -343,3 +343,22 @@ if sys.platform == "darwin":
     finally:
         os.close(_read_fd)
         os.close(_write_fd)
+
+
+# `wrap_oserror2` attaches `Path.w_path` as `OSError.filename`. Path and
+# attribute are converted separately; the filename slot is the path object.
+if hasattr(os, "getxattr"):
+    _xattr_missing = os.fsencode("/tmp/pyre_xattr_missing_" + str(os.getpid()))
+    _xattr_attr = "user.test"
+    for _xattr_call in (
+        lambda: os.listxattr(_xattr_missing),
+        lambda: os.getxattr(_xattr_missing, _xattr_attr),
+        lambda: os.setxattr(_xattr_missing, _xattr_attr, b"user"),
+        lambda: os.removexattr(_xattr_missing, _xattr_attr),
+    ):
+        try:
+            _xattr_call()
+        except OSError as _err:
+            assert _err.filename is _xattr_missing, (_xattr_call, _err.filename)
+        else:
+            raise AssertionError("expected OSError from " + _xattr_call.__name__)

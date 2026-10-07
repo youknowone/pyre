@@ -2068,7 +2068,17 @@ impl UnrollOptimizer {
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
             let preamble_arity = exported_renamed_inputargs.len();
-            let body_jump_arity = body_terminal_op.as_ref().map(|j| j.num_args()).unwrap_or(0);
+            let body_jump_arity = body_terminal_op
+                .as_ref()
+                .map(|j| j.num_args())
+                .or_else(|| {
+                    body_ops
+                        .iter()
+                        .rev()
+                        .find(|op| op.opcode == OpCode::Jump)
+                        .map(|op| op.num_args())
+                })
+                .unwrap_or(0);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
@@ -2096,9 +2106,9 @@ impl UnrollOptimizer {
             // reads a raw integer as a Ref — measured as EXC_BAD_ACCESS on the
             // loop counter inside GuardClass.
             //
-            // Give up, which is `unroll.py:242`'s own escape (it lets
+            // Give up, which is `jump_to_preamble`'s own escape (it lets
             // `send_extra_operation` raise `InvalidLoop`) and lands on
-            // `compile.py:368-371`'s cancel. Scoped to the retrace: a
+            // `compile_retrace`'s cancel. Scoped to the retrace: a
             // `compile_loop` unroll keeps its start label in the SAME artifact,
             // so its preamble target is local and this mismatch cannot arise.
             if !self.emit_start_label && body_jump_arity != preamble_arity {
