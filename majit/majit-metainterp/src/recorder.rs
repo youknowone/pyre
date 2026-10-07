@@ -2475,11 +2475,18 @@ mod tests {
             assert_eq!(trb._refs.iter().filter(|&&a| a == 0x1000).count(), 1);
         }
 
-        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        // `_refs` is a GcArray of GCREF the collector traces itself.
+        // `walk_const_ptr_refs` rekeys `_refs_dict` from that array and
+        // traces ConstPtr table slots the recorder still holds.
+        majit_ir::const_ptr_table::walk(&mut |gcref| {
+            if gcref.0 == 0x1000 {
+                gcref.0 += 0x1000;
+            }
+        });
+        rec.walk_const_ptr_refs(&mut |_| {});
+        assert_eq!(old.as_const_ptr(), Some(GcRef(0x2000)));
         let trb = rec.trb.as_ref().expect("byte buffer");
-        assert!(trb._refs.iter().any(|&a| a == 0x2000));
-        assert!(!trb._refs.iter().any(|&a| a == 0x1000));
-        assert_eq!(trb._refs_dict.get(&0x2000).copied(), Some(1));
+        assert_eq!(trb._refs_dict.len(), 1, "same address interned once");
     }
 
     #[test]
@@ -2497,24 +2504,26 @@ mod tests {
         }
         rec.record_guard(OpCode::GuardTrue, &[OpRef::const_int(1)], None);
         let mut visited = Vec::new();
-        rec.walk_const_ptr_refs(&mut |reference| {
-            visited.push(reference.0);
-            reference.0 += 0x1000;
+        majit_ir::const_ptr_table::walk(&mut |reference| {
+            if (base..base + 4 * 0x1000).contains(&reference.0) {
+                visited.push(reference.0);
+                reference.0 += 0x1000;
+            }
         });
+        rec.walk_const_ptr_refs(&mut |_| {});
         visited.sort_unstable();
         assert_eq!(
             visited,
             vec![base, base + 0x1000, base + 0x2000, base + 0x3000]
         );
-        let trb = rec.trb.as_ref().expect("byte buffer");
-        assert_eq!(trb._refs_dict.len(), 4);
-        for i in 0..4 {
-            let address = base + (i + 1) * 0x1000;
-            assert!(
-                trb._refs.iter().any(|&a| a == address),
-                "forwarded {address:#x} missing from _refs"
+        for (i, &constant) in constants.iter().enumerate() {
+            assert_eq!(
+                constant.as_const_ptr(),
+                Some(GcRef(base + (i + 1) * 0x1000))
             );
         }
+        let trb = rec.trb.as_ref().expect("byte buffer");
+        assert_eq!(trb._refs_dict.len(), 4);
     }
 
     #[test]
