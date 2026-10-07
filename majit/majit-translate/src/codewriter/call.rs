@@ -5976,35 +5976,15 @@ impl CallControl {
     /// the callee whose argument carries the flag, and only when
     /// `_jit_look_inside_` is not false. The flag is stripped from the
     /// argument in that case instead of being written on the callee.
-    /// `seeded_inputs` are that callee's formals the flagged actuals
-    /// bind to, so a later `hint_fresh_virtualizable` inside the body
-    /// still forwards the flag.
-    ///
-    /// The first AccessDirect call assigns those formals. A later call
-    /// to the same graph intersects them: `pairtype(SomeInstance,
-    /// SomeInstance).union` keeps a flag only when every binding has
-    /// it, and `default_specialize` caches one `(AccessDirect, key)`
-    /// graph for every flagged call. Returns whether the seed set
-    /// changed, so BFS can scan an already-candidate graph again.
-    fn note_access_directly_callee(&mut self, path: &CallPath, seeded_inputs: &[u64]) -> bool {
+    fn stamp_access_directly_flag(&mut self, path: &CallPath) -> bool {
         let Some(graph) = self.function_graphs.get_mut(path) else {
             return false;
         };
         if graph.func.jit_look_inside == Some(false) {
             return false;
         }
-        if !graph.access_directly {
-            graph.access_directly = true;
-            graph
-                .access_directly_inputs
-                .extend_from_slice(seeded_inputs);
-            return true;
-        }
-        let before = graph.access_directly_inputs.len();
-        graph
-            .access_directly_inputs
-            .retain(|id| seeded_inputs.contains(id));
-        graph.access_directly_inputs.len() != before
+        graph.access_directly = true;
+        true
     }
 
     /// Formals of `callee` whose actual is in `hinted`.
@@ -6171,278 +6151,318 @@ impl CallControl {
                 todo.push(path);
             }
         }
-        while let Some(path) = todo.pop() {
-            let graph = match self.function_graphs.get(&path) {
-                Some(g) => g.clone(),
-                None => {
-                    crate::decline::record(
-                        BFS_GATE,
-                        "seeded-path-has-no-graph",
-                        format_args!("{path}"),
-                    );
-                    continue;
-                }
-            };
-            let access_directly_vars = Self::access_directly_result_ids(&graph);
-            // RPython call.py:77-90: scan all Call ops in the graph.
-            // For each call, check guess_call_kind (with BFS-aware
-            // is_candidate that treats "has graph" as candidate).
-            for (block_idx, block) in graph.blocks.iter().enumerate() {
-                for (op_idx, op) in block.operations.iter().enumerate() {
-                    // `call.py:76-77` — only `direct_call` and
-                    // `indirect_call` ops are walked; everything else is
-                    // skipped.  The op-shape dispatch produces the callee
-                    // set `call.py graphs_from(op, is_candidate)` would
-                    // yield: one path for a direct call, the whole family
-                    // for an indirect one.
-                    let passes_access_directly =
-                        Self::op_passes_access_directly(&op.kind, &access_directly_vars);
-                    let callees: Vec<CallPath> = match &op.kind {
-                        // `call.py:103-112` indirect_call — the attached
-                        // `c_graphs` family, `None` meaning "unknown
-                        // family" and classifying the site as residual.
-                        OpKind::IndirectCall { graphs, .. } => match graphs {
-                            Some(graphs) if graphs.is_empty() => builtin_wrappers.clone(),
-                            Some(graphs) => graphs.clone(),
-                            None => {
-                                crate::decline::record(
-                                    BFS_GATE,
-                                    "indirect-family-unknown",
-                                    format_args!("in {path}"),
-                                );
-                                continue;
-                            }
-                        },
-                        // Same indirect_call site, spelled the way it
-                        // exists *before* `rpbc::lower_indirect_calls`
-                        // rewrites it into `VtableMethodPtr` +
-                        // `IndirectCall`.  That lowering runs inside
-                        // `transform_graph_to_jitcode`, i.e. strictly
-                        // after `find_all_graphs`, so this is the shape
-                        // the BFS actually sees.
-                        //
-                        // This is not a second family resolver: the arm
-                        // below and `lower_indirect_calls` both call
-                        // `all_impls_for_indirect`, and the lowering only
-                        // folds an empty answer into `graphs = None`,
-                        // which the arm above skips exactly as an empty
-                        // `callees` does here.  The two arms therefore
-                        // enumerate the same callees
-                        // (`rpbc.py c_graphs = row_of_graphs.values()`).
-                        //
-                        // Running the lowering before graph discovery so
-                        // only the post-rtyper shape reaches the BFS would
-                        // match RPython's phase order, but it forces every
-                        // registered graph to be lowered up front, which is
-                        // the eager pass on-demand body lowering replaced
-                        // when the prepass peak RSS came down from 7.71 GB
-                        // to 4.25 GB.
-                        OpKind::Call {
-                            target:
-                                CallTarget::Indirect {
-                                    trait_root,
-                                    method_name,
-                                },
-                            ..
-                        } => self.all_impls_for_indirect(trait_root, method_name),
-                        // `call.py:117-136` direct_call.  These three
-                        // classifications are attached to the single
-                        // `funcobj` and so apply to the direct branch
-                        // only; an indirect family is instead validated
-                        // as a whole in `getcalldescr`.
-                        OpKind::Call { target, .. } => {
-                            let callee_path =
-                                match self.direct_callee_graph_path(target, Some(&path)) {
-                                    Some(callee) => callee,
-                                    None => {
-                                        // The single widest silent refusal in the
-                                        // pipeline: a call whose target resolves to
-                                        // no registered path at all.  Upstream has
-                                        // no analogue — `funcobj.graph` is an
-                                        // object reference that either exists or is
-                                        // `None` (`guess_call_kind`), never a name lookup
-                                        // that can miss — so a miss here means the
-                                        // callee was never lowered into
-                                        // `function_graphs`, not that a gate judged
-                                        // it.  Every gate downstream of this point
-                                        // is therefore never consulted for this
-                                        // callee, which is exactly the reading that
-                                        // a bare `continue` cannot support.
-                                        crate::decline::record(
-                                            BFS_GATE,
-                                            "callee-target-unresolvable",
-                                            format_args!("{target:?} in {path}"),
-                                        );
-                                        continue;
+        // Annotator union of AccessDirect formals finishes before any
+        // body forwards them. Collect every flagged call site, then
+        // write the intersection and rescan.
+        let mut access_direct_sites: HashMap<CallPath, Vec<u64>> = HashMap::new();
+        let mut published: HashSet<CallPath> = HashSet::new();
+        loop {
+            while let Some(path) = todo.pop() {
+                let graph = match self.function_graphs.get(&path) {
+                    Some(g) => g.clone(),
+                    None => {
+                        crate::decline::record(
+                            BFS_GATE,
+                            "seeded-path-has-no-graph",
+                            format_args!("{path}"),
+                        );
+                        continue;
+                    }
+                };
+                // A flagged call from this graph is a complete observation
+                // only after incoming AccessDirect sites have been
+                // committed. An earlier scan would record an unflagged
+                // formal that later `retain` cannot restore
+                // (`annrpython.py recursivecall` binds actuals after
+                // `mergeinputargs`).
+                let caller_ready =
+                    published.contains(&path) || !access_direct_sites.contains_key(&path);
+                let access_directly_vars = Self::access_directly_result_ids(&graph);
+                // RPython call.py:77-90: scan all Call ops in the graph.
+                // For each call, check guess_call_kind (with BFS-aware
+                // is_candidate that treats "has graph" as candidate).
+                for (block_idx, block) in graph.blocks.iter().enumerate() {
+                    for (op_idx, op) in block.operations.iter().enumerate() {
+                        // `call.py:76-77` — only `direct_call` and
+                        // `indirect_call` ops are walked; everything else is
+                        // skipped.  The op-shape dispatch produces the callee
+                        // set `call.py graphs_from(op, is_candidate)` would
+                        // yield: one path for a direct call, the whole family
+                        // for an indirect one.
+                        let passes_access_directly =
+                            Self::op_passes_access_directly(&op.kind, &access_directly_vars);
+                        let callees: Vec<CallPath> = match &op.kind {
+                            // `call.py:103-112` indirect_call — the attached
+                            // `c_graphs` family, `None` meaning "unknown
+                            // family" and classifying the site as residual.
+                            OpKind::IndirectCall { graphs, .. } => match graphs {
+                                Some(graphs) if graphs.is_empty() => builtin_wrappers.clone(),
+                                Some(graphs) => graphs.clone(),
+                                None => {
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "indirect-family-unknown",
+                                        format_args!("in {path}"),
+                                    );
+                                    continue;
+                                }
+                            },
+                            // Same indirect_call site, spelled the way it
+                            // exists *before* `rpbc::lower_indirect_calls`
+                            // rewrites it into `VtableMethodPtr` +
+                            // `IndirectCall`.  That lowering runs inside
+                            // `transform_graph_to_jitcode`, i.e. strictly
+                            // after `find_all_graphs`, so this is the shape
+                            // the BFS actually sees.
+                            //
+                            // This is not a second family resolver: the arm
+                            // below and `lower_indirect_calls` both call
+                            // `all_impls_for_indirect`, and the lowering only
+                            // folds an empty answer into `graphs = None`,
+                            // which the arm above skips exactly as an empty
+                            // `callees` does here.  The two arms therefore
+                            // enumerate the same callees
+                            // (`rpbc.py c_graphs = row_of_graphs.values()`).
+                            //
+                            // Running the lowering before graph discovery so
+                            // only the post-rtyper shape reaches the BFS would
+                            // match RPython's phase order, but it forces every
+                            // registered graph to be lowered up front, which is
+                            // the eager pass on-demand body lowering replaced
+                            // when the prepass peak RSS came down from 7.71 GB
+                            // to 4.25 GB.
+                            OpKind::Call {
+                                target:
+                                    CallTarget::Indirect {
+                                        trait_root,
+                                        method_name,
+                                    },
+                                ..
+                            } => self.all_impls_for_indirect(trait_root, method_name),
+                            // `call.py:117-136` direct_call.  These three
+                            // classifications are attached to the single
+                            // `funcobj` and so apply to the direct branch
+                            // only; an indirect family is instead validated
+                            // as a whole in `getcalldescr`.
+                            OpKind::Call { target, .. } => {
+                                let callee_path =
+                                    match self.direct_callee_graph_path(target, Some(&path)) {
+                                        Some(callee) => callee,
+                                        None => {
+                                            // The single widest silent refusal in the
+                                            // pipeline: a call whose target resolves to
+                                            // no registered path at all.  Upstream has
+                                            // no analogue — `funcobj.graph` is an
+                                            // object reference that either exists or is
+                                            // `None` (`guess_call_kind`), never a name lookup
+                                            // that can miss — so a miss here means the
+                                            // callee was never lowered into
+                                            // `function_graphs`, not that a gate judged
+                                            // it.  Every gate downstream of this point
+                                            // is therefore never consulted for this
+                                            // callee, which is exactly the reading that
+                                            // a bare `continue` cannot support.
+                                            crate::decline::record(
+                                                BFS_GATE,
+                                                "callee-target-unresolvable",
+                                                format_args!("{target:?} in {path}"),
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                // `getfunctionptr(graph)`: remember the nested
+                                // closure identity on the op so emit's
+                                // `graphs_from` uses the same path BFS followed.
+                                if matches!(
+                                    target,
+                                    CallTarget::Method {
+                                        resolved_path: None,
+                                        fun_decl_id: None,
+                                        ..
                                     }
-                                };
-                            // `getfunctionptr(graph)`: remember the nested
-                            // closure identity on the op so emit's
-                            // `graphs_from` uses the same path BFS followed.
-                            if matches!(
-                                target,
-                                CallTarget::Method {
-                                    resolved_path: None,
-                                    fun_decl_id: None,
-                                    ..
+                                ) {
+                                    self.stamp_method_resolved_path(
+                                        &path,
+                                        block_idx,
+                                        op_idx,
+                                        callee_path.clone(),
+                                    );
                                 }
-                            ) {
-                                self.stamp_method_resolved_path(
-                                    &path,
-                                    block_idx,
-                                    op_idx,
-                                    callee_path.clone(),
-                                );
-                            }
-                            // `call.py:119-120`
-                            // jitdriver_sd_from_portal_runner_ptr → recursive.
-                            if self.is_portal_recursive_call(&callee_path) {
-                                // Not a refusal — the portal is already a
-                                // candidate and re-walking it would loop —
-                                // but recorded so the BFS's skip rows add up
-                                // to every call site it saw.
-                                crate::decline::record(
-                                    BFS_GATE,
-                                    "callee-is-portal-recursive",
-                                    format_args!("{callee_path} in {path}"),
-                                );
-                                continue;
-                            }
-                            // `call.py:129-134`
-                            // `_gctransformer_hint_close_stack_` → residual.
-                            // `get_jitcode` asserts such a graph never
-                            // reaches it, so following one here would turn
-                            // a residual classification into a panic.
-                            if self
-                                .func_effects(&callee_path)
-                                .is_some_and(|f| f.close_stack)
-                            {
-                                crate::decline::record(
-                                    BFS_GATE,
-                                    "callee-close-stack-residual",
-                                    format_args!("{callee_path} in {path}"),
-                                );
-                                continue;
-                            }
-                            // `call.py:135-136`
-                            // `hasattr(targetgraph.func, 'oopspec')` → builtin.
-                            if self
-                                .func_effects_with_crate_alias(&callee_path)
-                                .is_some_and(|f| f.recorded_oopspec().is_some())
-                            {
-                                crate::decline::record(
-                                    BFS_GATE,
-                                    "callee-oopspec-builtin",
-                                    format_args!("{callee_path} in {path}"),
-                                );
-                                continue;
-                            }
-                            // `#[pyre_class]`'s `allocate`/`allocate_stable`
-                            // constructors build the object then call the
-                            // non-numeric `lltype::malloc_typed[_stable]`, which
-                            // has no ported general `malloc->new` lowering.  The
-                            // caller resolves them to the
-                            // `collect_marked_class_ctor_stubs_from_llbc` residual
-                            // stub, so — like a builtin — the BFS must not follow
-                            // the constructor body: otherwise the two-phase census
-                            // annotates its unliftable body (and its transitive
-                            // `malloc_typed_stable`) standalone and reports a
-                            // spurious Phase-A failure for a graph no caller ever
-                            // traces into.
-                            if matches!(
-                                callee_path.last_segment(),
-                                Some("allocate") | Some("allocate_stable")
-                            ) {
-                                crate::decline::record(
-                                    BFS_GATE,
-                                    "callee-pyre-class-ctor",
-                                    format_args!("{callee_path} in {path}"),
-                                );
-                                continue;
-                            }
-                            vec![callee_path]
-                        }
-                        // Not a call operation.  This arm is the population
-                        // filter, not a decline: recording it would count
-                        // every arithmetic op in every graph and drown the
-                        // rows that are about call sites.
-                        _ => continue,
-                    };
-                    for callee_path in callees {
-                        // A target with no registered graph is upstream's
-                        // `funcobj.graph is None` → residual (call.py:127).
-                        //
-                        // In upstream that condition is a property of the
-                        // callable (an `external`/`llhelper` funcptr genuinely
-                        // has no graph).  Here it also covers a callee whose
-                        // body the front end never lowered — the two are
-                        // indistinguishable from inside this loop, which is
-                        // precisely why the count has to exist: it turns "no
-                        // jitcode appeared" into "this named path had no
-                        // registered graph at BFS time".
-                        let graph_ref = match self.function_graphs.get(&callee_path) {
-                            Some(g) => g,
-                            None => {
-                                crate::decline::record(
-                                    BFS_GATE,
-                                    "callee-has-no-registered-graph",
-                                    format_args!("{callee_path} in {path}"),
-                                );
-                                continue;
-                            }
-                        };
-                        // `default_specialize` writes `access_directly` on
-                        // the callee before `look_inside_graph`. RPython's
-                        // `AccessDirect` cache key is a different graph, so
-                        // the already-candidate continue in `find_all_graphs`
-                        // does not skip that later call. One codewriter
-                        // graph records the later seed and is scanned
-                        // again when the set changed. `get` clones the
-                        // `Rc`, so drop it and re-read after the write
-                        // (`make_mut` would otherwise copy).
-                        let already_candidate = self.candidate_graphs.contains(&callee_path);
-                        if passes_access_directly {
-                            let seeded = Self::access_directly_input_ids(
-                                &op.kind,
-                                &access_directly_vars,
-                                &graph_ref,
-                            );
-                            drop(graph_ref);
-                            let changed = self.note_access_directly_callee(&callee_path, &seeded);
-                            if already_candidate {
-                                if changed {
-                                    todo.push(callee_path);
+                                // `call.py:119-120`
+                                // jitdriver_sd_from_portal_runner_ptr → recursive.
+                                if self.is_portal_recursive_call(&callee_path) {
+                                    // Not a refusal — the portal is already a
+                                    // candidate and re-walking it would loop —
+                                    // but recorded so the BFS's skip rows add up
+                                    // to every call site it saw.
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "callee-is-portal-recursive",
+                                        format_args!("{callee_path} in {path}"),
+                                    );
+                                    continue;
                                 }
+                                // `call.py:129-134`
+                                // `_gctransformer_hint_close_stack_` → residual.
+                                // `get_jitcode` asserts such a graph never
+                                // reaches it, so following one here would turn
+                                // a residual classification into a panic.
+                                if self
+                                    .func_effects(&callee_path)
+                                    .is_some_and(|f| f.close_stack)
+                                {
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "callee-close-stack-residual",
+                                        format_args!("{callee_path} in {path}"),
+                                    );
+                                    continue;
+                                }
+                                // `call.py:135-136`
+                                // `hasattr(targetgraph.func, 'oopspec')` → builtin.
+                                if self
+                                    .func_effects_with_crate_alias(&callee_path)
+                                    .is_some_and(|f| f.recorded_oopspec().is_some())
+                                {
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "callee-oopspec-builtin",
+                                        format_args!("{callee_path} in {path}"),
+                                    );
+                                    continue;
+                                }
+                                // `#[pyre_class]`'s `allocate`/`allocate_stable`
+                                // constructors build the object then call the
+                                // non-numeric `lltype::malloc_typed[_stable]`, which
+                                // has no ported general `malloc->new` lowering.  The
+                                // caller resolves them to the
+                                // `collect_marked_class_ctor_stubs_from_llbc` residual
+                                // stub, so — like a builtin — the BFS must not follow
+                                // the constructor body: otherwise the two-phase census
+                                // annotates its unliftable body (and its transitive
+                                // `malloc_typed_stable`) standalone and reports a
+                                // spurious Phase-A failure for a graph no caller ever
+                                // traces into.
+                                if matches!(
+                                    callee_path.last_segment(),
+                                    Some("allocate") | Some("allocate_stable")
+                                ) {
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "callee-pyre-class-ctor",
+                                        format_args!("{callee_path} in {path}"),
+                                    );
+                                    continue;
+                                }
+                                vec![callee_path]
+                            }
+                            // Not a call operation.  This arm is the population
+                            // filter, not a decline: recording it would count
+                            // every arithmetic op in every graph and drown the
+                            // rows that are about call sites.
+                            _ => continue,
+                        };
+                        for callee_path in callees {
+                            // A target with no registered graph is upstream's
+                            // `funcobj.graph is None` → residual (call.py:127).
+                            //
+                            // In upstream that condition is a property of the
+                            // callable (an `external`/`llhelper` funcptr genuinely
+                            // has no graph).  Here it also covers a callee whose
+                            // body the front end never lowered — the two are
+                            // indistinguishable from inside this loop, which is
+                            // precisely why the count has to exist: it turns "no
+                            // jitcode appeared" into "this named path had no
+                            // registered graph at BFS time".
+                            let graph_ref = match self.function_graphs.get(&callee_path) {
+                                Some(g) => g,
+                                None => {
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "callee-has-no-registered-graph",
+                                        format_args!("{callee_path} in {path}"),
+                                    );
+                                    continue;
+                                }
+                            };
+                            // `default_specialize` writes `access_directly` on
+                            // the callee before `look_inside_graph`. RPython's
+                            // `AccessDirect` cache key is a different graph, so
+                            // the already-candidate continue in `find_all_graphs`
+                            // does not skip that later call. One codewriter
+                            // graph records every flagged call site and
+                            // forwards formals only after those sites
+                            // intersect. `get` clones the `Rc`, so drop it
+                            // before the write (`make_mut` would otherwise
+                            // copy).
+                            let already_candidate = self.candidate_graphs.contains(&callee_path);
+                            if passes_access_directly && caller_ready {
+                                let seeded = Self::access_directly_input_ids(
+                                    &op.kind,
+                                    &access_directly_vars,
+                                    &graph_ref,
+                                );
+                                drop(graph_ref);
+                                if self.stamp_access_directly_flag(&callee_path) {
+                                    match access_direct_sites.entry(callee_path.clone()) {
+                                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                            entry.get_mut().retain(|id| seeded.contains(id));
+                                        }
+                                        std::collections::hash_map::Entry::Vacant(entry) => {
+                                            entry.insert(seeded);
+                                        }
+                                    }
+                                }
+                                if already_candidate {
+                                    continue;
+                                }
+                            } else if already_candidate {
                                 continue;
                             }
-                        } else if already_candidate {
-                            continue;
-                        }
-                        let graph_ref = match self.function_graphs.get(&callee_path) {
-                            Some(g) => g,
-                            None => continue,
-                        };
-                        // RPython call.py:84,87: callee must satisfy
-                        // policy.look_inside_graph(graph).
-                        if policy.look_inside_graph(&graph_ref) {
-                            self.candidate_graphs.insert(callee_path.clone());
-                            todo.push(callee_path);
-                        } else {
-                            // `policy.py look_inside_graph` said no —
-                            // a `dont_look_inside` / `elidable` hint, or a
-                            // loop without `unroll_safe`.  Upstream and pyre
-                            // agree on this one, so it is the decline row a
-                            // reader wants to see NON-empty: a zero here with
-                            // a non-zero `callee-has-no-registered-graph`
-                            // means the policy never got a say.
-                            crate::decline::record(
-                                BFS_GATE,
-                                "callee-policy-declined",
-                                format_args!("{callee_path} in {path}"),
-                            );
+                            let graph_ref = match self.function_graphs.get(&callee_path) {
+                                Some(g) => g,
+                                None => continue,
+                            };
+                            // RPython call.py:84,87: callee must satisfy
+                            // policy.look_inside_graph(graph).
+                            if policy.look_inside_graph(&graph_ref) {
+                                self.candidate_graphs.insert(callee_path.clone());
+                                todo.push(callee_path);
+                            } else {
+                                // `policy.py look_inside_graph` said no —
+                                // a `dont_look_inside` / `elidable` hint, or a
+                                // loop without `unroll_safe`.  Upstream and pyre
+                                // agree on this one, so it is the decline row a
+                                // reader wants to see NON-empty: a zero here with
+                                // a non-zero `callee-has-no-registered-graph`
+                                // means the policy never got a say.
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "callee-policy-declined",
+                                    format_args!("{callee_path} in {path}"),
+                                );
+                            }
                         }
                     }
                 }
+            }
+            let mut progressed = false;
+            for (path, seeds) in &access_direct_sites {
+                let Some(graph) = self.function_graphs.get_mut(path) else {
+                    continue;
+                };
+                let inputs_changed = graph.access_directly_inputs != *seeds;
+                if inputs_changed {
+                    graph.access_directly_inputs.clone_from(seeds);
+                }
+                let first_publish = published.insert(path.clone());
+                if self.candidate_graphs.contains(path) && (first_publish || inputs_changed) {
+                    todo.push(path.clone());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
             }
         }
     }
@@ -12314,6 +12334,182 @@ mod tests {
         let stored_inner = cc.function_graphs().get(&inner_path).expect("inner");
         assert!(!stored_inner.access_directly);
         assert!(!cc.is_candidate(&inner_path));
+    }
+
+    /// Flagged calls in separate helpers can be seen in an order that
+    /// would scan `mid` after the first site and before the second.
+    /// The annotator unions every AccessDirect site before a body
+    /// forwards a formal, so a loopy child of the first formal is not
+    /// stamped.
+    #[test]
+    fn helper_graphs_intersect_formals_before_forwarding() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let mid_path = CallPath::from_segments(["mid"]);
+        let mut mid = FunctionGraph::new("mid");
+        let entry = mid.startblock;
+        let p0 = mid.alloc_value_var();
+        let p1 = mid.alloc_value_var();
+        mid.block_mut(entry).inputargs.push(p0.clone());
+        mid.block_mut(entry).inputargs.push(p1);
+        mid.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([p0]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(mid_path.clone(), mid);
+
+        let mut make_helper = |name: &str, hint_first: bool| {
+            let helper_path = CallPath::from_segments([name]);
+            let mut helper = FunctionGraph::new(name);
+            let entry = helper.startblock;
+            let frame = helper.alloc_value_var();
+            let hinted = helper.alloc_value_var();
+            helper.block_mut(entry).operations.push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args([frame]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            let plain = helper.alloc_value_var();
+            let args = if hint_first {
+                crate::model::call_args([hinted, plain])
+            } else {
+                crate::model::call_args([plain, hinted])
+            };
+            helper.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                    args,
+                    result_ty: ValueType::Void,
+                },
+            });
+            cc.register_function_graph(helper_path.clone(), helper);
+            helper_path
+        };
+        let helper_a = make_helper("helper_a", true);
+        let helper_b = make_helper("helper_b", false);
+        drop(make_helper);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        // LIFO pops `helper_a` first: the site that flags `p0`.
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(helper_b.segments.iter().map(String::as_str)),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(helper_a.segments.iter().map(String::as_str)),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        let stored_mid = cc.function_graphs().get(&mid_path).expect("mid");
+        assert!(stored_mid.access_directly);
+        assert!(stored_mid.access_directly_inputs.is_empty());
+        let stored_inner = cc.function_graphs().get(&inner_path).expect("inner");
+        assert!(!stored_inner.access_directly);
+        assert!(!cc.is_candidate(&inner_path));
+    }
+
+    /// `H` calls `M(local_hint, H_formal)`. The first scan of `H` happens
+    /// before `H`'s formals are committed, so it would record only
+    /// `M`'s first argument. `retain` cannot restore the second; the
+    /// call site is recorded only after `mergeinputargs` would have
+    /// bound `H`'s actuals.
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn later_pass_keeps_formals_unknown_on_the_first_scan() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let m_path = CallPath::from_segments(["M"]);
+        let mut m = FunctionGraph::new("M");
+        let entry = m.startblock;
+        let mp0 = m.alloc_value_var();
+        let mp1 = m.alloc_value_var();
+        m.block_mut(entry).inputargs.push(mp0);
+        m.block_mut(entry).inputargs.push(mp1.clone());
+        m.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([mp1]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(m_path.clone(), m);
+
+        let h_path = CallPath::from_segments(["H"]);
+        let mut h = FunctionGraph::new("H");
+        let entry = h.startblock;
+        let hp0 = h.alloc_value_var();
+        h.block_mut(entry).inputargs.push(hp0.clone());
+        let frame = h.alloc_value_var();
+        let local_hint = h.alloc_value_var();
+        h.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(local_hint.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        h.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(m_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([local_hint, hp0]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(h_path.clone(), h);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(h_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
     }
 
     /// A formal that did not arrive flagged does not invent the flag
