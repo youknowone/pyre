@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=9.2
 # Cranelift on ubuntu read 2.2x (run 37131346131) and an earlier
 # ubuntu reading was 9.2x. 11 keeps both inside the floor..ceiling
 # window: the floor is 11/6.
