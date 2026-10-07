@@ -311,6 +311,19 @@ pub fn get_fielddescr_index_in(
             continue;
         }
         if gccache.is_known_struct(field_type) {
+            // The dotted `outer.inner` spelling names one leaf of this
+            // nested struct on the outer owner.
+            if let Some(rest) = fieldname
+                .strip_prefix(name.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+            {
+                let r = get_fielddescr_index_in(gccache, field_type, rest, cur_index);
+                if r >= 0 {
+                    return r;
+                }
+                cur_index = -r - 1;
+                continue;
+            }
             if has_direct {
                 // Count inner leaves; do not return an inner name match.
                 let r = get_fielddescr_index_in(gccache, field_type, "", cur_index);

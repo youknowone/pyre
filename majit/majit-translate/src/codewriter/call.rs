@@ -2569,6 +2569,11 @@ pub struct CallControl {
     /// Repeat `fielddescrof_keyed` hits replay the mint records and return
     /// the cached descr. The layout walk runs once per key.
     fielddescrof_memo: std::cell::RefCell<FieldDescrofMemo>,
+    /// `(inner, outer, field)` for every by-value nested struct row:
+    /// `outer` stores an `inner` inline as `field`. Built from
+    /// `struct_fields` on the first query; reset whenever `struct_fields` or
+    /// `known_struct_names` change.
+    by_value_embedders: std::cell::OnceCell<Vec<(String, String, String)>>,
 
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     /// If an array's element type is in this set, the array descriptor gets
@@ -3218,6 +3223,7 @@ impl CallControl {
             struct_size_log: std::cell::RefCell::new(None),
             field_footprint: std::cell::RefCell::new(FieldDescrofMemoEntry::default()),
             fielddescrof_memo: std::cell::RefCell::new(HashMap::new()),
+            by_value_embedders: std::cell::OnceCell::new(),
             known_struct_names: HashSet::new(),
             struct_fields: crate::front::StructFieldRegistry::default(),
             error_carrier: crate::OwnedErrorCarrierSpec::default(),
@@ -3300,12 +3306,14 @@ impl CallControl {
     /// RPython: register struct type names for get_type_flag(ARRAY.OF).
     pub fn set_known_struct_names(&mut self, names: HashSet<String>) {
         self.known_struct_names = names;
+        self.by_value_embedders = std::cell::OnceCell::new();
         self.clear_fielddescrof_memo();
     }
 
     /// RPython: register struct field types for op.args[0].concretetype resolution.
     pub fn set_struct_fields(&mut self, registry: crate::front::StructFieldRegistry) {
         self.struct_fields = registry;
+        self.by_value_embedders = std::cell::OnceCell::new();
         self.clear_fielddescrof_memo();
     }
 
@@ -4014,6 +4022,7 @@ impl CallControl {
                 .flatten()
         })?;
         let mut offset: usize = 0;
+        let mut leaf = None;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
             // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`
@@ -4041,234 +4050,345 @@ impl CallControl {
             // type string, so `is_known_struct` is false and it stays a
             // single pointer leaf.
             if self.is_known_struct(fty) {
+                // pyre names a leaf of a by-value nested struct with the
+                // dotted `outer.inner` spelling on the outer GC owner
+                // (`heaptracker.py all_fielddescrs` flattens the nested
+                // STRUCT's leaves into the owner). Resolve that leaf here
+                // so the owner's `(STRUCT, fieldname)` descr exists.
+                if let Some(tail) = field_name
+                    .strip_prefix(fname.as_str())
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    && let Some((flag, ir_type, field_size, inner)) =
+                        self.nested_struct_leaf(fty, tail)
+                {
+                    let at = self
+                        .layout_field_offset(
+                            owner_id.or_else(|| majit_ir::descr::struct_id_for_name(owner_root)),
+                            owner_root,
+                            fname,
+                        )
+                        .unwrap_or(offset);
+                    leaf = Some((flag, ir_type, field_size, at.saturating_add(inner)));
+                    break;
+                }
                 offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
             if fname == field_name {
-                // `descr.py get_field_descr(gccache, STRUCT,
-                // fieldname)` cache-or-mint: a `(STRUCT, fieldname)`
-                // cache hit returns the runtime
-                // `__majit_register_descrs`-minted Arc; a miss mints a
-                // fresh `Arc<SimpleFieldDescr>` and caches.  Analyzer
-                // and runtime sides converge on the same `Arc<
-                // SimpleFieldDescr>` instance — PyPy's
-                // `cpu.fielddescrof(STRUCT, fieldname)` per-tuple
-                // object identity.
-                //
-                // After the cache-or-mint resolves, stamp the
-                // analyzer's per-trace `idx` (from
-                // `descr_indices.field_index`) onto the descr via
-                // `set_index` so trace serialization round-trips on
-                // the analyzer's id (`pyre-jit-trace::state` line
-                // 5879/5933 matches by `fd.index() == field_idx`).
-                // The atomic write is benign on cache hit — analyzer
-                // is the sole writer of this slot (the macro path
-                // discards the return).
-                //
-                // `descr.py is_immutable = STRUCT._immutable_field(
-                // fieldname)` parity: consult
-                // `self.immutable_fields_by_struct` populated from the
-                // program's `#[jit_immutable_fields("name", "name?",
-                // "name[*]", ...)]` attribute declarations.
-                // `ImmutableRank::Immutable` and
-                // `ImmutableRank::ImmutableArray` map to plain
-                // `is_immutable=true`; `QuasiImmutable*` ranks map to
-                // `is_quasi_immutable=true` (the `record_quasiimmut_field`
-                // path `jtransform.py:895-903`).  Missing entry retains
-                // the mutable default.
-                // Runtime publication hashes a struct's definition path,
-                // whereas analyzer input can carry a use-site-qualified owner.
-                // Normalize through `STRUCT_ORIGIN_REGISTRY` so both paths use
-                // the same keyed descriptor and its attached effect-info index.
-                // Prefer the source-attached identity token (collision-free
-                // even when `owner_root` is a bare leaf two modules share);
-                // fall back to canonicalising the name when the descriptor
-                // carries no token (synthetic / positional construction).
-                // Both spellings hash to the same `u64` for a non-colliding
-                // type, so this keeps the runtime-publish convergence.
-                // RPython's cache key is the concrete low-level STRUCT object,
-                // and a source StructId already is one: `concrete_adt_struct_id`
-                // mints an instantiated owner through `StructId::instantiate`,
-                // so `Option<usize>::Some` and `Option<BinOpKind>::Some` are
-                // already distinct tokens here. `struct_id_for_name` instantiates
-                // the same way for an owner that carries no token, which is what
-                // `assembler::fielddescrof` stamps onto the emitted descr's
-                // `type_id` — resolve the key exactly as it does, or the effect
-                // set recorded below and the shipped field descr name one struct
-                // under two different hashes and never converge.
-                let registry_struct_id = majit_ir::descr::struct_id_for_name(owner_root);
-                let struct_key = match owner_id.or(registry_struct_id) {
-                    Some(sid) => LLType::Struct(sid.as_u64()),
-                    None => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
-                        owner_root,
-                    ))),
-                };
-                let struct_id = match struct_key {
-                    LLType::Struct(id) => id,
-                    _ => unreachable!("fielddescrof_concrete always builds a Struct key"),
-                };
-                // `descr.py get_field_descr` always calls
-                // `get_size_descr(gccache, STRUCT, vtable)` to bind
-                // `fielddescr.parent_descr` before returning. Pyre's
-                // `get_field_descr` only reads `_cache_size` (no mint).
-                // Mirror upstream by minting/hitting the parent here
-                // from the analyzer's struct layout knowledge:
-                // `compute_struct_size` matches `symbolic.get_size(STRUCT)`;
-                // analyzer has no vtable / immutability surface so we
-                // pass 0 / false (a runtime `build_object_descr_group`
-                // publish under the same `struct_key` carries the real
-                // vtable on its PyreSizeDescr — cache-hit returns
-                // *that* Arc here unchanged).
-                if owner_id.is_some() && registry_struct_id.is_none() {
-                    self.field_footprint.borrow_mut().owner_id_miss = true;
-                    majit_ir::descr::record_field_owner_id_registry_miss();
-                }
-                let (struct_size, struct_size_path) =
-                    compute_struct_size_with_path(self, owner_root);
-                let offset_of = |sid| {
-                    self.layout_of(sid, owner_root).and_then(|l| {
-                        l.fields
-                            .iter()
-                            .find(|f| f.name.as_str() == field_name)
-                            .map(|f| f.offset)
-                    })
-                };
-                let concrete_offset = owner_id.and_then(offset_of);
-                let template_offset = if concrete_offset.is_none() {
-                    registry_struct_id.and_then(offset_of)
-                } else {
-                    None
-                };
-                let field_offset_source = if concrete_offset.is_some() {
-                    majit_ir::descr::FieldOffsetSource::ConcreteHit
-                } else if template_offset.is_some() {
-                    majit_ir::descr::FieldOffsetSource::TemplateHit
-                } else {
-                    majit_ir::descr::FieldOffsetSource::AccumulatorFallback
-                };
-                self.field_footprint.borrow_mut().offset_source = Some(field_offset_source);
-                majit_ir::descr::record_field_offset_source(field_offset_source);
-                let field_offset = concrete_offset.or(template_offset).unwrap_or(offset);
-                let rank = self.field_immutability(Some(owner_root), field_name);
-                let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
-                let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
-                let member = majit_ir::effectinfo::DescrSetMember::Field {
-                    struct_id,
-                    field_name: field_name.to_string(),
-                };
-                use majit_ir::descr::Descr;
-                let size_descr_arc = {
-                    let mut gc = majit_ir::descr::gc_cache().lock();
-                    gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
-                };
-                // Field-walk pass (PyPy `cpu.fielddescrof` per-tuple
-                // identity convergence): when the runtime published
-                // a SizeDescr under this `struct_key` (via
-                // `build_object_descr_group` →
-                // `register_keyed_size`), its `PyreFieldDescr`s live
-                // in `size_descr.all_fielddescrs()` already.  Return
-                // that Arc directly so analyzer's `set_ei_index`
-                // lands on the SAME slot the runtime reads.  Name
-                // match: PyreFieldDescr stores `"STRUCT.field"`
-                // (descr.py format) so the analyzer's bare
-                // `field_name` must match as suffix; SimpleFieldDescr
-                // mints store either form so exact match also wins.
-                if let Some(sd) = size_descr_arc.as_size_descr() {
-                    let needle = format!(".{}", field_name);
-                    for fd in sd.all_fielddescrs() {
-                        let stored = fd.field_name();
-                        if stored == field_name || stored.ends_with(&needle) {
-                            fd.set_index(idx);
-                            // This slot is filled in *this* process; the
-                            // runtime's own cache is a different one, so the
-                            // layout still has to travel. Read it back off the
-                            // descr rather than off the locals below, which
-                            // describe the mint that did not happen.
-                            trace_field_ei_descr_mint(
-                                "parent_field",
-                                owner_root,
-                                owner_id.is_some(),
-                                registry_struct_id,
-                                struct_size_path,
-                            );
-                            let spec = majit_ir::effectinfo::DescrMintSpec::Field {
-                                struct_size,
-                                offset: fd.offset(),
-                                field_size: fd.field_size(),
-                                field_type: fd.field_type(),
-                                flag: fd.field_flag(),
-                                is_immutable: fd.is_immutable(),
-                                is_quasi_immutable: fd.is_quasi_immutable(),
-                                index_in_parent: fd.index_in_parent(),
-                            };
-                            self.field_footprint.borrow_mut().mint =
-                                Some((member.clone(), spec.clone()));
-                            majit_ir::descr::record_ei_descr_mint(member.clone(), spec);
-                            return Some((fd.clone() as majit_ir::descr::DescrRef, member));
-                        }
-                    }
-                }
-                // No runtime publish for this `(STRUCT, fieldname)`
-                // tuple — fall back to analyzer-only mint.  The
-                // `SimpleFieldDescr.parent_descr` Weak still binds to
-                // the cached SizeDescr (which may be a PyreSizeDescr
-                // if the runtime published the parent but not this
-                // field, or a SimpleSizeDescr from line above).
-                // `descr.py STRUCT._immutable_field(fieldname)` parity.
-                //
-                // `symbolic.get_field_token` (`symbolic.py:7`) returns the
-                // exact offset; prefer `struct_layouts` (rtyper-resolved /
-                // Charon-exact via `apply_exact_layout`) over the heuristic
-                // `offset` accumulation, which only approximates `#[repr(C)]`
-                // and diverges under `#[repr(Rust)]` reordering — the
-                // divergence that matters for enum variant payloads keyed
-                // by `{enum_leaf}::{variant}`.  Falls back to the
-                // accumulator only for a struct absent from `struct_layouts`.
-                // descr.py: index = heaptracker.get_fielddescr_index_in(
-                // STRUCT, fieldname).
-                let index_in_parent = field_pos_in(self, owner_root, field_name);
-                let descr = majit_ir::descr::gc_cache().lock().get_field_descr(
-                    struct_key,
-                    field_name,
-                    None,
-                    field_offset,
-                    field_size,
-                    ir_type,
-                    is_immutable,
-                    is_quasi_immutable,
-                    flag,
-                    u32::MAX,
-                    false,
-                    // Always a claim: `field_pos_in` walks the owner's layout and
-                    // panics rather than hand back an unnumbered field.
-                    Some(index_in_parent),
-                );
-                descr.set_index(idx);
-                // Same arguments this `get_field_descr` miss just used, kept so
-                // the runtime's own cache can take the same miss branch
-                // (`descr.py`) instead of finding an empty slot.
-                trace_field_ei_descr_mint(
-                    "analyzer_field",
-                    owner_root,
-                    owner_id.is_some(),
-                    registry_struct_id,
-                    struct_size_path,
-                );
-                let spec = majit_ir::effectinfo::DescrMintSpec::Field {
-                    struct_size,
-                    offset: field_offset,
-                    field_size,
-                    field_type: ir_type,
-                    flag,
-                    is_immutable,
-                    is_quasi_immutable,
-                    index_in_parent,
-                };
-                self.field_footprint.borrow_mut().mint = Some((member.clone(), spec.clone()));
-                majit_ir::descr::record_ei_descr_mint(member.clone(), spec);
-                return Some((descr as majit_ir::descr::DescrRef, member));
+                leaf = Some((flag, ir_type, field_size, offset));
+                break;
             }
             offset = offset.saturating_add(field_size);
+        }
+        let (flag, ir_type, field_size, offset) = leaf?;
+        // `descr.py get_field_descr(gccache, STRUCT,
+        // fieldname)` cache-or-mint: a `(STRUCT, fieldname)`
+        // cache hit returns the runtime
+        // `__majit_register_descrs`-minted Arc; a miss mints a
+        // fresh `Arc<SimpleFieldDescr>` and caches.  Analyzer
+        // and runtime sides converge on the same `Arc<
+        // SimpleFieldDescr>` instance — PyPy's
+        // `cpu.fielddescrof(STRUCT, fieldname)` per-tuple
+        // object identity.
+        //
+        // After the cache-or-mint resolves, stamp the
+        // analyzer's per-trace `idx` (from
+        // `descr_indices.field_index`) onto the descr via
+        // `set_index` so trace serialization round-trips on
+        // the analyzer's id (`pyre-jit-trace::state` line
+        // 5879/5933 matches by `fd.index() == field_idx`).
+        // The atomic write is benign on cache hit — analyzer
+        // is the sole writer of this slot (the macro path
+        // discards the return).
+        //
+        // `descr.py is_immutable = STRUCT._immutable_field(
+        // fieldname)` parity: consult
+        // `self.immutable_fields_by_struct` populated from the
+        // program's `#[jit_immutable_fields("name", "name?",
+        // "name[*]", ...)]` attribute declarations.
+        // `ImmutableRank::Immutable` and
+        // `ImmutableRank::ImmutableArray` map to plain
+        // `is_immutable=true`; `QuasiImmutable*` ranks map to
+        // `is_quasi_immutable=true` (the `record_quasiimmut_field`
+        // path in `jtransform.py` `rewrite_op_getfield`).  Missing entry retains
+        // the mutable default.
+        // Runtime publication hashes a struct's definition path,
+        // whereas analyzer input can carry a use-site-qualified owner.
+        // Normalize through `STRUCT_ORIGIN_REGISTRY` so both paths use
+        // the same keyed descriptor and its attached effect-info index.
+        // Prefer the source-attached identity token (collision-free
+        // even when `owner_root` is a bare leaf two modules share);
+        // fall back to canonicalising the name when the descriptor
+        // carries no token (synthetic / positional construction).
+        // Both spellings hash to the same `u64` for a non-colliding
+        // type, so this keeps the runtime-publish convergence.
+        // RPython's cache key is the concrete low-level STRUCT object,
+        // and a source StructId already is one: `concrete_adt_struct_id`
+        // mints an instantiated owner through `StructId::instantiate`,
+        // so `Option<usize>::Some` and `Option<BinOpKind>::Some` are
+        // already distinct tokens here. `struct_id_for_name` instantiates
+        // the same way for an owner that carries no token, which is what
+        // `assembler::fielddescrof` stamps onto the emitted descr's
+        // `type_id` — resolve the key exactly as it does, or the effect
+        // set recorded below and the shipped field descr name one struct
+        // under two different hashes and never converge.
+        let registry_struct_id = majit_ir::descr::struct_id_for_name(owner_root);
+        let struct_key = match owner_id.or(registry_struct_id) {
+            Some(sid) => LLType::Struct(sid.as_u64()),
+            None => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
+                owner_root,
+            ))),
+        };
+        let struct_id = match struct_key {
+            LLType::Struct(id) => id,
+            _ => unreachable!("fielddescrof_concrete always builds a Struct key"),
+        };
+        // `descr.py get_field_descr` always calls
+        // `get_size_descr(gccache, STRUCT, vtable)` to bind
+        // `fielddescr.parent_descr` before returning. Pyre's
+        // `get_field_descr` only reads `_cache_size` (no mint).
+        // Mirror upstream by minting/hitting the parent here
+        // from the analyzer's struct layout knowledge:
+        // `compute_struct_size` matches `symbolic.get_size(STRUCT)`;
+        // analyzer has no vtable / immutability surface so we
+        // pass 0 / false (a runtime `build_object_descr_group`
+        // publish under the same `struct_key` carries the real
+        // vtable on its PyreSizeDescr — cache-hit returns
+        // *that* Arc here unchanged).
+        if owner_id.is_some() && registry_struct_id.is_none() {
+            self.field_footprint.borrow_mut().owner_id_miss = true;
+            majit_ir::descr::record_field_owner_id_registry_miss();
+        }
+        let (struct_size, struct_size_path) = compute_struct_size_with_path(self, owner_root);
+        let offset_of = |sid| {
+            self.layout_of(sid, owner_root).and_then(|l| {
+                l.fields
+                    .iter()
+                    .find(|f| f.name.as_str() == field_name)
+                    .map(|f| f.offset)
+            })
+        };
+        let concrete_offset = owner_id.and_then(offset_of);
+        let template_offset = if concrete_offset.is_none() {
+            registry_struct_id.and_then(offset_of)
+        } else {
+            None
+        };
+        let field_offset_source = if concrete_offset.is_some() {
+            majit_ir::descr::FieldOffsetSource::ConcreteHit
+        } else if template_offset.is_some() {
+            majit_ir::descr::FieldOffsetSource::TemplateHit
+        } else {
+            majit_ir::descr::FieldOffsetSource::AccumulatorFallback
+        };
+        self.field_footprint.borrow_mut().offset_source = Some(field_offset_source);
+        majit_ir::descr::record_field_offset_source(field_offset_source);
+        let field_offset = concrete_offset.or(template_offset).unwrap_or(offset);
+        let rank = self.field_immutability(Some(owner_root), field_name);
+        let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+        let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
+        let member = majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id,
+            field_name: field_name.to_string(),
+        };
+        use majit_ir::descr::Descr;
+        let size_descr_arc = {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
+        };
+        // Field-walk pass (PyPy `cpu.fielddescrof` per-tuple
+        // identity convergence): when the runtime published
+        // a SizeDescr under this `struct_key` (via
+        // `build_object_descr_group` →
+        // `register_keyed_size`), its `PyreFieldDescr`s live
+        // in `size_descr.all_fielddescrs()` already.  Return
+        // that Arc directly so analyzer's `set_ei_index`
+        // lands on the SAME slot the runtime reads.  Name
+        // match: PyreFieldDescr stores `"STRUCT.field"`
+        // (descr.py format) so the analyzer's bare
+        // `field_name` must match as suffix; SimpleFieldDescr
+        // mints store either form so exact match also wins.
+        if let Some(sd) = size_descr_arc.as_size_descr() {
+            let needle = format!(".{}", field_name);
+            for fd in sd.all_fielddescrs() {
+                let stored = fd.field_name();
+                if stored == field_name || stored.ends_with(&needle) {
+                    fd.set_index(idx);
+                    // This slot is filled in *this* process; the
+                    // runtime's own cache is a different one, so the
+                    // layout still has to travel. Read it back off the
+                    // descr rather than off the locals below, which
+                    // describe the mint that did not happen.
+                    trace_field_ei_descr_mint(
+                        "parent_field",
+                        owner_root,
+                        owner_id.is_some(),
+                        registry_struct_id,
+                        struct_size_path,
+                    );
+                    let spec = majit_ir::effectinfo::DescrMintSpec::Field {
+                        struct_size,
+                        offset: fd.offset(),
+                        field_size: fd.field_size(),
+                        field_type: fd.field_type(),
+                        flag: fd.field_flag(),
+                        is_immutable: fd.is_immutable(),
+                        is_quasi_immutable: fd.is_quasi_immutable(),
+                        index_in_parent: fd.index_in_parent(),
+                    };
+                    self.field_footprint.borrow_mut().mint = Some((member.clone(), spec.clone()));
+                    majit_ir::descr::record_ei_descr_mint(member.clone(), spec);
+                    return Some((fd.clone() as majit_ir::descr::DescrRef, member));
+                }
+            }
+        }
+        // No runtime publish for this `(STRUCT, fieldname)`
+        // tuple — fall back to analyzer-only mint.  The
+        // `SimpleFieldDescr.parent_descr` Weak still binds to
+        // the cached SizeDescr (which may be a PyreSizeDescr
+        // if the runtime published the parent but not this
+        // field, or a SimpleSizeDescr from line above).
+        // `descr.py STRUCT._immutable_field(fieldname)` parity.
+        //
+        // `symbolic.py` `get_field_token` returns the
+        // exact offset; prefer `struct_layouts` (rtyper-resolved /
+        // Charon-exact via `apply_exact_layout`) over the heuristic
+        // `offset` accumulation, which only approximates `#[repr(C)]`
+        // and diverges under `#[repr(Rust)]` reordering — the
+        // divergence that matters for enum variant payloads keyed
+        // by `{enum_leaf}::{variant}`.  Falls back to the
+        // accumulator only for a struct absent from `struct_layouts`.
+        // descr.py: index = heaptracker.get_fielddescr_index_in(
+        // STRUCT, fieldname).
+        let index_in_parent = field_pos_in(self, owner_root, field_name);
+        let descr = majit_ir::descr::gc_cache().lock().get_field_descr(
+            struct_key,
+            field_name,
+            None,
+            field_offset,
+            field_size,
+            ir_type,
+            is_immutable,
+            is_quasi_immutable,
+            flag,
+            u32::MAX,
+            false,
+            // Always a claim: `field_pos_in` walks the owner's layout and
+            // panics rather than hand back an unnumbered field.
+            Some(index_in_parent),
+        );
+        descr.set_index(idx);
+        // Same arguments this `get_field_descr` miss just used, kept so
+        // the runtime's own cache can take the same miss branch
+        // (`descr.py`) instead of finding an empty slot.
+        trace_field_ei_descr_mint(
+            "analyzer_field",
+            owner_root,
+            owner_id.is_some(),
+            registry_struct_id,
+            struct_size_path,
+        );
+        let spec = majit_ir::effectinfo::DescrMintSpec::Field {
+            struct_size,
+            offset: field_offset,
+            field_size,
+            field_type: ir_type,
+            flag,
+            is_immutable,
+            is_quasi_immutable,
+            index_in_parent,
+        };
+        self.field_footprint.borrow_mut().mint = Some((member.clone(), spec.clone()));
+        majit_ir::descr::record_ei_descr_mint(member.clone(), spec);
+        Some((descr as majit_ir::descr::DescrRef, member))
+    }
+
+    /// Offset of `field` in the registered layout of `owner`, when one is.
+    fn layout_field_offset(
+        &self,
+        sid: Option<majit_ir::descr::StructId>,
+        owner: &str,
+        field: &str,
+    ) -> Option<usize> {
+        self.layout_of(sid?, owner)?
+            .fields
+            .iter()
+            .find(|f| f.name.as_str() == field)
+            .map(|f| f.offset)
+    }
+
+    /// Every `(outer, "field.<path>")` dotted leaf that names `owner.path`
+    /// on a GC owner storing the by-value struct `owner` inline.
+    ///
+    /// `heaptracker.py all_fielddescrs` flattens a nested STRUCT's leaves
+    /// into its GC owner, and the trace caches that owner's dotted leaf. A
+    /// body reaching the nested struct through a reference (`&l.int_items`)
+    /// reads or writes the same bytes, while `effectinfo.py consider_struct`
+    /// keeps no effect on a non-GC STRUCT. The dotted leaves are the ones
+    /// [`crate::front::mir::is_flattened_storage_leaf`] names.
+    fn by_value_embedding_leaves(&self, owner: &str, path: &str) -> Vec<(String, String)> {
+        let rows = self.by_value_embedders.get_or_init(|| {
+            let mut rows: Vec<(String, String, String)> = (&self.struct_fields.fields)
+                .into_iter()
+                .flat_map(|(outer, fields)| {
+                    fields
+                        .iter()
+                        .filter(|(_, fty)| self.is_known_struct(fty))
+                        .map(move |(fname, fty)| (fty.clone(), outer.clone(), fname.clone()))
+                })
+                .collect();
+            rows.sort();
+            rows
+        });
+        rows.iter()
+            .filter(|(inner, outer, fname)| {
+                inner == owner && crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
+            })
+            .map(|(_, outer, fname)| (outer.clone(), format!("{fname}.{path}")))
+            .collect()
+    }
+
+    /// `(flag, type, size, offset)` of the leaf `path` names inside the
+    /// by-value struct `owner`; `path` is itself dotted when the leaf sits
+    /// in a deeper nested struct. `heaptracker.py get_fielddescr_index_in`
+    /// recurses into a nested `lltype.Struct` the same way.
+    fn nested_struct_leaf(
+        &self,
+        owner: &str,
+        path: &str,
+    ) -> Option<(
+        majit_ir::descr::ArrayFlag,
+        majit_ir::value::Type,
+        usize,
+        usize,
+    )> {
+        let fields = self.struct_field_entries(owner)?;
+        let sid = majit_ir::descr::struct_id_for_name(owner);
+        let mut offset: usize = 0;
+        for (fname, fty) in fields {
+            let (flag, ir_type, field_size) = get_type_flag(fty);
+            if ir_type == majit_ir::value::Type::Void || fname == "typeptr" {
+                continue;
+            }
+            let at = self
+                .layout_field_offset(sid, owner, fname)
+                .unwrap_or(offset);
+            if self.is_known_struct(fty) {
+                if let Some(rest) = path
+                    .strip_prefix(fname.as_str())
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    && let Some((flag, ir_type, field_size, inner)) =
+                        self.nested_struct_leaf(fty, rest)
+                {
+                    return Some((flag, ir_type, field_size, at.saturating_add(inner)));
+                }
+                offset = at.saturating_add(compute_struct_size(self, fty));
+                continue;
+            }
+            if fname == path {
+                return Some((flag, ir_type, field_size, at));
+            }
+            offset = at.saturating_add(field_size);
         }
         None
     }
@@ -9504,11 +9624,17 @@ impl CallControl {
         analyzed: &mut ReadWriteAnalyzedCalls,
     ) -> ReadWriteEffects {
         // `analyze_external_call`: a funcobj without a graph has no
-        // `_callbacks` here, so `bottom_result()`.
+        // `_callbacks` here, so `bottom_result()`. The
+        // `__majit_call_target_<fn>` word-ABI entry is not such a funcobj:
+        // it stands for `getfunctionptr(graph)` of the decorated `<fn>`, so
+        // the analyzer walks that function's graph.
         let (Some(key), Some(graph)) = (
             self.function_graphs.key_for(path),
             self.function_graphs.get(path),
         ) else {
+            if let Some(user) = user_path_behind_majit_call_target(path) {
+                return self.analyze_readwrite(&user, seen, analyzed);
+            }
             return ReadWriteEffects::bottom_result();
         };
         if !seen.enter(key.clone(), analyzed) {
@@ -9649,7 +9775,7 @@ impl CallControl {
         let index = self
             .descr_indices
             .field_index(&field.owner_root, &field.name);
-        ReadWriteEffects::singleton(
+        let mut result = ReadWriteEffects::singleton(
             RwKey {
                 tag,
                 index,
@@ -9660,7 +9786,46 @@ impl CallControl {
                 owner_id: field.owner_id,
                 name: field.name.clone(),
             },
-        )
+        );
+        let Some(owner) = field.owner_root.as_deref() else {
+            return result;
+        };
+        // A whole by-value nested struct field is each of its dotted leaves
+        // (`heaptracker.py all_fielddescrs` flattens them into `owner`):
+        // copying it out reads them, storing it writes them.
+        let mut leaves = Vec::new();
+        if let Some(fty) = self.field_type(owner, &field.name)
+            && self.is_known_struct(fty)
+            && let Some(rows) = self.struct_field_entries(fty)
+        {
+            leaves.extend(
+                rows.iter()
+                    .filter(|(leaf, _)| {
+                        crate::front::mir::is_flattened_storage_leaf(owner, &field.name, leaf)
+                    })
+                    .map(|(leaf, _)| (owner.to_string(), format!("{}.{leaf}", field.name))),
+            );
+        }
+        // A field of a by-value nested struct is also the dotted leaf of
+        // the GC owner storing that struct inline.
+        leaves.extend(self.by_value_embedding_leaves(owner, &field.name));
+        for (outer, dotted) in leaves {
+            let owner_root = Some(outer);
+            let index = self.descr_indices.field_index(&owner_root, &dotted);
+            result.insert(
+                RwKey {
+                    tag,
+                    index,
+                    owner_id: None,
+                },
+                RwOperand::Field {
+                    owner_root,
+                    owner_id: None,
+                    name: dotted,
+                },
+            );
+        }
+        result
     }
 
     /// `_array_result(op.args[0].concretetype)`.
@@ -16453,6 +16618,51 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 4);
         // `heaptracker.py` `-cur_index - 1` over the 5 leaves above.
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -6);
+        // The dotted spelling names one flattened leaf of `hdr`.
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "hdr.y", 0), 1);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "hdr.z", 0), -6);
+    }
+
+    /// A dotted `outer.inner` field on the owner is the inner struct's leaf
+    /// at the owner's offset. writeanalyze records it as a write of the
+    /// owner's `(STRUCT, "outer.inner")`, the descr the codewriter's oopspec
+    /// lowering reads, so the effect set names it instead of dropping it.
+    #[test]
+    fn fielddescrof_resolves_dotted_nested_struct_leaf() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "DottedInner".to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "DottedOuter".to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                ("items".to_string(), "DottedInner".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["DottedInner".to_string()].into_iter().collect());
+        let (descr, member) = cc
+            .fielddescrof_keyed(0, "DottedOuter", None, "items.len")
+            .expect("dotted leaf of a nested struct resolves");
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.offset(), 16, "length (8) + items.block (8)");
+        assert_eq!(fd.field_size(), 8);
+        match member {
+            majit_ir::effectinfo::DescrSetMember::Field { field_name, .. } => {
+                assert_eq!(field_name, "items.len");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            cc.fielddescrof_keyed(1, "DottedOuter", None, "items.cap")
+                .is_none()
+        );
     }
 
     /// The embedded object header contributes no slot, the way recursing
@@ -17113,6 +17323,70 @@ mod tests {
                 .map(|key| key.index)
                 .collect(),
         }
+    }
+
+    /// A residual `COND_CALL` names the `__majit_call_target_<fn>` word-ABI
+    /// entry, which stands for `getfunctionptr(graph)` of `<fn>`.
+    /// writeanalyze walks `<fn>`'s graph instead of treating the entry as a
+    /// graphless external funcobj with no writes.
+    #[test]
+    fn readwrite_call_target_entry_walks_the_user_graph() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        rw_register(&mut cc, "grow", vec![rw_write_field("List", "items")]);
+        let effects = rw_of(&cc, &mut cache, "__majit_call_target_grow");
+        assert!(!is_top(&effects));
+        assert_eq!(
+            write_fields(&effects),
+            write_fields(&rw_of(&cc, &mut cache, "grow"))
+        );
+        assert_eq!(write_fields(&effects).len(), 1);
+    }
+
+    /// A write of a by-value nested struct's field through a reference to
+    /// it is a write of the owner's dotted leaf too: the owner stores the
+    /// struct inline, and the trace caches the dotted `(STRUCT, "f.leaf")`.
+    /// A write of the whole nested struct field writes every dotted leaf.
+    #[test]
+    fn readwrite_nested_struct_field_names_the_owner_dotted_leaf() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "IntArray".to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "W_ListObject".to_string(),
+            vec![
+                ("strategy".to_string(), "usize".to_string()),
+                ("int_items".to_string(), "IntArray".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["IntArray".to_string()].into_iter().collect());
+        let list = Some("W_ListObject".to_string());
+        rw_register(&mut cc, "set_len", vec![rw_write_field("IntArray", "len")]);
+        let effects = rw_of(&cc, &mut cache, "set_len");
+        let own = cc
+            .descr_indices
+            .field_index(&Some("IntArray".to_string()), "len");
+        let len = cc.descr_indices.field_index(&list, "int_items.len");
+        assert_eq!(write_fields(&effects), vec![own, len]);
+
+        // Storing the whole nested struct stores each of its leaves.
+        rw_register(
+            &mut cc,
+            "set_items",
+            vec![rw_write_field("W_ListObject", "int_items")],
+        );
+        let effects = rw_of(&cc, &mut cache, "set_items");
+        let whole = cc.descr_indices.field_index(&list, "int_items");
+        let block = cc.descr_indices.field_index(&list, "int_items.block");
+        assert_eq!(write_fields(&effects), vec![whole, block, len]);
     }
 
     /// Every graph a walk enters keeps its set in `_analyzed_calls`; a
