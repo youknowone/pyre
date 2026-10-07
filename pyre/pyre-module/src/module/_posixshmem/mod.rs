@@ -5,8 +5,49 @@
 //! `host_env = off` builds expose an empty module so `import
 //! _posixshmem` still succeeds (matching PyPy's mixedmodule behaviour
 //! when the conditional `interpleveldefs` entry is absent).
+//!
+//! Unix + `host_env` + not-sandbox calls `c_shm_open` / `c_shm_unlink`.
+//! Sandbox keeps `rustpython_host_env::shm`.
 
 use pyre_object::*;
+
+/// `lib_pypy/_posixshmem_build.py` includes and libc calls:
+/// `includes=['sys/mman.h', 'sys/stat.h', 'fcntl.h']`, C names `shm_open` /
+/// `shm_unlink`, `releasegil=False`, no `save_err`. Darwin links nothing;
+/// every other POSIX target links `rt` (`libraries`).
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+mod ll {
+    use majit_rlib::rffi::{CCHARP, INT, UINT};
+
+    #[cfg(target_vendor = "apple")]
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/mman.h", "sys/stat.h", "fcntl.h"],
+        };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/mman.h", "sys/stat.h", "fcntl.h"],
+            libraries: ["rt"],
+        };
+    }
+
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_shm_open = "shm_open",
+        [CCHARP, INT, UINT],
+        INT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_shm_unlink = "shm_unlink",
+        [CCHARP],
+        INT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+}
 
 #[cfg(all(unix, feature = "host_env"))]
 fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -37,20 +78,43 @@ fn shm_open(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     };
     let c_name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
-    // `lib_pypy/_posixshmem.py:13-20` retries on EINTR.
-    let fd = loop {
-        match rustpython_host_env::shm::shm_open(&c_name, flags, mode) {
-            Ok(fd) => break fd,
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => {
+    // `lib_pypy/_posixshmem.py shm_open` retries on EINTR.
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let fd = loop {
+            let fd =
+                unsafe { ll::c_shm_open(c_name.as_ptr() as majit_rlib::rffi::CCHARP, flags, mode) };
+            if fd < 0 {
+                let errno = majit_rlib::rposix::_get_errno();
+                if errno == libc::EINTR {
+                    continue;
+                }
+                let e = std::io::Error::from_raw_os_error(errno);
                 return Err(pyre_interpreter::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(0),
+                    errno,
                     format!("shm_open: {e}"),
                 ));
             }
-        }
-    };
-    Ok(w_int_new(fd as i64))
+            break fd;
+        };
+        Ok(w_int_new(fd as i64))
+    }
+    #[cfg(feature = "sandbox")]
+    {
+        let fd = loop {
+            match rustpython_host_env::shm::shm_open(&c_name, flags, mode) {
+                Ok(fd) => break fd,
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("shm_open: {e}"),
+                    ));
+                }
+            }
+        };
+        Ok(w_int_new(fd as i64))
+    }
 }
 
 #[cfg(all(unix, feature = "host_env"))]
@@ -70,20 +134,42 @@ fn shm_unlink(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     };
     let c_name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
-    // `lib_pypy/_posixshmem.py:33-40` retries on EINTR.
-    loop {
-        match rustpython_host_env::shm::shm_unlink(&c_name) {
-            Ok(()) => break,
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => {
+    // `lib_pypy/_posixshmem.py shm_unlink` retries on EINTR.
+    #[cfg(not(feature = "sandbox"))]
+    {
+        loop {
+            let rv = unsafe { ll::c_shm_unlink(c_name.as_ptr() as majit_rlib::rffi::CCHARP) };
+            if rv < 0 {
+                let errno = majit_rlib::rposix::_get_errno();
+                if errno == libc::EINTR {
+                    continue;
+                }
+                let e = std::io::Error::from_raw_os_error(errno);
                 return Err(pyre_interpreter::PyError::os_error_with_errno(
-                    e.raw_os_error().unwrap_or(0),
+                    errno,
                     format!("shm_unlink: {e}"),
                 ));
             }
+            break;
         }
+        Ok(w_none())
     }
-    Ok(w_none())
+    #[cfg(feature = "sandbox")]
+    {
+        loop {
+            match rustpython_host_env::shm::shm_unlink(&c_name) {
+                Ok(()) => break,
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("shm_unlink: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(w_none())
+    }
 }
 
 pyre_interpreter::py_module! {
