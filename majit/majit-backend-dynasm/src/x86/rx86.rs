@@ -527,6 +527,13 @@ pub(crate) fn mov_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     writeimm32(mc, immed);
 }
 
+/// `MOV32_bi` — `mov dword [rbp + ofs], imm32`. `rex_nw`, no `REX.W`.
+pub(crate) fn mov32_bi(mc: &mut Assembler, offset: i32, immed: i32) {
+    DynasmApi::push(mc, 0xC7);
+    encode_stack_bp(mc, offset, false, 0);
+    writeimm32(mc, immed);
+}
+
 /// `MOV32_mi` — `mov dword [base + ofs], imm32`.
 pub fn mov32_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
@@ -883,6 +890,16 @@ pub(crate) fn pop_b(mc: &mut Assembler, offset: i32) {
 /// `MOVSD_xm` — `movsd xmm, [base + ofs]`.
 pub fn movsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::Nw, 0xF2, &[0x0F, 0x10], dst, mem.0, mem.1);
+}
+
+/// `MOVSD_xj` — `movsd xmm, [abs]`. `encode_abs`: modrm `0x04|reg`, sib `0x25`, disp32.
+pub fn movsd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    emit_prefix_rex(mc, 0xF2, RexKind::Nw, rex_register(dst, 8));
+    push_bytes(mc, &[0x0F, 0x10]);
+    let orbyte = reg_number_3bits(dst) << 3;
+    DynasmApi::push(mc, 0x04 | orbyte);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
 }
 
 /// `MOVSD_mx` — `movsd [base + ofs], xmm`.
