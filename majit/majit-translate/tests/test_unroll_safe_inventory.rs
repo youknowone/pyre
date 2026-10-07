@@ -428,14 +428,6 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
-    // `function.py` funccall FLATPYCALL arm. Main #2220 added
-    // `funccall_flat_from_args` with the same `@jit.unroll_safe` as
-    // `_flat_pycall`; the argument copy is a code object's constant
-    // `co_argcount`.
-    (
-        "funccall_flat_from_args",
-        "function.py funccall FLATPYCALL / _flat_pycall",
-    ),
     // Source now marks `action_dispatcher` `dont_look_inside`. The leaf
     // stays: this test reads `build/llbc/pyre-interpreter.ullbc`, which
     // still harvests `_jit_unroll_safe_action_dispatcher`, and the check
