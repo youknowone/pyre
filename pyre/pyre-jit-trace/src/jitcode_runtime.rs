@@ -376,18 +376,26 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
 }
 
 /// `newframe` takes the metainterp wrapper around the same portal body.
+///
+/// `warmspot.py` / `call.py` `jd.mainjitcode` — the portal JitCode
+/// lives on `JitDriverStaticData`, not a process-global cache.
 pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    static PORTAL_META: OnceLock<Option<Arc<majit_metainterp::jitcode::JitCode>>> = OnceLock::new();
-    PORTAL_META
-        .get_or_init(|| {
-            let canonical = portal_jitcode()?;
-            let index = canonical.index();
-            Some(Arc::new(
-                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
-                    .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
-            ))
-        })
-        .clone()
+    crate::driver::try_driver_pair()?
+        .0
+        .dispatch_jitcode()
+        .cloned()
+}
+
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`:
+/// the metainterp wrapper around the portal body, with the reachable symbolic
+/// residual rows every runtime jitcode carries. Installed once on the driver.
+pub fn new_portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    let canonical = portal_jitcode()?;
+    let index = canonical.index();
+    Some(Arc::new(
+        majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
+            .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
+    ))
 }
 
 /// Resolve the portal `JitCode` for the configured driver whose portal
@@ -1308,6 +1316,29 @@ pub fn all_liveness() -> &'static [u8] {
     &ALL_LIVENESS
 }
 
+/// Build-time `CallInfoCollection` rows. `descr_index` indexes
+/// [`descr_ref_at`]. `func` is still the build-time address.
+pub fn callinfo_rows() -> &'static [majit_ir::effectinfo::CallInfoRow] {
+    static ROWS: LazyLock<Vec<majit_ir::effectinfo::CallInfoRow>> = LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/callinfos.bin"));
+        bincode::deserialize(BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize callinfos.bin \
+                 ({} bytes): {e}",
+                BYTES.len(),
+            )
+        })
+    });
+    &ROWS
+}
+
+/// Build-process function address → this process, for addresses that are
+/// not symbolic path hashes. Symbolic hashes are rebound by
+/// `EmbeddedJitCodeTable::rebound_symbolic_fnaddr`.
+pub fn rebind_build_fnaddr(func: i64) -> i64 {
+    crate::runtime_fnaddr_patch::runtime_fnaddr(func)
+}
+
 fn call_descr_arg_types(arg_classes: &str) -> Vec<majit_ir::Type> {
     arg_classes
         .chars()
@@ -1475,6 +1506,11 @@ fn decode_kind0_descrs() {
 /// production by running [`materialize_gccache_owned_descrs`] before
 /// `freeze_types`.
 fn register_synthetic_struct_tids() {
+    // Runtime groups carry collector tids (`W_INT_GC_TYPE_ID` and the
+    // rest). They must own `_cache_size` before this walk, including when
+    // no kind-0 slot named the struct. A descr minted afterwards reuses
+    // that entry instead of keeping the truncated cache key.
+    crate::descr::force_declared_object_groups();
     if !majit_gc::gc_sync::is_initialized() {
         return;
     }
@@ -2400,12 +2436,17 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // records the byte and a guard-failure resume panics here.
     // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
     // omits that key.
+    // `setarrayitem_raw_i` is the store half of `ll_vec_reverse` /
+    // `ll_setitem_fast` (`rlist.py ll_reverse`, `blackhole.py`
+    // `bhimpl_setarrayitem_raw_i`). The handler is already wired; the
+    // assembler numbers the key only once a graph actually emits it.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
         "recursive_call_f/iIRFIRF>f",
         "recursive_call_v/iIRFIRF",
         "getarrayitem_raw_i/iid>i",
+        "setarrayitem_raw_i/iiid",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()
@@ -2991,6 +3032,32 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `new_with_vtable` size descr is loaded from `descrs.bin` with a
+    /// type-static sentinel. After the descr-pool load the vtable word is
+    /// the runtime `&INT_TYPE`, the address tracing and `bh_new_with_vtable`
+    /// write into `ob_type`.
+    #[test]
+    fn loaded_new_with_vtable_size_descr_carries_runtime_int_type() {
+        use majit_jitcode::jitcode::BhDescr;
+        let live = &pyre_object::INT_TYPE as *const _ as u64;
+        let mut found = false;
+        for index in 0..descr_count() {
+            let Some(descr) = get_descr_by_index(index) else {
+                continue;
+            };
+            if let BhDescr::Size { vtable, .. } = descr
+                && *vtable == live
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "a runtime-loaded new_with_vtable Size descr must carry &INT_TYPE"
+        );
+    }
 
     #[test]
     fn descr_index_kind_matches_each_serialized_entry() {

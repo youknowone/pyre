@@ -105,7 +105,10 @@ impl Forwarded {
         {
             return Forwarded::SmallConst(enc);
         }
-        Forwarded::SmallWide(crate::operand::fresh_wide(value))
+        // history.py Const object in `_forwarded` (optimizer.py make_constant).
+        // Wide values use the same Rc cell Operand::Const uses; the SmallWide
+        // slab never frees (rework.md F16).
+        Forwarded::Const(Rc::new(Cell::new(value)))
     }
 
     pub fn is_const(&self) -> bool {

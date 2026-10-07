@@ -89,10 +89,10 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
-use crate::flowspace::model::{ConstValue, Variable};
+use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link,
-    LinkArg, OpKind, SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor,
+    FunctionGraph, Link, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -858,12 +858,10 @@ fn lower_result_exc_returns_inner(
         // `?`-diamond into a direct forward of the callee's `Result` to
         // `returnblock`, leaving no `Ok`/`Err` shell to rewrite, so
         // `tail_forwarded_returns` is 0.
-        // This is the same disposition as a scoped tail-forward
-        // (`SiteOutcome::TailForward`): the residual-call ABI erases the
-        // shell (`Ok` → value, `Err` → `BH_LAST_EXC_VALUE`) and the
-        // codewriter re-derives `guard_no_exception` op-locally, so the
-        // forward already carries `T` and the raise propagates
-        // implicitly — no rewrite is needed.
+        // This is a scoped callee whose only Result is an *unscoped*
+        // callee's return forwarded as a value.  The caller rule never
+        // saw that site (it only records scoped `Result<T, PyError>`
+        // callees), so there is no exception edge to install here.
         if has_tail_forwarded_call_result(graph) {
             return Ok(0);
         }
@@ -2945,6 +2943,7 @@ pub(crate) fn apply_foreign_from_residuals(
                     target: CallTarget::FunctionPath {
                         segments: conv.segments.clone(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args,
                     result_ty: ValueType::Ref(None),
@@ -4018,8 +4017,14 @@ fn rewire_one_call_site(
                  switches would read garbage"
             ));
         }
-        // The forward needs no CFG rewrite — but it does need the same
-        // retyping the diamond arm performs, and for the same reason.
+        // The forward still needs the exception edge the diamond arm
+        // installs: after the callee raises, `Err` no longer flows as a
+        // Result value on the returnblock link (`exceptiontransform.py`
+        // `create_exception_handling`, `jtransform.py`
+        // `rewrite_op_direct_call`).  An empty close list is the
+        // `return f(...)` form — `raise_link_through_closes` then points
+        // straight at `exceptblock`.  It also needs the same retyping
+        // the diamond arm performs, and for the same reason.
         // `front::mir` types every aggregate `Ref`, so the call declares
         // the `Result` shell; once the callee is transformed it hands
         // back `T` and the raise travels the exception edge, so the value
@@ -4062,15 +4067,13 @@ fn rewire_one_call_site(
         }
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
-        if !tail_closes.is_empty() {
-            let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
-            let normal = graph.blocks[a].exits[0].clone();
-            graph.set_control_flow_metadata(
-                BlockId(a),
-                Some(ExitSwitch::LastException),
-                vec![normal, exc_link],
-            );
-        }
+        let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
+        let normal = graph.blocks[a].exits[0].clone();
+        graph.set_control_flow_metadata(
+            BlockId(a),
+            Some(ExitSwitch::LastException),
+            vec![normal, exc_link],
+        );
         separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
@@ -4420,6 +4423,30 @@ fn break_arm_closes(
         .collect()
 }
 
+/// Bind a `Call.args` Constant to a Variable (`emit_constant`).
+///
+/// Upstream `SpaceOperation.args` hold `Constant`s (`flowspace/model.py`).
+/// Our Call.args are Variables, so a recast's class-root ByteStr is a
+/// `ConstStr` on the block that uses it.
+fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Constant) -> Variable {
+    let (kind, ty) = match &c.value {
+        ConstValue::Int(n) => (OpKind::ConstInt(*n), ConcreteType::Signed),
+        ConstValue::Bool(b) => (OpKind::ConstBool(*b), ConcreteType::Signed),
+        ConstValue::ByteStr(s) => (OpKind::ConstStr(s.clone()), ConcreteType::GcRef),
+        ConstValue::Float(bits) => (OpKind::ConstFloat(*bits), ConcreteType::Float),
+        ConstValue::None => (OpKind::ConstNone, ConcreteType::GcRef),
+        other => panic!(
+            "Call.args Constant {other:?} has no SSA materialisation \
+             (`emit_constant`; flowspace SpaceOperation.args hold Constants)"
+        ),
+    };
+    let var = graph
+        .push_op_var(bb, kind, true)
+        .expect("constant materialisation produces a result");
+    FunctionGraph::set_concretetype_of_inline(&var, ty);
+    var
+}
+
 /// The exception link of a call whose raise must first run `closes`, the
 /// bracket closes (in the call block's namespace) its normal return runs.
 /// Without closes the link goes straight to `exceptblock`; with them it goes
@@ -4446,10 +4473,14 @@ fn raise_link_through_closes(
             let OpKind::Call { args, .. } = close else {
                 return Err(format!("{name}: a bracket close is not a call"));
             };
+            // Link.args carry Variables. A recast close keeps the
+            // class root as `LinkArg::Const` (`cast_instance_call`);
+            // rematerialise it on the raise block (`emit_constant`).
             for arg in args {
-                let arg = arg.clone().into_variable();
-                if !close_vars.contains(&arg) {
-                    close_vars.push(arg);
+                if let Some(var) = arg.as_variable()
+                    && !close_vars.contains(var)
+                {
+                    close_vars.push(var.clone());
                 }
             }
         }
@@ -4468,12 +4499,15 @@ fn raise_link_through_closes(
             };
             let args: Vec<Variable> = args
                 .iter()
-                .map(|arg| {
-                    let pos = close_vars
-                        .iter()
-                        .position(|v| *v == arg.clone().into_variable())
-                        .expect("collected above");
-                    r_inputs[pos].clone()
+                .map(|arg| match arg {
+                    LinkArg::Value(v) => {
+                        let pos = close_vars
+                            .iter()
+                            .position(|x| x == v)
+                            .expect("collected above");
+                        r_inputs[pos].clone()
+                    }
+                    LinkArg::Const(c) => materialize_call_arg_constant(graph, r_id, c),
                 })
                 .collect();
             graph.push_op_var(
@@ -6401,12 +6435,13 @@ fn try_fuse_drain_match(
             unreachable!("validated RootScope close is a call")
         };
         for arg in args {
-            let arg = arg.clone().into_variable();
-            if !close_vars_a.contains(&arg) {
-                close_vars_a.push(arg.clone());
-            }
-            if !forwarded.contains(&arg) {
-                forwarded.push(arg);
+            if let Some(var) = arg.as_variable() {
+                if !close_vars_a.contains(var) {
+                    close_vars_a.push(var.clone());
+                }
+                if !forwarded.contains(var) {
+                    forwarded.push(var.clone());
+                }
             }
         }
     }
@@ -6527,12 +6562,13 @@ fn try_fuse_drain_match(
         };
         let args = args
             .iter()
-            .map(|arg| {
-                close_vars_a
+            .map(|arg| match arg {
+                LinkArg::Value(v) => close_vars_a
                     .iter()
-                    .position(|v| v == arg)
+                    .position(|x| x == v)
                     .map(|i| r_inputs[i + 1].clone())
-                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument"))
+                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument")),
+                LinkArg::Const(c) => Ok(materialize_call_arg_constant(graph, r_id, c)),
             })
             .collect::<Result<Vec<_>, _>>()?;
         graph.push_op_var(
@@ -9432,6 +9468,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             };
         }
         // The constructor's result variable now holds the exception object.
@@ -10506,6 +10543,50 @@ mod tail_forward_close_tests {
             "the raise edge frees the buffer"
         );
         assert_eq!(raise.exits[0].target, graph.exceptblock);
+    }
+
+    /// `return f()` with no bracket closes: the call still needs
+    /// `LastException` so flatten emits `catch_exception` rather than
+    /// dropping the exception exit (`flatten.py insert_exits` when the
+    /// last op is not `-live-`).
+    #[test]
+    fn a_direct_tail_forward_gets_an_exception_edge() {
+        let mut graph = FunctionGraph::new("tail_direct");
+        let start = graph.startblock;
+        let r = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::function_path(["m", "f"]),
+                    args: crate::model::call_args(Vec::new()),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call result");
+        graph.set_goto(start, graph.returnblock, vec![r.clone()]);
+
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "",
+            &ValueType::Int,
+            true,
+            true,
+            &[(r.clone(), None, ValueType::Int)],
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("tail forward");
+        assert!(matches!(outcome, SiteOutcome::TailForward));
+        let a = &graph.blocks[start.0];
+        assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
+        let [normal, exc] = a.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert_eq!(normal.target, graph.returnblock);
+        assert_eq!(exc.target, graph.exceptblock);
+        assert!(exc.last_exception.is_some());
+        assert!(exc.last_exc_value.is_some());
     }
 }
 

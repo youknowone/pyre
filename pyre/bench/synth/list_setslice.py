@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=setslice,newlist
+# pyre-check: trace-shape=main:absent=CallMayForceN,absent=CallMayForceR
 # pyre-check: max-pypy-ratio=1.0
 # pyre-check: skip-cpython
 # Integer list setslice (per-strategy ops).  Exercises W_ListObject slice

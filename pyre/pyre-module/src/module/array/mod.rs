@@ -16,7 +16,7 @@ use pyre_interpreter::{
 };
 use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
-use rustpython_wtf8::{CodePoint, Wtf8Buf};
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 /// A fixed inline byte buffer for one packed element (≤ 8 bytes).
 type Bytes = [u8; 8];
@@ -415,10 +415,13 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let init_matches = std::ptr::eq(cls, pyre_object::gc_roots::shadow_stack_get(canonical_slot))
         || unsafe {
             match (
-                pyre_interpreter::baseobjspace::lookup_in_type(cls, "__init__"),
+                pyre_interpreter::baseobjspace::lookup_in_type(
+                    cls,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
                 pyre_interpreter::baseobjspace::lookup_in_type(
                     pyre_object::gc_roots::shadow_stack_get(canonical_slot),
-                    "__init__",
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
                 ),
             ) {
                 (Some(sub), Some(base)) => std::ptr::eq(sub, base),

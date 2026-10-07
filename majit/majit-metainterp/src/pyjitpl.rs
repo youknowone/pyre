@@ -7,8 +7,8 @@ pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     MergePointBanks, RecycleFramestackOnDrop, StandaloneFrameStack, decode_jit_merge_point_banks,
     recycle_framestack, residual_write_effect_info, setup_frame_from_merge_point, trace_jitcode,
-    trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    trace_jitcode_at_resume_framestack, trace_jitcode_at_resume_framestack_allowing_residuals,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
@@ -2563,7 +2563,7 @@ pub struct MetaInterp<M: Clone> {
     /// own header.
     ///
     /// A cut loop's entry is not a general procedure entry, even though it is
-    /// structurally shaped like one. `cut_trace_from_with_consts` does run
+    /// structurally shaped like one. `cut_trace_from` does run
     /// (`[jit] cut_trace_from: start.op_index=40 original_boxes=33
     /// trace_ops=77`) and the artifact does carry a peeled preamble —
     /// `front_target_tokens` is `[preamble(no virtual state), specialized]`,
@@ -2783,6 +2783,11 @@ pub struct MetaInterp<M: Clone> {
     /// from the tracing green_key when cross-loop cut retargets to the
     /// inner loop's key (compile.py:269).
     pub(crate) last_compiled_key: Option<u64>,
+    /// Whether the last root trace entered by a structured green key, whose
+    /// layout prepends the back-edge target (`TraceCtx::green_key_prepends_pc`).
+    /// A bridge has no key of its own and files its closing loop under the
+    /// same layout.
+    pub(crate) structured_entry_keys: bool,
     /// Owning JitCellToken of the most recently compiled loop or bridge.
     /// `compile.py:record_loop_or_bridge` registers this token itself on every
     /// quasi-immutable dependency, including when the dependency was found in
@@ -3247,70 +3252,96 @@ pub type ResolveExceptionContext = extern "C" fn(i64) -> i64;
 /// from any tracing thread after the hook is installed.
 pub type SymbolicFnaddrPathResolver = fn(i64) -> Option<&'static str>;
 
-static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RECORD_INLINE_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RECORD_DISCARDED_LEVEL_TRACEBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RESOLVE_EXCEPTION_CONTEXT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static SYMBOLIC_FNADDR_PATH_RESOLVER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// Interpreter-owned callbacks `warmspot.py` would put on
+/// `MetaInterpStaticData` at setup. Folded from the process-global
+/// `register_*` / `set_*` OnceLocks: one struct, filled once, read
+/// through [`host_hooks`] / `self.staticdata.host`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostHooks {
+    pub stack_almost_full: Option<fn() -> bool>,
+    pub criticalcode_start: Option<fn()>,
+    pub criticalcode_stop: Option<fn()>,
+    pub record_application_traceback: Option<RecordApplicationTraceback>,
+    pub record_inline_application_traceback: Option<RecordInlineApplicationTraceback>,
+    pub record_discarded_level_traceback: Option<RecordDiscardedLevelTraceback>,
+    pub resolve_exception_context: Option<ResolveExceptionContext>,
+    pub force_quasi_immutable: Option<crate::quasiimmut::ForceQuasiImmutable>,
+    pub symbolic_fnaddr_path_resolver: Option<SymbolicFnaddrPathResolver>,
+    /// Host builds the `QuasiImmutDescr` a portal `QUASIIMMUT_FIELD` records.
+    /// `None` skips the op: the following getfield stays a real load.
+    pub make_quasi_immut_descr: Option<MakeQuasiImmutDescr>,
+}
+
+/// Host builds the `QuasiImmutDescr` a portal `QUASIIMMUT_FIELD` records.
+/// The constant field value is filled after the watcher is installed.
+pub type MakeQuasiImmutDescr =
+    fn(struct_ptr: i64, field: &majit_ir::DescrRef) -> Option<majit_ir::DescrRef>;
+
+static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(HostHooks {
+    stack_almost_full: None,
+    criticalcode_start: None,
+    criticalcode_stop: None,
+    record_application_traceback: None,
+    record_inline_application_traceback: None,
+    record_discarded_level_traceback: None,
+    resolve_exception_context: None,
+    force_quasi_immutable: None,
+    symbolic_fnaddr_path_resolver: None,
+    make_quasi_immut_descr: None,
+});
+
+/// Published copy of [`MetaInterpStaticData::host`]. Readers that do
+/// not hold `staticdata` go through here — one slot, not one
+/// OnceLock per hook.
+pub fn host_hooks() -> HostHooks {
+    *HOST_HOOKS.lock()
+}
+
+/// Install the host hook table. Called once from the driver constructor
+/// (`eval.rs` / `call_jit.rs`).
+pub fn publish_host_hooks(hooks: HostHooks) {
+    *HOST_HOOKS.lock() = hooks;
+}
 
 pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
-    RECORD_APPLICATION_TRACEBACK.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+    HOST_HOOKS.lock().record_application_traceback = hook;
 }
 
 pub fn set_record_inline_application_traceback_hook(
     hook: Option<RecordInlineApplicationTraceback>,
 ) {
-    RECORD_INLINE_APPLICATION_TRACEBACK.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+    HOST_HOOKS.lock().record_inline_application_traceback = hook;
 }
 
 pub fn set_record_discarded_level_traceback_hook(hook: Option<RecordDiscardedLevelTraceback>) {
-    RECORD_DISCARDED_LEVEL_TRACEBACK.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+    HOST_HOOKS.lock().record_discarded_level_traceback = hook;
 }
 
 pub fn set_resolve_exception_context_hook(hook: Option<ResolveExceptionContext>) {
-    RESOLVE_EXCEPTION_CONTEXT.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+    HOST_HOOKS.lock().resolve_exception_context = hook;
 }
 
 /// Install the host-owned lookup for symbolic residual-call addresses.
 ///
 /// `None` preserves the standalone metainterpreter's hash-only diagnostic.
 pub fn set_symbolic_fnaddr_path_resolver(hook: Option<SymbolicFnaddrPathResolver>) {
-    SYMBOLIC_FNADDR_PATH_RESOLVER.store(
-        hook.map_or(0, |callback| callback as usize),
-        std::sync::atomic::Ordering::Release,
-    );
+    HOST_HOOKS.lock().symbolic_fnaddr_path_resolver = hook;
+}
+
+pub fn set_force_quasi_immutable_on_host(hook: Option<crate::quasiimmut::ForceQuasiImmutable>) {
+    HOST_HOOKS.lock().force_quasi_immutable = hook;
 }
 
 pub fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
-    let hook = SYMBOLIC_FNADDR_PATH_RESOLVER.load(std::sync::atomic::Ordering::Acquire);
-    if hook == 0 {
-        return None;
-    }
-    // SAFETY: the stored address is a `SymbolicFnaddrPathResolver` published
-    // by `set_symbolic_fnaddr_path_resolver`.
-    let callback: SymbolicFnaddrPathResolver = unsafe { std::mem::transmute(hook) };
-    callback(fnaddr)
+    host_hooks()
+        .symbolic_fnaddr_path_resolver
+        .and_then(|f| f(fnaddr))
 }
 
 pub fn resolve_exception_context_hook_address() -> *const () {
-    RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .resolve_exception_context
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 /// Chain `exc_value` through the same host hook the compiled run calls, so the
@@ -3320,37 +3351,59 @@ pub fn resolve_exception_context_for_recording(exc_value: i64) -> i64 {
     if exc_value == 0 {
         return 0;
     }
-    let hook = RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire);
-    if hook == 0 {
-        return 0;
-    }
-    // SAFETY: the stored address is a `ResolveExceptionContext` published by
-    // `set_resolve_exception_context_hook`.
-    let callback: ResolveExceptionContext = unsafe { std::mem::transmute(hook) };
-    callback(exc_value)
+    host_hooks()
+        .resolve_exception_context
+        .map_or(0, |f| f(exc_value))
 }
 
 pub fn record_application_traceback_hook_address() -> *const () {
-    RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .record_application_traceback
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 pub fn record_inline_application_traceback_hook_address() -> *const () {
-    RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .record_inline_application_traceback
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 pub fn record_discarded_level_traceback_hook_address() -> *const () {
-    RECORD_DISCARDED_LEVEL_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+    host_hooks()
+        .record_discarded_level_traceback
+        .map_or(std::ptr::null(), |f| f as *const ())
 }
 
 fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MIFrame) {
-    if exc_value == 0 || frame_ptr.is_null() || frame.inline_frame {
+    if exc_value == 0 {
+        return;
+    }
+    let jitcode_index = frame.jitcode.try_index().map_or(-1, |index| index as i32);
+    let opcode_position = frame.last_opcode_position as i32;
+    // `pytraceback.py record_application_traceback` appends a node for every
+    // non-hidden frame. An inlined MIFrame is still that frame: skipping it
+    // left a raise inside an inlined callee with no node (`[()]` instead of
+    // the frame-name tuple). Route through the inline hook so the host can
+    // attach the node to this jitcode's own pycode rather than the portal
+    // virtualizable (which is the caller's frame).
+    if frame.inline_frame {
+        record_inline_application_traceback_for_recording(
+            exc_value,
+            0,
+            0,
+            jitcode_index,
+            opcode_position,
+        );
+        return;
+    }
+    if frame_ptr.is_null() {
         return;
     }
     record_application_traceback_for_recording(
         exc_value,
         frame_ptr as usize as i64,
-        frame.jitcode.try_index().map_or(-1, |index| index as i32),
-        frame.last_opcode_position as i32,
+        jitcode_index,
+        opcode_position,
     );
 }
 
@@ -3365,13 +3418,9 @@ pub fn record_application_traceback_for_recording(
     if exc_value == 0 || frame_ptr == 0 {
         return;
     }
-    let callback = RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
-    if callback == 0 {
+    let Some(callback) = host_hooks().record_application_traceback else {
         return;
-    }
-    // Safety: the only stored values come from a RecordApplicationTraceback
-    // function pointer in set_record_application_traceback_hook.
-    let callback: RecordApplicationTraceback = unsafe { std::mem::transmute(callback) };
+    };
     callback(
         exc_value,
         frame_ptr,
@@ -3389,16 +3438,15 @@ pub fn record_inline_application_traceback_for_recording(
     jitcode_index: i32,
     opcode_position: i32,
 ) {
-    if exc_value == 0 || w_code == 0 {
+    if exc_value == 0 {
         return;
     }
-    let callback = RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
-    if callback == 0 {
+    // `w_code == 0` is not a skip: the host resolves this jitcode's own
+    // pycode (`code_for_jitcode_index`) and ignores a helper with no
+    // Python code. Passing a sentinel here used to drop inlined nodes.
+    let Some(callback) = host_hooks().record_inline_application_traceback else {
         return;
-    }
-    // Safety: the only stored values come from a
-    // RecordInlineApplicationTraceback function pointer.
-    let callback: RecordInlineApplicationTraceback = unsafe { std::mem::transmute(callback) };
+    };
     callback(
         exc_value,
         w_code,
@@ -3420,13 +3468,9 @@ pub fn record_discarded_level_traceback_for_recording(exc_value: i64, w_code: i6
     if exc_value == 0 || w_code == 0 {
         return;
     }
-    let callback = RECORD_DISCARDED_LEVEL_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
-    if callback == 0 {
+    let Some(callback) = host_hooks().record_discarded_level_traceback else {
         return;
-    }
-    // Safety: the only stored values come from a RecordDiscardedLevelTraceback
-    // function pointer in set_record_discarded_level_traceback_hook.
-    let callback: RecordDiscardedLevelTraceback = unsafe { std::mem::transmute(callback) };
+    };
     callback(exc_value, w_code, py_pc);
 }
 
@@ -3747,9 +3791,25 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
+        // `jitexc.DoneWithThisFrameRef.result` is a gcref attribute of the
+        // raised exception, alive until `ll_portal_runner` returns it. Here
+        // it outlives the trace ctx: the FINISH compile drains the ctx
+        // between the walk's return and the caller that delivers it.
+        if let Some(values) = self.single_pass_finish_values.as_mut() {
+            for value in values.iter_mut() {
+                if let Value::Ref(gcref) = value {
+                    visitor(gcref);
+                }
+            }
+        }
         let Some(trace_ctx) = self.tracing.as_mut().or(self.compile_tracing.as_mut()) else {
             return;
         };
+        for value in trace_ctx.walk_finish_values.iter_mut() {
+            if let Value::Ref(gcref) = value {
+                visitor(gcref);
+            }
+        }
         trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
         // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args). No other walker visits them,
@@ -4482,6 +4542,7 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: 0,
             internal_compile_panics: 0,
             last_compiled_key: None,
+            structured_entry_keys: false,
             last_compiled_artifact_token: None,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
@@ -4496,7 +4557,11 @@ impl<M: Clone> MetaInterp<M> {
             pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
-            staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
+            staticdata: {
+                let mut sd = MetaInterpStaticData::new();
+                sd.host = host_hooks();
+                std::sync::Arc::new(sd)
+            },
             framestack: crate::pyjitpl::MIFrameStack::empty(),
             free_frames_list: Vec::new(),
             portal_call_depth: 0,
@@ -6725,6 +6790,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             None => self.warm_state.should_force_finish_tracing(green_key),
         };
+        self.structured_entry_keys = green_key_values.is_some();
         let mut ctx = if let Some(values) = green_key_values {
             TraceCtx::with_green_key(recorder, green_key, values, self.staticdata.clone())
         } else {
@@ -7131,6 +7197,10 @@ impl<M: Clone> MetaInterp<M> {
         let issubclass = self.issubclass;
         let pending_exc_box = self.last_exc_box;
         let pending_exc_value = self.last_exc_value;
+        let portals: Vec<Option<std::sync::Arc<crate::jitcode::JitCode>>> =
+            (0..self.staticdata.jitdrivers_sd.len())
+                .map(|index| self.mainjitcode_of(index).cloned())
+                .collect();
         let (action, last_exc_box, last_exc_value) = self
             .with_trace_ctx_and_framestack(
                 |ctx, framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
@@ -7143,7 +7213,8 @@ impl<M: Clone> MetaInterp<M> {
                         exec_r,
                         exec_f,
                         exec_v,
-                    );
+                    )
+                    .with_portals(portals);
                     let mut machine =
                         crate::pyjitpl::JitCodeMachine::with_framestack(framestack, &[], &[]);
                     machine.set_cpu(cpu);
@@ -7167,12 +7238,24 @@ impl<M: Clone> MetaInterp<M> {
         // Stamp `MIFrame.pc` so `copy_data_from_miframe` resumes where the
         // walk stopped (`blackhole.py`). Leave the stack on the MetaInterp;
         // `aborted_framestack` is only the standalone walker's handoff.
+        //
+        // A refused residual (`symbolic_residual_abort`) never ran, so the
+        // blackhole resumes at that instruction's `orgpc` rather than after
+        // it; see `stage_interpret_abort_blackhole`, which consumes the flag.
+        let refused = self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.symbolic_residual_abort);
         if matches!(
             action,
             crate::TraceAction::Abort | crate::TraceAction::SwitchToBlackhole(_)
         ) && let Some(top) = self.framestack.frames.last_mut()
         {
-            top.pc = top.code_cursor;
+            top.pc = if refused {
+                top.last_opcode_position
+            } else {
+                top.code_cursor
+            };
         }
         action
     }
@@ -8710,41 +8793,30 @@ impl<M: Clone> MetaInterp<M> {
         let trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] cut_trace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
+                    "[jit] cut_trace_from: start.op_index={} original_boxes={} jump_args={} trace_ops={} header_pc={}",
                     start.op_index,
                     original_boxes.len(),
+                    jump_args.len(),
                     trace.ops.len(),
                     ctx.header_pc,
                 );
             }
-            // cut_trace_from_with_consts remaps escaped original inputargs to
-            // their trace-entry Const via a transient build-time map keyed by
-            // `OpRef.raw()`.  It declines (`None`) when the cut would drop a
-            // value held only by a guard snapshot.  The uncut trace is NOT a
-            // fallback here: everything downstream of a live merge point is
-            // built for the cut namespace and entry contract, so cancel this
-            // compilation and let the interpreter run the loop instead.
-            //
-            // `compile.py:269` cannot reach this: `trace.cut_trace_from` builds
-            // a lazy view and is total.  The cancellation is not a new exit
-            // though — it lands on the outcome the `except InvalidLoop` arm
-            // just below it already defines, "this trace produced no loop",
-            // reached one step earlier because pyre's cut is materialized.
-            // A loop entry (`compile.py compile_loop`) supplies only the
-            // merge-point red boxes. A snapshot box that cannot be replayed
-            // is an inputarg only on a bridge (`compile.py compile_retrace`,
-            // `opencoder.py CutTrace`); appending it here widens the entry
-            // `patch_new_loop_to_load_virtualizable_fields` asserts, so the
-            // cut declines and this compilation is cancelled.
-            let Some(cut) = trace.cut_trace_from_with_consts(
-                start,
-                original_boxes,
-                &ctx.initial_inputarg_consts,
-                false,
-            ) else {
-                return CompileOutcome::Cancelled;
-            };
-            cut
+            // pyjitpl.py `reached_loop_header`
+            // `assert len(original_boxes) == len(live_arg_boxes)`: the first
+            // visit and the closing JUMP build the same list.
+            assert_eq!(
+                original_boxes.len(),
+                jump_args.len(),
+                "pyjitpl.py reached_loop_header: len(original_boxes) == len(live_arg_boxes) \
+                 (first visit {} vs JUMP {})",
+                original_boxes.len(),
+                jump_args.len(),
+            );
+            // `compile.py compile_loop` `trace.cut_trace_from(start, inputargs)`
+            // is total: `opencoder.py CutTrace` views the suffix with
+            // `inputargs` = the merge-point live boxes. A pre-cut producer
+            // the suffix names is one of those boxes (`TraceIterator._get`).
+            trace.cut_trace_from(start, original_boxes)
         } else {
             trace
         };
@@ -10708,7 +10780,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let (orig_vable_ptr_retrace, retrace_cut, initial_inputarg_consts, call_pure_results) = {
+            let (orig_vable_ptr_retrace, retrace_cut, call_pure_results) = {
                 let ctx = self.compile_tracing.as_ref().unwrap();
                 let retrace_merge_point = ctx
                     .merge_point_at_start(retrace_pos)
@@ -10754,17 +10826,8 @@ impl<M: Clone> MetaInterp<M> {
                     ctx,
                     driver_descriptor.as_ref(),
                 );
-                // The recorder carries Const values inline on the OpRef variants
-                // (history.py ConstInt / ConstFloat / ConstPtr), so there is no legacy TraceCtx
-                // ConstantPool to snapshot — this typed-constant map starts fresh.
-                let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
                 let call_pure_results = ctx.call_pure_results.clone();
-                (
-                    orig_vable_ptr_retrace,
-                    retrace_cut,
-                    initial_inputarg_consts,
-                    call_pure_results,
-                )
+                (orig_vable_ptr_retrace, retrace_cut, call_pure_results)
             };
             let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
@@ -10788,24 +10851,20 @@ impl<M: Clone> MetaInterp<M> {
                         trace.ops.len(),
                     );
                 }
-                // A declined cut cannot fall back to the uncut trace: the
-                // retrace is installed against the merge point's entry
-                // contract. `compile.py compile_retrace` `cut_trace_from` is
-                // total, so this is the same outcome as `InvalidLoop`:
-                // `history.cut` the tentative JUMP and keep tracing.
-                let Some(cut) = trace.cut_trace_from_with_consts(
-                    start,
-                    original_boxes,
-                    &initial_inputarg_consts,
-                    true,
-                ) else {
-                    ctx.cut_trace(jump_cut);
-                    self.tracing = Some(ctx);
-                    self.partial_trace = Some(partial);
-                    self.retracing_from = retracing_from_kept;
-                    return false;
-                };
-                cut
+                // pyjitpl.py `reached_loop_header`
+                // `assert len(original_boxes) == len(live_arg_boxes)`.
+                assert_eq!(
+                    original_boxes.len(),
+                    jump_args.len(),
+                    "pyjitpl.py reached_loop_header: len(original_boxes) == len(live_arg_boxes) \
+                     (first visit {} vs JUMP {})",
+                    original_boxes.len(),
+                    jump_args.len(),
+                );
+                // `compile.py compile_retrace` `cut_trace_from` is total:
+                // `opencoder.py CutTrace` views the suffix with the merge
+                // point's live boxes as inputargs.
+                trace.cut_trace_from(start, original_boxes)
             } else {
                 trace
             };
@@ -11700,11 +11759,31 @@ impl<M: Clone> MetaInterp<M> {
         // `MIFrame.pc` is the cursor after operand decode
         // (`run_blackhole_interp_to_cancel_tracing`). CloseLoop aborts
         // return before `interpret` stamps it.
+        //
+        // That position presumes the top instruction ran, which upstream
+        // always holds: `do_residual_call` executes the call before anything
+        // can raise `SwitchToBlackhole`.  A walk that refused a residual
+        // (`symbolic_residual_abort`) stopped *before* running it, so the
+        // post-decode cursor would hand the blackhole a result register the
+        // call never wrote.  Resume at the instruction's own start instead —
+        // the `orgpc` the opimpl handlers decode from — so the blackhole
+        // executes the call itself or declines it and the portal replays.
+        let refused = self
+            .tracing
+            .as_mut()
+            .is_some_and(|ctx| std::mem::replace(&mut ctx.symbolic_residual_abort, false));
         if let Some(top) = self.framestack.frames.last_mut() {
-            // Same boundary as `publish_walk_abort_handoff`:
-            // `BlackholeInterpreter.setposition` dispatches `MIFrame.pc`,
-            // and `_get_opimpl_method` only stores an instruction start.
-            top.pc = dispatch::snap_pc_to_instruction_start(top);
+            // `BlackholeInterpreter.setposition` dispatches `MIFrame.pc`, and
+            // `_get_opimpl_method` only stores an instruction start
+            // (`publish_walk_abort_handoff`). A refused residual never ran, so
+            // that start is the op's `orgpc` (`last_opcode_position`), not the
+            // post-decode cursor. An instruction that did run keeps the
+            // cursor when it already sits on a startpoint.
+            top.pc = if refused && top.jitcode.is_valid_startpoint(top.last_opcode_position) {
+                top.last_opcode_position
+            } else {
+                dispatch::snap_pc_to_instruction_start(top)
+            };
         }
         let framestack = std::mem::replace(&mut self.framestack, MIFrameStack::empty());
         self.pending_abort_blackhole = Some(crate::PendingAbortBlackhole {
@@ -17376,6 +17455,12 @@ impl<M: Clone> MetaInterp<M> {
             jct.retraced_count.get() & majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING != 0
         });
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
+        // history.py `Const.value` is only on a box the trace already
+        // proved constant. The deadframe word is the runtime value of this
+        // one failure (`load_box_from_cpu`), not that proof. Seeding every
+        // live slot here makes `virtualstate` pin a GUARD_VALUE on a pointer
+        // that is a fresh object each iteration, so the bridge fails and the
+        // next failure compiles another one.
         if let Some(index) = source_jitdriver_index {
             let descriptor = self
                 .staticdata
@@ -22727,6 +22812,10 @@ pub struct MetaInterpStaticData {
     /// the backend exists, instead of deriving it by Python module
     /// reflection.
     pub jit_starting_line: String,
+    /// Interpreter-owned setup hooks. `warmspot.py` fills
+    /// `MetaInterpStaticData` once; pyre used to scatter the same
+    /// pointers across process-global OnceLocks / atomics.
+    pub host: HostHooks,
 }
 
 /// pyjitpl.py `class MetaInterpGlobalData`.
@@ -31902,12 +31991,14 @@ mod tests {
         }
         {
             let ctx = meta.trace_ctx().unwrap();
+            // No structured key: the banks are the declared greens, whose
+            // first int is the back-edge target (`next_instr`).
             ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
-                vec![("g", Type::Int)],
+                vec![("next_instr", Type::Int), ("g", Type::Int)],
                 vec![("r", Type::Int)],
             ));
             ctx.close_green_pc = Some(pc);
-            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+            ctx.close_greens = Some((vec![pc, extra], Vec::new(), Vec::new()));
         }
         let closed = meta
             .trace_ctx()

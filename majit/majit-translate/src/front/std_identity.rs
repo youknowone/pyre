@@ -497,6 +497,7 @@ mod tests {
         CallTarget::FunctionPath {
             segments: segments.iter().map(|s| s.to_string()).collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 

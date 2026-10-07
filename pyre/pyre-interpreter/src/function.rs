@@ -257,7 +257,7 @@ pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1
 /// `quasiimmut.py` keys everything off the mutate-field *name*; pyre needs a
 /// value it can pass through the descr-index dispatch in
 /// `pyre-jit-trace state.rs` / `pyre-jit eval.rs`, so the name becomes a tag.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum QuasiImmutSlot {
     Code,
     WFuncGlobalsObj,
@@ -277,40 +277,6 @@ impl QuasiImmutSlot {
     pub fn index(self) -> usize {
         self as usize
     }
-}
-
-/// The `mutate_<name>` field for one `?` entry, or `None` when `obj` does not
-/// carry the `Function` layout the slot lives in.
-///
-/// Reaching a slot casts `obj` to `*const Function`, so the carrier test is the
-/// precondition for the cast, not a convenience. `is_function_carrier` is the
-/// right predicate rather than a bare `FUNCTION_TYPE` comparison: the four
-/// types `function_new_impl` stamps — `function`, `builtin_function_or_method`,
-/// `method_descriptor`, `wrapper_descriptor` — all allocate a real `Function`
-/// whose slots are initialised, and skipping any of them would leave a write
-/// unannounced. Under-invalidation is the unsound direction; over-invalidation
-/// is not (`quasiimmut.py`).
-///
-/// Answers `None` while [`Function::mutate_slots`] is still null, which is the
-/// null `mutate_<name>` of `quasiimmut.py`: nothing has folded the field, so
-/// there is nothing to revoke. Only [`function_current_qmut_instance`] creates
-/// the block.
-///
-/// # Safety
-/// `obj` must be null or point at a live `PyObject`.
-pub unsafe fn function_quasi_immut_field<'a>(
-    obj: PyObjectRef,
-    slot: QuasiImmutSlot,
-) -> Option<&'a QuasiImmutField> {
-    if obj.is_null() || !unsafe { is_function_carrier(obj) } {
-        return None;
-    }
-    let f = obj as *const Function;
-    let slots = unsafe { (*f).mutate_slots.load(Ordering::Acquire) };
-    if slots.is_null() {
-        return None;
-    }
-    Some(unsafe { &(*slots).0[slot.index()] })
 }
 
 /// `quasiimmut.py get_current_qmut_instance` — resolve the instance
@@ -352,15 +318,58 @@ pub unsafe fn function_current_qmut_instance(
     Some(unsafe { &(*slots).0[slot.index()] }.get_current_qmut_instance())
 }
 
-/// `quasiimmut.py make_invalidation_function._invalidate_now` — revoke
-/// every loop that folded this field. Runs BEFORE the store, the way
+/// `quasiimmut.py make_invalidation_function.invalidation` — revoke every
+/// loop that folded this field. Runs BEFORE the store, the way
 /// `typeobject.rs w_type_set_version_tag` calls its notify first.
+///
+/// Reaching a slot casts `obj` to `*const Function`, so the carrier test is the
+/// precondition for the cast, not a convenience. `is_function_carrier` is the
+/// right predicate rather than a bare `FUNCTION_TYPE` comparison: the four
+/// types `function_new_impl` stamps — `function`, `builtin_function_or_method`,
+/// `method_descriptor`, `wrapper_descriptor` — all allocate a real `Function`
+/// whose slots are initialised, and skipping any of them would leave a write
+/// unannounced. Under-invalidation is the unsound direction; over-invalidation
+/// is not (`quasiimmut.py`).
+///
+/// The `if getattr(p, mutatefieldname)` test is a `Relaxed` null check of
+/// [`Function::mutate_slots`]: nothing is read through the pointer here, and
+/// [`function_invalidate_now`] reloads it with `Acquire` before touching the
+/// block. A null block is the null `mutate_<name>` of `quasiimmut.py`: nothing
+/// has folded the field, so there is nothing to revoke. Only
+/// [`function_current_qmut_instance`] creates the block.
 ///
 /// # Safety
 /// `obj` must be null or point at a live `PyObject`.
 pub unsafe fn function_notify_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
-    if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
-        field.invalidate();
+    if obj.is_null() || !unsafe { is_function_carrier(obj) } {
+        return;
+    }
+    let slots = unsafe {
+        (*(obj as *const Function))
+            .mutate_slots
+            .load(Ordering::Relaxed)
+    };
+    if !slots.is_null() {
+        unsafe { function_invalidate_now(obj, slot.index()) };
+    }
+}
+
+/// `quasiimmut.py make_invalidation_function._invalidate_now`
+/// (`_dont_inline_`). Upstream specializes one per mutate field; the
+/// [`QuasiImmutSlot`] position stands in for that field.
+///
+/// # Safety
+/// `obj` must point at a live function carrier and `index` must be below
+/// [`QUASI_IMMUT_SLOT_COUNT`].
+#[majit_macros::dont_look_inside]
+unsafe fn function_invalidate_now(obj: PyObjectRef, index: usize) {
+    let slots = unsafe {
+        (*(obj as *const Function))
+            .mutate_slots
+            .load(Ordering::Acquire)
+    };
+    if !slots.is_null() {
+        unsafe { &(*slots).0[index] }.invalidate();
     }
 }
 
@@ -1559,6 +1568,8 @@ pub unsafe fn getcode(obj: PyObjectRef) -> PyObjectRef {
                 return _get_immutable_code(obj);
             }
             // function.py `Function.getcode`: `jit.promote(self.code)`.
+            // Promote the pointer, not its address bits: a GuardValue on
+            // the integer is a baked immediate the collector cannot forward.
             return majit_metainterp::jit::promote((*func).code) as PyObjectRef;
         }
         // function.py `Function.getcode`: the untraced `return self.code`.
@@ -2818,19 +2829,18 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         // generator, coroutine, and async generator remains permitted for
         // compatibility, but warns because the callable's result protocol
         // changes underneath existing references.
-        let old_code = &*(get_pycode(obj) as *const crate::CodeObject);
-        let kind_mask = crate::CodeFlags::GENERATOR
-            | crate::CodeFlags::COROUTINE
-            | crate::CodeFlags::ASYNC_GENERATOR;
+        let kind_mask = crate::astcompiler::consts::CO_GENERATOR
+            | crate::astcompiler::consts::CO_COROUTINE
+            | crate::astcompiler::consts::CO_ASYNC_GENERATOR;
+        let old_flags = (*(getcode(obj) as *const crate::pycode::PyCode)).co_flags;
+        let new_flags = (*(w_code as *const crate::pycode::PyCode)).co_flags;
         // `warn_deprecation` runs the app-level warnings machinery and
         // `function_get_doc` realizes the docstring; both allocate, so publish
         // the two operands and read them back from their root slots rather
         // than storing through a pre-move address.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[obj, w_code]);
-        if old_code.flags.intersection(kind_mask).bits()
-            != (*raw_code).flags.intersection(kind_mask).bits()
-        {
+        if old_flags & kind_mask != new_flags & kind_mask {
             crate::warn::warn_deprecation(
                 "Assigning a code object of non-matching type is deprecated (e.g., from a generator to a plain function)",
             )?;
@@ -4114,6 +4124,7 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
 /// regular closure but skips the builtin-call setup.
 type ExcInfoDirectFn = fn(&mut crate::pyframe::PyFrame) -> PyObjectRef;
+#[majit_macros::prebuilt_static]
 static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();
@@ -4132,9 +4143,12 @@ pub fn register_sys_exc_info_path(code: PyObjectRef, direct_fn: ExcInfoDirectFn)
     let _ = SYS_EXC_INFO_DIRECT_FN.set(direct_fn);
 }
 
+/// The slot is only compared by identity against a function's code and never
+/// dereferenced through, so the read is a plain `Relaxed` load of the
+/// space-wide attribute (`space._code_of_sys_exc_info`).
 #[inline]
 fn sys_exc_info_code() -> PyObjectRef {
-    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Acquire)
+    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]
@@ -4160,8 +4174,10 @@ pub fn funccall_valuestack(
     // caller frame is already a GC object kept live by `FrameAnchor` and the
     // execution-context chain, and `pyframe_object_custom_trace` visits
     // `locals_cells_stack_w`. Value-stack stores can still leave a young
-    // pointer in an old array, so the write barrier runs before anything allocates.
-    crate::pyframe::remember_frame_locals_array(frame.locals_cells_stack_w);
+    // pointer in an old array, so the write barrier runs before anything
+    // allocates. It takes the frame: the valuestack array stays inside
+    // `peekvalue` / `dropvalues`, never a call argument.
+    crate::pyframe::remember_frame_locals(frame);
     // A compiled callee prologue can publish an overflow before control
     // returns to this dispatcher.  The fresh stack check belongs to the
     // Python frame entry (`PyFrame.execute_frame.insert_stack_check_here`),
@@ -4302,39 +4318,18 @@ pub fn funccall_valuestack(
     }
 
     // function.py:194-199 — PASSTHROUGHARGS1 dispatch.
-    // PyPy's BuiltinCodePassThroughArguments1.funcrun_obj receives w_obj
-    // separately from an Arguments rest, then concatenates them as
-    // `args_w = [w_obj] + _args_w` before calling the unwrapped fn. Pyre's
-    // single BuiltinCodeFn signature already takes a flat slice, so the
-    // peek/Arguments split is structural — the final closure invocation
-    // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
     if !natural_arity_call
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
         let w_obj = frame.peekvalue(nargs - 1);
-        let rest = frame.make_arguments(nargs - 1, false, func);
-        // Same live-variable set as the fixed-arity arm above, for the same
-        // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and `args_w` is a native Vec no root walker updates.
-        // `builtin_code_call` roots nothing of its own, so the whole
-        // `[code, w_obj, ...rest]` set has to be published here and read back
-        // for the call.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut live = Vec::with_capacity(2 + rest.len());
-        live.push(code as PyObjectRef);
-        live.push(w_obj);
-        live.extend_from_slice(&rest);
-        let root_base = _roots.pin_roots(&live);
+        let args = frame.make_arguments(nargs - 1, false, func);
         frame.dropvalues(dropvalues);
-        let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
-        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        };
+        return crate::gateway::BuiltinCodePassThroughArguments1::funcrun_obj(
+            code as PyObjectRef,
+            w_obj,
+            args,
+        );
     }
 
     // function.py:201-203 — fallback: build Arguments via make_arguments
@@ -4394,12 +4389,9 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
-    // `[None] * size` nursery array.  Arguments just written into it are
-    // also young.  `remember_frame_locals_array` still runs: a full nursery
-    // can spill the array to old-gen, and until the callee sits on
-    // `f_backref` nothing else exposes these slots.
-    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    // `function.py` `_flat_pycall` copies through `peekvalue` into the
+    // callee frame. `set_locals_w` writes the slots; the array itself is
+    // not a call argument (`jtransform.py` `_check_no_vable_array`).
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -4417,14 +4409,9 @@ fn _flat_pycall(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall` returns `new_frame.run(...)`.
+        // `call::eval_current_frame_raw` is that call (`dont_look_inside`).
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 
@@ -4496,9 +4483,7 @@ fn _flat_pycall_defaults(
         }
     }
 
-    // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
-    // locals array to old-gen, and the arguments and defaults in it are young.
-    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    // Same copy as `_flat_pycall`: the callee array is not passed onward.
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -4513,14 +4498,8 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall_defaults` returns `new_frame.run(...)`.
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 

@@ -218,6 +218,8 @@ where
         table[jitcode::insns::BC_INT_GUARD_VALUE as usize] = Self::opimpl_int_guard_value;
         table[jitcode::insns::BC_ASSERT_NOT_NONE as usize] = Self::opimpl_assert_not_none;
         table[jitcode::insns::BC_RECORD_EXACT_CLASS as usize] = Self::opimpl_record_exact_class;
+        table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD as usize] =
+            Self::opimpl_record_quasiimmut_field;
         table[jitcode::insns::BC_REF_GUARD_VALUE as usize] = Self::opimpl_ref_guard_value;
         table[jitcode::insns::BC_FLOAT_GUARD_VALUE as usize] = Self::opimpl_float_guard_value;
         table[jitcode::insns::BC_GUARD_CLASS as usize] = Self::opimpl_guard_class;
@@ -232,6 +234,7 @@ where
         table[jitcode::insns::BC_NEWLIST_CLEAR as usize] = Self::opimpl_newlist_clear;
         table[jitcode::insns::BC_INT_ISCONSTANT as usize] = Self::opimpl_int_isconstant;
         table[jitcode::insns::BC_REF_ISCONSTANT as usize] = Self::opimpl_ref_isconstant;
+        table[jitcode::insns::BC_INT_ISVIRTUAL as usize] = Self::opimpl_int_isvirtual;
         table[jitcode::insns::BC_REF_ISVIRTUAL as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_STRLEN as usize] = Self::opimpl_strlen;
         table[jitcode::insns::BC_STRGETITEM as usize] = Self::opimpl_strgetitem;
@@ -577,7 +580,7 @@ where
         // *records* New / NewWithVtable so the optimizer can virtualize
         // the struct away when it does not escape.
         let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
-        let (size, vtable, type_id, headerless, descr, dest) = {
+        let (size, bh_vtable, type_id, headerless, descr, dest) = {
             let frame = self.frames.current_mut();
             let (descr_idx, dest) = frame.read_new();
             let bh = frame
@@ -591,6 +594,18 @@ where
                 size_descr_ref_from_bh(bh),
                 dest,
             )
+        };
+        // `pyjitpl.py opimpl_new_with_vtable`: the class word is
+        // `descr.get_vtable()`. Assembler may leave BhDescr.vtable
+        // at 0; the published size descr in `_cache_size` holds it.
+        let vtable = if with_vtable {
+            descr
+                .as_size_descr()
+                .map(|sd| sd.vtable())
+                .filter(|&v| v != 0)
+                .unwrap_or(bh_vtable)
+        } else {
+            bh_vtable
         };
         // A `headerless` descr means the interpreter owns this struct in
         // its own collected pool (`headerless_structs`), which is what
@@ -649,7 +664,28 @@ where
             return TraceAction::Abort;
         }
         if with_vtable && vtable != 0 {
-            unsafe { *(ptr as *mut usize) = vtable };
+            // Allocation stays in this arm. `cpu.bh_new_with_vtable`
+            // refuses a raw fallback once a collector is installed,
+            // and cranelift's copy skips a headerless descr. Tests
+            // trace with no backend installed
+            // (`TraceCtx::for_test`), so there is no cpu to call.
+            // The header stores are still the one helper the
+            // backends use. An unconfigured `vtable_offset` keeps
+            // the offset-0 type word this arm has always written;
+            // a configured offset replaces it. The class word is
+            // written only when the backend was given one.
+            let (vtable_offset, w_class_offset) = match ctx.blackhole_cpu() {
+                Some(cpu) => (cpu.vtable_offset().or(Some(0)), cpu.w_class_offset()),
+                None => (Some(0), None),
+            };
+            unsafe {
+                majit_backend::write_new_with_vtable_header(
+                    ptr as *mut u8,
+                    vtable,
+                    vtable_offset,
+                    w_class_offset,
+                );
+            }
         }
         let kind = if with_vtable {
             OpCode::NewWithVtable
@@ -773,6 +809,16 @@ where
             {
                 majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
             }
+            let shadow = match bytecode {
+                jitcode::insns::BC_SETFIELD_GC_R => {
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize))
+                }
+                jitcode::insns::BC_SETFIELD_GC_F => {
+                    majit_ir::Value::Float(f64::from_bits(concrete as u64))
+                }
+                _ => majit_ir::Value::Int(concrete),
+            };
+            ctx.sync_shadow_if_vable_heap_store(struct_ptr, offset, value_opref, shadow);
         }
         TraceAction::Continue
     }
@@ -1156,15 +1202,36 @@ where
             // an entry seeded without a live concrete and skips
             // the check.  A null struct fabricated `loaded` rather
             // than reading, so it has nothing to compare either.
+            //
+            // RPython runs `executor.execute(cpu, metainterp,
+            // opnum, fielddescr, box)` for this compare
+            // (`_opimpl_getfield_gc_any_pureornot`). That is
+            // `bh_getfield_gc_{i,r}`, a word-sized ref load —
+            // not a raw i64 read that on a 32-bit target
+            // swallows the next field.
             let expected = match ctx.box_value(cached) {
                 Some(Value::Int(n)) => Some(n),
                 Some(Value::Ref(r)) => Some(r.0 as i64),
                 _ => None,
             };
+            let executed = if is_ref {
+                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Ref)
+                    .and_then(|v| match v {
+                        Value::Ref(r) => Some(r.0 as i64),
+                        _ => None,
+                    })
+            } else {
+                ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Int)
+                    .and_then(|v| match v {
+                        Value::Int(n) => Some(n),
+                        _ => None,
+                    })
+            };
+            let compare = executed.unwrap_or(loaded);
             assert!(
-                struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                struct_ptr == 0 || !matches!(expected, Some(exp) if exp != compare),
                 "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                     loaded {loaded} != cached {expected:?} \
+                     loaded {compare} != cached {expected:?} \
                      (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
                 if is_ref { "ref" } else { "int" },
             );
@@ -2449,14 +2516,19 @@ where
         // return ConstInt(result)`.  RPython reads from the live
         // struct; pyre's trace-side shadow is
         // `virtualizable_array_lengths`, populated by
-        // `init_virtualizable_boxes` (resume.py:471-486 parity)  allow-line-citation
+        // `init_virtualizable_boxes` (resume.py ResumeDataVirtualAdder._number_virtuals parity)
         // before the trace runs, so it carries the same length
-        // RPython would dereference.
-        let len = ctx
-            .virtualizable_array_lengths()
-            .and_then(|lengths| lengths.get(array_idx).copied())
-            .unwrap_or(0);
-        self.set_int_reg(ctx, dest, Some(result), Some(len as i64));
+        // RPython would dereference.  The nonstandard leg goes
+        // through `opimpl_arraylen_gc` / `bh_arraylen_gc` and
+        // stamps that length on `result`.
+        let len = match ctx.box_value(result) {
+            Some(Value::Int(n)) => n,
+            _ => ctx
+                .virtualizable_array_lengths()
+                .and_then(|lengths| lengths.get(array_idx).copied())
+                .unwrap_or(0) as i64,
+        };
+        self.set_int_reg(ctx, dest, Some(result), Some(len));
         TraceAction::Continue
     }
 
@@ -3662,12 +3734,11 @@ where
                     }
                 }
                 if inner_close {
-                    // The merge point's live arg boxes (only the green
-                    // slots are populated for the state-field dispatch
-                    // model; reds are state fields restored separately).
-                    // These become the inner loop's `original_boxes` —
-                    // the promoted-green constants — for the cross-loop
-                    // cut remap (compile.py compile_loop `cut_trace_from`).
+                    // Merge-point operand boxes (greens + reds). The inner
+                    // loop's `original_boxes` are the reds plus
+                    // `virtualizable_boxes[:-1]` (`reached_loop_header`
+                    // `live_arg_boxes[num_green_args:]`); greens stay in
+                    // this list for `same_greenkey`.
                     let (opref_opt, ty) = match slot {
                         0 | 3 => (
                             frame.int_regs.get(reg_idx).copied().flatten(),
@@ -4067,6 +4138,9 @@ where
                     jdindex,
                     result_dst,
                     &green_values,
+                    &[],
+                    &[],
+                    &[],
                 ) {
                     TraceAction::Continue => {}
                     // Abort propagates (missing fresh-reds / target).
@@ -4299,20 +4373,12 @@ where
                             .find_merge_point_same_greenkey(close_key, close_key_typed.as_ref())
                             .is_none()
                     {
-                        let vable_boxes =
-                            ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                        let original_boxes = match sym
-                            .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
-                        {
-                            Some(mut boxes) => {
-                                ctx.remove_consts_and_duplicates(&mut boxes);
-                                boxes
-                                    .into_iter()
-                                    .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                    .collect()
-                            }
-                            None => live_arg_boxes.to_vec(),
-                        };
+                        let original_boxes = self.reached_loop_header_original_boxes(
+                            ctx,
+                            sym,
+                            &redboxes,
+                            &live_arg_boxes,
+                        );
                         if crate::mptrace_enabled() {
                             eprintln!(
                                 "@@@MPTRACE bridge-add-mp key={close_key} header_pc={} num_ops={}",
@@ -4349,6 +4415,22 @@ where
                     // `recover`.
                     ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
                     ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
+                }
+                // pyjitpl.py `reached_loop_header`: before `compile_loop`,
+                // `get_procedure_token(greenboxes)` + `has_compiled_targets`
+                // records a JUMP into the loop that already owns this merge
+                // point (`compile_trace`). A root trace has no `bridge_info`,
+                // so the guard-origin block never runs; publishing the token
+                // key is what makes the driver take `compile_trace_from_interp`
+                // instead of `compile_loop`'s `ABORT_BAD_LOOP`.
+                if !ctx.is_bridge_trace
+                    && let Some(close_key) = ctx.close_green_key_hash()
+                    && ctx
+                        .has_compiled_targets_fn
+                        .as_ref()
+                        .is_some_and(|f| f(close_key))
+                {
+                    ctx.close_jump_into_key = Some(close_key);
                 }
                 // GUARD_FUTURE_CONDITION already emitted unconditionally at
                 // the reached_loop_header entry above (pyjitpl.py).
@@ -4586,23 +4668,16 @@ where
                     // the greens plus one unexpanded vable ref while its
                     // close expanded to one box per element — the arity
                     // mismatch that made every nested loop decline.
-                    let vable_boxes = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                    let original_boxes = match sym
-                        .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
-                    {
-                        Some(mut boxes) => {
-                            // pyjitpl.py MetaInterp.remove_consts_and_duplicates normalizes the list
-                            // before it becomes anything — the LABEL
-                            // this registration turns into cannot carry
-                            // a constant or a repeated box.
-                            ctx.remove_consts_and_duplicates(&mut boxes);
-                            boxes
-                                .into_iter()
-                                .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                .collect()
-                        }
-                        None => live_arg_boxes.into_vec(),
-                    };
+                    // (pyjitpl.py MetaInterp.reached_loop_header). Register the SAME list the
+                    // close JUMP uses (`reached_loop_header` `live_arg_boxes`
+                    // after slicing greens): reds plus
+                    // `virtualizable_boxes[:-1]`.
+                    let original_boxes = self.reached_loop_header_original_boxes(
+                        ctx,
+                        sym,
+                        &redboxes,
+                        &live_arg_boxes,
+                    );
                     if crate::mptrace_enabled() {
                         eprintln!(
                             "@@@MPTRACE add-mp pc={pc} inner_key={inner_key} num_ops={}",
@@ -5277,6 +5352,17 @@ where
             let is_loopinvariant =
                 effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
+            if let Some(action) = self.try_record_set_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                &args,
+                &raw_r,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py execute_varargs parity (plain
             // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py
             // (MAY_FORCE_N branch).  Both branches share the same
@@ -5373,6 +5459,26 @@ where
             // vrefs.
             if is_forces {
                 ctx.vrefs_after_residual_call();
+            }
+            // `frame_anchor_release` is the drop of a tracing-only
+            // shadow-stack slot. `interp_jit.py` `dispatch` has no
+            // counterpart; skip the `CallN` when the helper ran.
+            // `stack_check` is the same: compiled loops poll the
+            // breaker on the back-edge (`rstack.py`). Skip only
+            // when the helper did not publish an exception.
+            if let Some(spec) = crate::box_trace::void_skip_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) == 0
+            {
+                if is_forces
+                    && matches!(
+                        self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                        TraceAction::Abort
+                    )
+                {
+                    return TraceAction::Abort;
+                }
+                return TraceAction::Continue;
             }
             // 3. record IR (`history.record` →
             //    `_record_helper_varargs`). pyjitpl.py
@@ -5700,12 +5806,44 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
             // TOKEN_TRACING_RESCALL in that branch).
             if is_forces {
                 ctx.vrefs_after_residual_call();
+            }
+            // `gc_interp::enabled` is `@elidable` (`rlib/jit.py`):
+            // the env read is cached. Record the traced constant
+            // instead of `CallI` so compiled loops do not keep the
+            // residual the frozen jitcode still emits.
+            // `ll_issubclass` is `@elidable_cannot_raise`
+            // (`rclass.py`); same fold. An elidable result is a
+            // constant only when every argument is one
+            // (`pyjitpl.py execute_varargs` pure path); a variable
+            // input keeps the recorded call below.
+            if let Some(spec) = crate::box_trace::elidable_int_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && args.iter().all(|arg| arg.is_constant())
+            {
+                let folded = ctx.const_int(concrete);
+                self.set_int_reg(ctx, dst, Some(folded), Some(concrete));
+                if is_forces
+                    && matches!(
+                        self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                        TraceAction::Abort
+                    )
+                {
+                    return TraceAction::Abort;
+                }
+                return TraceAction::Continue;
             }
             // pyjitpl.py do_residual_call plain branch:
             //     pure = effectinfo.check_is_elidable()
@@ -5807,13 +5945,18 @@ where
                     let frame = self.frames.current_mut();
                     eprintln!(
                         "[interpret] residual may_force jitcode={} last_op={} cursor={} \
-                         extraeffect={:?} can_raise={} next={:?}",
+                         extraeffect={:?} can_raise={} next={:?} fnaddr={:#x} classes={:?} \
+                         ret={} last_exc={:#x}",
                         frame.jitcode.name(),
                         frame.last_opcode_position,
                         frame.code_cursor,
                         effectinfo.extraeffect,
                         effectinfo.check_can_raise(false),
                         frame.jitcode.code.get(frame.code_cursor),
+                        concrete_ptr as usize,
+                        calldescr.arg_classes,
+                        concrete,
+                        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
                     );
                 }
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -6027,6 +6170,25 @@ where
                 return TraceAction::Continue;
             }
 
+            if let Some(action) = self.try_record_load_global_exc_class(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                &raw_i,
+                dst,
+            ) {
+                return action;
+            }
+            if let Some(action) = self.try_record_get_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                dst,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
             // clear_exception precedes vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
@@ -6062,12 +6224,62 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
             // TOKEN_TRACING_RESCALL in that branch).
             if is_forces {
                 ctx.vrefs_after_residual_call();
+            }
+            // interp_jit.py `PyFrame.dispatch` has no per-opcode
+            // `reload_top_root`. When the live result equals the
+            // argument, no collection moved it — record the
+            // identity instead of `CallR`.
+            if let Some(spec) = crate::box_trace::identity_ref_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && let Some(&raw_op) = args.first()
+            {
+                let arg_bits = raw_r.first().copied().unwrap_or(0);
+                if concrete == arg_bits {
+                    self.set_ref_reg(ctx, dst, Some(raw_op), Some(concrete));
+                    if is_forces
+                        && matches!(
+                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
+                    }
+                    return TraceAction::Continue;
+                }
+            }
+            // `frame_anchor_live` rereads the red frame. Reuse
+            // the standard virtualizable OpRef when the concrete
+            // equals that frame. The recorded push keeps the depth word so
+            // blackhole resume still has the depth.
+            if let Some(spec) = crate::box_trace::frame_anchor_live_residual()
+                && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                && let Some(vable) = ctx.standard_virtualizable_box()
+                && let Some(ptr) = ctx.standard_virtualizable_ptr()
+                && concrete == ptr as i64
+            {
+                self.set_ref_reg(ctx, dst, Some(vable), Some(concrete));
+                if is_forces
+                    && matches!(
+                        self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                        TraceAction::Abort
+                    )
+                {
+                    return TraceAction::Abort;
+                }
+                return TraceAction::Continue;
             }
             // pyjitpl.py do_residual_call plain branch —
             // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
@@ -8215,6 +8427,72 @@ where
         TraceAction::Continue
     }
 
+    // pyjitpl.py opimpl_record_quasiimmut_field. `rdd`: struct,
+    // field descr, unused mutate descr. No watcher skips the op so
+    // the following getfield stays a real load.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_record_quasiimmut_field(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let resume_pc = self.frames.current_mut().last_opcode_position;
+        let (struct_reg, field_idx) = {
+            let frame = self.frames.current_mut();
+            let struct_reg = frame.next_reg() as usize;
+            let field_idx = frame.next_u16() as usize;
+            let _mutate_idx = frame.next_u16();
+            (struct_reg, field_idx)
+        };
+        let fielddescr = {
+            let frame = self.frames.current_mut();
+            if let Some(descr) = frame.runtime_optimizer_descr(field_idx) {
+                descr
+            } else if let Some(bh) = frame.runtime_bh_descr(field_idx) {
+                field_descr_ref_from_bh(bh).1
+            } else {
+                ctx.symbolic_residual_abort = true;
+                return TraceAction::Abort;
+            }
+        };
+        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
+        let field_key = heapcache_field_key(&fielddescr);
+        if field_key.is_some_and(|key| ctx.heap_cache().is_quasi_immut_known(key, struct_opref)) {
+            ctx.profiler()
+                .count_ops(OpCode::QuasiimmutField, crate::counters::HEAPCACHED_OPS);
+        } else if let Some(descr) = crate::pyjitpl::host_hooks()
+            .make_quasi_immut_descr
+            .and_then(|hook| hook(struct_ptr, &fielddescr))
+        {
+            if let Some(key) = field_key {
+                ctx.heap_cache_mut()
+                    .quasi_immut_now_known(key, struct_opref);
+            }
+            let _ = ctx.execute_and_record(
+                Some(self.cpu.as_ref()),
+                OpCode::QuasiimmutField,
+                Some(descr),
+                &[struct_opref],
+                None,
+                self.last_exception_value,
+            );
+            if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+                self.record_state_guard(
+                    ctx,
+                    sym,
+                    OpCode::GuardNotInvalidated,
+                    &[],
+                    resume_pc,
+                    false,
+                );
+            }
+        }
+        TraceAction::Continue
+    }
+
     // pyjitpl.py opimpl_ref_guard_value → implement_guard_value
     #[inline(never)]
     #[allow(unused_variables)]
@@ -8822,6 +9100,32 @@ where
         };
         let (opref, _) = self.read_ref_reg(ctx, src);
         let value = opref.is_constant() as i64;
+        let dest_box = ctx.const_int(value);
+        self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
+        TraceAction::Continue
+    }
+
+    // pyjitpl.py `_opimpl_isvirtual`: `return ConstInt(
+    // heapcache.is_likely_virtual(box))`.  No IR op.  The int-kind
+    // spelling is `jtransform.py` `jit.isvirtual` on a raw header
+    // address; a non-ref box is never virtual.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_int_isvirtual(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let (src, dest) = {
+            let frame = self.frames.current_mut();
+            let src = frame.next_reg() as usize;
+            let dest = frame.next_reg() as usize;
+            (src, dest)
+        };
+        let (opref, _) = self.read_int_reg(ctx, src);
+        let value = ctx.is_likely_virtual(opref) as i64;
         let dest_box = ctx.const_int(value);
         self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
         TraceAction::Continue

@@ -10190,10 +10190,18 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     let metaclass_to_pin = if std::ptr::eq(w_metaclass, w_metatype) {
         None
     } else {
-        let meta_call =
-            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metaclass, "__call__") };
-        let type_call =
-            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metatype, "__call__") };
+        let meta_call = unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                w_metaclass,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+            )
+        };
+        let type_call = unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                w_metatype,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+            )
+        };
         if meta_call != type_call {
             return type_call_decline("metaclass overrides __call__");
         }
@@ -10254,13 +10262,33 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // return value stand for the whole of `type.__call__`, was measured to
     // produce a wrong answer (`TypeError: 'NewOv' object is not callable`, an
     // instance reaching the callable slot) and is not what this does.
-    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__new__") };
-    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    let tp_new = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    };
+    let obj_new = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_object,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    };
     if tp_new != obj_new {
         return type_call_decline("__new__ overridden");
     }
-    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__init__") };
-    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    let tp_init = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+        )
+    };
+    let obj_init = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_object,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+        )
+    };
     let init_override = (tp_init != obj_init).then_some(tp_init).flatten();
     // Both answers are baked by identity -- `__new__` as "object's, so the
     // allocation is this emit's", `__init__` as the body walked below -- and
@@ -10477,7 +10505,12 @@ pub(crate) fn try_walker_inline_object_new<Sym: WalkSym>(
     if w_object.is_null() {
         return Ok(None);
     }
-    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    let obj_new = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_object,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    };
     if obj_new != Some(callable) {
         return Ok(None);
     }
@@ -10610,16 +10643,23 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     if version_tag == 0 {
         return Ok(None);
     }
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(dunder)),
+        )
+    }) else {
         return Ok(None);
     };
     let Some(base_exception) = pyre_interpreter::builtins::lookup_exc_class("BaseException") else {
         return Ok(None);
     };
-    let Some(default_method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base_exception, dunder) })
-    else {
+    let Some(default_method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            base_exception,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(dunder)),
+        )
+    }) else {
         return Ok(None);
     };
     if std::ptr::eq(method, default_method) {
@@ -10782,9 +10822,12 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     if version_tag == 0 {
         return Ok(None);
     }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__hash__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__hash__")),
+        )
+    }) else {
         return Ok(None);
     };
     // `__hash__ = None` raises in the residual; a non-Python `__hash__`
@@ -11584,12 +11627,24 @@ fn diag_nondatadescr_miss(pc: usize, name: &str, obj: pyre_object::PyObjectRef) 
         unsafe { pyre_interpreter::baseobjspace::w_type_version_tag(w_type) }
     };
     let getattr = !w_type.is_null()
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }
-            .is_some();
+        && unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                    "__getattr__",
+                )),
+            )
+        }
+        .is_some();
     let looked = if w_type.is_null() {
         None
     } else {
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, name) }
+        unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name)),
+            )
+        }
     };
     let cell_null = w_type.is_null()
         || unsafe {
@@ -13086,15 +13141,16 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     // `subclass_special_override`: an inherited slot is the layout truth,
     // not an override. Inlining it would call the builtin `__bool__` and
     // skip a subclass that only overrides `__len__`.
+    let bool_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__bool__"));
     let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__bool__") })
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, bool_name) })
     else {
         decline!("no __bool__");
     };
     let base = unsafe { pyre_object::get_instantiate(&*(*concrete_receiver).ob_type) };
     if !base.is_null()
         && let Some(inherited) =
-            (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base, "__bool__") })
+            (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base, bool_name) })
         && std::ptr::eq(inherited, method)
     {
         decline!("__bool__ is the inherited slot");
@@ -14903,13 +14959,15 @@ fn binop_reflected_runs_first(
     let Some(reflected) = user_binop_reflected_dunder(op_kind) else {
         return false;
     };
+    let forward_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(forward));
+    let reflected_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(reflected));
     let Some((lsrc, _)) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_l, forward) })
+        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_l, forward_name) })
     else {
         return false;
     };
     let Some((rsrc, _)) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_r, reflected) })
+        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_r, reflected_name) })
     else {
         return false;
     };
@@ -15029,7 +15087,12 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         );
     }
 
-    let forward_method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) };
+    let forward_method = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(dunder)),
+        )
+    };
     if let Some(method) = forward_method
         && let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) })
     {
@@ -15138,8 +15201,12 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
             pyre_object::typeobject::w_type_get_name(w_typ_r)
         }));
     }
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_typ_r, dunder) })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_typ_r,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(dunder)),
+        )
+    }) else {
         decline!(format_args!("{} has no {dunder}", unsafe {
             pyre_object::typeobject::w_type_get_name(w_typ_r)
         }));
@@ -15589,8 +15656,12 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(dunder)),
+        )
+    }) else {
         return Ok(None);
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
@@ -15845,9 +15916,12 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ));
     }
 
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__format__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__format__")),
+        )
+    }) else {
         decline!(format_args!("{} has no __format__", unsafe {
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
@@ -16097,9 +16171,14 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         decline!("haystack class has no version tag");
     }
 
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__contains__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                "__contains__",
+            )),
+        )
+    }) else {
         decline!("haystack class has no __contains__");
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
@@ -16242,9 +16321,14 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     if version_tag == 0 {
         decline!("metaclass has no version tag");
     }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(metaclass, "__instancecheck__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            metaclass,
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                "__instancecheck__",
+            )),
+        )
+    }) else {
         decline!("metaclass has no __instancecheck__");
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {

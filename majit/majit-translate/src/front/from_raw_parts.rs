@@ -350,6 +350,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 
@@ -360,6 +361,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 
@@ -376,6 +378,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 
@@ -386,6 +389,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         }
     }
 
@@ -566,6 +570,7 @@ mod tests {
                             .map(|s| s.to_string())
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![header.clone(), offset]),
                     result_ty: ValueType::Ref(None),

@@ -90,6 +90,31 @@ pub fn binary_value(
     // passes its own spelling — `&` for `a & b`, `&=` for `a &= b`.
     let symbol = operator_symbol(op);
     use crate::objspace::descroperation as desc;
+    let dunder = match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(desc::BinopDunder::Add),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => Some(desc::BinopDunder::Sub),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => Some(desc::BinopDunder::Mul),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+            Some(desc::BinopDunder::FloorDiv)
+        }
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            Some(desc::BinopDunder::Mod)
+        }
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
+            Some(desc::BinopDunder::TrueDiv)
+        }
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => Some(desc::BinopDunder::LShift),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => Some(desc::BinopDunder::RShift),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(desc::BinopDunder::And),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(desc::BinopDunder::Or),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(desc::BinopDunder::Xor),
+        _ => None,
+    };
+    if let Some(dunder) = dunder
+        && let Some(w_res) = desc::try_binop_shortcut(a, b, dunder)?
+    {
+        return Ok(w_res);
+    }
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => desc::add_impl(a, b, symbol),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => desc::sub_impl(a, b, symbol),
@@ -104,10 +129,6 @@ pub fn binary_value(
             desc::truediv_impl(a, b, symbol)
         }
         BinaryOperator::Power => pow(a, b),
-        // PyPy `pyopcode.py:INPLACE_POWER` calls `space.inplace_pow`
-        // directly; unlike the generated `inplace_impl` family this operation
-        // has its own three-argument-aware dispatch in descroperation.py,
-        // and with it its own `**=` fallback.
         BinaryOperator::InplacePower => desc::inplace_pow(a, b),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => desc::lshift_impl(a, b, symbol),
         BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => {
@@ -115,8 +136,6 @@ pub fn binary_value(
         }
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => desc::rshift_impl(a, b, symbol),
         BinaryOperator::And | BinaryOperator::InplaceAnd => desc::and_impl(a, b, symbol),
-        // mappingproxy `__ior__` (read-only) raises TypeError, handled
-        // above by `try_inplace_special`; both fall through to `or_`.
         BinaryOperator::Or | BinaryOperator::InplaceOr => desc::or_impl(a, b, symbol),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => desc::xor_impl(a, b, symbol),
         BinaryOperator::Subscr => getitem(a, b),
@@ -361,10 +380,7 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
             );
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
-            let live: Vec<PyObjectRef> = (0..items.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
-                .collect();
-            return Ok(pyre_object::w_tuple_new(live));
+            return Ok(w_tuple_from_shadow(base, items.len()));
         }
     }
     Err(PyError::type_error("expected list for list_to_tuple"))
@@ -493,10 +509,7 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
         value_count += 1;
     }
     Ok(if all_match {
-        let values: Vec<PyObjectRef> = (0..value_count)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
-            .collect();
-        pyre_object::w_tuple_new(values)
+        w_tuple_from_shadow(values_base, value_count)
     } else {
         pyre_object::w_none()
     })
@@ -655,8 +668,22 @@ pub fn match_class_value(
         }
     }
 
-    let values: Vec<PyObjectRef> = extracted.iter().map(|&slot| roots.get(slot)).collect();
-    Ok(pyre_object::w_tuple_new(values))
+    let packed = pyre_object::gc_roots::shadow_stack_len();
+    for &slot in &extracted {
+        let _ = pyre_object::gc_roots::pin_root(roots.get(slot));
+    }
+    Ok(w_tuple_from_shadow(packed, extracted.len()))
+}
+
+/// A traced `Vec<PyObjectRef>` is the raw header word. Building that `Vec`
+/// in the caller leaves the argument in the ref bank, so the tuple is
+/// assembled here from shadow-stack slots the caller already holds.
+#[majit_macros::dont_look_inside]
+fn w_tuple_from_shadow(base: usize, count: usize) -> PyObjectRef {
+    let values: Vec<PyObjectRef> = (0..count)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect();
+    pyre_object::w_tuple_new(values)
 }
 
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
@@ -1543,6 +1570,7 @@ mod tests {
 
     #[test]
     fn test_binary_value_reuses_objspace_dispatch() {
+        crate::test_hooks::install_hash_hook();
         let result = binary_value(w_int_new(8), w_int_new(3), BinaryOperator::Subtract)
             .expect("binary dispatch should succeed");
         unsafe {
