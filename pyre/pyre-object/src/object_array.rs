@@ -1922,7 +1922,81 @@ pub fn allocate_array_with_item_size(
 /// Allocate a flat byte buffer for Array(Struct(...)):
 /// `[len][num_elems * item_size bytes]`.
 pub fn allocate_array_struct(num_elems: usize, item_size: usize) -> *mut GcTypedArray {
-    allocate_flat_gc_typed_array(num_elems, item_size)
+    allocate_array_struct_at(num_elems, item_size, GC_TYPED_ARRAY_ITEMS_OFFSET)
+}
+
+/// Same block as [`allocate_array_struct`], with items at `items_base`.
+///
+/// `arraydescr.basesize` (`symbolic.get_array_token`) is the first item.
+/// `GcEntries<i64, *mut PyObject>` aligns `[Entry; 0]` to 8, so a 4-byte
+/// length word on wasm32 puts items at 8, not at [`GC_TYPED_ARRAY_ITEMS_OFFSET`].
+/// The allocation is 8-aligned so that offset stays aligned for `u64`.
+pub fn allocate_array_struct_at(
+    num_elems: usize,
+    item_size: usize,
+    items_base: usize,
+) -> *mut GcTypedArray {
+    let items_size = num_elems
+        .checked_mul(item_size)
+        .expect("GcTypedArray item bytes overflow");
+    let total = items_base
+        .checked_add(items_size)
+        .expect("GcTypedArray allocation size overflow");
+    let align = std::mem::align_of::<u64>().max(std::mem::align_of::<GcTypedArray>());
+    let layout = Layout::from_size_align(total, align).expect("GcTypedArray layout");
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let array = raw.cast::<GcTypedArray>();
+        (*array).len = num_elems;
+        array
+    }
+}
+
+/// Same payload as [`allocate_array_struct_at`], on the collector heap when
+/// `tid` is this host's integer-dict `DICTENTRYARRAY` layout
+/// (`dictentryarray_tid_for_varray_struct`).
+///
+/// Blackhole `VArrayStructInfo.allocate` rebuilds a virtual `DICTENTRYARRAY`
+/// through this path. A raw `alloc_zeroed` block has no GC header, so
+/// `int_dict_storage_custom_trace` would hand the collector a non-object.
+/// Analyzer-minted sequential ids (`GcCache::init_array_descr`) sit in the
+/// same dense range as collector ids (`is_registered_type_id` is
+/// `typeid < type_count()`), so membership alone is not identity.
+pub fn allocate_array_struct_at_typed(
+    num_elems: usize,
+    item_size: usize,
+    items_base: usize,
+    tid: u32,
+) -> *mut GcTypedArray {
+    let tid = crate::rordereddict_entries::dictentryarray_tid_for_varray_struct(
+        items_base, item_size, tid,
+    );
+    if tid != 0 {
+        let items_size = num_elems
+            .checked_mul(item_size)
+            .expect("GcTypedArray item bytes overflow");
+        let total = items_base
+            .checked_add(items_size)
+            .expect("GcTypedArray allocation size overflow");
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, total);
+        if !raw.is_null() {
+            // `try_gc_alloc_stable_raw` is uninitialized. A virtual
+            // `DICTENTRYARRAY` rebuild is `bh_new_array_clear`; leave
+            // `f_valid` and the value word 0 like
+            // `materialize_cleared_struct_gcarray`.
+            unsafe {
+                std::ptr::write_bytes(raw, 0, total);
+                let array = raw.cast::<GcTypedArray>();
+                (*array).len = num_elems;
+                crate::gc_hook::try_gc_write_barrier_managed(raw);
+                return array;
+            }
+        }
+    }
+    allocate_array_struct_at(num_elems, item_size, items_base)
 }
 
 fn allocate_flat_gc_typed_array(length: usize, item_size: usize) -> *mut GcTypedArray {
@@ -2033,14 +2107,19 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
 
 /// resume.py setinteriorfield(i, array, num, fielddescrs[j]) parity.
 /// resume.py ResumeDataDirectReader: dispatch on descr type.
-/// llmodel.py bh_setinteriorfield_gc_i: byte offset = elem_idx * item_size + field_offset.
+/// llmodel.py bh_setinteriorfield_gc_i: byte offset =
+/// `basesize + elem_idx * item_size + field_offset`.
 ///
+/// `items_base` is that `basesize`. A flat [`GcTypedArray`] passes
+/// [`GC_TYPED_ARRAY_ITEMS_OFFSET`]. A length-prefixed `GcArray<T>` whose
+/// element is aligned past the length word passes the wider offset.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
 pub fn setinteriorfield(
     array: *mut GcTypedArray,
+    items_base: usize,
     elem_idx: usize,
     field_offset: usize,
     field_size: usize,
@@ -2070,8 +2149,11 @@ pub fn setinteriorfield(
     if end > total {
         return;
     }
+    let Some(abs) = items_base.checked_add(byte_offset) else {
+        return;
+    };
     unsafe {
-        let ptr = gc_typed_array_items_base(array).add(byte_offset);
+        let ptr = (array as *mut u8).add(abs);
         match descr_field_type {
             2 => {
                 let bits = value as u64;
@@ -2126,6 +2208,31 @@ mod tests {
         let over = Layout::from_size_align(bound - GC_ARRAY_HEADER_SIZE + 1, 1).unwrap();
         assert_eq!(std_gc_array_size(over), None);
         assert!(Layout::from_size_align(bound + 1, GC_ARRAY_HEADER_ALIGN).is_err());
+    }
+
+    #[test]
+    fn allocate_array_struct_at_typed_falls_back_when_tid_unset() {
+        let arr = allocate_array_struct_at_typed(2, 16, GC_TYPED_ARRAY_ITEMS_OFFSET, 0);
+        assert!(!arr.is_null());
+        assert_eq!(gcarray_len(arr), 2);
+    }
+
+    #[test]
+    fn allocate_array_struct_at_typed_falls_back_when_tid_unregistered() {
+        // Analyzer-minted sequential ids (`GcCache::init_array_descr`) are
+        // nonzero and unregistered. `try_gc_alloc_stable_raw` would abort
+        // under an installed allocator; the helper must keep malloc.
+        let arr = allocate_array_struct_at_typed(2, 16, GC_TYPED_ARRAY_ITEMS_OFFSET, 0x00C0_FFEE);
+        assert!(!arr.is_null());
+        assert_eq!(gcarray_len(arr), 2);
+        let arr = allocate_array_struct_at_typed(
+            1,
+            16,
+            GC_TYPED_ARRAY_ITEMS_OFFSET,
+            majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID,
+        );
+        assert!(!arr.is_null());
+        assert_eq!(gcarray_len(arr), 1);
     }
 
     #[test]
@@ -2271,6 +2378,28 @@ mod tests {
         unsafe {
             dealloc_list_items_block(src);
             dealloc_list_items_block(dst);
+        }
+    }
+
+    /// The store address is the caller's items base, not the flat header.
+    /// A 64-bit host gives both the same offset, so the base here sits
+    /// 16 bytes past [`GC_TYPED_ARRAY_ITEMS_OFFSET`].
+    #[test]
+    fn setinteriorfield_writes_at_the_descr_items_base() {
+        let items_base = GC_TYPED_ARRAY_ITEMS_OFFSET + 16;
+        let item_size = 8usize;
+        let array = allocate_array_struct_at(2, item_size, items_base);
+        setinteriorfield(array, items_base, 1, 0, 1, item_size, 1, 0x5a);
+        unsafe {
+            let raw = array.cast::<u8>();
+            assert_eq!(raw.add(GC_TYPED_ARRAY_ITEMS_OFFSET).read(), 0);
+            assert_eq!(raw.add(items_base + item_size).read(), 0x5a);
+            let total = items_base + 2 * item_size;
+            let align = std::mem::align_of::<u64>().max(std::mem::align_of::<GcTypedArray>());
+            std::alloc::dealloc(
+                raw,
+                std::alloc::Layout::from_size_align(total, align).unwrap(),
+            );
         }
     }
 }

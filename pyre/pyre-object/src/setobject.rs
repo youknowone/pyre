@@ -1708,18 +1708,18 @@ unsafe fn unwrapped_walk_gc_refs<S>(
 ) where
     S: AbstractUnwrappedSetStrategy,
 {
-    if !strategy.key_is_gc_ref() {
-        return;
-    }
     let set = unsafe { &mut *(w_set as *mut W_SetObject) };
     if set.sstorage.is_null() {
         return;
     }
     let entries = unsafe { &mut *strategy.storage_ptr(set) };
-    for (key, _) in entries.iter_mut_for_trace() {
-        unsafe { strategy.trace_key(key, visitor) };
+    if strategy.key_is_gc_ref() {
+        for (key, _) in entries.iter_mut_for_trace() {
+            unsafe { strategy.trace_key(key, visitor) };
+        }
+        visitor(entries.entries_slot() as *mut PyObjectRef);
     }
-    visitor(entries.entries_slot() as *mut PyObjectRef);
+    entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
 }
 
 /// `ObjectSetStrategy.update` for an unwrapped operand: iterate `wrap` keys
@@ -4300,6 +4300,7 @@ impl SetStrategy for ObjectSetStrategy {
             visitor(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 }
 
@@ -4323,20 +4324,29 @@ fn ascii_storage_from_unwrapped_iff(
 
 /// `AbstractUnwrappedSetStrategy.get_storage_from_unwrapped_list` for
 /// plain ints. Duplicates collapse; the first insertion stays.
+///
+/// `get_empty_dict` then insert. `gc_alloc_storage_box` first so the
+/// rdict is a GC object before the loop.
 #[majit_macros::look_inside_iff(int_storage_from_unwrapped_iff)]
 fn int_storage_from_unwrapped(items: &[i64]) -> (*mut u8, usize) {
-    let mut dict = IntSetStorage::new();
+    let _roots = crate::gc_roots::push_roots();
+    let storage =
+        crate::gc_storage::gc_alloc_storage_box(IntSetStorage::new(), int_set_storage_gc_type_id());
+    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
+    let dict = unsafe { &mut *(storage as *mut IntSetStorage) };
+    let idx_slot = dict.pin_indexes();
     for &item in items {
         dict.insert(item, ());
+        dict.reload_indexes_root(idx_slot);
     }
     let len = dict.len();
-    let storage =
-        crate::gc_storage::gc_alloc_storage_box(dict, int_set_storage_gc_type_id()) as *mut u8;
-    (storage, len)
+    (storage as *mut u8, len)
 }
 
 /// `get_storage_from_unwrapped_list` for `bytes` blocks. The key is the
 /// block `BytesSetStrategy.unwrap` stores, not a copy of its characters.
+///
+/// `get_empty_dict` then insert through `gc_alloc_storage_box`.
 #[majit_macros::look_inside_iff(bytes_storage_from_unwrapped_iff)]
 fn bytes_storage_from_unwrapped(
     items: &[*const crate::bytesobject::BytesBlock],
@@ -4346,23 +4356,29 @@ fn bytes_storage_from_unwrapped(
     for &item in items {
         let _ = crate::gc_roots::pin_root(item as PyObjectRef);
     }
-    let mut dict = BytesSetStorage::new();
+    let storage = crate::gc_storage::gc_alloc_storage_box(
+        BytesSetStorage::new(),
+        bytes_set_storage_gc_type_id(),
+    );
+    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
+    let dict = unsafe { &mut *(storage as *mut BytesSetStorage) };
+    let idx_slot = dict.pin_indexes();
     for index in 0..items.len() {
         let block =
             crate::gc_roots::shadow_stack_get(base + index) as *mut crate::bytesobject::BytesBlock;
         dict.insert(crate::dictmultiobject::BytesKey(block), ());
+        dict.reload_indexes_root(idx_slot);
     }
     let len = dict.len();
-    let storage =
-        crate::gc_storage::gc_alloc_storage_box(dict, bytes_set_storage_gc_type_id()) as *mut u8;
-    (storage, len)
+    (storage as *mut u8, len)
 }
 
 /// `get_storage_from_unwrapped_list` for ASCII rstrs.
 ///
 /// `publish_roots` then one `normalize_roots`. Per-item `pin_root` would
 /// query after the first rstr and leave the rest invisible. The pins stay
-/// up across `gc_alloc_storage_box`.
+/// up across `gc_alloc_storage_box`. `get_empty_dict` then insert through
+/// that box.
 #[majit_macros::look_inside_iff(ascii_storage_from_unwrapped_iff)]
 fn ascii_storage_from_unwrapped(
     items: &[*const crate::unicodeobject::UnicodeValueStorage],
@@ -4374,16 +4390,21 @@ fn ascii_storage_from_unwrapped(
     }
     let base = crate::gc_roots::publish_roots(&published);
     crate::gc_roots::normalize_roots(base, published.len());
-    let mut dict = AsciiSetStorage::new();
+    let storage = crate::gc_storage::gc_alloc_storage_box(
+        AsciiSetStorage::new(),
+        ascii_set_storage_gc_type_id(),
+    );
+    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
+    let dict = unsafe { &mut *(storage as *mut AsciiSetStorage) };
+    let idx_slot = dict.pin_indexes();
     for index in 0..items.len() {
         let block =
             crate::gc_roots::shadow_stack_get(base + index) as *mut crate::unicodeobject::Utf8Str;
         dict.insert(crate::celldict::StrKey(block), ());
+        dict.reload_indexes_root(idx_slot);
     }
     let len = dict.len();
-    let storage =
-        crate::gc_storage::gc_alloc_storage_box(dict, ascii_set_storage_gc_type_id()) as *mut u8;
-    (storage, len)
+    (storage as *mut u8, len)
 }
 
 /// Publish unwrapped storage. `sstorage` lands before the strategy, the
