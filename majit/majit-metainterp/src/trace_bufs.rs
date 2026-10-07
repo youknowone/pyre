@@ -157,6 +157,7 @@ impl CharList {
         let mut scratch = GcRef(0);
         let hdr = unsafe {
             let mut needs = false;
+            majit_gc::stress_trace_pool_alloc(&mut scratch, 1);
             let fresh = majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 list_hdr_type_id(),
                 std::mem::size_of::<ListHdr>(),
@@ -292,6 +293,7 @@ impl CharList {
         } else {
             let mut live = self.header_ref();
             let mut needs = false;
+            majit_gc::stress_trace_pool_alloc(&mut live, 1);
             let fresh = unsafe {
                 majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                     super::trace_ops_gc_type_id(),
@@ -522,6 +524,7 @@ impl<T: Copy> WordArray<T> {
         let mut roots = [old, GcRef(extra_addr)];
         let root_count = if self.gc_ptrs { 2 } else { 1 };
         let mut needs = false;
+        majit_gc::stress_trace_pool_alloc(roots.as_mut_ptr(), root_count);
         let fresh = unsafe {
             majit_gc::alloc_fast_nursery_collecting_typed_roots(
                 (self.type_id)(),
