@@ -941,6 +941,47 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.py` `CConfig` `HAVE_CHFLAGS` / `HAVE_LCHFLAGS`.  The product
+// `interp_posix.py` names are documentation stubs; the calls are the
+// llexternals those stubs would use.  Flags are `unsigned int` on Apple
+// and OpenBSD, `unsigned long` on FreeBSD/NetBSD/DragonFly.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "openbsd"))]
+pub type ChflagsFlags = libc::c_uint;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "dragonfly"))]
+pub type ChflagsFlags = libc::c_ulong;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+crate::rffi::llexternal!(
+    pub c_chflags = "chflags",
+    [*const libc::c_char, ChflagsFlags],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+crate::rffi::llexternal!(
+    pub c_lchflags = "lchflags",
+    [*const libc::c_char, ChflagsFlags],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_utime` saves errno. `rposix.c_utimes` is behind `HAVE_UTIMES`
 // and takes a pointer to two `struct timeval` values.
 #[cfg(unix)]
@@ -2681,6 +2722,35 @@ mod tests {
         assert_eq!(get_saved_errno(), libc::ENOENT);
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    #[test]
+    fn c_chflags_zero_on_temp_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::env::temp_dir().join(format!("pyre-rffi-chflags-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_chflags(c_path.as_ptr(), 0) },
+            0,
+            "c_chflags errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe { c_lchflags(c_path.as_ptr(), 0) },
+            0,
+            "c_lchflags errno {}",
+            get_saved_errno()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]

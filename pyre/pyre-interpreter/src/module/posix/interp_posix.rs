@@ -4928,6 +4928,26 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         Ok(names)
     }
 
+    /// `rposix.listdir`: `c_opendir` then `_listdir` with `rewind=False`.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+        let dirp = unsafe { majit_rlib::rposix::c_opendir(c_path.as_ptr()) };
+        if dirp.is_null() {
+            return Err(majit_rlib::rposix::get_saved_errno());
+        }
+        let mut names = Vec::new();
+        let errno = readdir_collect(dirp, |name, _ino, _d_type| names.push(name.to_vec()));
+        unsafe {
+            let _ = majit_rlib::rposix::c_closedir(dirp);
+        }
+        if errno != 0 {
+            Err(errno)
+        } else {
+            Ok(names)
+        }
+    }
+
     // ── posix.listdir(path=".") → list of str ──
     crate::module_ns_store(
         ns,
@@ -4970,7 +4990,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 return Ok(pyre_object::w_list_new(items.take()));
             }
-            #[cfg(not(feature = "sandbox"))]
+            #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+            {
+                let mut w_path = w_path();
+                let names = pyre_object::with_roots!(w_path => path_listdir(path))
+                    .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+                let mut items = pyre_object::gc_roots::RootedItems::new();
+                for n in &names {
+                    items.push(fs_name_obj(bytes_mode, n));
+                }
+                Ok(pyre_object::w_list_new(items.take()))
+            }
+            #[cfg(all(not(feature = "sandbox"), not(all(unix, feature = "host_env"))))]
             {
                 let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
                     .map_err(|e| fs_err_with_filename(e, w_path()))?;
@@ -5065,17 +5096,43 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // wrapped to a smaller request.
                 let n = usize::try_from(n)
                     .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
-                // `os_urandom_impl` allocates the object before it fills it,
-                // so a size the allocator cannot meet is refused rather than
-                // reaching the entropy source.  `host_os::urandom` reserves
-                // its own buffer infallibly and ends the process there, so the
-                // buffer is reserved here and filled through the same
-                // `getrandom::fill` it would have used.
-                #[cfg(not(feature = "sandbox"))]
+                // `interp_posix.urandom` calls `rurandom.urandom`. A size the
+                // allocator cannot meet is refused rather than reaching the
+                // entropy source.
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                let buf = {
+                    let _ = crate::builtins::try_vec_zeroed(n)?;
+                    // `interp_posix.urandom` / `_signal_checker`. Invoked
+                    // from `rurandom._getrandom` on Linux `EINTR`.
+                    let mut signal_error: Option<crate::PyError> = None;
+                    let outcome = {
+                        let mut checker = || {
+                            match crate::module::signal::interp_signal::checksignals_now() {
+                                Ok(()) => true,
+                                Err(err) => {
+                                    signal_error = Some(err);
+                                    false
+                                }
+                            }
+                        };
+                        majit_rlib::rurandom::urandom(n, Some(&mut checker))
+                    };
+                    match outcome {
+                        Ok(buf) => buf,
+                        Err(errno) => {
+                            if let Some(err) = signal_error.take() {
+                                return Err(err);
+                            }
+                            // `wrap_oserror(..., w_exception_class=NotImplementedError)`.
+                            return Err(crate::PyError::not_implemented(
+                                std::io::Error::from_raw_os_error(errno).to_string(),
+                            ));
+                        }
+                    }
+                };
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 let buf = {
                     let mut buf = crate::builtins::try_vec_zeroed(n)?;
-                    // Report entropy failures: absorbing one would return
-                    // predictable bytes.
                     getrandom::fill(&mut buf).map_err(|e| io_err(std::io::Error::from(e), ""))?;
                     buf
                 };
@@ -5234,219 +5291,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // (st_mode, st_ino, ...). We expose it as a plain instance with
     // attributes so that both `os.stat(p).st_mode` and
     // `os.stat(p)[0]` work.
-    // `st_flags` lives in the BSD/macOS `struct stat` but `std`'s
-    // `Metadata`/`MetadataExt` does not surface it, so read it with a raw
-    // `stat`/`lstat`/`fstat`; on failure default to 0 (the primary
-    // metadata read already succeeded).
-    // Under sandbox the stat path is mediated (st_flags arrives over the wire),
-    // so this raw-libc helper is compiled out.
-    #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
-    fn macos_path_st_flags(path: &[u8], follow: bool) -> u32 {
-        let Ok(c) = std::ffi::CString::new(path) else {
-            return 0;
-        };
-        unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            let rc = if follow {
-                libc::stat(c.as_ptr(), &mut st)
-            } else {
-                libc::lstat(c.as_ptr(), &mut st)
-            };
-            if rc == 0 { st.st_flags } else { 0 }
-        }
-    }
-    #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-    fn macos_fd_st_flags(fd: i32) -> u32 {
-        let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-        rustpython_host_env::fileutils::fstat(fd)
-            .map(|st| st.st_flags)
-            .unwrap_or(0)
-    }
-    #[cfg(all(
-        target_os = "macos",
-        not(feature = "host_env"),
-        not(feature = "sandbox")
-    ))]
-    fn macos_fd_st_flags(fd: i32) -> u32 {
-        unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            if libc::fstat(fd, &mut st) == 0 {
-                st.st_flags
-            } else {
-                0
-            }
-        }
-    }
+    // Unix path/descriptor forms fill a `STAT_STRUCT` through
+    // `rposix_stat.c_stat` / `c_lstat` / `c_fstat` and read `st_flags`
+    // off that struct. Under sandbox the fields arrive over the wire.
 
-    /// `st_flags` (macOS/BSD) is not surfaced by `std::fs::Metadata`, so
-    /// the caller obtains it via a raw `stat`/`lstat`/`fstat` and passes
-    /// it in; it is ignored (and unread) on platforms whose `struct stat`
-    /// lacks the field.
-    fn make_stat_result(meta: &std::fs::Metadata, st_flags: u32) -> pyre_object::PyObjectRef {
-        // Extract stat fields in a cross-platform way.
-        #[cfg(unix)]
-        let (
-            st_mode,
-            st_ino,
-            st_dev,
-            st_nlink,
-            st_uid,
-            st_gid,
-            st_size,
-            st_atime,
-            st_mtime,
-            st_ctime,
-            st_atime_ns,
-            st_mtime_ns,
-            st_ctime_ns,
-        ) = {
-            use std::os::unix::fs::MetadataExt;
-            (
-                meta.mode() as i64,
-                meta.ino() as i64,
-                meta.dev() as i64,
-                meta.nlink() as i64,
-                meta.uid() as i64,
-                meta.gid() as i64,
-                meta.size() as i64,
-                meta.atime(),
-                meta.mtime(),
-                meta.ctime(),
-                whole_ns(meta.atime(), meta.atime_nsec()),
-                whole_ns(meta.mtime(), meta.mtime_nsec()),
-                whole_ns(meta.ctime(), meta.ctime_nsec()),
-            )
-        };
-        #[cfg(windows)]
-        let (
-            st_mode,
-            st_ino,
-            st_dev,
-            st_nlink,
-            st_uid,
-            st_gid,
-            st_size,
-            st_atime,
-            st_mtime,
-            st_ctime,
-            st_atime_ns,
-            st_mtime_ns,
-            st_ctime_ns,
-        ) = {
-            use std::os::windows::fs::MetadataExt;
-            let ft = meta.file_type();
-            let attrs = meta.file_attributes();
-            // `attributes_to_mode`: a directory carries the execute bits and a
-            // read-only file drops the write ones, both read off the
-            // attributes.  `_Py_attribute_data_to_stat` then replaces only the
-            // format bits for a symlink, so a link to a directory keeps the
-            // execute bits its own attributes carry.
-            let permissions = if attrs & FileAttributes::READONLY.bits() != 0 {
-                0o444
-            } else {
-                0o666
-            };
-            let format = if ft.is_symlink() {
-                0o120000
-            } else if ft.is_dir() {
-                0o40000
-            } else {
-                0o100000
-            };
-            let executable = if attrs & FileAttributes::DIRECTORY.bits() != 0 {
-                0o111
-            } else {
-                0
-            };
-            let mode: i64 = format | executable | permissions;
-            let size = meta.file_size() as i64;
-            // Windows FILETIME is 100-ns intervals since 1601-01-01.
-            // Convert to Unix epoch seconds.
-            const EPOCH_DIFF: i64 = 11_644_473_600;
-            let atime_secs = (meta.last_access_time() as i64 / 10_000_000) - EPOCH_DIFF;
-            let mtime_secs = (meta.last_write_time() as i64 / 10_000_000) - EPOCH_DIFF;
-            let ctime_secs = (meta.creation_time() as i64 / 10_000_000) - EPOCH_DIFF;
-            let atime_ns = whole_ns(
-                atime_secs,
-                (meta.last_access_time() as i64 % 10_000_000) * 100,
-            );
-            let mtime_ns = whole_ns(
-                mtime_secs,
-                (meta.last_write_time() as i64 % 10_000_000) * 100,
-            );
-            let ctime_ns = whole_ns(ctime_secs, (meta.creation_time() as i64 % 10_000_000) * 100);
-            (
-                mode, 0i64, // st_ino — not available on Windows
-                0i64, // st_dev
-                1i64, // nlink — not easily available on stable Windows
-                0i64, // st_uid
-                0i64, // st_gid
-                size, atime_secs, mtime_secs, ctime_secs, atime_ns, mtime_ns, ctime_ns,
-            )
-        };
-
-        #[cfg(unix)]
-        let (st_blksize, st_blocks, st_rdev) = {
-            use std::os::unix::fs::MetadataExt;
-            (
-                meta.blksize() as i64,
-                meta.blocks() as i64,
-                meta.rdev() as i64,
-            )
-        };
-
-        // The Windows-only members `std::fs::Metadata` can answer: the
-        // attribute word it already carries, and the creation time it reports
-        // as a FILETIME. It knows no reparse tag, so that stays zero.
-        #[cfg(windows)]
-        let (win_file_attributes, win_birthtime, win_birthtime_ns) = {
-            use std::os::windows::fs::MetadataExt;
-            const EPOCH_DIFF: i64 = 11_644_473_600;
-            let created = meta.creation_time() as i64;
-            let secs = (created / 10_000_000) - EPOCH_DIFF;
-            (
-                meta.file_attributes(),
-                secs,
-                whole_ns(secs, (created % 10_000_000) * 100),
-            )
-        };
-        stat_result_from_fields(
-            &StatFields {
-                mode: st_mode,
-                ino: st_ino as u128,
-                dev: st_dev,
-                nlink: st_nlink,
-                uid: st_uid,
-                gid: st_gid,
-                size: st_size,
-                atime: st_atime,
-                mtime: st_mtime,
-                ctime: st_ctime,
-                atime_ns: st_atime_ns,
-                mtime_ns: st_mtime_ns,
-                ctime_ns: st_ctime_ns,
-                #[cfg(unix)]
-                blksize: st_blksize,
-                #[cfg(unix)]
-                blocks: st_blocks,
-                #[cfg(unix)]
-                rdev: st_rdev,
-                #[cfg(windows)]
-                file_attributes: win_file_attributes,
-                #[cfg(windows)]
-                reparse_tag: 0,
-                #[cfg(windows)]
-                birthtime: win_birthtime,
-                #[cfg(windows)]
-                birthtime_ns: win_birthtime_ns,
-            },
-            st_flags,
-        )
-    }
-
-    /// The `stat_result` fields, read out of whichever source produced them:
-    /// `std::fs::Metadata` for the path and descriptor forms, `libc::stat`
-    /// for the `fstatat` form a `dir_fd`-relative name takes.
     /// A whole timestamp in nanoseconds.
     ///
     /// `i64` nanoseconds run out in 2262, and a file can carry a later time
@@ -5814,6 +5662,32 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
     }
 
+    /// `rposix_stat.build_stat_result` over a filled `STAT_STRUCT`.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn stat_result_from_libc_stat(st: &libc::stat) -> pyre_object::PyObjectRef {
+        #[cfg(target_os = "macos")]
+        let st_flags = st.st_flags;
+        #[cfg(not(target_os = "macos"))]
+        let st_flags = 0u32;
+        stat_result_from_fields(&stat_fields_from_libc(st), st_flags)
+    }
+
+    /// `rposix_stat.stat` / `lstat`: `c_stat` / `c_lstat` into a `STAT_STRUCT`.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    fn libc_stat_path(path: &[u8], follow: bool) -> Result<libc::stat, i32> {
+        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let ret = if follow {
+            unsafe { majit_rlib::rposix::c_stat(c_path.as_ptr(), st.as_mut_ptr()) }
+        } else {
+            unsafe { majit_rlib::rposix::c_lstat(c_path.as_ptr(), st.as_mut_ptr()) }
+        };
+        if ret != 0 {
+            return Err(majit_rlib::rposix::get_saved_errno());
+        }
+        Ok(unsafe { st.assume_init() })
+    }
+
     /// The Windows counterpart of `stat_fields_from_libc`.  `win32_xstat` and
     /// `fstat` fill the same `StatStruct`, so routing both entry points
     /// through it is what lets a name and a descriptor for one file report one
@@ -6175,14 +6049,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 return Err(errno_err_with_filename(errno, path.w_path()));
             }
             let st = unsafe { st.assume_init() };
-            #[cfg(target_os = "macos")]
-            let st_flags = st.st_flags;
-            #[cfg(not(target_os = "macos"))]
-            let st_flags = 0u32;
-            return Ok(stat_result_from_fields(
-                &stat_fields_from_libc(&st),
-                st_flags,
-            ));
+            return Ok(stat_result_from_libc_stat(&st));
         }
         // Unreachable in practice — `stat_entry` turns a `dir_fd` away at
         // unwrap time wherever `HAVE_FSTATAT` is false — but the arm has to
@@ -6220,28 +6087,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 )),
             };
         }
-        #[cfg(all(not(feature = "sandbox"), not(all(windows, feature = "host_env"))))]
+        #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let meta = if follow_symlinks {
-                host_fs::metadata(path_from_bytes(&path.as_bytes).as_ref())
-            } else {
-                host_fs::symlink_metadata(path_from_bytes(&path.as_bytes).as_ref())
-            };
-            match meta {
-                Ok(m) => {
-                    #[cfg(target_os = "macos")]
-                    let st_flags = macos_path_st_flags(&path.as_bytes, follow_symlinks);
-                    #[cfg(not(target_os = "macos"))]
-                    let st_flags = 0u32;
-                    Ok(make_stat_result(&m, st_flags))
-                }
-                Err(e) => Err(fs_err_with_filename2(
-                    e,
-                    2,
-                    path.w_path(),
-                    pyre_object::PY_NULL,
-                )),
-            }
+            let mut w_path = path.w_path();
+            let st = pyre_object::with_roots!(w_path => {
+                libc_stat_path(&path.as_bytes, follow_symlinks)
+            })
+            .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+            return Ok(stat_result_from_libc_stat(&st));
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = (path, follow_symlinks);
+            Err(crate::PyError::os_error_with_errno(
+                libc::ENOSYS,
+                "stat".to_string(),
+            ))
         }
     }
 
@@ -6374,26 +6235,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let dir_fd = pyre_object::with_roots!(w_path => dir_entry_dir_fd(self_obj))?;
-            if dir_fd != -1 {
-                return match dir_entry_stat_at(&path, dir_fd, follow) {
-                    Ok(st) => Ok(Some(st.st_mode as u32 & S_IFMT)),
-                    Err(errno) if errno == libc::ENOENT => Ok(None),
-                    Err(errno) => Err(errno_err_with_filename(errno, w_path)),
-                };
-            }
+            let st = if dir_fd != -1 {
+                pyre_object::with_roots!(w_path => dir_entry_stat_at(&path, dir_fd, follow))
+            } else {
+                pyre_object::with_roots!(w_path => libc_stat_path(&path, follow))
+            };
+            return match st {
+                Ok(st) => Ok(Some(st.st_mode as u32 & S_IFMT)),
+                Err(errno) if errno == libc::ENOENT => Ok(None),
+                Err(errno) => Err(errno_err_with_filename(errno, w_path)),
+            };
         }
         #[cfg(feature = "sandbox")]
         {
             let _ = (w_path, path, follow);
             return Err(crate::host_seam::stub("posix.DirEntry"));
         }
-        #[cfg(not(feature = "sandbox"))]
+        #[cfg(all(not(feature = "sandbox"), not(unix)))]
         let meta = if follow {
             host_fs::metadata(path_from_bytes(&path).as_ref())
         } else {
             host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
         };
-        #[cfg(not(feature = "sandbox"))]
+        #[cfg(all(not(feature = "sandbox"), not(unix)))]
         match meta {
             Ok(m) => {
                 let ft = m.file_type();
@@ -6475,11 +6339,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let dir_fd = pyre_object::with_roots!(w_path => dir_entry_dir_fd(w_self))?;
-            if dir_fd != -1 {
-                let st = dir_entry_stat_at(&path, dir_fd, false)
-                    .map_err(|errno| errno_err_with_filename(errno, w_path))?;
-                return Ok(pyre_object::w_int_new(st.st_ino as i64));
-            }
+            let st = if dir_fd != -1 {
+                pyre_object::with_roots!(w_path => dir_entry_stat_at(&path, dir_fd, false))
+            } else {
+                pyre_object::with_roots!(w_path => libc_stat_path(&path, false))
+            };
+            return match st {
+                Ok(st) => Ok(pyre_object::w_int_new(st.st_ino as i64)),
+                Err(errno) => Err(errno_err_with_filename(errno, w_path)),
+            };
         }
         // `posixmodule.c DirEntry_inode` reads the same file index `os.stat`
         // reports, so the 0 this used to answer with on Windows disagreed with
@@ -6495,21 +6363,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let _ = (w_path, path);
             return Err(crate::host_seam::stub("posix.DirEntry"));
         }
-        #[cfg(not(any(feature = "sandbox", all(windows, feature = "host_env"))))]
+        #[cfg(not(any(feature = "sandbox", unix, all(windows, feature = "host_env"))))]
         {
-            let meta = host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
-                .map_err(|e| fs_err_with_filename(e, w_path))?;
-            #[cfg(unix)]
-            let ino = {
-                use std::os::unix::fs::MetadataExt;
-                meta.ino() as i64
-            };
-            #[cfg(not(unix))]
-            let ino = {
-                let _ = &meta;
-                0i64
-            };
-            Ok(pyre_object::w_int_new(ino))
+            let _ = (w_path, path);
+            Ok(pyre_object::w_int_new(0))
         }
     }
     /// Fetch a fresh `stat` (`follow=true`) / `lstat` (`follow=false`) result —
@@ -6517,7 +6374,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     /// the descriptor the entry's `scandir` was handed (or `-1`); a real one
     /// resolves the entry's bare `name` through `fstatat`.
     fn dir_entry_fetch_stat(
-        w_path: PyObjectRef,
+        mut w_path: PyObjectRef,
         path: &[u8],
         follow: bool,
         dir_fd: i32,
@@ -6525,17 +6382,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             if dir_fd != -1 {
-                let st = dir_entry_stat_at(path, dir_fd, follow)
-                    .map_err(|errno| errno_err_with_filename(errno, w_path))?;
-                #[cfg(target_os = "macos")]
-                let st_flags = st.st_flags;
-                #[cfg(not(target_os = "macos"))]
-                let st_flags = 0u32;
-                return Ok(stat_result_from_fields(
-                    &stat_fields_from_libc(&st),
-                    st_flags,
-                ));
+                let st = pyre_object::with_roots!(w_path => {
+                    dir_entry_stat_at(path, dir_fd, follow)
+                })
+                .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+                return Ok(stat_result_from_libc_stat(&st));
             }
+            let st = pyre_object::with_roots!(w_path => libc_stat_path(path, follow))
+                .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+            return Ok(stat_result_from_libc_stat(&st));
         }
         #[cfg(not(all(unix, not(feature = "sandbox"))))]
         let _ = dir_fd;
@@ -6551,23 +6406,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let _ = (w_path, path, follow);
             return Err(crate::host_seam::stub("posix.DirEntry"));
         }
-        #[cfg(not(any(feature = "sandbox", all(windows, feature = "host_env"))))]
+        #[cfg(not(any(feature = "sandbox", unix, all(windows, feature = "host_env"))))]
         {
-            let meta = if follow {
-                host_fs::metadata(path_from_bytes(path).as_ref())
-            } else {
-                host_fs::symlink_metadata(path_from_bytes(path).as_ref())
-            };
-            match meta {
-                Ok(m) => {
-                    #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
-                    let st_flags = macos_path_st_flags(path, follow);
-                    #[cfg(not(all(target_os = "macos", not(feature = "sandbox"))))]
-                    let st_flags = 0u32;
-                    Ok(make_stat_result(&m, st_flags))
-                }
-                Err(e) => Err(fs_err_with_filename(e, w_path)),
-            }
+            let _ = (w_path, path, follow);
+            Err(crate::PyError::os_error_with_errno(
+                libc::ENOSYS,
+                "stat".to_string(),
+            ))
         }
     }
     /// `posixmodule.c DirEntry_get_stat` caches the built result and hands back
@@ -7280,13 +7125,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     /// `rposix_stat.py fstat`: the descriptor form both `os.fstat` and
     /// `os.stat` with a descriptor answer through, so the two cannot drift.
     fn fstat_fd(fd: i32) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-        // `rposix_stat.py:fstat` passes the descriptor to libc, where
-        // `-1` reports EBADF.  Rust's `OwnedFd::from_raw_fd(-1)`
-        // asserts before `File::metadata` can produce that error.
-        // Windows answers a descriptor it cannot name with the Win32 error
-        // instead (`_Py_fstat_noraise` sets ERROR_INVALID_HANDLE itself), so
-        // leave that arm to report it.
-        #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+        // `rposix_stat.py fstat` passes the descriptor to `c_fstat`, where
+        // `-1` reports EBADF.  The sandbox seam does not, so keep the
+        // refusal here.  Windows answers a descriptor it cannot name with
+        // the Win32 error instead (`_Py_fstat_noraise` sets
+        // ERROR_INVALID_HANDLE itself).
+        #[cfg(feature = "sandbox")]
         if fd == -1 {
             return Err(crate::PyError::os_error_with_errno(
                 libc::EBADF,
@@ -7301,27 +7145,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            use std::os::unix::io::FromRawFd;
-            // interp_posix.py `fstat`: retry its syscall on EINTR.
-            let meta = loop {
-                let f = unsafe { std::fs::File::from_raw_fd(fd) };
-                let meta = f.metadata();
-                let _ = std::mem::ManuallyDrop::new(f); // don't close
-                match meta {
-                    Ok(m) => break m,
-                    Err(e) => crate::builtins::eintr_retry_with(e, |e| {
-                        crate::PyError::os_error_with_errno(
-                            crate::builtins::io_error_posix_errno(&e, 9),
-                            format!("{}", e),
-                        )
-                    })?,
+            // interp_posix.py `fstat`: `rposix_stat.fstat` then
+            // `wrap_oserror(..., eintr_retry=True)`.
+            loop {
+                let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let ret = unsafe { majit_rlib::rposix::c_fstat(fd, st.as_mut_ptr()) };
+                if ret == 0 {
+                    return Ok(stat_result_from_libc_stat(&unsafe { st.assume_init() }));
                 }
-            };
-            #[cfg(target_os = "macos")]
-            let st_flags = macos_fd_st_flags(fd);
-            #[cfg(not(target_os = "macos"))]
-            let st_flags = 0u32;
-            Ok(make_stat_result(&meta, st_flags))
+                let errno = majit_rlib::rposix::get_saved_errno();
+                crate::builtins::eintr_retry_with(
+                    std::io::Error::from_raw_os_error(errno),
+                    |e| {
+                        crate::PyError::os_error_with_errno(
+                            crate::builtins::io_error_posix_errno(&e, libc::EBADF),
+                            format!("{e}"),
+                        )
+                    },
+                )?;
+            }
         }
         // `_Py_fstat_noraise`: the descriptor's underlying handle, then
         // `GetFileInformationByHandle` — which is what `File::metadata`
@@ -10807,15 +10649,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             )
         ))]
         {
-            // `<sys/stat.h>` declares `lchflags` on the Apple targets, where
-            // the `libc` crate carries only `chflags` and `fchflags`.
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            unsafe extern "C" {
-                fn lchflags(path: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            use libc::lchflags;
-
             fn chflags_entry(
                 args: &[pyre_object::PyObjectRef],
                 name: &str,
@@ -10843,15 +10676,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 };
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                let r = if follow {
-                    unsafe { libc::chflags(c_path.as_ptr(), flags as _) }
-                } else {
-                    unsafe { lchflags(c_path.as_ptr(), flags as _) }
-                };
+                let mut w_path = path.w_path();
+                // `rposix.c_chflags` / `c_lchflags` release the GIL and save errno.
+                let r = pyre_object::with_roots!(w_path => unsafe {
+                    if follow {
+                        majit_rlib::rposix::c_chflags(c_path.as_ptr(), flags as _)
+                    } else {
+                        majit_rlib::rposix::c_lchflags(c_path.as_ptr(), flags as _)
+                    }
+                });
                 if r < 0 {
                     return Err(io_err_with_filename(
-                        std::io::Error::last_os_error(),
-                        path.w_path(),
+                        std::io::Error::from_raw_os_error(
+                            majit_rlib::rposix::get_saved_errno(),
+                        ),
+                        w_path,
                     ));
                 }
                 Ok(pyre_object::w_none())
