@@ -4156,6 +4156,15 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
+    // Root the caller before any allocation in this dispatcher.  `_flat_pycall`
+    // `space.createframe` is a nursery safepoint; RPython's GC transform then
+    // reloads `frame` for the peek/dropvalues that follow.  The raw `&mut`
+    // would otherwise name the abandoned copy, so dropvalues would miss the
+    // live valuestackdepth and the CALL result push would write past the
+    // array.  `OpcodeStepExecutor::call` already holds an outer FrameAnchor
+    // for that push; this inner one is what the peek/dropvalues after
+    // createframe read through.
+    let caller = crate::eval::FrameAnchor::new(frame);
     // `function.py funccall_valuestack` does not register an extra root: the
     // caller frame is already a GC object kept live by `FrameAnchor` and the
     // execution-context chain, and `pyframe_object_custom_trace` visits
@@ -4182,6 +4191,7 @@ pub fn funccall_valuestack(
         && std::ptr::eq(code, sys_exc_info_code())
         && let Some(direct_fn) = sys_exc_info_direct_fn()
     {
+        let frame = unsafe { &mut *caller.live() };
         frame.dropvalues(dropvalues);
         return direct_fn(frame);
     }
@@ -4237,7 +4247,7 @@ pub fn funccall_valuestack(
             }
             _ => unreachable!(),
         }
-        frame.dropvalues(dropvalues);
+        unsafe { &mut *caller.live() }.dropvalues(dropvalues);
 
         let code = _roots.get(root_base);
         let rooted_arg = |index| _roots.get(root_base + 1 + index);
@@ -4271,7 +4281,7 @@ pub fn funccall_valuestack(
     if !natural_arity_call
         && (nargs | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity
     {
-        return _flat_pycall(func, code, nargs, frame, dropvalues);
+        return _flat_pycall(func, code, nargs, &caller, dropvalues);
     }
 
     // function.py:188-193 — FLATPYCALL bit set + nargs within defaults range
@@ -4292,7 +4302,7 @@ pub fn funccall_valuestack(
                     func,
                     code,
                     nargs,
-                    frame,
+                    &caller,
                     defs,
                     natural_arity - nargs,
                     dropvalues,
@@ -4326,7 +4336,7 @@ pub fn funccall_valuestack(
         live.push(w_obj);
         live.extend_from_slice(&rest);
         let root_base = _roots.pin_roots(&live);
-        frame.dropvalues(dropvalues);
+        unsafe { &mut *caller.live() }.dropvalues(dropvalues);
         let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
         return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {
             Ok(v) => v,
@@ -4341,7 +4351,7 @@ pub fn funccall_valuestack(
     // (carries methodcall + w_function for diagnostics) and dispatch through
     // call_args.
     let args = frame.make_arguments(nargs, methodcall, func);
-    frame.dropvalues(dropvalues);
+    unsafe { &mut *caller.live() }.dropvalues(dropvalues);
     funccall(func, &args)
 }
 
@@ -4356,7 +4366,7 @@ fn _flat_pycall(
     mut func: PyObjectRef,
     code: PyObjectRef,
     nargs: usize,
-    frame: &mut crate::pyframe::PyFrame,
+    caller: &crate::eval::FrameAnchor,
     dropvalues: usize,
 ) -> PyObjectRef {
     // `function.py _flat_pycall` copies positional arguments off the caller
@@ -4389,6 +4399,10 @@ fn _flat_pycall(
         },
     );
 
+    // createframe is a nursery safepoint.  RPython reloads `frame` here via
+    // the GC transform; read the forwarded caller for peekvalue / dropvalues
+    // so those writes land on the live valuestackdepth.
+    let frame = unsafe { &mut *caller.live() };
     // function.py:210-211 — copy from stack into locals directly
     // peekvalue(nargs-1-i) gives bottom-to-top order (matching local slot order)
     for i in 0..nargs {
@@ -4400,6 +4414,7 @@ fn _flat_pycall(
     // can spill the array to old-gen, and until the callee sits on
     // `f_backref` nothing else exposes these slots.
     crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -4440,7 +4455,7 @@ fn _flat_pycall_defaults(
     func: PyObjectRef,
     code: PyObjectRef,
     nargs: usize,
-    frame: &mut crate::pyframe::PyFrame,
+    caller: &crate::eval::FrameAnchor,
     defs: PyObjectRef,
     defs_to_load: usize,
     dropvalues: usize,
@@ -4477,6 +4492,10 @@ fn _flat_pycall_defaults(
         },
     );
 
+    // createframe is a nursery safepoint; reload the caller the way the GC
+    // transform reloads `frame` after `space.createframe` in
+    // `function.py _flat_pycall_defaults`.
+    let frame = unsafe { &mut *caller.live() };
     // function.py:221-222 — copy positional args from stack
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
@@ -4499,6 +4518,7 @@ fn _flat_pycall_defaults(
     // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
     // locals array to old-gen, and the arguments and defaults in it are young.
     crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 

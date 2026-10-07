@@ -2547,7 +2547,20 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else {
         return Err(index_type_error("list", index));
     };
-    match w_list_getitem(obj, idx) {
+    // `listobject.py` `W_ListObject.descr_getitem` calls `self.getitem(index)`
+    // with no list lock. `w_list_getitem` is opaque (`dont_look_inside` pairs
+    // acquire/release), so the `gil_ready == 0` arm's look-inside call is
+    // what `grab_initial_jitcodes` uses to reach `w_list_getitem_inner`.
+    // Publication fails the guard and the retrace takes the locked wrapper.
+    // The BINARY_SUBSCR walker descends that inner body by name
+    // (`list_getitem_jitcode`).
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    let item = if ready != 0 {
+        w_list_getitem(obj, idx)
+    } else {
+        pyre_object::w_list_getitem_inner(obj, idx)
+    };
+    match item {
         Some(val) => Ok(val),
         None => Err(PyError::index_error("list index out of range")),
     }
@@ -19088,11 +19101,6 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
         return PY_NULL;
     }
     let index = pyre_object::w_list_iter_index(obj);
-    // Negative `__setstate__` cursor: null, source stays. Hoisted so both
-    // arms skip `getitem` wrap-around on a negative index.
-    if index < 0 {
-        return PY_NULL;
-    }
     // `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ =
     // ['gil_ready?']`). While that word is still 0 the process has no
     // other thread (`setup_threads` publishes it before `spawn`), so the
@@ -19100,23 +19108,17 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
     // the retrace takes `list_iter_descr_next_locked`.
     let ready = pyre_object::gil_ready::gil_ready_word();
     if ready != 0 {
+        if index < 0 {
+            return PY_NULL;
+        }
         return list_iter_descr_next_locked(obj, seq, index);
     }
-    // `iterobject.py` `W_FastListIterObject.descr_next` calls
-    // `w_seq.getitem(index)` with no list lock. `w_list_getitem` is
-    // opaque (`dont_look_inside` pairs acquire/release), so this
-    // look-inside call is what `grab_initial_jitcodes` uses to reach
-    // `w_list_getitem_inner`. Hiding that body behind the locked
-    // residual left `list_getitem_jitcode()` empty and every `list[int]`
-    // residualised the locked wrapper.
-    let item = pyre_object::w_list_getitem_inner(seq, pyre_object::seq_index_to_i64(index));
-    match item {
-        None => list_iter_stop(obj, index),
-        Some(item) => {
-            pyre_object::w_list_iter_set_index(obj, index + 1);
-            item
-        }
+    let item = pyre_object::w_list_iter_item(seq, pyre_object::seq_index_to_i64(index));
+    if item.is_null() {
+        return list_iter_stop(obj, index);
     }
+    pyre_object::w_list_iter_set_index(obj, index + 1);
+    item
 }
 
 /// Negative `__setstate__` cursor: null, and the source stays. Any other
