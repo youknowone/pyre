@@ -4818,8 +4818,8 @@ impl TraceCtx {
     /// Each box is an `InputArg*` / `*FrontendOp` / `Const*` that carries its
     /// own value. `InputArg*` and `*FrontendOp` refs are forwarded by the
     /// recorder walk (`walk_active_trace_refs` visits `inputargs` and
-    /// `value_slots`); this walk rewrites `ConstPtr` gcrefs that live in the
-    /// box list itself, then forwards `virtualizable_heap_ptr`. The trailing
+    /// `value_slots`); this walk traces `ConstPtr` indexes the vable box
+    /// list still holds, then forwards `virtualizable_heap_ptr`. The trailing
     /// identity is `virtualizable_boxes[-1]`; a bridge must keep that rebuilt
     /// frame identity live instead of falling back to an older cached
     /// portal-frame pointer.
@@ -4831,11 +4831,9 @@ impl TraceCtx {
             Some(Value::Ref(identity)) => Some(identity.as_usize()),
             _ => None,
         };
-        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
-            for slot in boxes.iter_mut() {
-                if let OpRef::ConstPtr(gcref) = slot {
-                    visitor(gcref);
-                }
+        if let Some(boxes) = self.virtualizable_boxes.as_ref() {
+            for slot in boxes {
+                slot.trace_const_ptr(&mut visitor);
             }
         }
         // The cell names either the identity or a different object: a frontend

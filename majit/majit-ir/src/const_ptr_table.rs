@@ -1,0 +1,447 @@
+//! Owner of `ConstPtr.value`.
+//!
+//! `history.py` `ConstPtr` is one GC object. Holders store the box; the
+//! collector writes `value`. `OpRef` is a `Copy` word, so the box's
+//! address cannot live in the word: a minor would stale every copy.
+//! The word is an index into this table. The table is the single
+//! mutable `value` slot. `gcreftracer.GcTable` is the same shape for
+//! addresses baked into compiled code.
+//!
+//! A slot is a root only while a live holder traces it
+//! (`trace_index`). `history.py` drops a `ConstPtr` with the trace that
+//! referenced the box; walking every slot would keep a dead trace's
+//! referent alive for the process. Compiled loops keep their own
+//! `GcTable` roots.
+//!
+//! Intern key is `gc_id_or_identityhash` (`minimark.py`
+//! `id_or_identityhash`), not the address. The key is recorded at
+//! intern time and is not recomputed during a collection.
+
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
+
+use crate::value::{GcRef, gc_id_or_identityhash};
+
+struct Table {
+    /// Index 0 is null and is never interned.
+    slots: Vec<GcRef>,
+    /// `(identity hash, index)`, sorted by hash then index.
+    by_hash: Vec<(u64, u32)>,
+    /// `begin_wave` generation that last traced this slot. Wave 0 does
+    /// not dedup: a unit test that never opens a wave still forwards.
+    marks: Vec<u32>,
+}
+
+/// Non-zero while a collection (or a test helper) is forwarding.
+/// Slots already traced in this wave are not written twice.
+static WAVE: AtomicU32 = AtomicU32::new(0);
+
+/// Next id `Wave::enter` publishes. Separate from `WAVE` so dropping a
+/// guard can restore the enclosing wave without reusing an id `marks`
+/// still holds. `0` is never issued. After the counter wraps, the next
+/// id is published only once `marks` has been cleared.
+static NEXT_WAVE: AtomicU32 = AtomicU32::new(1);
+
+impl Table {
+    fn new() -> Self {
+        Self {
+            slots: vec![GcRef::NULL],
+            by_hash: Vec::new(),
+            marks: vec![0],
+        }
+    }
+}
+
+static TABLE: Mutex<Table> = Mutex::new(Table {
+    slots: Vec::new(),
+    by_hash: Vec::new(),
+    marks: Vec::new(),
+});
+static READY: AtomicBool = AtomicBool::new(false);
+
+// Reentrancy on the walking thread. Another test thread must not
+// observe it: the table mutex is what serializes slot updates.
+thread_local! {
+    static WALKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn walking() -> bool {
+    WALKING.with(|cell| cell.get())
+}
+
+fn set_walking(value: bool) {
+    WALKING.with(|cell| cell.set(value));
+}
+
+/// Lock-free mirror of `Table.slots` for `history.py` `ConstPtr.getref_base`.
+///
+/// `resolve` runs once per constant ref in a blackhole resume. Taking
+/// the intern mutex there is not the field load upstream emits. Chunks
+/// are append-only and never freed, so a published chunk pointer stays
+/// valid. The table mutex still covers intern, the hash index, and the
+/// forwarding walk.
+const SLOT_CHUNK: usize = 256;
+const SLOT_CHUNKS: usize = 1024;
+
+struct SlotChunk {
+    slots: [AtomicUsize; SLOT_CHUNK],
+}
+
+static SLOT_CHUNK_PTRS: [AtomicPtr<SlotChunk>; SLOT_CHUNKS] = {
+    const NULL: AtomicPtr<SlotChunk> = AtomicPtr::new(std::ptr::null_mut());
+    [NULL; SLOT_CHUNKS]
+};
+
+fn publish_slot(index: usize, addr: GcRef) {
+    if index == 0 {
+        return;
+    }
+    let ci = index / SLOT_CHUNK;
+    assert!(
+        ci < SLOT_CHUNKS,
+        "const_ptr_table: more than {} slots",
+        SLOT_CHUNK * SLOT_CHUNKS
+    );
+    let mut chunk = SLOT_CHUNK_PTRS[ci].load(Ordering::Acquire);
+    if chunk.is_null() {
+        let fresh = Box::into_raw(Box::new(SlotChunk {
+            slots: std::array::from_fn(|_| AtomicUsize::new(0)),
+        }));
+        match SLOT_CHUNK_PTRS[ci].compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            // `Ok` is the previous (null) value. The published pointer is
+            // `fresh`.
+            Ok(_) => chunk = fresh,
+            Err(existing) => {
+                unsafe { drop(Box::from_raw(fresh)) };
+                chunk = existing;
+            }
+        }
+    }
+    unsafe {
+        (*chunk).slots[index % SLOT_CHUNK].store(addr.0, Ordering::Release);
+    }
+}
+
+fn table() -> parking_lot::MutexGuard<'static, Table> {
+    let mut guard = TABLE.lock();
+    if !READY.load(Ordering::Acquire) {
+        if guard.slots.is_empty() {
+            *guard = Table::new();
+        }
+        READY.store(true, Ordering::Release);
+    }
+    guard
+}
+
+/// Index of `addr` in the table. Null is 0. Same referent, same index.
+pub fn intern(addr: GcRef) -> u32 {
+    if addr.is_null() {
+        return 0;
+    }
+    let hash = gc_id_or_identityhash(addr.0) as u64;
+    let mut guard = table();
+    if let Some(idx) = find(&guard, hash, addr.0) {
+        return idx;
+    }
+    let idx = guard.slots.len() as u32;
+    guard.slots.push(addr);
+    guard.marks.push(0);
+    let pos = guard
+        .by_hash
+        .partition_point(|&(h, i)| (h, i) < (hash, idx));
+    guard.by_hash.insert(pos, (hash, idx));
+    // Publish before releasing the intern lock so another thread that
+    // finds this index cannot `resolve` a still-zero mirror.
+    publish_slot(idx as usize, addr);
+    idx
+}
+
+/// Open a forwarding wave. A second trace of the same slot in this
+/// wave does not call the visitor. Drop restores the enclosing wave.
+/// The id itself comes from [`NEXT_WAVE`]. A wrapping `u32` would
+/// reissue an old generation while `marks` still holds it, and
+/// [`claim_wave`] would skip that slot; the wrap path zeros `marks`
+/// before publishing the next id. The collector holds one guard across
+/// a root walk so `drag_out_root` writes each live `ConstPtr.value` once.
+pub struct Wave {
+    prev: u32,
+}
+
+impl Wave {
+    pub fn enter() -> Self {
+        let prev = WAVE.load(Ordering::Relaxed);
+        let next = alloc_wave_id();
+        WAVE.store(next, Ordering::Relaxed);
+        Wave { prev }
+    }
+}
+
+/// Publish the next nonzero generation.
+///
+/// `0` stays reserved for "no wave". The id `u32::MAX` is issued once;
+/// the caller that then observes `0` clears `Table::marks` while holding
+/// the table lock, then stores `1`. `claim_wave` takes that same lock, so
+/// it cannot treat a reissued generation as already traced.
+fn alloc_wave_id() -> u32 {
+    loop {
+        let cur = NEXT_WAVE.load(Ordering::Relaxed);
+        if cur == 0 {
+            let mut guard = table();
+            if NEXT_WAVE.load(Ordering::Relaxed) == 0 {
+                guard.marks.fill(0);
+                NEXT_WAVE.store(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        let new = cur.wrapping_add(1);
+        if NEXT_WAVE
+            .compare_exchange(cur, new, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return cur;
+        }
+    }
+}
+
+impl Drop for Wave {
+    fn drop(&mut self) {
+        WAVE.store(self.prev, Ordering::Release);
+    }
+}
+
+/// Forward one live slot. Holders call this; the slot is not a root
+/// merely because `intern` recorded it.
+///
+/// A nested visitor (one that collects) is skipped: the outer call is
+/// already updating slots, matching [`walk`]'s `WALKING` guard.
+pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if index == 0 || walking() {
+        return;
+    }
+    let mut guard = table();
+    let idx = index as usize;
+    if idx >= guard.slots.len() || guard.slots[idx].is_null() {
+        return;
+    }
+    if !claim_wave(&mut guard.marks, idx) {
+        return;
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            set_walking(false);
+        }
+    }
+    set_walking(true);
+    let _clear = Clear;
+    visitor(&mut guard.slots[idx]);
+    publish_slot(idx, guard.slots[idx]);
+}
+
+/// `true` when this wave has not yet traced `idx`. Wave 0 always claims.
+fn claim_wave(marks: &mut Vec<u32>, idx: usize) -> bool {
+    let wave = WAVE.load(Ordering::Relaxed);
+    if wave == 0 {
+        return true;
+    }
+    if idx >= marks.len() {
+        marks.resize(idx + 1, 0);
+    }
+    if marks[idx] == wave {
+        return false;
+    }
+    marks[idx] = wave;
+    true
+}
+
+/// Write the forwarded address of an existing index.
+///
+/// `MIFrame.set_forwarded_ref_value` publishes one move into the box.
+/// The identity hash recorded at intern time does not change.
+pub fn set_slot(index: u32, addr: GcRef) {
+    if index == 0 {
+        return;
+    }
+    let mut guard = table();
+    if let Some(slot) = guard.slots.get_mut(index as usize) {
+        *slot = addr;
+    } else {
+        return;
+    }
+    publish_slot(index as usize, addr);
+}
+
+/// Current address of index `index`.
+///
+/// `history.py` `ConstPtr.getref_base` reads the box field. The mirror
+/// slot is an atomic so this does not take the intern mutex.
+#[inline]
+pub fn resolve(index: u32) -> GcRef {
+    if index == 0 {
+        return GcRef::NULL;
+    }
+    let i = index as usize;
+    let ci = i / SLOT_CHUNK;
+    if ci >= SLOT_CHUNKS {
+        return GcRef::NULL;
+    }
+    let chunk = SLOT_CHUNK_PTRS[ci].load(Ordering::Acquire);
+    if chunk.is_null() {
+        return GcRef::NULL;
+    }
+    GcRef(unsafe { (*chunk).slots[i % SLOT_CHUNK].load(Ordering::Acquire) })
+}
+
+/// Index whose current value is `addr`.
+///
+/// `intern` records one slot per referent. A root walk that has already
+/// read `ConstPtr.value` uses this to name that slot without recomputing
+/// `gc_id_or_identityhash` (a stale nursery address must not be hashed).
+pub fn index_of_current(addr: GcRef) -> Option<u32> {
+    if addr.is_null() {
+        return None;
+    }
+    let guard = table();
+    guard
+        .slots
+        .iter()
+        .position(|slot| slot.0 == addr.0)
+        .map(|idx| idx as u32)
+        .filter(|idx| *idx != 0)
+}
+
+/// Forward every non-null slot. Nested walk (a visitor that collects)
+/// is a no-op: the outer walk is already updating the slots.
+pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {
+    if walking() {
+        return;
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            set_walking(false);
+        }
+    }
+    set_walking(true);
+    let _clear = Clear;
+    let mut guard = table();
+    let mut idx = 1;
+    while idx < guard.slots.len() {
+        if guard.slots[idx].is_null() || !claim_wave(&mut guard.marks, idx) {
+            idx += 1;
+            continue;
+        }
+        visitor(&mut guard.slots[idx]);
+        publish_slot(idx, guard.slots[idx]);
+        idx += 1;
+    }
+}
+
+fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
+    let start = table.by_hash.partition_point(|&(h, _)| h < hash);
+    for &(h, idx) in &table.by_hash[start..] {
+        if h != hash {
+            break;
+        }
+        if table.slots.get(idx as usize).map(|s| s.0) == Some(addr) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    /// `walk` claims every non-null slot for the current [`Wave`]
+    /// (`claim_wave`). These tests share that process-global table, so a
+    /// parallel `walk` inside another test's wave marks its slot,
+    /// `trace_index` returns without the visitor, and `resolve` still
+    /// returns the interned address.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn intern_is_stable_and_null_is_zero() {
+        let _serial = TEST_SERIAL.lock();
+        assert_eq!(intern(GcRef::NULL), 0);
+        assert!(resolve(0).is_null());
+        let a = GcRef(0x1111_0000);
+        let i = intern(a);
+        assert_eq!(intern(a), i);
+        assert_eq!(resolve(i), a);
+        let b = GcRef(0x2222_0000);
+        assert_ne!(intern(b), i);
+    }
+
+    #[test]
+    fn walk_forwards_the_slot_the_index_names() {
+        let _serial = TEST_SERIAL.lock();
+        let addr = GcRef(0x3333_0000);
+        let idx = intern(addr);
+        walk(&mut |slot| {
+            if slot.0 == addr.0 {
+                *slot = GcRef(0x4444_0000);
+            }
+        });
+        assert_eq!(resolve(idx), GcRef(0x4444_0000));
+    }
+
+    #[test]
+    fn a_later_wave_forwards_a_slot_the_previous_wave_traced() {
+        let _serial = TEST_SERIAL.lock();
+        let first = GcRef(0x6E6A_ED90_0100);
+        let idx = intern(first);
+        {
+            let _wave = Wave::enter();
+            trace_index(idx, &mut |slot| {
+                if slot.0 == first.0 {
+                    *slot = GcRef(0x6E6A_ED90_0180);
+                }
+            });
+        }
+        {
+            let _wave = Wave::enter();
+            trace_index(idx, &mut |slot| {
+                if slot.0 == 0x6E6A_ED90_0180 {
+                    *slot = GcRef(0x6E6A_ED90_0200);
+                }
+            });
+        }
+        assert_eq!(resolve(idx), GcRef(0x6E6A_ED90_0200));
+    }
+
+    #[test]
+    fn wrapped_wave_id_does_not_skip_a_slot_marked_with_that_generation() {
+        let _serial = TEST_SERIAL.lock();
+        let addr = GcRef(0x6E6A_ED90_0A01);
+        let idx = intern(addr);
+        {
+            let mut guard = table();
+            let slot = idx as usize;
+            if slot >= guard.marks.len() {
+                guard.marks.resize(slot + 1, 0);
+            }
+            // Generation 1 is the id the wrap path publishes next.
+            guard.marks[slot] = 1;
+        }
+        NEXT_WAVE.store(0, Ordering::Relaxed);
+        {
+            let _wave = Wave::enter();
+            let mut visited = false;
+            trace_index(idx, &mut |slot| {
+                assert_eq!(slot.0, addr.0);
+                visited = true;
+            });
+            assert!(visited);
+        }
+    }
+}

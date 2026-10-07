@@ -118,13 +118,12 @@ pub struct HeapcRecord {
 }
 
 impl HeapcRecord {
-    /// Forward ConstPtrs stored in `_heapc_deps`.
+    /// Trace ConstPtr indexes stored in `_heapc_deps`. This record is
+    /// the holder (`history.py` `ConstPtr`).
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        if let Some(deps) = &mut self.deps {
-            for slot in deps.iter_mut().flatten() {
-                if let OpRef::ConstPtr(gcref) = slot {
-                    visitor(gcref);
-                }
+        if let Some(deps) = &self.deps {
+            for slot in deps.iter().flatten() {
+                slot.trace_const_ptr(visitor);
             }
         }
     }
@@ -1038,30 +1037,34 @@ impl HeapCache {
         self._check_flag(opref, HeapFlags::KNOWN_CLASS, boxes)
     }
 
-    /// Walk every cached *value* slot so a `ConstPtr` ref survives a moving
-    /// minor collection. history.py `ConstPtr.value` is a gcref field
-    /// the Python GC traces through the box object graph; pyre stores cached
-    /// values as flat [`OpRef`] slots and forwards inline `ConstPtr` values in
-    /// place. Every other `OpRef` kind is a no-op.
+    /// `ConstPtr` in this cache is a [`majit_ir::const_ptr_table`] index.
+    /// `history.py` `ConstPtr.value` is written once per wave.
+    /// `trace_const_ptr` traces that index and does not write the
+    /// `OpRef`, so a sorted `VecMap` key stays put while the referent
+    /// stays live. A lookup with the same index still hits.
     ///
-    /// Only value slots are walked — these are returned on cache hits and
-    /// emitted into the op-graph (`loopinvariant_result` / `CacheEntry`
-    /// field values), so a stale one is a use-after-move. The
-    /// `cache_anything` / `cache_seen_allocation` / `quasiimmut_seen_refs`
-    /// *keys* are deliberately left stale: a forwarded lookup key simply
-    /// misses the stale-keyed entry and the cache repopulates (same contract
-    /// as the `call_pure_results` cache), and an in-place key rewrite would
-    /// break the sorted-`VecMap` ordering.
+    /// Holders are the value slots (`loopinvariant_result`,
+    /// `CacheEntry` field values) and the `cache_anything` /
+    /// `cache_seen_allocation` keys. An older constant can remain a
+    /// key after `last_const_box` moves on.
     ///
     /// `FO_REPLACED_WITH_CONST` and `_heapc_deps` live on the FrontendOp
     /// record; the recorder walks those ConstPtrs.
+    ///
+    /// `quasiimmut_seen_refs` stores `ConstPtr.getref_base` addresses
+    /// (`heapcache.py` `new_ref_dict`). Those words are not indexes.
+
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let OpRef::ConstPtr(gcref) = slot {
-                visitor(gcref);
-            }
+            // The word is an index. This cache is a live holder.
+            slot.trace_const_ptr(visitor);
         }
         fn forward_entry(entry: &mut CacheEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
+            for map in [&entry.cache_anything, &entry.cache_seen_allocation] {
+                for key in map.keys() {
+                    key.trace_const_ptr(visitor);
+                }
+            }
             for value in entry.cache_anything.values_mut() {
                 forward(value, visitor);
             }
@@ -2810,59 +2813,83 @@ mod tests {
         assert!(cache.is_class_known(obj));
     }
 
+    /// `Wave` is process-global. These tests each enter one.
+    fn const_ptr_walk_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap()
+    }
+
     #[test]
     fn test_walk_const_ptr_refs_forwards_replaced_with_const() {
+        let _lock = const_ptr_walk_lock();
         // `FO_REPLACED_WITH_CONST` recovers the Const from the box's own
         // value (`constant_from_op`). Forwarding that value is the
         // recorder's walk; HeapCache no longer stores the Const.
         let mut fx = Fixture::new();
         let old = OpRef::ref_op(3);
-        fx.boxes.set_value(old, Value::Ref(GcRef(0x1000)));
+        let addr = GcRef(0x96_0CAC_E001);
+        fx.boxes.set_value(old, Value::Ref(addr));
+        let new = OpRef::const_ptr(addr);
         {
             let mut cache = fx.view();
-            cache.replace_box(old, OpRef::const_ptr(GcRef(0x1000)));
-            assert_eq!(
-                cache.maybe_replace_with_const(old),
-                OpRef::const_ptr(GcRef(0x1000))
-            );
+            cache.replace_box(old, new);
+            assert_eq!(cache.maybe_replace_with_const(old), new);
         }
+
+        // The cache walk traces the same slot the table walk does. One
+        // wave writes `ConstPtr.value` once.
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_ir::const_ptr_table::walk(&mut |gcref: &mut GcRef| {
+            if *gcref == addr {
+                *gcref = GcRef(0x96_0CAC_E002);
+            }
+        });
+        fx.view().walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
+            gcref.0 = gcref.0.wrapping_add(0x1_0000);
+        });
+        assert_eq!(new.as_const_ptr(), Some(GcRef(0x96_0CAC_E002)));
+
         if let Some(Value::Ref(mut gcref)) = fx.boxes.box_value(old) {
             gcref.0 = gcref.0.wrapping_add(0x1_0000);
             fx.boxes.set_value(old, Value::Ref(gcref));
         }
         assert_eq!(
             fx.view().maybe_replace_with_const(old),
-            OpRef::const_ptr(GcRef(0x1_1000))
+            OpRef::const_ptr(GcRef(0x96_0CAD_E001))
         );
     }
 
     #[test]
-    fn test_walk_const_ptr_refs_leaves_cache_keys_stale() {
-        // Cache *keys* are intentionally not forwarded: an in-place key
-        // rewrite would break the sorted-VecMap ordering, and a stale key
-        // simply misses + repopulates (the live lookup arrives already
-        // forwarded). A `ConstPtr` object used as a `cache_anything`
-        // key must therefore stay at its pre-collection address.
+    fn test_walk_const_ptr_refs_traces_cache_keys_without_rekeying() {
+        let _lock = const_ptr_walk_lock();
+        // The key word is the table index. `trace_const_ptr` keeps the
+        // referent alive and does not rewrite the `VecMap` key, so the
+        // original `OpRef` still hits and another address is another key.
         let mut fx = Fixture::new();
         let mut cache = fx.view();
-        let const_obj = OpRef::const_ptr(GcRef(0x2000));
+        let const_obj = OpRef::const_ptr(GcRef(0x96_0CAC_E010));
+        let index = const_obj.const_ptr_index().unwrap();
         let field = 7;
-        // A non-const cached value so the walk leaves the value slot alone
-        // and the assertions isolate the key's address.
+        // A non-const cached value, so the visitor runs for the key.
         cache.getfield_now_known(const_obj, field, OpRef::ref_op(20), IDENTITY_ORACLE);
 
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         cache.walk_const_ptr_refs(&mut |gcref: &mut GcRef| {
             gcref.0 = gcref.0.wrapping_add(0x1_0000);
         });
 
-        // The entry is still keyed by the original (pre-move) address...
+        assert_eq!(const_obj.const_ptr_index(), Some(index));
+        assert_eq!(const_obj.as_const_ptr(), Some(GcRef(0x96_0CAD_E010)));
         assert_eq!(
             cache.getfield_cached(const_obj, field, IDENTITY_ORACLE),
             Some(OpRef::ref_op(20))
         );
-        // ...and was NOT re-keyed to the forwarded address.
         assert_eq!(
-            cache.getfield_cached(OpRef::const_ptr(GcRef(0x1_2000)), field, IDENTITY_ORACLE),
+            cache.getfield_cached(
+                OpRef::const_ptr(GcRef(0x96_0CAD_E010)),
+                field,
+                IDENTITY_ORACLE
+            ),
             None
         );
     }

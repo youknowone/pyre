@@ -483,9 +483,7 @@ impl OptVirtualize {
                             .item_type();
                         let default_box = match item_type {
                             Type::Int | Type::Void => Operand::const_from_value(Value::Int(0)),
-                            Type::Ref => {
-                                Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
-                            }
+                            Type::Ref => Operand::const_(majit_ir::Const::Ref(0)),
                             Type::Float => Operand::const_from_value(Value::Float(0.0)),
                         };
                         vec![default_box; size as usize]
@@ -1678,7 +1676,7 @@ impl OptVirtualize {
             ),
             (
                 VREF_FORCED_FIELD_INDEX,
-                Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
+                Operand::const_(majit_ir::Const::Ref(0)),
             ),
         ]);
         // info.py AbstractStructPtrInfo stores no fielddescr side-list; the SizeDescr
@@ -1770,7 +1768,7 @@ impl OptVirtualize {
             .unwrap_or(false);
         if did_forced_write {
             // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-            let null_op = Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
+            let null_op = Operand::const_(majit_ir::Const::Ref(0));
             ctx.with_ptr_info_mut(&vref_box, |info| {
                 if let PtrInfo::Virtual(vinfo) = info {
                     set_field(
@@ -1799,7 +1797,7 @@ impl OptVirtualize {
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
         // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
         let arg_vref = vref_box.clone();
-        let arg_null = Operand::const_(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
+        let arg_null = Operand::const_(majit_ir::Const::Ref(0));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
         ctx.emit_extra(ctx.current_pass_idx, set_token);

@@ -500,6 +500,19 @@ pub fn register_mutator() {
     });
 }
 
+/// Whether this thread has a [`register_mutator`] entry.
+///
+/// Scoped extra areas panic without one. Callers that root only when a
+/// moving collector can see them use this to skip the area in tests that
+/// never register.
+pub fn mutator_is_registered() -> bool {
+    let thread_id = std::thread::current().id();
+    MUTATOR_REGISTRY
+        .lock()
+        .iter()
+        .any(|entry| entry.thread_id == thread_id)
+}
+
 /// Append an opaque root area to the current registered mutator.
 ///
 /// # Safety

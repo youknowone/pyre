@@ -1,6 +1,19 @@
 pub use collector::HEAP_DUMP_EIO;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use header::{GCREF, GCREFOpaque, GcType};
+
+/// `history.py` `ConstPtr` is rooted by the holder that stores the box
+/// (`trace_index`), not by every slot `intern` has ever recorded.
+/// The registration stays so a collector still has a named walker; it
+/// does not keep dead trace constants alive. Compiled-code constants
+/// use `gcreftracer.GcTable`.
+/// Idempotent: `register_extra_root_walker` dedups by function address.
+pub fn install_const_ptr_table_walker() {
+    shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
+}
+
+fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
+
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:
@@ -1143,6 +1156,14 @@ pub trait GcAllocator: Send {
         obj_addr
     }
 
+    /// `id_or_identityhash` without allocating a shadow.
+    ///
+    /// A root walk already holds the collector. `MiniMarkGC` reads an
+    /// existing shadow or forwarding pointer. A stub returns `obj_addr`.
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        obj_addr
+    }
+
     /// `gc.py self.write_barrier_descr = WriteBarrierDescr(self)`:
     /// the descriptor for the write barrier check. Defaulting to `None` is
     /// `gc.py GcLLDescr_boehm.write_barrier_descr = None` — a collector
@@ -1967,6 +1988,9 @@ impl GcAllocator for GcHandle {
     }
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
+    }
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        gc_sync::gc_query_reentrant(|gc| gc.id_or_identityhash_reentrant(obj_addr))
     }
     fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
         gc_sync::gc_query_reentrant(|gc| gc.get_write_barrier_descr())
@@ -2881,6 +2905,10 @@ pub fn minor_epoch() -> u64 {
 
 pub fn bump_minor_epoch() {
     MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `Reader` caches `NUMBERING` payload bytes until this generation
+    // changes. Same publication point as `MINOR_EPOCH`: after the
+    // nursery reset, before the mutator resumes.
+    majit_ir::resumecode::bump_numbering_payload_epoch();
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.

@@ -9382,15 +9382,15 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // handler takes the latch. The adopters bridge the pre-drive publication
     // window and the blackhole drivers then install their own packed roots.
     //
-    // A `MIFrame` stores each Ref register as the box itself. Once the
-    // frames are latched here, `MetaInterp::walk_active_trace_refs` no
-    // longer reaches them, so ConstPtr gcrefs are forwarded below.
+    // A `MIFrame` stores each Ref register as the box itself. ConstPtr
+    // in `ref_regs` is a table index. The latch is the holder while
+    // `walk_active_trace_refs` cannot see the frame.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
-        for slot in latched.miframe.ref_regs.iter_mut() {
-            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-            }
+        // `ConstPtr` in `ref_regs` is a table index. This latch is the
+        // holder while `walk_active_trace_refs` cannot see the frame.
+        for slot in latched.miframe.ref_regs.iter().flatten() {
+            slot.trace_const_ptr(visitor);
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
@@ -9410,10 +9410,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
         for frame in latched.framestack.frames.iter_mut() {
-            for slot in frame.ref_regs.iter_mut() {
-                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                    visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-                }
+            // Both halves, for the reason the single-frame arm gives.
+            for slot in frame.ref_regs.iter().flatten() {
+                slot.trace_const_ptr(visitor);
             }
         }
         if latched.last_exc_value != 0 {
@@ -11604,6 +11603,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
+    // GuardClass, the `w_class` pin and the version-tag pin can minor-collect.
+    // `concrete_obj` is a copy; the receiver box is `obj`
+    // (`RefFrontendOp` / `getref_base`).
+    let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);
     let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
         crate::descr::mapdict_map_descr(concrete_obj)
     });
@@ -11770,13 +11773,19 @@ fn walker_promote_object_mutable_cell<Sym: WalkSym>(
     cell: pyre_object::PyObjectRef,
     expected: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
-    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+    // `opimpl_getfield_gc_r` records the getfield and can minor-collect
+    // while the trace buffer grows. `expected` is not a root until the
+    // guard constant below; reload it from the pin. The cell constant's
+    // table index is held by `record_bytes` across that growth.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[cell, expected]);
+    let cell_const = ctx.trace_ctx.const_ref(roots.get(base) as i64);
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_const,
         crate::descr::object_mutable_cell_value_descr(),
     );
-    let expected_const = ctx.trace_ctx.const_ref(expected as i64);
+    let expected_const = ctx.trace_ctx.const_ref(roots.get(base + 1) as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[value, expected_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
