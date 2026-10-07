@@ -1121,6 +1121,26 @@ fn real_main() {
                     "opcode_ops",
                     "compare_value_from_tag",
                 ]),
+                // BINARY_SLICE residual `bh_binary_slice_fn`. The portal
+                // never calls this split, so the descent looks the body up
+                // by this graph key (`specialize.rs
+                // try_walker_orthodox_binary_slice`). The wrapper holds
+                // `push_roots`; this is the inner graph.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "runtime_ops",
+                    "binary_slice_values_inner",
+                ]),
+                // `w_list_getitem` is `dont_look_inside`. The getitem
+                // descent looks this lock-free body up by name
+                // (`jitcode_runtime.rs list_getitem_jitcode`). The portal
+                // closure does not reach the split, so seed it like
+                // `binary_slice_values_inner`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_getitem_inner",
+                ]),
                 // `W_FastListIterObject.descr_next` is residual `jit_next`.
                 // The portal never calls this split, so the descent looks the
                 // body up by this one graph key.

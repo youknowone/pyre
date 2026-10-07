@@ -2149,6 +2149,11 @@ fn caller_operand_slots<Sym: WalkSym>(
         | pyre_interpreter::Instruction::CompareOp { .. }
         | pyre_interpreter::Instruction::StoreAttr { .. }
         | pyre_interpreter::Instruction::FormatWithSpec => 2,
+        // `[obj, start, stop]`. `binary_slice` pops stop, start, then obj, so
+        // `obj` is the deepest of the three. `try_walker_orthodox_binary_slice`
+        // inlines each bound's `__index__` from this residual; with no arm
+        // `CallStack::NoOperandShape` left the body a residual `BinarySlice`.
+        pyre_interpreter::Instruction::BinarySlice => 3,
         other => {
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(

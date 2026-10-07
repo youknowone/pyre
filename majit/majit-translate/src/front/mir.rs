@@ -10221,13 +10221,14 @@ impl<'a> Lowering<'a> {
     /// `heaptracker.py all_fielddescrs` flattens a by-value nested
     /// struct into dotted leaves on the outer GC owner. `W_ListObject`
     /// stores Integer/Float items as an inline `IntArray` /
-    /// `FloatArray`; a write of `.block` / `.len` is therefore
-    /// `setfield_gc(l, int_items.block)` — the same field
-    /// `_handle_list_call` and `rlist.py` `l.items = newitems` use.
-    /// Without the flatten, Charon emits `FieldWrite(block)` on the
-    /// nested `IntArray` copy, so heap CSE of `int_items.block` and
-    /// the CondCall write-set both miss the store.
-    fn flatten_list_storage_field_write(
+    /// `FloatArray`; a read or write of `.block` / `.len` is therefore
+    /// `getfield_gc` / `setfield_gc(l, int_items.block)` — the same field
+    /// `_handle_list_call` and `rlist.py` `l.items` / `l.items = newitems`
+    /// use. Without the flatten, Charon emits `FieldRead`/`FieldWrite(block)`
+    /// on the nested `IntArray` copy, so heap CSE of `int_items.block`
+    /// misses the access and a `getfield` of `IntArray.block` at offset 0
+    /// loads the typed-block capacity header.
+    fn flatten_list_storage_field(
         &self,
         inner: &Place,
         elem: &ProjectionElem,
@@ -10360,9 +10361,7 @@ impl<'a> Lowering<'a> {
             let value_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
             return self.pair_setitem(mir_bb, seq, &index_payload.clone(), value, &value_ty);
         }
-        if let Some((owner, flat_name, owner_id)) =
-            self.flatten_list_storage_field_write(&inner, &elem)
-        {
+        if let Some((owner, flat_name, owner_id)) = self.flatten_list_storage_field(&inner, &elem) {
             let list_place = peel_nested_storage_place(inner);
             let base = self.resolve_place(mir_bb, list_place)?;
             let bb_id = self.block_id[mir_bb];
@@ -17090,6 +17089,30 @@ impl<'a> Lowering<'a> {
                         container_is_enum,
                         owner_is_closure_env,
                     )? {
+                        return Ok(res);
+                    }
+                    if let Some((owner, flat_name, owner_id)) =
+                        self.flatten_list_storage_field(&inner, &elem)
+                    {
+                        let list_place = peel_nested_storage_place(clone_place(&inner));
+                        let base = self.resolve_place(mir_bb, list_place)?;
+                        let bb_id = self.block_id[mir_bb];
+                        let ty =
+                            tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves);
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::FieldRead {
+                                base,
+                                field: FieldDescriptor::new(flat_name, Some(owner))
+                                    .with_owner_id(owner_id)
+                                    .with_base_is_deref(true),
+                                ty,
+                                pure: false,
+                            },
+                        });
                         return Ok(res);
                     }
                     let base = self.resolve_place(mir_bb, *inner)?;
@@ -55300,7 +55323,7 @@ pub(crate) fn charon_array_len_to_string(len: &serde_json::Value, llbc: &Llbc) -
 
 /// Drop Deref wrappers and the by-value storage field (`int_items` /
 /// `float_items` / …) so the write base is the list pointer. Pair of
-/// [`Lowering::flatten_list_storage_field_write`].
+/// [`Lowering::flatten_list_storage_field`].
 fn peel_nested_storage_place(inner: Place) -> Place {
     let mut cur = inner;
     loop {

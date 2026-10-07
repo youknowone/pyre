@@ -7954,6 +7954,23 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // BINARY_SLICE walks `runtime_ops::binary_slice_values_inner` so
+    // `is_list` / `is_str` / `is_tuple` are recorded guards and a custom
+    // `__index__` is the body's `eval_slice_index`. Bytes / bytearray /
+    // user `__getitem__` stay in `binary_slice_getitem_fallback`. Not a
+    // spec-fold row.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 3
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinarySlice
+    {
+        if let Some(outcome) = try_walker_orthodox_binary_slice(
+            ctx, code, op, funcptr, &r_args, call_descr, dst, dst_bank,
+        )? {
+            return Ok((outcome, op.next_pc));
+        }
+    }
+
     // STORE_SUBSCR `list[int] = value` walks `w_list_setitem_inner`,
     // eliding the `CALL_MAY_FORCE` that would force the virtualizable every
     // iteration.  Falls through to the generic residual otherwise (SAFE).

@@ -1167,6 +1167,19 @@ pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
         .version_tag
         .load(std::sync::atomic::Ordering::Acquire)
 }
+
+/// typeobject.py `version_tag` `self._version_tag` on a jitted heap type.
+/// Relaxed so the codewriter folds the load to a getfield; the
+/// interpreter Acquire reader is [`w_type_get_version_tag`].
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_read_version_tag_field(obj: PyObjectRef) -> u64 {
+    (*(obj as *const W_TypeObject))
+        .version_tag
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Store a new version-tag identity (typeobject.py `mutated`).
 ///
 /// Revokes the loops that baked the old identity as a constant before

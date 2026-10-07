@@ -9368,6 +9368,28 @@ mod tests {
         ));
         assert!(std::sync::Arc::ptr_eq(&round_trip, &runtime));
         assert_ne!(runtime.as_array_descr().unwrap().type_id(), 0);
+        // `opimpl_new_array` allocates from `BhDescr::resolve_gc_tid` with
+        // `gc_type_id: 0`; that lookup must recover the runtime tid, not
+        // a truncated `path_hash`.
+        assert_eq!(
+            BhDescr::Array {
+                base_size: token.base_size,
+                itemsize: token.item_size,
+                len_offset: Some(token.len_offset),
+                type_id: majit_ir::descr::path_hash(atid),
+                gc_type_id: 0,
+                item_type: Type::Int,
+                is_array_of_pointers: false,
+                is_array_of_structs: false,
+                is_item_signed: true,
+                is_gc_managed: true,
+                ei_index: u32::MAX,
+                array_type_id: Some(atid.to_string()),
+                interior_fields: Vec::new(),
+            }
+            .resolve_gc_tid(),
+            runtime.as_array_descr().unwrap().type_id(),
+        );
     }
 
     #[test]
@@ -10031,6 +10053,36 @@ mod tests {
                 .resolve_array_tid(cache_key),
             Some(PY_OBJECT_ARRAY_GC_TYPE_ID),
         );
+    }
+
+    /// `int_gcarray_descr` / `float_gcarray_descr` occupy the same
+    /// `cache[ARRAY]` slots the codewriter names (`LIST_INT_ITEMS_ARRAY` /
+    /// `LIST_FLOAT_ITEMS_ARRAY`) so `BhDescr::resolve_gc_tid` recovers the
+    /// collector tid `GcLLDescr_framework.init_array_descr` wrote.
+    #[test]
+    fn typed_items_gcarray_descrs_publish_under_the_codewriter_array_identity() {
+        crate::state::publish_typed_items_gcarray_descrs();
+        for (descr, atid) in [
+            (
+                crate::state::int_gcarray_descr(),
+                majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY,
+            ),
+            (
+                crate::state::float_gcarray_descr(),
+                majit_jitcode::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY,
+            ),
+        ] {
+            let array = descr
+                .as_array_descr()
+                .expect("typed items gcarray descr must be an ArrayDescr");
+            let cache_key = majit_ir::descr::path_hash(atid);
+            assert_eq!(
+                majit_ir::descr::gc_cache()
+                    .lock()
+                    .resolve_array_tid(cache_key),
+                Some(array.type_id()),
+            );
+        }
     }
 }
 

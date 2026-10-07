@@ -909,7 +909,47 @@ pub fn store_slice_values(
 /// boundaries; everything else (`bytes`, `bytearray`, instances with
 /// `__getitem__`) falls back to a `slice` object dispatched through
 /// `getitem`. A `None` start/stop defaults to `0` / `len`.
+///
+/// `push_roots` lives here so the inner graph a trace descends does not
+/// start on that `dont_look_inside` residual (`specialize.rs
+/// try_walker_orthodox_binary_slice`). The inner pins with `pin_root`
+/// (`dont_look_inside_cannot_raise`, bound in `jit_trace_fnaddrs`).
+#[inline(never)]
 pub fn binary_slice_values(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    // Same wrapper/inner split as `w_list_getitem`: the list lock lives
+    // here so `binary_slice_values_inner` holds no `w_list_lock` pair.
+    // Flatten residual-calls the inner, so a compiled trace matches
+    // getitem and does not enter this wrapper.
+    if unsafe { pyre_object::is_list(obj) } {
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let obj = pyre_object::gc_roots::pin_root(obj);
+        let start_slot = pyre_object::gc_roots::shadow_stack_len();
+        let start = pyre_object::gc_roots::pin_root(start);
+        let stop_slot = pyre_object::gc_roots::shadow_stack_len();
+        let stop = pyre_object::gc_roots::pin_root(stop);
+        let _list_guard = unsafe { pyre_object::listobject::w_list_lock(obj) };
+        return binary_slice_values_inner(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(start_slot),
+            pyre_object::gc_roots::shadow_stack_get(stop_slot),
+        );
+    }
+    binary_slice_values_inner(obj, start, stop)
+}
+
+/// Body of [`binary_slice_values`]. The public function stays
+/// `inline(never)` so this split has its own graph; the residual C ABI
+/// wrapper calls this directly so compiled traces do not pay the
+/// `push_roots` hop. `inline(never)` is load-bearing: rustc otherwise
+/// folds this body into the wrapper and the codewriter never mints the
+/// graph a trace descends (`specialize.rs try_walker_orthodox_binary_slice`).
+#[inline(never)]
+pub(crate) fn binary_slice_values_inner(
     obj: PyObjectRef,
     start: PyObjectRef,
     stop: PyObjectRef,
@@ -920,21 +960,19 @@ pub fn binary_slice_values(
         // are published as one livevar set, and each consumer that follows a
         // collection point reads its operand back off the root slot — the
         // receiver included, since its type says nothing about whether it moves.
-        let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.base();
-        let (start_slot, stop_slot) = (obj_slot + 1, obj_slot + 2);
-        roots.publish(&[obj, start, stop]);
-        roots.normalize(obj_slot, 3);
-        let obj = roots.get(obj_slot);
-        let start = roots.get(start_slot);
-        let stop = roots.get(stop_slot);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let obj = pyre_object::gc_roots::pin_root(obj);
+        let start_slot = pyre_object::gc_roots::shadow_stack_len();
+        let start = pyre_object::gc_roots::pin_root(start);
+        let stop_slot = pyre_object::gc_roots::shadow_stack_len();
+        let stop = pyre_object::gc_roots::pin_root(stop);
         if pyre_object::is_list(obj) {
             let s = if pyre_object::is_none(start) {
                 0
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
-            let stop = roots.get(stop_slot);
+            let stop = pyre_object::gc_roots::shadow_stack_get(stop_slot);
             let raw_e = if pyre_object::is_none(stop) {
                 None
             } else {
@@ -945,15 +983,22 @@ pub fn binary_slice_values(
             // is what the omitted `stop` defaults to and what a negative bound
             // folds against.  Read off the root slot, since the same call is
             // what may have moved the list.
-            let len = pyre_object::w_list_len(roots.get(obj_slot)) as i64;
+            let len =
+                pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot)) as i64;
             let e = raw_e.unwrap_or(len);
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-            // Bounds are normalised here, outside `ll_listslice`: a user
+            // Bounds are normalised here, outside `ll_listslice_inner`: a user
             // `__index__` may have resized this list, and the operand roots
             // above are what keep it alive across that call. The leaf
-            // allocates once and copies; it does not convert bounds.
-            return Ok(pyre_object::ll_listslice(roots.get(obj_slot), s, e));
+            // allocates once and copies; it does not convert bounds. The
+            // list lock is the wrapper's (`binary_slice_values` /
+            // `ll_listslice`), so this body has no `w_list_lock` pair.
+            return Ok(pyre_object::listobject::ll_listslice_inner(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                s,
+                e,
+            ));
         }
         if pyre_object::is_str(obj) {
             // Slice on code-point boundaries over the WTF-8 view, so a
@@ -970,7 +1015,7 @@ pub fn binary_slice_values(
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
-            let stop = roots.get(stop_slot);
+            let stop = pyre_object::gc_roots::shadow_stack_get(stop_slot);
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
@@ -978,19 +1023,27 @@ pub fn binary_slice_values(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
-            // The payload view is a pointer derived from the receiver's value
-            // box, and a derived pointer is the one thing a root slot cannot
-            // track.  Take it, and the index storage beside it, after the last
-            // conversion — off the receiver that same conversion may have moved.
-            let obj = roots.get(obj_slot);
-            let full = pyre_object::w_str_get_wtf8(obj);
-            let part = rustpython_wtf8::Wtf8::from_bytes(
-                &full.as_bytes()[pyre_object::w_str_index_to_byte(obj, s)
-                    ..pyre_object::w_str_index_to_byte(obj, e)],
-            )
-            .expect("code-point-aligned slice is WTF-8");
-            // Substring slicing churns fresh dynamic strings; make it collectable.
-            return Ok(pyre_object::w_str_from_wtf8_managed(part.to_wtf8_buf()));
+            // `_utf8[start:end]` through `ll_stringslice_startstop`
+            // (`rstr.py`); wrap with `space.newutf8`. A whole-string slice
+            // of an exact `str` shares the operand (`unicodeobject.py`
+            // `_getitem_slice`). Take storage and index table after the last
+            // conversion — off the receiver that conversion may have moved.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if s == 0
+                && e == pyre_object::w_str_len(obj)
+                && pyre_object::pyobject::is_exact_type(obj, &pyre_object::pyobject::STR_TYPE)
+            {
+                return Ok(obj);
+            }
+            let start_b = pyre_object::w_str_index_to_byte(obj, s) as i64;
+            let stop_b = pyre_object::w_str_index_to_byte(obj, e) as i64;
+            let storage = unsafe { pyre_object::unicodeobject::w_str_storage(obj) };
+            let piece =
+                pyre_object::lowlevel_string::ll_stringslice_startstop(storage, start_b, stop_b);
+            return Ok(pyre_object::unicodeobject::w_str_from_storage_and_length(
+                piece,
+                e - s,
+            ));
         }
         if pyre_object::is_tuple(obj) {
             // A tuple's length is fixed, so it is read before the bounds
@@ -1003,7 +1056,7 @@ pub fn binary_slice_values(
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
-            let stop = roots.get(stop_slot);
+            let stop = pyre_object::gc_roots::shadow_stack_get(stop_slot);
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
@@ -1011,32 +1064,50 @@ pub fn binary_slice_values(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-            // The arity-2 specialisations box their payload on fetch, the same
-            // allocating fetch the `list` arm accumulates in root slots — and
-            // that allocation sits inside this loop, so the receiver is read
-            // back on every iteration and not just once before it.
-            let items_base = pyre_object::gc_roots::shadow_stack_len();
-            let mut fetched = 0usize;
-            for i in s..e {
-                if let Some(v) = pyre_object::w_tuple_getitem(roots.get(obj_slot), i as i64) {
-                    let _ = roots.pin_root(v);
-                    fetched += 1;
-                }
-            }
-            let mut items = Vec::with_capacity(fetched);
-            for i in 0..fetched {
-                items.push(roots.get(items_base + i));
-            }
-            return Ok(pyre_object::w_tuple_new(items));
+            // `ll_listslice_startstop`: `ll_newlist` plus `ll_arraycopy`
+            // (`tuple_getslice_step1_block`). Not a host `Vec`.
+            return Ok(unsafe {
+                crate::baseobjspace::tuple_slice_startstop(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    s,
+                    e,
+                )
+            });
         }
         // Fall back to slice(start, stop) → getitem dispatch.
         // Handles bytes, bytearray, instances with __getitem__, etc.
-        let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
-        // The receiver is live across that allocation, and the fresh slice has
-        // no heap edge until `getitem` stores it.
-        let slice_obj = roots.pin_root(slice_obj);
-        crate::baseobjspace::getitem(roots.get(obj_slot), slice_obj)
+        binary_slice_getitem_fallback(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(start_slot),
+            pyre_object::gc_roots::shadow_stack_get(stop_slot),
+        )
     }
+}
+
+/// [`binary_slice_values_inner`] for every type the list / str / tuple
+/// arms do not slice. `space.getitem` over `space.newslice`.
+///
+/// `w_slice_new` brackets its malloc with `push_roots`
+/// (`gct_fv_gc_malloc`). Residualising that RAII `RootScope` inside a
+/// look-inside walk drops the shadow stack at the residual return, and
+/// the inlined write of `W_SliceObject` then reads `start` / `stop` /
+/// `step` from the wrong slots. Keep the whole fallback opaque, matching
+/// `convert_value_slow`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn binary_slice_getitem_fallback(
+    obj: PyObjectRef,
+    start: PyObjectRef,
+    stop: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let start = pyre_object::gc_roots::pin_root(start);
+    let stop = pyre_object::gc_roots::pin_root(stop);
+    let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
+    let slice_obj = pyre_object::gc_roots::pin_root(slice_obj);
+    crate::baseobjspace::getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), slice_obj)
 }
 
 fn build_list_from_args(args: &[PyObjectRef]) -> PyObjectRef {

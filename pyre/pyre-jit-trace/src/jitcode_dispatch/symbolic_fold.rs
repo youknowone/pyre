@@ -22,21 +22,10 @@ fn execute_box_str_constant(args: &[Value]) -> Option<Value> {
     let Value::Ref(GcRef(ptr)) = args[0] else {
         return None;
     };
-    if ptr == 0 {
-        return None;
-    }
-    let obj = ptr as pyre_object::PyObjectRef;
-    // The translated model aliases a `&Wtf8` view to its backing
-    // `W_UnicodeObject`. A constant that is not an exact `str` — a subclass,
-    // or a non-object whose header word is not a type pointer — is not that
-    // alias. `isinstance_str_w` walks the MRO and dereferences the type word,
-    // so a header that is not a type pointer faults. Exact `is_str` only
-    // compares the word.
-    if !unsafe { pyre_object::is_str(obj) } {
-        return None;
-    }
-    let payload = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(obj) };
-    let result = pyre_object::unicodeobject::box_str_constant(payload);
+    // Wrapper header (`is_str`) or the `_utf8` storage pointer prebuilt STR
+    // constants materialize as (`runtime_fnaddr_patch.rs`
+    // `materialize_prebuilt_str`). Untrusted non-str Refs decline.
+    let result = pyre_object::unicodeobject::interned_str_from_const_ptr(ptr)?;
     Some(Value::Ref(GcRef(result as usize)))
 }
 

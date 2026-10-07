@@ -1401,6 +1401,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::runtime_ops::is_op",
         crate::opcode_ops::jit_runtime_ops_is_op,
     );
+    // Same binding as BINARY/COMPARE: the walker descends
+    // `binary_slice_values`, and guard-failure blackholing calls the
+    // matching one-word C-ABI wrapper. The wrapper's own `jit_*` path is
+    // not registered: two leaf names on one address make
+    // `patch_constants_i_fnaddrs` ambiguous.
+    cp3(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::binary_slice_values",
+        crate::opcode_ops::jit_runtime_ops_binary_slice_values,
+    );
     cp1(
         &mut entries,
         "pyre_interpreter::baseobjspace::len",
@@ -3640,6 +3650,51 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::object_array::jit_ll_arraycopy",
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
+    );
+    // BINARY_SLICE list arm: lock-free inner and per-strategy copy leaves.
+    // Word ABI `(obj, start, n)` so a declined helper walk residualizes
+    // through `jitcode.fnaddr` instead of a fat `&[T]`.
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_inner",
+        "pyre_object::ll_listslice_inner",
+        pyre_object::listobject::ll_listslice_inner,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_ints",
+        "pyre_object::ll_listslice_ints",
+        pyre_object::listobject::ll_listslice_ints,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_floats",
+        "pyre_object::ll_listslice_floats",
+        pyre_object::listobject::ll_listslice_floats,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_objects",
+        "pyre_object::ll_listslice_objects",
+        pyre_object::listobject::ll_listslice_objects,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_new_int_list",
+        "pyre_object::ll_listslice_new_int_list",
+        pyre_object::listobject::ll_listslice_new_int_list,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_new_float_list",
+        "pyre_object::ll_listslice_new_float_list",
+        pyre_object::listobject::ll_listslice_new_float_list,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::listobject::ll_listslice_new_object_list",
+        "pyre_object::ll_listslice_new_object_list",
+        pyre_object::listobject::ll_listslice_new_object_list,
     );
     // `ll_math.py` C llexternals, under the `ll_math::math_*` / crate-root
     // alias paths the front retargets the Opaque `f64` methods to. Float
@@ -6171,6 +6226,10 @@ mod tests {
             (
                 "pyre_interpreter::runtime_ops::is_op",
                 crate::opcode_ops::jit_runtime_ops_is_op as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::runtime_ops::binary_slice_values",
+                crate::opcode_ops::jit_runtime_ops_binary_slice_values as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::type_methods::format_simple_w",

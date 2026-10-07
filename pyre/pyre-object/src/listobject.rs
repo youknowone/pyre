@@ -10,9 +10,10 @@
 
 use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
-    dealloc_list_items_block, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
-    grow_list_items_block_gc, grow_typed_items_block, items_block_capacity, items_block_items_base,
-    items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
+    alloc_typed_items_block_nursery, dealloc_list_items_block, gc_float_array_gc_type_id,
+    gc_int_array_gc_type_id, grow_list_items_block_gc, grow_typed_items_block,
+    items_block_capacity, items_block_items_base, items_block_set_ref, jit_ll_arraycopy,
+    typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -65,7 +66,7 @@ static LIST_LOCKS: LazyLock<Vec<ForkListLock>> =
 /// `repr(transparent)`: the guard is its lock word, so the translator types a
 /// `ListGuard` value as that integer and its drop releases that word.
 #[repr(transparent)]
-struct ListGuard {
+pub struct ListGuard {
     lock: usize,
     not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -84,7 +85,7 @@ impl Drop for ListGuard {
 /// acquire again. The scalar acquire/release ABI below is necessary but is
 /// not, by itself, permission to admit this body into tracing.
 #[majit_macros::dont_look_inside]
-unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
+pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
     ListGuard {
         lock: w_list_lock_acquire(obj),
         not_send: std::marker::PhantomData,
@@ -3104,6 +3105,17 @@ pub fn ll_list_int_set_items(l: &mut W_ListObject, items: *mut TypedItemsBlock) 
     l.int_items.block = items;
 }
 
+/// `rlist.py LIST.ll_items` for Integer storage (`l.items`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_r(int_items.block)`. rustc otherwise
+/// inlines the load as `FieldRead(block)` on a nested `IntArray` copy.
+#[inline(never)]
+#[majit_macros::oopspec("list.int_items(l)")]
+pub fn ll_list_int_items(l: &W_ListObject) -> *mut TypedItemsBlock {
+    l.int_items.block
+}
+
 /// `rlist.py _ll_list_resize_hint_really` for Integer storage.
 ///
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
@@ -3710,20 +3722,28 @@ pub unsafe fn w_list_iter_item(obj: PyObjectRef, index: i64) -> PyObjectRef {
 /// `obj` must point to a valid `W_ListObject`. `start` and `stop` are
 /// already normalised machine bounds (a `stop` past the length is clamped).
 pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
-    // The arms address the backing array directly instead of boxing one item
-    // at a time through `w_list_getitem`, so the length, the strategy and the
-    // copy have to see one state: a concurrent append or strategy transition
-    // would otherwise replace the storage under a raw sub-slice.  The lock is
-    // reentrant, so an arm that still boxes may take it again.
-    //
-    // A contended acquisition parks in `before_external_block`, which lets the
-    // collector move the receiver, so root it across the wait and read it back
-    // — the same bracket `w_list_clone_if_shared_strategy` uses.
+    // Same wrapper/inner split as `w_list_getitem`: the BINARY_SLICE
+    // descent walks the lock-free body. The lock stays on the interpreter
+    // wrapper and on [`binary_slice_values`].
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
+    ll_listslice_inner(obj, start, stop)
+}
+
+/// [`ll_listslice`]'s body, run with the list's guard already held.
+///
+/// The arms address the backing array directly instead of boxing one item
+/// at a time through `w_list_getitem`, so the length, the strategy and the
+/// copy have to see one state.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`, and the caller must hold
+/// `w_list_lock(obj)`. `start` and `stop` are already normalised machine
+/// bounds (a `stop` past the length is clamped).
+pub unsafe fn ll_listslice_inner(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
     let length = w_list_len(obj);
     let start = start.min(length);
     let stop = if stop > length { length } else { stop };
@@ -3736,45 +3756,119 @@ pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObj
         ListStrategy::Integer => ll_listslice_ints(obj, start, newlength),
         ListStrategy::Float => ll_listslice_floats(obj, start, newlength),
         ListStrategy::Object => ll_listslice_objects(obj, start, newlength),
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            // `BaseRangeListStrategy.getslice`: `switch_to_integer_strategy`
+            // then `IntegerListStrategy.getslice`.
+            let obj = switch_range_to_integer_strategy(&mut *(obj as *mut W_ListObject));
+            ll_listslice_ints(obj, start, newlength)
+        }
         _ => ll_listslice_boxed(obj, start, newlength),
     }
 }
 
-/// Copy a sub-slice of `obj` into a fresh Integer-strategy list.
+/// `rlist.py ll_newlist` for IntegerListStrategy storage (`GcArray(Signed)`).
 ///
-/// The header allocation can collect. `obj` is pinned across it and re-read
-/// before the source array is addressed; the element copy lands in a host
-/// `Vec` before `IntArray::from_vec` allocates the destination block.
-#[majit_macros::dont_look_inside]
-fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, piece: &[i64]) -> PyObjectRef {
-    let n = piece.len();
-    let _roots = crate::gc_roots::push_roots();
+/// `@jit.oopspec("newlist(length)")`: `do_fixed_newlist` rewrites a Signed
+/// ARRAY to `new_array` (items stay uninitialized). The slice caller writes
+/// every slot through `ll_arraycopy`. Not `newlist_clear`: that oopspec
+/// mints the ref-`ItemsBlock` array descr (`tuple_ll_newlist`). This block
+/// is `gc_int_array_gc_type_id`.
+///
+/// The interpreter body is nursery `malloc_fast`
+/// (`Digits::new` / `alloc_typed_items_block_nursery`). No root bracket:
+/// `gct_fv_gc_malloc.push_roots` belongs on the malloc rewrite, and
+/// `push_roots` is `dont_look_inside` with no jitcode, which aborts the
+/// BINARY_SLICE subwalk. Live vars stay in the caller's scope
+/// (`binary_slice_values` / `ll_listslice`) or the JIT gcmap.
+#[inline(never)]
+#[majit_macros::oopspec("newlist(length)")]
+unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
+    let count = count as usize;
+    if count == 0 {
+        return std::ptr::null_mut();
+    }
+    alloc_typed_items_block_nursery(count, gc_int_array_gc_type_id())
+}
+
+/// `W_ListObject.from_storage_and_strategy` for IntegerListStrategy: the
+/// header adopts an already-allocated Signed items block, the way
+/// `wraptuple` adopts `tuple_ll_newlist`'s array. Typed strategies keep
+/// `length == 0` and a null object `items` block.
+///
+/// No `push_roots`: that helper has no jitcode and aborts the BINARY_SLICE
+/// subwalk. `pin_root` is `dont_look_inside_cannot_raise` and is bound; the
+/// caller's `RootScope` (interpreter) or the JIT gcmap (trace) keeps the
+/// block live across the header malloc.
+#[inline(never)]
+unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
+    let block_slot = crate::gc_roots::shadow_stack_len();
+    if !block.is_null() {
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+    }
+    let w_class = get_instantiate(&LIST_TYPE);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let header = || PyObject {
+        ob_type: &LIST_TYPE as *const PyType,
+        w_class: crate::gc_roots::shadow_stack_get(class_slot),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE);
+    let block_now = if block.is_null() {
+        std::ptr::null_mut()
+    } else {
+        crate::gc_roots::shadow_stack_get(block_slot) as *mut TypedItemsBlock
+    };
+    let int_items = IntArray::from_block(block_now, n);
+    let built = W_ListObject {
+        ob_header: header(),
+        allocated: n as isize,
+        length: AtomicUsize::new(0),
+        items: std::ptr::null_mut(),
+        strategy: ListStrategy::Integer,
+        int_items,
+        float_items: FloatArray::empty(),
+        bytes_items: BytesArray::empty(),
+        ascii_items: UnicodeArray::empty(),
+    };
+    if !raw.is_null() {
+        std::ptr::write(raw as *mut W_ListObject, built);
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        return raw as PyObjectRef;
+    }
+    Box::into_raw(Box::new(built)) as PyObjectRef
+}
+
+/// `rlist.py ll_listslice_startstop`: `ll_newlist` plus `ll_arraycopy`.
+///
+/// No oopspec — the JIT inlines this body. Word ABI `(obj, start, n)` so a
+/// declined sub-walk can residualize through `jitcode.fnaddr`. A `&[i64]`
+/// is two words (`jit_fnaddr.rs` `ResidualSlot`) and is never an argument;
+/// the copy addresses the typed blocks through `jit_ll_arraycopy`.
+///
+/// No `push_roots` in this body (`rlist.py ll_listslice_startstop` has
+/// none). Pins land on the caller's `RootScope`.
+#[inline(never)]
+pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _obj = crate::gc_roots::pin_root(obj);
-    let result_slot = crate::gc_roots::shadow_stack_len();
-    let result = w_list_new_with_strategy(Vec::new(), ListStrategy::Integer);
-    let _ = crate::gc_roots::pin_root(result);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let list = unsafe { &*(obj as *const W_ListObject) };
-    let storage = list.int_items.as_slice();
-    let fresh = &storage[start..start + n];
-    let copied = fresh.to_vec();
-    let items = IntArray::from_vec(copied);
-    let block_slot = items.pin_block();
-    let mut items = items;
-    items.reload_block(block_slot);
-    let result = crate::gc_roots::shadow_stack_get(result_slot);
-    list_write_barrier(result);
-    let result = crate::gc_roots::shadow_stack_get(result_slot);
-    let list = unsafe { &mut *(result as *mut W_ListObject) };
-    list.int_items.install(items);
-    // `install` tears the outgoing block down through a safepoint, and
-    // `w_list_new_with_strategy` left `allocated` at the zero-length vector it
-    // was handed. `__sizeof__` reads this field, so name the slice's slots.
-    let result = crate::gc_roots::shadow_stack_get(result_slot);
-    let list = unsafe { &mut *(result as *mut W_ListObject) };
-    list.allocated = n as isize;
-    crate::gc_roots::shadow_stack_get(result_slot)
+    let dest = int_ll_newlist(n as i64);
+    let dest_slot = crate::gc_roots::shadow_stack_len();
+    if !dest.is_null() {
+        let _ = crate::gc_roots::pin_root(dest as PyObjectRef);
+    }
+    if n > 0 {
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        // rlist.py `ll_arraycopy`: `rgc.ll_arraycopy(source.ll_items(), ...)`.
+        let src = ll_list_int_items(&*(obj as *const W_ListObject)) as PyObjectRef;
+        let dest_now = crate::gc_roots::shadow_stack_get(dest_slot);
+        crate::object_array::jit_ll_arraycopy(src, dest_now, start as i64, 0, n as i64);
+    }
+    let dest_now = if dest.is_null() {
+        std::ptr::null_mut()
+    } else {
+        crate::gc_roots::shadow_stack_get(dest_slot) as *mut TypedItemsBlock
+    };
+    w_list_adopt_int_items(dest_now, n)
 }
 
 /// Copy a sub-slice of `obj` into a fresh Float-strategy list.
@@ -3782,8 +3876,8 @@ fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, piece: &[i64]) -> P
 /// Same order as [`ll_listslice_new_int_list`]: pin the source, allocate the
 /// header, re-read, then host-copy before the block allocation.
 #[majit_macros::dont_look_inside]
-fn ll_listslice_new_float_list(obj: PyObjectRef, start: usize, piece: &[f64]) -> PyObjectRef {
-    let n = piece.len();
+#[inline(never)]
+pub unsafe fn ll_listslice_new_float_list(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _obj = crate::gc_roots::pin_root(obj);
@@ -3818,12 +3912,12 @@ fn ll_listslice_new_float_list(obj: PyObjectRef, start: usize, piece: &[f64]) ->
 /// after that, and `alloc_list_items_block_gc` pins each element before its
 /// own block allocation. The list barrier runs before the owner edge is stored.
 #[majit_macros::dont_look_inside]
-unsafe fn ll_listslice_new_object_list(
+#[inline(never)]
+pub unsafe fn ll_listslice_new_object_list(
     obj: PyObjectRef,
     start: usize,
-    piece: &[PyObjectRef],
+    n: usize,
 ) -> PyObjectRef {
-    let n = piece.len();
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _obj = crate::gc_roots::pin_root(obj);
@@ -3850,31 +3944,16 @@ unsafe fn ll_listslice_new_object_list(
     crate::gc_roots::shadow_stack_get(result_slot)
 }
 
-unsafe fn ll_listslice_ints(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
-    let list = &*(obj as *const W_ListObject);
-    let storage = list.int_items.as_slice();
-    // Names the item kind for array_identity_of_base.
-    let _len = storage.len();
-    let piece = &storage[start..start + n];
-    ll_listslice_new_int_list(obj, start, piece)
+pub unsafe fn ll_listslice_ints(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    ll_listslice_new_int_list(obj, start, n)
 }
 
-unsafe fn ll_listslice_floats(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
-    let list = &*(obj as *const W_ListObject);
-    let storage = list.float_items.as_slice();
-    // Names the item kind for array_identity_of_base.
-    let _len = storage.len();
-    let piece = &storage[start..start + n];
-    ll_listslice_new_float_list(obj, start, piece)
+pub unsafe fn ll_listslice_floats(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    ll_listslice_new_float_list(obj, start, n)
 }
 
-unsafe fn ll_listslice_objects(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
-    let list = &*(obj as *const W_ListObject);
-    let storage = list.object_items_as_slice();
-    // Names the item kind for array_identity_of_base.
-    let _len = storage.len();
-    let piece = &storage[start..start + n];
-    ll_listslice_new_object_list(obj, start, piece)
+pub unsafe fn ll_listslice_objects(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    ll_listslice_new_object_list(obj, start, n)
 }
 
 /// Strategies whose `getitem` boxes (range, bytes, ascii, int-or-float).
