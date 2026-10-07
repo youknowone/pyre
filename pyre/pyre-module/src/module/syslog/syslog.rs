@@ -2,22 +2,21 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-
 /// `lib_pypy/syslog.py` — process-global tracking of whether
 /// `openlog()` has been called so the first `syslog()` can auto-open with
 /// the default libc ident (NULL → program name).
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(feature = "host_env")]
 static SYSLOG_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `lib_pypy/syslog.py _S_ident_o` — keepalive for the `char*` passed
 /// to `c_openlog` until the next `openlog` / `closelog`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(feature = "host_env")]
 static S_IDENT_O: std::sync::Mutex<Option<Box<std::ffi::CStr>>> = std::sync::Mutex::new(None);
 
 /// `_syslog_build.py` includes and `lib_pypy/syslog.py` libc calls:
 /// `includes=['syslog.h']`, `releasegil=False`, no `save_err`.
 /// `c_syslog` is specialized to `syslog(priority, "%s", message)`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(feature = "host_env")]
 mod ll {
     use majit_rlib::rffi::{CCHARP, INT};
 
@@ -59,15 +58,14 @@ mod ll {
 
 /// syslog module — PyPy: lib_pypy/syslog.py.
 ///
-/// openlog / syslog / closelog / setlogmask. Unix + `host_env` +
-/// not-sandbox calls `c_openlog` / `c_syslog` / `c_closelog` /
-/// `c_setlogmask`. Sandbox keeps `rustpython_host_env::syslog`.
+/// openlog / syslog / closelog / setlogmask. `host_env` calls
+/// `c_openlog` / `c_syslog` / `c_closelog` / `c_setlogmask`.
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     pyre_interpreter::module_ns_store(
         ns,
         "openlog",
         pyre_interpreter::make_builtin_function("openlog", |args| {
-            #[cfg(all(unix, feature = "host_env"))]
+            #[cfg(feature = "host_env")]
             {
                 // `args` is the gateway's native copy; a collection in
                 // `str_utf8_w` does not forward it.
@@ -78,8 +76,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 {
                     // openlog(3) keeps a C string, so the ident ends at
                     // the first NUL.
-                    let ident =
-                        pyre_interpreter::baseobjspace::str_utf8_w(_roots.get(args_base))?;
+                    let ident = pyre_interpreter::baseobjspace::str_utf8_w(_roots.get(args_base))?;
                     let ident = ident.split_once('\0').map_or(ident, |(s, _)| s);
                     std::ffi::CString::new(ident)
                         .ok()
@@ -104,24 +101,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 } else {
                     libc::LOG_USER
                 };
-                #[cfg(not(feature = "sandbox"))]
-                {
-                    let mut held = S_IDENT_O.lock().unwrap();
-                    *held = ident;
-                    let ident_ptr = held
-                        .as_ref()
-                        .map(|c| c.as_ptr() as majit_rlib::rffi::CCHARP)
-                        .unwrap_or(std::ptr::null_mut());
-                    unsafe { ll::c_openlog(ident_ptr, logoption, facility) };
-                }
-                #[cfg(feature = "sandbox")]
-                {
-                    rustpython_host_env::syslog::openlog(ident, logoption, facility);
-                }
+                let mut held = S_IDENT_O.lock().unwrap();
+                *held = ident;
+                let ident_ptr = held
+                    .as_ref()
+                    .map(|c| c.as_ptr() as majit_rlib::rffi::CCHARP)
+                    .unwrap_or(std::ptr::null_mut());
+                unsafe { ll::c_openlog(ident_ptr, logoption, facility) };
                 SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(pyre_object::w_none())
             }
-            #[cfg(not(all(unix, feature = "host_env")))]
+            #[cfg(not(feature = "host_env"))]
             {
                 let _ = args;
                 Err(pyre_interpreter::PyError::not_implemented(
@@ -134,7 +124,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         ns,
         "syslog",
         pyre_interpreter::make_builtin_function("syslog", |args| {
-            #[cfg(all(unix, feature = "host_env"))]
+            #[cfg(feature = "host_env")]
             {
                 let (priority, mut w_msg) = if args.len() >= 2 {
                     if !unsafe { pyre_object::is_int(args[0]) } {
@@ -149,7 +139,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 } else if args.len() == 1 {
                     (libc::LOG_INFO, args[0])
                 } else {
-                    return Err(pyre_interpreter::PyError::type_error("syslog() requires a message"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "syslog() requires a message",
+                    ));
                 };
                 if !unsafe { pyre_object::is_str(w_msg) } {
                     return Err(pyre_interpreter::PyError::type_error(
@@ -165,21 +157,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // first syslog() call delivers correctly even when the
                     // caller skipped openlog().
                     if !SYSLOG_OPENED.load(std::sync::atomic::Ordering::Relaxed) {
-                        #[cfg(not(feature = "sandbox"))]
-                        {
-                            let mut held = S_IDENT_O.lock().unwrap();
-                            *held = None;
-                            pyre_object::with_roots!(w_msg => unsafe {
-                                ll::c_openlog(std::ptr::null_mut(), 0, libc::LOG_USER);
-                            });
-                        }
-                        #[cfg(feature = "sandbox")]
-                        {
-                            rustpython_host_env::syslog::openlog(None, 0, libc::LOG_USER);
-                        }
+                        let mut held = S_IDENT_O.lock().unwrap();
+                        *held = None;
+                        pyre_object::with_roots!(w_msg => unsafe {
+                            ll::c_openlog(std::ptr::null_mut(), 0, libc::LOG_USER);
+                        });
                         SYSLOG_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    #[cfg(not(feature = "sandbox"))]
                     pyre_object::with_roots!(w_msg => unsafe {
                         ll::c_syslog(
                             priority,
@@ -187,14 +171,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             cmsg.as_ptr() as majit_rlib::rffi::CCHARP,
                         );
                     });
-                    #[cfg(feature = "sandbox")]
-                    {
-                        rustpython_host_env::syslog::syslog(priority, &cmsg);
-                    }
                 }
                 Ok(pyre_object::w_none())
             }
-            #[cfg(not(all(unix, feature = "host_env")))]
+            #[cfg(not(feature = "host_env"))]
             {
                 let _ = args;
                 Err(pyre_interpreter::PyError::not_implemented(
@@ -209,20 +189,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "closelog",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(feature = "host_env")]
                 {
-                    #[cfg(not(feature = "sandbox"))]
-                    {
-                        if SYSLOG_OPENED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                            unsafe { ll::c_closelog() };
-                        }
-                        *S_IDENT_O.lock().unwrap() = None;
+                    if SYSLOG_OPENED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        unsafe { ll::c_closelog() };
                     }
-                    #[cfg(feature = "sandbox")]
-                    {
-                        rustpython_host_env::syslog::closelog();
-                        SYSLOG_OPENED.store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    *S_IDENT_O.lock().unwrap() = None;
                 }
                 Ok(pyre_object::w_none())
             },
@@ -235,7 +207,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "setlogmask",
             |args| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(feature = "host_env")]
                 {
                     let mask = if let Some(&a) = args.first() {
                         if !unsafe { pyre_object::is_int(a) } {
@@ -245,20 +217,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         }
                         unsafe { pyre_object::w_int_get_value(a) as i32 }
                     } else {
-                        return Err(pyre_interpreter::PyError::type_error("setlogmask() missing argument"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "setlogmask() missing argument",
+                        ));
                     };
-                    #[cfg(not(feature = "sandbox"))]
-                    {
-                        Ok(pyre_object::w_int_new(unsafe { ll::c_setlogmask(mask) } as i64))
-                    }
-                    #[cfg(feature = "sandbox")]
-                    {
-                        Ok(pyre_object::w_int_new(
-                            rustpython_host_env::syslog::setlogmask(mask) as i64,
-                        ))
-                    }
+                    Ok(pyre_object::w_int_new(
+                        unsafe { ll::c_setlogmask(mask) } as i64
+                    ))
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
+                #[cfg(not(feature = "host_env"))]
                 {
                     let _ = args;
                     Err(pyre_interpreter::PyError::not_implemented(
@@ -287,7 +254,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "LOG_CRIT",
             pyre_object::w_int_new(libc::LOG_CRIT as i64),
         );
-        pyre_interpreter::module_ns_store(ns, "LOG_ERR", pyre_object::w_int_new(libc::LOG_ERR as i64));
+        pyre_interpreter::module_ns_store(
+            ns,
+            "LOG_ERR",
+            pyre_object::w_int_new(libc::LOG_ERR as i64),
+        );
         pyre_interpreter::module_ns_store(
             ns,
             "LOG_WARNING",
@@ -308,7 +279,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "LOG_DEBUG",
             pyre_object::w_int_new(libc::LOG_DEBUG as i64),
         );
-        pyre_interpreter::module_ns_store(ns, "LOG_PID", pyre_object::w_int_new(libc::LOG_PID as i64));
+        pyre_interpreter::module_ns_store(
+            ns,
+            "LOG_PID",
+            pyre_object::w_int_new(libc::LOG_PID as i64),
+        );
         pyre_interpreter::module_ns_store(
             ns,
             "LOG_CONS",
@@ -354,7 +329,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "LOG_AUTH",
             pyre_object::w_int_new(libc::LOG_AUTH as i64),
         );
-        pyre_interpreter::module_ns_store(ns, "LOG_LPR", pyre_object::w_int_new(libc::LOG_LPR as i64));
+        pyre_interpreter::module_ns_store(
+            ns,
+            "LOG_LPR",
+            pyre_object::w_int_new(libc::LOG_LPR as i64),
+        );
         pyre_interpreter::module_ns_store(
             ns,
             "LOG_NEWS",
@@ -444,9 +423,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "LOG_MASK",
             |args| {
                 let pri =
-                    pyre_interpreter::baseobjspace::int_w(args.first().copied().ok_or_else(|| {
-                        pyre_interpreter::PyError::type_error("LOG_MASK() missing argument")
-                    })?)?;
+                    pyre_interpreter::baseobjspace::int_w(args.first().copied().ok_or_else(
+                        || pyre_interpreter::PyError::type_error("LOG_MASK() missing argument"),
+                    )?)?;
                 Ok(pyre_object::w_int_new(1i64 << pri))
             },
             1,
@@ -459,9 +438,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "LOG_UPTO",
             |args| {
                 let pri =
-                    pyre_interpreter::baseobjspace::int_w(args.first().copied().ok_or_else(|| {
-                        pyre_interpreter::PyError::type_error("LOG_UPTO() missing argument")
-                    })?)?;
+                    pyre_interpreter::baseobjspace::int_w(args.first().copied().ok_or_else(
+                        || pyre_interpreter::PyError::type_error("LOG_UPTO() missing argument"),
+                    )?)?;
                 Ok(pyre_object::w_int_new((1i64 << (pri + 1)) - 1))
             },
             1,

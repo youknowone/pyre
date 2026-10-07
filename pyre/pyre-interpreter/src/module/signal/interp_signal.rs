@@ -171,7 +171,7 @@ fn itimer_retval(val: &libc::itimerval) -> pyre_object::PyObjectRef {
 }
 
 /// interp_signal.py `SignalMask.__enter__` — `c_sigemptyset` then `c_sigaddset`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn fill_sigset(mut w_signals: PyObjectRef) -> Result<libc::sigset_t, crate::PyError> {
     let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
     let _ = pyre_object::with_roots!(w_signals => unsafe {
@@ -186,7 +186,7 @@ fn fill_sigset(mut w_signals: PyObjectRef) -> Result<libc::sigset_t, crate::PyEr
 }
 
 /// interp_signal.py `_sigset_to_signals`.
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn sigset_to_signals(mask: &mut libc::sigset_t) -> pyre_object::PyObjectRef {
     let mut items = pyre_object::gc_roots::RootedItems::new();
     for s in 1..signalstate::NSIG {
@@ -821,9 +821,9 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 ///
 /// `signal()` / `getsignal()` register real handlers (sigaction +
 /// pending-flag, delivered by `CheckSignalAction`).  `set_wakeup_fd`
-/// records the fd but the handler does not yet write to it.  alarm /
-/// pause / raise_signal / strsignal / valid_signals are backed by
-/// `rustpython_host_env::signal`.  Signal-number constants are sourced
+/// records the fd but the handler does not yet write to it.  Unix
+/// `strsignal` / `valid_signals` / `pthread_sigmask` / `sigpending`
+/// call `rsignal` llexternals.  Signal-number constants are sourced
 /// from `libc::*` so they match the host's POSIX numbering (the previous
 /// macOS-flavoured hard-coded list disagreed with Linux for
 /// SIGUSR1/SIGUSR2/SIGCHLD).
@@ -1117,10 +1117,8 @@ pub fn register_module(
                     // `'Unknown signal: 32'` on pypy.
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
-                    #[cfg(all(unix, not(feature = "sandbox")))]
+                    #[cfg(unix)]
                     let text = majit_rlib::rsignal::strsignal(signum);
-                    #[cfg(all(unix, feature = "sandbox"))]
-                    let text = rustpython_host_env::signal::strsignal(signum);
                     #[cfg(windows)]
                     let text = rustpython_host_env::signal::strsignal(signum);
                     #[cfg(not(any(unix, windows)))]
@@ -1156,7 +1154,7 @@ pub fn register_module(
                     // The bound is `NSIG`, exclusive: `sigfillset` sets the
                     // bit for `NSIG - 1` and one past it too on darwin, so a
                     // wider bound answers with a signal that has no name.
-                    #[cfg(all(unix, not(feature = "sandbox")))]
+                    #[cfg(unix)]
                     {
                         let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
                         let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(&mut mask) };
@@ -1175,7 +1173,7 @@ pub fn register_module(
                         }
                         Ok(sigset_to_signals(&mut mask))
                     }
-                    #[cfg(not(all(unix, not(feature = "sandbox"))))]
+                    #[cfg(windows)]
                     {
                         let sigs = rustpython_host_env::signal::valid_signals(
                             signalstate::NSIG as usize,
@@ -1438,7 +1436,7 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "sigwait",
                 |args| {
-                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                    #[cfg(feature = "host_env")]
                     {
                         if args.is_empty() {
                             return Err(crate::PyError::type_error(
@@ -1453,42 +1451,6 @@ pub fn register_module(
                         let ret = pyre_object::with_roots!(w_sigset => unsafe {
                             majit_rlib::rsignal::c_sigwait(&mut set, &mut signum)
                         });
-                        if ret != 0 {
-                            return Err(errno_exception("OSError", ret));
-                        }
-                        Ok(pyre_object::w_int_new(signum as i64))
-                    }
-                    #[cfg(all(feature = "host_env", feature = "sandbox"))]
-                    {
-                        if args.is_empty() {
-                            return Err(crate::PyError::type_error(
-                                "sigwait() takes exactly one argument (0 given)",
-                            ));
-                        }
-                        let mut set = rustpython_host_env::signal::sigemptyset().map_err(|e| {
-                            crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("sigemptyset: {e}"),
-                            )
-                        })?;
-                        for it in signal_set_items(args[0])? {
-                            let signum = unsafe { pyre_object::w_int_get_value(it) };
-                            check_signum_in_range(signum)?;
-                            let signum = signum as i32;
-                            rustpython_host_env::signal::sigaddset(&mut set, signum).map_err(
-                                |e| {
-                                    crate::PyError::os_error_with_errno(
-                                        e.raw_os_error().unwrap_or(0),
-                                        format!("sigaddset: {e}"),
-                                    )
-                                },
-                            )?;
-                        }
-                        let mut signum: libc::c_int = 0;
-                        let ret = {
-                            let _blocked = crate::module::thread::before_external_block();
-                            unsafe { libc::sigwait(&set, &mut signum) }
-                        };
                         if ret != 0 {
                             return Err(errno_exception("OSError", ret));
                         }
@@ -1512,7 +1474,7 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "sigpending",
                 |_args| {
-                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                    #[cfg(feature = "host_env")]
                     {
                         let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
                         let ret = unsafe { majit_rlib::rsignal::c_sigpending(&mut mask) };
@@ -1523,22 +1485,6 @@ pub fn register_module(
                             ));
                         }
                         Ok(sigset_to_signals(&mut mask))
-                    }
-                    #[cfg(all(feature = "host_env", feature = "sandbox"))]
-                    {
-                        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-                        let ret = unsafe { libc::sigpending(&mut mask) };
-                        if ret != 0 {
-                            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                            return Err(errno_exception("OSError", errno));
-                        }
-                        let mut items = pyre_object::gc_roots::RootedItems::new();
-                        for s in 1..signalstate::NSIG {
-                            if rustpython_host_env::signal::sigset_contains(mask, s) {
-                                items.push(pyre_object::w_int_new(s as i64));
-                            }
-                        }
-                        Ok(pyre_object::w_set_from_items(&items.take()))
                     }
                     #[cfg(not(feature = "host_env"))]
                     Err(crate::PyError::not_implemented(
@@ -1596,12 +1542,7 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "pthread_sigmask",
                 |args| {
-                    #[cfg(feature = "sandbox")]
-                    {
-                        let _ = args;
-                        return Err(crate::host_seam::stub("signal.pthread_sigmask"));
-                    }
-                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                    #[cfg(feature = "host_env")]
                     {
                         if args.len() < 2 {
                             return Err(crate::PyError::type_error(
