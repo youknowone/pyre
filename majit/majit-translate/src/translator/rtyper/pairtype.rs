@@ -527,6 +527,11 @@ fn dispatch_convert_from_to(
             );
             Ok(result.map(Hlvalue::Variable))
         }
+        // A Rust `Vec` header is a raw pointer; `r_uint(vec)` is
+        // `cast_ptr_to_int` of that address (`vec_header_i` / `vec_header_r`).
+        (RustVecRepr, IntegerRepr) => {
+            super::rrustvec::pair_rustvec_integer_convert_from_to(r_from, r_to, v, llops)
+        }
         _ => Ok(None),
     }
 }

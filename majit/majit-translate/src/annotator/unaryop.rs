@@ -828,7 +828,12 @@ fn init_someobject_defaults(
                 // `ptr_method_is_null` bound method so the result types as
                 // `SomeBool`.  Last-resort (after `find_method` + the constant
                 // path), so a real `is_null` member is never shadowed.
-                if attr == "is_null" && matches!(s_self, SomeValue::List(_) | SomeValue::Dict(_)) {
+                if attr == "is_null"
+                    && matches!(
+                        s_self,
+                        SomeValue::List(_) | SomeValue::Dict(_) | SomeValue::RustVec(_)
+                    )
+                {
                     return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
                         "ptr_method_is_null",
                         s_self.clone(),
@@ -1400,6 +1405,18 @@ fn init_somerustvec_overrides(
         SomeValueTag::RustVec,
         Specialization {
             apply: pure(|_ann, _hl| SomeValue::Integer(SomeInteger::new(true, false))),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    register(
+        reg,
+        OpKind::Iter,
+        SomeValueTag::RustVec,
+        Specialization {
+            apply: pure(|ann, hl| {
+                let sv = ann.annotation(&hl.args[0]).expect("rustvec.iter: unbound");
+                SomeValue::Iterator(SomeIterator::new(sv, vec![]))
+            }),
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
@@ -3879,6 +3896,7 @@ pub(crate) fn container_getanyitem(
             }
         }
         SomeValue::List(l) => l.listdef.read_item(position),
+        SomeValue::RustVec(v) => (*v.s_item).clone(),
         SomeValue::Dict(d) => {
             // unaryop.py getanyitem — per-variant dispatch.
             match variant.unwrap_or("keys") {

@@ -283,7 +283,31 @@ thread_local! {
 /// Last-writer-wins on the outer key; re-registering the same qualname
 /// replaces the prior field set.  Matches PyPy where re-assignment
 /// `FORCE_ATTRIBUTES_INTO_CLASSES[cls] = {...}` overwrites.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
+    register_struct_fields_with_layout(qualname, fields, None);
+}
+
+fn someshell_from_primitive_layout(ty: &str) -> Option<SomeValue> {
+    match ty.trim() {
+        "i8" | "i16" | "i32" | "i64" | "isize" => Some(super::model::s_int()),
+        "u8" | "u16" | "u32" | "u64" | "usize" => Some(super::model::s_uint()),
+        "f32" => Some(SomeValue::SingleFloat(super::model::SomeSingleFloat::new())),
+        "f64" => Some(SomeValue::Float(super::model::SomeFloat::new())),
+        "bool" => Some(super::model::s_bool()),
+        _ => None,
+    }
+}
+
+/// Seed FORCE from `fields`, skipping a row whose declared layout is a
+/// one-word `Vec` header. Layout keeps `ValueType::Int` (the header
+/// address); the annotator projects `SomeRustVec` from the `*mut Vec<…>`
+/// spelling. Seeding Integer made `len` of that field `'int' has no length`.
+pub(crate) fn register_struct_fields_with_layout(
+    qualname: &str,
+    fields: &[(String, crate::model::ValueType)],
+    layout: Option<&[(String, String)]>,
+) {
     STRUCT_FORCE_KEYS.with(|cell| {
         cell.borrow_mut().insert(qualname.to_string());
     });
@@ -291,7 +315,23 @@ pub(crate) fn register_struct_fields(qualname: &str, fields: &[(String, crate::m
         let mut table = cell.borrow_mut();
         let entry = table.entry(qualname.to_string()).or_default();
         entry.clear();
+        let word = crate::layout::target_word_size();
         for (name, vt) in fields {
+            if let Some(rows) = layout
+                && let Some((_, ty)) = rows.iter().find(|(n, _)| n == name)
+            {
+                if majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, word).is_some() {
+                    continue;
+                }
+                // Instantiated layout spelling (`i64`, `f64`) is the
+                // field's type, not the generic `ValueType` of `T`.
+                // Seeding Unsigned from the type parameter made
+                // `Option<i64>::Some.__pos_0` disagree with the annotator.
+                if let Some(s_value) = someshell_from_primitive_layout(ty) {
+                    entry.insert(name.clone(), s_value);
+                    continue;
+                }
+            }
             let Some(s_value) = crate::codewriter::annotation_state::valuetype_to_someshell(vt)
             else {
                 continue;
@@ -3320,6 +3360,28 @@ mod tests {
     fn attribute_init_rejects_dunder_class() {
         let result = std::panic::catch_unwind(|| Attribute::new("__class__"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn instantiated_i64_layout_seeds_signed_not_generic_unsigned() {
+        register_struct_fields_with_layout(
+            "Option<i64>::Some",
+            &[("__pos_0".into(), crate::model::ValueType::Unsigned)],
+            Some(&[("__pos_0".into(), "i64".into())]),
+        );
+        FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+            let table = cell.borrow();
+            let entry = table
+                .get("Option<i64>::Some")
+                .expect("FORCE row for Option<i64>::Some");
+            match entry.get("__pos_0") {
+                Some(SomeValue::Integer(i)) => assert!(
+                    !i.unsigned,
+                    "instantiated i64 must seed Signed, got unsigned"
+                ),
+                other => panic!("expected Signed Integer, got {other:?}"),
+            }
+        });
     }
 
     #[test]

@@ -2677,7 +2677,21 @@ fn published_struct_field_layout(
     } else if is_tuple_object && field_name == "wrappeditems" {
         "[*mut PyObject]".to_string()
     } else {
-        tyref_to_field_layout_string(field_ty, llbc)
+        annotation_struct_field_type(field_ty, llbc)
+    }
+}
+
+/// Type string `Bookkeeper::project_struct_field_type` consumes for a
+/// declared field. A `Vec` of one-word items is a canonical header-pointer
+/// spelling `project_rust_vec` accepts; [`tyref_to_field_layout_string`]
+/// writes `isize`, which annotates as `SomeInteger` and then `len` of the
+/// field raises `'int' has no length`.
+fn annotation_struct_field_type(ty: &TyRef, llbc: &Llbc) -> String {
+    match tyref_rust_vec_item_kind(ty, llbc) {
+        Some(majit_ir::rvec::VecItemKind::Int) => "*mut Vec<usize>".to_string(),
+        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
+        Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
+        None => tyref_to_field_layout_string(ty, llbc),
     }
 }
 
@@ -2795,6 +2809,21 @@ fn derive_program_metadata(
                 // so downstream lookups (`canonical_call_target`'s
                 // bare-leaf fallback) resolve either spelling.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                // A transparent GC handle's sole payload is a pointer to
+                // `Deref::Target` (`PyError.0` is `*mut PyErrorObject`).
+                // The declared field type is `PyObjectRef` (`*mut PyObject`);
+                // projecting that class has no common annotator base with
+                // the handle, which subclasses the object class.
+                let owner_ty = type_decl_adt_tyref(td.def_id);
+                let handle_payload =
+                    transparent_handle_field_spelling(&owner_ty, llbc, no_tombstoned_leaves());
+                let handle_field_index = handle_payload
+                    .as_ref()
+                    .and_then(|_| transparent_nonzst_field(td, llbc).map(|(i, _)| i));
+                let handle_attr = handle_payload.as_ref().and_then(|_| {
+                    transparent_deref_target_class(&owner_ty, llbc, no_tombstoned_leaves())
+                        .map(|root| ValueType::Ref(Some(root)))
+                });
                 // A pair-slice field is its pointer word under the field's
                 // own name and its length word under `pair_len_field_name`.
                 let rows: Vec<(String, String)> = fields
@@ -2806,11 +2835,16 @@ fn derive_program_metadata(
                             let len = pair_len_field_name(&fname);
                             return vec![(fname, "usize".to_string()), (len, "usize".to_string())];
                         }
+                        let layout = match (handle_field_index == Some(i), handle_payload.as_ref())
+                        {
+                            (true, Some(spelling)) => spelling.clone(),
+                            _ => published_struct_field_layout(&name, &fname, &f.ty, llbc),
+                        };
                         let field_ty =
                             crate::virtualizable_decl::overlay_virtualizable_llfield_layout(
                                 &strip_crate_prefix(&name),
                                 &fname,
-                                published_struct_field_layout(&name, &fname, &f.ty, llbc),
+                                layout,
                             );
                         vec![(fname, field_ty)]
                     })
@@ -2903,12 +2937,19 @@ fn derive_program_metadata(
                             let len = pair_len_field_name(&fname);
                             return vec![(fname, ValueType::Unsigned), (len, ValueType::Unsigned)];
                         }
+                        let attr_ty = if handle_field_index == Some(i) {
+                            handle_attr.clone().unwrap_or_else(|| {
+                                tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc)
+                            })
+                        } else {
+                            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc)
+                        };
                         vec![(
                             fname.clone(),
                             crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                 &canonical_name,
                                 &fname,
-                                tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
+                                attr_ty,
                             ),
                         )]
                     })
@@ -3243,7 +3284,7 @@ fn derive_program_metadata(
                                 )
                             } else {
                                 (
-                                    tyref_to_field_layout_string(&f.ty, llbc),
+                                    annotation_struct_field_type(&f.ty, llbc),
                                     tyref_to_attr_value_type(&f.ty, llbc),
                                 )
                             };
@@ -10747,6 +10788,15 @@ impl<'a> Lowering<'a> {
                             // SomeInstance class on every assignment (and a
                             // nullable pointer merely sets `can_be_None`).
                             value = self.narrow_typed_ref_field_value(bb_id, value, Some(dest_ty));
+                            // `PyError.0 = pin_root(...)`: the declared field
+                            // is `PyObjectRef`, the class row is the inner
+                            // object (`*mut PyErrorObject`). Reads of
+                            // `self.0` already recast through
+                            // `cast_off_error_carrier`; the store must land
+                            // on that same inner class, or setattr unions
+                            // `PyObject ∪ PyErrorObject`.
+                            value =
+                                self.recast_error_carrier_field_store(bb_id, &field_base_ty, value);
                             let ty =
                                 crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                     &owner_root,
@@ -12508,6 +12558,23 @@ impl<'a> Lowering<'a> {
         self.resolve_operand(mir_bb, op)
     }
 
+    /// Store into an error-carrier field (`self.0` on `PyError`) as the
+    /// inner object class, matching [`Self::cast_off_error_carrier`].
+    fn recast_error_carrier_field_store(
+        &mut self,
+        bb_id: BlockId,
+        field_base_ty: &TyRef,
+        value: LinkArg,
+    ) -> LinkArg {
+        if !self.ty_is_error_carrier(field_base_ty) {
+            return value;
+        }
+        let Some(inner) = self.error_carrier_inner_class_root(field_base_ty) else {
+            return value;
+        };
+        self.narrow_value_to_instance_root(bb_id, value, &inner)
+    }
+
     /// Whether `ty` is the configured exception carrier (`PyError`).
     fn ty_is_error_carrier(&self, ty: &TyRef) -> bool {
         let spec = self.static_addrs.error_carrier.carrier_path;
@@ -12527,34 +12594,25 @@ impl<'a> Lowering<'a> {
         tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
     }
 
-    /// Class root of the carrier's single pointer field (`PyObjectRef`).
+    /// Class root of the carrier's payload: `Deref::Target` (`PyErrorObject`).
+    /// The declared field is `PyObjectRef` (`*mut PyObject`); projecting that
+    /// class has no common annotator base with the handle, which subclasses
+    /// the object class (`rclass.py` MRO through `OperationError`).
     fn error_carrier_inner_class_root(&self, ty: &TyRef) -> Option<String> {
         if !self.ty_is_error_carrier(ty) {
             return None;
         }
-        let node = strip_ty_wrappers(tyref_node(ty, self.llbc)?, self.llbc)?;
-        let decl = self.llbc.type_by_id(adt_node_def_id(node)?)?;
-        let (index, _) = transparent_nonzst_field(decl, self.llbc)?;
-        let TypeDeclKind::Struct(fields) = &decl.kind else {
-            return None;
-        };
-        let field = fields.get(index)?;
-        tyref_class_root_with(&field.ty, self.llbc, self.tombstoned_leaves)
+        transparent_deref_target_class(ty, self.llbc, self.tombstoned_leaves)
     }
 
     /// `PyError(ptr)` is one pointer word. The class is the handle's
-    /// `Deref::Target` (`OperationError` carries `w_type` and `_w_value`),
-    /// so the word is not merged with `PyObject`. A configured carrier the
-    /// structural rule does not classify still uses its own leaf.
+    /// own leaf (`error::PyError`), a subclass of `Deref::Target`.
     fn retag_error_carrier(
         &mut self,
         wrapper_ty: &TyRef,
         value: Variable,
     ) -> (Option<OpKind>, Variable) {
-        let Some(root) =
-            transparent_deref_target_class(wrapper_ty, self.llbc, self.tombstoned_leaves)
-                .or_else(|| self.error_carrier_class_root(wrapper_ty))
-        else {
+        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
             return (None, value);
         };
         let res = self
@@ -20206,6 +20264,17 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
+        // `core::panicking::*` / `std::panicking::*` (`assert_failed`,
+        // `panic`, `panic_fmt`, …) is a Rust abort. Upstream that is
+        // `ll_assert` / `fatalerror`: the same implicit AssertionError
+        // raise `TermKind::Abort` already closes a block with. Do not
+        // register a stub body for the panicking helper.
+        if let CallFunc::Regular(reg) = &call.func
+            && regular_call_is_panicking_abort(reg, self.llbc)
+        {
+            self.graph.set_raise_implicit(bb_id, "AssertionError");
+            return Ok(());
+        }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
         // `base()`, `shadow_stack_len` and the read-back leave the jitcode
         // here, before any operand is resolved -- the guard and its borrow
@@ -22680,6 +22749,54 @@ impl<'a> Lowering<'a> {
                         .and_then(|local| self.atomic_ordering_locals.get(&local))
                         .map(String::as_str);
                     if ordering == Some("Relaxed") {
+                        // A borrow recorded on `atomic_ref_place` already
+                        // aliases the scalar field (`STR.hash` is Signed).
+                        // `from_ptr` identity leaves the field *address*;
+                        // loading that word is `raw_load`, not aliasing the
+                        // pointer (Unsigned) onto the Signed memo.
+                        let referent = arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .and_then(|local| self.atomic_ref_place.get(&local))
+                            .map(clone_place);
+                        if let Some(referent) = referent {
+                            let value = self.resolve_place(mir_bb, referent)?;
+                            self.local_var[dest_local] = Some(LocalValue::One(value));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                        if let Some((item_ty, itemsize, is_item_signed)) =
+                            self.raw_word_descr(&call.dest.ty)
+                        {
+                            let offset = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(offset.clone()),
+                                kind: OpKind::ConstInt(0),
+                            });
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(res.clone()),
+                                kind: OpKind::RawLoad {
+                                    base: args[0].clone(),
+                                    offset,
+                                    item_ty,
+                                    itemsize,
+                                    is_item_signed,
+                                },
+                            });
+                            self.local_var[dest_local] = Some(LocalValue::One(res));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -31229,16 +31346,6 @@ impl<'a> Lowering<'a> {
             .get(0)?,
             self.llbc,
         )?;
-        // `Option<PyError>` carries the handle by value. Its class is the
-        // `Deref::Target`, the same root [`enum_payload_instance_class_root`]
-        // paints on `Result::Err`.
-        if let Some(root) = transparent_deref_target_class(
-            &TyRef::Other(payload.clone()),
-            self.llbc,
-            self.tombstoned_leaves,
-        ) {
-            return Some(root);
-        }
         if let Some(root) =
             raw_ptr_pointee_class_root_with(payload, self.llbc, self.tombstoned_leaves)
         {
@@ -38066,6 +38173,16 @@ fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
     llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
 }
 
+/// `core::panicking::*` / `std::panicking::*` — a Rust abort, lowered
+/// as `RaiseImplicit(AssertionError)` the way `TermKind::Abort` is.
+fn regular_call_is_panicking_abort(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let Some(path) = regular_call_name_path(reg, llbc) else {
+        return false;
+    };
+    let mut segs = path.split("::");
+    matches!(segs.next(), Some("core") | Some("std")) && segs.next() == Some("panicking")
+}
+
 /// `Result::branch` behind `?`. Charon records the impl method
 /// `core::result::<Impl>::branch`. A trait `Try::branch` is the same
 /// operator. `Result::expect` is a different leaf and stays out.
@@ -44446,37 +44563,17 @@ fn fundecl_module(fd: &FunDecl) -> Option<String> {
 
 /// Class a `repr(transparent)` GC handle's methods are registered on.
 ///
-/// `tyref_class_root_with` paints the handle as
-/// [`transparent_deref_target_class`]. `seed_struct_root_method_members`
-/// installs the method on this owner, and `MethodDesc.func_args` prepends
-/// that class (`description.py`), discarding the receiver variable's
-/// annotation. The subject seed binds the same `class_root`. Registering
-/// the method on the wrapper makes `mergeinputargs` union the wrapper
-/// with its `Deref::Target`.
-///
-/// Only a `self` receiver moves. An associated function
-/// (`PyError::from_exc_object`, `PyError::type_error`) stays on the
-/// wrapper path `catch_and_rewrap` looks up. The caller applies
-/// `impl_atomic_alias_leaf` first, so `Atomic<T>` is not retargeted.
-/// The ADT-id check stays on the wrapper: the signature input is still
-/// that type.
+/// The handle intern's as a subclass of `Deref::Target` and keeps its own
+/// fields, so methods stay on the wrapper (`error::PyError`). Painting the
+/// target made getattr of `.0` / a `MutRef<Handle>.value` resolve on the
+/// payload.
 fn gc_handle_method_class_root(
-    llbc: &Llbc,
-    fd: &FunDecl,
-    adt_def_id: u64,
-    tombstoned: &std::collections::HashSet<String>,
+    _llbc: &Llbc,
+    _fd: &FunDecl,
+    _adt_def_id: u64,
+    _tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if !first_input_is_adt_free(llbc, fd, adt_def_id) {
-        return None;
-    }
-    // `W_Range::allocate(payload: Self)` presents the owner as its first
-    // input under the source name. Only `self` (or an unnamed monomorphised
-    // receiver) is the method `func_args` rewrites.
-    if fd.first_arg_local_name().is_some_and(|name| name != "self") {
-        return None;
-    }
-    let first = fd.signature.inputs.first()?;
-    transparent_deref_target_class(first, llbc, tombstoned)
+    None
 }
 
 fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, String)> {
@@ -49893,11 +49990,15 @@ fn tyref_to_value_type_with(
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
     }
-    // A `repr(transparent)` GC handle whose `Deref::Target` is a struct
-    // is that struct's class. `OperationError` (`pypy/interpreter/error.py`)
-    // carries `w_type` and `_w_value`; it is not a `W_Root`. A wrapper
-    // with no such impl keeps the transparent peel below.
-    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+    // A `repr(transparent)` GC handle keeps the wrapper's class. The
+    // handle intern's as a subclass of `Deref::Target` (`error::PyError`
+    // under `error::PyErrorObject`); painting the target made getattr of
+    // the handle's `.0` / a `MutRef<Handle>.value` resolve on the payload.
+    if transparent_deref_target_class(ty, llbc, tombstoned).is_some()
+        && let Some(root) = tyref_node(ty, llbc)
+            .and_then(|node| strip_ty_wrappers(node, llbc))
+            .and_then(|node| adt_node_class_root_leaf(node, llbc, tombstoned))
+    {
         return ValueType::Ref(Some(root));
     }
     // A transparent one-field struct has the same low-level value shape as
@@ -50829,9 +50930,11 @@ fn tyref_to_attr_value_type_with(
     }
     // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
     // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
-    // `int`). Leaving the field `Ref` seeds a classdef-less instance and
-    // a later `ll_vec_length` / `gcarray_from_pyobject_vec` call passes
-    // that ref for an `Int` parameter.
+    // `int`). Layout and the register bank keep that Int. FORCE does not
+    // seed the field (`register_struct_fields` skips a Vec layout row) so
+    // `project_struct_rows` installs `SomeRustVec` from the `*mut Vec<…>`
+    // annotation spelling. An Integer FORCE made `len` of the field
+    // `'int' has no length`.
     if tyref_rust_vec_item_kind(ty, llbc).is_some() {
         return ValueType::Int;
     }
@@ -50953,13 +51056,6 @@ fn tyref_class_root_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    // `OperationError` (`pypy/interpreter/error.py`) carries `w_type` and
-    // `_w_value`. A transparent GC handle is that `Deref::Target`'s class,
-    // not the wrapper's leaf. A bare ADT node takes the same path in
-    // [`adt_node_class_root_with`].
-    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
-        return Some(root);
-    }
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
@@ -51678,6 +51774,12 @@ fn transparent_deref_target_class(
     class
 }
 
+/// `TyRef` of a named ADT declaration, for Deref-target / handle-field
+/// lookups that already have the `TypeDecl` in hand.
+fn type_decl_adt_tyref(def_id: u64) -> TyRef {
+    TyRef::Other(serde_json::json!({"Adt": {"id": def_id, "generics": {"types": []}}}))
+}
+
 /// Field-row spelling of a transparent GC handle, or of a raw pointer to one.
 ///
 /// `project_struct_field_type` turns the row into the payload class, and
@@ -52142,24 +52244,14 @@ pub(crate) fn type_decl_ref_builtin(tref: &serde_json::Value) -> Option<&str> {
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
 /// type node, or `None` for non-ADTs and generic instantiations.
 ///
-/// A `repr(transparent)` GC handle answers with its `Deref::Target`
-/// class (`OperationError` carries `w_type` and `_w_value`). The leaf
-/// below is what a non-handle ADT paints, and what the target itself
-/// resolves to.
+/// A `repr(transparent)` GC handle keeps the wrapper leaf. The handle
+/// intern's as a subclass of `Deref::Target`, so getattr of the handle's
+/// own fields (`error::PyError`.0) resolves on the wrapper.
 fn adt_node_class_root_with(
     node: &serde_json::Value,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if let Some(def_id) = adt_node_def_id(node)
-        && llbc
-            .type_by_id(def_id)
-            .is_some_and(TypeDecl::is_repr_transparent)
-        && let Some(root) =
-            transparent_deref_target_class(&TyRef::Other(node.clone()), llbc, tombstoned)
-    {
-        return Some(root);
-    }
     adt_node_class_root_leaf(node, llbc, tombstoned)
 }
 
@@ -55133,13 +55225,6 @@ fn enum_payload_instance_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    // The payload class and the value's class are one root. A transparent
-    // GC handle stored here is its `Deref::Target`, matching
-    // [`tyref_class_root_with`]. A pointer payload still goes through
-    // [`adt_node_class_root_with`] below.
-    if let Some(root) = transparent_deref_target_class(payload, llbc, tombstoned) {
-        return Some(root);
-    }
     let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
     if let Some(root) = raw_ptr_pointee_class_root_with(payload, llbc, tombstoned) {
         return Some(root);
@@ -73482,9 +73567,11 @@ mod tests {
         )
     }
 
-    /// `Deref::Target` of a transparent GC-ref wrapper is that struct's class.
+    /// A transparent GC-ref wrapper keeps its own class. The handle intern's
+    /// as a subclass of `Deref::Target`; the payload row stays a pointer to
+    /// that target.
     #[test]
-    fn transparent_gc_handle_class_follows_deref_target() {
+    fn transparent_gc_handle_keeps_the_wrapper_class() {
         let decls = pointer_handle_decls();
         let blanket = serde_json::json!({
             "impl_trait": {
@@ -73503,10 +73590,10 @@ mod tests {
         );
         assert_eq!(
             super::tyref_to_value_type(&ty, &llbc),
-            ValueType::Ref(Some("PyErrorObject".into()))
+            ValueType::Ref(Some("PyError".into()))
         );
-        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
-        // The payload row is one pointer to that class. A bare
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+        // The payload row is one pointer to the Deref target. A bare
         // `PyErrorObject` would be laid out as the whole object.
         assert_eq!(
             super::tyref_to_field_layout_string(&ty, &llbc),
@@ -73518,7 +73605,7 @@ mod tests {
         .expect("pointer TyRef parses");
         assert_eq!(
             super::enum_payload_instance_class_root(&ptr, &llbc, no_tombstoned_leaves()).as_deref(),
-            Some("PyErrorObject")
+            Some("PyError")
         );
         assert_eq!(
             super::tyref_to_field_layout_string(&ptr, &llbc),
@@ -73530,7 +73617,7 @@ mod tests {
             serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(25, 2)]),
             3,
         );
-        assert_eq!(same_class, ValueType::Ref(Some("PyErrorObject".into())));
+        assert_eq!(same_class, ValueType::Ref(Some("PyError".into())));
 
         let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
@@ -73646,9 +73733,9 @@ mod tests {
         let (llbc, ty) = load_handle(copies, serde_json::json!([copy_impl]), 7);
         assert_eq!(
             super::tyref_to_value_type(&ty, &llbc),
-            ValueType::Ref(Some("PyErrorObject".into()))
+            ValueType::Ref(Some("Handle".into()))
         );
-        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        assert_handle_class(&llbc, &ty, Some("Handle"));
     }
 
     fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {
@@ -73709,11 +73796,10 @@ mod tests {
         (llbc, ty)
     }
 
-    /// An external `repr(transparent)` handle is `Opaque`. The `Deref`
-    /// impl and the pointer-sized layout are what the defining crate's
-    /// field recorded.
+    /// An external `repr(transparent)` handle is `Opaque`. The wrapper
+    /// keeps its own class; the payload row is a pointer to `Deref::Target`.
     #[test]
-    fn opaque_transparent_gc_handle_follows_deref_target() {
+    fn opaque_transparent_gc_handle_keeps_the_wrapper_class() {
         let mut decls = pointer_handle_decls();
         decls[2] = (
             3,
@@ -73727,9 +73813,9 @@ mod tests {
         );
         assert_eq!(
             super::tyref_to_value_type(&ty, &llbc),
-            ValueType::Ref(Some("PyErrorObject".into()))
+            ValueType::Ref(Some("PyError".into()))
         );
-        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
         assert_eq!(
             super::tyref_to_field_layout_string(&ty, &llbc),
             "*mut PyErrorObject"
@@ -73754,9 +73840,9 @@ mod tests {
         );
         assert_eq!(
             super::tyref_to_value_type(&ty, &llbc),
-            ValueType::Ref(Some("PyErrorObject".into()))
+            ValueType::Ref(Some("PyError".into()))
         );
-        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
 
         // No extraction target: the width is unknown, so the opaque
         // view does not guess a class.

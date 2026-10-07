@@ -215,6 +215,11 @@ pub struct Bookkeeper {
     /// the same rather than building a fresh ListDef per call outside
     /// a reflow frame.
     pub(crate) listdefs: RefCell<HashMap<Option<PositionKey>, ListDef>>,
+    /// Interned `ListDef` per projected item-type spelling.
+    /// `project_struct_field_type` used to mint a fresh ListDef per
+    /// Vec/array site; `listdef.agree` / `ListItem.merge` then could not
+    /// unify them under `contains()`'s `SideEffectFreeGuard`.
+    pub(crate) type_listdefs: RefCell<HashMap<String, ListDef>>,
     /// RPython `self.dictdefs = {}` (bookkeeper.py). Same
     /// `Option<PositionKey>` key semantics as `listdefs`.
     pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
@@ -570,6 +575,7 @@ impl Bookkeeper {
             policy,
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
+            type_listdefs: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
             descs: RefCell::new(IndexMap::new()),
             classdefs: RefCell::new(Vec::new()),
@@ -673,7 +679,7 @@ impl Bookkeeper {
                 .expect("HOST_ENV missing builtin Exception");
             return vec![exception];
         }
-        if self.exception_carrier_handle.borrow().as_deref() == Some(key)
+        if self.exception_carrier_handle_key(key)
             && let Some(object_key) = self.exception_carrier.borrow().clone()
             && let Some(host) = self.struct_root_classes.borrow().get(&object_key)
         {
@@ -1335,6 +1341,22 @@ impl Bookkeeper {
         spec: &crate::annotator::signature::AnnotationSpec,
     ) -> Result<SomeValue, crate::annotator::signature::SignatureError> {
         crate::annotator::signature::annotationoftype(spec, Some(self))
+    }
+
+    fn intern_projected_listdef(self: &Rc<Self>, item_ty: &str, s_inner: SomeValue) -> ListDef {
+        let key = list_item_type_key(item_ty);
+        {
+            let cache = self.type_listdefs.borrow();
+            if let Some(existing) = cache.get(&key) {
+                let existing = existing.clone();
+                drop(cache);
+                let _ = existing.generalize(&s_inner);
+                return existing;
+            }
+        }
+        let new_ld = ListDef::new(Some(self.clone()), s_inner, false, false);
+        self.type_listdefs.borrow_mut().insert(key, new_ld.clone());
+        new_ld
     }
 
     /// RPython `Bookkeeper.getlistdef(**flags_if_new)` (bookkeeper.py).
@@ -2367,22 +2389,26 @@ impl Bookkeeper {
             }
         };
         let mut fields: Vec<(String, String)> = {
-            let guard = self.struct_fields.borrow();
-            match guard.as_ref().and_then(|r| {
-                if majit_ir::descr::is_shaped_tuple_name(n)
-                    || majit_ir::descr::is_shaped_array_name(n)
-                {
-                    r.fields.get(n).cloned()
-                } else {
-                    r.fields.get(n).cloned().or_else(|| {
-                        r.fields
-                            .get(majit_ir::descr::strip_generic_args(n).as_ref())
-                            .cloned()
-                    })
+            if let Some(rows) = crate::front::mir::mut_ref_shape_rows(n) {
+                rows.clone()
+            } else {
+                let guard = self.struct_fields.borrow();
+                match guard.as_ref().and_then(|r| {
+                    if majit_ir::descr::is_shaped_tuple_name(n)
+                        || majit_ir::descr::is_shaped_array_name(n)
+                    {
+                        r.fields.get(n).cloned()
+                    } else {
+                        r.fields.get(n).cloned().or_else(|| {
+                            r.fields
+                                .get(majit_ir::descr::strip_generic_args(n).as_ref())
+                                .cloned()
+                        })
+                    }
+                }) {
+                    Some(f) => f,
+                    None => return Ok(()),
                 }
-            }) {
-                Some(f) => f,
-                None => return Ok(()),
             }
         };
         if majit_ir::descr::is_shaped_tuple_name(n) || majit_ir::descr::is_shaped_array_name(n) {
@@ -3005,8 +3031,7 @@ impl Bookkeeper {
         for list_wrapper in ["Vec<", "VecDeque<"] {
             if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
                 let s_inner = self.project_struct_field_type(inner);
-                let listdef =
-                    super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
+                let listdef = self.intern_projected_listdef(inner, s_inner);
                 return SomeValue::List(super::model::SomeList::new(listdef));
             }
         }
@@ -3016,7 +3041,7 @@ impl Bookkeeper {
                 None => rest.trim(),
             };
             let s_inner = self.project_struct_field_type(inner);
-            let listdef = super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
+            let listdef = self.intern_projected_listdef(inner, s_inner);
             return SomeValue::List(super::model::SomeList::new(listdef));
         }
         if let Some(inner) = strip_generic_one(stripped, "Option<") {
@@ -4314,6 +4339,19 @@ pub(crate) fn raw_fn_ptr_somevalue() -> SomeValue {
 fn is_fn_type_spelling(t: &str) -> bool {
     let t = t.trim();
     t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
+}
+
+fn list_item_type_key(item_ty: &str) -> String {
+    let mut t = item_ty.trim();
+    if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
+        return "pyobject::PyObject".to_string();
+    }
+    t = t
+        .trim_start_matches("*mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches('&')
+        .trim_start_matches("mut ");
+    t.trim().to_string()
 }
 
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
@@ -6339,6 +6377,49 @@ mod tests {
                 Some(SomeValue::Integer(_))
             ),
             "tail scalar leaf projects to SomeInteger"
+        );
+    }
+
+    #[test]
+    fn a_raw_vec_pointer_field_projects_to_somerustvec() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "W_TypeObject".to_string(),
+            vec![(
+                "weak_subclasses".to_string(),
+                "*mut Vec<*mut Weakref>".to_string(),
+            )],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("W_TypeObject")
+            .expect("W_TypeObject registers");
+        let attr = cd
+            .borrow()
+            .attrs
+            .get("weak_subclasses")
+            .expect("weak_subclasses attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(attr, SomeValue::RustVec(_)),
+            "a *mut Vec of one-word items is SomeRustVec, got {attr:?}"
+        );
+    }
+
+    #[test]
+    fn same_item_vecdeque_and_array_share_one_listdef() {
+        let bk = bk();
+        let a = bk.project_struct_field_type("VecDeque<PyObjectRef>");
+        let b = bk.project_struct_field_type("[pyobject::PyObject]");
+        let (SomeValue::List(la), SomeValue::List(lb)) = (a, b) else {
+            panic!("expected two SomeList");
+        };
+        assert!(
+            la.listdef.same_as(&lb.listdef),
+            "same item type must intern one ListDef"
         );
     }
 
