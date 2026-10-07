@@ -48932,6 +48932,58 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     })
 }
 
+/// Residual stubs for inherent methods keyed the Type-split way
+/// `unspecialized_fun_segments` spells a `FunctionPath` callsite.
+///
+/// `Lowering::impl_method_owner` declines `CallTarget::Method` when the
+/// owner TypeDecl is opaque in the *caller's* LLBC (a dependency artefact
+/// has no ClassDef) or is raw storage.  The callsite then looks up
+/// `executioncontext::ExecutionContext::leave`.  A safe method is not
+/// harvested by [`collect_unsafe_fn_stubs_from_llbc`]; if its body also
+/// failed to lower (`leave`'s Result-shell rewrite declines),
+/// `function_graphs` holds no key.  The defining crate still sees a
+/// full TypeDecl with GC fields, so a raw-storage-only harvest misses
+/// it.  Same `register_external` analog as
+/// [`collect_marked_class_ctor_stubs_from_llbc`]: signature-only stub,
+/// non-overwriting so a lowered graph keeps the key.
+/// `executioncontext.py leave` has no `@jit.dont_look_inside`.
+pub fn collect_raw_storage_impl_method_stubs_from_llbc(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    Option<String>,
+)> {
+    collect_fn_stubs_from_llbc_if(llbc, gc_struct_ids, error_carrier, |fd| {
+        fundecl_is_inherent_impl_method(fd)
+    })
+}
+
+/// True when `fd` is an inherent-impl item (`Impl` payload has `Ty`,
+/// not `Trait`).  The Type-split stub key is `[qualified_owner, leaf]`.
+fn fundecl_is_inherent_impl_method(fd: &FunDecl) -> bool {
+    let segs = &fd.item_meta.name;
+    let Some(last_idx) = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))
+    else {
+        return false;
+    };
+    if last_idx == 0 {
+        return false;
+    }
+    match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v
+            .as_object()
+            .and_then(|o| o.get("Impl"))
+            .and_then(|p| p.get("Ty"))
+            .is_some(),
+        _ => false,
+    }
+}
+
 /// Collect signature-only residual stubs for every local function whose
 /// markers make it opaque to the JIT policy ([`hints_reject_body`]:
 /// `#[dont_look_inside]` and `#[elidable]` alike), including functions which
@@ -52475,22 +52527,31 @@ fn collect_fn_stubs_from_llbc_if(
         {
             continue;
         }
-        // Both free functions and impl-owned functions are collected,
-        // keyed on `name_path()` — the segment vector
-        // `call_target_segments` emits for a `CallKind::Fun(Regular)`
-        // in this file.  An impl method usually lowers to
-        // `CallTarget::Method` (resolved via the receiver classdef), but a
-        // receiver-less associated function (`Owner::new() -> ()/bool`) and
-        // any impl method reached through an `FnDef` constant fall back to
-        // `CallTarget::FunctionPath { name_path }`,
-        // whose lookup is served only by this registry — skipping impl
-        // owners would leave those call sites "not registered".
-        let segments: Vec<String> = fd
+        // Both free functions and impl-owned functions are collected.
+        // `name_path()` is the `CallKind::Fun(Regular)` spelling.  When
+        // `Lowering::impl_method_owner` declines `CallTarget::Method`
+        // (raw-storage ADT, associated fn, field-name collision),
+        // `unspecialized_fun_segments` emits the Type-split
+        // `impl_method_owner_for_fundecl` path instead
+        // (`executioncontext::ExecutionContext::leave`).  Three-plus-
+        // segment keys cannot leaf-match, so a stub keyed only on
+        // `name_path` (`…::<Impl>::leave`) misses that callsite —
+        // `register_external` analog of the unlowered body.  Emit both.
+        let name_path: Vec<String> = fd
             .item_meta
             .name_path()
             .split("::")
             .map(String::from)
             .collect();
+        let mut keys = vec![name_path];
+        if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+            let mut type_split: Vec<String> =
+                owner_qualified.split("::").map(String::from).collect();
+            type_split.push(leaf);
+            if keys.iter().all(|k| k != &type_split) {
+                keys.push(type_split);
+            }
+        }
         // Prefer the Charon body's declared parameter names
         // (`locals[1..=argc]`, the same source the regular lowering reads
         // at `local.name`); fall back to positional `arg{N}` when the body
@@ -52504,7 +52565,13 @@ fn collect_fn_stubs_from_llbc_if(
                     .unwrap_or_else(|| format!("arg{i}"))
             })
             .collect();
-        out.push((segments, Signature::new(argnames, None, None), token));
+        for segments in keys {
+            out.push((
+                segments,
+                Signature::new(argnames.clone(), None, None),
+                token.clone(),
+            ));
+        }
     }
     out
 }
@@ -59186,6 +59253,13 @@ fn option_shared_ref_return_is_one_word(
 fn ref_return_is_single_word(ast: &str) -> bool {
     let ast = ast.trim();
     if ast.starts_with("*mut ") || ast.starts_with("*const ") {
+        return true;
+    }
+    // `PyObjectRef` is the GC pointer word (`GCREF`); `Option<PyObjectRef>`
+    // below is the same word with a null niche.  `Result<PyObjectRef,PyError>`
+    // projects to this payload (`dont_look_inside_return_token`), and a
+    // residual stub of `leave` / `return_trace` needs that one-word shell.
+    if ast == "PyObjectRef" {
         return true;
     }
     // `Option<*mut T>` / `Option<PyObjectRef>` is the null niche: one

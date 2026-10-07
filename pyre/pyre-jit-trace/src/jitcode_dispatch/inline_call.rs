@@ -3674,7 +3674,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         )
     } else {
         ctx.trace_ctx
-            .record_op_with_descr(OpCode::CallMayForceR, &allboxes, portal_descr)
+            .record_op_with_descr(OpCode::CallMayForceR, &allboxes, portal_descr.clone())
     };
     if let ResidualExecOutcome::Executed(Ok(result)) = exec {
         ctx.trace_ctx.set_opref_concrete(
@@ -14702,8 +14702,18 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(foriter_green_key) = walker_foriter_green_key(ctx, op.pc) else {
         return Ok(None);
     };
+    // A demoted site uses residual `jit_next` so FOR_ITER converts
+    // exhaustion. Once a compiled loop exists for the same greens,
+    // `opimpl_jit_merge_point` CALL_ASSEMBLERs that loop
+    // (`get_assembler_token`); the first `__next__` still inlines, matching
+    // the CONTAINS_OP bridge that CALL_ASSEMBLERs Loop 1.
     if ctx.trace_ctx.is_bridge_trace
         && crate::trace::instance_next_foriter_bridge_demoted(foriter_green_key)
+        && !ctx
+            .trace_ctx
+            .has_compiled_targets_fn
+            .as_ref()
+            .is_some_and(|f| f(foriter_green_key))
     {
         return Ok(None);
     }
@@ -15812,10 +15822,11 @@ fn descend_generatorentry<Sym: WalkSym>(
     // route `emit_walker_loop_callee_call_assembler` takes). A raw call
     // left the callee's frame seeded as this walk's vable, and the next
     // snapshot wrote that frame's slot count into the caller's array.
+    let allboxes = [funcptr, iter_op];
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
-        &[funcptr, iter_op],
+        &allboxes,
         call_descr,
         OpRef::NONE,
         op.pc,

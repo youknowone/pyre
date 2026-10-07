@@ -2616,19 +2616,12 @@ fn call_assembler_result_kind_name(kind: u64) -> &'static str {
     }
 }
 
-/// `None` when the target exposes no FINISH descr: a loop-greenkey target
-/// reached via do_recursive_call(assembler_call=True) at an inline-frame loop
-/// header (pyjitpl.py) exits via guard-deopt, not FINISH, so it has no
-/// fixed result kind to compare against a caller's expectation. The result is
-/// reconstructed on the deopt/helper path. Callers skip the (cranelift-only)
-/// expectation check in that case.
-fn actual_call_assembler_target_result_kind(
-    fail_descrs: &[DescrRef],
-) -> Result<Option<u64>, BackendError> {
-    let Some(finish_descr) = fail_descrs.iter().find(|descr| as_fd(descr).is_finish()) else {
-        return Ok(None);
-    };
-    actual_call_assembler_result_kind(as_fd(finish_descr)).map(Some)
+/// Portal-return FINISH (`compile.py` `DoneWithThisFrameDescr*`), or `None`.
+fn portal_return_finish_descr(fail_descrs: &[DescrRef]) -> Option<&DescrRef> {
+    fail_descrs.iter().find(|descr| {
+        let fd = as_fd(descr);
+        fd.is_finish() && !fd.is_exit_frame_with_exception()
+    })
 }
 
 fn validate_call_assembler_target_result_kind(
@@ -2645,34 +2638,6 @@ fn validate_call_assembler_target_result_kind(
         call_assembler_result_kind_name(expected_result_kind),
         call_assembler_result_kind_name(actual_result_kind),
     )))
-}
-
-fn validate_registered_target_against_call_assembler_expectations(
-    target_token: u64,
-    target: &RegisteredLoopTarget,
-) -> Result<(), BackendError> {
-    let expected_result_kinds: Vec<u64> = with_call_assembler_expectations(|m| {
-        m.get(&target_token)
-            .map(|target_expectations| target_expectations.values().copied().collect())
-            .unwrap_or_default()
-    });
-    if expected_result_kinds.is_empty() {
-        return Ok(());
-    }
-
-    let Some(actual_result_kind) = actual_call_assembler_target_result_kind(&target.fail_descrs)?
-    else {
-        return Ok(());
-    };
-    for expected_result_kind in expected_result_kinds {
-        validate_call_assembler_target_result_kind(
-            target_token,
-            expected_result_kind,
-            actual_result_kind,
-            "callee finish result kind",
-        )?;
-    }
-    Ok(())
 }
 
 fn remove_call_assembler_expectations_locked(
@@ -2756,29 +2721,6 @@ fn install_call_assembler_expectations(
 ) -> Result<(), BackendError> {
     let expectations = collect_call_assembler_expectations(ops)?;
 
-    for (&target_token, &expected_result_kind) in &expectations {
-        if let Some(target) = lookup_call_assembler_target(target_token) {
-            // A null `code_ptr` has no compiled finish exits, so
-            // `fail_descrs` is empty. Defer the actual-result-kind check to a
-            // later real registration, where `register_call_assembler_target`
-            // runs `validate_registered_target_against_call_assembler_expectations`
-            // against the real finish descrs.
-            if target.code_ptr.is_null() {
-                continue;
-            }
-            if let Some(actual_result_kind) =
-                actual_call_assembler_target_result_kind(&target.fail_descrs)?
-            {
-                validate_call_assembler_target_result_kind(
-                    target_token,
-                    expected_result_kind,
-                    actual_result_kind,
-                    "callee finish result kind",
-                )?;
-            }
-        }
-    }
-
     with_call_assembler_expectations(|registry| -> Result<(), BackendError> {
         for (&target_token, &expected_result_kind) in &expectations {
             if let Some(callers) = registry.get(&target_token) {
@@ -2861,7 +2803,6 @@ fn register_call_assembler_target(
         compiled_loop_token: Arc::downgrade(&clt),
         cpu_attachments: Arc::clone(&compiled.cpu_attachments),
     };
-    validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
     invalidate_ca_thread_cache(token.number);
     // Create/update dispatch slot for direct call
@@ -2920,7 +2861,6 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
             "call-assembler redirect from token {old_number} to {new_number} changed input types"
         )));
     }
-    validate_registered_target_against_call_assembler_expectations(old_number, &new_target)?;
     // Update dispatch slot so existing compiled code sees the new target.
     // Must update both code_ptr AND finish_descr_ptr (the new target has
     // different FailDescr pointers for its finish exit).
@@ -3077,18 +3017,6 @@ fn maybe_take_call_assembler_deadframe(fail_index: u32, exec: &JitExecResult) ->
     Some(take_call_assembler_deadframe_from_handle(
         exec.get_jf_int(0) as u64,
     ))
-}
-
-fn actual_call_assembler_result_kind(descr: &dyn FailDescr) -> Result<u64, BackendError> {
-    match descr.fail_arg_types() {
-        [] | [Type::Void] => Ok(CALL_ASSEMBLER_RESULT_VOID),
-        [Type::Int] => Ok(CALL_ASSEMBLER_RESULT_INT),
-        [Type::Float] => Ok(CALL_ASSEMBLER_RESULT_FLOAT),
-        [Type::Ref] => Ok(CALL_ASSEMBLER_RESULT_REF),
-        other => Err(BackendError::Unsupported(format!(
-            "call-assembler target exposes unsupported finish result layout: {other:?}"
-        ))),
-    }
 }
 
 /// llmodel.py force() as a free function.
@@ -5848,12 +5776,14 @@ fn resolve_call_assembler_target(
     // A target reached via do_recursive_call(assembler_call=True) at an
     // inline-frame loop header (opimpl_jit_merge_point pyjitpl.py) is a
     // loop greenkey, not a function-entry trace: it exits via guard-deopt and
-    // exposes no FINISH descr. RPython/x86 never require a target-local finish
-    // exit — _call_assembler_check_descr (x86/assembler.py) compares the
+    // exposes no portal-return FINISH. A segmented loop's only FINISH is
+    // `exit_frame_with_exception_descr_ref` (`_create_segmented_trace_and_blackhole`).
+    // RPython/x86 never require a target-local finish exit —
+    // `_call_assembler_check_descr` (x86/assembler.py) compares the
     // returned jf_descr against the CPU-global done_with_this_frame descr, and
     // the helper path handles the deopt result. When the target DOES expose a
-    // finish exit (function-entry traces), keep validating its result type.
-    if let Some(finish_descr) = target.fail_descrs.iter().find(|d| as_fd(d).is_finish()) {
+    // portal-return finish (function-entry traces), keep validating its result type.
+    if let Some(finish_descr) = portal_return_finish_descr(&target.fail_descrs) {
         let finish_types = as_fd(finish_descr).fail_arg_types();
 
         // Validate that the finish result type matches the call descriptor.

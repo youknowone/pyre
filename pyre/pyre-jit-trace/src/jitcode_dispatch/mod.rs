@@ -9823,11 +9823,19 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
     let back_edge_jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc.take();
     if !ctx.is_top_level {
-        let token = portal_assembler_token(w_code as *const (), header_py, is_being_profiled);
-        return Ok(Some(DispatchOutcome::SubLoopCalleeCallAssembler {
-            token,
-            target_pc: header_py,
-        }));
+        // `opimpl_jit_merge_point` after the `loop_header` stamp:
+        // `should_unroll_one_iteration` (`interp_jit.py`) then
+        // `finishframe` then `do_recursive_call(assembler_call=True)`.
+        if !active.0.code_ptr.is_null()
+            && inlined_should_unroll_one_iteration(unsafe { &*active.0.code_ptr })
+        {
+            return Ok(None);
+        }
+        return Ok(Some(inlined_loop_header_call_assembler(
+            w_code as *const (),
+            header_py,
+            is_being_profiled,
+        )));
     }
     let Some(back_edge_jit_pc) = back_edge_jit_pc else {
         return Ok(None);
@@ -13676,6 +13684,89 @@ pub(crate) fn portal_assembler_token(
     driver.get_or_make_portal_assembler_token_arc(&key, &greenboxes, &red_types)
 }
 
+/// `opimpl_jit_merge_point` inlined branch (`pyjitpl.py`):
+/// `should_unroll_one_iteration` (`interp_jit.py`) plus
+/// `MIFrame.unroll_iterations`. True means follow one more iteration.
+///
+/// Decrements the top MIFrame only when `portal_call_depth > 0`. The root
+/// frame is also born at 1, so a depth-0 crossing must not consume it.
+fn inlined_should_unroll_one_iteration(code: &pyre_interpreter::CodeObject) -> bool {
+    // ITERABLE_COROUTINE and ASYNC_GENERATOR are deliberately not
+    // tested: the hook selects only the two bits `should_unroll_one_iteration`
+    // (`eval.rs` / `interp_jit.py`) selects.
+    if !code
+        .flags
+        .intersects(pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR)
+    {
+        return false;
+    }
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return false;
+    };
+    let meta = driver.meta_interp_mut();
+    if meta.portal_call_depth <= 0 {
+        return false;
+    }
+    let Some(frame) = meta.framestack.frames.last_mut() else {
+        return false;
+    };
+    if frame.unroll_iterations == 0 {
+        return false;
+    }
+    frame.unroll_iterations -= 1;
+    true
+}
+
+/// `opimpl_jit_merge_point`: stamp cleared, `should_unroll_one_iteration`
+/// (`interp_jit.py`) / `MIFrame.unroll_iterations`, then
+/// `do_recursive_call(assembler_call=True)`.
+///
+/// Order matches the inlined (`portal_call_depth > 0`) arm: clear
+/// `seen_loop_header_for_jdindex` first, then the unroll test, then
+/// `get_assembler_token` (`warmstate.py`). An iteration that keeps
+/// unrolling must not `compile_tmp_callback`. `None` still residualizes
+/// the portal runner (`inlined_loop_header_call_assembler`).
+fn inlined_merge_point_recursive_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    callee_code: usize,
+    next_instr: usize,
+    is_being_profiled: bool,
+    carrier_resume: bool,
+    op: &DecodedOp,
+) -> Option<(DispatchOutcome, usize)> {
+    ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+    let _ = ctx.trace_ctx.seen_loop_header_jit_pc.take();
+    if let Some(pjc) = crate::state::pyjitcode_for_code(callee_code as *const ()) {
+        if !pjc.code_ptr.is_null() && inlined_should_unroll_one_iteration(unsafe { &*pjc.code_ptr })
+        {
+            return Some((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+    let token = portal_assembler_token(callee_code as *const (), next_instr, is_being_profiled);
+    Some(surface_carrier_or_inline_subloop(
+        token,
+        next_instr,
+        carrier_resume,
+        op.pc,
+        op.next_pc,
+    ))
+}
+
+/// After a `loop_header` stamp, inlined `opimpl_jit_merge_point` always
+/// `do_recursive_call(assembler_call=True)`. `get_assembler_token`
+/// (`warmstate.py`) `compile_tmp_callback`s when the cell has no loop;
+/// `None` still residualizes the portal runner.
+pub(crate) fn inlined_loop_header_call_assembler(
+    code_ptr: *const (),
+    header_py: usize,
+    is_being_profiled: bool,
+) -> DispatchOutcome {
+    DispatchOutcome::SubLoopCalleeCallAssembler {
+        token: portal_assembler_token(code_ptr, header_py, is_being_profiled),
+        target_pc: header_py,
+    }
+}
+
 /// Portal reds `[frame, ec]` (`interp_jit.py`). Empty when the sym has neither.
 fn portal_sym_reds<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> (Vec<OpRef>, SymRedWriteback) {
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -13927,42 +14018,19 @@ fn cut_inlined_loop_backedge<Sym: WalkSym>(
         // returns before recording. No segment: a sub-walk cannot consume
         // `SegmentTrace`.
         record_synthetic_debug_merge_point(ctx, header_py, is_being_profiled, w_code);
-        // `should_unroll_one_iteration` is true for `CO_COROUTINE|CO_GENERATOR`.
-        // `unroll_iterations` lives on the current MIFrame. The root frame is
-        // also born at 1, so only `portal_call_depth > 0` — an inlined portal
-        // frame — may consume it. The first crossing decrements and follows
-        // the goto. The next crossing is `do_recursive_call`.
-        let follow_unroll = code.flags.intersects(
-            pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR,
-        ) && {
-            if let Some((driver, _)) = crate::driver::try_driver_pair() {
-                let meta = driver.meta_interp_mut();
-                if meta.portal_call_depth > 0 {
-                    if let Some(frame) = meta.framestack.frames.last_mut() {
-                        if frame.unroll_iterations > 0 {
-                            frame.unroll_iterations -= 1;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if follow_unroll {
+        // `should_unroll_one_iteration` (`interp_jit.py`) plus
+        // `MIFrame.unroll_iterations` (`opimpl_jit_merge_point`).
+        if inlined_should_unroll_one_iteration(code) {
             return Ok(None);
         }
-        let token = portal_assembler_token(w_code as *const (), header_py, is_being_profiled);
-        return Ok(Some(DispatchOutcome::SubLoopCalleeCallAssembler {
-            token,
-            target_pc: header_py,
-        }));
+        // `opimpl_jit_merge_point` after a `loop_header` stamp:
+        // `finishframe` then `do_recursive_call(assembler_call=True)`
+        // (`direct_assembler_call` → `get_assembler_token`).
+        return Ok(Some(inlined_loop_header_call_assembler(
+            w_code as *const (),
+            header_py,
+            is_being_profiled,
+        )));
     }
     match classify_portal_goto_target(pjc.jitcode.code.as_slice(), target) {
         Some(PortalGotoTarget::LoopHeader) => return Ok(None),
@@ -16548,9 +16616,54 @@ fn handle<Sym: WalkSym>(
                         .map(|frame| frame.w_code),
                 );
             }
+            // pyjitpl.py `_handle_guard_failure` pre-arms the flag when the
+            // source guard is a `ResumeAtPositionDescr` — the descr
+            // `inline_short_preamble` stamps onto the guards it replays
+            // (unroll.py OptUnroll.inline_short_preamble). Those guards sit at
+            // the target loop's entry, so the bridge grown from one has to
+            // close at its very first merge point rather than record another
+            // iteration first. Arming here rather than at the bridge setup
+            // keeps the flag equal to the `jdindex` the assert below compares
+            // against, and runs before the recursive arm so a pre-armed
+            // inlined header still takes `do_recursive_call`.
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
+            {
+                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+                ctx.trace_ctx.seen_loop_header_jit_pc = None;
+            }
+            // pyjitpl.py `opimpl_jit_merge_point`:
+            //     if seen_loop_header_for_jdindex < 0:
+            //         if not jitdriver_sd.no_loop_header:
+            //             if self.metainterp.portal_call_depth:
+            //                 return
+            // An inlined callee's first merge point (fall-through into a
+            // `while`, or dispatch top) keeps tracing so the body records.
+            // `finishframe` + `do_recursive_call(assembler_call=True)` waits
+            // for a `loop_header` stamp. Cutting here residualizes that body
+            // (`f_locals` as a may-force call) and aborts `ABORT_ESCAPE`.
+            // `no_loop_header` drivers skip this return: the auto-stamp
+            // below treats the first merge point as the header, then the
+            // recursive arm CALL_ASSEMBLERs (`pyjitpl.py`, and
+            // `pyjitpl/dispatch.rs` `inline_depth() > 0 && seen < 0 &&
+            // !no_loop_header`).
+            let no_loop_header = ctx
+                .trace_ctx
+                .metainterp_sd()
+                .jitdrivers_sd
+                .get(jdindex)
+                .map(|jd| jd.no_loop_header)
+                .unwrap_or(false);
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && !ctx.is_top_level
+                && !no_loop_header
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
             // `opimpl_jit_merge_point` (`pyjitpl.py`), the `else` taken when
-            // `metainterp.portal_call_depth` is non-zero: this header is not
-            // the traced loop's own close. Finish the callee and
+            // `metainterp.portal_call_depth` is non-zero and a loop_header has
+            // already stamped the flag: this header is not the traced loop's
+            // own close. Finish the callee and
             // `do_recursive_call(..., assembler_call=True)`. A frame rebuilt
             // by `rebuild_from_resumedata` is an ordinary MIFrame, so a bridge
             // that resumes inside a callee and later reaches that callee's
@@ -16576,31 +16689,15 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
-                let callee_key = crate::driver::make_green_key_typed(
-                    callee_code as *const (),
+                if let Some(outcome) = inlined_merge_point_recursive_call(
+                    ctx,
+                    callee_code,
                     next_instr,
                     is_being_profiled,
-                );
-                let (driver, _) = crate::driver::driver_pair();
-                let greenboxes = [
-                    Value::Int(next_instr as i64),
-                    Value::Int(is_being_profiled as i64),
-                    Value::Ref(majit_ir::GcRef(callee_code)),
-                ];
-                let red_types = [Type::Ref, Type::Ref];
-                let token = driver.get_or_make_portal_assembler_token_arc(
-                    &callee_key,
-                    &greenboxes,
-                    &red_types,
-                );
-                if token.is_some() || carrier_resume {
-                    return Ok(surface_carrier_or_inline_subloop(
-                        token,
-                        next_instr,
-                        carrier_resume,
-                        op.pc,
-                        op.next_pc,
-                    ));
+                    carrier_resume,
+                    op,
+                ) {
+                    return Ok(outcome);
                 }
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
@@ -16625,31 +16722,15 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
-                        let callee_key = crate::driver::make_green_key_typed(
-                            callee_code as *const (),
+                        if let Some(outcome) = inlined_merge_point_recursive_call(
+                            ctx,
+                            callee_code,
                             next_instr,
                             is_being_profiled,
-                        );
-                        let (driver, _) = crate::driver::driver_pair();
-                        let greenboxes = [
-                            Value::Int(next_instr as i64),
-                            Value::Int(is_being_profiled as i64),
-                            Value::Ref(majit_ir::GcRef(callee_code)),
-                        ];
-                        let red_types = [Type::Ref, Type::Ref];
-                        let token = driver.get_or_make_portal_assembler_token_arc(
-                            &callee_key,
-                            &greenboxes,
-                            &red_types,
-                        );
-                        if token.is_some() || carrier_resume {
-                            return Ok(surface_carrier_or_inline_subloop(
-                                token,
-                                next_instr,
-                                carrier_resume,
-                                op.pc,
-                                op.next_pc,
-                            ));
+                            carrier_resume,
+                            op,
+                        ) {
+                            return Ok(outcome);
                         }
                     }
                     top_level_live_code(ctx)
@@ -16681,20 +16762,6 @@ fn handle<Sym: WalkSym>(
             // loop crossing. Skip exactly once. `take()` clears on the first
             // crossing regardless of pc, so a mid-body-resume bridge whose
             // first crossing is a DIFFERENT header is unaffected.
-            // pyjitpl.py `_handle_guard_failure` pre-arms the flag
-            // when the source guard is a `ResumeAtPositionDescr` — the descr
-            // `inline_short_preamble` stamps onto the guards it replays
-            // (unroll.py:337 / :409). Those guards sit at the target loop's
-            // entry, so the bridge grown from one has to close at its very
-            // first merge point rather than record another iteration first.
-            // Arming here rather than at the bridge setup keeps the flag equal
-            // to the `jdindex` the assert below compares against.
-            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
-                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
-            {
-                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
-                ctx.trace_ctx.seen_loop_header_jit_pc = None;
-            }
             if ctx.is_top_level
                 && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
                 && ctx.fbw_mode.bridge_entry_merge_pc.take() == Some(next_instr)
@@ -16707,13 +16774,8 @@ fn handle<Sym: WalkSym>(
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`
-                let no_loop_header = ctx
-                    .trace_ctx
-                    .metainterp_sd()
-                    .jitdrivers_sd
-                    .get(jdindex)
-                    .map(|jd| jd.no_loop_header)
-                    .unwrap_or(false);
+                // (`no_loop_header` hoisted above, same as
+                // `pyjitpl/dispatch.rs`).
                 if !no_loop_header {
                     // pyjitpl.py `if self.metainterp.portal_call_depth:
                     // return` — nested portal call waits for an explicit
