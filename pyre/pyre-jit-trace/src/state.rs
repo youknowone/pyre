@@ -8680,6 +8680,25 @@ fn reconstruct_inline_recipe(
         Some(d) => d,
         None => decline!("NoStackDepthAtPc"),
     };
+    // `get_list_of_active_boxes` (`pyjitpl.py`): `in_a_call` clears the CALL
+    // dest only when `_result_argcode` is i/r/f. A miss is not a reconstruct
+    // decline — `consume_boxes` still fills every live register.
+    // `opimpl_jit_merge_point` residualizes CALL_ASSEMBLER at a loop header
+    // that "has no result at all", so a deeper frame does not by itself mean
+    // this pause has a pending CALL dest. Demand a result color only when
+    // trivia names one.
+    let pending_result_color = if in_a_call {
+        usize::try_from(frame.pc).ok().and_then(|pc| {
+            pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
+                p.result_color_trivia_for_jitcode_pc(pc)
+                    .map(|c| c as usize)
+                    .filter(|&c| c != u16::MAX as usize)
+            })
+        })
+    } else {
+        None
+    };
+    let in_a_call = pending_result_color.is_some();
     let pending_result_abs_slot = if in_a_call && stack_only > 0 {
         Some(nlocals + stack_only - 1)
     } else {
@@ -8701,21 +8720,6 @@ fn reconstruct_inline_recipe(
         liveness
             .stack_depth_at(py_pc + 1)
             .map(|post| nlocals + post.saturating_sub(1))
-    } else {
-        None
-    };
-    let pending_result_color = if in_a_call {
-        let Some(pc) = usize::try_from(frame.pc).ok() else {
-            decline!("NoPendingResultColor");
-        };
-        let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
-            p.result_color_trivia_for_jitcode_pc(pc)
-                .map(|c| c as usize)
-                .filter(|&c| c != u16::MAX as usize)
-        }) else {
-            decline!("NoPendingResultColor");
-        };
-        Some(color)
     } else {
         None
     };
@@ -16613,7 +16617,11 @@ fn emit_reconstructed_callee_pyframe(
     let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
     // The operands live at the guard, at their `locals_cells_stack_w` slots:
     // the walk resumes mid-body and reads the frame image there (a callee
-    // loop header's FOR_ITER reads its iterator from the stack slot).
+    // loop header's FOR_ITER peeks `array[valuestackdepth - 1]`, pyframe.py
+    // `peekvalue`). Store the slots *and* the absolute depth; a prefix-only
+    // `valuestackdepth` (`stack_base`) makes that peek a local/cell instead
+    // of the iterator (`rebuild_from_resumedata` / `consume_boxes` refill
+    // the rebuilt MIFrame's live image, including operand-stack depth).
     let stack_items: Vec<OpRef> = recipe.registers_r[stack_base..recipe.valuestackdepth].to_vec();
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     crate::helpers::emit_new_pyframe_inline_with_params(
@@ -16623,7 +16631,7 @@ fn emit_reconstructed_callee_pyframe(
         &stack_items,
         nlocals,
         frame_array_size,
-        stack_base,
+        recipe.valuestackdepth,
         pycode_const,
         w_globals_const,
     )
@@ -16931,6 +16939,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
+        for captured in recipe.concrete_r[stack_base..valuestackdepth].iter() {
+            if let majit_ir::Value::Ref(gc) = *captured {
+                if gc != majit_ir::GcRef::NO_CONCRETE {
+                    let _ =
+                        pyre_object::gc_roots::pin_root(gc.as_usize() as pyre_object::PyObjectRef);
+                }
+            }
+        }
         let closure = if stack_base == nlocals {
             pyre_object::PY_NULL
         } else {
@@ -16979,6 +16995,18 @@ pub(crate) fn setup_reconstructed_callee_frame(
         if !concrete_frame.is_gc_owned() {
             return None;
         }
+        // `PyFrame::new_for_call_*` leaves `valuestackdepth` at the locals/cells
+        // prefix. The recipe's operand stack is already in `concrete_r` at
+        // those slots (`consume_boxes`); write it through and bump the depth
+        // so a residual `FOR_ITER` peek on this recording-time frame sees
+        // the same iterator the symbolic image holds.
+        let frame_ptr = concrete_frame.as_mut_ptr() as usize;
+        for k in stack_base..valuestackdepth {
+            if let Some(&captured) = recipe.concrete_r.get(k) {
+                store_live_frame_array_slot(frame_ptr, k, captured);
+            }
+        }
+        store_live_frame_static_int(frame_ptr, 2, valuestackdepth as i64);
         let concrete_frame_ptr = concrete_frame.as_mut_ptr();
         ctx.set_opref_concrete(
             frame_vable,
@@ -16997,6 +17025,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
             .map(|i| i + 1)
             .unwrap_or(root_base + 2 + stack_base);
         let mut live_stack = vec![majit_ir::Value::Void; valuestackdepth];
+        for k in 0..stack_base.min(valuestackdepth) {
+            live_stack[k] = live_prefix[k];
+        }
         for k in stack_base..valuestackdepth.min(recipe.concrete_r.len()) {
             live_stack[k] = match recipe.concrete_r[k] {
                 majit_ir::Value::Ref(_) => majit_ir::Value::Ref(majit_ir::GcRef(
@@ -17051,20 +17082,23 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // removal a live operand-stack slot's color is per-program-point
     // (`pcdep_color_slots`) and need not equal `nlocals + d` — the encoder
     // (`get_list_of_active_boxes`) maps color→slot via
-    // `semantic_ref_slot_for_reg_color`, so invert it here to land each stack
-    // value at the color the dispatcher will touch. Placing it at the raw slot
-    // index (the old identity assumption) lands it under the wrong register and
-    // leaves the true color still holding the portal-red seed (frame/ec) whose
-    // color the register allocator reused for this stack slot. Runs AFTER the
-    // frame/ec seeding so a reused color resolves to the live stack value.
+    // `semantic_ref_slot_for_reg_color`, so invert it here to land each live
+    // slot at the color the dispatcher will touch. `consume_boxes` writes
+    // every live register of the rebuilt MIFrame, locals included; a
+    // stack-only copy left those colors `NONE` and the walk reloaded them
+    // from the frame image. Placing a slot at the raw index (the old
+    // identity assumption) lands it under the wrong register and leaves
+    // the true color still holding the portal-red seed (frame/ec) whose
+    // color the register allocator reused for this slot. Runs AFTER the
+    // frame/ec seeding so a reused color resolves to the live slot value.
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
-    // The allocate path re-reads Refs from roots taken before FrameBox::new;
-    // the resume path captured with no allocation in between, so
-    // recipe.concrete_r is still current.
+    // The allocate path re-reads the locals prefix and the stack Refs from
+    // roots taken before FrameBox::new; the resume path captured with no
+    // allocation in between, so recipe.concrete_r is still current.
     let slot_concrete = live_stack_concrete.as_deref().unwrap_or(&recipe.concrete_r);
-    for k in stack_base..valuestackdepth {
+    for k in 0..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
             continue;
