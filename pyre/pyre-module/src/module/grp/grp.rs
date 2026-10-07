@@ -19,37 +19,137 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
     })
 }
 
+/// `_pwdgrp_build.py` includes and `lib_pypy/grp.py` libc calls:
+/// `includes=['sys/types.h', 'grp.h']`, `releasegil=False`, no `save_err`.
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+mod ll {
+    use majit_rlib::rffi::CCHARP;
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/types.h", "grp.h"],
+        };
+    }
+
+    macro_rules! external {
+        ($($t:tt)*) => {
+            majit_rlib::rffi::llexternal!($($t)*, compilation_info = ECI, releasegil = false);
+        };
+    }
+
+    external!(
+        pub(super) c_getgrgid = "getgrgid",
+        [libc::gid_t],
+        *mut libc::group
+    );
+    external!(
+        pub(super) c_getgrnam = "getgrnam",
+        [CCHARP],
+        *mut libc::group
+    );
+    external!(
+        pub(super) c_setgrent = "setgrent",
+        [],
+        ()
+    );
+    external!(
+        pub(super) c_getgrent = "getgrent",
+        [],
+        *mut libc::group
+    );
+    external!(
+        pub(super) c_endgrent = "endgrent",
+        [],
+        ()
+    );
+}
+
+/// `lib_pypy/grp.py _group_from_gstruct`. String fields are copied with
+/// `charp2str` immediately: `getgrent` (and `getgrgid` / `getgrnam`) may
+/// return a pointer into a static buffer. `gr_mem` is a NULL-terminated
+/// `char**` walked into a list of strings.
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
+    let name = unsafe { majit_rlib::rffi::charp2str((*g).gr_name.cast()) };
+    let passwd = unsafe { majit_rlib::rffi::charp2str((*g).gr_passwd.cast()) };
+    let gid = unsafe { (*g).gr_gid } as i64;
+    let mut member_bytes = Vec::new();
+    unsafe {
+        let mut p = (*g).gr_mem;
+        loop {
+            let member = *p;
+            if member.is_null() {
+                break;
+            }
+            member_bytes.push(majit_rlib::rffi::charp2str(member.cast()));
+            p = p.add(1);
+        }
+    }
+    let mem_list = {
+        let mut mem = pyre_object::gc_roots::RootedItems::new();
+        for s in &member_bytes {
+            mem.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(s)));
+        }
+        pyre_object::w_list_new(mem.take())
+    };
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &name,
+    )));
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &passwd,
+    )));
+    fields.push(pyre_object::w_int_new(gid));
+    fields.push(mem_list);
+    pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
+}
+
+/// `getgrall`'s `try`/`finally`: `c_endgrent` runs on every exit.
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+struct EndgrentOnDrop;
+
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+impl Drop for EndgrentOnDrop {
+    fn drop(&mut self) {
+        unsafe { ll::c_endgrent() };
+    }
+}
+
+/// Sandbox keeps the `rustpython_host_env::grp` Group layout.
+#[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
+fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
+    // Each `w_str_new_managed` is collectable.  A plain Vec is not a
+    // root, so later member/name allocations can sweep earlier strings
+    // before `new_instance` pins its argument vector.  Pin each mint
+    // as it is produced; close the member bracket before the field
+    // bracket (`RootedItems` cannot grow under another open set).
+    let mem_list = {
+        let mut mem = pyre_object::gc_roots::RootedItems::new();
+        for s in &g.mem {
+            mem.push(pyre_object::w_str_new_managed(s));
+        }
+        pyre_object::w_list_new(mem.take())
+    };
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(&g.name));
+    fields.push(pyre_object::w_str_new_managed(&g.passwd));
+    fields.push(pyre_object::w_int_new(g.gid as i64));
+    fields.push(mem_list);
+    pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
+}
+
 /// grp module — `lib_pypy/grp.py` (PyPy keeps it app-level via
-/// `_pwdgrp_cffi`).  pyre takes CPython's `Modules/grpmodule.c`
-/// shape since pyre has no app-level stdlib.
+/// `_pwdgrp_cffi`).
 ///
 /// getgrgid / getgrnam / getgrall return a `grp.struct_group`
 /// structseq (subclass of tuple) with named fields `gr_name`,
 /// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py`.
+///
+/// Unix + `host_env` + not-sandbox calls `c_getgrgid` / `c_getgrnam` /
+/// `c_setgrent` / `c_getgrent` / `c_endgrent`. Sandbox keeps
+/// `rustpython_host_env::grp`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    #[cfg(feature = "host_env")]
-    fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
-        // Each `w_str_new_managed` is collectable.  A plain Vec is not a
-        // root, so later member/name allocations can sweep earlier strings
-        // before `new_instance` pins its argument vector.  Pin each mint
-        // as it is produced; close the member bracket before the field
-        // bracket (`RootedItems` cannot grow under another open set).
-        let mem_list = {
-            let mut mem = pyre_object::gc_roots::RootedItems::new();
-            for s in &g.mem {
-                mem.push(pyre_object::w_str_new_managed(s));
-            }
-            pyre_object::w_list_new(mem.take())
-        };
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_str_new_managed(&g.name));
-        fields.push(pyre_object::w_str_new_managed(&g.passwd));
-        fields.push(pyre_object::w_int_new(g.gid as i64));
-        fields.push(mem_list);
-        pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
-    }
-
     // `lib_pypy/grp.py class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
     pyre_interpreter::module_ns_store(ns, "struct_group", struct_group_type());
@@ -81,16 +181,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getgrgid: gid is out of range",
                     ));
                 };
-                match rustpython_host_env::grp::getgrgid(gid) {
-                    Ok(Some(g)) => Ok(make_struct_group(&g)),
-                    Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
-                        "getgrgid(): gid not found: {}",
-                        gid
-                    ))),
-                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("getgrgid: {e}"),
-                    )),
+                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                {
+                    let g = unsafe { ll::c_getgrgid(gid) };
+                    if g.is_null() {
+                        Err(pyre_interpreter::PyError::key_error(format!(
+                            "getgrgid(): gid not found: {}",
+                            gid
+                        )))
+                    } else {
+                        Ok(make_struct_group(g))
+                    }
+                }
+                #[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
+                {
+                    match rustpython_host_env::grp::getgrgid(gid) {
+                        Ok(Some(g)) => Ok(make_struct_group(&g)),
+                        Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
+                            "getgrgid(): gid not found: {}",
+                            gid
+                        ))),
+                        Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getgrgid: {e}"),
+                        )),
+                    }
                 }
             },
             1,
@@ -120,16 +235,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getgrnam: name must not contain NUL bytes",
                     ));
                 }
-                match rustpython_host_env::grp::getgrnam(name) {
-                    Ok(Some(g)) => Ok(make_struct_group(&g)),
-                    Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
-                        "getgrnam(): name not found: {}",
-                        name
-                    ))),
-                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("getgrnam: {e}"),
-                    )),
+                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                {
+                    let g = {
+                        let ll_name =
+                            majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
+                        unsafe { ll::c_getgrnam(ll_name.buf) }
+                    };
+                    if g.is_null() {
+                        Err(pyre_interpreter::PyError::key_error(format!(
+                            "getgrnam(): name not found: {}",
+                            name
+                        )))
+                    } else {
+                        Ok(make_struct_group(g))
+                    }
+                }
+                #[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
+                {
+                    match rustpython_host_env::grp::getgrnam(name) {
+                        Ok(Some(g)) => Ok(make_struct_group(&g)),
+                        Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
+                            "getgrnam(): name not found: {}",
+                            name
+                        ))),
+                        Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getgrnam: {e}"),
+                        )),
+                    }
                 }
             },
             1,
@@ -144,12 +278,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // Each struct_group is freshly allocated and building the
                 // next one allocates again, so they are pinned as they
                 // arrive.
-                let groups = rustpython_host_env::grp::getgrall();
-                let mut items = pyre_object::gc_roots::RootedItems::new();
-                for g in groups.iter() {
-                    items.push(make_struct_group(g));
+                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                {
+                    unsafe { ll::c_setgrent() };
+                    let _endgrent = EndgrentOnDrop;
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    loop {
+                        let g = unsafe { ll::c_getgrent() };
+                        if g.is_null() {
+                            break;
+                        }
+                        items.push(make_struct_group(g));
+                    }
+                    Ok(pyre_object::w_list_new(items.take()))
                 }
-                Ok(pyre_object::w_list_new(items.take()))
+                #[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
+                {
+                    let groups = rustpython_host_env::grp::getgrall();
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for g in groups.iter() {
+                        items.push(make_struct_group(g));
+                    }
+                    Ok(pyre_object::w_list_new(items.take()))
+                }
             },
             0,
         ),
