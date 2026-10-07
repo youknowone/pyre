@@ -920,7 +920,7 @@ pub(crate) fn frozen_cache_store(
 ///
 /// `gateway.py` `ApplevelClass` / `build_applevel_dict` compile from source
 /// at translation. The runtime image is that source; stuffing a hash into
-/// [`FrozenSourceStamp::mtime_ns`] would accept a colliding body.
+/// the mtime word would accept a colliding body.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn applevel_cache_load(
     cache_key: &str,
