@@ -21,6 +21,9 @@
 # must resume from the emitted post-call `-live-` anchor even though the
 # semantic Python fallthrough is past the end of `load_stop`; replaying from
 # the call pops the result a second time.
+# The list getitem path records the list-strategy guard
+# (`W_ListObject.descr_getitem` -> strategy `getitem`); its failures on
+# other-strategy lists are part of guard_failures.
 try:
     import pypyjit
 
