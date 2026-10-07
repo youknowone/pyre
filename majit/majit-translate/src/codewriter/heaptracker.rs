@@ -428,6 +428,9 @@ mod tests {
 
     #[test]
     fn field_list_has_vtable_when_first_struct_chain_reaches_typeptr() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
         // `attrs_have_vtable` looks up `canonical_struct_name(owner)`. A
         // sibling lib test that loaded interpreter LLBC may have registered
         // `PyObject` in `STRUCT_ORIGIN_REGISTRY`, so the leaf spelling is
@@ -476,6 +479,9 @@ mod tests {
 
     #[test]
     fn callcontrol_has_vtable_walks_inlined_header() {
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
         let header_type = majit_ir::descr::canonical_struct_name("PyObject");
         let wrapper_type = majit_ir::descr::canonical_struct_name("Boxed");
         let mut cc = CallControl::new();
