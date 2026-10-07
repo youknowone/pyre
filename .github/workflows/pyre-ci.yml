@@ -1409,23 +1409,9 @@ jobs:
       # future image refuses the write, the suite should still run and report.
       if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
       shell: bash
-      env:
-        CPYTHON_SUITE_PARTIAL: cpython-suite-partial.jsonl
       run: |
         sudo sysctl -w vm.overcommit_memory=1 || echo "note: could not relax overcommit; fork-heavy modules may report ENOMEM"
         ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 600
-    - name: Show CPython suite partial results
-      # The 90-minute job cap can cancel the suite before the summary, which
-      # is the only place that used to name TIMEOUT/CRASH/FAIL modules.
-      if: ${{ always() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
-      shell: bash
-      run: |
-        if [ -f cpython-suite-partial.jsonl ]; then
-          echo "=== partial CPython suite results ==="
-          cat cpython-suite-partial.jsonl
-        else
-          echo "no cpython-suite-partial.jsonl"
-        fi
 
   pyre-check-macos:
     name: pyre/check.py ${{ matrix.label }} (macos-latest)

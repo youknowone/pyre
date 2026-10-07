@@ -1350,18 +1350,6 @@ def main() -> int:
                     sys.stdout.write(f" {preview}")
                 sys.stdout.write("\n")
             sys.stdout.flush()
-            partial = os.environ.get("CPYTHON_SUITE_PARTIAL")
-            if partial:
-                try:
-                    with open(partial, "a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(
-                            {"module": module, "status": status,
-                             "detail": detail[:300]},
-                            ensure_ascii=False,
-                        ) + "\n")
-                        fh.flush()
-                except OSError:
-                    pass
 
     def run_tracked(module: str) -> tuple[str, str]:
         with io_lock:
