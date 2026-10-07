@@ -6509,6 +6509,7 @@ impl<M: Clone> MetaInterp<M> {
                 // see `setup_tracing` for the contract on raw-pointer
                 // lifetime pinning by MetaInterp ownership.
                 ctx.set_cpu(Some(&self.backend));
+                ctx.set_metainterp_cpu(self.cpu.clone());
                 self.tracing = Some(ctx);
                 self.arm_portal_trace_positions();
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
@@ -6960,6 +6961,7 @@ impl<M: Clone> MetaInterp<M> {
         // this trace because `self` (MetaInterp) owns both `tracing`
         // and `backend`, and tracing is torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
+        ctx.set_metainterp_cpu(self.cpu.clone());
         self.tracing = Some(ctx);
         self.arm_portal_trace_positions();
         // pyjitpl.py `opimpl_jit_merge_point` auto-stamp
@@ -18083,6 +18085,7 @@ impl<M: Clone> MetaInterp<M> {
         // pinning by MetaInterp ownership.  Bridge traces share the
         // same backend reference as the source loop.
         ctx.set_cpu(Some(&self.backend));
+        ctx.set_metainterp_cpu(self.cpu.clone());
         // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
         // `prepare_trace_segmenting` can set FORCE_BRIDGE_SEGMENTING here.
