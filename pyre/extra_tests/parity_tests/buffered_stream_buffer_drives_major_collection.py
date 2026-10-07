@@ -4,6 +4,7 @@
 # parity-tests reason: the buffered streams' bytearray buffer lives outside
 # the GC heap, and only its accounting toward the major-collection threshold
 # (`rgc.add_memory_pressure`) lets a loop of dropped streams reach a major.
+# parity-env: PYPY_GC_NURSERY=4M
 # parity-env: PYPY_GC_MIN=8M
 # parity-env: PYPY_GC_MAX_DELTA=4M
 # parity-env: PYPY_GC_INCREMENT_STEP=32M
@@ -16,8 +17,14 @@ iterations and the finalizers close the dropped files; uncharged, the
 loop allocates too little GC memory to reach one, and the open files pile up
 until the descriptor table is exhausted.
 
-`PYPY_GC_MIN` is the first-major floor (`incminimark` `post_setup`); the
-default `nursery*8` on a large-RAM host never trips inside this loop.
+`PYPY_GC_NURSERY` pins the nursery at `env.NURSERY_SIZE_UNKNOWN_CACHE`.
+`allocate_nursery` then sets `min_heap_size = max(PYPY_GC_MIN,
+nursery * major_collection_threshold)`.  A host
+whose `best_nursery_size_for_L2cache` reading is a large last-level cache
+would otherwise lift that floor above this loop's 400 MiB of buffers, so
+no major runs and the peak stays at the in-flight set.  `PYPY_GC_MIN` is
+the first-major floor (`incminimark` `post_setup`); the default
+`nursery*8` on a large-RAM host never trips inside this loop.
 `PYPY_GC_MAX_DELTA` caps how far the next-major threshold may sit above the
 live size (default 1/8 of RAM). `PYPY_GC_INCREMENT_STEP` is the mark budget
 per nursery collection; the default `nursery*4` can leave the first
