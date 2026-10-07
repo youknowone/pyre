@@ -1652,7 +1652,7 @@ fn emit_traceback_node<Sym: WalkSym>(
 ) -> Result<OpRef, DispatchError> {
     let traceback = ctx
         .trace_ctx
-        .execute_new_with_vtable(crate::descr::pytraceback_size_descr());
+        .execute_new_with_vtable(crate::descr::pytraceback_size_descr(), None);
     let fields = [
         (site.frame, 0),
         // Field 1 is `lasti`, which the slot holds in bytes.
@@ -4213,13 +4213,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let recorded = match dst_bank {
         'r' => ctx
             .trace_ctx
-            .call_assembler_ref_arc_typed(token, &red_ops, &red_types),
+            .call_assembler_ref_arc_typed_with_value(token, &red_ops, &red_types, concrete),
         'i' => ctx
             .trace_ctx
-            .call_assembler_int_arc_typed(token, &red_ops, &red_types),
+            .call_assembler_int_arc_typed_with_value(token, &red_ops, &red_types, concrete),
         'f' => ctx
             .trace_ctx
-            .call_assembler_float_arc_typed(token, &red_ops, &red_types),
+            .call_assembler_float_arc_typed_with_value(token, &red_ops, &red_types, concrete),
         'v' => {
             ctx.trace_ctx
                 .call_assembler_void_arc_typed(token, &red_ops, &red_types);
@@ -4234,16 +4234,6 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         Some(call_descr.get_extra_info()),
         &allboxes,
     );
-    // `make_result_of_lastop(resbox)`: the executed result is the op's
-    // value whatever its bits (zero, +0.0 and null included).
-    if recorded != OpRef::NONE && raised == 0 {
-        let value = match dst_bank {
-            'i' => majit_ir::Value::Int(concrete),
-            'f' => majit_ir::Value::Float(f64::from_bits(concrete as u64)),
-            _ => majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-        };
-        ctx.trace_ctx.set_opref_concrete(recorded, value);
-    }
     if recorded != OpRef::NONE {
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
     }

@@ -2501,6 +2501,12 @@ impl TraceCtx {
     /// that was never constructed — an invariant violation that would
     /// silently swallow the value under the previous `if let Some`
     /// shape and hide cache-hit sanity-check mismatches.  Panic instead.
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu`: the bridge
+    /// InputArg is born with `cpu.get_int_value(deadframe, num)`.
+    pub fn load_box_from_cpu(&mut self, num: u32, kind: Type, value: Value) -> OpRef {
+        self.recorder.load_box_from_cpu(num, kind, value)
+    }
+
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
         if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return;
