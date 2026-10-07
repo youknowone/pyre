@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=15
+# pyre-check: max-pypy-ratio=13.2
 # Locals for except-as stop the module-dict `version?` revoke storm
 # (`celldict.py notify_version_watchers`), so pypy compiles these
 # sections. `run()`'s `for` deletes the `except E as e` name and then

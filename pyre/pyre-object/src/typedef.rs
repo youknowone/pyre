@@ -248,6 +248,8 @@ pub fn leak_typedef(
 /// its existing public name (`typedef.py GetSetProperty.typedef =
 /// TypeDef("getset_descriptor", ...)`) while the GC consts stay on
 /// the `W_GETSET_PROPERTY_*` convention.
+///
+/// `GetSetProperty._immutable_fields_ = ["fget", "fset", "fdel"]`.
 #[pyre_class(
     "getset_descriptor",
     type_id = 40,
@@ -281,6 +283,21 @@ pub struct GetSetProperty {
     /// `typedef.py:345 self.use_closure` — passes `(self, space, obj)`
     /// vs `(space, obj)` to the wrapped callbacks.
     pub use_closure: bool,
+}
+
+/// ULLBC harvest of `GetSetProperty._immutable_fields_ = ["fget", "fset", "fdel"]`.
+/// `#[jit_immutable_fields]` cannot wrap a `#[pyre_class]` struct (both
+/// consume the item), so this is the marker const that macro emits:
+/// `harvest_immutable_fields_from_llbcs` reads `_immutable_fields_<Struct>`,
+/// and `jitcode_lower` reads `__MAJIT_IMMUTABLE_FIELDS`.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _immutable_fields_GetSetProperty: &str = "fget,fset,fdel";
+
+impl GetSetProperty {
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub const __MAJIT_IMMUTABLE_FIELDS: &str = "fget,fset,fdel";
 }
 
 /// Allocate a `GetSetProperty` bound to `GETSET_DESCRIPTOR_TYPE`.

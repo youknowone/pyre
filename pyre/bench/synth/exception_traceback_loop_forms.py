@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=7.2
 # Traceback nodes recorded by a compiled loop, driven by BOTH loop forms.
 #
 # The sibling exception-traceback fixtures all drive their workload with

@@ -1474,7 +1474,9 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     // residual setattr, the way mapdict names `setattr_would_force_quasi_immut`.
     // The sweep and the store share the watcher lock: an `is_installed`
     // test outside it lets a recorder publish a watcher for the old
-    // pointer after the test and before the store.
+    // pointer after the test and before the store.  pyre is 3.14t, so
+    // `invalidate_then_store` owns every store; the GIL made that pair
+    // indivisible in `quasiimmut.py make_invalidation_function.invalidation`.
     let t = obj as *mut W_TypeObject;
     (*t).w_name_watchers.invalidate_then_store(|| {
         // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).

@@ -3966,10 +3966,67 @@ pub(crate) fn function_call_obj_args(
     call_obj_args(func, obj, args)
 }
 
+/// `function.py Function.funccall` — the Result-returning body.
+///
+/// Fixed-arity 0..=4 builtins go through `BuiltinCodeN.fastcall_N`:
+/// `getcode()` then `code.fastfunc_N(...)`.  `builtin_code_call` is the
+/// gateway that holds that function-pointer field; the caller's live
+/// arguments are pinned here because that gateway roots nothing of its
+/// own (`funccall_valuestack`'s same pin).
+///
+/// `funccall_valuestack` uses this same `BuiltinCodeN.fastcall_N` arm
+/// whether or not a trace is recording: the CALL walker intercepts the
+/// `CallFn` residual, and after `abort: force quasi-immut` the regular
+/// interpreter still wants the gateway rather than `space.call_function`.
+pub fn funccall_result(
+    func: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { crate::getcode(func) };
+    let nargs = args.len();
+    let fast_natural_arity =
+        unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
+    if nargs == fast_natural_arity
+        && nargs <= 4
+        && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) }
+    {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.base();
+        let _ = _roots.pin_root(code as PyObjectRef);
+        for &arg in args {
+            let _ = _roots.pin_root(arg);
+        }
+        let code = _roots.get(root_base);
+        let rooted_arg = |index| _roots.get(root_base + 1 + index);
+        return match nargs {
+            0 => unsafe { crate::builtin_code_call(code, &[]) },
+            1 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0)]) },
+            2 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1)]) },
+            3 => unsafe {
+                crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1), rooted_arg(2)])
+            },
+            4 => unsafe {
+                crate::builtin_code_call(
+                    code,
+                    &[rooted_arg(0), rooted_arg(1), rooted_arg(2), rooted_arg(3)],
+                )
+            },
+            _ => unreachable!(),
+        };
+    }
+    crate::call::call_function_impl_result(func, args)
+}
+
 /// PyPy-compatible `funccall` helper.
 #[inline]
 pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    call_args(func, args)
+    match funccall_result(func, args) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 /// baseobjspace.py: `space._code_of_sys_exc_info` — the BuiltinCode object

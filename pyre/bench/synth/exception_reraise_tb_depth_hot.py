@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=3.5
+# pyre-check: max-pypy-ratio=2.8
 # macOS dynasm floor-failed 0.96x against 4 (CI run 37359978909, also rhai and
 # jit-exception-bridge); the widest ubuntu reading is wasm 2.7x. 3.5 keeps the
 # derived floor at 0.875x.

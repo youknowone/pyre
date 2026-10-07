@@ -12437,6 +12437,68 @@ pub(crate) fn getset_property_get(
     }
 }
 
+/// `typedef.py GetSetProperty.descr_property_set`'s body, published as
+/// `getset_descriptor.__set__`.
+///
+/// Twin of [`getset_property_get`]: upstream `descr_property_set` is the
+/// descriptor's own interp-level method. `StdObjSpace.setattr` looks up
+/// `__set__` then `get_and_call_function` on this interp2app, which reaches
+/// `self.fset(self, space, w_obj, w_value)`. Naming the body lets the
+/// `__set__` entry call it directly; `baseobjspace::set` does not type-test
+/// `GetSetProperty` (there is no such arm in `setattr` / `set`).
+pub(crate) fn getset_property_set(
+    mut w_self: PyObjectRef,
+    mut w_obj: PyObjectRef,
+    mut w_value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `getset_set` runs `descr_setcheck` ahead of the missing-setter
+    // refusal, so a receiver that is wrong in both respects reports
+    // itself rather than the setter.
+    unsafe { getset_descr_check(w_self, w_obj) }?;
+    let fset = read_fset(w_self);
+    if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
+        return Err(getset_no_accessor(w_self, "writable"));
+    }
+    let mut reqcls = read_reqcls(w_self);
+    if !reqcls.is_null()
+        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
+    {
+        if e.kind == crate::PyErrorKind::DescrMismatch {
+            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
+        }
+        return Err(e);
+    }
+    // typedef.py descr_property_set: `fset(self, space, w_obj, w_value)` —
+    // an interp-level call. `fset` is the typecheck-wrapped setter
+    // Function; `funccall` is `Function.funccall`, which for a
+    // FunctionWithFixedCode BuiltinCode3 is `fastcall_3`.
+    match pyre_object::with_roots!(reqcls, w_obj, w_self, w_value => {
+        crate::function::funccall_result(fset, &[w_self, w_obj, w_value])
+    }) {
+        Ok(_) => Ok(pyre_object::w_none()),
+        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
+            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `typedef.py GetSetProperty.descr_property_set` published as interp2app.
+///
+/// A closure in `init_getset_descriptor_type` is not a member of
+/// `BuiltinCode.func`'s PBC family (`listobject.py` `append` / `__len__`
+/// siblings), so `get_and_call_function` could not descend this gateway.
+pub fn __majit_wrap_getset_descr_property_set(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    getset_property_set(args[0], args[1], args[2])
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_getset_descr_property_set,
+    __majit_wrap_getset_descr_property_set
+);
+
 /// Invoke a getset getter's registered function with the two words
 /// `typedef.py` hands it, under the roots `call_builtin_code_positional`
 /// publishes for the same call: the getter may collect, and both words are
@@ -12517,40 +12579,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__set__",
-            make_builtin_function_with_arity(
-                "__set__",
-                |args| {
-                    let mut w_self = args[0];
-                    let mut w_obj = args[1];
-                    let w_value = args[2];
-                    // `getset_set` runs `descr_setcheck` ahead of the
-                    // missing-setter refusal, so a receiver that is wrong in
-                    // both respects reports itself rather than the setter.
-                    unsafe { getset_descr_check(w_self, w_obj) }?;
-                    let fset = read_fset(w_self);
-                    if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
-                        return Err(getset_no_accessor(w_self, "writable"));
-                    }
-                    let mut reqcls = read_reqcls(w_self);
-                    if !reqcls.is_null()
-                        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
-                    {
-                        if e.kind == crate::PyErrorKind::DescrMismatch {
-                            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
-                        }
-                        return Err(e);
-                    }
-                    match pyre_object::with_roots!(reqcls, w_obj, w_self => crate::call::call_function_impl_result(fset, &[w_self, w_obj, w_value]))
-                    {
-                        Ok(_) => Ok(pyre_object::w_none()),
-                        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
-                            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
-                        }
-                        Err(e) => Err(e),
-                    }
-                },
-                3,
-            ),
+            make_builtin_function_with_arity("__set__", __majit_wrap_getset_descr_property_set, 3),
         )
     };
     // typedef.py GetSetProperty.descr_property_del
@@ -14178,45 +14207,8 @@ fn init_type_type(ns: PyObjectRef) {
         2,
     );
     // typeobject.py descr_set__name__
-    let name_setter = make_builtin_function_with_arity(
-        "__name__",
-        |args| {
-            let mut w_type = args[1];
-            let mut w_value = args[2];
-            // Only heap types may be renamed.
-            check_set_special_type_attr(w_type, w_value, "__name__")?;
-            // typeobject.py:1050 — `space.isinstance_w(w_value, space.w_text)`
-            // accepts str and any str subclass, not only the exact type.
-            if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {
-                return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-                    "can only assign string to ",
-                    unsafe { pyre_object::w_type_get_name(w_type) },
-                    ".__name__, not '",
-                    type_name_of(w_value),
-                    "'"
-                )));
-            }
-            // typeobject.py:1054 text_w — read through the surrogate-aware
-            // WTF-8 view so a lone surrogate does not panic before the
-            // checks below run.
-            let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
-            // typeobject.py:1055 — reject embedded null characters.
-            for cp in wtf8.code_points() {
-                if cp.to_u32() == 0 {
-                    return Err(crate::PyError::value_error(
-                        "type name must not contain null characters",
-                    ));
-                }
-            }
-            // typeobject.py _check_surrogate.
-            pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;
-            // typeobject.py `w_type.name = name` — surrogate-free, so
-            // the str view is valid UTF-8.
-            unsafe { pyre_object::w_type_set_name(w_type, w_value) };
-            Ok(pyre_object::w_none())
-        },
-        3,
-    );
+    let name_setter =
+        make_builtin_function_with_arity("__name__", __majit_wrap_type_descr_set_name, 3);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -14448,6 +14440,52 @@ fn special_type_attr_delete(
     check_set_special_type_attr(args[1], pyre_object::PY_NULL, name)?;
     Ok(pyre_object::w_none())
 }
+
+/// `typeobject.py descr_set__name__` published as the `type.__name__`
+/// GetSetProperty setter.  A closure at the TypeDef site is not a
+/// `BuiltinCode.func` PBC member, so a descended `descr_property_set`
+/// could not look inside this fset.
+pub fn __majit_wrap_type_descr_set_name(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut w_type = args[1];
+    let mut w_value = args[2];
+    // Only heap types may be renamed.
+    check_set_special_type_attr(w_type, w_value, "__name__")?;
+    // typeobject.py descr_set__name__ `space.isinstance_w(w_value, space.w_text)`
+    // accepts str and any str subclass, not only the exact type.
+    if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "can only assign string to ",
+            unsafe { pyre_object::w_type_get_name(w_type) },
+            ".__name__, not '",
+            type_name_of(w_value),
+            "'"
+        )));
+    }
+    // typeobject.py descr_set__name__ text_w — read through the surrogate-aware
+    // WTF-8 view so a lone surrogate does not panic before the
+    // checks below run.
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_value) };
+    // typeobject.py descr_set__name__ `if '\x00' in name` — a byte
+    // search on the utf8/wtf8 payload, not a code-point walk.
+    if wtf8.as_bytes().contains(&0) {
+        return Err(crate::PyError::value_error(
+            "type name must not contain null characters",
+        ));
+    }
+    // typeobject.py _check_surrogate.
+    pyre_object::with_roots!(w_type, w_value => crate::builtins::check_surrogate(w_value))?;
+    // typeobject.py `w_type.name = name` — surrogate-free, so
+    // the str view is valid UTF-8.
+    unsafe { pyre_object::w_type_set_name(w_type, w_value) };
+    Ok(pyre_object::w_none())
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_type_descr_set_name,
+    __majit_wrap_type_descr_set_name
+);
 
 fn type_del_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     special_type_attr_delete(args, "__name__")

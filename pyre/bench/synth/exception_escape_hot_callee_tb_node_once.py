@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11.2
+# pyre-check: max-pypy-ratio=7.2
 # Ubuntu run 33279264115: 5.6x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # A hot compiled CALLEE holding a try block the exception does not stay in used

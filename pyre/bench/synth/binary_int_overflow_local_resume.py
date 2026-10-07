@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=3.9
+# pyre-check: max-pypy-ratio=2.8
 # Overflowing integer operations must resume with the values that were loaded
 # from local slots, including values produced by recursive calls and unpacking.
 
