@@ -10432,6 +10432,11 @@ fn walker_emit_exact_dict_int_hit<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
+    // A virtual dict records `ll_dict_lookup` from the int-strategy body.
+    // This fold reads a concrete table.
+    if ctx.trace_ctx.is_likely_virtual(dict_op) {
+        return Ok(None);
+    }
     let Some(key) = walker_concrete_ref_object(ctx, key_op) else {
         return Ok(None);
     };
@@ -10580,6 +10585,11 @@ pub(crate) fn try_walker_specialize_subscr_int_miss<Sym: WalkSym>(
     r_args: &[OpRef],
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 2 {
+        return Ok(None);
+    }
+    // Same decline as the hit fold: a virtual dict stays on the inlined
+    // getitem body. `Err` here would abort the trace.
+    if ctx.trace_ctx.is_likely_virtual(r_args[0]) {
         return Ok(None);
     }
     let (Some(dict), Some(key)) = (

@@ -2687,6 +2687,8 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "newtuple_from_array"
             | "build_map_from_array"
             | "build_map_from_empty_array"
+            | "dict_display_new"
+            | "dict_display_setitem"
             | "build_set_from_array"
             | "build_string_from_array"
     )
@@ -5046,6 +5048,33 @@ where
                 dst_reg,
             ))
         }
+        "dict_display_new" => {
+            if !op.args.is_empty() {
+                return None;
+            }
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // `ll_newdict`: `inline_call_r_r` of `w_dict_new` with no args.
+            build_orthodox_inline_call_r_r_n(
+                inline_call_targets::DICT_DISPLAY_NEW,
+                Vec::new(),
+                dst_reg,
+            )
+        }
+        "dict_display_setitem" => {
+            if op.args.len() != 3 || op.result.is_some() {
+                return None;
+            }
+            let refs = op
+                .args
+                .iter()
+                .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
+                .collect();
+            // One `BUILD_MAP` pair. `inline_call_r_v`, same shape as `delitem`.
+            build_orthodox_inline_call_r_v(inline_call_targets::DICT_DISPLAY_SETITEM, refs)
+        }
         _ => None,
     }
 }
@@ -6478,7 +6507,7 @@ where
 /// scattered across the arms.  A path this build did not bind is not an
 /// error: [`fully_bound_callee_body`] declines it and the arm keeps its
 /// residual fallback.
-mod inline_call_targets {
+pub(crate) mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
     /// BINARY_SLICE — `lower_binary_slice_hlop_to_insn`.
@@ -6488,6 +6517,10 @@ mod inline_call_targets {
     pub const LEN: &str = "pyre_interpreter::baseobjspace::len";
     /// DELETE_SUBSCR — `lower_delsubscr_hlop_to_insn`.
     pub const DELITEM: &str = "pyre_interpreter::baseobjspace::delitem";
+    /// BUILD_MAP allocation — `lower_tuple_build_hlop_to_insn`.
+    pub const DICT_DISPLAY_NEW: &str = "pyre_object::dictmultiobject::w_dict_new";
+    /// BUILD_MAP insert — `lower_tuple_build_hlop_to_insn`.
+    pub const DICT_DISPLAY_SETITEM: &str = "pyre_interpreter::baseobjspace::dict_display_setitem";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -6543,7 +6576,7 @@ mod inline_call_targets {
 /// build-time descr pool, which a body assembled at build time does not carry
 /// per-jitcode; the pool is installed first because a scan that resolves no
 /// callee also reports no target, which would read here as a clean body.
-fn fully_bound_callee_body(
+pub(crate) fn fully_bound_callee_body(
     canonical_path: &'static str,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();

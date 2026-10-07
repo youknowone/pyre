@@ -3633,9 +3633,10 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     descr
 }
 
-/// The runtime's own descr for a list backing block named by its ARRAY
-/// identity.  The build-time descr pool consults this before minting, so
-/// the GC tid stamped here reaches the shared `_cache_array` slot first.
+/// The runtime's own descr for a list backing block or a `DICTENTRYARRAY`
+/// named by its ARRAY identity.  The build-time descr pool consults this
+/// before minting, so the GC tid stamped here reaches the shared
+/// `_cache_array` slot first.
 pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
     use majit_jitcode::codewriter::jtransform as jt;
     let canonical = jt::canonical_array_type_id(array_type_id);
@@ -3643,8 +3644,60 @@ pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
         jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
         jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
         jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),
+        other if is_i64_pyobject_entries_array(other) => {
+            Some(i64_pyobject_entries_gcarray_descr(other))
+        }
         _ => None,
     }
+}
+
+/// `GcArray<Entry<i64, *mut PyObject>>` — the integer-dict `DICTENTRYARRAY`
+/// (`get_ll_dict` / `_ll_malloc_entries`).
+fn is_i64_pyobject_entries_array(array_type_id: &str) -> bool {
+    let inner = array_type_id
+        .strip_prefix("GcArray<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(array_type_id);
+    let leaf = inner.rsplit("::").next().unwrap_or(inner);
+    leaf.starts_with("Entry<i64") && (leaf.contains("PyObject") || leaf.contains("pyobject"))
+}
+
+/// `cpu.arraydescrof(ENTRIES)` for the integer-dict entry buffer.
+///
+/// Stamps `i64_pyobject_entries_gc_type_id` onto the shared
+/// `_cache_array` slot so `NEW_ARRAY_CLEAR` allocates with the
+/// collector layout that scans each entry's `value`, rather than an
+/// analyzer-minted sequential tid that `init_array_descr` assigned.
+fn i64_pyobject_entries_gcarray_descr(array_type_id: &str) -> DescrRef {
+    use majit_ir::descr::{ArrayFlag, LLType};
+    use majit_ir::{ArrayDescr, Descr};
+    type K = i64;
+    type V = pyre_object::PyObjectRef;
+    let base_size = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, items);
+    let item_size = std::mem::size_of::<pyre_object::rordereddict::Entry<K, V>>();
+    let len_offset = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, length);
+    let tid = pyre_object::rordereddict::i64_pyobject_entries_gc_type_id();
+    let key = LLType::Array(majit_ir::descr::path_hash(array_type_id));
+    let descr = {
+        let mut cache = majit_ir::descr::gc_cache().lock();
+        cache.get_array_descr(
+            key,
+            base_size,
+            item_size,
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            len_offset,
+            false,
+            '\x00',
+        )
+    };
+    if tid != 0 {
+        if let Some(ad) = descr.as_array_descr() {
+            ad.set_type_id(tid);
+        }
+    }
+    descr
 }
 
 /// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block

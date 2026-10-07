@@ -29,7 +29,8 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState,
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, GraphFlattener, Kind, ResKind, SSARepr, slot_for_call_flavor,
+    CallDescrStub, CallFlavor, GraphFlattener, Kind, ResKind, SSARepr, fully_bound_callee_body,
+    inline_call_targets, slot_for_call_flavor,
 };
 
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
@@ -12132,13 +12133,11 @@ impl CodeWriter {
                         // BuildMap(count): pops count key-value pairs (2*count
                         // stack items), pushes 1 dict. Net: -(2*count - 1).
                         //
-                        // Mirrors BuildTuple's `new_array_clear` + unrolled
-                        // `setarrayitem_gc_r` array build (`pyframe.py`),
-                        // then a single `build_map_from_array` residual consuming
-                        // the forced `[k0, v0, k1, v1, ...]` array. No arity cap:
-                        // the length travels in the array.  count 0 (`{}`) takes
-                        // the same path as every other count, exactly like
-                        // BuildSet: an empty array yields an empty dict.
+                        // When `w_dict_new` and `dict_display_setitem` are fully
+                        // bound, record `ll_newdict` plus one setitem per pair
+                        // (`[k0, v0, k1, v1, ...]`). Otherwise keep the pair
+                        // array and the `build_map_from_array` residual, or
+                        // `build_map_from_empty_array` for count 0 (`{}`).
                         Instruction::BuildMap { count } => {
                             let nitems = count.get(op_arg) as usize * 2;
                             let mut item_values_rev = Vec::with_capacity(nitems);
@@ -12151,48 +12150,79 @@ impl CodeWriter {
                             // bottom-to-top order, so reverse the pop order.
                             let items: Vec<super::flow::FlowValue> =
                                 item_values_rev.into_iter().rev().collect();
-                            let array_var = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "new_array_clear",
-                                vec![
-                                    super::flow::FlowValue::Constant(
-                                        super::flow::Constant::signed(nitems as i64),
+                            let display_bound =
+                                fully_bound_callee_body(inline_call_targets::DICT_DISPLAY_NEW)
+                                    .is_some()
+                                    && fully_bound_callee_body(
+                                        inline_call_targets::DICT_DISPLAY_SETITEM,
                                     )
-                                    .into(),
-                                ],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            for (i, item) in items.into_iter().enumerate() {
-                                emit_graph_op_void(
+                                    .is_some();
+                            let result_value = if display_bound {
+                                let dict_value = emit_graph_op_with_result(
+                                    &mut graph,
                                     &current_block.block(),
-                                    "setarrayitem_gc_r",
-                                    vec![
-                                        super::flow::FlowValue::Variable(array_var).into(),
-                                        super::flow::FlowValue::Constant(
-                                            super::flow::Constant::signed(i as i64),
-                                        )
-                                        .into(),
-                                        item.into(),
-                                    ],
+                                    "dict_display_new",
+                                    vec![],
+                                    Kind::Ref,
                                     py_pc as i64,
                                 );
-                            }
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                // `space.newdict()` alone when there is no
-                                // pair to `space.setitem`.
-                                if nitems == 0 {
-                                    "build_map_from_empty_array"
-                                } else {
-                                    "build_map_from_array"
-                                },
-                                vec![super::flow::FlowValue::Variable(array_var).into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
+                                for pair in items.chunks_exact(2) {
+                                    emit_graph_op_void(
+                                        &current_block.block(),
+                                        "dict_display_setitem",
+                                        vec![
+                                            super::flow::FlowValue::Variable(dict_value).into(),
+                                            pair[0].clone().into(),
+                                            pair[1].clone().into(),
+                                        ],
+                                        py_pc as i64,
+                                    );
+                                }
+                                dict_value
+                            } else {
+                                let array_var = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "new_array_clear",
+                                    vec![
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(nitems as i64),
+                                        )
+                                        .into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                for (i, item) in items.into_iter().enumerate() {
+                                    emit_graph_op_void(
+                                        &current_block.block(),
+                                        "setarrayitem_gc_r",
+                                        vec![
+                                            super::flow::FlowValue::Variable(array_var).into(),
+                                            super::flow::FlowValue::Constant(
+                                                super::flow::Constant::signed(i as i64),
+                                            )
+                                            .into(),
+                                            item.into(),
+                                        ],
+                                        py_pc as i64,
+                                    );
+                                }
+                                emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    // `space.newdict()` alone when there is no
+                                    // pair to `space.setitem`.
+                                    if nitems == 0 {
+                                        "build_map_from_empty_array"
+                                    } else {
+                                        "build_map_from_array"
+                                    },
+                                    vec![super::flow::FlowValue::Variable(array_var).into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                )
+                            };
                             // Physically write the accumulator into its
                             // value-stack slot rather than only bumping the
                             // symbolic depth: `SET_ADD` / `MAP_ADD` read the
