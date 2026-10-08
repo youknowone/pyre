@@ -4374,7 +4374,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Result<FunctionGraph, LowerError> {
-    let u = fd.unstructured().ok_or_else(|| {
+    let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
             "{}: no Unstructured body (extracted with --ullbc?)",
             fd.item_meta.name_path()
