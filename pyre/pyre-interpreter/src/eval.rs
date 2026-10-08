@@ -2552,14 +2552,6 @@ pub fn prepare_frame_resume_for_dispatch(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    if let Some(slot) = resume.input_root_slot {
-        let current = pyre_object::gc_roots::shadow_stack_get(slot);
-        resume.w_inputvalue = if current.is_null() {
-            None
-        } else {
-            Some(current)
-        };
-    }
     match prepare_frame_resume(
         frame,
         resume.w_inputvalue.take(),
@@ -2598,7 +2590,6 @@ pub(crate) fn eval_frame_plain_with_resume(
     frame.fix_array_ptrs();
     let mut resume = crate::call::FrameResumeArgs {
         w_inputvalue,
-        input_root_slot: None,
         operr,
         throw_args,
     };
@@ -2643,7 +2634,15 @@ pub(crate) fn eval_frame_plain_with_resume(
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
         // the handle across the hook and write it back before the resume
-        // reads it.
+        // reads it. `w_inputvalue` is `resume_execute_frame`'s `w_arg_or_err`
+        // (`pyframe.py`); the hook can move it, so the shadow-stack slot is
+        // the live word after `call_trace`.
+        let input_pin = resume.w_inputvalue.map(|value| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = roots.base();
+            let _ = roots.pin_root(value);
+            (roots, slot)
+        });
         if let Some(err) = resume.operr.take() {
             let roots = pyre_object::gc_roots::push_roots();
             let mut err = err;
@@ -2653,10 +2652,20 @@ pub(crate) fn eval_frame_plain_with_resume(
             resume.operr = Some(err);
             drop(roots);
             if let Err(e) = trace {
+                drop(input_pin);
                 return (Err(e), pyre_object::w_none());
             }
         } else if let Err(e) = execution_context.call_trace(frame_anchor.live()) {
+            drop(input_pin);
             return (Err(e), pyre_object::w_none());
+        }
+        if let Some((roots, slot)) = &input_pin {
+            let current = roots.get(*slot);
+            resume.w_inputvalue = if current.is_null() {
+                None
+            } else {
+                Some(current)
+            };
         }
         let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };

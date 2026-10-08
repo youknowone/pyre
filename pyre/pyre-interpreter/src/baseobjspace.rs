@@ -22085,36 +22085,16 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
         None => None,
     };
-    // `next`/`send` carry no operation error. Resume through the registered
-    // one-word helper so the walk does not abort on `execute_generator_frame`
-    // and does not hold a pointer to this frame's resume struct.
-    let executed = if operr.is_none() && throw_args.is_none() {
-        let input = match w_inputvalue {
-            Some(value) => value,
-            None => pyre_object::PY_NULL,
-        };
-        let value = crate::call::eval_resumed_frame_raw(
-            &mut *crate::eval::frame_anchor_live(frame_depth),
-            input,
-        );
-        if value.is_null() {
-            Err(crate::call::take_call_error()
-                .unwrap_or_else(|| crate::PyError::runtime_error("generator resume failed")))
-        } else {
-            Ok(value)
-        }
-    } else {
-        let mut resume = crate::call::FrameResumeArgs {
-            w_inputvalue,
-            input_root_slot: None,
-            operr,
-            throw_args,
-        };
-        crate::call::get_eval_fn()(
-            &mut *crate::eval::frame_anchor_live(frame_depth),
-            Some(&mut resume),
-        )
-    };
+    // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
+    // `execute_generator_frame` is look-inside and dispatches through
+    // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver
+    // to every frame. `pyframe.py execute_frame` / `resume_execute_frame`
+    // carry no `dont_look_inside`.
+    let executed = (*crate::eval::frame_anchor_live(frame_depth)).execute_generator_frame(
+        w_inputvalue,
+        operr,
+        throw_args,
+    );
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell

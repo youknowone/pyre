@@ -197,10 +197,6 @@ use crate::pyframe::PyFrame;
 /// one caller that resumes a frame.
 pub struct FrameResumeArgs {
     pub w_inputvalue: Option<PyObjectRef>,
-    /// Shadow-stack slot holding `w_inputvalue` when the caller published it.
-    /// `prepare_frame_resume_for_dispatch` reloads from here after callbacks
-    /// that can move the object. `None` means the pointer was not published.
-    pub input_root_slot: Option<usize>,
     pub operr: Option<crate::PyError>,
     pub throw_args: Option<([PyObjectRef; 3], usize)>,
 }
@@ -479,39 +475,6 @@ pub fn current_eval_fn_addr() -> usize {
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     clear_call_error();
     match get_eval_fn()(frame, None) {
-        Ok(value) => value,
-        Err(error) => {
-            set_call_error(error);
-            PY_NULL
-        }
-    }
-}
-
-/// Resume a suspended frame through the same one-word residual ABI.
-///
-/// `w_inputvalue` null means no sent value (`Option::None`). A sent `None`
-/// is `w_none`, not null. `operr` / `throw_args` stay with the caller: this
-/// residual is only the `next`/`send` path, whose resume payload is one
-/// object. A pointer to the caller's `FrameResumeArgs` would be the stack
-/// address observed while tracing, and the compiled loop would keep calling
-/// it after that frame is gone.
-#[majit_macros::dont_look_inside]
-pub fn eval_resumed_frame_raw(frame: &mut PyFrame, w_inputvalue: PyObjectRef) -> PyObjectRef {
-    // `get_eval_fn` can collect while the sent value is still live.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::publish_roots(&[w_inputvalue]);
-    let rooted = pyre_object::gc_roots::shadow_stack_get(slot);
-    let mut resume = FrameResumeArgs {
-        w_inputvalue: if rooted.is_null() { None } else { Some(rooted) },
-        // Profiling callbacks inside the evaluator can collect before the
-        // resume payload is consumed. The slot is what the collector
-        // forwards; the copy above is only the pre-callback value.
-        input_root_slot: Some(slot),
-        operr: None,
-        throw_args: None,
-    };
-    clear_call_error();
-    match get_eval_fn()(frame, Some(&mut resume)) {
         Ok(value) => value,
         Err(error) => {
             set_call_error(error);

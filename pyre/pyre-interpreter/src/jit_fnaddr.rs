@@ -2703,11 +2703,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::call::eval_current_frame_raw",
         crate::call::eval_current_frame_raw,
     );
-    p2(
-        &mut entries,
-        "pyre_interpreter::call::eval_resumed_frame_raw",
-        crate::call::eval_resumed_frame_raw,
-    );
     // Generator completion residualizes `PyFrame::clear_references`. The
     // symbolic path the codewriter records is the impl-method key.
     p1(

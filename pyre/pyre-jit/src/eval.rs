@@ -9884,6 +9884,17 @@ fn portal_activation_bracketed(
     // native carrier and write the slots back before the resume reads
     // them.
     let mut resume = resume;
+    // `pyframe.py execute_frame` keeps `w_arg_or_err` as a GC local across
+    // `call_trace`. Pin the sent value the same way `operr` is pinned: the
+    // hook can collect, and `resume_execute_frame` reads the live word.
+    let input_pin = resume.as_ref().and_then(|resume| {
+        resume.w_inputvalue.map(|value| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = roots.base();
+            let _ = roots.pin_root(value);
+            (roots, slot)
+        })
+    });
     let operr_pin = resume.as_mut().and_then(|resume| {
         resume.operr.as_mut().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
@@ -9894,6 +9905,7 @@ fn portal_activation_bracketed(
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => {
             drop(operr_pin);
+            drop(input_pin);
             Err(err)
         }
         Ok(()) => {
@@ -9904,6 +9916,16 @@ fn portal_activation_bracketed(
                 err.reload(roots, *slot);
             }
             drop(operr_pin);
+            if let Some((roots, slot)) = &input_pin
+                && let Some(resume) = resume.as_mut()
+            {
+                let current = roots.get(*slot);
+                resume.w_inputvalue = if current.is_null() {
+                    None
+                } else {
+                    Some(current)
+                };
+            }
             // `self.resume_execute_frame(w_arg_or_err)` and its
             // `except pyopcode.Yield` arm, in `execute_frame`'s inner `try`: a
             // resumed frame is positioned mid-body and the sent value belongs
