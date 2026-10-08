@@ -1648,8 +1648,10 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
     assert!(!body_has_returning_handler(&reraise_body));
 
     // Mixed return/reraise: goto_if_not from the handler to void_return,
-    // fall-through reraise. Classify as Unproven so except-as-return
-    // admit does not walk it without `inline_poison_pcs`.
+    // fall-through reraise. `except E as e: return` is this shape —
+    // CHECK_EXC_MATCH miss reraises, match returns. `perform_call`
+    // traces the taken return; poison_confined stays off because the
+    // reraise arm is a guard side-exit, not a Returns-only region.
     let goto_if_not = insns["goto_if_not/iL"];
     let mixed_body = [
         int_copy,
@@ -1666,8 +1668,11 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
         reraise,
         void_return,
     ];
-    assert_eq!(exc_handler_shape(&mixed_body, 7), ExcHandlerShape::Unproven);
-    assert!(!body_has_returning_handler(&mixed_body));
+    assert_eq!(
+        exc_handler_shape(&mixed_body, 7),
+        ExcHandlerShape::ExceptAsReturn
+    );
+    assert!(body_has_returning_handler(&mixed_body));
     assert!(!poison_confined_to_returning_handlers(&mixed_body, &[7]));
     assert!(!poison_confined_to_reraise_handlers(&mixed_body, &[7]));
 
@@ -1692,9 +1697,9 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
     ];
     assert_eq!(
         exc_handler_shape(&mismatch_body, 7),
-        ExcHandlerShape::Unproven
+        ExcHandlerShape::ExceptAsReturn
     );
-    assert!(!body_has_returning_handler(&mismatch_body));
+    assert!(body_has_returning_handler(&mismatch_body));
 
     // except-as-return does not install `inline_poison_pcs`, so a Dirty
     // happy path plus an unrelated returning handler must decline.
