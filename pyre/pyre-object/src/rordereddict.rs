@@ -35,16 +35,16 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use crate::pyobject::PyObjectRef;
 
 use crate::object_array::{
-    alloc_typed_items_block, dealloc_typed_items_block, gc_int_array_gc_type_id,
-    typed_items_block_capacity, typed_items_block_items_base, TypedItemsBlock,
+    TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block, gc_int_array_gc_type_id,
+    typed_items_block_capacity, typed_items_block_items_base,
 };
 
 pub use crate::rordereddict_entries::{
-    alloc_entries, entries_allocated_len, entries_item_ptr, i64_pyobject_entries_gc_type_id,
+    Entry, EntryDummy, GcEntries, GcEntriesType, GcRefOffsets, alloc_entries,
+    entries_allocated_len, entries_item_ptr, i64_pyobject_entries_gc_type_id, ll_arraycopy,
     set_bytes_key_pyobject_entries_gc_type_id, set_i64_pyobject_entries_gc_type_id,
     set_identity_key_pyobject_entries_gc_type_id, set_object_key_pyobject_entries_gc_type_id,
-    set_object_key_unit_entries_gc_type_id, set_str_key_pyobject_entries_gc_type_id, Entry,
-    EntryDummy, GcEntries, GcEntriesType, GcRefOffsets,
+    set_object_key_unit_entries_gc_type_id, set_str_key_pyobject_entries_gc_type_id,
 };
 
 /// An index slot naming no entry, and one whose entry has been deleted.
@@ -389,7 +389,7 @@ impl<K, V, S> RDict<K, V, S> {
             return d;
         }
         // `_ll_malloc_entries` for the estimate `ll_newdict_size` allocates.
-        d.set_entries(alloc_entries::<K, V>(capacity));
+        d.entries = alloc_entries::<K, V>(capacity);
         let mut size = DICT_INITSIZE;
         while size <= (capacity + 1) * 2 {
             size *= 2;
@@ -474,23 +474,14 @@ impl<K, V, S> RDict<K, V, S> {
         }
     }
 
-    /// `d.entries = new` is a `setfield_gc` on this table. Remember the
-    /// table so a young `DICTENTRYARRAY` is found by the next minor
-    /// (`write_barrier` / `remember_young_pointer`).
-    #[inline]
-    fn set_entries(&mut self, newitems: *mut GcEntries<K, V>) {
-        self.entries = newitems;
-        crate::gc_hook::try_gc_write_barrier(self as *const Self as *mut u8);
-    }
-
     /// `ll_dict_copy` into a table that is already a GC object.
     ///
     /// `_ll_malloc_entries` for the dest array may collect; both tables
     /// and the source array stay on the shadow stack for that malloc.
     pub fn copy_from(&mut self, src: &Self)
     where
-        K: Copy,
-        V: Copy,
+        K: Copy + GcRefOffsets,
+        V: Copy + GcRefOffsets,
         S: Clone,
         (K, V): GcEntriesType,
     {
@@ -502,10 +493,15 @@ impl<K, V, S> RDict<K, V, S> {
             std::ptr::null_mut()
         } else {
             let entries = alloc_entries::<K, V>(n);
-            src.copy_entries_prefix(entries, src.num_ever_used_items);
+            // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
+            // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
+            unsafe {
+                ll_arraycopy(src.entries, entries, 0, 0, src.num_ever_used_items);
+            }
             entries
         };
-        self.set_entries(entries);
+        self.barrier_self();
+        self.entries = entries;
         let entries_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
         let fresh = src.clone_index_block();
@@ -528,28 +524,6 @@ impl<K, V, S> RDict<K, V, S> {
     #[inline]
     pub fn entries_gc_ptr(&self) -> crate::PyObjectRef {
         self.entries as crate::PyObjectRef
-    }
-
-    /// `rgc.py ll_arraycopy`: `writebarrier_before_copy` then memcpy of
-    /// `n` used entries from this table into `dest`.
-    fn copy_entries_prefix(&self, dest: *mut GcEntries<K, V>, n: usize) {
-        if n == 0 || dest.is_null() || self.entries.is_null() {
-            return;
-        }
-        if crate::gc_hook::try_gc_owns_object(self.entries as *mut u8)
-            && crate::gc_hook::try_gc_owns_object(dest as *mut u8)
-        {
-            let _ = majit_gc::gc_writebarrier_before_copy(
-                majit_ir::GcRef(self.entries as usize),
-                majit_ir::GcRef(dest as usize),
-                0,
-                0,
-                n,
-            );
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.entry_ptr(), entries_item_ptr(dest), n);
-        }
     }
 
     /// `setfield_gc(d, 'entries')` write barrier on the dict itself, taken
@@ -1138,8 +1112,8 @@ where
 /// `ll_dict_grow`. look_inside_iff(isvirtual(d)).
 pub fn ll_dict_grow<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1152,8 +1126,8 @@ where
 
 fn ll_dict_grow_orig<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1165,9 +1139,13 @@ where
     let _roots = crate::gc_roots::push_roots();
     d.pin_table_and_entries();
     let newitems = alloc_entries::<K, V>(new_allocated);
-    let n = d.num_ever_used_items;
-    d.copy_entries_prefix(newitems, n);
-    d.set_entries(newitems);
+    // rordereddict.py `ll_dict_grow`: `rgc.ll_arraycopy(d.entries,
+    // newitems, 0, 0, len(d.entries))`.
+    unsafe {
+        ll_arraycopy(d.entries, newitems, 0, 0, d.allocated_len());
+    }
+    d.barrier_self();
+    d.entries = newitems;
     d.generation = d.generation.wrapping_add(1);
     false
 }
@@ -1176,8 +1154,8 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_grow_trampoline<K, V, S>(d: &mut RDict<K, V, S>) -> bool
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1403,11 +1381,7 @@ where
         Q: Equivalent<K> + ?Sized,
     {
         let i = ll_dict_lookup(self, hash, key);
-        if i < 0 {
-            None
-        } else {
-            Some(i as usize)
-        }
+        if i < 0 { None } else { Some(i as usize) }
     }
 
     /// `ll_dict_lookup(d, key, hash, FLAG_STORE)`.
@@ -1715,8 +1689,8 @@ where
     /// `ll_dict_grow`. Returns whether the index was rebuilt (compaction).
     fn dict_grow(&mut self) -> bool
     where
-        K: Copy + EntryDummy,
-        V: Copy + EntryDummy,
+        K: Copy + EntryDummy + GcRefOffsets,
+        V: Copy + EntryDummy + GcRefOffsets,
         (K, V): GcEntriesType,
     {
         ll_dict_grow(self)
@@ -1909,7 +1883,7 @@ where
             return RDict::with_hasher(S2::default());
         }
         let mut dst = RDict::with_hasher(S2::default());
-        dst.set_entries(alloc_entries::<K2, V>(n));
+        dst.entries = alloc_entries::<K2, V>(n);
         let mut live = 0usize;
         for slot in 0..n {
             if !self.entry_valid(slot) {
@@ -1964,7 +1938,7 @@ where
             return Self::with_hasher(S::default());
         }
         let mut dst = Self::with_hasher(S::default());
-        dst.set_entries(alloc_entries::<K, V>(n));
+        dst.entries = alloc_entries::<K, V>(n);
         let mut nlive = 0usize;
         for slot in 0..n {
             if !live[slot] {
@@ -1999,7 +1973,8 @@ where
 
     pub fn reserve(&mut self, additional: usize)
     where
-        K: Copy,
+        K: Copy + GcRefOffsets,
+        V: Copy + GcRefOffsets,
         (K, V): GcEntriesType,
     {
         let entries_capacity = self.allocated_len();
@@ -2009,9 +1984,11 @@ where
             let _roots = crate::gc_roots::push_roots();
             self.pin_table_and_entries();
             let newitems = alloc_entries::<K, V>(new_n);
-            let n = self.num_ever_used_items;
-            self.copy_entries_prefix(newitems, n);
-            self.set_entries(newitems);
+            unsafe {
+                ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
+            }
+            self.barrier_self();
+            self.entries = newitems;
             self.generation = self.generation.wrapping_add(1);
         }
         let want = (self.num_live_items + additional) * 2;
@@ -2086,8 +2063,8 @@ where
 /// `ll_dict_copy`: allocate `len(d.entries)` items, copy the used prefix, barrier.
 impl<K, V, S> Clone for RDict<K, V, S>
 where
-    K: Copy,
-    V: Copy,
+    K: Copy + GcRefOffsets,
+    V: Copy + GcRefOffsets,
     S: Clone,
     (K, V): GcEntriesType,
 {
@@ -2099,7 +2076,11 @@ where
             std::ptr::null_mut()
         } else {
             let entries = alloc_entries::<K, V>(n);
-            self.copy_entries_prefix(entries, self.num_ever_used_items);
+            // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
+            // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
+            unsafe {
+                ll_arraycopy(self.entries, entries, 0, 0, self.num_ever_used_items);
+            }
             entries
         };
         Self {

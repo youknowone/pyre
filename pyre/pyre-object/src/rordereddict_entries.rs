@@ -251,6 +251,111 @@ where
     entries
 }
 
+/// rgc.py `copy_struct_item` / `CopyStructEntry.specialize_call`:
+/// `getinteriorfield` then `setinteriorfield` per `DICTENTRY` field, in
+/// `get_ll_dict` `entryfields` order (`key`, `f_valid`, `value`, `f_hash`).
+/// A GC pointer field is `framework.py` `var_needs_set_transform` /
+/// `var_needsgc` then `transform_generic_set` / `_set_into_gc_array_part`:
+/// `write_barrier_from_array` then the store. [`GcRefOffsets`] empty means
+/// the field is not a GC pointer, so that instantiation has no barrier.
+/// `CopyStructEntry` inlines those ops into the caller.
+#[inline(always)]
+unsafe fn copy_struct_item<K: Copy + GcRefOffsets, V: Copy + GcRefOffsets>(
+    source: *mut GcEntries<K, V>,
+    dest: *mut GcEntries<K, V>,
+    si: usize,
+    di: usize,
+) {
+    let src = entries_item_ptr(source);
+    let dst = entries_item_ptr(dest);
+    unsafe {
+        if !K::GC_REF_OFFSETS.is_empty() && crate::gc_hook::try_gc_owns_object(dest as *mut u8) {
+            majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(dest as usize), di);
+        }
+        (*dst.add(di)).key = (*src.add(si)).key;
+        (*dst.add(di)).f_valid = (*src.add(si)).f_valid;
+        if !V::GC_REF_OFFSETS.is_empty() && crate::gc_hook::try_gc_owns_object(dest as *mut u8) {
+            majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(dest as usize), di);
+        }
+        (*dst.add(di)).value = (*src.add(si)).value;
+        (*dst.add(di)).f_hash = (*src.add(si)).f_hash;
+    }
+}
+
+/// rgc.py `copy_item`: `ARRAY.OF` is the `odictentry` struct, so
+/// `copy_struct_item`.
+#[inline(always)]
+unsafe fn copy_item<K: Copy + GcRefOffsets, V: Copy + GcRefOffsets>(
+    source: *mut GcEntries<K, V>,
+    dest: *mut GcEntries<K, V>,
+    si: usize,
+    di: usize,
+) {
+    unsafe {
+        copy_struct_item(source, dest, si, di);
+    }
+}
+
+/// `rgc.py ll_arraycopy` for the `DICTENTRYARRAY` (`GcEntries<K, V>`).
+///
+/// Upstream's `@specialize.ll()` gives every ARRAY its own `ll_arraycopy`
+/// graph, and the `length <= 1` `copy_item` head ("Hack to ensure that we
+/// get a proper effectinfo.write_descrs_arrays") is the `setinteriorfield`
+/// writeanalyze reads that ARRAY's interior-field effects off.
+/// [`crate::object_array::jit_ll_arraycopy`] copies items as `PyObjectRef`;
+/// a `DICTENTRY` is a struct, so this graph does the write barrier and
+/// memcpy itself.
+///
+/// # Safety
+/// `source` and `dest` are live `GcEntries` and both ranges are in bounds.
+pub unsafe fn ll_arraycopy<K: Copy + GcRefOffsets, V: Copy + GcRefOffsets>(
+    source: *mut GcEntries<K, V>,
+    dest: *mut GcEntries<K, V>,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) {
+    if length <= 1 {
+        if length == 1 {
+            unsafe {
+                copy_item(source, dest, source_start, dest_start);
+            }
+        }
+        return;
+    }
+    let mut slowpath = false;
+    if crate::gc_hook::try_gc_owns_object(dest as *mut u8) {
+        if crate::gc_hook::try_gc_owns_object(source as *mut u8) {
+            slowpath = !majit_gc::gc_writebarrier_before_copy(
+                majit_ir::GcRef(source as usize),
+                majit_ir::GcRef(dest as usize),
+                source_start,
+                dest_start,
+                length,
+            );
+        } else {
+            slowpath = true;
+        }
+    }
+    if slowpath {
+        let mut i = 0usize;
+        while i < length {
+            unsafe {
+                copy_item(source, dest, source_start + i, dest_start + i);
+            }
+            i += 1;
+        }
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            entries_item_ptr(source).add(source_start),
+            entries_item_ptr(dest).add(dest_start),
+            length,
+        );
+    }
+}
+
 #[cfg(test)]
 impl GcEntriesType for (u64, u64) {
     fn entries_gc_type_id() -> u32 {
@@ -344,5 +449,70 @@ mod tests {
             vec![unit_key + std::mem::offset_of!(Key, obj)]
         );
         assert!(<()>::GC_REF_OFFSETS.is_empty());
+    }
+
+    #[test]
+    fn ll_arraycopy_length_one_copies_each_entry_field() {
+        let source = alloc_entries::<u64, u64>(2);
+        let dest = alloc_entries::<u64, u64>(2);
+        unsafe {
+            let src = entries_item_ptr(source);
+            (*src.add(1)).key = 11;
+            (*src.add(1)).f_valid = true;
+            (*src.add(1)).value = 22;
+            (*src.add(1)).f_hash = 33;
+            ll_arraycopy(source, dest, 1, 0, 1);
+            let dst = entries_item_ptr(dest);
+            assert_eq!((*dst).key, 11);
+            assert!((*dst).f_valid);
+            assert_eq!((*dst).value, 22);
+            assert_eq!((*dst).f_hash, 33);
+            assert!(!(*dst.add(1)).f_valid);
+            assert_eq!((*dst.add(1)).key, 0);
+            assert_eq!((*dst.add(1)).value, 0);
+            assert_eq!((*dst.add(1)).f_hash, 0);
+        }
+    }
+
+    #[test]
+    fn ll_arraycopy_length_zero_is_a_no_op() {
+        let source = alloc_entries::<u64, u64>(1);
+        let dest = alloc_entries::<u64, u64>(1);
+        unsafe {
+            (*entries_item_ptr(source)).key = 7;
+            (*entries_item_ptr(source)).f_valid = true;
+            (*entries_item_ptr(source)).value = 8;
+            (*entries_item_ptr(source)).f_hash = 9;
+            ll_arraycopy(source, dest, 0, 0, 0);
+            let dst = &*entries_item_ptr(dest);
+            assert!(!dst.f_valid);
+            assert_eq!(dst.key, 0);
+            assert_eq!(dst.value, 0);
+            assert_eq!(dst.f_hash, 0);
+        }
+    }
+
+    #[test]
+    fn ll_arraycopy_copies_a_prefix() {
+        let source = alloc_entries::<u64, u64>(3);
+        let dest = alloc_entries::<u64, u64>(3);
+        unsafe {
+            let src = entries_item_ptr(source);
+            for i in 0..3 {
+                (*src.add(i)).key = 10 + i as u64;
+                (*src.add(i)).f_valid = true;
+                (*src.add(i)).value = 20 + i as u64;
+                (*src.add(i)).f_hash = 30 + i as u64;
+            }
+            ll_arraycopy(source, dest, 0, 0, 3);
+            let dst = entries_item_ptr(dest);
+            for i in 0..3 {
+                let entry = &*dst.add(i);
+                assert_eq!(entry.key, 10 + i as u64);
+                assert!(entry.f_valid);
+                assert_eq!(entry.value, 20 + i as u64);
+                assert_eq!(entry.f_hash, 30 + i as u64);
+            }
+        }
     }
 }
