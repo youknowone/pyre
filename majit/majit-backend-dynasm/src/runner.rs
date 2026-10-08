@@ -568,6 +568,9 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_get_typeids_text(Some(dynasm_get_typeids_text));
     majit_gc::set_active_get_typeids_list(Some(dynasm_get_typeids_list));
     majit_gc::set_active_add_memory_pressure(Some(dynasm_add_memory_pressure));
+    majit_gc::set_active_maybe_collect_for_external_malloc(Some(
+        dynasm_maybe_collect_for_external_malloc,
+    ));
     majit_gc::set_active_total_memory_pressure(Some(dynasm_total_memory_pressure));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
@@ -1210,6 +1213,13 @@ fn dynasm_add_memory_pressure(size: isize, object: GcRef) {
     } else {
         majit_gc::gc_sync::gc_op_with_root(object, |g, object| g.add_memory_pressure(size, object));
     }
+}
+
+fn dynasm_maybe_collect_for_external_malloc(totalsize: usize) -> bool {
+    if let Some(result) = gc_box::with_mut(|g| g.maybe_collect_for_external_malloc(totalsize)) {
+        return result;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.maybe_collect_for_external_malloc(totalsize))
 }
 
 fn dynasm_total_memory_pressure() -> isize {

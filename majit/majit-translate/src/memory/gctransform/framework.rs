@@ -441,6 +441,9 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::collect_generation",
     "majit_gc::collect_step",
     "majit_gc::collect_oldgen_nonmoving",
+    // `external_malloc`'s `threshold_reached` collection, for a host object
+    // whose payload is charged as memory pressure instead of allocated.
+    "majit_gc::maybe_collect_for_external_malloc",
     // The host hook the interpreter reaches them through.
     "gc_hook::try_gc_alloc_collecting_rooted",
     // A requested collection, which is the one collection point an interpreter

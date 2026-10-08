@@ -181,16 +181,23 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     };
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
-    account_buffer_growth(crate::gc_roots::shadow_stack_get(obj_slot), alloc);
-    // `ByteBuffer.__init__` is a GC list malloc; `external_malloc` then
-    // runs `minor_collection_with_major_progress` when `threshold_reached`.
-    // The `Vec` payload sits outside `get_total_memory_used`, so
-    // `raw_malloc_memory_pressure` is what moves the threshold.
-    // That helper cannot collect; `collect(0)` is the malloc's collection
-    // at this constructor safepoint.
-    if alloc > 0 && crate::gc_hook::try_gc_major_threshold_reached() {
-        crate::gc_hook::try_gc_collect(0);
+    // `ByteBuffer.__init__` is a GC list malloc; `external_malloc` tests
+    // `threshold_reached(raw_malloc_usage(totalsize))` then
+    // `minor_collection_with_major_progress(totalsize + nursery_size/2)`
+    // with `force_enabled=False`. The `Vec` payload sits outside
+    // `get_total_memory_used`, so that check runs here before
+    // `raw_malloc_memory_pressure` charges it. Explicit `collect(0)`
+    // would pass `force_enabled=True` and advance a major while
+    // `gc.disable()` is in effect.
+    //
+    // `major_collection_step` raises `MemoryError` out of `external_malloc`
+    // when the heap limit is hit. The body is already allocated here, so
+    // there is no allocation to fail: the exception is owed at the next
+    // dispatch, as for any collection with none waiting.
+    if alloc > 0 && majit_gc::maybe_collect_for_external_malloc(alloc) {
+        majit_ir::eval_breaker_word::set_memory_error();
     }
+    account_buffer_growth(crate::gc_roots::shadow_stack_get(obj_slot), alloc);
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 

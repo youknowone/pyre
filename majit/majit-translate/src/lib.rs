@@ -2635,6 +2635,7 @@ fn analyze_pipeline_from_module_paths(
         "collect_full",
         "collect_step",
         "collect_oldgen_nonmoving",
+        "maybe_collect_for_external_malloc",
     ] {
         call_control.mark_canmallocgc(parse::CallPath::from_segments(["majit_gc", gc_entry]));
     }

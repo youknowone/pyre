@@ -1690,7 +1690,7 @@ impl MiniMarkGC {
         // already present a complete root set at an allocation; the young birth
         // adds no requirement they do not already meet.
         if total_size >= self.config.large_object_threshold {
-            if self.maybe_collect_for_external_malloc(total_size) {
+            if self.do_maybe_collect_for_external_malloc(total_size) {
                 return GcRef(0);
             }
             // `external_malloc` (`incminimark.py`): `arena_malloc` returning
@@ -1948,7 +1948,7 @@ impl MiniMarkGC {
             for i in 0..root_count {
                 unsafe { self.roots.add(roots.add(i)) };
             }
-            let oom = self.maybe_collect_for_external_malloc(total_size);
+            let oom = self.do_maybe_collect_for_external_malloc(total_size);
             for i in (0..root_count).rev() {
                 self.roots.remove(unsafe { roots.add(i) });
             }
@@ -2810,7 +2810,7 @@ impl MiniMarkGC {
     ///
     /// Returns true when the collection armed `oom_pending`: the triggering
     /// allocation must fail rather than allocate past `PYPY_GC_MAX`.
-    fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) -> bool {
+    pub fn do_maybe_collect_for_external_malloc(&mut self, totalsize: usize) -> bool {
         if !self.threshold_reached(totalsize) {
             return false;
         }
@@ -3147,7 +3147,7 @@ impl MiniMarkGC {
         length: usize,
         has_gc_ptrs_in_var: bool,
     ) -> GcRef {
-        if self.maybe_collect_for_external_malloc(total_size) {
+        if self.do_maybe_collect_for_external_malloc(total_size) {
             return GcRef(0);
         }
         self.try_alloc_young_nonmoving_with_cards(type_id, total_size, length, has_gc_ptrs_in_var)
@@ -10136,7 +10136,7 @@ impl GcAllocator for MiniMarkGC {
         // other allocations are virtualized never fills the nursery, so this
         // is the collection those young rawmalloced frames would otherwise
         // never see. `raw_malloc_usage` is identity on a byte size.
-        if self.maybe_collect_for_external_malloc(total_size) {
+        if self.do_maybe_collect_for_external_malloc(total_size) {
             return GcRef(0);
         }
         // incminimark.py `external_malloc(..., alloc_young=True)`; a refused
@@ -10303,6 +10303,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn add_memory_pressure(&mut self, size: isize, object: GcRef) {
         self.do_add_memory_pressure(size, object);
+    }
+
+    fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) -> bool {
+        self.do_maybe_collect_for_external_malloc(totalsize)
     }
 
     fn total_memory_pressure(&mut self) -> isize {
@@ -18009,6 +18013,25 @@ cache size\t: 8192 kB\n";
         let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         assert_eq!(gc.move_out_of_nursery(obj.0), obj.0);
         assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_SHADOW_INITIALIZED) });
+    }
+
+    /// `external_malloc` uses `force_enabled=False`, so a disabled collector
+    /// still minors and then returns without starting a major.
+    #[test]
+    fn maybe_collect_for_external_malloc_respects_disable() {
+        let mut gc = test_gc(4096);
+        gc.next_major_collection_threshold = 0.0;
+        gc.disable();
+        let minors = gc.minor_collections;
+        let majors = gc.major_collections;
+
+        assert!(gc.threshold_reached(16));
+        assert!(!gc.do_maybe_collect_for_external_malloc(16));
+
+        assert_eq!(gc.minor_collections, minors + 1);
+        assert_eq!(gc.major_collections, majors);
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        assert!(!gc.isenabled());
     }
 
     /// incminimark.py `collect(gen)`: a negative generation is the minor that
