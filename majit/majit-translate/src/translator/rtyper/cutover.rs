@@ -2862,6 +2862,13 @@ fn declared_return_annotation(
     }
     let root = graph.return_class_root.as_deref()?;
     let bk = registry.bookkeeper();
+    // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
+    // the same shell FieldRead and a `raw:<owner>` token already use.
+    // SomeInstance here made mergeinputargs raise Instance(X) ∪ Ptr(X)
+    // (`llannotation.py` pairtype(SomePtr, SomeObject).union).
+    if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
+        return Some(cell);
+    }
     let classdef = bk
         .getuniqueclassdef(&bk.intern_class_by_qualname(root))
         .ok()?;
@@ -7580,31 +7587,34 @@ mod tests {
         let mut graph = out.graph;
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let ref_regs = regallocs
-            .get(&crate::flatten::RegKind::Ref)
-            .expect("ref regalloc");
-        let input_color = ref_regs
+        // `history.getkind` Ptr(raw) → int: `&E` is SomePtr, so the
+        // receiver lives in the int bank (`rewrite_op_getfield`
+        // `_gckind=='raw'`).
+        let int_regs = regallocs
+            .get(&crate::flatten::RegKind::Int)
+            .expect("int regalloc");
+        let input_color = int_regs
             .color_for_variable(&input)
-            .expect("input is an r register");
+            .expect("raw pointer input is an i register");
         let mut saw_call = false;
         for block in &graph.blocks {
             for op in &block.operations {
-                let args_r = match &op.kind {
-                    OpKind::CallResidual { args_r, .. }
-                    | OpKind::CallElidable { args_r, .. }
-                    | OpKind::CallMayForce { args_r, .. }
-                    | OpKind::InlineCall { args_r, .. } => args_r,
+                let args_i = match &op.kind {
+                    OpKind::CallResidual { args_i, .. }
+                    | OpKind::CallElidable { args_i, .. }
+                    | OpKind::CallMayForce { args_i, .. }
+                    | OpKind::InlineCall { args_i, .. } => args_i,
                     _ => continue,
                 };
-                let Some(arg0) = args_r.first() else {
+                let Some(arg0) = args_i.first() else {
                     continue;
                 };
-                let arg_color = ref_regs
+                let arg_color = int_regs
                     .color_for_variable(arg0)
-                    .expect("call's first ref arg is an r register");
+                    .expect("call's first int arg is an i register");
                 assert_eq!(
                     arg_color, input_color,
-                    "call's first arg must be the input r register"
+                    "call's first arg must be the input i register"
                 );
                 saw_call = true;
             }
@@ -8684,6 +8694,65 @@ mod tests {
             crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
             "the declared fn type returns what the SomeString result rtypes to"
         );
+    }
+
+    #[test]
+    fn declared_return_annotation_raw_class_root_is_someptr() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let owner = "rawret::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        registry.set_struct_fields(Rc::new(fields));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        registry.set_struct_layouts(cc.struct_layouts_handle());
+
+        let mut graph = LegacyGraph::new("push_roots");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(owner.into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a by-value raw ADT result declares its annotation");
+        let SomeValue::Ptr(ptr) = declared else {
+            panic!("a raw class-root result is SomePtr, got {declared:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("raw class-root SomePtr must point at a Struct");
+        };
+        assert_eq!(st._name, owner);
+        assert_eq!(st._gckind, GcKind::Raw);
     }
 
     #[test]

@@ -582,6 +582,19 @@ fn raw_struct_ptr_from_layout(
     if registry.is_enum_base(lookup) && !registry.enum_base_has_payload(lookup) {
         return None;
     }
+    // A closure env is not a C raw struct. `tyref_input_class_root` keeps
+    // the full `name_path` so capture fields project through SomeInstance
+    // getattr (`project_struct_field_type`). Seeding SomePtr made
+    // getattr(`__pos_0`) use the lltype row, which spells a captured
+    // `&usize` as Address (`pointer_field_lltype` of a scalar pointee).
+    // `base + 1` then became Address+Int, and `shadow_stack_get` merged
+    // r_uint ∪ Address. RPython forbids closures; the env stays the
+    // instance whose capture rows `project_struct_field_type` already
+    // peels to the integer word.
+    let leaf = class_root.rsplit("::").next().unwrap_or(class_root);
+    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
+        return None;
+    }
     // `GcKind::Raw` is every struct that is not on the GC field-0 chain.
     // A dict strategy or a type object is still an instance; only a
     // word-storage ADT is `SomePtr`. An empty set is a fixture that never
@@ -1207,6 +1220,164 @@ impl Bookkeeper {
         let registry = registry.as_ref()?;
         let layouts = self.struct_layouts.borrow().clone()?;
         raw_struct_ptr_from_layout(registry, &layouts, class_root)
+    }
+
+    /// SomeInstance of a registered named struct — the shell
+    /// `robjmodel_instantiate` writes. Variant payloads (`__pos_N`) use
+    /// this so the constructor does not union Instance with the SomePtr
+    /// `project_struct_field_type` would mint for a raw-word owner.
+    fn struct_instance_annotation(self: &Rc<Self>, field_ty: &str) -> Option<SomeValue> {
+        let stripped = field_ty
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim_start_matches("*const ")
+            .trim_start_matches("*mut ")
+            .trim();
+        let named_root = majit_ir::descr::strip_generic_args(stripped);
+        let registered = {
+            let guard = self.struct_fields.borrow();
+            guard
+                .as_ref()
+                .map(|r| r.fields.contains_key(named_root.as_ref()))
+                .unwrap_or(false)
+        };
+        if !registered {
+            return None;
+        }
+        {
+            let canonical = majit_ir::descr::canonical_struct_name(named_root.as_ref());
+            if !self.projected_struct_rows.borrow().contains(&canonical) {
+                self.pending_struct_row_projection
+                    .borrow_mut()
+                    .push(named_root.to_string());
+            }
+        }
+        let host = self.intern_class_by_qualname(named_root.as_ref());
+        match self.getuniqueclassdef(&host) {
+            Ok(classdef) => Some(SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            ))),
+            Err(_) => None,
+        }
+    }
+
+    /// True when `field_ty` is a stored raw pointer, or a named struct
+    /// whose stored fields include one. A zero-sized field occupies no
+    /// word (`StructLayout.fields[..].size`, Charon layout size 0), so a
+    /// marker ADT is not a stored pointer. Variant payloads of
+    /// stored-pointer owners stay SomePtr so `getfield_raw` matches the
+    /// named-field projection. A classed scalar ADT (Fmt, Utf16Or32Form,
+    /// RootScope) keeps the SomeInstance `robjmodel_instantiate` writes.
+    fn struct_ty_has_raw_pointer_field(&self, field_ty: &str) -> bool {
+        let stripped = field_ty
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        if registry_ty_is_raw_ptr(stripped) {
+            return true;
+        }
+        let named_root = majit_ir::descr::strip_generic_args(stripped);
+        self.named_ty_has_stored_raw_pointer(named_root.as_ref())
+    }
+
+    /// A named ADT stores a raw pointer when a layout field of size > 0
+    /// has a `RawPtr` registry type. Size-0 fields are omitted from
+    /// `StructLayout.fields` (and Charon reports size 0), so they are
+    /// not stored. Without a layout, only `RawPtr` registry rows count —
+    /// a marker ADT is a different constructor, not `*mut`/`*const`.
+    fn named_ty_has_stored_raw_pointer(&self, named: &str) -> bool {
+        let guard = self.struct_fields.borrow();
+        let Some(reg) = guard.as_ref() else {
+            return false;
+        };
+        let Some(rows) = reg.field_rows(named) else {
+            return false;
+        };
+        if let Some(layout) = self.layout_of_named(named) {
+            return layout.fields.iter().any(|field| {
+                field.size > 0
+                    && rows
+                        .iter()
+                        .any(|(name, ty)| name == &field.name && registry_ty_is_raw_ptr(ty))
+            });
+        }
+        rows.iter().any(|(_, ty)| registry_ty_is_raw_ptr(ty))
+    }
+
+    fn layout_of_named(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<crate::codewriter::call::StructLayout>> {
+        let layouts = self.struct_layouts.borrow();
+        let layouts = layouts.as_ref()?;
+        layout_for_owner(layouts, generic_owner_lookup(name)).map(|(_, layout)| layout)
+    }
+
+    /// Promote a positional payload SomePtr to SomeInstance only for a
+    /// classed scalar ADT written by `robjmodel_instantiate` (Fmt /
+    /// Utf16Or32Form / RootScope as an enum payload). A closure capture
+    /// and a nullable pointer word keep the SomePtr the writer stores.
+    fn variant_payload_promotes_to_instance(
+        &self,
+        owner: &str,
+        field_name: &str,
+        field_ty: &str,
+        s_value: &SomeValue,
+    ) -> bool {
+        if !majit_charon_reader::ullbc::is_positional_field_name(field_name)
+            || !matches!(s_value, SomeValue::Ptr(_))
+        {
+            return false;
+        }
+        let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
+        if majit_charon_reader::ullbc::is_closure_leaf(owner_leaf) {
+            return false;
+        }
+        if self.field_ty_is_nullable_ptr(field_ty) {
+            return false;
+        }
+        !self.struct_ty_has_raw_pointer_field(field_ty)
+    }
+
+    /// A niche-optimized pointer-sized enum is the nullable `lltype.Ptr`
+    /// (`None` is the null niche), not a classed instance. Decided from
+    /// the registered layout (size == pointer word and the host tag is
+    /// `TagEncoding::Niche`) or, when that host fact is absent, from a
+    /// fieldless enum base (`is_enum_base && !enum_base_has_payload`):
+    /// intern would mint `Instance(enum)` over the already-collapsed Ptr.
+    /// Every payload enum's base is also `__discriminant` only — the
+    /// variants hold the payload (`rclass.py` variant subclass) — so
+    /// `is_enum_base` alone is not this fact. `BuiltinEncoder` is that
+    /// payload enum: `Option<BuiltinEncoder>::Some.__pos_0` is Instance
+    /// so instantiate can setattr a `Utf8` variant.
+    fn field_ty_is_nullable_ptr(&self, field_ty: &str) -> bool {
+        let stripped = field_ty
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+        let named = majit_ir::descr::strip_generic_args(stripped);
+        if let Some(layout) = self.layout_of_named(named.as_ref())
+            && layout.size == crate::layout::target_word_size()
+            && layout.host.as_ref().is_some_and(|host| {
+                matches!(
+                    host.tag.as_ref(),
+                    Some(tag) if matches!(
+                        tag.encoding,
+                        majit_charon_reader::ullbc::TagEncoding::Niche { .. }
+                    )
+                )
+            })
+        {
+            return true;
+        }
+        self.struct_fields.borrow().as_ref().is_some_and(|reg| {
+            reg.is_enum_base(named.as_ref()) && !reg.enum_base_has_payload(named.as_ref())
+        })
     }
 
     /// TODO: no upstream equivalent.  Wire the enum
@@ -3012,6 +3183,34 @@ impl Bookkeeper {
                 continue;
             }
             let s_value = self.project_struct_field_type(field_ty);
+            // A variant payload (`__pos_N`) is written by
+            // `robjmodel_instantiate` + setattr, which is always
+            // SomeInstance (`builtin.py` `robjmodel_instantiate`).
+            // Flattening a classed scalar ADT (Fmt / Utf16Or32Form)
+            // to SomePtr made `llannotation.py`
+            // `pairtype(SomePtr, SomeObject).union` refuse Instance ∪
+            // Ptr at the constructor. A payload whose rows include a
+            // raw pointer (PosixMap.ptr: *mut u8) stays SomePtr so
+            // `getfield_raw` matches the named-field projection
+            // (`raw_struct_ptr_annotation`). Named raw fields
+            // (`mapped`, `sin_addr`) and FUNC.ARGS `&Raw` are not
+            // `__pos_N` and stay SomePtr either way.
+            //
+            // A closure capture is the captured value, not a variant
+            // constructor: `__cast_instance_intrinsic` / FUNC.ARGS of a
+            // raw owner write SomePtr (`load_attr` RootScope). Promoting
+            // that slot to Instance made setattr refuse Ptr ∪ Instance.
+            // A niche-optimized pointer-sized enum already collapsed to
+            // the nullable Ptr (`project_struct_field_type` Option arm,
+            // None is the null word); promoting that to Instance(enum)
+            // is the mmap_get_attr_i64 `Ptr(MappedObj) ∪ Instance(enum)`
+            // refusal.
+            let s_value =
+                if self.variant_payload_promotes_to_instance(n, field_name, field_ty, &s_value) {
+                    self.struct_instance_annotation(field_ty).unwrap_or(s_value)
+                } else {
+                    s_value
+                };
             let mut classdef_mut = classdef.borrow_mut();
             let attr = classdef_mut
                 .attrs
@@ -3574,6 +3773,12 @@ impl Bookkeeper {
                 return raw_fn_ptr_somevalue();
             }
             let s_inner = self.project_struct_field_type(inner);
+            // The same join is refused for a raw-struct payload
+            // (`llannotation.py` `pairtype(SomePtr, SomeObject).union`).
+            // None is the null word of that Ptr.
+            if matches!(s_inner, SomeValue::Ptr(_)) {
+                return s_inner;
+            }
             let s_none = super::model::s_none();
             return super::model::unionof([&s_inner, &s_none]).unwrap_or(SomeValue::Impossible);
         }
@@ -3710,6 +3915,27 @@ impl Bookkeeper {
         };
         if !registered {
             return SomeValue::Impossible;
+        }
+        // A by-value raw struct is Ptr of a Raw Struct:
+        // `history.getkind` Ptr(raw) → "int";
+        // `jtransform.rewrite_op_getfield` `_gckind=='raw'` → getfield_raw;
+        // `rewrite_op_getsubstruct` → int_add(ptr, ofs).
+        // SomeInstance here made dual-gate report legacy=Signed, real=GcRef
+        // on a nested FieldRead (MappedObj payload, sockaddr_in.sin_addr,
+        // RootScope, VersionTag).
+        if let Some(s_ptr) = self.raw_struct_ptr_annotation(named_root.as_ref()) {
+            return s_ptr;
+        }
+        {
+            let guard = self.struct_fields.borrow();
+            if let Some(reg) = guard.as_ref() {
+                let lookup = named_root.as_ref();
+                if reg.is_enum_base(lookup) && !reg.enum_base_has_payload(lookup) {
+                    // Fieldless enum value is the integer tag
+                    // (`rclass.py` getinstancerepr of a discriminant-only base).
+                    return super::model::s_int();
+                }
+            }
         }
         // Resolve the struct-typed field to its identity-registered
         // `ClassDef` through `descs` (`intern_class_by_qualname` ->
@@ -4880,6 +5106,13 @@ fn list_item_type_key(item_ty: &str) -> String {
 /// the prefix is absent OR the suffix is not `>`.
 fn strip_generic_one<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
     input.strip_prefix(prefix).and_then(|s| s.strip_suffix('>'))
+}
+
+/// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
+/// wrapping a pointer is a different constructor and does not match.
+fn registry_ty_is_raw_ptr(ty: &str) -> bool {
+    let t = ty.trim();
+    t.starts_with("*mut ") || t.starts_with("*const ")
 }
 
 /// Split a generic-args slice on top-level `,` boundaries, respecting
@@ -6930,6 +7163,679 @@ mod tests {
             matches!(attr, SomeValue::RustVec(_)),
             "a *mut Vec of one-word items is SomeRustVec, got {attr:?}"
         );
+    }
+
+    #[test]
+    fn named_raw_struct_field_projects_to_someptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let inner = "rawproj::PosixMap";
+        let parent = "rawproj::Mapped";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            parent.to_string(),
+            vec![("mapped".into(), inner.to_string())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "len".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let projected = bk.project_struct_field_type(inner);
+        let SomeValue::Ptr(ptr) = projected else {
+            panic!("raw nested struct must project to SomePtr, got {projected:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("SomePtr target must be a Struct");
+        };
+        assert_eq!(st._gckind, GcKind::Raw);
+
+        let parent_cd = bk
+            .getuniqueclassdef_for_struct_root(parent)
+            .expect("parent registers");
+        let mapped = parent_cd
+            .borrow()
+            .attrs
+            .get("mapped")
+            .expect("mapped attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(mapped, SomeValue::Ptr(_)),
+            "parent.mapped must be SomePtr, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn option_some_payload_of_pointer_raw_struct_stays_ptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::PosixMap";
+        let some = "Option<rawproj::PosixMap>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![("__pos_0".into(), inner.to_string())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "len".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        assert!(
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "by-value raw field type stays SomePtr"
+        );
+
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(some)
+            .expect("Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "Option::Some.__pos_0 of a pointer-carrying raw struct stays SomePtr, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn option_some_payload_of_scalar_raw_struct_stays_instance() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::Fmt";
+        let some = "Option<rawproj::Fmt>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("size".into(), "usize".into()),
+                ("needcount".into(), "bool".into()),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![("__pos_0".into(), inner.to_string())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "size".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "needcount".into(),
+                        offset: 8,
+                        size: 1,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        assert!(
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "by-value scalar raw struct still projects SomePtr as a named field"
+        );
+
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(some)
+            .expect("Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Instance(_)),
+            "Option::Some.__pos_0 of a classed scalar ADT stays SomeInstance so instantiate can setattr it, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn option_some_payload_of_payload_enum_stays_instance() {
+        // `BuiltinEncoder`: the base is `__discriminant` only, the
+        // `Utf16Or32` variant carries `Utf16Or32Form`. A named-field
+        // projection is still SomePtr (`raw_struct_ptr_annotation`);
+        // Option::Some.__pos_0 stays SomeInstance so instantiate can
+        // setattr a `Utf8` variant (`llannotation.py`
+        // pairtype(SomePtr, SomeObject).union).
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "type_methods::BuiltinEncoder";
+        let variant = "type_methods::BuiltinEncoder::Utf16Or32";
+        let form = "type_methods::Utf16Or32Form";
+        let some = "Option<type_methods::BuiltinEncoder>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields
+            .insert(variant.to_string(), vec![("__pos_0".into(), form.into())]);
+        reg.fields.insert(
+            form.to_string(),
+            vec![
+                ("is32".into(), "bool".into()),
+                ("order".into(), "ByteOrder".into()),
+                ("bom".into(), "bool".into()),
+            ],
+        );
+        reg.fields
+            .insert(some.to_string(), vec![("__pos_0".into(), inner.into())]);
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "__discriminant".into(),
+                    offset: 0,
+                    size: 1,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        assert!(
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "payload-enum named field still projects SomePtr"
+        );
+
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(some)
+            .expect("Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Instance(_)),
+            "Option::Some.__pos_0 of a payload enum stays SomeInstance so instantiate can setattr a fieldless variant, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn option_some_payload_of_rootscope_stays_instance() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::RootScope";
+        let some = "Option<rawproj::RootScope>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("save_point".into(), "usize".into()),
+                ("_not_send".into(), "PhantomData<*const ()>".into()),
+            ],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![("__pos_0".into(), inner.to_string())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(some)
+            .expect("Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Instance(_)),
+            "PhantomData<*const ()> is not a stored pointer; RootScope payload stays SomeInstance, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn closure_capture_of_raw_struct_stays_ptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::RootScope";
+        let owner = "eval::<Impl>::load_attr::closure";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("save_point".into(), "usize".into()),
+                ("_not_send".into(), "PhantomData<*const ()>".into()),
+            ],
+        );
+        reg.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".into(), inner.to_string())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("closure env registers");
+        let capture = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("capture attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(capture, SomeValue::Ptr(_)),
+            "a closure capture of a raw owner stays SomePtr so setattr of the cast value unions, got {capture:?}"
+        );
+    }
+
+    #[test]
+    fn option_some_payload_of_option_raw_ptr_stays_ptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::host_layout::HostLayout;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        use majit_charon_reader::ullbc::{TagEncoding, TagLayout};
+
+        let inner = "rawproj::PosixMap";
+        let option_root = "Option";
+        let some = "Option<Option<rawproj::PosixMap>>::Some";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let option_id = majit_ir::descr::StructId::from_canonical(option_root);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (option_root.to_string(), Some(option_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        // Enum-base row: intern would mint Instance(Option) if the payload
+        // were promoted. The host layout is the niche-optimized pointer word.
+        reg.fields.insert(
+            option_root.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            some.to_string(),
+            vec![("__pos_0".into(), "Option<rawproj::PosixMap>".into())],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "len".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            option_id,
+            crate::call::StructLayout {
+                size: word,
+                align: word,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: Some(HostLayout {
+                    size: word as u64,
+                    align: word as u64,
+                    variant_field_offsets: vec![vec![], vec![0]],
+                    tag: Some(TagLayout {
+                        offset: 0,
+                        signed: false,
+                        bits: (word * 8) as u32,
+                        encoding: TagEncoding::Niche {
+                            untagged_variant: 1,
+                            niche_variants: 0..=0,
+                            niche_start: 0,
+                        },
+                    }),
+                }),
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let some_cd = bk
+            .getuniqueclassdef_for_struct_root(some)
+            .expect("nested Option::Some registers");
+        let payload = some_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("payload attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(payload, SomeValue::Ptr(_)),
+            "Option::Some.__pos_0 of Option<Raw> stays the nullable Ptr, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn closure_env_stays_instance_even_when_raw_word_owner() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let owner = "descroperation::try_dispatch_ternary_pow_special::closure#2";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(owner.to_string(), vec![("__pos_0".into(), "&usize".into())]);
+        reg.raw_word_owners.insert(owner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "__pos_0".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let projected = bk.project_struct_field_type(owner);
+        assert!(
+            matches!(projected, SomeValue::Instance(_)),
+            "a closure env stays SomeInstance so capture getattr peels &usize to r_uint, got {projected:?}"
+        );
+
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("closure env registers");
+        let capture = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("capture attr projected")
+            .s_value
+            .clone();
+        match capture {
+            SomeValue::Integer(i) => assert!(
+                i.unsigned,
+                "captured &usize must project r_uint, got signed"
+            ),
+            other => panic!("captured &usize must project SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fieldless_enum_projects_to_signed_integer() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "rawproj::StrategyKind".to_string(),
+            vec![("__discriminant".to_string(), "u8".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        match bk.project_struct_field_type("rawproj::StrategyKind") {
+            SomeValue::Integer(i) => assert!(
+                !i.unsigned,
+                "fieldless enum must project Signed, got unsigned"
+            ),
+            other => panic!("fieldless enum must project SomeInteger, got {other:?}"),
+        }
     }
 
     #[test]
