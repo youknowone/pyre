@@ -243,27 +243,10 @@ impl<'a> BridgeVirtualCache<'a> {
         cache
     }
 
-    /// Register `concrete_roots` when a recording-only cache first holds a
-    /// live object. `resume.py virtuals_cache` is a field on the reader, so
-    /// the collector updates it in place; `get_concrete_ptr` then re-reads
-    /// the forwarded address rather than the copy in `concrete_ptr_cache`.
-    fn ensure_concrete_roots(&mut self) {
-        if self.concrete_roots.len() != self.virtuals_ptr_cache.len()
-            && !self.virtuals_ptr_cache.is_empty()
-        {
-            self.concrete_roots = vec![0i64; self.virtuals_ptr_cache.len()];
-            // SAFETY: fixed address, unregistered in `Drop`.
-            unsafe {
-                majit_gc::shadow_stack::push_resume_ref_roots(&mut self.concrete_roots);
-            }
-        }
-    }
-
     /// Publish a freshly allocated virtual as a root and remember which
     /// `OpRef` names it, so later operands resolve to the address the
     /// collector is maintaining rather than to a copy taken before it moved.
     fn set_concrete_root(&mut self, vidx: usize, address: i64) {
-        self.ensure_concrete_roots();
         if let Some(slot) = self.concrete_roots.get_mut(vidx) {
             *slot = address;
         }
@@ -367,13 +350,6 @@ impl<'a> BridgeVirtualCache<'a> {
     pub fn set_concrete_int(&mut self, i: usize, v: i64) {
         if i < self.concrete_int_cache.len() {
             self.concrete_int_cache[i] = Some(v);
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn simulate_collect_concrete_root(&mut self, i: usize, address: i64) {
-        if let Some(slot) = self.concrete_roots.get_mut(i) {
-            *slot = address;
         }
     }
 }
@@ -1848,7 +1824,11 @@ mod tests {
             &[Some(majit_ir::GcRef(0x1000))],
         );
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1000)));
-        cache.simulate_collect_concrete_root(0, 0x2000);
+        majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+            if root.0 == 0x1000 {
+                root.0 = 0x2000;
+            }
+        });
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x2000)));
     }
 
