@@ -80,6 +80,9 @@ pub mod frame_locals_proxy {
         w_frame: PyObjectRef,
     }
 
+    /// Offset of `w_frame` for the JIT field descr.
+    pub const W_FRAME_OFFSET: usize = std::mem::offset_of!(FrameLocalsProxy, w_frame);
+
     /// The frame `obj` is a live proxy onto, or `None` for anything else.
     ///
     /// The proxy reads the frame's array lazily rather than copying out of it,
@@ -4303,9 +4306,15 @@ impl PyFrame {
     /// residual after `proxy_list_new`.
     #[inline]
     pub fn get_extra_locals(&self) -> PyObjectRef {
-        match self.getdebug_data() {
-            None => pyre_object::PY_NULL,
-            Some(data) => data.w_extra_locals,
+        // A call through `getdebug_data` residualizes as a symbolic
+        // `Option<&FrameDebugData>` ctor the walker cannot bind
+        // (`getdebug_data` at the first byte of this body). Read the
+        // debug payload field directly, the same None-checked getfield
+        // `pyframe.py getdebug` is.
+        if self.debugdata.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            unsafe { (*self.debugdata).w_extra_locals }
         }
     }
 
