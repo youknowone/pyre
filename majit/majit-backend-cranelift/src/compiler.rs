@@ -393,6 +393,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_young_nonmoving_typed(Some(
         alloc_young_nonmoving_typed_via_active_runtime,
     ));
+    majit_gc::set_active_alloc_young_nonmoving_typed_no_collect(Some(
+        alloc_young_nonmoving_typed_no_collect_via_active_runtime,
+    ));
     majit_gc::set_active_collect_generation(Some(collect_generation_via_active_runtime));
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
@@ -1691,6 +1694,13 @@ fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
 /// `minor_collection_with_major_progress`).
 fn alloc_young_nonmoving_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// [`alloc_young_nonmoving_typed_via_active_runtime`] without the collection
+/// in front of the birth (`GcAllocator::alloc_young_nonmoving_typed_no_collect`).
+fn alloc_young_nonmoving_typed_no_collect_via_active_runtime(type_id: u32, size: usize) -> GcRef {
+    with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed_no_collect(type_id, size))
+        .unwrap_or(GcRef(0))
 }
 
 /// User-level `gc.collect(n)` trampoline — drives

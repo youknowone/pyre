@@ -10151,6 +10151,24 @@ impl GcAllocator for MiniMarkGC {
         self.alloc_oldgen_typed(type_id, size)
     }
 
+    fn alloc_young_nonmoving_typed_no_collect(&mut self, type_id: u32, size: usize) -> GcRef {
+        let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
+            return GcRef(0);
+        };
+        // The same young birth without `external_malloc`'s
+        // `minor_collection_with_major_progress` in front of it, for the
+        // reason `alloc_oldgen_typed` gives: the host callers this entry
+        // exists for hold the fields they are about to store on the Rust
+        // stack, where a collection run here would leave them stale. The
+        // threshold question is still asked — `finish_alloc_young_nonmoving`
+        // raises the deferred major request, and the interpreter safepoint
+        // answers it where the root set is known.
+        if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
+            return obj;
+        }
+        self.alloc_oldgen_typed(type_id, size)
+    }
+
     fn collection_counts(&self) -> (usize, usize) {
         (self.minor_collections, self.major_collections)
     }

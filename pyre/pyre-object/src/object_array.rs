@@ -1784,9 +1784,29 @@ pub unsafe fn dealloc_mro_block(block: *mut FixedObjectArray) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArray {
-    let len = values.len();
     let payload = FIXED_ARRAY_ITEMS_OFFSET + std::mem::size_of_val(values);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(PY_OBJECT_ARRAY_GC_TYPE_ID, payload);
+    unsafe { fill_mro_block(values, raw) }
+}
+
+/// [`alloc_mro_block_gc`] for a heap type's `mro_w`: the same non-moving
+/// block, born young (`external_malloc(..., alloc_young=True)`) so that it
+/// dies with the type at the first minor collection that reaches neither.
+/// The block holds the type itself (`mro_w[0]`), so an old-born block on
+/// the remembered set would promote a class that nothing else refers to.
+/// # Safety
+/// Same as [`alloc_mro_block_gc`].
+pub unsafe fn alloc_mro_block_gc_young(values: &[PyObjectRef]) -> *mut FixedObjectArray {
+    let payload = FIXED_ARRAY_ITEMS_OFFSET + std::mem::size_of_val(values);
+    let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+        PY_OBJECT_ARRAY_GC_TYPE_ID,
+        payload,
+    );
+    unsafe { fill_mro_block(values, raw) }
+}
+
+unsafe fn fill_mro_block(values: &[PyObjectRef], raw: *mut u8) -> *mut FixedObjectArray {
+    let len = values.len();
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray
     } else {

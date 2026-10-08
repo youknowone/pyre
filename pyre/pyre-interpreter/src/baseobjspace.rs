@@ -14513,6 +14513,10 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
             }
             (*w_obj).w_class = w_newcls;
         });
+        // `setfield` of a GC pointer into `w_obj`: a heap class is born young
+        // (`w_type_new`), so an old instance pointing at it has to be in the
+        // remembered set before the next minor collection.
+        pyre_object::gc_hook::try_gc_write_barrier(w_obj as *mut u8);
     }
     Ok(w_none())
 }

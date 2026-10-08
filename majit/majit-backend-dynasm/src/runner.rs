@@ -523,6 +523,9 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
     majit_gc::set_active_alloc_young_nonmoving_typed(Some(dynasm_alloc_young_nonmoving_typed));
+    majit_gc::set_active_alloc_young_nonmoving_typed_no_collect(Some(
+        dynasm_alloc_young_nonmoving_typed_no_collect,
+    ));
     majit_gc::set_active_collect_generation(Some(dynasm_collect_generation));
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
@@ -963,6 +966,19 @@ fn dynasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
         return GcRef(0);
     }
     majit_gc::gc_sync::gc_op(|g| g.alloc_young_nonmoving_typed(type_id, size))
+}
+
+/// [`dynasm_alloc_young_nonmoving_typed`] without the collection in front of
+/// the birth, for the host constructors that fill the block from words held
+/// on the Rust stack (`GcAllocator::alloc_young_nonmoving_typed_no_collect`).
+fn dynasm_alloc_young_nonmoving_typed_no_collect(type_id: u32, size: usize) -> GcRef {
+    if let Some(r) = gc_box::with_mut(|g| g.alloc_young_nonmoving_typed_no_collect(type_id, size)) {
+        return r;
+    }
+    if !majit_gc::gc_sync::is_initialized() {
+        return GcRef(0);
+    }
+    majit_gc::gc_sync::gc_op(|g| g.alloc_young_nonmoving_typed_no_collect(type_id, size))
 }
 
 /// Allocate the struct a `bh_new` / `bh_new_with_vtable` descr describes

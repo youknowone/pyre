@@ -849,6 +849,16 @@ pub trait GcAllocator: Send {
         self.alloc_oldgen_typed(type_id, size)
     }
 
+    /// [`Self::alloc_young_nonmoving_typed`] without the collection in front
+    /// of the birth, on [`Self::alloc_oldgen_typed`]'s reasoning: the caller
+    /// holds the words it is about to store on the Rust stack rather than in
+    /// a root, so the threshold is answered by the deferred major request and
+    /// the interpreter safepoint's poll instead of here. A collector without
+    /// a young non-moving arm answers with [`Self::alloc_oldgen_typed`].
+    fn alloc_young_nonmoving_typed_no_collect(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.alloc_oldgen_typed(type_id, size)
+    }
+
     /// incminimark.py:1569: jit_remember_young_pointer(obj)
     /// Perform a write barrier check on `obj`.
     /// Must be called before storing a GC reference into `obj`.
@@ -1777,6 +1787,9 @@ impl GcAllocator for GcHandle {
     }
     fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_young_nonmoving_typed(type_id, size))
+    }
+    fn alloc_young_nonmoving_typed_no_collect(&mut self, type_id: u32, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_young_nonmoving_typed_no_collect(type_id, size))
     }
     fn write_barrier(&mut self, obj: GcRef) {
         // No root bracket: the barrier neither allocates nor collects, so
@@ -3066,6 +3079,25 @@ pub fn set_active_alloc_young_nonmoving_typed(hook: Option<AllocYoungNonmovingTy
 /// [`alloc_oldgen_typed`]; `GcRef(0)` when no backend is installed.
 pub fn alloc_young_nonmoving_typed(type_id: u32, payload_size: usize) -> GcRef {
     match ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED.get() {
+        Some(f) => f(type_id, payload_size),
+        None => alloc_oldgen_typed(type_id, payload_size),
+    }
+}
+
+global_hook!(static ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED_NO_COLLECT: AllocYoungNonmovingTypedFn);
+
+/// Install the active backend's non-collecting young non-moving allocator
+/// callback ([`GcAllocator::alloc_young_nonmoving_typed_no_collect`]). Pass
+/// `None` to clear.
+pub fn set_active_alloc_young_nonmoving_typed_no_collect(hook: Option<AllocYoungNonmovingTypedFn>) {
+    ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED_NO_COLLECT.set(hook);
+}
+
+/// [`alloc_young_nonmoving_typed`] without a collection in front of the
+/// birth. A backend that installed no such hook answers with
+/// [`alloc_oldgen_typed`]; `GcRef(0)` when no backend is installed.
+pub fn alloc_young_nonmoving_typed_no_collect(type_id: u32, payload_size: usize) -> GcRef {
+    match ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED_NO_COLLECT.get() {
         Some(f) => f(type_id, payload_size),
         None => alloc_oldgen_typed(type_id, payload_size),
     }
