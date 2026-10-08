@@ -6886,11 +6886,12 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
 /// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
 /// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
 /// The oracle aborts that compile (`vable escaped during a call in
-/// descr__new__ to ConstClass(_create_new_type)`).  `W_TypeObject.__init__`
-/// is `@dont_look_inside`; a same-crate Rust call would otherwise inline
-/// `_check_surrogate` into the caller graph.
+/// descr__new__ to ConstClass(_create_new_type)`).  `_create_new_type` has
+/// no `@dont_look_inside`; `JitPolicy.look_inside_graph` residualizes it
+/// because the body has loops (`contains_loop` / `find_backedges`).
+/// `W_TypeObject.__init__` is `@dont_look_inside`.  `#[inline(never)]` keeps
+/// the helper a separate graph so rustc does not fold it into `type_descr_new`.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 fn type_create_new_type(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -7137,7 +7138,11 @@ fn type_create_new_type(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
+                // `gettopframe` / `force_all_frames` re-read the live address
+                // after `force_frame`; the hook can collect.
+                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
                 crate::executioncontext::jit_force_virtualizable_field(frame);
+                let frame = anchor.live();
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()
                     && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?

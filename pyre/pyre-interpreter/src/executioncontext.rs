@@ -3746,9 +3746,11 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
 mod tests {
     use super::{force_frame, force_frame_before_locals_read};
     use crate::PyFrame;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicPtr, Ordering};
 
     static SEEN: AtomicPtr<PyFrame> = AtomicPtr::new(std::ptr::null_mut());
+    static FORCE_FRAME_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     unsafe extern "C" fn record(frame: *mut PyFrame) {
         SEEN.store(frame, Ordering::SeqCst);
@@ -3756,6 +3758,7 @@ mod tests {
 
     #[test]
     fn registered_force_frame_hook_is_invoked_with_the_frame_pointer() {
+        let _lock = FORCE_FRAME_HOOK_TEST_LOCK.lock().unwrap();
         force_frame_before_locals_read(std::ptr::null_mut());
 
         SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -3772,6 +3775,7 @@ mod tests {
     #[test]
     fn redirected_field_force_flags_only_during_the_hook() {
         use super::{force_is_redirected_field, jit_force_virtualizable_field};
+        let _lock = FORCE_FRAME_HOOK_TEST_LOCK.lock().unwrap();
         assert!(!force_is_redirected_field());
         unsafe extern "C" fn check_flag(frame: *mut PyFrame) {
             assert!(

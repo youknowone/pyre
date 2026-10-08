@@ -5208,8 +5208,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // One-argument `type(x)` enters `type_descr_call_impl`'s graph
     // (`__majit_wrap_type_query`) instead of the instantiation emit.
     // Three-argument `type(name, bases, dict)` walks `type_descr_new`
-    // (`descr__new__`); `_create_new_type` is a residual `dont_look_inside`
-    // callee so `_check_surrogate` is not in-trace.
+    // (`descr__new__`); `_create_new_type` is residual because
+    // `look_inside_graph` refuses its loops, so `_check_surrogate` is
+    // not in-trace.
     let type_query = !method_form
         && !bound_method
         && !is_call_kw
