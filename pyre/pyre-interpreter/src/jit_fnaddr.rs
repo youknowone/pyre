@@ -82,17 +82,17 @@ impl<T> ResidualRet for *mut T {}
 /// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
 /// call, so the raw functions are a different table type there.
 extern "C" fn shadow_stack_push_word(gcref: i64) -> i64 {
-    let _ = core::hint::black_box("jit_fnaddr::shadow_stack_push_word".as_ptr());
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_push_word");
     majit_gc::shadow_stack::push(majit_ir::GcRef(gcref as usize)) as i64
 }
 
 extern "C" fn shadow_stack_get_word(index: i64) -> i64 {
-    let _ = core::hint::black_box("jit_fnaddr::shadow_stack_get_word".as_ptr());
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_get_word");
     majit_gc::shadow_stack::get(index as usize).as_usize() as i64
 }
 
 extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
-    let _ = core::hint::black_box("jit_fnaddr::shadow_stack_try_pop_to_word".as_ptr());
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_try_pop_to_word");
     majit_gc::shadow_stack::try_pop_to(depth as usize);
 }
 

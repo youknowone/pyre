@@ -1389,14 +1389,17 @@ fn report_helper_fnaddr_skip(name: &Ident, reason: HelperFnAddrSkip) {
 /// targets that would otherwise have identical bodies. `drain_list_append`
 /// keeps a forwarding call for the same reason: one published address must
 /// name one function (`registered_paths_sharing_an_address_are_alias_spellings`).
+///
+/// Expands to [`majit_ir::icf_identity`]: empty `nomem` asm whose comment
+/// carries a unique const immediate (native) or a volatile read of that
+/// immediate (wasm32), never `black_box` of a pointer.
 fn icf_identity_tokens(name: &Ident) -> proc_macro2::TokenStream {
     quote! {
-        let _ = ::core::hint::black_box(::core::concat!(
+        ::majit_ir::icf_identity!(::core::concat!(
             ::core::module_path!(),
             "::",
             stringify!(#name),
-        )
-        .as_ptr());
+        ));
     }
 }
 
@@ -2669,8 +2672,8 @@ fn expand_dont_look_inside_attribute(
     // so no `dont_look_inside` body is folded into a traced caller regardless.
     // Residual call targets are likewise unaffected: they resolve through the
     // function-item coercions `pyre-interpreter/src/jit_fnaddr.rs` writes by
-    // hand, not through a linker symbol. A unique `black_box` of the path
-    // still sits in the body so LLVM MergeFunctions cannot fold two published
+    // hand, not through a linker symbol. [`majit_ir::icf_identity`] still
+    // sits in the body so LLVM MergeFunctions cannot fold two published
     // helpers that would otherwise be byte-identical (`drain_list_append`).
     //
     // `#[elidable]` keeps its `#[inline(never)]` and this family drops it, and
