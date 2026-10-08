@@ -396,7 +396,6 @@ spec_folds! {
     ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
     SetAddMethod         => ("set_add_method",           "residual_call", "-"),
     StoreAttrDirect      => ("store_attr_direct",        "residual_call", "-"),
-    StoreAttrResidual    => ("store_attr_residual",      "residual_call", "store_attr_direct"),
     LoadAttr             => ("load_attr",                "residual_call", "-"),
     LoadAttrPureRead     => ("load_attr_pure_read",      "specialize",    "load_attr"),
     LoadTypeAttr         => ("load_type_attr",           "residual_call", "-"),
@@ -679,50 +678,6 @@ pub(crate) fn spec_gate<T, E>(
         SPEC_CONSULTED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if matches!(&outcome, Ok(Some(_))) {
             SPEC_FIRED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    outcome
-}
-
-/// The STORE_ATTR gate.  One call, two firing outcomes: `Direct` folded the
-/// store away, `Residual` only rewrote the generic setattr residual's descr,
-/// arguments and effect.  Both are `Ok(Some(_))`, so they are recorded on
-/// separate rows; the shared call means `consulted` and `suppressed` land on
-/// both.
-///
-/// The two rows cannot be suppressed independently — naming either one, or
-/// `all`, suppresses the single call.
-#[inline]
-pub(super) fn spec_gate_store_attr<E>(
-    call: impl FnOnce() -> Result<Option<WalkerStoreAttrSpecialization>, E>,
-) -> Result<Option<WalkerStoreAttrSpecialization>, E> {
-    // Neither axis armed: one cached load, one predictable branch, then the
-    // original call.  This is what every default run executes.
-    if !spec_instrumented() {
-        return call();
-    }
-    let (direct_idx, residual_idx) = (
-        SpecFold::StoreAttrDirect.index(),
-        SpecFold::StoreAttrResidual.index(),
-    );
-    let mask = spec_suppressed_mask();
-    if mask.get(direct_idx) || mask.get(residual_idx) {
-        SPEC_SUPPRESSED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SPEC_SUPPRESSED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(None);
-    }
-    let outcome = call();
-    if fbw_spec_census_enabled() {
-        SPEC_CONSULTED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SPEC_CONSULTED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        match &outcome {
-            Ok(Some(WalkerStoreAttrSpecialization::Direct)) => {
-                SPEC_FIRED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(Some(WalkerStoreAttrSpecialization::Residual(..))) => {
-                SPEC_FIRED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(None) | Err(_) => {}
         }
     }
     outcome

@@ -11973,18 +11973,6 @@ fn next_op_is_load_method_self_for_attr<Sym: WalkSym>(
     })
 }
 
-/// STORE_ATTR mirror of [`try_walker_specialize_load_attr`] for an existing
-/// unboxed integer or float slot.  Recognition proves the plain mapdict write
-/// cannot invoke Python or raise; the returned descriptor/arglist replaces only
-/// the residual helper and effect.  The caller deliberately continues through
-/// the generic residual recorder/executor so concrete execution, body-effect
-/// tracking, and rollback semantics remain identical to the generic setattr
-/// path (mapdict.py).
-enum WalkerStoreAttrSpecialization {
-    Residual(DescrRef, Vec<OpRef>),
-    Direct,
-}
-
 /// The canonical Python class of an exact builtin operand, or `None` when it
 /// is a subclass instance or carries no `w_class` to pin.
 ///
