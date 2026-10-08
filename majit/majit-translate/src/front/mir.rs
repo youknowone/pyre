@@ -687,6 +687,7 @@ fn concrete_adt_struct_id(
 fn ref_enum_instantiation_of_adt(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<RefEnumInst> {
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     let def_id = type_decl_ref_adt_id(adt)?;
@@ -694,7 +695,7 @@ fn ref_enum_instantiation_of_adt(
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
     // `Deref::Target` class so the payload attr and the cast agree.
-    let args = render_adt_payload_type_args(adt, llbc, 0);
+    let args = render_adt_payload_type_args(adt, llbc, 0, gc_struct_ids);
     Some(RefEnumInst {
         def_id,
         name_path,
@@ -718,7 +719,10 @@ fn ref_enum_instantiation_of_adt(
 ///     these pre-mints the variant subclasses before
 ///     `assign_inheritance_ids`; otherwise the discriminant narrowing mints
 ///     them lazily afterwards, unnumbered (per-graph Skip→legacy walker).
-fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
+fn collect_ref_enum_instantiations(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Vec<RefEnumInst> {
     let mut found: std::collections::HashSet<RefEnumInst> = std::collections::HashSet::new();
     for fd in llbc.iter_local_fns() {
         let Some(u) = fd.unstructured() else {
@@ -737,7 +741,7 @@ fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
                 else {
                     continue;
                 };
-                if let Some(pair) = ref_enum_instantiation_of_adt(head, llbc) {
+                if let Some(pair) = ref_enum_instantiation_of_adt(head, llbc, gc_struct_ids) {
                     found.insert(pair);
                 }
             }
@@ -751,7 +755,7 @@ fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
             else {
                 continue;
             };
-            if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc) {
+            if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids) {
                 found.insert(pair);
             }
         }
@@ -765,7 +769,12 @@ fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
 /// renders as-is via [`tyref_to_ast_string`].  Only a bare type variable
 /// is substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
 /// inner rendering, which the caller treats as unresolved and skips.
-fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
+fn substitute_field_type(
+    ty: &TyRef,
+    args: &[String],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> String {
     if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
         && let Some(idx) = typevar_bound_index(node)
     {
@@ -777,7 +786,9 @@ fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
     // A concrete payload that is itself the handle (a monomorphized
     // `Result::Err` field) has to name the same class the cast writes.
     // A type variable already carries that spelling in `args`.
-    if let Some(spelling) = transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+    if let Some(spelling) =
+        transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
+    {
         return spelling;
     }
     tyref_to_ast_string(ty, llbc)
@@ -867,6 +878,7 @@ fn register_ref_enum_instantiation_rows(
         std::collections::HashMap<i64, String>,
     >,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     for inst in insts {
         let Some(td) = llbc.type_by_id(inst.def_id) else {
@@ -900,7 +912,7 @@ fn register_ref_enum_instantiation_rows(
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
+                let concrete = substitute_field_type(&f.ty, &inst.args, llbc, gc_struct_ids);
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
                 // under the same rule as a sole scalar.
@@ -1266,7 +1278,7 @@ impl CrateLoweringState {
         // per-instantiation roots) and numbers the variant subclasses before
         // `assign_inheritance_ids`, so the split classes drain rather than
         // landing unnumbered (per-graph Skip).
-        let ref_enum_insts = collect_ref_enum_instantiations(llbc);
+        let ref_enum_insts = collect_ref_enum_instantiations(llbc, gc_struct_ids);
         for inst in &ref_enum_insts {
             let leaf = inst
                 .name_path
@@ -1297,6 +1309,7 @@ impl CrateLoweringState {
             &ref_enum_insts,
             &enum_variant_by_discriminant,
             &mut struct_fields,
+            gc_struct_ids,
         );
 
         // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
@@ -2719,6 +2732,7 @@ fn published_struct_field_layout(
     field_name: &str,
     field_ty: &TyRef,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> String {
     let leaf = type_path.rsplit("::").next().unwrap_or(type_path);
     let is_rbigint = type_path == "rbigint::RBigInt" || type_path.ends_with("::rbigint::RBigInt");
@@ -2730,7 +2744,7 @@ fn published_struct_field_layout(
     } else if is_tuple_object && field_name == "wrappeditems" {
         "[*mut PyObject]".to_string()
     } else {
-        annotation_struct_field_type(field_ty, llbc)
+        annotation_struct_field_type(field_ty, llbc, gc_struct_ids)
     }
 }
 
@@ -2739,12 +2753,16 @@ fn published_struct_field_layout(
 /// spelling `project_rust_vec` accepts; [`tyref_to_field_layout_string`]
 /// writes `isize`, which annotates as `SomeInteger` and then `len` of the
 /// field raises `'int' has no length`.
-fn annotation_struct_field_type(ty: &TyRef, llbc: &Llbc) -> String {
+fn annotation_struct_field_type(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> String {
     match tyref_rust_vec_item_kind(ty, llbc) {
         Some(majit_ir::rvec::VecItemKind::Int) => "*mut Vec<usize>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
-        None => tyref_to_field_layout_string(ty, llbc),
+        None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids),
     }
 }
 
@@ -2898,14 +2916,23 @@ fn derive_program_metadata(
                 // projecting that class has no common annotator base with
                 // the handle, which subclasses the object class.
                 let owner_ty = type_decl_adt_tyref(td.def_id);
-                let handle_payload =
-                    transparent_handle_field_spelling(&owner_ty, llbc, no_tombstoned_leaves());
+                let handle_payload = transparent_handle_field_spelling(
+                    &owner_ty,
+                    llbc,
+                    no_tombstoned_leaves(),
+                    gc_struct_ids,
+                );
                 let handle_field_index = handle_payload
                     .as_ref()
                     .and_then(|_| transparent_nonzst_field(td, llbc).map(|(i, _)| i));
                 let handle_attr = handle_payload.as_ref().and_then(|_| {
-                    transparent_deref_target_class(&owner_ty, llbc, no_tombstoned_leaves())
-                        .map(|root| ValueType::Ref(Some(root)))
+                    transparent_deref_target_class(
+                        &owner_ty,
+                        llbc,
+                        no_tombstoned_leaves(),
+                        gc_struct_ids,
+                    )
+                    .map(|root| ValueType::Ref(Some(root)))
                 });
                 // A pair-slice field is its pointer word under the field's
                 // own name and its length word under `pair_len_field_name`.
@@ -2921,7 +2948,13 @@ fn derive_program_metadata(
                         let layout = match (handle_field_index == Some(i), handle_payload.as_ref())
                         {
                             (true, Some(spelling)) => spelling.clone(),
-                            _ => published_struct_field_layout(&name, &fname, &f.ty, llbc),
+                            _ => published_struct_field_layout(
+                                &name,
+                                &fname,
+                                &f.ty,
+                                llbc,
+                                gc_struct_ids,
+                            ),
                         };
                         let field_ty =
                             crate::virtualizable_decl::overlay_virtualizable_llfield_layout(
@@ -3372,12 +3405,12 @@ fn derive_program_metadata(
                                 ("u32".to_string(), ValueType::Int)
                             } else if tyref_is_type_parameter(&f.ty, llbc) {
                                 (
-                                    tyref_to_field_layout_string(&f.ty, llbc),
+                                    tyref_to_field_layout_string(&f.ty, llbc, gc_struct_ids),
                                     ValueType::Unknown,
                                 )
                             } else {
                                 (
-                                    annotation_struct_field_type(&f.ty, llbc),
+                                    annotation_struct_field_type(&f.ty, llbc, gc_struct_ids),
                                     tyref_to_attr_value_type_with(
                                         &f.ty,
                                         llbc,
@@ -12861,7 +12894,7 @@ impl<'a> Lowering<'a> {
         if !self.ty_is_error_carrier(ty) {
             return None;
         }
-        transparent_deref_target_class(ty, self.llbc, self.tombstoned_leaves)
+        transparent_deref_target_class(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
     }
 
     /// `PyError(ptr)` is one pointer word. The class is the handle's
@@ -31262,9 +31295,9 @@ impl<'a> Lowering<'a> {
             && let Some((_, name, ty, _, _)) = self.resolve_adt_field(&base.ty, payload)
             && let Some(type_path) = self.field_decl_path(&base.ty)
         {
-            published_struct_field_layout(&type_path, &name, &ty, self.llbc)
+            published_struct_field_layout(&type_path, &name, &ty, self.llbc, self.gc_struct_ids)
         } else {
-            tyref_to_field_layout_string(&place.ty, self.llbc)
+            tyref_to_field_layout_string(&place.ty, self.llbc, self.gc_struct_ids)
         };
         type_spelling_is_fixed_object_array(&spelling)
     }
@@ -52220,7 +52253,7 @@ fn tyref_to_value_type_with(
     // handle intern's as a subclass of `Deref::Target` (`error::PyError`
     // under `error::PyErrorObject`); painting the target made getattr of
     // the handle's `.0` / a `MutRef<Handle>.value` resolve on the payload.
-    if transparent_deref_target_class(ty, llbc, tombstoned).is_some()
+    if transparent_deref_target_class(ty, llbc, tombstoned, gc_struct_ids).is_some()
         && let Some(root) = tyref_node(ty, llbc)
             .and_then(|node| strip_ty_wrappers(node, llbc))
             .and_then(|node| adt_node_class_root_leaf(node, llbc, tombstoned))
@@ -54179,6 +54212,7 @@ fn transparent_handle_has_deref_class(
     wrapper_id: u64,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> bool {
     match &decl.kind {
         TypeDeclKind::Struct(fields) => {
@@ -54195,12 +54229,7 @@ fn transparent_handle_has_deref_class(
                 return false;
             }
             matches!(
-                tyref_to_value_type_with(
-                    &field.ty,
-                    llbc,
-                    tombstoned,
-                    &harvest_declared_gc_facts(llbc).gc_struct_ids(),
-                ),
+                tyref_to_value_type_with(&field.ty, llbc, tombstoned, gc_struct_ids),
                 ValueType::Ref(_)
             )
         }
@@ -54250,11 +54279,12 @@ fn transparent_deref_target_class(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let wrapper_id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(wrapper_id)?;
-    if !transparent_handle_has_deref_class(decl, wrapper_id, llbc, tombstoned) {
+    if !transparent_handle_has_deref_class(decl, wrapper_id, llbc, tombstoned, gc_struct_ids) {
         return None;
     }
     let trait_id = deref_trait_decl_id(llbc)?;
@@ -54330,14 +54360,15 @@ fn transparent_handle_field_spelling(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<String> {
-    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned, gc_struct_ids) {
         return Some(format!("*mut {root}"));
     }
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.as_object()?.get("RawPtr")?.as_array()?.first()?;
     let pointee_ty = TyRef::Other(pointee.clone());
-    let root = transparent_deref_target_class(&pointee_ty, llbc, tombstoned)?;
+    let root = transparent_deref_target_class(&pointee_ty, llbc, tombstoned, gc_struct_ids)?;
     Some(format!("*mut {root}"))
 }
 
@@ -56540,12 +56571,18 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
     }
 }
 
-fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+fn tyref_to_field_layout_string(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> String {
     // A transparent GC handle is one pointer to its `Deref::Target`.
     // Spell that pointer before the reference / transparent-scalar arms:
     // the bare wrapper leaf would project as the wrapper's class, and
     // the target's own name would be laid out as the whole object.
-    if let Some(spelling) = transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+    if let Some(spelling) =
+        transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
+    {
         return spelling;
     }
     // A reference field is one pointer repr, not an inline copy of its
@@ -57396,6 +57433,7 @@ fn render_adt_payload_type_args(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
     depth: usize,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Vec<String> {
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
@@ -57410,8 +57448,13 @@ fn render_adt_payload_type_args(
                     }
                     let ty = TyRef::Other(t.clone());
                     Some(
-                        transparent_handle_field_spelling(&ty, llbc, no_tombstoned_leaves())
-                            .unwrap_or(rendered),
+                        transparent_handle_field_spelling(
+                            &ty,
+                            llbc,
+                            no_tombstoned_leaves(),
+                            gc_struct_ids,
+                        )
+                        .unwrap_or(rendered),
                     )
                 })
                 .collect()
@@ -73794,10 +73837,14 @@ mod tests {
         let mutable = super::TyRef::Other(serde_json::json!({
             "Ref": ["_", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
         }));
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
 
-        assert_eq!(super::tyref_to_field_layout_string(&shared, &llbc), "&i64");
         assert_eq!(
-            super::tyref_to_field_layout_string(&mutable, &llbc),
+            super::tyref_to_field_layout_string(&shared, &llbc, &gc_struct_ids),
+            "&i64"
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(&mutable, &llbc, &gc_struct_ids),
             "&mut i64"
         );
     }
@@ -76382,6 +76429,7 @@ mod tests {
             serde_json::json!([null, blanket, pyerror_deref_impl(23, 2)]),
             3,
         );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         assert_eq!(
             super::tyref_to_value_type(&ty, &llbc),
             ValueType::Ref(Some("PyError".into()))
@@ -76390,7 +76438,7 @@ mod tests {
         // The payload row is one pointer to the Deref target. A bare
         // `PyErrorObject` would be laid out as the whole object.
         assert_eq!(
-            super::tyref_to_field_layout_string(&ty, &llbc),
+            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
             "*mut PyErrorObject"
         );
         let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
@@ -76402,7 +76450,7 @@ mod tests {
             Some("PyError")
         );
         assert_eq!(
-            super::tyref_to_field_layout_string(&ptr, &llbc),
+            super::tyref_to_field_layout_string(&ptr, &llbc, &gc_struct_ids),
             "*mut PyErrorObject"
         );
 
@@ -76414,9 +76462,13 @@ mod tests {
         assert_eq!(same_class, ValueType::Ref(Some("PyError".into())));
 
         let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
         assert_handle_class(&llbc, &ty, Some("PyError"));
-        assert_eq!(super::tyref_to_field_layout_string(&ty, &llbc), "PyError");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
+            "PyError"
+        );
 
         let mut scalar_decls = decls.clone();
         scalar_decls[2] = (
@@ -76428,9 +76480,13 @@ mod tests {
             serde_json::json!([pyerror_deref_impl(23, 2)]),
             3,
         );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
         assert_handle_class(&llbc, &ty, Some("Word"));
-        assert_eq!(super::tyref_to_field_layout_string(&ty, &llbc), "i64");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
+            "i64"
+        );
 
         let split = paint_handle(
             decls.clone(),
@@ -76597,13 +76653,14 @@ mod tests {
             3,
             Some(8),
         );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         assert_eq!(
             super::tyref_to_value_type(&ty, &llbc),
             ValueType::Ref(Some("PyError".into()))
         );
         assert_handle_class(&llbc, &ty, Some("PyError"));
         assert_eq!(
-            super::tyref_to_field_layout_string(&ty, &llbc),
+            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
             "*mut PyErrorObject"
         );
 
@@ -76964,6 +77021,7 @@ mod tests {
             }
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let adt_ty = |def_id: u64, args: serde_json::Value| {
             serde_json::from_value::<super::TyRef>(serde_json::json!({
                 "Value": [8, {
@@ -76982,7 +77040,7 @@ mod tests {
             serde_json::json!([{"Scalar": {"Integer": {"Unsigned": "Usize"}}}]),
         );
         assert_eq!(
-            super::tyref_to_field_layout_string(&usize_ty, &llbc),
+            super::tyref_to_field_layout_string(&usize_ty, &llbc, &gc_struct_ids),
             "usize"
         );
         assert_eq!(
@@ -76998,7 +77056,7 @@ mod tests {
             1,
             serde_json::json!([{"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}]),
         );
-        let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc);
+        let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc, &gc_struct_ids);
         assert_eq!(ptr_str, "*mut u8");
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str).1,
@@ -77061,8 +77119,12 @@ mod tests {
             }]
         }))
         .expect("fixture TyRef parses");
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
 
-        assert_eq!(super::tyref_to_field_layout_string(&enum_ty, &llbc), "u8");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&enum_ty, &llbc, &gc_struct_ids),
+            "u8"
+        );
         assert_eq!(
             crate::codewriter::call::get_type_flag("u8"),
             (
@@ -77154,8 +77216,9 @@ mod tests {
             super::tyref_to_attr_value_type(&linked_ty, &llbcs[1]),
             crate::model::ValueType::Int
         );
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbcs[1]).gc_struct_ids();
         assert_eq!(
-            super::tyref_to_field_layout_string(&linked_ty, &llbcs[1]),
+            super::tyref_to_field_layout_string(&linked_ty, &llbcs[1], &gc_struct_ids),
             "i64"
         );
     }
