@@ -1849,17 +1849,24 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
     // flush stays keyed on that virtualizable, whose resume pc this residual
     // already latched, so the walk resumes forward rather than replaying from
     // entry.
-    let escaped_published = PUBLISHED_INLINE_FRAME.with(|slot| {
-        let published = slot.get();
-        let matched = !published.is_null() && std::ptr::eq(published, frame);
-        if matched {
-            let f_back = unsafe { (*published).get_f_back() };
-            if !f_back.is_null() {
-                unsafe { (*f_back).mark_as_escaped() };
+    // `hook_access_field` residual (`jit_force_virtualizable_field`) tests the
+    // instance's own token. A published inlined callee is a different
+    // instance and must not escape the portal; `sys._getframe` still does.
+    let escaped_published = if pyre_interpreter::executioncontext::force_is_redirected_field() {
+        false
+    } else {
+        PUBLISHED_INLINE_FRAME.with(|slot| {
+            let published = slot.get();
+            let matched = !published.is_null() && std::ptr::eq(published, frame);
+            if matched {
+                let f_back = unsafe { (*published).get_f_back() };
+                if !f_back.is_null() {
+                    unsafe { (*f_back).mark_as_escaped() };
+                }
             }
-        }
-        matched
-    });
+            matched
+        })
+    };
     ACTIVE_FRAME_ESCAPE.with(|slot| {
         if let Some((expected, portal_py_pc)) = slot.get()
             && {
