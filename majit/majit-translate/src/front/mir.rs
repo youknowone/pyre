@@ -19612,6 +19612,28 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // rustc promotes `(a..=b)` to an `AnonConst` whose init is
+                // `RangeInclusive::new(const, const)` plus a `&` return.
+                // `promoted_init_from_body` requires a 1-BB assign+return,
+                // so the 3-BB Call+Ref+Unwind shape is not spliced, and
+                // the Global read would residualize a 0-arg Call on the
+                // static's path (`…::is_primitive::promoted`). That path
+                // is not a function: `symbolic_fnaddr_for_path` hashes it
+                // to `SYMBOLIC_FNADDR_BASE` and the walker aborts.
+                //
+                // RPython constants are live host values at translation
+                // time (`const_eval_init_body`); un-promote the range back
+                // into the caller as the inline `new(lo, hi)` the
+                // `(a..=b).contains(&x)` fold (`front::range_contains`)
+                // already consumes. PyPy's `isinstance(ct, W_CTypePrimitive)`
+                // on a promoted ctype is a constant-folded class check
+                // (`ctypeprim.W_CTypePrimitive`); a helper with a graph is
+                // `guess_call_kind` → `'regular'` (`call.py`) → `inline_call`.
+                if let Some((lo, hi)) = promoted_int_range_inclusive_bounds(self.llbc, id)
+                    && tyref_is_int_range_inclusive(&place_ty, self.llbc)
+                {
+                    return Ok(self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty));
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots
@@ -20710,6 +20732,61 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: Place::Global references unknown GlobalDecl id {def_id}"
                 ))
             })
+    }
+
+    /// Emit the inline `RangeInclusive::new(lo, hi)` a promoted
+    /// `(a..=b)` constant becomes once its AnonConst init is folded.
+    /// Records a [`crate::front::range_contains::RangeInclusiveNewSite`]
+    /// so the post-pass can pair it with `contains` and remove `new`.
+    fn emit_promoted_int_range_inclusive(
+        &mut self,
+        mir_bb: usize,
+        lo: i64,
+        hi: i64,
+        place_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let lo_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(lo_v.clone()),
+            kind: OpKind::ConstInt(lo),
+        });
+        let hi_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(hi_v.clone()),
+            kind: OpKind::ConstInt(hi),
+        });
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        // Owner-qualified associated-function spelling
+        // `unspecialized_fun_segments` emits for `RangeInclusive::new`
+        // (`ops::range::RangeInclusive::new`). The fold matches the
+        // `["range", "RangeInclusive", "new"]` tail.
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ops", "range", "RangeInclusive", "new"]),
+                args: crate::model::call_args(vec![lo_v.clone(), hi_v.clone()]),
+                result_ty: tyref_to_value_type_with(
+                    place_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                ),
+            },
+        });
+        self.range_inclusive_new_sites
+            .push(crate::front::range_contains::RangeInclusiveNewSite {
+                result_var: res.clone(),
+                lo: lo_v,
+                hi: hi_v,
+            });
+        res
     }
 
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
@@ -61335,6 +61412,96 @@ fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u64) -> Option<u64> {
         }
     }
     named
+}
+
+/// An `AnonConst` / promoted const whose init is `RangeInclusive::new`
+/// of two integer constants.  rustc lifts `(a..=b)` out of the function;
+/// Charon records the init as a 3-BB Call+Ref-return+Unwind, which
+/// `promoted_init_from_body` will not splice.  The bounds are the live
+/// host values RPython would already have at translation time.
+fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64, i64)> {
+    let g = llbc.global_by_id(def_id)?;
+    if g.rest
+        .get("global_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("AnonConst")
+    {
+        return None;
+    }
+    let leaf = g.item_meta.name_path().rsplit("::").next()?.to_string();
+    if !majit_charon_reader::ullbc::is_const_initializer_leaf(&leaf) {
+        return None;
+    }
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+    let u = llbc.fn_by_id(init_id)?.unstructured()?;
+    let mut bounds = None;
+    for bb in &u.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        if leaf != "new"
+            || !owner
+                .rsplit("::")
+                .next()
+                .is_some_and(|s| s == "RangeInclusive")
+        {
+            continue;
+        }
+        if call.args.len() != 2 {
+            return None;
+        }
+        let lo = operand_as_signed_int(llbc, &call.args[0])?;
+        let hi = operand_as_signed_int(llbc, &call.args[1])?;
+        if bounds.is_some() {
+            return None;
+        }
+        bounds = Some((lo, hi));
+    }
+    bounds
+}
+
+/// Integer constant carried by a `RangeInclusive::new` operand: a
+/// literal, or a `NamedConst` global (`KIND_PRIM_CHAR` / `KIND_PRIM_COMPLEX`).
+fn operand_as_signed_int(llbc: &Llbc, op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Const(value) => match decode_constant(llbc, value).ok()? {
+            DecodedConst::Int(n) => Some(n),
+            DecodedConst::UInt(n) => i64::try_from(n).ok(),
+            DecodedConst::Int128(n) => i64::try_from(n).ok(),
+            DecodedConst::UInt128(n) => i64::try_from(n).ok(),
+            _ => None,
+        },
+        Operand::Copy(place) | Operand::Move(place) => {
+            let PlaceKind::Global { id, .. } = &place.kind else {
+                return None;
+            };
+            global_signed_int(llbc, *id)
+        }
+    }
+}
+
+fn global_signed_int(llbc: &Llbc, def_id: u64) -> Option<i64> {
+    match fold_named_const_on_llbc(llbc, def_id).or_else(|| {
+        let g = llbc.global_by_id(def_id)?;
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+        const_eval_init_body(llbc, &llbc.fn_by_id(init_id)?.unstructured()?)
+    })? {
+        OpKind::ConstInt(n) => Some(n),
+        OpKind::ConstUInt(n) => i64::try_from(n).ok(),
+        _ => None,
+    }
 }
 
 /// Fold a `NamedConst` whose initializer is the trivial
