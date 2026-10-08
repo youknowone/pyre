@@ -8074,9 +8074,10 @@ struct Lowering<'a> {
     /// minted it from. The target body is lowered before pass 2 writes
     /// those pairs as link args, so a use in the target reads the map.
     input_copied_from: std::collections::HashMap<u64, u64>,
-    /// Header addresses of a `Vec<PyObjectRef>`. `index_mut(RangeFull)`
-    /// aliases `&mut vec[..]` to this word. A block input copied from it
-    /// is recorded too.
+    /// Header addresses of a `Vec<PyObjectRef>`. A whole-list mutable
+    /// view (`deref_mut`, `as_mut_slice`, `index_mut(RangeFull)`) aliases
+    /// `&mut vec` / `&mut vec[..]` to this word. A block input copied from
+    /// it is recorded too.
     object_vec_headers: std::collections::HashSet<u64>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
@@ -9505,6 +9506,17 @@ impl<'a> Lowering<'a> {
                 None => return false,
             }
         }
+    }
+
+    /// Whether MIR `local` currently holds a [`Self::note_object_vec_header`]
+    /// address: the dest of a whole-list mut view (`deref_mut`,
+    /// `as_mut_slice`, `index_mut(RangeFull)`).
+    fn local_is_object_vec_header(&self, local: usize) -> bool {
+        self.local_var
+            .get(local)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())
+            .is_some_and(|var| self.var_is_object_vec_header(&var))
     }
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
@@ -15350,6 +15362,63 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// `&vec`, `&mut vec`, `&vec[..]`, `&mut vec[..]` of a `Vec<PyObjectRef>`
+    /// are the same `SomeList` value. RPython has no borrow wrapper.
+    ///
+    /// Shared views copy the items into one length-prefixed object array
+    /// (`gcarray_from_pyobject_vec`). Mutable views keep the header address
+    /// so a write, or `shadow_stack_copy_range`, updates that vec.
+    fn try_lower_object_vec_whole_list_view(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+        reg: &RegularCall,
+    ) -> Result<bool, LowerError> {
+        let Some(view) = object_vec_whole_list_view(reg, call.args.len(), self.llbc) else {
+            return Ok(false);
+        };
+        let Some(first_ty) = call.args.first().and_then(operand_tyref) else {
+            return Ok(false);
+        };
+        if !tyref_is_object_pointer_rust_vec(first_ty, self.llbc) {
+            return Ok(false);
+        }
+        let header = self.resolve_operand(mir_bb, call.args[0].clone())?;
+        let inherit = operand_local(call.args.first())
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        self.bind_object_vec_whole_list_view(mir_bb, dest_local, header, target, view, inherit)?;
+        Ok(true)
+    }
+
+    /// The shared object-vec whole-list arm. [`Self::try_lower_object_vec_whole_list_view`]
+    /// is the only caller; Deref and RangeFull both reach it.
+    fn bind_object_vec_whole_list_view(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        header: Variable,
+        target: usize,
+        view: ObjectVecWholeListView,
+        inherit_byte_view: bool,
+    ) -> Result<(), LowerError> {
+        if view == ObjectVecWholeListView::Shared
+            && !rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
+        {
+            return self.emit_object_vec_gcarray(mir_bb, dest_local, header, target);
+        }
+        if view == ObjectVecWholeListView::Mut {
+            self.note_object_vec_header(&header);
+        }
+        self.alias_dest_to_arg0(dest_local, header, inherit_byte_view);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph
+            .set_goto(self.block_id[mir_bb], target_bb, link_args);
+        Ok(())
+    }
+
     /// Emit a call of the helper at `path` and return its result.
     fn emit_path_call(
         &mut self,
@@ -16181,13 +16250,22 @@ impl<'a> Lowering<'a> {
         // The receiver must be a pair in this frame (a length slot), not
         // merely a pair-shaped type. An object-pointer `&mut [T]` parameter
         // keeps the one-word helper ABI; only a body local of that type is
-        // the `{ptr, len}` view.
-        operand_local(call.args.first()).is_some_and(|local| self.len_shadow[local].is_some())
-            && call
-                .args
-                .first()
-                .and_then(operand_tyref)
-                .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
+        // the `{ptr, len}` view. A whole-list `&mut vec` aliases the vec
+        // header ([`Self::try_lower_object_vec_whole_list_view`]) and has
+        // no length slot; slice methods on that view still take this arm,
+        // which splits the header with [`Self::pair_of_vec`].
+        // `<[T]>::reverse` of the header stays `ll_vec_reverse` in the
+        // regular call arm (`rlist.py` `ll_reverse`).
+        operand_local(call.args.first()).is_some_and(|local| {
+            self.len_shadow[local].is_some()
+                || (self.local_is_object_vec_header(local)
+                    && regular_call_name_path(reg, self.llbc).as_deref()
+                        != Some("core::slice::<Impl>::reverse"))
+        }) && call
+            .args
+            .first()
+            .and_then(operand_tyref)
+            .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
             && regular_call_name_path(reg, self.llbc).is_some_and(|path| match path.as_str() {
                 "core::slice::<Impl>::len"
                 | "core::slice::<Impl>::is_empty"
@@ -16223,7 +16301,12 @@ impl<'a> Lowering<'a> {
     ///   `ll_slice_arraycopy` of the destination length. `as_ptr` and
     ///   `as_mut_ptr` are the pointer word.
     /// - `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice` and
-    ///   `Vec::index(RangeFull)` are `(ll_vec_items(v), ll_vec_length(v))`.
+    ///   `Vec::index(RangeFull)` of a one-word item vec are
+    ///   `(ll_vec_items(v), ll_vec_length(v))`. `Vec<PyObjectRef>`
+    ///   whole-list views are one `SomeList` word
+    ///   ([`Self::try_lower_object_vec_whole_list_view`]); a slice method
+    ///   on a mut view splits that header with [`Self::pair_of_vec`] and
+    ///   uses the same `ll_slice_*` helpers.
     /// - `slice::from_raw_parts(p, n)` is `(p, n)`.
     /// - Any other callee returning a pair slice takes the address of a
     ///   one-word length slot as a trailing argument, stores the length
@@ -16260,6 +16343,25 @@ impl<'a> Lowering<'a> {
                 }
                 None => args.push(self.resolve_operand(mir_bb, op.clone())?),
             }
+        }
+        // Whole-list `&mut vec` / `&mut vec[..]` of `Vec<PyObjectRef>` is
+        // the header word, so it has no length slot. Slice methods on that
+        // view (`rotate_left` / `rotate_right`, `copy_from_slice`, ...) and
+        // `iter_mut` still walk the item buffer: split the header the way
+        // `pair_of_vec` splits a `Vec` (`ll_vec_items` / `ll_vec_length`).
+        if !pair_lens.iter().any(|(at, _)| *at == 0)
+            && args
+                .first()
+                .is_some_and(|v| self.var_is_object_vec_header(v))
+        {
+            let kind = arg_tys
+                .first()
+                .and_then(Option::as_ref)
+                .and_then(|ty| self.pair_slice_kind(ty))
+                .unwrap_or(majit_ir::rvec::VecItemKind::Ref);
+            let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
+            args[0] = ptr;
+            pair_lens.insert(0, (0, len));
         }
         let vec_kind = arg_tys
             .first()
@@ -22034,6 +22136,19 @@ impl<'a> Lowering<'a> {
         if self.lower_item_addr_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
+        // Whole-list `Vec<PyObjectRef>` views (`&vec`, `&mut vec`, `&vec[..]`,
+        // `&mut vec[..]`) are one `SomeList` word. Take that arm before
+        // `is_pair_call`: an object-pointer `&mut [T]` dest would otherwise
+        // become a `{ptr, len}` pair, and a later one-word use
+        // (`shadow_stack_copy_range`, a reborrow) declines with
+        // `pair-slice local read as one word`. Slice methods on the mut
+        // view (`rotate_right`) still take `is_pair_call`, which splits
+        // the header.
+        if let CallFunc::Regular(reg) = &call.func
+            && self.try_lower_object_vec_whole_list_view(mir_bb, &call, dest_local, target, reg)?
+        {
+            return Ok(());
+        }
         if self.is_pair_call(&call, dest_local) {
             return self.lower_pair_call(mir_bb, call, dest_local, target);
         }
@@ -22839,31 +22954,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Vec<PyObjectRef>::deref` yields `&[T]`. The vec is the
-                // address of its header; a shared slice is one
-                // length-prefixed object array, so copy the items
-                // (`gcarray_from_pyobject_vec`). `deref_mut` yields
-                // `&mut [T]`, the `{ptr, len}` view that aliases the
-                // vec's item buffer (`pair_of_vec`); a copy would drop
-                // stores (`arguments_w.iter_mut()`). `<[T]>::reverse`
-                // keeps the header alias below.
-                if args.len() == 1
-                    && self.is_container_identity_deref(&reg)
-                    && regular_call_name_path(&reg, self.llbc)
-                        .as_deref()
-                        .is_some_and(|path| path.ends_with("::deref"))
-                    && first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc))
-                    && !rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
-                {
-                    return self.emit_object_vec_gcarray(
-                        mir_bb,
-                        dest_local,
-                        args[0].clone(),
-                        target,
-                    );
-                }
                 // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
                 // identity in the lifted value model (String/&str and
                 // Vec/&[T] share one repr), so alias the destination to
@@ -23264,31 +23354,14 @@ impl<'a> Lowering<'a> {
                 // identity before the scalar element arm; Range/RangeFrom/
                 // RangeTo remain real getslice operations.
                 //
-                // `Vec<PyObjectRef>[..]` shared is the length-prefixed object
-                // array `deref` / `as_slice` build. `index_mut` keeps the
-                // header address: the slice is the vec's own buffer, and
-                // `shadow_stack_copy_range` writes that vec.
+                // `Vec<PyObjectRef>[..]` is [`Self::try_lower_object_vec_whole_list_view`].
                 if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
+                    // A `Vec` of raw pointers is an address (`getkind` int).
+                    // The slice view is `lltype.cast_int_to_ptr`.
+                    // `Vec<PyObjectRef>` already took the whole-list arm above.
                     let object_vec = first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc));
-                    match vec_index_regular_unchecked_leaf(&reg, self.llbc) {
-                        Some("index") if object_vec => {
-                            return self.emit_object_vec_gcarray(
-                                mir_bb,
-                                dest_local,
-                                args[0].clone(),
-                                target,
-                            );
-                        }
-                        Some("index_mut") if object_vec => {
-                            self.note_object_vec_header(&args[0]);
-                        }
-                        _ => {}
-                    }
-                    // A `Vec` of raw pointers is an address (`getkind` int).
-                    // The slice view is `lltype.cast_int_to_ptr`.
-                    // `Vec<PyObjectRef>` already took the GcArray arm above.
                     if !object_vec
                         && borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc, self.gc_struct_ids)
                     {
@@ -25649,22 +25722,8 @@ impl<'a> Lowering<'a> {
                 // annotation.  Same shape as the reflexive identity aliases
                 // below.
                 //
-                // `Vec<PyObjectRef>::as_slice` is the object array the
-                // deref arm builds, not an alias of the header.
+                // `Vec<PyObjectRef>::as_slice` is [`Self::try_lower_object_vec_whole_list_view`].
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    if regular_call_name_path(&reg, self.llbc).as_deref()
-                        == Some("alloc::vec::<Impl>::as_slice")
-                        && first_arg_ty
-                            .as_ref()
-                            .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc))
-                    {
-                        return self.emit_object_vec_gcarray(
-                            mir_bb,
-                            dest_local,
-                            args[0].clone(),
-                            target,
-                        );
-                    }
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -40592,6 +40651,45 @@ fn is_vec_rangefull_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
         .is_some_and(|t| tyref_to_ast_string(&t, llbc) == "RangeFull")
+}
+
+/// Shared vs mutable whole-list view of a `Vec<PyObjectRef>`.
+///
+/// `&vec` / `&vec[..]` / `as_slice` copy the items into one object array.
+/// `&mut vec` / `&mut vec[..]` / `as_mut_slice` keep the header address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectVecWholeListView {
+    Shared,
+    Mut,
+}
+
+/// Deref / DerefMut / `as_slice` / `as_mut_slice` / `Index(RangeFull)` of a
+/// `Vec`. The caller still checks the receiver is a `Vec<PyObjectRef>`.
+fn object_vec_whole_list_view(
+    reg: &RegularCall,
+    nargs: usize,
+    llbc: &Llbc,
+) -> Option<ObjectVecWholeListView> {
+    let path = regular_call_name_path(reg, llbc)?;
+    let leaf = path.rsplit("::").next()?;
+    if nargs == 1 {
+        // `alloc::vec::<Impl>::deref` after monomorphization. A slice
+        // `as_slice` has a slice receiver, not a `Vec`.
+        let vec_method = path.starts_with("alloc::vec::");
+        return match leaf {
+            "deref" | "as_slice" if vec_method => Some(ObjectVecWholeListView::Shared),
+            "deref_mut" | "as_mut_slice" if vec_method => Some(ObjectVecWholeListView::Mut),
+            _ => None,
+        };
+    }
+    if nargs == 2 && is_vec_rangefull_index_regular(reg, llbc) {
+        return match vec_index_regular_unchecked_leaf(reg, llbc)? {
+            "index" => Some(ObjectVecWholeListView::Shared),
+            "index_mut" => Some(ObjectVecWholeListView::Mut),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Whether `ty` is an index type [`vec_index_regular_leaf`] may lower to a
@@ -66017,6 +66115,9 @@ fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
 fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     let n = body.locals.locals.len();
     let mut view = vec![false; n];
+    // Whole-list `&mut vec` / `&mut vec[..]` is the header word, not a
+    // `{ptr, len}` pair. `iter_mut` of that dest still walks the buffer.
+    let mut whole_list_mut_dest = vec![false; n];
     for bb in &body.body {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
@@ -66035,7 +66136,15 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
             && slice_ty_item_is_object_pointer(&call.dest.ty, llbc)
             && (ref_kind_is_mut(&call.dest.ty, llbc) || raw_ptr_kind_is_mut(&call.dest.ty, llbc))
         {
-            view[dest] = true;
+            // A Range / RangeFrom / RangeTo subslice stays the aliasing view.
+            let whole_list_mut = matches!(&call.func, CallFunc::Regular(reg)
+                if object_vec_whole_list_view(reg, call.args.len(), llbc)
+                    == Some(ObjectVecWholeListView::Mut));
+            if whole_list_mut {
+                whole_list_mut_dest[dest] = true;
+            } else {
+                view[dest] = true;
+            }
         }
     }
     let mut changed = true;
@@ -66068,7 +66177,9 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
                 },
                 _ => continue,
             };
-            if view.get(recv).copied().unwrap_or(false) {
+            if view.get(recv).copied().unwrap_or(false)
+                || whole_list_mut_dest.get(recv).copied().unwrap_or(false)
+            {
                 view[dest] = true;
                 changed = true;
             }
@@ -91477,6 +91588,331 @@ mod tests {
         assert!(
             !leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
             "deref_mut must not copy into a gcarray: {leaves:?}"
+        );
+    }
+
+    fn object_vec_whole_list_fixture(
+        name: &str,
+        callee_path: &[&str],
+        callee_id: u64,
+        vec_mut: bool,
+        dest_is_mut_slice: bool,
+        extra_funs: Vec<serde_json::Value>,
+        extra_blocks: Vec<serde_json::Value>,
+        extra_locals: Vec<serde_json::Value>,
+        extra_args: Vec<serde_json::Value>,
+        extra_inputs: Vec<serde_json::Value>,
+    ) -> (Llbc, crate::model::FunctionGraph) {
+        let span = fixture_span();
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let obj = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let objptr = serde_json::json!({"RawPtr": [obj, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {"types": [objptr.clone()]}}
+        });
+        let vec_ref = if vec_mut {
+            serde_json::json!({"Ref": ["'_", vec_ty, "Mut"]})
+        } else {
+            serde_json::json!({"Ref": ["'_", vec_ty, "Shared"]})
+        };
+        let slice_kind = if dest_is_mut_slice { "Mut" } else { "Shared" };
+        let slice_ty = serde_json::json!({
+            "Ref": ["'_", {"Slice": [objptr.clone(), null]}, slice_kind]
+        });
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+        let mut locals = vec![
+            local(0, Some("ret"), &slice_ty),
+            local(1, Some("vec"), &vec_ref),
+        ];
+        locals.extend(extra_locals);
+        let mut inputs = vec![vec_ref.clone()];
+        inputs.extend(extra_inputs);
+        let arg_count = inputs.len() as u64;
+        let mut args = vec![serde_json::json!({"Copy": place(1, &vec_ref)})];
+        args.extend(extra_args);
+        let mut body_blocks = vec![serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span, "kind": {"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": callee_id}, "generics": generics}},
+                    "args": args,
+                    "dest": place(0, &slice_ty)
+                },
+                "target": 1,
+                "on_unwind": extra_blocks.len() as u64 + 2
+            }}}
+        })];
+        body_blocks.extend(extra_blocks);
+        body_blocks.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span, "kind": "Return"}
+        }));
+        body_blocks.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span, "kind": "UnwindResume"}
+        }));
+        let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
+        let fun = |id: u64,
+                   path: &[&str],
+                   ins: Vec<serde_json::Value>,
+                   output: serde_json::Value,
+                   body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(path),
+                "signature": {"is_unsafe": false, "inputs": ins, "output": output},
+                "body": body
+            })
+        };
+        let view_body = serde_json::json!({"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": arg_count, "locals": locals},
+            "body": body_blocks
+        }});
+        let mut fun_decls = vec![
+            fun(0, &["fixture", name], inputs, slice_ty.clone(), view_body),
+            fun(
+                callee_id,
+                callee_path,
+                vec![vec_ref],
+                slice_ty,
+                serde_json::json!("Opaque"),
+            ),
+        ];
+        fun_decls.extend(extra_funs);
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta(&["PyObject"]), "kind": {"Struct": []}},
+                    {"def_id": 1, "item_meta": meta(&["alloc", "vec", "Vec"]), "kind": {"Struct": []}},
+                ],
+                "fun_decls": fun_decls,
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph =
+            super::lower_function(&llbc, name).unwrap_or_else(|err| panic!("lower {name}: {err}"));
+        (llbc, graph)
+    }
+
+    fn object_vec_call_leaves(graph: &crate::model::FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `Vec<PyObjectRef>::deref` (`&vec`) is the length-prefixed object array.
+    #[test]
+    fn object_vec_deref_builds_the_gcarray() {
+        let (_llbc, graph) = object_vec_whole_list_fixture(
+            "view",
+            &["alloc", "vec", "<Impl>", "deref"],
+            1,
+            false,
+            false,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let leaves = object_vec_call_leaves(&graph);
+        assert!(
+            leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+            "deref must copy into a gcarray: {leaves:?}"
+        );
+        let input = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .expect("vec input");
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .expect("return link");
+        assert!(
+            !matches!(returned, crate::model::LinkArg::Value(value) if value == input),
+            "deref must not alias the header; graph: {graph:#?}"
+        );
+    }
+
+    /// `Vec<PyObjectRef>::deref_mut` (`&mut vec`) is the header address, the
+    /// same `SomeList` as `&mut vec[..]`. A gcarray copy would drop stores.
+    #[test]
+    fn object_vec_deref_mut_aliases_the_header() {
+        let (_llbc, graph) = object_vec_whole_list_fixture(
+            "view_mut",
+            &["alloc", "vec", "<Impl>", "deref_mut"],
+            1,
+            true,
+            true,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let leaves = object_vec_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+            "deref_mut must not copy into a gcarray: {leaves:?}"
+        );
+        assert!(
+            !leaves.iter().any(|l| l == "ll_vec_items_r"),
+            "deref_mut must not split the header into a pair: {leaves:?}"
+        );
+        let input = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .expect("vec input");
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .expect("return link");
+        assert!(
+            matches!(returned, crate::model::LinkArg::Value(value) if value == input),
+            "deref_mut must alias the vec header; graph: {graph:#?}"
+        );
+    }
+
+    /// `&mut vec` passed to `shadow_stack_copy_range` is that vec. The call
+    /// is `shadow_stack_copy_range_into_vec`.
+    #[test]
+    fn object_vec_deref_mut_retargets_shadow_stack_copy_into_vec() {
+        let span = fixture_span();
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let obj = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let objptr = serde_json::json!({"RawPtr": [obj, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {"types": [objptr.clone()]}}
+        });
+        let vec_mut = serde_json::json!({"Ref": ["'_", vec_ty, "Mut"]});
+        let slice_ty = serde_json::json!({
+            "Ref": ["'_", {"Slice": [objptr.clone(), null]}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+        let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
+        let fun = |id: u64,
+                   path: &[&str],
+                   inputs: Vec<serde_json::Value>,
+                   output: serde_json::Value,
+                   body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(path),
+                "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+                "body": body
+            })
+        };
+        let init_ret = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(0, &unit),
+            {"Aggregate": ["Tuple", []]}
+        ]}});
+        let copy_body = serde_json::json!({"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                local(0, Some("ret"), &unit),
+                local(1, Some("base"), &usize_ty),
+                local(2, Some("vec"), &vec_mut),
+                local(3, Some("slice"), &slice_ty),
+            ]},
+            "body": [
+                {"statements": [init_ret], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                        "args": [{"Copy": place(2, &vec_mut)}],
+                        "dest": place(3, &slice_ty)
+                    },
+                    "target": 1,
+                    "on_unwind": 3
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                        "args": [
+                            {"Copy": place(1, &usize_ty)},
+                            {"Copy": place(3, &slice_ty)}
+                        ],
+                        "dest": place(0, &unit)
+                    },
+                    "target": 2,
+                    "on_unwind": 3
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta(&["PyObject"]), "kind": {"Struct": []}},
+                    {"def_id": 1, "item_meta": meta(&["alloc", "vec", "Vec"]), "kind": {"Struct": []}},
+                ],
+                "fun_decls": [
+                    fun(0, &["fixture", "copy_into"], vec![usize_ty.clone(), vec_mut.clone()], unit.clone(), copy_body),
+                    fun(1, &["alloc", "vec", "<Impl>", "deref_mut"], vec![vec_mut.clone()], slice_ty.clone(), serde_json::json!("Opaque")),
+                    fun(2, &["pyre_object", "gc_roots", "shadow_stack_copy_range"], vec![usize_ty, slice_ty], unit, serde_json::json!("Opaque")),
+                ],
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "copy_into")
+            .unwrap_or_else(|err| panic!("lower copy_into: {err}"));
+        let paths: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.join("::")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("shadow_stack_copy_range_into_vec")),
+            "deref_mut dest must retarget the copy: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.ends_with("gcarray_from_pyobject_vec")),
+            "deref_mut must not copy into a gcarray: {paths:?}"
         );
     }
 
