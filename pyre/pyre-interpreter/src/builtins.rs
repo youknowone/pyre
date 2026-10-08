@@ -6885,12 +6885,17 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
 ///
 /// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
 /// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
-/// The oracle aborts that compile (`vable escaped during a call in
-/// descr__new__ to ConstClass(_create_new_type)`).  `_create_new_type` has
-/// no `@dont_look_inside`; `JitPolicy.look_inside_graph` residualizes it
-/// because the body has loops (`contains_loop` / `find_backedges`).
-/// `W_TypeObject.__init__` is `@dont_look_inside`.  `#[inline(never)]` keeps
-/// the helper a separate graph so rustc does not fold it into `type_descr_new`.
+/// `_create_new_type` has no `@dont_look_inside`; `JitPolicy.look_inside_graph`
+/// residualizes it because the body has loops (`contains_loop` /
+/// `find_backedges`).  `W_TypeObject.__init__` is `@dont_look_inside`.
+/// `#[inline(never)]` keeps the helper a separate graph so rustc does not
+/// fold it into `type_descr_new`.
+///
+/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
+/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
+/// out) so the heap slot is already current.  A hand-placed
+/// `jit_force_virtualizable` here aborted compiles that create a type
+/// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
 #[inline(never)]
 fn type_create_new_type(
     args: &[PyObjectRef],
@@ -7122,13 +7127,15 @@ fn type_create_new_type(
         // calls do not pass through __build_class__, so fill __module__ from
         // the live caller frame when the namespace did not supply it.
         //
-        // `ensure_module_attr` reads the caller through
-        // `getexecutioncontext().gettopframe_nohidden()` then
-        // `caller.get_w_globals()`.  That load is `pycode` / `debugdata`
-        // (`interp_jit.py` `PyFrame._virtualizable_`).  `W_TypeObject.__init__`
-        // is `dont_look_inside`, so `hook_access_field` keeps
-        // `jit_force_virtualizable` in the residual; `vable_after_residual_call`
-        // then aborts a classify-as-function compile (`ABORT_ESCAPE`).
+        // `ensure_module_attr` reaches the caller through
+        // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
+        // rather than through the `CURRENT_FRAME` thread-local.  No force is
+        // owed here: the walk only dereferences the vref and follows
+        // `f_backref`, and `force_frame` belongs to the consumers that hand a
+        // frame to application code.  `w_globals` is a declared virtualizable
+        // field, but no walk writes it on the live frame —
+        // `restore_resume_state_from` leaves it and `pycode` out of the resume
+        // restore as frame-invariant — so its heap slot is already current.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -7138,11 +7145,6 @@ fn type_create_new_type(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
-                // `gettopframe` / `force_all_frames` re-read the live address
-                // after `force_frame`; the hook can collect.
-                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-                crate::executioncontext::jit_force_virtualizable_field(frame);
-                let frame = anchor.live();
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()
                     && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?

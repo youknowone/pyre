@@ -204,39 +204,6 @@ pub fn jit_force_virtualizable(frame: *mut PyFrame) {
     force_frame_before_locals_read(frame);
 }
 
-thread_local! {
-    static FORCE_REDIRECTED_FIELD: Cell<bool> = const { Cell::new(false) };
-}
-
-struct RedirectedFieldForceGuard;
-
-impl Drop for RedirectedFieldForceGuard {
-    fn drop(&mut self) {
-        FORCE_REDIRECTED_FIELD.with(|flag| flag.set(false));
-    }
-}
-
-/// `rvirtualizable.py hook_access_field` on a redirected field of `frame`.
-///
-/// `force_virtualizable_if_necessary` tests that instance's own token.
-/// The backend hook also treats a published inlined callee as an escape of
-/// the portal (`flush_active_frame_escape`); a field read is not handing the
-/// frame to application code, so that disjunct stays off.
-///
-/// The genop carries the field name at translation time
-/// (`hook_access_field` / `replace_force_virtualizable_with_call`).
-/// That identity is not a runtime argument of `force_frame`, so this
-/// Cell is the courier from the interp-level force to the flush.
-pub fn jit_force_virtualizable_field(frame: *mut PyFrame) {
-    FORCE_REDIRECTED_FIELD.with(|flag| flag.set(true));
-    let _guard = RedirectedFieldForceGuard;
-    force_frame_before_locals_read(frame);
-}
-
-pub fn force_is_redirected_field() -> bool {
-    FORCE_REDIRECTED_FIELD.with(|flag| flag.get())
-}
-
 /// `_jit_vref.py` `vref()` = `jit_force_virtual`.
 ///
 /// `topframeref` and every frame's `f_backref` hold a `jit.virtual_ref` — at
@@ -3746,11 +3713,9 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
 mod tests {
     use super::{force_frame, force_frame_before_locals_read};
     use crate::PyFrame;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicPtr, Ordering};
 
     static SEEN: AtomicPtr<PyFrame> = AtomicPtr::new(std::ptr::null_mut());
-    static FORCE_FRAME_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     unsafe extern "C" fn record(frame: *mut PyFrame) {
         SEEN.store(frame, Ordering::SeqCst);
@@ -3758,7 +3723,6 @@ mod tests {
 
     #[test]
     fn registered_force_frame_hook_is_invoked_with_the_frame_pointer() {
-        let _lock = FORCE_FRAME_HOOK_TEST_LOCK.lock().unwrap();
         force_frame_before_locals_read(std::ptr::null_mut());
 
         SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -3769,29 +3733,6 @@ mod tests {
             SEEN.load(Ordering::SeqCst),
             dummy,
             "register_force_frame_hook + force_frame must dispatch the same pointer"
-        );
-    }
-
-    #[test]
-    fn redirected_field_force_flags_only_during_the_hook() {
-        use super::{force_is_redirected_field, jit_force_virtualizable_field};
-        let _lock = FORCE_FRAME_HOOK_TEST_LOCK.lock().unwrap();
-        assert!(!force_is_redirected_field());
-        unsafe extern "C" fn check_flag(frame: *mut PyFrame) {
-            assert!(
-                super::force_is_redirected_field(),
-                "flag must be set while the hook runs"
-            );
-            SEEN.store(frame, Ordering::SeqCst);
-        }
-        SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
-        let _hook = super::install_force_frame_hook(check_flag);
-        let dummy = 0x0000_0000_FEED_FACE as *mut PyFrame;
-        jit_force_virtualizable_field(dummy);
-        assert_eq!(SEEN.load(Ordering::SeqCst), dummy);
-        assert!(
-            !force_is_redirected_field(),
-            "flag must clear after the hook"
         );
     }
 
