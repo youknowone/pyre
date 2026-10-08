@@ -784,8 +784,8 @@ def child_env_base():
     return env
 
 
-# Both pyre and the PyPy baseline run under the same collector pins so the
-# ratio compares like with like.
+# Both sides run on the same nursery size. The PyPy baseline keeps PyPy's own
+# major-collection threshold, which follows from that nursery.
 PYPY_GC_NURSERY_PIN = str(4 * 1024 * 1024)
 PYPY_GC_MIN_PIN = str(1024 * 1024 * 1024)
 
@@ -1042,10 +1042,13 @@ def pyre_env():
 
 
 def pypy_env():
-    """Inherited environment plus the collector pins `pyre_env` also sets."""
+    """Inherited environment plus the shared nursery pin `pyre_env` also sets.
+
+    Both sides run on the same nursery size. The PyPy baseline keeps PyPy's
+    own major-collection threshold, which follows from that nursery.
+    """
     env = dict(os.environ)
     env.setdefault("PYPY_GC_NURSERY", PYPY_GC_NURSERY_PIN)
-    env.setdefault("PYPY_GC_MIN", PYPY_GC_MIN_PIN)
     return env
 
 
@@ -4515,7 +4518,7 @@ class Check:
         # one pyre spawn left outside `pyre_env()`, which is how a bytecode
         # cache still appeared under a run that pins PYTHONDONTWRITEBYTECODE.
         # A pypy baseline keeps the inherited environment and overlays the
-        # same collector pins the first pypy run used.
+        # same nursery pin the first pypy run used.
         baseline_is_pyre = baseline_key in ALL_BACKENDS
         if baseline_is_pyre:
             baseline_env = pyre_env()
