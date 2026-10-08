@@ -334,8 +334,12 @@ impl Repr for RustVecRepr {
     }
 }
 
-/// `r_uint` of a `Vec` header is the header address as an integer.
-/// RPython `lltype.cast_ptr_to_int` of a raw pointer.
+/// `r_uint(vec)` of a `Vec` header is the header address as an integer.
+///
+/// `rbuiltin.py rtype_cast_ptr_to_int` always yields `Signed`. An
+/// `Unsigned` target then runs `rint.py IntegerRepr.convert_from_to`,
+/// which emits `cast_int_to_uint`. A `Signed` target returns the
+/// `cast_ptr_to_int` result directly.
 pub fn pair_rustvec_integer_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
@@ -347,13 +351,27 @@ pub fn pair_rustvec_integer_convert_from_to(
         LowLevelType::Unsigned | LowLevelType::Signed => {}
         _ => return Ok(None),
     }
-    Ok(llops
+    let v_signed = llops
         .genop(
             "cast_ptr_to_int",
             vec![v.clone()],
-            GenopResult::LLType(r_to.lowleveltype().clone()),
+            GenopResult::LLType(LowLevelType::Signed),
         )
-        .map(Hlvalue::Variable))
+        .map(Hlvalue::Variable)
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_rustvec_integer_convert_from_to: cast_ptr_to_int returned void",
+            )
+        })?;
+    if r_to.lowleveltype() == &LowLevelType::Signed {
+        return Ok(Some(v_signed));
+    }
+    super::rint::pair_integer_integer_convert_from_to(
+        super::rint::signed_repr().as_ref(),
+        r_to,
+        &v_signed,
+        llops,
+    )
 }
 
 /// `newrustvec(kind)` / `newrustvec(kind, lengthhint)` — `ll_newemptylist` /
@@ -556,6 +574,79 @@ mod tests {
                 };
                 assert_only_direct_call_to(&llops, vec_helper_path(op, kind));
             }
+        }
+    }
+
+    /// `rbuiltin.py rtype_cast_ptr_to_int` always yields `Signed`.
+    /// `rint.py IntegerRepr.convert_from_to` then emits `cast_int_to_uint`
+    /// for an `Unsigned` target.
+    #[test]
+    fn pair_rustvec_integer_convert_from_to_signed_then_uint() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rint::{signed_repr, unsigned_repr};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (_ann, rtyper) = setup_rtyper();
+        let r_from = rust_vec_repr(&rtyper, VecItemKind::Int);
+        let v = Variable::new();
+        v.set_concretetype(Some(r_from.lowleveltype().clone()));
+        let v = Hlvalue::Variable(v);
+
+        let mut signed_ops = LowLevelOpList::new(rtyper.clone(), None);
+        let r_signed = signed_repr();
+        let signed = pair_rustvec_integer_convert_from_to(
+            r_from.as_ref(),
+            r_signed.as_ref(),
+            &v,
+            &mut signed_ops,
+        )
+        .expect("Signed conversion rtypes")
+        .expect("Signed conversion returns a value");
+        assert_eq!(signed_ops.ops.len(), 1);
+        assert_eq!(signed_ops.ops[0].opname, "cast_ptr_to_int");
+        match &signed_ops.ops[0].result {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype(), Some(LowLevelType::Signed));
+            }
+            other => panic!("expected Variable result, got {other:?}"),
+        }
+        match &signed {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype(), Some(LowLevelType::Signed));
+            }
+            other => panic!("expected Variable, got {other:?}"),
+        }
+
+        let mut unsigned_ops = LowLevelOpList::new(rtyper, None);
+        let r_unsigned = unsigned_repr();
+        let unsigned = pair_rustvec_integer_convert_from_to(
+            r_from.as_ref(),
+            r_unsigned.as_ref(),
+            &v,
+            &mut unsigned_ops,
+        )
+        .expect("Unsigned conversion rtypes")
+        .expect("Unsigned conversion returns a value");
+        assert_eq!(unsigned_ops.ops.len(), 2);
+        assert_eq!(unsigned_ops.ops[0].opname, "cast_ptr_to_int");
+        assert_eq!(unsigned_ops.ops[1].opname, "cast_int_to_uint");
+        match &unsigned_ops.ops[0].result {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype(), Some(LowLevelType::Signed));
+            }
+            other => panic!("expected Variable result, got {other:?}"),
+        }
+        match &unsigned_ops.ops[1].result {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype(), Some(LowLevelType::Unsigned));
+            }
+            other => panic!("expected Variable result, got {other:?}"),
+        }
+        match &unsigned {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype(), Some(LowLevelType::Unsigned));
+            }
+            other => panic!("expected Variable, got {other:?}"),
         }
     }
 }
