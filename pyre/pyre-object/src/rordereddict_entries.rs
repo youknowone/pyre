@@ -157,30 +157,6 @@ entries_gc_type_id!(
     crate::pyobject::PyObjectRef
 );
 
-/// Collector tid for a blackhole `VArrayStruct` only when it is this
-/// host's integer-dict `DICTENTRYARRAY` layout.
-///
-/// Backend `is_registered_type_id` is `typeid < type_count()`
-/// (`dynasm_is_registered_type_id` and the cranelift/wasm twins).
-/// `GcCache::init_array_descr` mints analyzer ids from 1 in that same
-/// dense range, so a membership test accepts another type's layout.
-/// Match the published [`i64_pyobject_entries_gc_type_id`] together with
-/// the `Entry<i64, PyObjectRef>` item size and `GcEntries` items base.
-pub fn dictentryarray_tid_for_varray_struct(items_base: usize, item_size: usize, tid: u32) -> u32 {
-    type K = i64;
-    type V = crate::pyobject::PyObjectRef;
-    let entries_tid = i64_pyobject_entries_gc_type_id();
-    if entries_tid != 0
-        && tid == entries_tid
-        && item_size == std::mem::size_of::<Entry<K, V>>()
-        && items_base == std::mem::offset_of!(GcEntries<K, V>, items)
-    {
-        tid
-    } else {
-        0
-    }
-}
-
 /// GC-reference offsets inside one [`Entry`], relative to the item start.
 pub fn entry_gc_ref_offsets<K: GcRefOffsets, V: GcRefOffsets>() -> Vec<usize> {
     let mut offsets = Vec::new();
@@ -323,32 +299,25 @@ mod tests {
     }
 
     #[test]
-    fn dictentryarray_tid_for_varray_struct_rejects_analyzer_ids() {
+    fn allocate_array_struct_at_typed_uses_the_published_entries_tid() {
         type K = i64;
         type V = crate::pyobject::PyObjectRef;
         let items_base = std::mem::offset_of!(GcEntries<K, V>, items);
         let item_size = std::mem::size_of::<Entry<K, V>>();
         let published = i64_pyobject_entries_gc_type_id();
-        if published != 0 {
-            assert_eq!(
-                dictentryarray_tid_for_varray_struct(items_base, item_size, published),
-                published
+        if majit_gc::gc_allocator_installed() {
+            assert!(!majit_ir::descr::array_tid_is_unresolved(published));
+            let arr = crate::object_array::allocate_array_struct_at_typed(
+                2, item_size, items_base, published,
             );
-            assert_eq!(
-                dictentryarray_tid_for_varray_struct(items_base, item_size + 8, published),
-                0
+            assert!(!arr.is_null());
+            assert_eq!(crate::object_array::gcarray_len(arr), 2);
+        } else {
+            let arr = crate::object_array::allocate_array_struct_at_typed(
+                2, item_size, items_base, published,
             );
-            assert_eq!(
-                dictentryarray_tid_for_varray_struct(items_base + 1, item_size, published),
-                0
-            );
-        }
-        // Analyzer-minted sequential id in the collector's dense range.
-        if published != 1 {
-            assert_eq!(
-                dictentryarray_tid_for_varray_struct(items_base, item_size, 1),
-                0
-            );
+            assert!(!arr.is_null());
+            assert_eq!(crate::object_array::gcarray_len(arr), 2);
         }
     }
 

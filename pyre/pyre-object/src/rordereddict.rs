@@ -41,11 +41,10 @@ use crate::object_array::{
 
 pub use crate::rordereddict_entries::{
     Entry, EntryDummy, GcEntries, GcEntriesType, GcRefOffsets, alloc_entries,
-    dictentryarray_tid_for_varray_struct, entries_allocated_len, entries_item_ptr,
-    i64_pyobject_entries_gc_type_id, set_bytes_key_pyobject_entries_gc_type_id,
-    set_i64_pyobject_entries_gc_type_id, set_identity_key_pyobject_entries_gc_type_id,
-    set_object_key_pyobject_entries_gc_type_id, set_object_key_unit_entries_gc_type_id,
-    set_str_key_pyobject_entries_gc_type_id,
+    entries_allocated_len, entries_item_ptr, i64_pyobject_entries_gc_type_id,
+    set_bytes_key_pyobject_entries_gc_type_id, set_i64_pyobject_entries_gc_type_id,
+    set_identity_key_pyobject_entries_gc_type_id, set_object_key_pyobject_entries_gc_type_id,
+    set_object_key_unit_entries_gc_type_id, set_str_key_pyobject_entries_gc_type_id,
 };
 
 /// An index slot naming no entry, and one whose entry has been deleted.
@@ -499,6 +498,17 @@ impl<K, V, S> RDict<K, V, S> {
         slot
     }
 
+    /// RPython locals of a GC pointer (`ll_dict_move_to_first` `old_entry.key`
+    /// / `old_entry.value`) are shadow-stack slots here.
+    fn pin_gcrefs_of<T: Copy + GcRefOffsets>(value: T) {
+        for &off in T::GC_REF_OFFSETS {
+            let p = unsafe { *((&value as *const T as *const u8).add(off) as *const PyObjectRef) };
+            if !p.is_null() {
+                let _ = crate::gc_roots::pin_root(p);
+            }
+        }
+    }
+
     /// Refresh a [`Self::pin_indexes`] slot after a reindex replaced the block.
     pub fn reload_indexes_root(&self, slot: usize) {
         crate::gc_roots::shadow_stack_set(slot, self.indexes as PyObjectRef);
@@ -510,6 +520,8 @@ impl<K, V, S> RDict<K, V, S> {
     /// table is a safepoint (`IntArray::install` / `IntArray::pin_block`).
     fn install_index_block(&mut self, new_size: usize) {
         let _roots = crate::gc_roots::push_roots();
+        let entries_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
         let fresh = Self::alloc_index_block(new_size);
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as PyObjectRef);
@@ -517,6 +529,7 @@ impl<K, V, S> RDict<K, V, S> {
         self.indexes = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
         unsafe { dealloc_typed_items_block(old) };
         self.indexes = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
+        self.entries = crate::gc_roots::shadow_stack_get(entries_slot) as *mut GcEntries<K, V>;
     }
 
     fn release_index_block(&mut self) {
@@ -1633,8 +1646,8 @@ where
     /// the dict, so this does too.
     pub fn move_slot_to_end(&mut self, slot: usize, last: bool) -> bool
     where
-        K: EntryDummy,
-        V: EntryDummy,
+        K: EntryDummy + GcRefOffsets,
+        V: EntryDummy + GcRefOffsets,
     {
         if slot >= self.num_ever_used_items {
             return false;
@@ -1647,17 +1660,26 @@ where
             if slot + 1 == self.num_ever_used_items {
                 return false;
             }
+            let _roots = crate::gc_roots::push_roots();
             let (k, v) = self.take_slot(hash, slot);
+            Self::pin_gcrefs_of(k);
+            Self::pin_gcrefs_of(v);
             self.insert(k, v);
         } else {
             if self.next_valid_slot(0) == Some(slot) {
                 return false;
             }
+            let _roots = crate::gc_roots::push_roots();
+            let _ = crate::gc_roots::pin_root(self.entries as PyObjectRef);
             let (k, v) = self.take_slot(hash, slot);
+            Self::pin_gcrefs_of(k);
+            Self::pin_gcrefs_of(v);
             let mut rest = Vec::with_capacity(self.num_live_items);
             for i in 0..self.num_ever_used_items {
                 if self.entry_valid(i) {
                     let e = self.entry_at(i);
+                    Self::pin_gcrefs_of(e.key);
+                    Self::pin_gcrefs_of(e.value);
                     rest.push((e.key, e.value));
                 }
             }
@@ -1679,8 +1701,8 @@ where
     /// [`Self::move_slot_to_end`] by key; answers `None` when the key is absent.
     pub fn move_to_end<Q>(&mut self, key: &Q, last: bool) -> Option<bool>
     where
-        K: EntryDummy,
-        V: EntryDummy,
+        K: EntryDummy + GcRefOffsets,
+        V: EntryDummy + GcRefOffsets,
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.hash_of(key);

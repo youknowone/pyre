@@ -13665,22 +13665,13 @@ fn materialize_virtual_from_rd(
                 .map(|array| array.base_size())
                 .unwrap_or(pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET);
             // `resume.py VArrayStructInfo.allocate` →
-            // `decoder.allocate_array(..., clear=True)`. A registered
-            // `DICTENTRYARRAY` tid must allocate through the collector
-            // (`_ll_malloc_entries`); a raw `alloc_zeroed` block has no
-            // header for `int_dict_storage_custom_trace`. Analyzer-minted
-            // sequential ids (`GcCache::init_array_descr`) collide with
-            // collector ids under `is_registered_type_id` (`typeid <
-            // type_count()`); only the runtime `DICTENTRYARRAY` layout
-            // (`dictentryarray_tid_for_varray_struct`) takes the typed path.
+            // `decoder.allocate_array(..., clear=True)`. `tid` is
+            // `ArrayDescr.tid` (`gc.py` `init_array_descr`).
             let tid = arraydescr
                 .as_ref()
                 .and_then(|descr| descr.as_array_descr())
                 .map(|array| array.type_id())
                 .unwrap_or(0);
-            let tid = pyre_object::rordereddict::dictentryarray_tid_for_varray_struct(
-                items_base, is, tid,
-            );
             let array = pyre_object::allocate_array_struct_at_typed(*size, is, items_base, tid);
             // resume.py: decoder.virtuals_cache.set_ptr(index, array)
             let result = Value::Ref(majit_ir::GcRef(array as usize));

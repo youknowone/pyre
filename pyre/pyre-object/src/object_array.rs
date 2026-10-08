@@ -1956,47 +1956,44 @@ pub fn allocate_array_struct_at(
 }
 
 /// Same payload as [`allocate_array_struct_at`], on the collector heap when
-/// `tid` is this host's integer-dict `DICTENTRYARRAY` layout
-/// (`dictentryarray_tid_for_varray_struct`).
+/// a collector is installed. `tid` is `ArrayDescr.tid`
+/// (`gc.py` `init_array_descr` / `TypeLayoutBuilder.get_type_id`).
 ///
-/// Blackhole `VArrayStructInfo.allocate` rebuilds a virtual `DICTENTRYARRAY`
-/// through this path. A raw `alloc_zeroed` block has no GC header, so
-/// `int_dict_storage_custom_trace` would hand the collector a non-object.
-/// Analyzer-minted sequential ids (`GcCache::init_array_descr`) sit in the
-/// same dense range as collector ids (`is_registered_type_id` is
-/// `typeid < type_count()`), so membership alone is not identity.
+/// Header-less malloc is only the no-collector path (unit tests /
+/// wasm-test). An unresolved tid with a collector installed is a bug:
+/// the items would never be traced.
 pub fn allocate_array_struct_at_typed(
     num_elems: usize,
     item_size: usize,
     items_base: usize,
     tid: u32,
 ) -> *mut GcTypedArray {
-    let tid = crate::rordereddict_entries::dictentryarray_tid_for_varray_struct(
-        items_base, item_size, tid,
-    );
-    if tid != 0 {
-        let items_size = num_elems
-            .checked_mul(item_size)
-            .expect("GcTypedArray item bytes overflow");
-        let total = items_base
-            .checked_add(items_size)
-            .expect("GcTypedArray allocation size overflow");
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, total);
-        if !raw.is_null() {
-            // `try_gc_alloc_stable_raw` is uninitialized. A virtual
-            // `DICTENTRYARRAY` rebuild is `bh_new_array_clear`; leave
-            // `f_valid` and the value word 0 like
-            // `materialize_cleared_struct_gcarray`.
-            unsafe {
-                std::ptr::write_bytes(raw, 0, total);
-                let array = raw.cast::<GcTypedArray>();
-                (*array).len = num_elems;
-                crate::gc_hook::try_gc_write_barrier_managed(raw);
-                return array;
-            }
-        }
+    if !majit_gc::gc_allocator_installed() {
+        return allocate_array_struct_at(num_elems, item_size, items_base);
     }
-    allocate_array_struct_at(num_elems, item_size, items_base)
+    majit_ir::descr::assert_array_tid_for_malloc(tid, "allocate_array_struct_at_typed");
+    let items_size = num_elems
+        .checked_mul(item_size)
+        .expect("GcTypedArray item bytes overflow");
+    let total = items_base
+        .checked_add(items_size)
+        .expect("GcTypedArray allocation size overflow");
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, total);
+    assert!(
+        !raw.is_null(),
+        "allocate_array_struct_at_typed: collector installed but allocation had no route"
+    );
+    // `try_gc_alloc_stable_raw` is uninitialized. A virtual
+    // `DICTENTRYARRAY` rebuild is `bh_new_array_clear`; leave
+    // `f_valid` and the value word 0 like
+    // `materialize_cleared_struct_gcarray`.
+    unsafe {
+        std::ptr::write_bytes(raw, 0, total);
+        let array = raw.cast::<GcTypedArray>();
+        (*array).len = num_elems;
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        array
+    }
 }
 
 fn allocate_flat_gc_typed_array(length: usize, item_size: usize) -> *mut GcTypedArray {
@@ -2211,18 +2208,11 @@ mod tests {
     }
 
     #[test]
-    fn allocate_array_struct_at_typed_falls_back_when_tid_unset() {
+    fn allocate_array_struct_at_typed_falls_back_without_a_collector() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
         let arr = allocate_array_struct_at_typed(2, 16, GC_TYPED_ARRAY_ITEMS_OFFSET, 0);
-        assert!(!arr.is_null());
-        assert_eq!(gcarray_len(arr), 2);
-    }
-
-    #[test]
-    fn allocate_array_struct_at_typed_falls_back_when_tid_unregistered() {
-        // Analyzer-minted sequential ids (`GcCache::init_array_descr`) are
-        // nonzero and unregistered. `try_gc_alloc_stable_raw` would abort
-        // under an installed allocator; the helper must keep malloc.
-        let arr = allocate_array_struct_at_typed(2, 16, GC_TYPED_ARRAY_ITEMS_OFFSET, 0x00C0_FFEE);
         assert!(!arr.is_null());
         assert_eq!(gcarray_len(arr), 2);
         let arr = allocate_array_struct_at_typed(

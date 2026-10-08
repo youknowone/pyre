@@ -14763,25 +14763,14 @@ fn handle<Sym: WalkSym>(
             // computed register (`baselen + (baselen >> 3) + 8`), so the
             // length is known from `Box.value` without being a jitcode
             // const. `heapcache.new_array` below still virtualizes only
-            // when `length.is_constant()`. Analyzer-minted sequential
-            // ids (`GcCache::init_array_descr`) collide with collector
-            // ids under `is_registered_type_id`; only the published
-            // `DICTENTRYARRAY` layout (`dictentryarray_tid_for_varray_struct`)
-            // materializes a recording-time block.
+            // when `length.is_constant()`. `tid` is `ArrayDescr.tid`
+            // (`gc.py` `init_array_descr` / `cpu.arraydescrof`).
             let cleared_struct_array = if clear {
                 descr.as_array_descr().and_then(|array| {
                     let item_size = array.item_size();
                     let items_base = array.base_size();
-                    let tid = pyre_object::rordereddict::dictentryarray_tid_for_varray_struct(
-                        items_base,
-                        item_size,
-                        array.type_id(),
-                    );
-                    let matches_header = array.is_array_of_structs()
-                        && tid != 0
-                        && array.len_descr().is_some_and(|field| {
-                            field.offset() == pyre_object::TYPED_ITEMS_BLOCK_LEN_OFFSET
-                        });
+                    let tid = array.type_id();
+                    let matches_header = array.is_array_of_structs() && array.len_descr().is_some();
                     matches_header.then_some((tid, item_size, items_base))
                 })
             } else {
@@ -14870,15 +14859,22 @@ fn handle<Sym: WalkSym>(
                         {
                             None
                         } else {
-                            let tid = ad.type_id();
-                            let tid = if tid != 0 {
-                                tid
+                            // Analyzer `get_array_descr` leaves
+                            // `UNSET_GC_TYPE_ID` until
+                            // `register_unresolved_array_tids` (`gc.py`
+                            // `init_array_descr`). Fall back to the host
+                            // `GcArray(Signed)` / `GcArray(Float)` tid,
+                            // the same way mint `0` does.
+                            let raw = ad.type_id();
+                            let tid = if raw != 0 && !majit_ir::descr::array_tid_is_unresolved(raw)
+                            {
+                                raw
                             } else if is_float_array {
                                 pyre_object::object_array::gc_float_array_gc_type_id()
                             } else {
                                 pyre_object::object_array::gc_int_array_gc_type_id()
                             };
-                            if tid == 0 {
+                            if tid == 0 || majit_ir::descr::array_tid_is_unresolved(tid) {
                                 None
                             } else {
                                 let p = unsafe {

@@ -347,6 +347,64 @@ pub fn struct_tid_is_unresolved(serialized_cache_key: u64, resolved_tid: u32) ->
     serialized_cache_key > u32::MAX as u64 && resolved_tid == serialized_cache_key as u32
 }
 
+/// ArrayDescr mint placeholder until `register_unresolved_array_tids`
+/// (`gc.py` `init_array_descr` / `TypeLayoutBuilder.get_type_id`).
+/// `TypeRegistry::register` hands out `entries.len()`, so `0` is a live
+/// collector slot (OBJECT). `majit_rlib::lltypesystem::rlist` re-exports
+/// this same value.
+pub const UNSET_GC_TYPE_ID: u32 = u32::MAX;
+
+/// Whether `ArrayDescr.tid` still waits for the layoutbuilder half.
+///
+/// Only [`UNSET_GC_TYPE_ID`]: `0` is a live collector slot
+/// (`TypeRegistry::register` starts at `entries.len()`).
+pub fn array_tid_is_unresolved(tid: u32) -> bool {
+    tid == UNSET_GC_TYPE_ID
+}
+
+/// A tid that can index `TypeRegistry`. `0` is OBJECT
+/// (`gctypelayout.py` "don't use typeid 0"), not an array. Unresolved
+/// arrays carry only [`UNSET_GC_TYPE_ID`] until
+/// `register_unresolved_array_tids` stamps the collector id.
+pub fn is_collector_array_tid(tid: u32) -> bool {
+    tid != 0 && !array_tid_is_unresolved(tid)
+}
+
+/// Compiled `NEW_ARRAY*` / `bh_new_array` must not bake the mint sentinel.
+pub fn assert_array_tid_for_malloc(tid: u32, what: &str) {
+    assert!(
+        !array_tid_is_unresolved(tid),
+        "{what}: ArrayDescr.tid is unresolved (gc.py init_array_descr / \
+         TypeLayoutBuilder.get_type_id)"
+    );
+}
+
+fn array_len_offset(ad: &dyn ArrayDescr) -> usize {
+    ad.len_descr().map(|field| field.offset()).unwrap_or(0)
+}
+
+/// `gctypelayout.py encode_type_shape` `varofstoinnergcptrs`.
+pub fn array_var_gc_ptr_offsets(ad: &dyn ArrayDescr) -> Vec<usize> {
+    if ad.is_array_of_structs() {
+        let mut offsets = Vec::new();
+        if let Some(fields) = ad.get_all_interiorfielddescrs() {
+            for descr in fields {
+                if let Some(interior) = descr.as_interior_field_descr() {
+                    let field = interior.field_descr();
+                    if field.is_pointer_field() {
+                        offsets.push(field.offset());
+                    }
+                }
+            }
+        }
+        offsets
+    } else if ad.is_array_of_pointers() {
+        vec![0]
+    } else {
+        Vec::new()
+    }
+}
+
 fn descr_tid_unresolved(descr: &DescrRef) -> bool {
     descr
         .as_size_descr()
@@ -1327,18 +1385,10 @@ pub struct GcCache {
     /// fuller-layout upgrade. Kept out of `_cache_size`.
     _size_keepalive: Vec<DescrRef>,
 
-    /// `gctypelayout.py TypeLayoutBuilder.get_type_id` analog —
-    /// the shared dense sequential GC type-id allocator covering both
-    /// `GcStruct` and `GcArray`.  PyPy's `type_info_group.add_member`
-    /// returns a monotonically-increasing index across `id_of_type`;
-    /// `init_size_descr` (`gc.py`) and `init_array_descr`
-    /// (`gc.py:544-549`) call `layoutbuilder.get_type_id(TYPE)` to
-    /// stamp `descr.tid`.  Pyre lifts the allocator onto `GcCache`
-    /// itself (no separate layoutbuilder object) — analyzer-side
-    /// SizeDescr + ArrayDescr cache-miss-mint each pull one tid from
-    /// this counter via the matching `init_*_descr` hook, mirroring
-    /// PyPy's structure.  Tid 0 is reserved (`gctypelayout.py`
-    /// "don't use typeid 0, may help debugging").
+    /// `gctypelayout.py TypeLayoutBuilder.get_type_id` analog for
+    /// SizeDescr. ArrayDescr tids come from the collector via
+    /// `register_unresolved_array_tids` (`gc.py` `init_array_descr`).
+    /// Tid 0 is reserved (`gctypelayout.py` "don't use typeid 0").
     next_type_id: u32,
 }
 
@@ -1557,6 +1607,82 @@ impl GcCache {
         }
     }
 
+    /// `gc.py GcLLDescr_framework.init_array_descr` asks
+    /// `TypeLayoutBuilder.get_type_id(A)` and writes `descr.tid`. majit-ir
+    /// cannot see the collector, so the callback (`register`) is the
+    /// collector half, called from the freeze-close hook before
+    /// `freeze_types`.
+    ///
+    /// `(base_size, item_size, len_offset, item_gc_offsets, is_ptr)` is
+    /// `encode_type_shape`'s `ofstovar` / `varitemsize` / `ofstolength` /
+    /// `varofstoinnergcptrs` / `T_IS_GCARRAY_OF_GCPTR`.
+    pub fn register_unresolved_array_tids(
+        &mut self,
+        mut register: impl FnMut(usize, usize, usize, Vec<usize>, bool) -> u32,
+    ) -> usize {
+        let pending: Vec<DescrRef> = self
+            ._cache_array
+            .values()
+            .filter(|descr| {
+                descr
+                    .as_array_descr()
+                    .is_some_and(|ad| ad.is_gc_managed() && array_tid_is_unresolved(ad.type_id()))
+            })
+            .cloned()
+            .collect();
+        let mut registered = 0;
+        for descr in pending {
+            let Some(ad) = descr.as_array_descr() else {
+                continue;
+            };
+            let is_ptr = ad.is_array_of_pointers();
+            let offsets = array_var_gc_ptr_offsets(ad);
+            let tid = register(
+                ad.base_size(),
+                ad.item_size(),
+                array_len_offset(ad),
+                offsets,
+                is_ptr,
+            );
+            debug_assert!(
+                !array_tid_is_unresolved(tid),
+                "register_unresolved_array_tids callback returned an unresolved tid"
+            );
+            ad.set_type_id(tid);
+            registered += 1;
+        }
+        registered
+    }
+
+    /// Re-announce array layouts to a replacement collector, the array twin
+    /// of [`Self::replay_synthetic_struct_tids`].
+    pub fn replay_synthetic_array_tids(
+        &mut self,
+        mut register: impl FnMut(usize, usize, usize, Vec<usize>, bool) -> u32,
+    ) {
+        let pending: Vec<DescrRef> = self
+            ._cache_array
+            .values()
+            .filter(|descr| descr.as_array_descr().is_some_and(|ad| ad.is_gc_managed()))
+            .cloned()
+            .collect();
+        for descr in pending {
+            let Some(ad) = descr.as_array_descr() else {
+                continue;
+            };
+            let is_ptr = ad.is_array_of_pointers();
+            let offsets = array_var_gc_ptr_offsets(ad);
+            let tid = register(
+                ad.base_size(),
+                ad.item_size(),
+                array_len_offset(ad),
+                offsets,
+                is_ptr,
+            );
+            ad.set_type_id(tid);
+        }
+    }
+
     /// `gc.py GcLLDescr_framework.init_size_descr` analog.
     /// Allocates a dense GC tid via `next_type_id` (the
     /// `TypeLayoutBuilder.get_type_id` analog) and stamps
@@ -1568,13 +1694,37 @@ impl GcCache {
         sizedescr.set_type_id(type_id);
     }
 
-    /// `gc.py GcLLDescr_framework.init_array_descr` analog.
-    /// Same shape as `init_size_descr` — share the `next_type_id`
-    /// counter per PyPy's single `type_info_group` covering both
-    /// GcStruct and GcArray.
-    pub fn init_array_descr(&mut self, _key: &LLType, arraydescr: &mut SimpleArrayDescr) {
-        let type_id = self.alloc_type_id();
-        arraydescr.set_type_id(type_id);
+    /// `gc.py GcLLDescr_framework.init_array_descr`.
+    ///
+    /// Upstream writes `layoutbuilder.get_type_id(A)` into `descr.tid`.
+    /// `get_array_descr` already returns the cached Arc on `LLType` hit
+    /// (`descr.py` `_cache_array[ARRAY]` / `id_of_type[TYPE]`), so this
+    /// miss arm is `get_type_id`'s `KeyError`. `descr.py` attaches
+    /// `all_interiorfielddescrs` before `init_array_descr`; pyre attaches
+    /// them after the Arc wrap, so the collector half
+    /// ([`Self::register_unresolved_array_tids`]) runs once interiors
+    /// exist — the SizeDescr twin of `register_unresolved_struct_tids`.
+    /// A later `get_array_descr` of a new key is another `KeyError`:
+    /// stamp it by calling `register_unresolved_array_tids` again while
+    /// `can_add_new_types` (`TypeRegistry::register`). After
+    /// `freeze_types` that callback panics, matching
+    /// `get_type_id`'s `assert self.can_add_new_types`.
+    ///
+    /// Two distinct `LLType` keys that share `encode_type_shape` reuse a
+    /// collector tid only in `register_array_layout` /
+    /// `TypeRegistry::find_varsize_type`.
+    pub fn init_array_descr(&mut self, key: &LLType, arraydescr: &mut SimpleArrayDescr) {
+        if !arraydescr.is_gc_managed() {
+            return;
+        }
+        if let Some(existing) = self._cache_array.get(key).and_then(|d| d.as_array_descr()) {
+            let tid = existing.type_id();
+            if !array_tid_is_unresolved(tid) {
+                arraydescr.set_type_id(tid);
+                return;
+            }
+        }
+        arraydescr.set_type_id(UNSET_GC_TYPE_ID);
     }
 
     /// `gctypelayout.py:349 type_info_group.add_member` analog — hand
@@ -8037,6 +8187,146 @@ mod register_keyed_size_authority_tests {
         assert_eq!(observed, vec![(16, vec![0, 8])]);
         assert_eq!(descr.as_size_descr().unwrap().type_id(), 42);
         assert_eq!(gc.resolve_struct_tid(cache_key), Some(42));
+    }
+
+    #[test]
+    fn unresolved_array_layout_is_registered_and_stamped() {
+        let mut gc = GcCache::new();
+        let cache_key = 0xfeed_face_cafe_u64;
+        let descr = gc.get_array_descr(
+            LLType::Array(cache_key),
+            8,
+            16,
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), UNSET_GC_TYPE_ID);
+        let array_arc: Arc<dyn ArrayDescr> = try_downcast_arc::<SimpleArrayDescr>(descr.clone())
+            .expect("SimpleArrayDescr")
+            as Arc<dyn ArrayDescr>;
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(0, array_arc, field));
+        descr
+            .as_array_descr()
+            .unwrap()
+            .set_all_interiorfielddescrs(vec![interior]);
+
+        let mut observed = Vec::new();
+        let count = gc.register_unresolved_array_tids(|base, item, len, offs, is_ptr| {
+            observed.push((base, item, len, offs, is_ptr));
+            99
+        });
+        assert_eq!(count, 1);
+        assert_eq!(observed, vec![(8, 16, 0, vec![8], false)]);
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), 99);
+
+        // A distinct `LLType` key is `get_type_id`'s `KeyError`.
+        // Interiors land after the Arc wrap, so the collector half is
+        // another `register_unresolved_array_tids` while
+        // `can_add_new_types`. Same sizes do not copy the stamped tid;
+        // `find_varsize_type` is the collector-side reuse.
+        let again = gc.get_array_descr(
+            LLType::Array(cache_key + 1),
+            8,
+            16,
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        assert_eq!(again.as_array_descr().unwrap().type_id(), UNSET_GC_TYPE_ID);
+        let array_arc: Arc<dyn ArrayDescr> = try_downcast_arc::<SimpleArrayDescr>(again.clone())
+            .expect("SimpleArrayDescr")
+            as Arc<dyn ArrayDescr>;
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(0, array_arc, field));
+        again
+            .as_array_descr()
+            .unwrap()
+            .set_all_interiorfielddescrs(vec![interior]);
+        let mut observed_late = Vec::new();
+        let late = gc.register_unresolved_array_tids(|base, item, len, offs, is_ptr| {
+            observed_late.push((base, item, len, offs, is_ptr));
+            100
+        });
+        assert_eq!(late, 1);
+        assert_eq!(observed_late, vec![(8, 16, 0, vec![8], false)]);
+        assert_eq!(again.as_array_descr().unwrap().type_id(), 100);
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), 99);
+    }
+
+    #[test]
+    fn pointer_struct_and_primitive_arrays_do_not_share_a_tid() {
+        let mut gc = GcCache::new();
+        let word = std::mem::size_of::<usize>();
+        let ptr = gc.get_array_descr(
+            LLType::Array(0x10),
+            word,
+            word,
+            ArrayFlag::Pointer,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        let strukt = gc.get_array_descr(
+            LLType::Array(0x11),
+            word,
+            word,
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        let prim = gc.get_array_descr(
+            LLType::Array(0x12),
+            word,
+            word,
+            ArrayFlag::Signed,
+            Type::Int,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        let array_arc: Arc<dyn ArrayDescr> = try_downcast_arc::<SimpleArrayDescr>(strukt.clone())
+            .expect("SimpleArrayDescr")
+            as Arc<dyn ArrayDescr>;
+        let field: Arc<dyn FieldDescr> =
+            Arc::new(SimpleFieldDescr::new(0, 0, word, Type::Ref, false));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(0, array_arc, field));
+        strukt
+            .as_array_descr()
+            .unwrap()
+            .set_all_interiorfielddescrs(vec![interior]);
+
+        gc.register_unresolved_array_tids(|_, _, _, offs, is_ptr| {
+            if is_ptr {
+                10
+            } else if offs == [0] {
+                11
+            } else {
+                12
+            }
+        });
+        let ptr_tid = ptr.as_array_descr().unwrap().type_id();
+        let struct_tid = strukt.as_array_descr().unwrap().type_id();
+        let prim_tid = prim.as_array_descr().unwrap().type_id();
+        assert_ne!(ptr_tid, struct_tid);
+        assert_ne!(ptr_tid, prim_tid);
+        assert_ne!(struct_tid, prim_tid);
+        assert!(is_collector_array_tid(ptr_tid));
+        assert!(is_collector_array_tid(struct_tid));
+        assert!(is_collector_array_tid(prim_tid));
     }
 
     fn size_descr_at(type_id: u32, vtable: usize, offsets: &[usize]) -> DescrRef {

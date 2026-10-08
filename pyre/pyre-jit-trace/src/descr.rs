@@ -323,14 +323,16 @@ fn get_or_create_array_descr_with_full_id(
             .cloned()
         {
             // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
-            // Runtime `init_array_descr` / `pyobject_gcarray_descr`
-            // carry the collector tid; stamp it onto the shared Arc
-            // so `gen_initialize_tid` does not fall back to
-            // `OBJECT_GC_TYPE_ID` (frame-locals walk as a 16-byte
-            // PyObject — `fib_recursive` SIGSEGV).
-            if type_id != 0
+            // `init_array_descr` leaves `UNSET_GC_TYPE_ID` until
+            // `register_unresolved_array_tids`. Runtime
+            // `pyobject_gcarray_descr` carries the collector tid; stamp
+            // it onto the shared Arc so `gen_initialize_tid` does not
+            // fall back to `OBJECT_GC_TYPE_ID` (frame-locals walk as a
+            // 16-byte PyObject — `fib_recursive` SIGSEGV).
+            if !majit_ir::descr::array_tid_is_unresolved(type_id)
+                && type_id != 0
                 && let Some(ad) = existing.as_array_descr()
-                && ad.type_id() == 0
+                && (majit_ir::descr::array_tid_is_unresolved(ad.type_id()) || ad.type_id() == 0)
             {
                 ad.set_type_id(type_id);
             }
@@ -10336,16 +10338,10 @@ mod tests {
         let array = descr.as_array_descr().expect("Array BhDescr -> ArrayDescr");
 
         assert!(array.is_array_of_structs());
-        // `type_id` is the dense sequential GC tid allocated by
-        // `GcCache::init_array_descr` (analog of `gc.py
-        // GcLLDescr_framework.init_array_descr` + `gctypelayout.py TypeLayoutBuilder
-        // TypeLayoutBuilder.get_type_id`).  Exact value depends on the
-        // global allocator state — test-suite ordering is non-deterministic
-        // so we only assert it is non-zero (tid 0 reserved per
-        // `gctypelayout.py`).  The structural identity that
-        // round-trips through `BhDescr::Array.type_id` (path_hash payload)
-        // lives in `cache_key` (`ArrayDescr::cache_key`), independent of the
-        // GC tid.
+        // Before the freeze-close hook, `init_array_descr` leaves
+        // `UNSET_GC_TYPE_ID`. After it, the tid is the collector id
+        // (`gc.py` `init_array_descr` / `TypeLayoutBuilder.get_type_id`).
+        // Tid 0 is reserved (`gctypelayout.py`). Identity is `cache_key`.
         assert_ne!(array.type_id(), 0);
         assert_eq!(array.cache_key(), 42);
         assert_eq!(array.item_type(), Type::Ref);

@@ -446,9 +446,11 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
 }
 
 /// Traced-iteration fill of a cleared `GcArray(Signed)` block from
-/// [`materialize_cleared_signed_gcarray`]. Scalar words, so there is no
-/// write barrier. An index or value with no `Box.value` cannot be replayed;
-/// drop the pointer the same way the ref arm does, and the next load declines.
+/// `new_array_clear`'s `alloc_typed_items_block_nursery` plus
+/// `typed_items_block_clear` (`llmodel.py` `bh_new_array_clear`).
+/// Scalar words, so there is no write barrier. An index or value with
+/// no `Box.value` cannot be replayed; drop the pointer the same way the
+/// ref arm does, and the next load declines.
 fn fill_materialized_signed_gcarray<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     array: OpRef,
@@ -484,67 +486,26 @@ fn fill_materialized_signed_gcarray<Sym: WalkSym>(
     }
 }
 
-/// Recording-time `bh_new_array_clear` for a constant-length
-/// `GcArray(Signed)` (`ordereddict.malloc_indexes` → `new_array_clear`).
-///
-/// The compiled op stays `NEW_ARRAY_CLEAR`. The returned pointer is only
-/// the traced iteration's `Op.value` (`walk_op_const_ptr_refs` roots it),
-/// zeroed the way `alloc_typed_items_block` zeros a `TypedItemsBlock`, so
-/// `getarrayitem_gc_i` can read `FREE` and `opimpl_goto_if_not_int_is_zero`
-/// can take `box.getint()`. `None` when the items-block gate is off, the
-/// host has not declared the array tid, or no stable allocator is installed.
-pub(crate) fn materialize_cleared_signed_gcarray(cap: usize) -> Option<*mut u8> {
-    let tid = pyre_object::gc_int_array_gc_type_id();
-    if tid == majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
-        || !pyre_object::itemsblock_gc_enabled()
-    {
-        return None;
-    }
-    let items_bytes = cap.checked_mul(std::mem::size_of::<i64>())?;
-    let payload = pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET.checked_add(items_bytes)?;
-    let raw = pyre_object::gc_hook::try_gc_alloc_stable(tid, payload)?;
-    if raw.is_null() {
-        return None;
-    }
-    unsafe {
-        let block = raw as *mut pyre_object::TypedItemsBlock;
-        (*block).capacity = cap;
-        std::ptr::write_bytes(
-            pyre_object::typed_items_block_items_base(block),
-            0,
-            items_bytes,
-        );
-    }
-    Some(raw)
-}
-
 /// Recording-time `bh_new_array_clear` for a constant-or-known-length
 /// array of structs (`ordereddict.malloc_i64_entries` → `new_array_clear`).
 ///
 /// The compiled op stays `NEW_ARRAY_CLEAR`. The pointer is the traced
 /// iteration's `Op.value`, zeroed the way `_ll_malloc_entries` zeros a
 /// `DICTENTRYARRAY`, so `bh_getinteriorfield_gc_i` of an unwritten slot
-/// reads 0. `tid` is the array descr's `type_id` (the collector id), not
-/// the signed-items id: the value field is a pointer the collector must
-/// scan. Analyzer-minted sequential ids (`GcCache::init_array_descr`)
-/// collide with collector ids under `is_registered_type_id`; only the
-/// published `DICTENTRYARRAY` layout (`dictentryarray_tid_for_varray_struct`)
-/// allocates. `None` when that identity does not match, the id is
-/// unregistered, or no stable allocator is installed.
+/// reads 0. `tid` is `ArrayDescr.tid` (`gc.py` `init_array_descr`).
+/// `None` when no collector is installed or `item_size` is 0.
+/// An unresolved tid with a collector installed is a bug
+/// (`llmodel.py` `bh_new_array_clear` never declines on a descr).
 pub(crate) fn materialize_cleared_struct_gcarray(
     cap: usize,
     tid: u32,
     item_size: usize,
     items_base: usize,
 ) -> Option<*mut u8> {
-    let tid =
-        pyre_object::rordereddict::dictentryarray_tid_for_varray_struct(items_base, item_size, tid);
-    if tid == 0
-        || item_size == 0
-        || (majit_gc::gc_allocator_installed() && !majit_gc::is_registered_type_id(tid))
-    {
+    if item_size == 0 || !majit_gc::gc_allocator_installed() {
         return None;
     }
+    majit_ir::descr::assert_array_tid_for_malloc(tid, "materialize_cleared_struct_gcarray");
     let items_bytes = cap.checked_mul(item_size)?;
     let payload = items_base.checked_add(items_bytes)?;
     let raw = pyre_object::gc_hook::try_gc_alloc_stable(tid, payload)?;
@@ -1605,37 +1566,29 @@ mod tests {
         assert_eq!(access.items_base, items_base);
     }
 
-    /// Analyzer-minted sequential ids sit in the collector's dense
-    /// range (`is_registered_type_id` is `typeid < type_count()`). A
-    /// recording-time `NEW_ARRAY_CLEAR` must not allocate a struct
-    /// array under one of those ids.
+    /// Recording-time `NEW_ARRAY_CLEAR` allocates with `ArrayDescr.tid`
+    /// when a collector is installed (`gc.py` `init_array_descr`).
     #[test]
-    fn materialize_cleared_struct_gcarray_rejects_analyzer_ids() {
+    fn materialize_cleared_struct_gcarray_uses_the_published_tid() {
         type K = i64;
         type V = pyre_object::PyObjectRef;
         let items_base = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, items);
         let item_size = std::mem::size_of::<pyre_object::rordereddict::Entry<K, V>>();
         assert_eq!(items_base, pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET);
-        assert!(super::materialize_cleared_struct_gcarray(8, 1, item_size, items_base).is_none());
-        assert!(
-            super::materialize_cleared_struct_gcarray(
-                8,
-                majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID,
-                item_size,
-                items_base,
-            )
-            .is_none()
-        );
-        let published = pyre_object::rordereddict::i64_pyobject_entries_gc_type_id();
-        if published != 0 {
+        if !majit_gc::gc_allocator_installed() {
             assert!(
-                super::materialize_cleared_struct_gcarray(8, published, item_size + 8, items_base,)
-                    .is_none()
+                super::materialize_cleared_struct_gcarray(8, 1, item_size, items_base).is_none()
             );
-            assert!(
-                super::materialize_cleared_struct_gcarray(8, published, item_size, items_base + 1)
-                    .is_none()
-            );
+            return;
         }
+        let published = pyre_object::rordereddict::i64_pyobject_entries_gc_type_id();
+        assert!(
+            !majit_ir::descr::array_tid_is_unresolved(published),
+            "host must have registered DICTENTRYARRAY before this test"
+        );
+        assert!(
+            super::materialize_cleared_struct_gcarray(8, published, item_size, items_base)
+                .is_some()
+        );
     }
 }

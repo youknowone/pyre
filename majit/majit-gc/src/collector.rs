@@ -14249,6 +14249,97 @@ mod tests {
     }
 
     #[test]
+    fn unknown_struct_array_descr_tid_is_walked_after_pre_freeze_register() {
+        use majit_ir::descr::{
+            ArrayDescr, ArrayFlag, Descr, FieldDescr, GcCache, LLType, SimpleArrayDescr,
+            SimpleFieldDescr, SimpleInteriorFieldDescr, UNSET_GC_TYPE_ID, try_downcast_arc,
+        };
+        use majit_ir::{DescrRef, Type};
+        use std::sync::Arc;
+
+        let mut gc = test_gc(8192);
+        let word = std::mem::size_of::<GcRef>();
+        // `gctypelayout.py make_type_info_group` dummy at typeid 0.
+        let _dummy = gc.register_type(TypeInfo::simple(word));
+        let mut cache = GcCache::new();
+        let cache_key = 0x0A11CEu64;
+        let descr = cache.get_array_descr(
+            LLType::Array(cache_key),
+            std::mem::size_of::<usize>(),
+            3 * std::mem::size_of::<usize>(),
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), UNSET_GC_TYPE_ID);
+        let array_arc: Arc<dyn ArrayDescr> = try_downcast_arc::<SimpleArrayDescr>(descr.clone())
+            .expect("SimpleArrayDescr")
+            as Arc<dyn ArrayDescr>;
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(
+            0,
+            std::mem::size_of::<usize>(),
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+        ));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(0, array_arc, field));
+        descr
+            .as_array_descr()
+            .unwrap()
+            .set_all_interiorfielddescrs(vec![interior]);
+
+        cache.register_unresolved_array_tids(|base, item, len, offs, is_ptr| {
+            let var_offsets = if !offs.is_empty() {
+                offs
+            } else if is_ptr {
+                vec![0]
+            } else {
+                Vec::new()
+            };
+            if let Some(tid) = gc.types.find_varsize_type(base, item, len, &var_offsets) {
+                return tid;
+            }
+            gc.register_type(TypeInfo::varsize_with_gc_ptr_offsets(
+                base,
+                item,
+                len,
+                var_offsets,
+                Vec::new(),
+            ))
+        });
+        let array_tid = descr.as_array_descr().unwrap().type_id();
+        assert_ne!(array_tid, UNSET_GC_TYPE_ID);
+        assert_ne!(array_tid, 0);
+
+        let leaf_tid = gc.register_type(TypeInfo::simple(word));
+        let mut array = GcAllocator::alloc_varsize_typed(&mut gc, array_tid, word, 3 * word, 1);
+        let child = gc.alloc_with_type(leaf_tid, word);
+        unsafe { *(child.0 as *mut usize) = 0xA11CE };
+        let items = array.0 + word;
+        unsafe { *((items + word) as *mut GcRef) = child };
+        unsafe { gc.roots.add(&mut array) };
+
+        gc.do_collect_nursery();
+        let mut referents = Vec::new();
+        gc.visit_referents(array.0, &mut |child| referents.push(child));
+        assert_eq!(referents.len(), 1);
+        assert_eq!(unsafe { *(referents[0].0 as *const usize) }, 0xA11CE);
+
+        gc.do_collect_full();
+        let mut referents_after_major = Vec::new();
+        gc.visit_referents(array.0, &mut |child| referents_after_major.push(child));
+        assert_eq!(referents_after_major.len(), 1);
+        assert_eq!(
+            unsafe { *(referents_after_major[0].0 as *const usize) },
+            0xA11CE
+        );
+        gc.roots.clear();
+    }
+
+    #[test]
     fn test_data_integrity_across_collections() {
         // Allocate objects with distinctive data, collect, verify data.
         let mut gc = test_gc(2048);

@@ -4589,7 +4589,11 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 /// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
 /// `RDict<K, PyObjectRef, S>`.
 unsafe fn typed_move_to_end<
-    K: std::hash::Hash + Eq + Copy + crate::rordereddict::EntryDummy,
+    K: std::hash::Hash
+        + Eq
+        + Copy
+        + crate::rordereddict::EntryDummy
+        + crate::rordereddict::GcRefOffsets,
     S: std::hash::BuildHasher,
 >(
     dict: *mut W_DictObject,

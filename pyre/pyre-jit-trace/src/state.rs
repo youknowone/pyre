@@ -3644,39 +3644,77 @@ pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
         jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
         jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
         jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),
-        other if is_i64_pyobject_entries_array(other) => {
-            Some(i64_pyobject_entries_gcarray_descr(other))
-        }
-        _ => None,
+        other => entries_gcarray_descr_for_type_id(other),
     }
 }
 
-/// `GcArray<Entry<i64, *mut PyObject>>` — the integer-dict `DICTENTRYARRAY`
-/// (`get_ll_dict` / `_ll_malloc_entries`).
-fn is_i64_pyobject_entries_array(array_type_id: &str) -> bool {
+fn entries_array_leaf(array_type_id: &str) -> &str {
     let inner = array_type_id
         .strip_prefix("GcArray<")
         .and_then(|s| s.strip_suffix('>'))
         .unwrap_or(array_type_id);
-    let leaf = inner.rsplit("::").next().unwrap_or(inner);
-    leaf.starts_with("Entry<i64") && (leaf.contains("PyObject") || leaf.contains("pyobject"))
+    inner.rsplit("::").next().unwrap_or(inner)
 }
 
-/// `cpu.arraydescrof(ENTRIES)` for the integer-dict entry buffer.
-///
-/// Stamps `i64_pyobject_entries_gc_type_id` onto the shared
-/// `_cache_array` slot so `NEW_ARRAY_CLEAR` allocates with the
-/// collector layout that scans each entry's `value`, rather than an
-/// analyzer-minted sequential tid that `init_array_descr` assigned.
-fn i64_pyobject_entries_gcarray_descr(array_type_id: &str) -> DescrRef {
+fn is_entry_kv(array_type_id: &str, key: &str, value_is_pyobject: bool) -> bool {
+    let leaf = entries_array_leaf(array_type_id);
+    if !leaf.starts_with("Entry<") {
+        return false;
+    }
+    let has_key = leaf.contains(key);
+    let has_pyobject = leaf.contains("PyObject") || leaf.contains("pyobject");
+    has_key && has_pyobject == value_is_pyobject
+}
+
+/// `cpu.arraydescrof(ENTRIES)` for every `entries_gc_type_id!` pair.
+fn entries_gcarray_descr_for_type_id(array_type_id: &str) -> Option<DescrRef> {
+    type V = pyre_object::PyObjectRef;
+    if is_entry_kv(array_type_id, "i64", true) {
+        return Some(entries_gcarray_descr::<i64, V>(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "ObjectKey", true) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::dictmultiobject::ObjectKey,
+            V,
+        >(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "BytesKey", true) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::dictmultiobject::BytesKey,
+            V,
+        >(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "IdentityKey", true) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::identitydict::IdentityKey,
+            V,
+        >(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "StrKey", true) {
+        return Some(entries_gcarray_descr::<pyre_object::celldict::StrKey, V>(
+            array_type_id,
+        ));
+    }
+    if is_entry_kv(array_type_id, "ObjectKey", false) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::dictmultiobject::ObjectKey,
+            (),
+        >(array_type_id));
+    }
+    None
+}
+
+/// `cpu.arraydescrof(ENTRIES)` for one `GcEntries<K, V>` ARRAY identity.
+fn entries_gcarray_descr<K, V>(array_type_id: &str) -> DescrRef
+where
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
     use majit_ir::descr::{ArrayFlag, LLType};
     use majit_ir::{ArrayDescr, Descr};
-    type K = i64;
-    type V = pyre_object::PyObjectRef;
     let base_size = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, items);
     let item_size = std::mem::size_of::<pyre_object::rordereddict::Entry<K, V>>();
     let len_offset = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, length);
-    let tid = pyre_object::rordereddict::i64_pyobject_entries_gc_type_id();
+    let tid = <(K, V) as pyre_object::rordereddict::GcEntriesType>::entries_gc_type_id();
     let key = LLType::Array(majit_ir::descr::path_hash(array_type_id));
     let descr = {
         let mut cache = majit_ir::descr::gc_cache().lock();
@@ -3692,9 +3730,11 @@ fn i64_pyobject_entries_gcarray_descr(array_type_id: &str) -> DescrRef {
             '\x00',
         )
     };
-    if tid != 0 {
+    if !majit_ir::descr::array_tid_is_unresolved(tid) {
         if let Some(ad) = descr.as_array_descr() {
-            ad.set_type_id(tid);
+            if majit_ir::descr::array_tid_is_unresolved(ad.type_id()) || ad.type_id() != tid {
+                ad.set_type_id(tid);
+            }
         }
     }
     descr

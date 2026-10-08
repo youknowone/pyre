@@ -1508,6 +1508,29 @@ impl TypeRegistry {
         &self.entries[type_id as usize]
     }
 
+    /// Collector tid of a varsize type with this `encode_type_shape` layout,
+    /// or `None`. Used by `init_array_descr`'s layoutbuilder half so a
+    /// `DICTENTRYARRAY` already registered by the host is not registered
+    /// again (`TypeLayoutBuilder.get_type_id` returns the existing id).
+    pub fn find_varsize_type(
+        &self,
+        base_size: usize,
+        item_size: usize,
+        length_offset: usize,
+        var_gc_ptr_offsets: &[usize],
+    ) -> Option<u32> {
+        if item_size == 0 {
+            return None;
+        }
+        self.entries.iter().enumerate().find_map(|(id, info)| {
+            (info.item_size == item_size
+                && info.size == base_size
+                && info.length_offset == length_offset
+                && info.var_gc_ptr_offsets == var_gc_ptr_offsets)
+                .then_some(id as u32)
+        })
+    }
+
     /// Number of registered types.
     pub fn len(&self) -> usize {
         self.entries.len()
