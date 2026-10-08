@@ -331,11 +331,172 @@ mod tests {
             !code.windows(8).any(|window| window == bits),
             "float bits must not sit in the code stream"
         );
-        let parked = compiled.data_blocks.iter().any(|block| {
+        let mut pool_addr = None;
+        for block in &compiled.data_blocks {
             let bytes = unsafe { std::slice::from_raw_parts(block.ptr(), block.len()) };
-            bytes.windows(8).any(|window| window == bits)
-        });
-        assert!(parked, "float bits must live in the machine data block");
+            if let Some(pos) = bytes.windows(8).position(|window| window == bits) {
+                pool_addr = Some(block.ptr() as usize + pos);
+            }
+        }
+        let pool_addr = pool_addr.expect("float bits must live in the machine data block");
+        // `Assembler386.mov` consumes that `ConstFloatLoc`: `MOVSD_xj` when
+        // the address fits disp32, otherwise `MOV_ri` of the address plus
+        // `MOVSD_xm`.
+        let addr_i = pool_addr as i64;
+        let referenced = if addr_i == addr_i as i32 as i64 {
+            let disp = (addr_i as i32).to_le_bytes();
+            code.windows(4).any(|window| window == disp)
+        } else {
+            let imm = (pool_addr as u64).to_le_bytes();
+            code.windows(8).any(|window| window == imm)
+        };
+        assert!(
+            referenced,
+            "mov must reference the convert_to_imm address {pool_addr:#x}"
+        );
+    }
+
+    /// SysV: eight XMM argument registers, then the stack. The ninth float
+    /// constant is a `ConstFloatLoc` spilled by `regalloc_immedmem2mem`
+    /// (two `MOV32_si`). The first eight reach xmm0–xmm7 via `MOVSD`.
+    #[test]
+    fn float_const_stack_call_returns_ninth() {
+        extern "C" fn ninth(
+            a: f64,
+            b: f64,
+            c: f64,
+            d: f64,
+            e: f64,
+            f: f64,
+            g: f64,
+            h: f64,
+            i: f64,
+        ) -> f64 {
+            let _ = (a, b, c, d, e, f, g, h);
+            i
+        }
+
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.can_collect = false;
+
+        let mut args = Vec::with_capacity(10);
+        args.push(Operand::from_opref(OpRef::const_int(
+            ninth as *const () as i64,
+        )));
+        for i in 0..8 {
+            args.push(Operand::from_opref(OpRef::const_float((i as f64) + 10.0)));
+        }
+        args.push(Operand::from_opref(OpRef::const_float(1.5)));
+
+        let call = OpRc::new(Op::new(OpCode::CallF, &args));
+        call.pos().set(OpRef::float_op(0));
+        call.setdescr(majit_ir::make_call_descr(
+            vec![Type::Float; 9],
+            Type::Float,
+            effect,
+        ));
+        let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&call)]);
+        finish.pos().set(OpRef::void_op(1));
+        finish.set_fail_arg_types(vec![Type::Float]);
+        finish.setfailargs(vec![].into());
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let token = JitCellToken::new(523);
+        backend
+            .compile_loop(&[], &[call, OpRc::new(finish)], &token)
+            .expect("compile float-const stack call");
+        let frame = backend.execute_token(&token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(
+            backend.get_float_value(&frame, 0).to_bits(),
+            1.5f64.to_bits()
+        );
+    }
+
+    /// `RegAlloc.make_sure_var_in_reg` returns `FloatImmedLoc` for a
+    /// `ConstFloat`, and `save_into_mem` writes those bits. The base is
+    /// the trace `InputArg` (`Operand::from_bound_inputarg`); a
+    /// position-only `InputArgRef` is not an operand the recorder emits.
+    #[test]
+    fn gc_store_float_constant_writes_bits() {
+        let mut buf = [0u8; 8];
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let inputargs = vec![majit_ir::InputArg::new_ref_rc(0)];
+        let store = OpRc::new(Op::new(
+            OpCode::GcStore,
+            &[
+                Operand::from_bound_inputarg(&inputargs[0]),
+                Operand::from_opref(OpRef::const_int(0)),
+                Operand::from_opref(OpRef::const_float(1.5)),
+                Operand::from_opref(OpRef::const_int(8)),
+            ],
+        ));
+        store.pos().set(OpRef::void_op(1));
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(2));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(524);
+        backend
+            .compile_loop(&inputargs, &[store, OpRc::new(finish)], &token)
+            .expect("compile gc_store of a float constant");
+        let frame = backend.execute_token(
+            &token,
+            &[majit_ir::Value::Ref(majit_ir::GcRef(
+                buf.as_mut_ptr() as usize
+            ))],
+        );
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(f64::from_le_bytes(buf).to_bits(), 1.5f64.to_bits());
+    }
+
+    /// `compute_vars_longevity` asserts a fail arg is not a `Const`, and
+    /// `Renamer.start_renaming` refuses to place one there. The fail arg
+    /// is the `SameAsF` box that received the constant; `locs_for_fail`
+    /// records that box and `get_float_value` reads it back.
+    #[test]
+    fn guard_fail_arg_float_box() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let same = OpRc::new(Op::new(
+            OpCode::SameAsF,
+            &[Operand::from_opref(OpRef::const_float(1.5))],
+        ));
+        same.pos().set(OpRef::float_op(0));
+        let armed = OpRc::new(Op::new(
+            OpCode::IntIsTrue,
+            &[Operand::from_opref(OpRef::const_int(0))],
+        ));
+        armed.pos().set(OpRef::int_op(1));
+        let guard = Op::new(OpCode::GuardTrue, &[Operand::from_bound_op(&armed)]);
+        guard.pos().set(OpRef::void_op(2));
+        guard.set_fail_arg_types(vec![Type::Float]);
+        guard.setfailargs(vec![Operand::from_bound_op(&same)].into());
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(3));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(525);
+        backend
+            .compile_loop(
+                &[],
+                &[same, armed, OpRc::new(guard), OpRc::new(finish)],
+                &token,
+            )
+            .expect("compile guard with a float-box fail arg");
+        let frame = backend.execute_token(&token, &[]);
+        assert!(!backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(
+            backend.get_float_value(&frame, 0).to_bits(),
+            1.5f64.to_bits()
+        );
     }
 
     // ── COND_CALL_GC_WB_ARRAY inline card marking ──────────────────────
@@ -972,6 +1133,11 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             value: i.value,
             is_float: true,
         },
+        // `ConstFloatLoc` is an absolute address (`location_code` `'j'`).
+        Loc::ConstFloat(c) => TargetArgLoc::Immed {
+            value: c.value as i64,
+            is_float: true,
+        },
         Loc::Addr(a) => TargetArgLoc::Addr {
             base: a.base,
             index: a.index,
@@ -1000,7 +1166,10 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
         } => Loc::Frame(crate::regloc::FrameLoc::new(position, ebp_offset, is_float)),
         TargetArgLoc::Immed { value, is_float } => {
             if is_float {
-                Loc::immed_float(value)
+                // Written by `target_argloc_from_loc` for `ConstFloatLoc`.
+                Loc::ConstFloat(crate::regloc::ConstFloatLoc {
+                    value: value as usize,
+                })
             } else {
                 Loc::immed(value)
             }
@@ -1046,7 +1215,9 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
         Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
-        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
+        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => {
+            None
+        }
     }
 }
 
@@ -1426,12 +1597,6 @@ impl CompiledCode {
     }
 }
 
-/// `regloc.py` `ConstFloatLoc`: an absolute address in the machine data
-/// block. Location code `'j'`, width 8.
-struct ConstFloatLoc {
-    value: usize,
-}
-
 /// The `genop_*` methods here are line-by-line ports of the RPython emitters
 /// (`x86/assembler.py` `genop_*`).  Emission runs through `regalloc_perform`,
 /// which works from regalloc `arglocs`, so the ports whose opcode that
@@ -1586,23 +1751,11 @@ impl<'a> Assembler386<'a> {
         (scratch, 0)
     }
 
-    /// `X86XMMRegisterManager.convert_to_imm`: `malloc_aligned(8, 8)`, write
-    /// the bits, `ConstFloatLoc(adr)`.
-    fn convert_to_imm(&mut self, bits: u64) -> ConstFloatLoc {
-        let adr = self
-            .datablockwrapper
-            .malloc_aligned(8, 8)
-            .expect("MachineDataBlockWrapper.malloc_aligned");
-        // The address is 8-aligned inside the open data block. `compile_loop`
-        // / `compile_bridge` hold the assembler-writing bracket across this.
-        unsafe { (adr as *mut u64).write(bits) };
-        ConstFloatLoc { value: adr }
-    }
-
     /// `Assembler386.mov` → `MOVSD` of a `ConstFloatLoc` (location code `'j'`).
     /// An address that fits a signed disp32 is `MOVSD_xj` (`encode_abs`);
     /// otherwise `_addr_as_reg_offset` then `MOVSD_xm`.
-    fn emit_movsd_const_float(&mut self, dst: u8, loc: ConstFloatLoc) {
+    /// The pool slot was allocated by `X86XMMRegisterManager.convert_to_imm`.
+    fn emit_movsd_const_float(&mut self, dst: u8, loc: crate::regloc::ConstFloatLoc) {
         let addr = loc.value as i64;
         if rx86::fits_in_32bits(addr) {
             rx86::movsd_xj(&mut self.mc, dst, addr as i32);
@@ -1612,18 +1765,33 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    fn emit_const_float_to_xmm(&mut self, dst: u8, bits: u64) {
-        let loc = self.convert_to_imm(bits);
-        self.emit_movsd_const_float(dst, loc);
+    /// Two `int32` halves of a `ConstFloatLoc`. `regalloc_immedmem2mem`
+    /// reads them from the pool address (`CArrayPtr(INT)`).
+    fn const_float_halves(from: crate::regloc::ConstFloatLoc) -> (i32, i32) {
+        let low = unsafe { (from.value as *const i32).read_unaligned() };
+        let high = unsafe { (from.value as *const i32).add(1).read_unaligned() };
+        (low, high)
+    }
+
+    /// Bit pattern stored by `X86XMMRegisterManager.convert_to_imm`.
+    fn const_float_bits(from: crate::regloc::ConstFloatLoc) -> i64 {
+        unsafe { (from.value as *const i64).read_unaligned() }
     }
 
     /// `regalloc_immedmem2mem`: a `ConstFloatLoc` stored to a frame slot is
     /// two `MOV32_bi` of the halves already written into the data block.
-    fn regalloc_immedmem2mem(&mut self, from: ConstFloatLoc, to_offset: i32) {
-        let low = unsafe { (from.value as *const i32).read_unaligned() };
-        let high = unsafe { (from.value as *const i32).add(1).read_unaligned() };
+    fn regalloc_immedmem2mem(&mut self, from: crate::regloc::ConstFloatLoc, to_offset: i32) {
+        let (low, high) = Self::const_float_halves(from);
         rx86::mov32_bi(&mut self.mc, to_offset, low);
         rx86::mov32_bi(&mut self.mc, to_offset.wrapping_add(4), high);
+    }
+
+    /// `regalloc_immedmem2mem` for a `RawEspLoc`: two `MOV32_si`.
+    /// `mov32_mi((ESP, offset))` is that encoding (`encode_stack_sp`).
+    fn regalloc_immedmem2esp(&mut self, from: crate::regloc::ConstFloatLoc, offset: i32) {
+        let (low, high) = Self::const_float_halves(from);
+        rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset), low);
+        rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset.wrapping_add(4)), high);
     }
 
     /// `assembler.py reserve_gcref_table`: reserve `n` zeroed words,
@@ -3292,8 +3460,12 @@ impl<'a> Assembler386<'a> {
             let gcmap = ra.get_gcmap(&[], false);
             self.emit_check_frame_depth(gcmap);
         }
+        // `X86XMMRegisterManager.assembler.datablockwrapper`. `prepare_*`
+        // rebuilds `xrm`, and `emit_check_frame_depth` borrows this assembler,
+        // so the pointer is installed immediately before the walk.
+        ra.xrm.set_datablockwrapper(&mut self.datablockwrapper);
         // assembler.py:374 walk_operations — get allocation decisions.
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations()?;
         self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
@@ -4831,6 +5003,9 @@ impl<'a> Assembler386<'a> {
                     let is_float = match src_loc {
                         Loc::Reg(r) => r.is_xmm,
                         ebp_loc_pat!(e) => e.is_float,
+                        // `ConstFloatLoc.is_float` — the pool address rides the
+                        // float remap, which moves it with `MOVSD`.
+                        Loc::ConstFloat(_) => true,
                         // An immediate is re-materialized into whichever set
                         // its destination is in, and an address is not a legal
                         // parallel-move operand at all.
@@ -6555,26 +6730,30 @@ impl<'a> Assembler386<'a> {
         //   float register    → len(gen_regs) + position in `cpu.float_regs`
         //   stack             → (loc.value - base_ofs) // WORD
         //                         (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
-        // PyPy regalloc never passes `Const` to `getfailargs()` — `loc()`
-        // returns the immediate inline.  Pyre allocates a const-store
-        // slot for `Loc::Immed` at codegen time and encodes the slot
-        // into `rd_locs` so the deopt path treats it as a normal stack
-        // position (`_decode_pos` in `llmodel.py`).
+        // A constant fail-arg does not fit that USHORT. Pyre allocates a
+        // const-store slot, writes the bits, and encodes the slot so
+        // deopt reads a normal stack position (`_decode_pos`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
-            .map(|fl| match fl {
-                None => 0xFFFF,
-                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                    // Allocate a const-store slot at codegen time;
-                    // encode the slot into `rd_locs` (PyPy stack-position
-                    // form) so deopt reads it like any other stack fail-arg.
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    slot as u16
-                }
-                Some(loc) => deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
+            .map(|fl| {
+                // `locs_for_fail` → `self.loc`: a float constant is
+                // `ConstFloatLoc`. `store_info_on_descr` would encode
+                // `loc.is_float()` as `len(gen_regs) + loc.value * coeff`,
+                // and `ConstFloatLoc.value` is the pool address, not an xmm
+                // index. Copy the bits into the same const-store slot an
+                // `ImmedFloat` uses so `rd_locs` stays a jitframe position
+                // (`_decode_pos`).
+                let bits = match fl {
+                    None => return 0xFFFF,
+                    Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
+                    Some(Loc::ConstFloat(c)) => Self::const_float_bits(*c),
+                    Some(loc) => return deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
+                };
+                let slot = self.frame_depth;
+                self.frame_depth += 1;
+                const_stores.push((slot, bits));
+                slot as u16
             })
             .collect();
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
@@ -7518,8 +7697,10 @@ impl<'a> Assembler386<'a> {
             ResolvedArg::Slot(offset) => {
                 rx86::movsd_xb(&mut self.mc, 0, offset);
             }
-            ResolvedArg::Const(val) => {
-                self.emit_const_float_to_xmm(0, val as u64);
+            ResolvedArg::Const(_) => {
+                panic!(
+                    "float constants are ConstFloatLoc from X86XMMRegisterManager.convert_to_imm"
+                );
             }
         }
     }
@@ -7531,8 +7712,10 @@ impl<'a> Assembler386<'a> {
             ResolvedArg::Slot(offset) => {
                 rx86::movsd_xb(&mut self.mc, 1, offset);
             }
-            ResolvedArg::Const(val) => {
-                self.emit_const_float_to_xmm(1, val as u64);
+            ResolvedArg::Const(_) => {
+                panic!(
+                    "float constants are ConstFloatLoc from X86XMMRegisterManager.convert_to_imm"
+                );
             }
         }
     }
@@ -8239,10 +8422,16 @@ impl<'a> Assembler386<'a> {
                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                     self.emit_abi_arg_from_imm(placement, i.value, arg_type)
                 }
-                // `RegisterManager::loc` and `make_sure_var_in_reg` only ever
-                // yield Reg/Frame/Immed, so any other spelling is a regalloc
-                // change this emitter has not been taught.  Falling through
-                // would drop the argument and call with a stale register.
+                // `jump.py _move`: `ConstFloatLoc` and `RawEspLoc` are both
+                // memory references, so this is `regalloc_immedmem2mem`
+                // (two `MOV32_si`), not `MOVSD`. An xmm destination goes
+                // through `remap_frame_layout` → `Assembler386.mov` → `MOVSD`.
+                Loc::ConstFloat(c) => {
+                    let AbiArgPlacement::Stack(offset) = placement else {
+                        panic!("float stack argument is not a stack placement");
+                    };
+                    self.regalloc_immedmem2esp(*c, offset);
+                }
                 other => panic!("call argument {abi_idx} has unsupported location {other:?}"),
             }
         }
@@ -10210,9 +10399,9 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                     // copy 128-bit from -> to
                     rx86::movapd_xx(&mut self.mc, d.value, s.value);
                 } else if !s.is_xmm && !d.is_xmm {
-                    if s.value == scratch_reg || d.value == scratch_reg {
-                        self.forget_scratch_register();
-                    }
+                    // `LocationCodeBuilder._binaryop` INSN forgets the scratch
+                    // register only when the destination (`loc1`) is
+                    // `X86_64_SCRATCH_REG`, and only for a `MOV`.
                     self.forget_if_scratch_written(d.value);
                     dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), Rq(s.value));
                 } else if s.is_xmm && !d.is_xmm {
@@ -10245,8 +10434,8 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                     rx86::mov_rb(&mut self.mc, d.value, ofs);
                 }
             }
-            (Loc::ImmedFloat(i), Loc::Reg(d)) if d.is_xmm => {
-                self.emit_const_float_to_xmm(d.value, i.value as u64);
+            (Loc::ConstFloat(loc), Loc::Reg(d)) if d.is_xmm => {
+                self.emit_movsd_const_float(d.value, *loc);
             }
             (Loc::Immed(i), Loc::Reg(d)) if d.is_xmm => {
                 self.forget_scratch_register();
@@ -10254,16 +10443,18 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                 rx86::mov_ri(&mut self.mc, scratch_reg, i.value);
                 rx86::movdq_xr(&mut self.mc, d.value, scratch_reg);
             }
-            (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) => {
+            // GPR `mov r, imm`. A float constant is `ConstFloatLoc` from
+            // `X86XMMRegisterManager.convert_to_imm`, matched above; an
+            // `ImmedFloat` into an xmm register is not this `mov`.
+            (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) if !d.is_xmm => {
                 if d.value == scratch_reg {
                     self.forget_scratch_register();
                 }
                 self.forget_if_scratch_written(d.value);
                 rx86::mov_ri(&mut self.mc, d.value, i.value);
             }
-            (Loc::ImmedFloat(i), ebp_loc_pat!(e)) => {
-                let loc = self.convert_to_imm(i.value as u64);
-                self.regalloc_immedmem2mem(loc, e.value);
+            (Loc::ConstFloat(from), ebp_loc_pat!(e)) => {
+                self.regalloc_immedmem2mem(*from, e.value);
             }
             (Loc::Immed(i), ebp_loc_pat!(e)) => {
                 self.forget_scratch_register();
