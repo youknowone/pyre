@@ -17620,6 +17620,7 @@ impl<'a> Lowering<'a> {
             .or_else(|| self.fold_transparent_int_const_global(global_id))?;
         match op {
             OpKind::ConstInt(_)
+            | OpKind::ConstFnAddr { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstInt128(_)
             | OpKind::ConstUInt128(_)
@@ -17701,7 +17702,7 @@ impl<'a> Lowering<'a> {
             // than a departure from it, and re-stamping it `Ref` would be the
             // deviation.  majit materialises a funcptr as its integer address
             // everywhere else as well (`jtransform.rs direct_funcptr_value`
-            // emits `ConstInt(fnaddr)`, which the assembler encodes through the
+            // emits `ConstFnAddr`, which the assembler encodes through the
             // `'i'` argcode), and the flowspace fold gives the define a
             // `Signed` legacy slot to match.
             DecodedConst::FnPath(segments) => {
@@ -70161,6 +70162,7 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
     for op in &block.operations {
         let pure = match &op.kind {
             OpKind::ConstInt(_)
+            | OpKind::ConstFnAddr { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
@@ -79979,7 +79981,7 @@ mod tests {
                         | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
                         OpKind::Input { ty, .. } => Some(ty.clone()),
                         OpKind::ConstRefNull => Some(ValueType::Ref(None)),
-                        OpKind::ConstInt(_) => Some(ValueType::Int),
+                        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some(ValueType::Int),
                         OpKind::ConstUInt(_) => Some(ValueType::Unsigned),
                         _ => None,
                     }) {

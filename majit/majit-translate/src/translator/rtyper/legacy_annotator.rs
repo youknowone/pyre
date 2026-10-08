@@ -265,7 +265,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
 fn infer_op_type(kind: &OpKind) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
-        OpKind::ConstInt(_) => ValueType::Int,
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => ValueType::Int,
         OpKind::ConstUInt(_) => ValueType::Unsigned,
         OpKind::ConstInt128(_) => ValueType::Int128,
         OpKind::ConstSingleFloat(_) => ValueType::SingleFloat,

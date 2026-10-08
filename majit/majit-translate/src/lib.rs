@@ -2722,6 +2722,7 @@ fn analyze_pipeline_from_module_paths(
             &mut prof,
             static_addrs.pytypes,
             static_addrs.pytypes_by_struct,
+            static_addrs.refs,
         );
     mark_phase!("make_jitcodes");
     // warmspot.py `WarmRunnerDesc.finish` after `make_jitcodes`: unique
@@ -3007,6 +3008,7 @@ fn make_jitcodes(
     prof: &mut PhaseProfiler,
     pytypes: &[(&str, i64)],
     pytypes_by_struct: &[(&str, i64)],
+    refs: &[(&str, i64)],
 ) -> (
     Vec<std::sync::Arc<jitcode::JitCode>>,
     Vec<usize>,
@@ -3030,6 +3032,7 @@ fn make_jitcodes(
     codewriter
         .assembler
         .intern_type_static_addrs(pytypes_by_struct);
+    codewriter.assembler.intern_static_ref_addrs(refs);
 
     // `warmspot.py:262-264` `vrefinfo = VirtualRefInfo(self);
     //  self.codewriter.setup_vrefinfo(vrefinfo)` — installs the
@@ -3832,6 +3835,7 @@ mod portal_driver_tests {
             &mut PhaseProfiler::new(),
             &[],
             &[],
+            &[],
         );
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
@@ -4068,6 +4072,7 @@ mod portal_driver_tests {
             &config,
             &mut call_control,
             &mut PhaseProfiler::new(),
+            &[],
             &[],
             &[],
         );

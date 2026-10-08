@@ -680,8 +680,17 @@ fn transduce_op(
             };
             let target = crate::model::CallTarget::function_path([helper]);
             let fnaddr = crate::codewriter::call::symbolic_fnaddr_for_target(&target);
+            let path = crate::codewriter::call::symbolic_fnaddr_path_for_target(&target);
             let funcptr = out
-                .push_op_var(block, OpKind::ConstInt(fnaddr), true)
+                .push_op_var(
+                    block,
+                    OpKind::ConstFnAddr {
+                        value: fnaddr,
+                        path,
+                        symbolic: true,
+                    },
+                    true,
+                )
                 .expect("funcptr const produces a result");
             crate::model::FunctionGraph::set_concretetype_of_inline(
                 &funcptr,
@@ -1158,7 +1167,7 @@ mod tests {
                 match &op.kind {
                     OpKind::LoweredBlackholeOp { opname, .. } => blackhole.push(opname.clone()),
                     OpKind::BinOp { op, .. } => binops.push(op.clone()),
-                    OpKind::ConstInt(_) => const_ints += 1,
+                    OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => const_ints += 1,
                     other => residual.push(format!("{other:?}")),
                 }
             }
@@ -1282,7 +1291,7 @@ mod tests {
                 OpKind::BinOp { op, .. } => binary.push(op.as_str()),
                 OpKind::LoweredBlackholeOp { opname, .. } => lowered.push(opname.as_str()),
                 OpKind::Live => live += 1,
-                OpKind::ConstInt(_) => {}
+                OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => {}
                 other => panic!("unexpected lowered integer-fragment op: {other:?}"),
             }
         }
@@ -1995,7 +2004,7 @@ mod tests {
             for op in &block.operations {
                 match &op.kind {
                     OpKind::Call { target, args, .. } => calls.push((target.clone(), args.len())),
-                    OpKind::ConstInt(_) => const_ints += 1,
+                    OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => const_ints += 1,
                     other => residual.push(format!("{other:?}")),
                 }
             }

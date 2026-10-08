@@ -395,6 +395,15 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstFnAddr { value, .. } => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Int(*value),
+                            LowLevelType::Signed,
+                        )),
+                    );
+                }
                 OpKind::ConstUInt(n) => {
                     map.insert(
                         result,
@@ -1705,6 +1714,7 @@ pub fn translate_op(
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
         OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
@@ -3770,6 +3780,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",
+        OpKind::ConstFnAddr { .. } => "ConstFnAddr",
         OpKind::ConstUInt(_) => "ConstUInt",
         OpKind::ConstBool(_) => "ConstBool",
         OpKind::ConstSymbolic { .. } => "ConstSymbolic",
@@ -4000,6 +4011,9 @@ fn legacy_const_define_hlvalue(
             ConstValue::Int(*n),
             LowLevelType::Signed,
         )))),
+        OpKind::ConstFnAddr { value, .. } => Ok(Some(Hlvalue::Constant(
+            Constant::with_concretetype(ConstValue::Int(*value), LowLevelType::Signed),
+        ))),
         OpKind::ConstUInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int(*n as i64),
             LowLevelType::Unsigned,
@@ -4089,7 +4103,7 @@ fn legacy_const_define_hlvalue(
             })?;
             // A fn-const is address-taken data for a static method table
             // (`typedef` `[(name, fn, arity)]`).  Its LL carrier is
-            // unconditionally `ConstInt(fnaddr)` (the const-define arm below),
+            // unconditionally `ConstFnAddr` (the const-define arm below),
             // it is never JIT-called in the compiled portal, so the `FuncType`
             // is pure typing bookkeeping with no machine-code channel.  Taking
             // the address does NOT need the callee's body — only its declared
@@ -5123,7 +5137,7 @@ fn function_graph_to_flowspace_inner(
                         // legacy/codewriter side must still see the
                         // synthetic define's declared Int slot: later
                         // jtransform materialises funcptr values as
-                        // `ConstInt(fnaddr)` and the assembler encodes
+                        // `ConstFnAddr` and the assembler encodes
                         // them through the `i` argcode.
                         LowLevelType::Signed
                     } else {

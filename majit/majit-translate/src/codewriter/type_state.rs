@@ -136,7 +136,7 @@ fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
 /// [`merge_synth_kinds`]'s precedence chain.
 pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<ConcreteType> {
     match kind {
-        OpKind::ConstInt(_) => Some(ConcreteType::Signed),
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some(ConcreteType::Signed),
         OpKind::ConstUInt(_) => Some(ConcreteType::Signed),
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => None,
         OpKind::ConstBool(_) => Some(ConcreteType::Signed),

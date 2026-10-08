@@ -581,7 +581,7 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
 
 fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
     match kind {
-        OpKind::ConstInt(_) => ConcreteType::Signed,
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => ConcreteType::Signed,
         // Unsigned shares the JIT integer register bank with Signed; the
         // annotation/repr distinction is carried separately.
         OpKind::ConstUInt(_) => ConcreteType::Signed,

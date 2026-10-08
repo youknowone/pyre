@@ -2447,6 +2447,12 @@ pub struct CallControl {
     /// concrete trace-call surface here. Unbound paths still fall back to
     /// the stable symbolic address shim.
     function_fnaddrs: HashMap<CallPath, i64>,
+    /// Original `jit_trace_fnaddrs` key for each [`Self::function_fnaddrs`]
+    /// `CallPath`. `register_macro_helper_trace_fnaddr` strips `r#` and
+    /// the crate root when building aliases; the reloc descriptor stores
+    /// this key so the runtime exact-matches the published spelling
+    /// (`assembler.py emit_const` carrying the symbolic object).
+    fnaddr_registry_keys: HashMap<CallPath, String>,
 
     /// Memoised [`Self::builtin_wrapper_indirect_graphs`] family.
     ///
@@ -3255,6 +3261,7 @@ impl CallControl {
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
+            fnaddr_registry_keys: HashMap::new(),
             builtin_wrapper_family: std::cell::OnceCell::new(),
             builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
             need_result_type_registry: std::cell::RefCell::new(HashMap::new()),
@@ -5036,24 +5043,26 @@ impl CallControl {
         if canonical.is_empty() {
             return;
         }
-        self.register_function_fnaddr(CallPath::from_segments(canonical.iter().copied()), fnaddr);
+        let mut register = |path: CallPath| {
+            self.fnaddr_registry_keys
+                .insert(path.clone(), full_path.to_string());
+            self.register_function_fnaddr(path, fnaddr);
+        };
+        register(CallPath::from_segments(canonical.iter().copied()));
         let mut crate_alias = Vec::with_capacity(canonical.len() + 1);
         crate_alias.push("crate");
         crate_alias.extend(canonical.iter().copied());
-        self.register_function_fnaddr(CallPath::from_segments(crate_alias), fnaddr);
+        register(CallPath::from_segments(crate_alias));
         // Charon names call targets crate-qualified (`name_path()` keeps
         // the crate root), and `target_to_path` returns 3+-segment
         // `FunctionPath`s verbatim — so `fnaddr_for_target`'s exact-path
         // lookup needs the unstripped spelling too.  Without it, every
         // residual call site that reaches the helper through its
-        // crate-qualified path falls back to the symbolic hash, which
-        // `patch_constants_i_fnaddrs` can never rebind to the runtime
-        // address.
+        // crate-qualified path falls back to the symbolic hash; the
+        // reloc descriptor still names this path so the runtime
+        // patcher can rebind it.
         if segments.len() > 1 {
-            self.register_function_fnaddr(
-                CallPath::from_segments(segments.iter().copied()),
-                fnaddr,
-            );
+            register(CallPath::from_segments(segments.iter().copied()));
         }
     }
 
@@ -6673,11 +6682,24 @@ impl CallControl {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{path:?}"));
         let mut shell = crate::jitcode::JitCode::new(name);
-        shell.fnaddr = self
-            .function_fnaddrs
+        // `call.py get_jitcode` stores `getfunctionptr(graph)` — a
+        // symbolic the C backend's linker resolves by name. Record the
+        // same `{ path, symbolic }` pair `fnaddr_binding_for_target`
+        // writes onto a `constants_i` FnAddr descriptor.
+        let reloc_path = self
+            .fnaddr_registry_keys
             .get(path)
-            .copied()
-            .unwrap_or_else(|| symbolic_fnaddr_for_path(path));
+            .cloned()
+            .unwrap_or_else(|| path.canonical_key());
+        let (fnaddr, symbolic) = match self.function_fnaddrs.get(path).copied() {
+            Some(addr) => (addr, false),
+            None => (symbolic_fnaddr_for_path(path), true),
+        };
+        shell.fnaddr = fnaddr;
+        shell.fnaddr_reloc = Some(crate::jitcode::ConstIRelocKind::FnAddr {
+            path: reloc_path,
+            symbolic,
+        });
         let arc = std::sync::Arc::new(shell);
         self.jitcodes.insert(path.clone(), arc.clone());
         self.unfinished_graphs.push(path.clone());
@@ -7552,12 +7574,29 @@ impl CallControl {
         }
     }
 
-    /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
-    /// integer funcptr identity for a call site. majit prefers a host-bound
-    /// trace-call address when one has been registered for the resolved
-    /// `CallPath`; otherwise it falls back to the stable symbolic address
-    /// shim for source-only analysis.
-    pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
+    /// Address and `CallPath` key [`CallControl::fnaddr_for_target`] resolved.
+    ///
+    /// The path is `assembler.py emit_const`'s symbolic: it travels with
+    /// the constant so the runtime patcher rewrites the slot by name
+    /// rather than by matching integer bits.
+    pub fn fnaddr_binding_for_target(&self, target: &CallTarget) -> FnAddrBinding {
+        let binding = |path: CallPath, addr: i64, symbolic: bool| FnAddrBinding {
+            path: self
+                .fnaddr_registry_keys
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| path.canonical_key()),
+            addr,
+            symbolic,
+        };
+        let from_table = |path: CallPath| match self.function_fnaddrs.get(&path).copied() {
+            Some(addr) => binding(path, addr, false),
+            None => {
+                let addr = symbolic_fnaddr_for_path(&path);
+                binding(path, addr, true)
+            }
+        };
+
         // A `__majit_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
         // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
         // one-register-per-slot residual-call ABI can carry. The codewriter
@@ -7579,23 +7618,16 @@ impl CallControl {
                 .last_segment()
                 .is_some_and(|leaf| leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX))
         {
-            return symbolic_fnaddr_for_path(path);
+            let addr = symbolic_fnaddr_for_path(path);
+            return binding(path.clone(), addr, true);
         }
 
         if let Some(segments) = crate::model::fn_const_segments(target) {
             let path = CallPath::from_segments(segments.iter().map(String::as_str));
-            return self
-                .function_fnaddrs
-                .get(&path)
-                .copied()
-                .unwrap_or_else(|| symbolic_fnaddr_for_path(&path));
+            return from_table(path);
         }
         if let Some(path) = self.target_to_path(target) {
-            return self
-                .function_fnaddrs
-                .get(&path)
-                .copied()
-                .unwrap_or_else(|| symbolic_fnaddr_for_path(&path));
+            return from_table(path);
         }
         // Graph-less inherent-method fallback. Elidable leaf methods
         // (`PyFrame::nlocals` / `ncells` / …) deliberately register NO
@@ -7623,11 +7655,24 @@ impl CallControl {
             for candidate in candidates {
                 let qualified = CallPath::for_impl_method(candidate, name.as_str());
                 if let Some(&addr) = self.function_fnaddrs.get(&qualified) {
-                    return addr;
+                    return binding(qualified, addr, false);
                 }
             }
         }
-        symbolic_fnaddr_for_target(target)
+        FnAddrBinding {
+            addr: symbolic_fnaddr_for_target(target),
+            path: symbolic_fnaddr_path_for_target(target),
+            symbolic: true,
+        }
+    }
+
+    /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
+    /// integer funcptr identity for a call site. majit prefers a host-bound
+    /// trace-call address when one has been registered for the resolved
+    /// `CallPath`; otherwise it falls back to the stable symbolic address
+    /// shim for source-only analysis.
+    pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
+        self.fnaddr_binding_for_target(target).addr
     }
 
     /// Strict lookup variant of [`fnaddr_for_target`].
@@ -9807,6 +9852,14 @@ pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
     )
 }
 
+pub(crate) fn symbolic_fnaddr_path_for_target(target: &CallTarget) -> String {
+    if let Some(segments) = crate::model::fn_const_segments(target) {
+        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        return path.canonical_key();
+    }
+    format!("target:{target}")
+}
+
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
     if let Some(segments) = crate::model::fn_const_segments(target) {
         let path = CallPath::from_segments(segments.iter().map(String::as_str));
@@ -9817,6 +9870,20 @@ pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
     let symbolic = stable_symbolic_fnaddr(target);
     record_symbolic_fnaddr(symbolic, format!("target:{target}"));
     symbolic
+}
+
+/// Build-process address plus the path the runtime patcher rebinds by.
+///
+/// `assembler.py emit_const` keeps the symbolic object; this is that
+/// object split into the integer the `'i'` bank stores and the name
+/// that identifies it across the build/run boundary. `symbolic` is
+/// true when the lookup minted a `symbolic_fnaddr_for_path` hash
+/// because no build address existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FnAddrBinding {
+    pub addr: i64,
+    pub path: String,
+    pub symbolic: bool,
 }
 
 impl Default for CallControl {
@@ -11565,6 +11632,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: same_as, cast_*, hint → cannot raise
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
@@ -14160,6 +14228,13 @@ mod tests {
         let jitcode = cc.get_jitcode(&path);
 
         assert_eq!(jitcode.fnaddr, symbolic_fnaddr_for_path(&path));
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: path.canonical_key(),
+                symbolic: true,
+            })
+        );
     }
 
     #[test]
@@ -14201,6 +14276,13 @@ mod tests {
         let jitcode = cc.get_jitcode(&path);
 
         assert_eq!(jitcode.fnaddr, 0xfeed_beef);
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: path.canonical_key(),
+                symbolic: false,
+            })
+        );
     }
 
     #[test]

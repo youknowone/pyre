@@ -609,7 +609,7 @@ pub struct Transformer<'a> {
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
-    /// Result of a `__fn_const` 0-arg Call rewritten to `ConstInt(fnaddr)`.
+    /// Result of a `__fn_const` 0-arg Call rewritten to `ConstFnAddr`.
     /// `fn_const_target_for_var` reads the producer Call; after the rewrite
     /// that producer is gone, so later `conditional_call` / indirect-call
     /// rewrites recover the callee from this map.
@@ -1377,6 +1377,7 @@ fn is_source_constant_variable(
             }
             match &op.kind {
                 OpKind::ConstInt(_)
+                | OpKind::ConstFnAddr { .. }
                 | OpKind::ConstUInt(_)
                 | OpKind::ConstBool(_)
                 | OpKind::ConstFloat(_)
@@ -3453,13 +3454,17 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         target: &CallTarget,
     ) -> (crate::flowspace::model::Variable, SpaceOperation) {
-        let fnaddr = self
-            .callcontrol
-            .as_deref()
-            .map(|cc| cc.fnaddr_for_target(target))
-            .unwrap_or_else(|| crate::call::symbolic_fnaddr_for_target(target));
-        // Function pointer materialized as ConstInt — assembler emits it
-        // through the `'i'` argcode so the kind is Signed.
+        let binding = match self.callcontrol.as_deref() {
+            Some(cc) => cc.fnaddr_binding_for_target(target),
+            None => crate::codewriter::call::FnAddrBinding {
+                addr: crate::call::symbolic_fnaddr_for_target(target),
+                path: crate::call::symbolic_fnaddr_path_for_target(target),
+                symbolic: true,
+            },
+        };
+        // Function pointer materialized as ConstFnAddr — assembler emits it
+        // through the `'i'` argcode so the kind is Signed, and records
+        // `path` as `assembler.py emit_const`'s symbolic object.
         let var = self.fresh_synthetic_variable_typed(
             graph,
             crate::codewriter::type_state::ConcreteType::Signed,
@@ -3468,7 +3473,11 @@ impl<'a> Transformer<'a> {
             var.clone(),
             SpaceOperation {
                 result: Some(var),
-                kind: OpKind::ConstInt(fnaddr),
+                kind: OpKind::ConstFnAddr {
+                    value: binding.addr,
+                    path: binding.path,
+                    symbolic: binding.symbolic,
+                },
             },
         )
     }
@@ -3483,7 +3492,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// Recover the callee a `__fn_const` define named, including after
-    /// that define was rewritten to `ConstInt(getfunctionptr)`.
+    /// that define was rewritten to `ConstFnAddr`.
     fn fn_const_target_of(
         &self,
         graph: &FunctionGraph,
@@ -7098,11 +7107,14 @@ impl<'a> Transformer<'a> {
         if args.is_empty()
             && let Some(segments) = crate::model::fn_const_segments(target)
         {
-            let fnaddr = self
-                .callcontrol
-                .as_deref()
-                .map(|cc| cc.fnaddr_for_target(target))
-                .unwrap_or_else(|| crate::call::symbolic_fnaddr_for_target(target));
+            let binding = match self.callcontrol.as_deref() {
+                Some(cc) => cc.fnaddr_binding_for_target(target),
+                None => crate::codewriter::call::FnAddrBinding {
+                    addr: crate::call::symbolic_fnaddr_for_target(target),
+                    path: crate::call::symbolic_fnaddr_path_for_target(target),
+                    symbolic: true,
+                },
+            };
             if let Some(result) = op.result.clone() {
                 self.fn_const_results.insert(
                     result,
@@ -7112,11 +7124,15 @@ impl<'a> Transformer<'a> {
             self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
-                detail: format!("__fn_const → ConstInt({fnaddr:#x})"),
+                detail: format!("__fn_const → ConstFnAddr({:#x})", binding.addr),
             });
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
-                kind: OpKind::ConstInt(fnaddr),
+                kind: OpKind::ConstFnAddr {
+                    value: binding.addr,
+                    path: binding.path,
+                    symbolic: binding.symbolic,
+                },
             }]);
         }
         // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias
@@ -12891,6 +12907,7 @@ fn remap_op(
     let kind = match &op.kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
@@ -17150,7 +17167,9 @@ mod tests {
                 "ll_math",
                 "math_fmod",
             ]));
-        assert!(matches!(&ops[3].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
+        assert!(
+            matches!(&ops[3].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
+        );
         match &ops[4].kind {
             OpKind::CallResidual {
                 funcptr,
@@ -17214,7 +17233,9 @@ mod tests {
         assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
         let expected_fnaddr =
             crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_int_str"]));
-        assert!(matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
+        );
         match &ops[2].kind {
             OpKind::CallResidual {
                 funcptr,
@@ -17290,7 +17311,7 @@ mod tests {
             "grain_render_int",
         ]));
         assert!(
-            matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected),
+            matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected),
             "the fnptr names the configured helper, not this layer's default",
         );
     }
@@ -17386,7 +17407,7 @@ mod tests {
         let expected =
             crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["grain_concat"]));
         assert!(
-            matches!(&ops[2].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected),
+            matches!(&ops[2].kind, OpKind::ConstFnAddr { value, .. } if *value == expected),
             "the fnptr names the configured helper, not this layer's default",
         );
     }
@@ -17475,7 +17496,7 @@ mod tests {
         let ops = &transformed.graph.block(graph.startblock).operations;
         assert!(
             ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::ConstInt(f) if *f == streq_fnaddr())),
+                .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { value, .. } if *value == streq_fnaddr())),
             "the fnptr is the ll_streq helper: {ops:?}",
         );
         assert!(
@@ -18736,7 +18757,7 @@ mod tests {
         assert_eq!(result.calls_classified, 1);
         assert!(matches!(
             result.graph.block(graph.startblock).operations[0].kind,
-            OpKind::ConstInt(_)
+            OpKind::ConstFnAddr { .. }
         ));
         assert!(matches!(
             result.graph.block(graph.startblock).operations[1].kind,
@@ -19076,12 +19097,12 @@ mod tests {
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
         let result = transformer.transform(&graph);
         let ops = &result.graph.block(graph.startblock).operations;
-        assert_eq!(ops.len(), 4, "Input + ConstInt + CallResidual + Live");
+        assert_eq!(ops.len(), 4, "Input + ConstFnAddr + CallResidual + Live");
         match &ops[1].kind {
-            OpKind::ConstInt(fnaddr) => {
-                assert_eq!(*fnaddr, cc.fnaddr_for_target(&target));
+            OpKind::ConstFnAddr { value, .. } => {
+                assert_eq!(*value, cc.fnaddr_for_target(&target));
             }
-            other => panic!("expected materialized funcptr ConstInt, got {other:?}"),
+            other => panic!("expected materialized funcptr ConstFnAddr, got {other:?}"),
         }
         match &ops[2].kind {
             OpKind::CallResidual {
@@ -20161,7 +20182,7 @@ mod tests {
                 .block(graph.startblock)
                 .operations
                 .iter()
-                .any(|op| matches!(op.kind, OpKind::ConstInt(0x1234)))
+                .any(|op| matches!(op.kind, OpKind::ConstFnAddr { value: 0x1234, .. }))
         );
     }
 
@@ -20193,7 +20214,7 @@ mod tests {
         );
         let ops = &result.graph.block(graph.startblock).operations;
         // RPython: always residual_call_*, effect in descriptor only.
-        assert!(matches!(ops[0].kind, OpKind::ConstInt(_)));
+        assert!(matches!(ops[0].kind, OpKind::ConstFnAddr { .. }));
         assert!(matches!(ops[1].kind, OpKind::CallResidual { .. }));
         // Verify the effect is correctly carried in the descriptor.
         if let OpKind::CallResidual { descriptor, .. } = &ops[1].kind {
@@ -22544,7 +22565,7 @@ mod tests {
     }
 
     /// A function item used as a value is a `__fn_const` 0-arg Call.
-    /// Rewrite it to `ConstInt(getfunctionptr)`, not a residual invocation.
+    /// Rewrite it to `ConstFnAddr`, not a residual invocation.
     #[test]
     fn fn_const_define_rewrites_to_const_int() {
         let config = GraphTransformConfig::default();
@@ -22578,8 +22599,8 @@ mod tests {
             RewriteResult::Replace(ops) => {
                 assert_eq!(ops.len(), 1);
                 assert!(
-                    matches!(ops[0].kind, OpKind::ConstInt(_)),
-                    "expected ConstInt(getfunctionptr), got {:?}",
+                    matches!(ops[0].kind, OpKind::ConstFnAddr { .. }),
+                    "expected ConstFnAddr(getfunctionptr), got {:?}",
                     ops[0].kind
                 );
                 assert_eq!(ops[0].result.as_ref(), Some(&result_var));

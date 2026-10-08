@@ -583,6 +583,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         // call variants downstream of `jtransform` carry a `result_kind`
         // char that `value_type_to_kind` already produced.
         OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstStr(_)

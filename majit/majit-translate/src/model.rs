@@ -882,6 +882,19 @@ pub enum OpKind {
         class_root: Option<String>,
     },
     ConstInt(i64),
+    /// Function-pointer integer constant (`jtransform.py
+    /// direct_funcptr_value` / `handle_residual_call`). Same `'i'` bank
+    /// as [`ConstInt`]; `path` is `assembler.py emit_const`'s symbolic
+    /// object (`llmemory.AddressAsInt` / `lltype` function pointer) so
+    /// the assembler records provenance instead of pooling a bare int.
+    ConstFnAddr {
+        value: i64,
+        path: String,
+        /// True when no build address existed and `value` is a
+        /// `symbolic_fnaddr_for_path` hash. Set at the
+        /// `fnaddr_binding_for_target` lookup, never inferred from bits.
+        symbolic: bool,
+    },
     /// Word-sized unsigned integer constant. RPython stores the same Python
     /// integer value as `ConstInt`, but its `Constant.concretetype` is
     /// `lltype.Unsigned`; keeping the source tag prevents `r_uint ∪ int`
