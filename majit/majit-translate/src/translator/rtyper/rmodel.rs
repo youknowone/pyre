@@ -2060,6 +2060,12 @@ impl Repr for PtrRepr {
             let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
             return Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)));
         }
+        // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref`: the receiver
+        // is already the nullable pointer word. Identity, matching the
+        // annotator's `ptr_method_as_ref`.
+        if method_name == "as_ref" || method_name == "as_mut" {
+            return hop.inputarg(self, 0).map(Some);
+        }
         Err(TyperError::message(format!(
             "missing PtrRepr.rtype_method_{method_name}"
         )))

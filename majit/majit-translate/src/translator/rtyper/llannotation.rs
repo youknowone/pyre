@@ -269,6 +269,13 @@ impl SomePtr {
                         "is_null",
                     )))
                 }
+                // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref`: the
+                // receiver is already the nullable pointer word
+                // (`raw_struct_ptr_annotation`). Identity, same as
+                // `front::mir` `is_raw_ptr_as_ref`.
+                Err(_) if attr == "as_ref" || attr == "as_mut" => Ok(SomeValue::BuiltinMethod(
+                    SomeBuiltinMethod::new("ptr_method_as_ref", SomeValue::Ptr(self.clone()), attr),
+                )),
                 Err(e) => Err(AnnotatorError::new(e)),
             },
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {

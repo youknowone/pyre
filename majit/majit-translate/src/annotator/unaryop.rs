@@ -3657,6 +3657,15 @@ pub(crate) fn call_builtin_method(
             };
             super::model::s_bool()
         }
+        // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref` on a SomePtr
+        // receiver: the pointer word is the option. Zero-arg identity.
+        "ptr_method_as_ref" => {
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            method.s_self.as_ref().clone()
+        }
         // `PyError::to_exc_object(&self) -> PyObjectRef` — the boxed
         // `W_BaseException`.  Zero positional args; the result is a
         // `PyObjectRef` instance (bound in the SomeInstance.getattr
@@ -4343,6 +4352,19 @@ fn init_someinstance_overrides(
                             "ptr_method_is_null",
                             s_self.clone(),
                             "is_null",
+                        ));
+                    }
+                }
+                if attr == "as_ref" || attr == "as_mut" {
+                    let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
+                        let classdesc = cd.borrow().classdesc.clone();
+                        super::classdesc::ClassDesc::lookup(&classdesc, &attr).is_some()
+                    });
+                    if !class_defines_attr {
+                        return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "ptr_method_as_ref",
+                            s_self.clone(),
+                            attr,
                         ));
                     }
                 }
