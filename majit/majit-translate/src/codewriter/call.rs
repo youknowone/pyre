@@ -6073,14 +6073,14 @@ impl CallControl {
         bfs_phase: bool,
         builtin_wrappers: &[CallPath],
     ) -> Vec<CallPath> {
-        // `call.py:76-77` — only `direct_call` and
+        // `call.py CallControl.find_all_graphs` — only `direct_call` and
         // `indirect_call` ops are walked; everything else is
         // skipped.  The op-shape dispatch produces the callee
         // set `call.py graphs_from(op, is_candidate)` would
         // yield: one path for a direct call, the whole family
         // for an indirect one.
         match &op.kind {
-            // `call.py:103-112` indirect_call — the attached
+            // `call.py CallControl.graphs_from` indirect_call — the attached
             // `c_graphs` family, `None` meaning "unknown
             // family" and classifying the site as residual.
             OpKind::IndirectCall { graphs, .. } => match graphs {
@@ -6129,7 +6129,7 @@ impl CallControl {
                     },
                 ..
             } => self.all_impls_for_indirect(trait_root, method_name),
-            // `call.py:117-136` direct_call.  These three
+            // `call.py CallControl.guess_call_kind` direct_call.  These three
             // classifications are attached to the single
             // `funcobj` and so apply to the direct branch
             // only; an indirect family is instead validated
@@ -6180,7 +6180,7 @@ impl CallControl {
                 // `find_all_graphs` walk; the annotator follows every
                 // call into a graph (`annrpython.py recursivecall`).
                 if bfs_phase {
-                    // `call.py:119-120`
+                    // `call.py CallControl.guess_call_kind`
                     // jitdriver_sd_from_portal_runner_ptr → recursive.
                     if self.is_portal_recursive_call(&callee_path) {
                         // Not a refusal — the portal is already a
@@ -6194,7 +6194,7 @@ impl CallControl {
                         );
                         return Vec::new();
                     }
-                    // `call.py:129-134`
+                    // `call.py CallControl.guess_call_kind`
                     // `_gctransformer_hint_close_stack_` → residual.
                     // `get_jitcode` asserts such a graph never
                     // reaches it, so following one here would turn
@@ -6210,7 +6210,7 @@ impl CallControl {
                         );
                         return Vec::new();
                     }
-                    // `call.py:135-136`
+                    // `call.py CallControl.guess_call_kind`
                     // `hasattr(targetgraph.func, 'oopspec')` → builtin.
                     if self
                         .func_effects_with_crate_alias(&callee_path)
