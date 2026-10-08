@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
@@ -4996,6 +4996,95 @@ fn resolve_binop(
     (a, b)
 }
 
+/// `assembler.py` `guard_success_cc` analog: a CompOp that
+/// `next_op_can_accept_cc` handed to the following guard keeps its
+/// Cranelift `IntCC` and operands here instead of materialising a bool.
+/// One previous-op slot, matching the single `guard_success_cc`.
+struct GuardSuccessCc {
+    cc: IntCC,
+    lhs: CValue,
+    rhs: CValue,
+}
+
+/// `rx86.invert_condition` — complement a comparison CC so the fail
+/// stub is the taken `brif` target (`assembler.py` `implement_guard`).
+fn invert_condition(cc: IntCC) -> IntCC {
+    cc.complement()
+}
+
+/// `llsupport/regalloc.py` `next_op_can_accept_cc`: the comparison at
+/// `i` may leave its condition in `guard_success_cc` instead of
+/// materialising a boolean, when `operations[i + 1]` is a
+/// `GUARD_TRUE` / `GUARD_FALSE` / `COND_CALL` whose only use of the
+/// result is that predicate (`longevity[op].last_usage > i + 1` is
+/// scanned from the remaining trace ops).
+fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
+    if i + 1 >= ops.len() {
+        return false;
+    }
+    if result.is_none() || result.is_constant() {
+        return false;
+    }
+    let next_op = &ops[i + 1];
+    let opnum = next_op.opcode;
+    if !matches!(
+        opnum,
+        OpCode::GuardTrue | OpCode::GuardFalse | OpCode::CondCallN
+    ) {
+        return false;
+    }
+    // history.py `Const.is_constant()` — Const operands are not
+    // op-result identities; comparison via raw position is invalid.
+    if next_op.num_args() == 0
+        || next_op.arg(0).is_constant()
+        || next_op.arg(0).to_opref().raw() != result.raw()
+    {
+        return false;
+    }
+    if result_last_usage(ops, result) > i + 1 {
+        return false;
+    }
+    if opnum != OpCode::CondCallN {
+        if next_op
+            .guard_fail_args()
+            .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+        {
+            return false;
+        }
+    } else if next_op
+        .args_slice()
+        .iter()
+        .skip(1)
+        .any(|a| a.to_opref() == result)
+    {
+        return false;
+    }
+    true
+}
+
+/// `regalloc.py` `Lifetime.last_usage` for `result`: last op index that
+/// reads it as an arg or fail arg. `0` when nothing reads it, matching
+/// a missing longevity entry for the `last_usage > i + 1` test.
+fn result_last_usage(ops: &[Op], result: OpRef) -> usize {
+    let mut last = 0;
+    for (idx, op) in ops.iter().enumerate() {
+        if op
+            .args_slice()
+            .iter()
+            .any(|a| !a.is_constant() && !a.is_none() && a.to_opref() == result)
+            || op
+                .guard_fail_args()
+                .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+        {
+            last = idx;
+        }
+    }
+    last
+}
+
+/// `x86/regalloc.py` `_consider_compop` + `force_allocate_reg_or_cc` /
+/// `assembler.py` `flush_cc`: emit the icmp, or keep the CC in
+/// `guard_success_cc` when the next op accepts it.
 fn emit_icmp(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
@@ -5003,11 +5092,59 @@ fn emit_icmp(
     cc: IntCC,
     op: &Op,
     vi: u32,
+    ops: &[Op],
+    op_idx: usize,
+    guard_success_cc: &mut Option<GuardSuccessCc>,
 ) {
     let (a, b) = resolve_binop(builder, opref_vars, constants, op);
+    // `assembler.py` `flush_cc`: a condition still pending here was
+    // published by an earlier op and never consumed.
+    debug_assert!(
+        guard_success_cc.is_none(),
+        "flush_cc: guard_success_cc already set"
+    );
+    if next_op_can_accept_cc(ops, op_idx, op.pos().get()) {
+        *guard_success_cc = Some(GuardSuccessCc { cc, lhs: a, rhs: b });
+        return;
+    }
     let cmp = builder.ins().icmp(cc, a, b);
     let r = builder.ins().uextend(cl_types::I64, cmp);
     builder.def_var(var(opref_vars, vi), r);
+}
+
+/// `assembler.py` `implement_guard`: jump to the fail stub on
+/// `invert_condition(guard_success_cc)`; the recorded body is fallthrough.
+fn implement_guard(
+    builder: &mut FunctionBuilder,
+    pending: GuardSuccessCc,
+    exit_block: Block,
+    cont_block: Block,
+) {
+    let fail = builder
+        .ins()
+        .icmp(invert_condition(pending.cc), pending.lhs, pending.rhs);
+    builder.ins().brif(fail, exit_block, &[], cont_block, &[]);
+}
+
+/// Fail-first `brif` when no CompOp published `guard_success_cc`.
+/// `load_condition_into_cc` TESTs a materialised boolean (`icmp eq 0`
+/// for fail-on-zero); a fail-on-nonzero guard `brif`s the value itself.
+/// The fail stub is `then` so the recorded body is the fallthrough
+/// (`implement_guard` / `jmp_cond_result`).
+fn brif_fail_first(
+    builder: &mut FunctionBuilder,
+    cond: CValue,
+    fail_on_zero: bool,
+    exit_block: Block,
+    cont_block: Block,
+) {
+    if fail_on_zero {
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        let fail = builder.ins().icmp(IntCC::Equal, cond, zero);
+        builder.ins().brif(fail, exit_block, &[], cont_block, &[]);
+    } else {
+        builder.ins().brif(cond, exit_block, &[], cont_block, &[]);
+    }
 }
 
 fn emit_fcmp(
@@ -12820,6 +12957,7 @@ impl CraneliftBackend {
 
         let mut guard_idx: usize = 0;
         let mut last_ovf_flag: Option<CValue> = None;
+        let mut guard_success_cc: Option<GuardSuccessCc> = None;
         let _nursery_inline_count: usize = 0; // reserved for future bridge inline support
 
         // RPython x86 backend parity: preamble runs ONCE per trace entry;
@@ -13380,6 +13518,7 @@ impl CraneliftBackend {
                 // Values defined in the guard's block do not dominate the
                 // bridge block. Re-read the pinned jitframe here.
                 last_ovf_flag = None;
+                guard_success_cc = None;
                 jf_ptr = builder.ins().get_pinned_reg(ptr_type);
                 builder.ins().set_pinned_reg(jf_ptr);
             }
@@ -13636,6 +13775,9 @@ impl CraneliftBackend {
                     IntCC::SignedLessThan,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::IntLe => emit_icmp(
                     &mut builder,
@@ -13644,6 +13786,9 @@ impl CraneliftBackend {
                     IntCC::SignedLessThanOrEqual,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::IntEq => emit_icmp(
                     &mut builder,
@@ -13652,6 +13797,9 @@ impl CraneliftBackend {
                     IntCC::Equal,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::IntNe => emit_icmp(
                     &mut builder,
@@ -13660,6 +13808,9 @@ impl CraneliftBackend {
                     IntCC::NotEqual,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::IntGt => emit_icmp(
                     &mut builder,
@@ -13668,6 +13819,9 @@ impl CraneliftBackend {
                     IntCC::SignedGreaterThan,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::IntGe => emit_icmp(
                     &mut builder,
@@ -13676,6 +13830,9 @@ impl CraneliftBackend {
                     IntCC::SignedGreaterThanOrEqual,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::UintLt => emit_icmp(
                     &mut builder,
@@ -13684,6 +13841,9 @@ impl CraneliftBackend {
                     IntCC::UnsignedLessThan,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::UintLe => emit_icmp(
                     &mut builder,
@@ -13692,6 +13852,9 @@ impl CraneliftBackend {
                     IntCC::UnsignedLessThanOrEqual,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::UintGt => emit_icmp(
                     &mut builder,
@@ -13700,6 +13863,9 @@ impl CraneliftBackend {
                     IntCC::UnsignedGreaterThan,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::UintGe => emit_icmp(
                     &mut builder,
@@ -13708,6 +13874,9 @@ impl CraneliftBackend {
                     IntCC::UnsignedGreaterThanOrEqual,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
 
                 // ── Pointer comparisons ──
@@ -13718,6 +13887,9 @@ impl CraneliftBackend {
                     IntCC::Equal,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
                 OpCode::PtrNe | OpCode::InstancePtrNe => emit_icmp(
                     &mut builder,
@@ -13726,6 +13898,9 @@ impl CraneliftBackend {
                     IntCC::NotEqual,
                     op,
                     vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
                 ),
 
                 // ── Float comparisons ──
@@ -13831,12 +14006,6 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let cond = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -13849,19 +14018,30 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
-
-                    let exit_on_zero =
-                        matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardNonnull);
-                    if exit_on_zero {
-                        builder
-                            .ins()
-                            .brif(is_zero, exit_block, &[], cont_block, &[]);
+                    // `load_condition_into_cc` + `implement_guard`: jcc to the
+                    // fail stub, fallthrough the recorded body. A CompOp that
+                    // `next_op_can_accept_cc` published into `guard_success_cc`
+                    // is inverted here (`rx86.invert_condition`) rather than
+                    // materialising the bool.
+                    if matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardFalse)
+                        && let Some(mut pending) = guard_success_cc.take()
+                    {
+                        // `genop_guard_guard_false` inverts first;
+                        // `genop_guard_guard_true` is just `implement_guard`.
+                        if matches!(op.opcode, OpCode::GuardFalse) {
+                            pending.cc = invert_condition(pending.cc);
+                        }
+                        implement_guard(&mut builder, pending, exit_block, cont_block);
                     } else {
-                        builder
-                            .ins()
-                            .brif(is_zero, cont_block, &[], exit_block, &[]);
+                        let cond = resolve_opref(
+                            &mut builder,
+                            &opref_var_map,
+                            &constants,
+                            op.arg(0).to_opref(),
+                        );
+                        let fail_on_zero =
+                            matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardNonnull);
+                        brif_fail_first(&mut builder, cond, fail_on_zero, exit_block, cont_block);
                     }
 
                     builder.switch_to_block(exit_block);
@@ -14521,8 +14701,6 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -14534,9 +14712,7 @@ impl CraneliftBackend {
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
-                    builder
-                        .ins()
-                        .brif(is_false, exit_block, &[], cont_block, &[]);
+                    brif_fail_first(&mut builder, cond, true, exit_block, cont_block);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -15929,23 +16105,28 @@ impl CraneliftBackend {
                 // args[0] = condition, args[1] = func_ptr, args[2..] = call args
                 // If condition != 0, perform the call.
                 OpCode::CondCallN => {
-                    let cond = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
                     let call_block = builder.create_block();
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
-                    builder
-                        .ins()
-                        .brif(is_zero, cont_block, &[], call_block, &[]);
+                    // `assembler.py` `cond_call`: jump to the slow path on
+                    // `guard_success_cc` (not inverted). A CompOp that
+                    // `next_op_can_accept_cc` published is consumed here;
+                    // otherwise TEST the materialised boolean.
+                    if let Some(pending) = guard_success_cc.take() {
+                        let take = builder.ins().icmp(pending.cc, pending.lhs, pending.rhs);
+                        builder.ins().brif(take, call_block, &[], cont_block, &[]);
+                    } else {
+                        let cond = resolve_opref(
+                            &mut builder,
+                            &opref_var_map,
+                            &constants,
+                            op.arg(0).to_opref(),
+                        );
+                        builder.ins().brif(cond, call_block, &[], cont_block, &[]);
+                    }
 
                     builder.switch_to_block(call_block);
                     builder.seal_block(call_block);
@@ -16010,6 +16191,9 @@ impl CraneliftBackend {
                     }
                     builder.append_block_param(cont_block, cl_types::I64);
 
+                    // Zero → call (fill the cache); nonzero → fallthrough with
+                    // the already-computed value (`genop_cond_call_value_i`).
+                    // COND_CALL_VALUE does not accept a cc (`next_op_can_accept_cc`).
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
                     builder.ins().brif(
@@ -18123,8 +18307,6 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -18136,9 +18318,7 @@ impl CraneliftBackend {
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
-                    builder
-                        .ins()
-                        .brif(is_false, exit_block, &[], cont_block, &[]);
+                    brif_fail_first(&mut builder, cond, true, exit_block, cont_block);
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
@@ -18171,8 +18351,6 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -18184,9 +18362,7 @@ impl CraneliftBackend {
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
-                    builder
-                        .ins()
-                        .brif(is_true, exit_block, &[], cont_block, &[]);
+                    builder.ins().brif(cond, exit_block, &[], cont_block, &[]);
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
@@ -23724,6 +23900,68 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 999_999);
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            guard_true_brif_fail_first_without_materialized_bool(&clif),
+            "GuardTrue must brif the complemented icmp to the fail stub first, without materialising the bool:\n{clif}"
+        );
+    }
+
+    /// IntLt + GuardTrue does not materialise the boolean (`uextend` of
+    /// `icmp slt`). `implement_guard` `brif`s the complemented `icmp sge`
+    /// to the fail stub (taken / first successor, a cold block).
+    fn guard_true_brif_fail_first_without_materialized_bool(clif: &str) -> bool {
+        fn block_name(header: &str) -> Option<&str> {
+            header
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .find(|tok| {
+                    tok.starts_with("block")
+                        && tok.bytes().nth(5).is_some_and(|b| b.is_ascii_digit())
+                })
+        }
+        let cold_blocks: indexmap::IndexSet<&str> = clif
+            .lines()
+            .map(str::trim)
+            .filter(|t| t.starts_with("block") && t.ends_with(':') && t.contains("cold"))
+            .filter_map(block_name)
+            .collect();
+        let mut slt: Option<&str> = None;
+        let mut slt_uextend = false;
+        let mut sge_names = indexmap::IndexSet::new();
+        let mut fail_first = false;
+        for line in clif.lines() {
+            let t = line.trim();
+            if slt.is_none() {
+                if let Some((lhs, rhs)) = t.split_once(" = icmp")
+                    && lhs.starts_with('v')
+                    && rhs.contains("slt")
+                {
+                    slt = Some(lhs);
+                }
+            } else if let Some((_lhs, rhs)) = t.split_once(" = uextend.i64 ")
+                && rhs.trim() == slt.unwrap()
+            {
+                slt_uextend = true;
+            }
+            if let Some((lhs, rhs)) = t.split_once(" = icmp")
+                && lhs.starts_with('v')
+                && rhs.contains("sge")
+            {
+                sge_names.insert(lhs);
+            }
+            if t.starts_with("brif ") {
+                let uses_sge = t
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|tok| sge_names.iter().any(|n| *n == tok));
+                if uses_sge {
+                    let fail_block = t.split_whitespace().nth(2).and_then(block_name);
+                    if fail_block.is_some_and(|b| cold_blocks.contains(b)) {
+                        fail_first = true;
+                    }
+                }
+            }
+        }
+        fail_first && !slt_uextend
     }
 
     /// `compile.py` `PropagateExceptionDescr.handle_fail` through the exit
