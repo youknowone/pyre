@@ -268,14 +268,15 @@ fn off_gc_layout(total: usize) -> Option<std::alloc::Layout> {
 /// block: usually it reads unrelated bytes and, when they happen to carry
 /// TRACK_YOUNG_PTRS, enters the barrier helper for nothing; when the block
 /// lands at the start of a mapped region it faults outright. Reserving the
-/// header word makes the read in-bounds, and the zeroed flags give it the
-/// same answer a freshly nursery-allocated frame gives — no barrier.
+/// header word makes the read in-bounds, and [`majit_gc::header::OFF_GC_HOST_MARKER`]
+/// keeps `GCFLAG_TRACK_YOUNG_PTRS` clear so the load gives the same answer
+/// a freshly nursery-allocated frame gives — no barrier.
 ///
 /// The block comes off the thread's free list when
 /// [`crate::deadframe::jitframe_pool_enabled`] says so, and from the
-/// allocator otherwise. A recycled block clears the header word and the
-/// fixed fields only; a fresh block also clears the spill area so those
-/// bytes are not uninit.
+/// allocator otherwise. A recycled block restamps the host-header marker
+/// and clears the fixed fields only; a fresh block also clears the spill
+/// area so those bytes are not uninit.
 ///
 /// Returns null when the allocation fails.
 pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
@@ -286,8 +287,9 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
         return std::ptr::null_mut();
     };
     if let Some(base) = crate::deadframe::take_pooled_block(total) {
-        // A parked block keeps its size slot. Zero the header word and the
-        // fixed JITFRAME fields (`jf_gcmap` must be null before any walk).
+        // A parked block keeps its size slot. Stamp the host-header marker
+        // and clear the fixed JITFRAME fields (`jf_gcmap` must be null
+        // before any walk).
         // `malloc_host_jitframe` is also `malloc_jitframe` /
         // `dynasm_nursery_slowpath_jitframe`, which does not call
         // `JitFrame::init`. Spill slots are written by the entry before
@@ -325,12 +327,22 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
 fn zero_off_gc_frame_prefix(base: *mut u8) {
     let n = OFF_GC_HEADER + std::mem::size_of::<JitFrame>();
     unsafe { std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, n) };
+    stamp_off_gc_host_header(base);
 }
 
-/// GC header word ahead of the frame pointer. Does not touch the size
-/// slot at `base`, the `JITFRAME` fields, or the spill array.
+/// Mimic GC header word ahead of the frame pointer. Writes
+/// [`majit_gc::header::OFF_GC_HOST_MARKER`] so [`jitframe_is_off_gc_host`]
+/// can tell this block from a nursery JITFRAME whose type id is 0
+/// (`GcHeader::new(0)`). Does not touch the size slot at `base`, the
+/// `JITFRAME` fields, or the spill array.
 fn zero_off_gc_header(base: *mut u8) {
-    unsafe { std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, OFF_GC_HEADER) };
+    stamp_off_gc_host_header(base);
+}
+
+fn stamp_off_gc_host_header(base: *mut u8) {
+    unsafe {
+        *(base.add(OFF_GC_SIZE_SLOT) as *mut u64) = majit_gc::header::OFF_GC_HOST_MARKER;
+    }
 }
 
 /// Payload bytes of an [`alloc_off_gc_jitframe`] block (the `size_bytes`
@@ -347,8 +359,8 @@ pub unsafe fn off_gc_payload_size(frame: *mut JitFrame) -> usize {
 }
 
 /// Prepare a frame [`alloc_off_gc_jitframe`] already returned for another
-/// `execute_token`. Clears the GC header word; [`JitFrame::init`] writes
-/// the fixed `JITFRAME` fields.
+/// `execute_token`. Restamps the host-header marker; [`JitFrame::init`]
+/// writes the fixed `JITFRAME` fields.
 ///
 /// `llmodel.py` `execute_token` allocates a fresh frame (`malloc_jitframe`)
 /// for every entry. Reusing one here leaves the previous entry's spill
@@ -367,9 +379,12 @@ pub unsafe fn reuse_off_gc_jitframe(frame: *mut JitFrame) {
 
 /// Whether `frame` is an [`alloc_off_gc_jitframe`] host block.
 ///
-/// The mimic header at `frame - GcHeader::SIZE` is zeroed for a host
-/// block (`zero_off_gc_header`). A GC JITFRAME stores `GcHeader::new(type_id)`
-/// there.
+/// The mimic header at `frame - GcHeader::SIZE` is
+/// [`majit_gc::header::OFF_GC_HOST_MARKER`] for a host block
+/// (`zero_off_gc_header`). A GC JITFRAME stores `GcHeader::new(type_id)`
+/// there; type id 0 with flags clear is also word 0 (`TypeRegistry::register`
+/// starts at 0, nursery `init_gc_object` flags=0), so a zero word is not
+/// an ownership test.
 ///
 /// # Safety
 /// `frame` is a jitframe payload: an off-GC block with the reserved
@@ -379,7 +394,10 @@ pub(crate) unsafe fn jitframe_is_off_gc_host(frame: *mut JitFrame) -> bool {
     if frame.is_null() {
         return false;
     }
-    unsafe { (*majit_gc::header::header_of(frame as usize)).tid_and_flags == 0 }
+    unsafe {
+        (*majit_gc::header::header_of(frame as usize)).tid_and_flags
+            == majit_gc::header::OFF_GC_HOST_MARKER
+    }
 }
 
 /// Release a frame from [`alloc_off_gc_jitframe`].
@@ -1133,6 +1151,30 @@ mod tests {
             "a fresh off-GC frame must not look like it tracks young pointers"
         );
         unsafe { free_off_gc_jitframe(frame) };
+    }
+
+    /// `TypeRegistry::register` hands out id 0 first, and a nursery
+    /// JITFRAME is `GcHeader::new(type_id)` with flags clear, so the host
+    /// marker must not be that zero word.
+    #[test]
+    fn jitframe_is_off_gc_host_rejects_type_id_zero_gc_frame() {
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        assert_eq!(tid, 0, "this case is the first registered type");
+        gc.set_jitframe_type_id(tid);
+        let bytes = JitFrame::alloc_size(4);
+        let host = alloc_off_gc_jitframe(bytes);
+        let gc_frame = malloc_jitframe(&mut gc, bytes);
+        assert!(!host.is_null() && !gc_frame.is_null());
+        unsafe {
+            assert_eq!(
+                (*majit_gc::header::header_of(gc_frame as usize)).tid_and_flags,
+                0
+            );
+            assert!(jitframe_is_off_gc_host(host));
+            assert!(!jitframe_is_off_gc_host(gc_frame));
+            free_off_gc_jitframe(host);
+        }
     }
 
     /// `jitframe_allocate` is `lltype.malloc(JITFRAME)`; a true flag that

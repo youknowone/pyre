@@ -542,7 +542,9 @@ pub fn park_or_free_done_entry_frame(
 /// off-GC host block. `malloc_jitframe_no_collect` may mint a GC
 /// replacement onto a host head; that link is left for the collector.
 ///
-/// Host vs GC is the header word at `obj - GcHeader::SIZE`.
+/// Host vs GC is [`crate::jitframe::jitframe_is_off_gc_host`]: the mimic
+/// header word equals [`majit_gc::header::OFF_GC_HOST_MARKER`], not a
+/// zero word (`GcHeader::new(0)` is also zero).
 unsafe fn free_off_gc_host_done_entry_chain(head: *mut JitFrame) {
     let mut cur = head;
     while !cur.is_null() {
@@ -687,6 +689,63 @@ mod tests {
             assert_eq!(get_int_value(frame, fd, 0), 7);
             assert_eq!(get_int_value(frame, fd, 1), 9);
             free_off_gc_jitframe(frame);
+        }
+    }
+
+    /// A host entry forwarded (`jf_forward`) to a type-id-0 GC JITFRAME
+    /// must free only the host link. `GcHeader::new(0)` is word 0, which
+    /// used to look like an off-GC mimic header.
+    #[test]
+    fn free_off_gc_host_done_entry_chain_leaves_type0_gc_replacement() {
+        use crate::jitframe::{
+            JitFrameInfo, jitframe_is_off_gc_host, jitframe_type_info, malloc_host_jitframe,
+            malloc_jitframe,
+        };
+        use majit_gc::GcAllocator;
+
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        assert_eq!(tid, 0, "this case is the first registered type");
+        gc.set_jitframe_type_id(tid);
+
+        let depth = 4;
+        let bytes = JitFrame::alloc_size(depth);
+        let host = malloc_host_jitframe(bytes);
+        let gc_frame = malloc_jitframe(&mut gc, bytes);
+        assert!(!host.is_null() && !gc_frame.is_null());
+        let info = JitFrameInfo::default();
+        unsafe {
+            JitFrame::init(host, &info, depth);
+            JitFrame::init(gc_frame, &info, depth);
+            *JitFrame::slot_ptr(gc_frame, 0) = 0x11C0_FFEE;
+            (*host).jf_forward = gc_frame;
+            assert!(jitframe_is_off_gc_host(host));
+            assert!(
+                !jitframe_is_off_gc_host(gc_frame),
+                "a type-id-0 nursery JITFRAME must not be classified as a host block"
+            );
+            majit_gc::shadow_stack::register_libc_jitframe(host as usize);
+            super::free_off_gc_host_done_entry_chain(host);
+            #[cfg(not(debug_assertions))]
+            assert!(
+                !majit_gc::shadow_stack::is_libc_jitframe(host as usize),
+                "host frame must have been released by free_host_jitframe"
+            );
+            // Debug `free_host_jitframe` unregisters only when a collector is
+            // installed; drop the test registration so a freed address is
+            // not left in the set.
+            majit_gc::shadow_stack::unregister_libc_jitframe(host as usize);
+            assert!(
+                gc.is_in_nursery(gc_frame as usize),
+                "GC replacement must stay for the collector"
+            );
+            assert_eq!(
+                (*majit_gc::header::header_of(gc_frame as usize)).type_id(),
+                0
+            );
+            assert_eq!(*JitFrame::slot_ptr(gc_frame, 0), 0x11C0_FFEE);
+            assert!((*gc_frame).jf_forward.is_null());
+            assert!(!jitframe_is_off_gc_host(gc_frame));
         }
     }
 
