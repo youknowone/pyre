@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
-    StackSlotKind,
+    AbiParam, Block, BlockArg, Function, InstBuilder, InstructionData, MemFlagsData,
+    Opcode as ClOpcode, Signature, StackSlotData, StackSlotKind, ValueDef,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -4847,6 +4847,57 @@ fn emit_icmp(
     let cmp = builder.ins().icmp(cc, a, b);
     let r = builder.ins().uextend(cl_types::I64, cmp);
     builder.def_var(var(opref_vars, vi), r);
+}
+
+/// Operands of an `icmp`, walking through `uextend`. Used to invert a CompOp
+/// so `brif` can jcc to the fail stub (`implement_guard` / `jmp_cond_result`).
+fn icmp_operands(builder: &FunctionBuilder, mut v: CValue) -> Option<(IntCC, CValue, CValue)> {
+    let dfg = &builder.func.dfg;
+    for _ in 0..4 {
+        let ValueDef::Result(inst, 0) = dfg.value_def(v) else {
+            return None;
+        };
+        match dfg.insts[inst] {
+            InstructionData::Unary {
+                opcode: ClOpcode::Uextend,
+                arg,
+            } => v = arg,
+            InstructionData::IntCompare { cond, args, .. } => {
+                return Some((cond, args[0], args[1]));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Predicate that is nonzero iff `cond` is zero. A preceding `icmp` is
+/// re-emitted with the complemented CC so x86 `is_nonzero_cmp` still fuses
+/// to `CMP`+`Jcc`; a generic integer falls back to `icmp eq 0`.
+fn inverted_predicate(builder: &mut FunctionBuilder, cond: CValue) -> CValue {
+    if let Some((cc, lhs, rhs)) = icmp_operands(builder, cond) {
+        builder.ins().icmp(cc.complement(), lhs, rhs)
+    } else {
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        builder.ins().icmp(IntCC::Equal, cond, zero)
+    }
+}
+
+/// `implement_guard`: x64 `jmp_cond_result` jccs to `then` and fallthroughs
+/// `else`. The fail stub is `then` so the recorded body is the fallthrough.
+fn brif_fail_first(
+    builder: &mut FunctionBuilder,
+    cond: CValue,
+    fail_on_zero: bool,
+    exit_block: Block,
+    cont_block: Block,
+) {
+    if fail_on_zero {
+        let fail = inverted_predicate(builder, cond);
+        builder.ins().brif(fail, exit_block, &[], cont_block, &[]);
+    } else {
+        builder.ins().brif(cond, exit_block, &[], cont_block, &[]);
+    }
 }
 
 fn emit_fcmp(
@@ -13776,20 +13827,14 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
-
-                    let exit_on_zero =
+                    // `load_condition_into_cc` + `implement_guard`: jcc to the
+                    // fail stub, fallthrough the recorded body. GuardTrue
+                    // fails on zero, so invert a preceding icmp (`complement`)
+                    // rather than `icmp eq 0` of its uextend — that form is
+                    // `SETcc`+`MOVZX`+`TEST` when the midend does not fold it.
+                    let fail_on_zero =
                         matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardNonnull);
-                    if exit_on_zero {
-                        builder
-                            .ins()
-                            .brif(is_zero, exit_block, &[], cont_block, &[]);
-                    } else {
-                        builder
-                            .ins()
-                            .brif(is_zero, cont_block, &[], exit_block, &[]);
-                    }
+                    brif_fail_first(&mut builder, cond, fail_on_zero, exit_block, cont_block);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -14448,8 +14493,6 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -14461,9 +14504,7 @@ impl CraneliftBackend {
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
-                    builder
-                        .ins()
-                        .brif(is_false, exit_block, &[], cont_block, &[]);
+                    brif_fail_first(&mut builder, cond, true, exit_block, cont_block);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
@@ -15868,11 +15909,10 @@ impl CraneliftBackend {
                         builder.set_cold_block(cont_block);
                     }
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
-                    builder
-                        .ins()
-                        .brif(is_zero, cont_block, &[], call_block, &[]);
+                    // `genop_discard_cond_call`: branch on the predicate, so a
+                    // preceding CompOp's `uextend(icmp)` fuses to `Jcc` rather
+                    // than `SETcc`+`TEST`.
+                    builder.ins().brif(cond, call_block, &[], cont_block, &[]);
 
                     builder.switch_to_block(call_block);
                     builder.seal_block(call_block);
@@ -15937,8 +15977,9 @@ impl CraneliftBackend {
                     }
                     builder.append_block_param(cont_block, cl_types::I64);
 
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
+                    // Zero → call (fill the cache); nonzero → fallthrough with
+                    // the already-computed value (`genop_cond_call_value_i`).
+                    let is_zero = inverted_predicate(&mut builder, cond);
                     builder.ins().brif(
                         is_zero,
                         call_block,
@@ -18032,8 +18073,6 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_false = builder.ins().icmp(IntCC::Equal, cond, zero);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -18045,9 +18084,7 @@ impl CraneliftBackend {
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
-                    builder
-                        .ins()
-                        .brif(is_false, exit_block, &[], cont_block, &[]);
+                    brif_fail_first(&mut builder, cond, true, exit_block, cont_block);
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
@@ -18080,8 +18117,6 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond, zero);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -18093,9 +18128,7 @@ impl CraneliftBackend {
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
-                    builder
-                        .ins()
-                        .brif(is_true, exit_block, &[], cont_block, &[]);
+                    builder.ins().brif(cond, exit_block, &[], cont_block, &[]);
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
@@ -23436,6 +23469,64 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 999_999);
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            guard_true_brifs_inverted_icmp(&clif),
+            "GuardTrue must brif the complemented icmp (fail-first), not icmp-eq-0 of the uextend:\n{clif}"
+        );
+    }
+
+    /// IntLt + GuardTrue inverts the `icmp` (`slt` → `sge`) and `brif`s that
+    /// result to the fail stub, then the continuation (`implement_guard`).
+    fn guard_true_brifs_inverted_icmp(clif: &str) -> bool {
+        let mut slt: Option<&str> = None;
+        let mut uext: Option<&str> = None;
+        let mut sge: Option<&str> = None;
+        for line in clif.lines() {
+            let t = line.trim();
+            if slt.is_none() {
+                if let Some((lhs, rhs)) = t.split_once(" = icmp")
+                    && lhs.starts_with('v')
+                    && rhs.contains("slt")
+                {
+                    slt = Some(lhs);
+                }
+                continue;
+            }
+            let slt_name = slt.unwrap();
+            if uext.is_none() {
+                if let Some((lhs, rhs)) = t.split_once(" = uextend.i64 ")
+                    && lhs.starts_with('v')
+                    && rhs.trim() == slt_name
+                {
+                    uext = Some(lhs);
+                }
+            }
+            if sge.is_none() {
+                if let Some((lhs, rhs)) = t.split_once(" = icmp")
+                    && lhs.starts_with('v')
+                    && rhs.contains("sge")
+                {
+                    sge = Some(lhs);
+                }
+                continue;
+            }
+            let sge_name = sge.unwrap();
+            if let Some(uext_name) = uext
+                && t.contains("icmp eq")
+                && t.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|tok| tok == uext_name)
+            {
+                return false;
+            }
+            if t.starts_with("brif ")
+                && t.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|tok| tok == sge_name)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// `compile.py` `PropagateExceptionDescr.handle_fail` through the exit
