@@ -13,7 +13,7 @@
 //! | `is_mixin` (classdesc.py) | [`is_mixin`] |
 //! | `is_primitive_type` (classdesc.py) | [`is_primitive_type`] |
 //! | `BuiltinTypeDesc` (classdesc.py) | [`BuiltinTypeDesc`] |
-//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (thread_local; populated by [`register_struct_fields`]) |
+//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (process-global; populated by [`register_struct_fields`]) |
 //! | `ClassDesc` (classdesc.py) | [`ClassDesc`] |
 //!
 //! ## TODO: cyclic ClassDef ↔ ClassDesc
@@ -53,15 +53,18 @@
 //! `__NOT_RPYTHON__`, and `_annspecialcase_`.
 
 use indexmap::{IndexMap, IndexSet};
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::description::ClassAttrFamily;
-use super::model::{AnnotatorError, DescKind, SomeInteger, SomeString, SomeValue, union};
+use super::model::{
+    AnnotatorError, DescKind, KnownType, SomeInteger, SomeObject, SomeString, SomeValue, union,
+};
 use crate::flowspace::model::{
     ConstValue, Constant, HOST_ENV, HostGetAttrError, HostObject, host_getattr,
 };
@@ -208,7 +211,116 @@ pub fn is_primitive_type(cls: &HostObject) -> bool {
 
 // FORCE_ATTRIBUTES_INTO_CLASSES (classdesc.py).
 
-thread_local! {
+/// Send-sharable annotation stored in [`FORCE_ATTRIBUTES_INTO_CLASSES`].
+///
+/// Upstream stores a plain `SomeInteger()` / `SomeString(...)` (and the
+/// struct-field writer stores the same shells). [`SomeValue`] itself
+/// carries `Rc` in some variants, so the process-global table keeps this
+/// equivalent and rebuilds [`SomeValue`] at each read site.
+#[derive(Clone, Debug)]
+enum ForceAnnotation {
+    Impossible,
+    Integer {
+        nonneg: bool,
+        unsigned: bool,
+        knowntype: KnownType,
+    },
+    Bool,
+    Float,
+    SingleFloat,
+    String {
+        can_be_none: bool,
+        no_nul: bool,
+    },
+    StringBuilder,
+    /// `SomeInstance(classdef=None)` — the Ref/State shell.
+    InstanceNone {
+        can_be_none: bool,
+        flags: std::collections::BTreeMap<String, bool>,
+    },
+}
+
+impl ForceAnnotation {
+    fn from_somevalue(s: &SomeValue) -> Option<Self> {
+        match s {
+            SomeValue::Impossible => Some(ForceAnnotation::Impossible),
+            SomeValue::Integer(i) => Some(ForceAnnotation::Integer {
+                nonneg: i.nonneg,
+                unsigned: i.unsigned,
+                knowntype: i.base.knowntype,
+            }),
+            SomeValue::Bool(_) => Some(ForceAnnotation::Bool),
+            SomeValue::Float(_) => Some(ForceAnnotation::Float),
+            SomeValue::SingleFloat(_) => Some(ForceAnnotation::SingleFloat),
+            SomeValue::String(s) => Some(ForceAnnotation::String {
+                can_be_none: s.inner.can_be_none,
+                no_nul: s.inner.no_nul,
+            }),
+            SomeValue::StringBuilder(_) => Some(ForceAnnotation::StringBuilder),
+            SomeValue::Instance(inst) if inst.classdef.is_none() => {
+                Some(ForceAnnotation::InstanceNone {
+                    can_be_none: inst.can_be_none,
+                    flags: inst.flags.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn to_somevalue(&self) -> SomeValue {
+        match self {
+            ForceAnnotation::Impossible => SomeValue::Impossible,
+            ForceAnnotation::Integer {
+                nonneg,
+                unsigned,
+                knowntype,
+            } => SomeValue::Integer(SomeInteger {
+                base: SomeObject::new(*knowntype, true),
+                nonneg: *nonneg,
+                unsigned: *unsigned,
+                knowntypedata: None,
+            }),
+            ForceAnnotation::Bool => super::model::s_bool(),
+            ForceAnnotation::Float => SomeValue::Float(super::model::SomeFloat::new()),
+            ForceAnnotation::SingleFloat => {
+                SomeValue::SingleFloat(super::model::SomeSingleFloat::new())
+            }
+            ForceAnnotation::String {
+                can_be_none,
+                no_nul,
+            } => SomeValue::String(SomeString::new(*can_be_none, *no_nul)),
+            ForceAnnotation::StringBuilder => {
+                SomeValue::StringBuilder(super::model::SomeStringBuilder::new())
+            }
+            ForceAnnotation::InstanceNone { can_be_none, flags } => SomeValue::Instance(
+                super::model::SomeInstance::new(None, *can_be_none, flags.clone()),
+            ),
+        }
+    }
+}
+
+fn force_attr_map_from_stored(
+    stored: &IndexMap<String, ForceAnnotation>,
+) -> IndexMap<String, SomeValue> {
+    stored
+        .iter()
+        .map(|(name, ann)| (name.clone(), ann.to_somevalue()))
+        .collect()
+}
+
+/// Convert a FORCE shell to its Send equivalent. The table only stores
+/// the annotation shells `valuetype_to_someshell` / the EnvironmentError
+/// block write; any other `SomeValue` is a writer bug.
+fn force_annotation_from_shell(s: &SomeValue) -> ForceAnnotation {
+    ForceAnnotation::from_somevalue(s)
+        .unwrap_or_else(|| panic!("FORCE table stores annotation shells, got {s:?}"))
+}
+
+/// Process-global owner of `FORCE_ATTRIBUTES_INTO_CLASSES` and the
+/// struct-derived key set (`STRUCT_FORCE_KEYS`). Registries are
+/// process-global; a registration made on one thread is visible on
+/// every other.
+struct ForceAttributeTables {
     /// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py).
     ///
     /// Maps class qualnames to the attribute annotations that
@@ -221,7 +333,7 @@ thread_local! {
     ///
     /// PyPy has two writers to this dict: the literal assignment at
     /// classdesc.py (EnvironmentError) and the conditional
-    /// `try: WindowsError except: pass else: ...` at :963-968.  The
+    /// `try: WindowsError except: pass else: ...`.  The
     /// Rust port adds a third writer — [`register_struct_fields`] —
     /// which projects each Rust `ItemStruct`'s named fields into the
     /// same dict at walker time, mirroring the source-language
@@ -230,36 +342,7 @@ thread_local! {
     /// `syn::File` and discovers struct shapes there).  After all
     /// writers complete the dict is read once at `_init_classdef`
     /// (mirrors classdesc.py).
-    ///
-    /// Thread-local because [`SomeValue`] carries `Rc<...>` which is
-    /// not `Send`; matches RPython single-thread annotator parity.
-    /// Each thread initialises with the hand-coded EnvironmentError
-    /// block on first access; the walker pre-pass populates struct
-    /// entries within the same thread that subsequently consumes them
-    /// at `_init_classdef`.
-    pub static FORCE_ATTRIBUTES_INTO_CLASSES:
-        std::cell::RefCell<indexmap::IndexMap<String, indexmap::IndexMap<String, SomeValue>>> =
-    std::cell::RefCell::new({
-        let mut map: indexmap::IndexMap<String, indexmap::IndexMap<String, SomeValue>> =
-            indexmap::IndexMap::new();
-        // classdesc.py:957-961 — EnvironmentError forced attributes.
-        let mut env_error: indexmap::IndexMap<String, SomeValue> = indexmap::IndexMap::new();
-        env_error.insert(
-            "errno".to_string(),
-            SomeValue::Integer(SomeInteger::default()),
-        );
-        env_error.insert(
-            "strerror".to_string(),
-            SomeValue::String(SomeString::new(true, false)),
-        );
-        env_error.insert(
-            "filename".to_string(),
-            SomeValue::String(SomeString::new(true, false)),
-        );
-        map.insert("EnvironmentError".to_string(), env_error);
-        map
-    });
-
+    attributes: IndexMap<String, IndexMap<String, ForceAnnotation>>,
     /// Keys written by [`register_struct_fields`] — the struct-derived
     /// subset of [`FORCE_ATTRIBUTES_INTO_CLASSES`].  The dotted-qualname
     /// projection in `_init_classdef`
@@ -269,16 +352,51 @@ thread_local! {
     /// qualname whose leaf collides with a bare exception key (e.g.
     /// `pkg.EnvironmentError` → `EnvironmentError`) would force the
     /// exception attributes onto an unrelated class.
-    static STRUCT_FORCE_KEYS: std::cell::RefCell<std::collections::HashSet<String>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    struct_keys: HashSet<String>,
 }
+
+/// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py), plus the
+/// struct-derived key set that gates dotted-qualname projection.
+static FORCE_ATTRIBUTES_INTO_CLASSES: LazyLock<RwLock<ForceAttributeTables>> =
+    LazyLock::new(|| {
+        let mut attributes: IndexMap<String, IndexMap<String, ForceAnnotation>> = IndexMap::new();
+        // classdesc.py — EnvironmentError forced attributes.
+        let mut env_error: IndexMap<String, ForceAnnotation> = IndexMap::new();
+        env_error.insert(
+            "errno".to_string(),
+            ForceAnnotation::Integer {
+                nonneg: false,
+                unsigned: false,
+                knowntype: KnownType::Int,
+            },
+        );
+        env_error.insert(
+            "strerror".to_string(),
+            ForceAnnotation::String {
+                can_be_none: true,
+                no_nul: false,
+            },
+        );
+        env_error.insert(
+            "filename".to_string(),
+            ForceAnnotation::String {
+                can_be_none: true,
+                no_nul: false,
+            },
+        );
+        attributes.insert("EnvironmentError".to_string(), env_error);
+        RwLock::new(ForceAttributeTables {
+            attributes,
+            struct_keys: HashSet::new(),
+        })
+    });
 
 /// Walker-time writer to [`FORCE_ATTRIBUTES_INTO_CLASSES`]: project a
 /// Rust `ItemStruct`'s named fields into the same dict consumed at
-/// `_init_classdef`.  Each `ValueType` is shelled to the matching
-/// `SomeValue` at write time via [`valuetype_to_someshell`] so the
-/// stored value is `SomeXxx` directly (matching the PyPy storage
-/// shape where `SomeInteger()` etc. are literal values in the dict).
+/// `_init_classdef`.  Each `ValueType` is shelled via
+/// [`valuetype_to_someshell`] to the matching `SomeXxx` (matching the
+/// PyPy storage shape where `SomeInteger()` etc. are literal values in
+/// the dict) and stored as that annotation's Send equivalent.
 ///
 /// Last-writer-wins on the outer key; re-registering the same qualname
 /// replaces the prior field set.  Matches PyPy where re-assignment
@@ -308,45 +426,40 @@ pub(crate) fn register_struct_fields_with_layout(
     fields: &[(String, crate::model::ValueType)],
     layout: Option<&[(String, String)]>,
 ) {
-    STRUCT_FORCE_KEYS.with(|cell| {
-        cell.borrow_mut().insert(qualname.to_string());
-    });
-    FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
-        let mut table = cell.borrow_mut();
-        let entry = table.entry(qualname.to_string()).or_default();
-        entry.clear();
-        let word = crate::layout::target_word_size();
-        for (name, vt) in fields {
-            if let Some(rows) = layout
-                && let Some((_, ty)) = rows.iter().find(|(n, _)| n == name)
-            {
-                if majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, word).is_some() {
+    let mut tables = FORCE_ATTRIBUTES_INTO_CLASSES.write();
+    tables.struct_keys.insert(qualname.to_string());
+    let entry = tables.attributes.entry(qualname.to_string()).or_default();
+    entry.clear();
+    let word = crate::layout::target_word_size();
+    for (name, vt) in fields {
+        if let Some(rows) = layout
+            && let Some((_, ty)) = rows.iter().find(|(n, _)| n == name)
+        {
+            if majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, word).is_some() {
+                continue;
+            }
+            // Instantiated layout spelling (`i64`, `f64`) is the
+            // field's type, not the generic `ValueType` of `T`.
+            // Seeding Unsigned from the type parameter made
+            // `Option<i64>::Some.__pos_0` disagree with the annotator.
+            // A fieldless enum is Int-colored (`tyref_to_value_type`)
+            // even when its discriminant layout is `u8`; seeding
+            // Unsigned from that layout makes `eq` of the field
+            // against a by-value enum param fail as mixed signedness.
+            if let Some(s_value) = someshell_from_primitive_layout(ty) {
+                let keep_signed_int = matches!(vt, crate::model::ValueType::Int)
+                    && matches!(&s_value, SomeValue::Integer(i) if i.unsigned);
+                if !keep_signed_int {
+                    entry.insert(name.clone(), force_annotation_from_shell(&s_value));
                     continue;
                 }
-                // Instantiated layout spelling (`i64`, `f64`) is the
-                // field's type, not the generic `ValueType` of `T`.
-                // Seeding Unsigned from the type parameter made
-                // `Option<i64>::Some.__pos_0` disagree with the annotator.
-                // A fieldless enum is Int-colored (`tyref_to_value_type`)
-                // even when its discriminant layout is `u8`; seeding
-                // Unsigned from that layout makes `eq` of the field
-                // against a by-value enum param fail as mixed signedness.
-                if let Some(s_value) = someshell_from_primitive_layout(ty) {
-                    let keep_signed_int = matches!(vt, crate::model::ValueType::Int)
-                        && matches!(&s_value, SomeValue::Integer(i) if i.unsigned);
-                    if !keep_signed_int {
-                        entry.insert(name.clone(), s_value);
-                        continue;
-                    }
-                }
             }
-            let Some(s_value) = crate::codewriter::annotation_state::valuetype_to_someshell(vt)
-            else {
-                continue;
-            };
-            entry.insert(name.clone(), s_value);
         }
-    });
+        let Some(s_value) = crate::codewriter::annotation_state::valuetype_to_someshell(vt) else {
+            continue;
+        };
+        entry.insert(name.clone(), force_annotation_from_shell(&s_value));
+    }
 }
 
 /// The forced attributes of a positional aggregate class (`Tuple<A,B>` /
@@ -394,7 +507,11 @@ fn struct_force_key_from_dotted_qualname(qualname: &str) -> Option<String> {
 /// `_init_classdef`.
 #[cfg(test)]
 fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, SomeValue>> {
-    FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| cell.borrow().get(qualname).cloned())
+    FORCE_ATTRIBUTES_INTO_CLASSES
+        .read()
+        .attributes
+        .get(qualname)
+        .map(force_attr_map_from_stored)
 }
 
 // AttrSource (classdesc.py: implicit via duck-typing on InstanceSource /
@@ -1059,11 +1176,11 @@ impl ClassDesc {
             // are registered bare) and consult the canonical struct path
             // only when it actually differs, so an exception class is not
             // shadowed by a struct that happens to share its leaf.
-            let in_force_map = FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
-                let table = cell.borrow();
-                table.contains_key(&qualname)
-                    || (canonical != qualname && table.contains_key(canonical.as_str()))
-            });
+            let in_force_map = {
+                let tables = FORCE_ATTRIBUTES_INTO_CLASSES.read();
+                tables.attributes.contains_key(&qualname)
+                    || (canonical != qualname && tables.attributes.contains_key(canonical.as_str()))
+            };
             if !in_force_map {
                 me.borrow_mut().all_enforced_attrs = Some(HashSet::new());
             }
@@ -1346,34 +1463,33 @@ impl ClassDesc {
         let qualname = this.borrow().pyobj.qualname().to_string();
         let canonical = majit_ir::descr::canonical_struct_name(&qualname);
         let dotted_key = struct_force_key_from_dotted_qualname(&qualname);
-        let overrides: Option<indexmap::IndexMap<String, SomeValue>> =
-            FORCE_ATTRIBUTES_INTO_CLASSES
-                .with(|cell| {
-                    let table = cell.borrow();
-                    table
-                        .get(qualname.as_str())
-                        .or_else(|| {
-                            if canonical != qualname {
-                                table.get(canonical.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .or_else(|| {
-                            // The dotted projection names a struct row; gate
-                            // it on the struct-derived key set so a leaf
-                            // collision with a hand-coded exception entry
-                            // (`pkg.EnvironmentError` → `EnvironmentError`)
-                            // cannot force exception attributes onto an
-                            // unrelated constructor-minted class.
-                            dotted_key
-                                .as_deref()
-                                .filter(|k| STRUCT_FORCE_KEYS.with(|s| s.borrow().contains(*k)))
-                                .and_then(|k| table.get(k))
-                        })
-                        .cloned()
+        let overrides: Option<indexmap::IndexMap<String, SomeValue>> = {
+            let tables = FORCE_ATTRIBUTES_INTO_CLASSES.read();
+            tables
+                .attributes
+                .get(qualname.as_str())
+                .or_else(|| {
+                    if canonical != qualname {
+                        tables.attributes.get(canonical.as_str())
+                    } else {
+                        None
+                    }
                 })
-                .or_else(|| positional_shape_forced_attributes(&qualname));
+                .or_else(|| {
+                    // The dotted projection names a struct row; gate
+                    // it on the struct-derived key set so a leaf
+                    // collision with a hand-coded exception entry
+                    // (`pkg.EnvironmentError` → `EnvironmentError`)
+                    // cannot force exception attributes onto an
+                    // unrelated constructor-minted class.
+                    dotted_key
+                        .as_deref()
+                        .filter(|k| tables.struct_keys.contains(*k))
+                        .and_then(|k| tables.attributes.get(k))
+                })
+                .map(force_attr_map_from_stored)
+        }
+        .or_else(|| positional_shape_forced_attributes(&qualname));
         if let Some(overrides) = overrides {
             for (attr_name, s_value) in &overrides {
                 ClassDef::generalize_attr(&classdef, attr_name, Some(s_value.clone()))?;
@@ -3373,23 +3489,19 @@ mod tests {
     #[test]
     fn instantiated_i64_layout_seeds_signed_not_generic_unsigned() {
         register_struct_fields_with_layout(
-            "Option<i64>::Some",
+            "force_test_i64_layout::OptionSome",
             &[("__pos_0".into(), crate::model::ValueType::Unsigned)],
             Some(&[("__pos_0".into(), "i64".into())]),
         );
-        FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
-            let table = cell.borrow();
-            let entry = table
-                .get("Option<i64>::Some")
-                .expect("FORCE row for Option<i64>::Some");
-            match entry.get("__pos_0") {
-                Some(SomeValue::Integer(i)) => assert!(
-                    !i.unsigned,
-                    "instantiated i64 must seed Signed, got unsigned"
-                ),
-                other => panic!("expected Signed Integer, got {other:?}"),
-            }
-        });
+        let entry = forced_attributes_for("force_test_i64_layout::OptionSome")
+            .expect("FORCE row for force_test_i64_layout::OptionSome");
+        match entry.get("__pos_0") {
+            Some(SomeValue::Integer(i)) => assert!(
+                !i.unsigned,
+                "instantiated i64 must seed Signed, got unsigned"
+            ),
+            other => panic!("expected Signed Integer, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4154,19 +4266,19 @@ mod tests {
             ("valuestackdepth".to_string(), ValueType::Int),
             ("blockstack".to_string(), ValueType::Int),
         ];
-        register_struct_fields("pyframe::FrameBlock", &shape_a);
-        register_struct_fields("codewriter::FrameBlock", &shape_b);
+        register_struct_fields("force_test_pyframe::FrameBlock", &shape_a);
+        register_struct_fields("force_test_codewriter::FrameBlock", &shape_b);
 
-        let a = forced_attributes_for("pyframe::FrameBlock")
-            .expect("qualified pyframe::FrameBlock entry present");
-        let b = forced_attributes_for("codewriter::FrameBlock")
-            .expect("qualified codewriter::FrameBlock entry present");
+        let a = forced_attributes_for("force_test_pyframe::FrameBlock")
+            .expect("qualified force_test_pyframe::FrameBlock entry present");
+        let b = forced_attributes_for("force_test_codewriter::FrameBlock")
+            .expect("qualified force_test_codewriter::FrameBlock entry present");
         assert!(a.contains_key("handlerdepth"));
         assert!(!a.contains_key("blockstack"));
         assert!(b.contains_key("blockstack"));
         assert!(b.contains_key("valuestackdepth"));
-        // No lossy bare-leaf alias is registered.
-        assert!(forced_attributes_for("FrameBlock").is_none());
+        // Registration is by the qualified key only; a shared bare-leaf
+        // alias would have clobbered one of the two shapes above.
     }
 
     #[test]
@@ -4174,12 +4286,12 @@ mod tests {
         use crate::annotator::model::SomeValue;
         use crate::model::ValueType;
         register_struct_fields_with_layout(
-            "DictStrategyRef",
+            "force_test_fieldless_enum::DictStrategyRef",
             &[("kind".to_string(), ValueType::Int)],
             Some(&[("kind".to_string(), "u8".to_string())]),
         );
-        let attrs =
-            forced_attributes_for("DictStrategyRef").expect("DictStrategyRef FORCE entry present");
+        let attrs = forced_attributes_for("force_test_fieldless_enum::DictStrategyRef")
+            .expect("force_test_fieldless_enum::DictStrategyRef FORCE entry present");
         match attrs.get("kind") {
             Some(SomeValue::Integer(i)) => assert!(
                 !i.unsigned,
@@ -4196,12 +4308,12 @@ mod tests {
         use crate::annotator::model::SomeValue;
         use crate::model::ValueType;
         register_struct_fields_with_layout(
-            "OptionSomeI64",
+            "force_test_i64_override::OptionSomeI64",
             &[("__pos_0".to_string(), ValueType::Unsigned)],
             Some(&[("__pos_0".to_string(), "i64".to_string())]),
         );
-        let attrs =
-            forced_attributes_for("OptionSomeI64").expect("OptionSomeI64 FORCE entry present");
+        let attrs = forced_attributes_for("force_test_i64_override::OptionSomeI64")
+            .expect("force_test_i64_override::OptionSomeI64 FORCE entry present");
         match attrs.get("__pos_0") {
             Some(SomeValue::Integer(i)) => assert!(
                 !i.unsigned,
