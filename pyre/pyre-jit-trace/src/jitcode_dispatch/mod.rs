@@ -4050,12 +4050,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    // `memmgr.max_unroll_recursion` is the shared manager. An extra driver's
-    // warmstate is built with `MemoryManager::new(0)`.
-    let max_unroll = driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .max_unroll_recursion() as usize;
+    // `warmrunnerdesc.memory_manager.max_unroll_recursion`: the one manager.
+    let max_unroll = driver.meta_interp().memory_manager.max_unroll_recursion() as usize;
     let can_inline = driver
         .meta_interp_mut()
         .warm_state_for_driver(jd_index)
@@ -4116,7 +4112,6 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                 // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), Some(green_key.clone())),
-                    ctx.trace_ctx.get_trace_position(),
                     Some(index),
                 );
                 let walked = match inline_call::run_sub_jitcode_walk(
@@ -4134,11 +4129,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
                     other => other,
                 };
-                if let Some(jd_no) = subwalk_jd {
-                    crate::state::note_inline_subwalk_end(
-                        jd_no,
-                        ctx.trace_ctx.get_trace_position(),
-                    );
+                if subwalk_jd.is_some() {
+                    crate::state::note_inline_subwalk_end();
                 }
                 let walked = walked?;
                 return Ok(Some(finish_recursive_inline(

@@ -47,6 +47,7 @@ pub struct TraceRecord {
 ///
 /// Collects statistics about trace compilation, guard failures,
 /// and loop entries. Prints a summary on drop when enabled.
+#[derive(Debug)]
 pub struct Logger {
     /// Successfully compiled traces.
     compiled: Vec<TraceRecord>,

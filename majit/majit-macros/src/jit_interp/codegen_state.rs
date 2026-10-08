@@ -1702,7 +1702,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     &__vinfo,
                     rd_virtuals,
                     resume_data,
-                    &mut __bridge_cache,
+                    reader,
                     fail_values,
                 );
                 if majit_metainterp::bridge_debug_enabled() {
@@ -2590,7 +2590,52 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 ))
             }
 
+            // resume.py _prepare_pendingfields — materialize the guard's virtuals + replay
+            // its deferred heap writes as bridge-entry NEW/SETFIELD_GC ops so
+            // the compiled bridge observes the heap state the blackhole deopt
+            // would rebuild. A push/dup whose node is virtualized-and-elided
+            // defers its head-store to rd_pendingfields while the size store
+            // commits inline; without this replay the bridge reads size>chain
+            // and dereferences a NULL node head. Runs independent of the
+            // frame-register seeding in `setup_bridge_sym` (which may decline).
+            #[allow(unused_variables)]
+            fn prepare_bridge_resume(
+                _sym: &mut #sym_ty,
+                ctx: &mut majit_metainterp::TraceCtx,
+                resume_data: &majit_metainterp::ResumeDataResult,
+                rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                fail_values: &[i64],
+                fail_types: &[majit_ir::Type],
+                reader: &mut majit_metainterp::BridgeVirtualCache<'_>,
+            ) {
+                if !majit_metainterp::replay_pending_fields(
+                    ctx,
+                    resume_data,
+                    rd_virtuals,
+                    reader,
+                ) {
+                    ctx.mark_bridge_replay_incomplete();
+                }
+            }
+
+            // resume.py `consume_vref_and_vable_boxes`: the virtualizable
+            // boxes are decoded, and here seeded onto the trace, before any
+            // frame's `consume_boxes`.
             #[allow(clippy::reversed_empty_ranges, unused_variables)]
+            fn consume_vref_and_vable_boxes(
+                _sym: &mut #sym_ty,
+                ctx: &mut majit_metainterp::TraceCtx,
+                resume_data: &majit_metainterp::ResumeDataResult,
+                rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                fail_values: &[i64],
+                fail_types: &[majit_ir::Type],
+                reader: &mut majit_metainterp::BridgeVirtualCache<'_>,
+            ) -> majit_metainterp::VrefVableBoxes {
+                #seed_bridge_vable
+                majit_metainterp::VrefVableBoxes::default()
+            }
+
+            #[allow(unused_variables)]
             fn setup_bridge_sym(
                 _sym: &mut #sym_ty,
                 ctx: &mut majit_metainterp::TraceCtx,
@@ -2598,7 +2643,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
                 fail_values: &[i64],
                 fail_types: &[majit_ir::Type],
-                executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+                reader: &mut majit_metainterp::BridgeVirtualCache<'_>,
+                _boxes: &majit_metainterp::VrefVableBoxes,
             ) {
                 if majit_metainterp::bridge_diag_enabled() {
                     eprintln!(
@@ -2607,37 +2653,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         rd_virtuals.map_or(0, |v| v.len()),
                     );
                 }
-                // resume.py _prepare_pendingfields — materialize the guard's virtuals + replay
-                // its deferred heap writes as bridge-entry NEW/SETFIELD_GC ops so
-                // the compiled bridge observes the heap state the blackhole deopt
-                // would rebuild. A push/dup whose node is virtualized-and-elided
-                // defers its head-store to rd_pendingfields while the size store
-                // commits inline; without this replay the bridge reads size>chain
-                // and dereferences a NULL node head. Runs independent of the
-                // frame-register seeding below (which may decline).
-                let __bridge_virtual_count = rd_virtuals.map_or(0, |v| v.len());
-                let mut __bridge_cache = match executing {
-                    Some(__alloc) => majit_metainterp::BridgeVirtualCache::executing(
-                        __bridge_virtual_count,
-                        majit_metainterp::default_bridge_array_descr,
-                        __alloc,
-                        fail_values,
-                        fail_types,
-                    ),
-                    None => majit_metainterp::BridgeVirtualCache::new(
-                        __bridge_virtual_count,
-                        majit_metainterp::default_bridge_array_descr,
-                    ),
-                };
-                if !majit_metainterp::replay_pending_fields(
-                    ctx,
-                    resume_data,
-                    rd_virtuals,
-                    &mut __bridge_cache,
-                ) {
-                    ctx.mark_bridge_replay_incomplete();
-                }
-                #seed_bridge_vable
             }
 
             fn is_compatible(&self, meta: &#meta_ty) -> bool {

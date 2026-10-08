@@ -2740,7 +2740,8 @@ mod tests {
     /// would keep that cache.
     #[test]
     fn call_may_force_varargs_drops_unescaped_getfield() {
-        let mut cache = HeapCache::new();
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
         let unescaped_obj = OpRef::ref_op(1);
         cache.new_object(unescaped_obj);
         cache.getfield_now_known(unescaped_obj, 1, OpRef::ref_op(20), IDENTITY_ORACLE);

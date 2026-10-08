@@ -100,6 +100,10 @@ pub fn jd1_live_values_at(root_base: i64) -> Vec<Value> {
     ]
 }
 
+/// `jitdrivers_sd` index of `unpackiterable_driver`: registered right
+/// after the Python portal (`jitdriver_sd.index`).
+pub const UNPACKITERABLE_JD_INDEX: usize = 1;
+
 impl UnpackJitState {
     /// jd1 (`unpackiterable_driver`) portal descriptor.
     /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`. The extracted

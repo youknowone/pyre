@@ -7774,7 +7774,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if let Some((driver, _)) = crate::driver::try_driver_pair()
         && !driver
             .meta_interp_mut()
-            .warm_state_mut()
+            .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
             .can_inline_callable_for_key(&callee_green_key)
     {
         return resolved_inline_decline(op.pc, line!());
@@ -7786,12 +7786,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // A skeleton walk has no installed driver, so only that diagnostic path
     // falls back to the upstream default.
     let max_unroll_recursion = crate::driver::try_driver_pair()
-        .map(|(driver, _)| {
-            driver
-                .meta_interp_mut()
-                .warm_state_mut()
-                .max_unroll_recursion() as usize
-        })
+        .map(|(driver, _)| driver.meta_interp().memory_manager.max_unroll_recursion() as usize)
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
     let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
@@ -7799,7 +7794,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
                 .meta_interp_mut()
-                .warm_state_mut()
+                .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
                 .disable_noninlinable_function_for_key(&callee_green_key);
         }
         return resolved_inline_decline(op.pc, line!());
@@ -10368,7 +10363,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     is_being_profiled,
                 )),
             ),
-            sub_wc.trace_ctx.get_trace_position(),
             None,
         );
         // `_interpret` checks `blackhole_if_trace_too_long` after the
@@ -10442,8 +10436,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             return Err(error);
         }
-        if let Some(jd_no) = subwalk_jd_no {
-            crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
+        if subwalk_jd_no.is_some() {
+            crate::state::note_inline_subwalk_end();
         }
         let prologue_cannot_call_assembler = fbw_executed_effect_count() != prologue_effects_before
             || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect());
@@ -15507,7 +15501,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     let green_key = {
         let (driver, _) = crate::driver::driver_pair();
         crate::genentry_state::genentry_resolved_cell_key(
-            driver.meta_interp_mut().warm_state_for_driver(2),
+            &driver.meta_interp_mut().warm_state_for_driver(2),
             pycode,
         )
     };

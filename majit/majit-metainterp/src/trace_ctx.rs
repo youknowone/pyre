@@ -796,15 +796,6 @@ pub struct TraceCtx {
     /// the box the first `getvirtual_ptr` allocated instead of emitting
     /// a second `NEW`.
     bridge_virtual_ops: Vec<Option<OpRef>>,
-    /// resume.py `ResumeDataBoxReader.virtuals_cache`, created in
-    /// `_prepare_virtuals` and reused by `_prepare_pendingfields` and
-    /// `consume_boxes`. Taken off this ctx for each call so the cache
-    /// and `TraceCtx` are not borrowed together.
-    bridge_virtuals_cache: Option<crate::resume_box_reader::BridgeVirtualCache<'static>>,
-    /// Objects `ResumeDataDirectReader.getvirtual_ptr` already allocated
-    /// for this guard. BoxReader `virtuals_cache` stores the Box; a
-    /// recording-only hit must return this object, not `Value::Void`.
-    bridge_direct_virtual_concretes: Vec<Option<GcRef>>,
     /// `resume.py` `rebuild_from_resumedata` storage, parked so
     /// `consume_boxes` can `getvirtual_ptr` (`create_history` already
     /// made tracing live). `None` outside a bridge.
@@ -2236,8 +2227,6 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_virtual_ops: Vec::new(),
-            bridge_virtuals_cache: None,
-            bridge_direct_virtual_concretes: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
@@ -2330,8 +2319,6 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_virtual_ops: Vec::new(),
-            bridge_virtuals_cache: None,
-            bridge_direct_virtual_concretes: Vec::new(),
             bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
@@ -2384,55 +2371,6 @@ impl TraceCtx {
             self.bridge_virtual_ops.resize(vidx + 1, None);
         }
         self.bridge_virtual_ops[vidx] = Some(op);
-    }
-
-    /// Take `ResumeDataBoxReader.virtuals_cache` for `_prepare_pendingfields`
-    /// or `consume_boxes`. The caller parks it again when the walk returns.
-    pub fn take_bridge_virtuals_cache(
-        &mut self,
-    ) -> Option<crate::resume_box_reader::BridgeVirtualCache<'static>> {
-        self.bridge_virtuals_cache.take()
-    }
-
-    /// Park `ResumeDataBoxReader.virtuals_cache` after `_prepare_virtuals`
-    /// so a later TAGVIRTUAL `getvirtual_ptr` is a cache hit.
-    pub fn park_bridge_virtuals_cache(
-        &mut self,
-        cache: crate::resume_box_reader::BridgeVirtualCache<'_>,
-    ) {
-        self.bridge_virtuals_cache = Some(cache.detach_executing());
-    }
-
-    /// Seed objects `ResumeDataDirectReader.allocate` already published.
-    /// `getvirtual_ptr` on the BoxReader cache returns this Box.
-    pub fn seed_direct_virtual_concretes(&mut self, slots: Vec<Option<GcRef>>) {
-        self.bridge_direct_virtual_concretes = slots;
-    }
-
-    /// `resume.py virtuals_cache` slots copied onto the recording reader.
-    pub(crate) fn bridge_direct_virtual_concretes_mut(&mut self) -> &mut [Option<GcRef>] {
-        &mut self.bridge_direct_virtual_concretes
-    }
-
-    /// The DirectReader object for virtual `vidx`, if that reader ran.
-    pub fn direct_virtual_concrete(&self, vidx: usize) -> Option<GcRef> {
-        self.bridge_direct_virtual_concretes
-            .get(vidx)
-            .copied()
-            .flatten()
-    }
-
-    /// Copy DirectReader objects into `virtuals_cache` so a recording-only
-    /// `getvirtual_ptr` hit returns the Box, not `Value::Void`.
-    pub fn seed_cache_from_direct_virtuals(
-        &self,
-        cache: &mut crate::resume_box_reader::BridgeVirtualCache<'_>,
-    ) {
-        for (vidx, slot) in self.bridge_direct_virtual_concretes.iter().enumerate() {
-            if let Some(gcref) = *slot {
-                cache.set_concrete_ptr(vidx, gcref);
-            }
-        }
     }
 
     /// Guard resume storage for `consume_boxes`'s `getvirtual_ptr`.

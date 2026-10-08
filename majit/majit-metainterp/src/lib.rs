@@ -184,7 +184,7 @@ pub use io_buffer::{
 };
 pub use jit_state::{
     DeoptMaterializationCache, GuardResumeFrame, GuardResumeReg, JitState, PendingFieldWriteLayout,
-    ResumeDataResult, bridge_decode_red,
+    ResumeDataResult, VrefVableBoxes, bridge_decode_red,
 };
 pub use jitcode::{
     BC_GOTO, EmbeddedJitCodeTable, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
@@ -262,9 +262,8 @@ pub use pyjitpl::{
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, PendingRefArrayWrite, decode_fieldnum, default_bridge_array_descr,
-    emit_pending_field_op, force_all_bridge_virtuals, materialize_bridge_virtual,
-    rebuilt_value_to_opref, replay_pending_fields, seed_bridge_virtualizable_boxes,
-    take_or_new_virtuals_cache,
+    emit_pending_field_op, materialize_bridge_virtual, rebuilt_value_to_opref,
+    replay_pending_fields, seed_bridge_virtualizable_boxes,
 };
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::ClearReplaceFrames;

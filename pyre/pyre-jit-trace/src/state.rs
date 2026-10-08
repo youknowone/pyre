@@ -3863,7 +3863,7 @@ pub(crate) fn note_root_trace_too_long(
             // `JitCell.trace_next_iteration` / `mark_force_finish_tracing` /
             // `dont_trace_here` on the compiling `active_jitdriver_sd`.
             let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
-            let warm_state = meta.warm_state_for_driver(compiling_jd);
+            let mut warm_state = meta.warm_state_for_driver(compiling_jd);
             // pyjitpl.py `warmrunnerstate.JitCell.trace_next_iteration(
             // greenkey)`, again counter-only.
             warm_state.trace_next_iteration(*merge_key);
@@ -3904,23 +3904,17 @@ pub(crate) fn note_root_trace_too_long(
     }
 }
 
-/// pyjitpl.py:2443-2445 — open a `portal_trace_positions` entry for a callee
-/// the FBW walker is about to inline.
+/// pyjitpl.py `_opimpl_recursive_call` → `perform_call` → `newframe` for a
+/// callee the FBW walker is about to inline.
 ///
-/// Upstream fills the log from `newframe`, reached through
-/// `_opimpl_recursive_call`'s greenkey-bearing `perform_call`.  The walker
+/// Upstream fills `portal_trace_positions` from `newframe`, reached through
+/// `_opimpl_recursive_call`'s greenkey-bearing `perform_call`. The walker
 /// inlines a Python callee by walking its body directly and never builds an
-/// `MIFrame`, so that append never happens and `find_biggest_function` reads an
-/// empty log — it can then never name a huge inlined function, and every
-/// too-long abort takes the segmenting arm by default rather than by finding.
-/// This is the walker's counterpart of that append.
-///
-/// The live trace position is read by the caller, which holds the
-/// `&mut TraceCtx`, and passed in — the driver is reached separately,
-/// exactly as [`note_root_trace_too_long`] does. pyjitpl.py `newframe`
-/// already appends from `tracing.or(compile_tracing)`; the walker then
-/// stamps its cursor onto that row. No second log owner: if `newframe`
-/// did not append (not a main jitcode / no history), this returns `None`.
+/// `MIFrame`, so that `newframe` never ran and `find_biggest_function` read
+/// an empty log. This runs the same `newframe`; `newframe` itself appends
+/// `(jitcode.jitdriver_sd, greenkey, self.history.get_trace_position())`
+/// from `tracing.or(compile_tracing)`, the one `TraceCtx` the walker holds a
+/// `&mut` into, so the walker does not stamp or append anything of its own.
 ///
 /// Returns the owning driver when this is a recursive portal activation.
 /// A normal exit pairs with [`note_inline_subwalk_end`]. `TraceTooLong` does
@@ -3929,7 +3923,6 @@ pub(crate) fn note_root_trace_too_long(
 /// clears the framestack.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
-    pos: majit_metainterp::recorder::TracePosition,
     portal_index: Option<usize>,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
@@ -3948,53 +3941,20 @@ pub(crate) fn note_inline_subwalk_start(
     // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
     // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
     let jitcode = crate::jitcode_runtime::get_runtime_jitcode_by_index(index)?;
-    let logged_before = meta.portal_trace_positions.as_ref().map(Vec::len);
-    meta.newframe(jitcode, Some(green_key.clone()));
-    // pyjitpl.py `newframe` appends
-    // `(jitcode.jitdriver_sd, greenkey, self.history.get_trace_position())`
-    // from `tracing.or(compile_tracing)`. The walker holds the live
-    // `TraceCtx` and stamps that cursor onto the row `newframe` wrote.
-    let appended = meta.portal_trace_positions.as_ref().map(Vec::len) != logged_before;
-    if appended {
-        if let Some(last) = meta
-            .portal_trace_positions
-            .as_mut()
-            .and_then(|positions| positions.last_mut())
-        {
-            last.2 = pos;
-        }
-    } else {
-        return None;
-    }
+    meta.newframe(jitcode, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
 }
 
-/// pyjitpl.py:2470-2472 — close the entry [`note_inline_subwalk_start`] opened.
-pub(crate) fn note_inline_subwalk_end(
-    jd_no: usize,
-    pos: majit_metainterp::recorder::TracePosition,
-) {
+/// pyjitpl.py `popframe(leave_portal_frame=True)` — close the frame
+/// [`note_inline_subwalk_start`] opened. `popframe` appends the closing
+/// `(jitdriver_sd, None, get_trace_position())` row itself.
+pub(crate) fn note_inline_subwalk_end() {
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
     majit_metainterp::mc_diag_bump(59);
-    // pyjitpl.py `popframe(leave_portal_frame=True)`.
-    let meta = driver.meta_interp_mut();
-    let logged_before = meta.portal_trace_positions.as_ref().map(Vec::len);
-    meta.popframe(true);
-    let appended = meta.portal_trace_positions.as_ref().map(Vec::len) != logged_before;
-    if appended {
-        if let Some(last) = meta
-            .portal_trace_positions
-            .as_mut()
-            .and_then(|positions| positions.last_mut())
-        {
-            last.2 = pos;
-        }
-    } else {
-        meta.push_portal_trace_position(jd_no, None, pos);
-    }
+    driver.meta_interp_mut().popframe(true);
 }
 
 /// Stage `reason` as the abort the walker is returning, so the single
@@ -7507,6 +7467,10 @@ impl PyreSym {
 }
 
 impl PyreJitState {
+    /// Slot of the `pypyjit` portal driver in `jitdrivers_sd`; the first
+    /// driver `warmspot.py` registers.
+    pub const PYPYJIT_JD_INDEX: usize = 0;
+
     /// Canonical PyPy portal driver layout from `interp_jit.py:67-74`.
     ///
     /// Single source of truth for the portal greens/reds/virtualizable shape:
@@ -9194,9 +9158,7 @@ fn bridge_decode_box(
                 return (opref, value);
             }
             if expected_kind != Type::Int
-                && let Some(gcref) = cache
-                    .get_concrete_ptr(*vidx)
-                    .or_else(|| ctx.direct_virtual_concrete(*vidx))
+                && let Some(gcref) = cache.get_concrete_ptr(*vidx)
             {
                 ctx.try_set_opref_concrete(opref, majit_ir::Value::Ref(gcref));
                 return (opref, majit_ir::Value::Ref(gcref));
@@ -9249,24 +9211,15 @@ fn apply_bridge_prepare(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     fail_values: &[i64],
     fail_types: &[Type],
-    executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+    reader: &mut BridgeVirtualCache<'_>,
 ) {
     let (driver, _) = crate::driver::driver_pair();
     let backend = driver.meta_interp().backend();
-    let virtual_count = rd_virtuals.map_or(0, |v| v.len());
-    // resume.py `_prepare_virtuals`: `if virtuals:` builds the cache with
-    // unset holes (`virtual_ptr_default`, matching `rd_virtual is None`).
+    // resume.py `_prepare_virtuals`: the reader's cache starts with unset
+    // holes (`virtual_ptr_default`, matching `rd_virtual is None`).
     // `getvirtual_ptr` lazily `allocate()`s on the first TAGVIRTUAL /
     // pending-field decode. `force_all_virtuals` is `force_from_resumedata`
     // only (direct/executing reader), not this BoxReader `_prepare`.
-    let mut virtuals_cache = majit_metainterp::take_or_new_virtuals_cache(
-        ctx,
-        virtual_count,
-        crate::descr::make_array_descr,
-        executing,
-        fail_values,
-        fail_types,
-    );
     prepare_bridge_pending_fields(
         sym,
         ctx,
@@ -9275,9 +9228,8 @@ fn apply_bridge_prepare(
         fail_values,
         fail_types,
         backend,
-        &mut virtuals_cache,
+        reader,
     );
-    ctx.park_bridge_virtuals_cache(virtuals_cache);
 }
 
 /// Prepare the guard-owned pending field stream for bridge tracing.
@@ -10877,6 +10829,16 @@ impl JitState for PyreJitState {
                 || self.namespace_len().is_some_and(|len| len == meta.ns_len))
     }
 
+    fn mint_bridge_array_descr(
+        base_size: usize,
+        item_size: usize,
+        len_offset: Option<usize>,
+        item_type: Type,
+        signed: bool,
+    ) -> majit_ir::DescrRef {
+        crate::descr::make_array_descr(base_size, item_size, len_offset, item_type, signed)
+    }
+
     fn prepare_bridge_resume(
         sym: &mut Self::Sym,
         ctx: &mut majit_metainterp::TraceCtx,
@@ -10884,7 +10846,7 @@ impl JitState for PyreJitState {
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         fail_values: &[i64],
         fail_types: &[Type],
-        executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+        reader: &mut BridgeVirtualCache<'_>,
     ) {
         apply_bridge_prepare(
             sym,
@@ -10893,8 +10855,76 @@ impl JitState for PyreJitState {
             rd_virtuals,
             fail_values,
             fail_types,
-            executing,
+            reader,
         );
+    }
+
+    fn consume_vref_and_vable_boxes(
+        _sym: &mut Self::Sym,
+        ctx: &mut majit_metainterp::TraceCtx,
+        resume_data: &majit_metainterp::ResumeDataResult,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+        fail_values: &[i64],
+        fail_types: &[Type],
+        virtuals_cache: &mut BridgeVirtualCache<'_>,
+    ) -> majit_metainterp::VrefVableBoxes {
+        let (driver, _) = crate::driver::driver_pair();
+        let backend = driver.meta_interp().backend();
+        let mut boxes = majit_metainterp::VrefVableBoxes::default();
+        // `consume_virtualizable_boxes` — virtualizable.py `load_list_of_boxes`
+        // layout `[vable_ptr, static_fields..., array_items...]`. resume.py
+        // `assert box.type == kind`: the payload is NOT uniformly Ref — the
+        // static fields carry their declared kinds
+        // (`PyFrame.virtualizable_fields`: last_instr/valuestackdepth are
+        // Int). `virt_live_value_types` yields the full live layout WITH the
+        // extra reds ([frame, <NUM_EXTRA_REDS>, <NUM_VABLE_SCALARS>,
+        // array...]); the vvals stream omits the extra reds, so strip them to
+        // recover the per-slot kind for each payload position.
+        let vvals = &resume_data.virtualizable_boxes;
+        let array_item_count = vvals
+            .len()
+            .saturating_sub(1 + crate::virtualizable_gen::NUM_VABLE_SCALARS);
+        let full_types = crate::virtualizable_gen::virt_live_value_types(array_item_count);
+        let nreds = crate::virtualizable_gen::NUM_EXTRA_REDS;
+        let mut vvals_types: Vec<Type> = Vec::with_capacity(vvals.len());
+        vvals_types.push(full_types.first().copied().unwrap_or(Type::Ref));
+        vvals_types.extend_from_slice(&full_types[(1 + nreds).min(full_types.len())..]);
+        for (idx, v) in vvals.iter().enumerate() {
+            let expected_kind = vvals_types.get(idx).copied().unwrap_or(Type::Ref);
+            boxes.virtualizable_boxes.push(bridge_decode_box(
+                ctx,
+                v,
+                expected_kind,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                virtuals_cache,
+            ));
+        }
+        // `consume_virtualref_boxes` decodes exactly `size * 2` entries; a
+        // malformed odd-length stream is a bug.
+        let vref_values = &resume_data.virtualref_values;
+        assert!(
+            vref_values.len() % 2 == 0,
+            "virtualref_values must contain an even number of entries (got {})",
+            vref_values.len(),
+        );
+        for v in vref_values {
+            boxes.virtualref_boxes.push(bridge_decode_box(
+                ctx,
+                v,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                virtuals_cache,
+            ));
+        }
+        boxes
     }
 
     fn setup_bridge_sym(
@@ -10904,7 +10934,8 @@ impl JitState for PyreJitState {
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         fail_values: &[i64],
         fail_types: &[Type],
-        executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+        virtuals_cache: &mut BridgeVirtualCache<'_>,
+        boxes: &majit_metainterp::VrefVableBoxes,
     ) {
         // rebuild_state_after_failure still consumes virtualizable and
         // virtualref boxes when the framestack stays empty. Return only
@@ -10944,18 +10975,9 @@ impl JitState for PyreJitState {
         // a direct reader already applied this guard's writes.
         let (driver, _) = crate::driver::driver_pair();
         let backend = driver.meta_interp().backend();
-        let virtual_count = rd_virtuals.map_or(0, |v| v.len());
         // resume.py one `virtuals_cache` from `_prepare_virtuals`; a later
         // TAGVIRTUAL is `getvirtual_ptr` on that cache, not a second
         // `allocate()` / SETFIELD of `wrappeditems`.
-        let mut virtuals_cache = majit_metainterp::take_or_new_virtuals_cache(
-            ctx,
-            virtual_count,
-            crate::descr::make_array_descr,
-            executing,
-            fail_values,
-            fail_types,
-        );
 
         // `_prepare` ran once, in `prepare_bridge_resume`; `consume_boxes`
         // never touches the pending fields again. The reader keeps the
@@ -11003,34 +11025,14 @@ impl JitState for PyreJitState {
                 first_vable_scalar_idx + crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let mut oprefs: Vec<OpRef> = Vec::with_capacity(vvals.len());
             let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
-            // resume.py `assert box.type == kind`: the vable payload is
-            // NOT uniformly Ref — the static fields carry their declared
-            // kinds (`PyFrame.virtualizable_fields`: last_instr/valuestackdepth are Int).
-            // `virt_live_value_types` yields the full live layout WITH the
-            // extra reds ([frame, <NUM_EXTRA_REDS>, <NUM_VABLE_SCALARS>,
-            // array...]); the vvals stream omits the extra reds, so strip them
-            // to recover the per-slot kind for each payload position.
-            let array_item_count = vvals
-                .len()
-                .saturating_sub(1 + crate::virtualizable_gen::NUM_VABLE_SCALARS);
-            let full_types = crate::virtualizable_gen::virt_live_value_types(array_item_count);
-            let nreds = crate::virtualizable_gen::NUM_EXTRA_REDS;
-            let mut vvals_types: Vec<Type> = Vec::with_capacity(vvals.len());
-            vvals_types.push(full_types.first().copied().unwrap_or(Type::Ref));
-            vvals_types.extend_from_slice(&full_types[(1 + nreds).min(full_types.len())..]);
-            for (idx, v) in vvals.iter().enumerate() {
-                let expected_kind = vvals_types.get(idx).copied().unwrap_or(Type::Ref);
-                let (op, val) = bridge_decode_box(
-                    ctx,
-                    v,
-                    expected_kind,
-                    rd_virtuals,
-                    resume_data,
-                    fail_values,
-                    fail_types,
-                    backend,
-                    &mut virtuals_cache,
-                );
+            // The boxes `consume_vref_and_vable_boxes` decoded, one per
+            // payload position.
+            assert_eq!(
+                boxes.virtualizable_boxes.len(),
+                vvals.len(),
+                "consume_vref_and_vable_boxes decoded the virtualizable stream"
+            );
+            for (idx, &(op, val)) in boxes.virtualizable_boxes.iter().enumerate() {
                 if idx >= vable_array_start {
                     store_live_frame_array_slot(
                         sym.concrete_vable_ptr as usize,
@@ -11167,7 +11169,7 @@ impl JitState for PyreJitState {
                         fail_values,
                         fail_types,
                         backend,
-                        &mut virtuals_cache,
+                        virtuals_cache,
                     );
                     // The Int bank is a scalar register red: the decoded value is paired
                     // with `reg_indices.int` by `value_cursor` and read from this guard's
@@ -11199,7 +11201,7 @@ impl JitState for PyreJitState {
                         fail_values,
                         fail_types,
                         backend,
-                        &mut virtuals_cache,
+                        virtuals_cache,
                     );
                     if !seed_deferred_to_overlay && !matches!(concrete_val, majit_ir::Value::Void) {
                         ctx.try_set_opref_concrete(resolved, concrete_val);
@@ -11225,7 +11227,7 @@ impl JitState for PyreJitState {
                         fail_values,
                         fail_types,
                         backend,
-                        &mut virtuals_cache,
+                        virtuals_cache,
                     );
                     // Float bank: a scalar register red, guard-accurate like the Int
                     // bank above; stamp its concrete unconditionally (the Ref-only
@@ -11873,38 +11875,16 @@ impl JitState for PyreJitState {
         // is a cheap struct-only constructor — instantiate once outside
         // the loop instead of per-pair.
         let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
-        // resume.py `consume_virtualref_boxes` decodes exactly
-        // `size * 2` entries; a malformed odd-length stream is a bug.
-        assert!(
-            vref_values.len() % 2 == 0,
-            "virtualref_values must contain an even number of entries (got {})",
+        assert_eq!(
+            boxes.virtualref_boxes.len(),
             vref_values.len(),
+            "consume_vref_and_vable_boxes decoded the virtualref stream"
         );
         let mut restored_virtualref_boxes: Vec<(OpRef, usize)> =
             Vec::with_capacity(vref_values.len());
-        for pair in vref_values.chunks_exact(2) {
-            let (virt_opref, virt_val) = bridge_decode_box(
-                ctx,
-                &pair[0],
-                Type::Ref,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                &mut virtuals_cache,
-            );
-            let (vref_opref, vref_val) = bridge_decode_box(
-                ctx,
-                &pair[1],
-                Type::Ref,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                &mut virtuals_cache,
-            );
+        for pair in boxes.virtualref_boxes.chunks_exact(2) {
+            let (virt_opref, virt_val) = pair[0];
+            let (vref_opref, vref_val) = pair[1];
             let virt_ptr = value_to_usize(&virt_val);
             let vref_ptr = value_to_usize(&vref_val);
             restored_virtualref_boxes.push((virt_opref, virt_ptr));
@@ -12019,7 +11999,7 @@ impl JitState for PyreJitState {
                         fail_values,
                         fail_types,
                         backend,
-                        &mut virtuals_cache,
+                        virtuals_cache,
                         in_a_call,
                         &pending_ref_array_writes,
                     ) {
@@ -12057,7 +12037,6 @@ impl JitState for PyreJitState {
                 recipes,
             });
         }
-        ctx.park_bridge_virtuals_cache(virtuals_cache);
     }
 
     /// resume.py rebuild_from_resumedata parity.
@@ -13334,7 +13313,6 @@ mod tests {
                     _index: 0,
                     snapshot_data_len: 0,
                     snapshot_array_data_len: 0,
-                    guard_count: None,
                 }
             }
             meta.push_portal_trace_position(
@@ -13359,7 +13337,10 @@ mod tests {
                 .lookup_chain_with_key(&callee)
                 .expect("disable_noninlinable_function_for_key installs the callee cell");
             assert!(
-                callee_cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
+                callee_cell
+                    .flags
+                    .get()
+                    .contains(JcFlags::JC_DONT_TRACE_HERE),
                 "the shipped door must disable the oversized inlined frame"
             );
             let portal_cell = meta
@@ -13367,15 +13348,19 @@ mod tests {
                 .lookup_chain_with_key(&portal)
                 .expect("bound_reached installed the portal cell");
             assert!(
-                !portal_cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
+                !portal_cell
+                    .flags
+                    .get()
+                    .contains(JcFlags::JC_DONT_TRACE_HERE),
                 "the portal cell must not receive JC_DONT_TRACE_HERE"
             );
             assert!(
-                !portal_cell.flags.contains(JcFlags::JC_FORCE_FINISH),
+                !portal_cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
                 "prepare_trace_segmenting must not run when an inlined frame caused the bloat"
             );
             assert!(
-                meta.warm_state_ref().can_inline_callable(callee_hash),
+                meta.warm_state_for_driver(PyreJitState::PYPYJIT_JD_INDEX)
+                    .can_inline_callable(callee_hash),
                 "portal 0 stays inlinable"
             );
             meta.abort_trace_live(false);
@@ -13434,7 +13419,6 @@ mod tests {
                     _index: 0,
                     snapshot_data_len: 0,
                     snapshot_array_data_len: 0,
-                    guard_count: None,
                 }
             }
             meta.push_portal_trace_position(idx0, Some((names_hash, Some(names.clone()))), pos(0));
@@ -13507,23 +13491,19 @@ mod tests {
             meta.warm_state_for_driver(idx0)
                 .attach_procedure_to_interp_for_key(&portal, std::sync::Arc::clone(&token));
         }
-        fn pos(n: usize) -> majit_metainterp::recorder::TracePosition {
-            majit_metainterp::recorder::TracePosition {
-                _pos: n,
-                _count: 0,
-                _index: 0,
-                snapshot_data_len: 0,
-                snapshot_array_data_len: 0,
-                guard_count: None,
-            }
-        }
-        let started = note_inline_subwalk_start((names_hash, Some(names.clone())), pos(0), None);
+        let started = note_inline_subwalk_start((names_hash, Some(names.clone())), None);
         assert!(
             started.is_some(),
             "note_inline_subwalk_start logs names() through the portal jitcode"
         );
         {
             let meta = pair.0.meta_interp_mut();
+            // pyjitpl.py `find_biggest_function`: an open frame is sized
+            // `self.history.length() - pos`, so the inlined body records
+            // one op after `newframe` logged its start.
+            meta.trace_ctx()
+                .expect("bound_reached opened the history")
+                .record_same_as(majit_ir::OpRef::const_int(1), Type::Int);
             assert_eq!(
                 meta.find_biggest_function(),
                 Some((0, (names_hash, Some(names.clone())))),
@@ -13540,7 +13520,7 @@ mod tests {
                 .lookup_chain_with_key(&names)
                 .expect("disable_noninlinable_function_for_key installs the names() cell");
             assert!(
-                names_cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
+                names_cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
                 "the shipped abort disables the oversized inlined names() frame"
             );
             let portal_cell = meta
@@ -13548,11 +13528,14 @@ mod tests {
                 .lookup_chain_with_key(&portal)
                 .expect("bound_reached installed the portal cell");
             assert!(
-                !portal_cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
+                !portal_cell
+                    .flags
+                    .get()
+                    .contains(JcFlags::JC_DONT_TRACE_HERE),
                 "the portal cell must not receive JC_DONT_TRACE_HERE"
             );
             assert!(
-                !portal_cell.flags.contains(JcFlags::JC_FORCE_FINISH),
+                !portal_cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
                 "prepare_trace_segmenting must not run when names() caused the bloat"
             );
             let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7));
@@ -15254,6 +15237,16 @@ mod tests {
             fail_arg_types: fail_types.to_vec(),
         };
 
+        let mut reader = BridgeVirtualCache::new(4, crate::descr::make_array_descr);
+        let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+            &mut reader,
+        );
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
@@ -15261,7 +15254,8 @@ mod tests {
             None,
             &fail_values,
             &fail_types,
-            None,
+            &mut reader,
+            &boxes,
         );
 
         assert_eq!(sym.valuestackdepth, 3);
@@ -15367,6 +15361,16 @@ mod tests {
             num_failargs: fail_values.len() as i32,
             fail_arg_types: fail_types.to_vec(),
         };
+        let mut reader = BridgeVirtualCache::new(4, crate::descr::make_array_descr);
+        let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+            &mut reader,
+        );
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
@@ -15374,7 +15378,8 @@ mod tests {
             None,
             &fail_values,
             &fail_types,
-            None,
+            &mut reader,
+            &boxes,
         );
         assert_eq!(sym.valuestackdepth, 4);
     }
@@ -15420,6 +15425,13 @@ mod tests {
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         let allocator = majit_metainterp::resume::NullAllocator;
+        let mut reader = BridgeVirtualCache::executing(
+            0,
+            crate::descr::make_array_descr,
+            &allocator,
+            &fail_values,
+            &fail_types,
+        );
         <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
             &mut sym,
             &mut ctx,
@@ -15427,10 +15439,19 @@ mod tests {
             None,
             &fail_values,
             &fail_types,
-            Some(&allocator),
+            &mut reader,
         );
         assert_eq!(field_target.value, 9, "_prepare applies the pending field");
         field_target.value = 1;
+        let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+            &mut reader,
+        );
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
@@ -15438,7 +15459,8 @@ mod tests {
             None,
             &fail_values,
             &fail_types,
-            Some(&allocator),
+            &mut reader,
+            &boxes,
         );
         assert!(
             !ctx.bridge_replay_incomplete(),
@@ -15522,7 +15544,7 @@ mod tests {
             Some(&virtuals),
             &fail_values,
             &fail_types,
-            None,
+            &mut BridgeVirtualCache::new(4, crate::descr::make_array_descr),
         );
         assert_eq!(ctx.bridge_virtual_op(0), Some(OpRef::const_int(12)));
         assert!(
@@ -15603,6 +15625,8 @@ mod tests {
         };
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        // One reader for `_prepare` and the later fill, as `start_bridge_tracing` builds it.
+        let mut reader = BridgeVirtualCache::new(virtuals.len(), crate::descr::make_array_descr);
         <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
             &mut sym,
             &mut ctx,
@@ -15610,22 +15634,25 @@ mod tests {
             Some(&virtuals),
             &fail_values,
             &fail_types,
-            None,
+            &mut reader,
         );
         let first = ctx
             .bridge_virtual_op(0)
             .expect("pending TAGVIRTUAL allocate()s once");
-        {
-            let parked = ctx
-                .take_bridge_virtuals_cache()
-                .expect("virtuals_cache parked at _prepare_virtuals");
-            assert_eq!(parked.get_any(0), Some(first));
-            ctx.park_bridge_virtuals_cache(parked);
-        }
+        assert_eq!(reader.get_any(0), Some(first));
         let ops_after_prepare = ctx.num_ops();
         let mut resume_later = resume_data.clone();
         resume_later.virtualref_values =
             vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)];
+        let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
+            &mut sym,
+            &mut ctx,
+            &resume_later,
+            Some(&virtuals),
+            &fail_values,
+            &fail_types,
+            &mut reader,
+        );
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
@@ -15633,7 +15660,8 @@ mod tests {
             Some(&virtuals),
             &fail_values,
             &fail_types,
-            None,
+            &mut reader,
+            &boxes,
         );
         assert_eq!(ctx.bridge_virtual_op(0), Some(first));
         assert_eq!(
@@ -15644,9 +15672,9 @@ mod tests {
     }
 
     /// Recording-only `getvirtual_ptr` parks an `OpRef` without a concrete.
-    /// `resume.py` `ResumeDataBoxReader.virtuals_cache` still holds the Box
-    /// the DirectReader allocated; a later TAGVIRTUAL must return that
-    /// object, not `Value::Void`.
+    /// The reader was constructed with the object the DirectReader
+    /// allocated (`BridgeVirtualCache::recording`'s `all_virtuals`); a
+    /// later TAGVIRTUAL must return that object, not `Value::Void`.
     #[test]
     fn setup_bridge_sym_recovers_direct_reader_object_on_recording_only_hit() {
         use majit_ir::resumedata::RebuiltValue;
@@ -15710,6 +15738,12 @@ mod tests {
         };
         let mut ctx = TraceCtx::for_test_types(&fail_types);
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        let direct_object = majit_ir::GcRef(&mut field_target as *mut FieldTarget as usize);
+        let mut reader = BridgeVirtualCache::recording(
+            virtuals.len(),
+            crate::descr::make_array_descr,
+            &[Some(direct_object)],
+        );
         <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
             &mut sym,
             &mut ctx,
@@ -15717,17 +15751,24 @@ mod tests {
             Some(&virtuals),
             &fail_values,
             &fail_types,
-            None,
+            &mut reader,
         );
         let first = ctx
             .bridge_virtual_op(0)
             .expect("pending TAGVIRTUAL allocate()s once");
-        let direct_object = majit_ir::GcRef(&mut field_target as *mut FieldTarget as usize);
-        ctx.seed_direct_virtual_concretes(vec![Some(direct_object)]);
         let ops_after_prepare = ctx.num_ops();
         let mut resume_later = resume_data.clone();
         resume_later.virtualref_values =
             vec![RebuiltValue::Virtual(0), RebuiltValue::Box(0, Type::Ref)];
+        let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
+            &mut sym,
+            &mut ctx,
+            &resume_later,
+            Some(&virtuals),
+            &fail_values,
+            &fail_types,
+            &mut reader,
+        );
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
@@ -15735,7 +15776,8 @@ mod tests {
             Some(&virtuals),
             &fail_values,
             &fail_types,
-            None,
+            &mut reader,
+            &boxes,
         );
         assert_eq!(ctx.bridge_virtual_op(0), Some(first));
         assert_eq!(
@@ -15743,18 +15785,11 @@ mod tests {
             ops_after_prepare,
             "later TAGVIRTUAL is a virtuals_cache hit; allocate() must not SETFIELD again"
         );
-        {
-            let parked = ctx
-                .take_bridge_virtuals_cache()
-                .expect("virtuals_cache parked after setup_bridge_sym");
-            assert_eq!(
-                parked.get_concrete_ptr(0),
-                Some(direct_object),
-                "getvirtual_ptr cache holds the DirectReader Box"
-            );
-            ctx.park_bridge_virtuals_cache(parked);
-        }
-        assert_eq!(ctx.direct_virtual_concrete(0), Some(direct_object));
+        assert_eq!(
+            reader.get_concrete_ptr(0),
+            Some(direct_object),
+            "getvirtual_ptr cache holds the DirectReader Box"
+        );
     }
 
     #[test]

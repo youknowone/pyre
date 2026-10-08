@@ -1353,7 +1353,8 @@ fn maybe_print_cell_census() {
     let stats = pyre_jit::eval::driver_pair()
         .0
         .meta_interp()
-        .warm_state_ref()
+        .warm_state_ref_for_driver(pyre_jit::PyreJitState::PYPYJIT_JD_INDEX)
+        .expect("pypyjit warmstate")
         .get_stats();
     // Unconditional once the gate is set, including on a zero: a missing line
     // then means the probe is not in the binary, which is a different fact from

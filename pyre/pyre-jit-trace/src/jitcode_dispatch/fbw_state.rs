@@ -2976,7 +2976,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
             );
             driver
                 .meta_interp_mut()
-                .warm_state_mut()
+                .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
                 .disable_noninlinable_function_for_key(&key);
         }
     }

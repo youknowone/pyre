@@ -56,7 +56,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     // Cuts the trace off inside an opcode arm (`TraceCtx::is_too_long`).
     driver
         .meta_interp_mut()
-        .warm_state_mut()
+        .warm_state_for_driver(0)
         .set_param("trace_limit", 2);
     let mut pc: usize = 0;
     let mut state = StackState {

@@ -98,6 +98,7 @@ pub fn fbw_diag_counter(i: usize) -> u64 {
     pyre_jit_trace::trace::fbw_diag::get(i)
 }
 
+pub use pyre_jit_trace::state::PyreJitState;
 /// The `[jit-stats]` key of each `fbw_diag` tally, in index order — declared
 /// beside the counters themselves, so a slot cannot be added there and go
 /// unprinted here. Joined against [`fbw_diag_counter`] by index.

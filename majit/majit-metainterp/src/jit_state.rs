@@ -218,6 +218,17 @@ pub struct GuardResumeFrame {
 }
 
 /// Interpreter-specific JIT state contract.
+/// `rebuild_from_resumedata`'s `virtualizable_boxes, virtualref_boxes`:
+/// what `consume_vref_and_vable_boxes` decoded ahead of the frames, each box
+/// with the concrete the reader stamped on it.
+#[derive(Debug, Clone, Default)]
+pub struct VrefVableBoxes {
+    /// `consume_virtualizable_boxes`: `[vable, static fields..., array items...]`.
+    pub virtualizable_boxes: Vec<(OpRef, Value)>,
+    /// `consume_virtualref_boxes`: `(virtual, vref)` pairs, flattened.
+    pub virtualref_boxes: Vec<(OpRef, Value)>,
+}
+
 pub trait JitState: Sized {
     type Meta: Clone;
     type Sym;
@@ -475,13 +486,26 @@ pub trait JitState: Sized {
     /// `BridgeInlineCarrier` on `ctx` (drained by `trace_bytecode` right
     /// before `interpret()`).
     ///
-    /// `executing` selects which half of `resume.py`'s reader pair this entry
-    /// needs. `Some(allocator)` is `ResumeDataBoxReader`, whose
-    /// `allocate_with_vtable` / `setfield` go through `execute_and_record` and
-    /// so apply each write as well as recording it — the reader upstream uses
-    /// for an entry no direct reader preceded. `None` records only, which is
-    /// sound exactly when a direct reader has already applied this guard's
-    /// writes.
+    /// `reader` is the one `ResumeDataBoxReader` state of this bridge entry,
+    /// built in `start_bridge_tracing` and shared by `_prepare`,
+    /// `consume_boxes` and `setup_bridge_sym`; its allocator, when it has
+    /// one, is the applying half (`execute_and_record`) for an entry no
+    /// direct reader preceded.
+    /// The array-descr factory the bridge reader mints `VRawBuffer` virtuals
+    /// with (`BridgeVirtualCache::mint_raw_array_descr`). Descr identity is
+    /// the consumer's gccache concern, so a state that virtualizes raw
+    /// buffers supplies its own keyed factory; the default mints a fresh
+    /// descr.
+    fn mint_bridge_array_descr(
+        base_size: usize,
+        item_size: usize,
+        len_offset: Option<usize>,
+        item_type: Type,
+        signed: bool,
+    ) -> majit_ir::DescrRef {
+        crate::default_bridge_array_descr(base_size, item_size, len_offset, item_type, signed)
+    }
+
     /// resume.py `AbstractResumeDataReader._prepare` (`_prepare_virtuals`
     /// then `_prepare_pendingfields`). Runs before `newframe` /
     /// `consume_boxes`, once per reader; `setup_bridge_sym` never applies
@@ -495,10 +519,31 @@ pub trait JitState: Sized {
         _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         _fail_values: &[i64],
         _fail_types: &[Type],
-        _executing: Option<&dyn crate::resume::BlackholeAllocator>,
+        _reader: &mut crate::BridgeVirtualCache<'_>,
     ) {
     }
 
+    /// resume.py `ResumeDataBoxReader.consume_vref_and_vable_boxes`:
+    /// decode the virtualizable and virtualref boxes, in that order, before
+    /// any frame's `consume_boxes` — so a virtual they name is allocated
+    /// ahead of one a frame names. The boxes come back with the concrete
+    /// each decode stamped, for the fill `setup_bridge_sym` does with them.
+    fn consume_vref_and_vable_boxes(
+        _sym: &mut Self::Sym,
+        _ctx: &mut crate::trace_ctx::TraceCtx,
+        _resume_data: &ResumeDataResult,
+        _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+        _fail_values: &[i64],
+        _fail_types: &[Type],
+        _reader: &mut crate::BridgeVirtualCache<'_>,
+    ) -> VrefVableBoxes {
+        VrefVableBoxes::default()
+    }
+
+    /// pyjitpl.py `rebuild_state_after_failure` after
+    /// `rebuild_from_resumedata` returned: the frontend's fill from the
+    /// rebuilt frames and from `boxes`.
+    #[allow(clippy::too_many_arguments)]
     fn setup_bridge_sym(
         _sym: &mut Self::Sym,
         _ctx: &mut crate::trace_ctx::TraceCtx,
@@ -506,7 +551,8 @@ pub trait JitState: Sized {
         _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         _fail_values: &[i64],
         _fail_types: &[Type],
-        _executing: Option<&dyn crate::resume::BlackholeAllocator>,
+        _reader: &mut crate::BridgeVirtualCache<'_>,
+        _boxes: &VrefVableBoxes,
     ) {
     }
 

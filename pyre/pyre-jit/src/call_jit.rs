@@ -3848,11 +3848,16 @@ pub fn trace_and_compile_from_bridge(
         )
     });
     if bridge_bail_stage() == 2 {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().clear_direct_virtual_concretes();
         return BridgeResolution::ResumeBlackhole;
     }
-    let Some((_, resume_pc, num_resume_frames, resume_coords)) = decoded_resume else {
+    let Some(crate::eval::DecodedGuardFailure {
+        resume_pc,
+        num_resume_frames,
+        coords: resume_coords,
+        direct_virtuals,
+        ..
+    }) = decoded_resume
+    else {
         return BridgeResolution::ResumeBlackhole;
     };
     let is_multiframe_resume = num_resume_frames > 1;
@@ -3899,8 +3904,6 @@ pub fn trace_and_compile_from_bridge(
     }
 
     if bridge_bail_stage() == 3 {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().clear_direct_virtual_concretes();
         return BridgeResolution::ResumeBlackhole;
     }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
@@ -3915,8 +3918,10 @@ pub fn trace_and_compile_from_bridge(
             // `decode_and_restore_guard_failure` has already walked this
             // guard's resume data applying every write — `replay_pending_fields`
             // for the deferred stores, `ResumeVableMode::GuardFailureSync` for
-            // the virtualizable — so the replay owes recording only.
+            // the virtualizable — so the replay owes recording only, seeded
+            // with the objects that reader allocated.
             false,
+            &direct_virtuals,
         )
     };
     if !started {
@@ -3926,54 +3931,11 @@ pub fn trace_and_compile_from_bridge(
                 green_key, trace_id, fail_index
             );
         }
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().clear_direct_virtual_concretes();
         return BridgeResolution::ResumeBlackhole;
     }
-    // resume.py `rebuild_from_resumedata` already ran inside
-    // `start_bridge_tracing` (`rebuild_state_after_failure`). A second
-    // walk would `newframe` again, `consume_boxes` again, and
-    // `handle_rvmprof_enter_on_resume` again. Rebuild here only when
-    // that start had no portal jitcode to seat frames with.
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.portal_framestack_len() == 0 {
-            if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
-                let resume_frames = driver
-                    .resume_data_result
-                    .as_ref()
-                    .map(|result| result.frames.clone())
-                    .unwrap_or_default();
-                let materialized: Vec<Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>> =
-                    resume_frames
-                        .iter()
-                        .map(|section| {
-                            usize::try_from(section.jitcode_index)
-                                .ok()
-                                .and_then(|index| {
-                                    pyre_jit_trace::state::ensure_build_time_jitcode_at(index)
-                                        .map(|payload| std::sync::Arc::clone(&payload.jitcode))
-                                })
-                        })
-                        .collect();
-                let consumed = driver.rebuild_portal_framestack_from_resumedata(
-                    portal,
-                    &resume_frames,
-                    raw_values,
-                    &exit_layout.exit_types,
-                    &materialized,
-                    &[],
-                    0,
-                );
-                if !consumed {
-                    if driver.is_tracing() {
-                        driver.meta_interp_mut().abort_trace(false);
-                    }
-                    return BridgeResolution::ResumeBlackhole;
-                }
-            }
-        }
-    }
+    // resume.py `rebuild_from_resumedata` ran once, inside
+    // `start_bridge_tracing` (`rebuild_state_after_failure`); the portal's
+    // `jd.mainjitcode` seats the frames (`call.py grab_initial_jitcodes`).
     // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`
     // once, after `rebuild_from_resumedata`. The same call covers the path
     // with no portal jitcode: there is no framestack to rebuild, and the
