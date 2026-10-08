@@ -3,6 +3,7 @@
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
 # corpus=3557ad4a6b13932a platform=linux
+# Attributed joins after getitem pin_roots / timezone re-extract.
 direct-skip (never reaches unported_category)	pyre_interpreter::rsocket_rffi::sockaddr_in_get_addr
 direct-skip (never reaches unported_category)	pyre_module::module::mmap::interp_mmap::<Impl>::as_ptr
 direct-skip (never reaches unported_category)	pyre_module::module::mmap::interp_mmap::<Impl>::len
