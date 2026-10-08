@@ -116,6 +116,12 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // No upstream counterpart by name; the loop is a bounded scan of a
     // fixed-size argument slice.
     ("leading_non_null_count", "flat builtin-keyword ABI scan"),
+    // The positional-prefix loop of that scan lives here. `_match_signature`
+    // is `@jit.unroll_safe`; the hint belongs on the graph that owns the loop.
+    (
+        "builtin_positional_count",
+        "argument.py _match_signature positional prefix",
+    ),
     // `argument.py` carries `@jit.unroll_safe` on `_match_signature`, the
     // keyword-binding loop this one mirrors; both are bounded by a signature
     // fixed at the callee rather than by the call's arguments.
