@@ -6810,7 +6810,8 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
 /// Integer-list copy walks `ll_listslice_inner` → `ll_listslice_new_int_list`
 /// (`rlist.py ll_listslice_startstop`): `newlist(length)` becomes `new_array`,
 /// `list.int_items` a getfield, `list.ll_arraycopy` `OS_ARRAYCOPY` as CallN.
-/// `w_list_adopt_int_items` stays `dont_look_inside_cannot_raise` (CallN).
+/// `w_list_adopt_int_items` is residual (`dont_look_inside`), the
+/// `w_tuple_adopt_fixed_items` / `w_int_gc_alloc` collector-heap boundary.
 /// The body's `is_list` / `is_str` / `is_tuple` tests are the guards; a
 /// custom `__index__` is `eval_slice_index` (`sliceobject.py`
 /// `_eval_slice_index`). Bytes / bytearray / user `__getitem__` stay in

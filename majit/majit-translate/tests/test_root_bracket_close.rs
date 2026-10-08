@@ -510,6 +510,66 @@ fn a_constant_offset_bracket_is_scalar_replaced() {
     }
 }
 
+/// `ll_listslice_inner` opens, pins, and closes on every return so a
+/// BINARY_SLICE caller can erase its own bracket and walk this body.
+#[test]
+fn ll_listslice_inner_is_depth_neutral() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("::ll_listslice_inner") || n.ends_with("ll_listslice_inner")),
+        "ll_listslice_inner must be depth-neutral, got {names:?}"
+    );
+}
+
+/// The inner list-copy body is scalar-replaced: the walk records the
+/// strategy copy, not residual `push_roots`.
+#[test]
+fn ll_listslice_inner_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let graph = lower_named(llbc, "ll_listslice_inner");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "ll_listslice_inner still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
+/// `eval_slice_index` opens, pins, and closes on every return. The
+/// path-sensitive walk classifies that body as depth-neutral.
+#[test]
+fn eval_slice_index_is_depth_neutral() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("::eval_slice_index") || n.ends_with("eval_slice_index")),
+        "eval_slice_index must be depth-neutral, got {names:?}"
+    );
+}
+
 /// `binary_slice_values_inner` opens a RootScope, batch-publishes the three
 /// operands, and calls `eval_slice_index`. A stack-sensitive callee used
 /// to refuse the whole rewrite; the walker then aborted on `push_roots`.

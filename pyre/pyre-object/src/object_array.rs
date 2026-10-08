@@ -6,10 +6,9 @@ use crate::pyobject::PyObject;
 use crate::{PY_NULL, PyObjectRef};
 
 /// Host constructor for a 3.14t length cell. Upstream `l.length`
-/// (`rlist.py`) is a plain Signed; minting the atomic word is residual.
-/// `dont_look_inside_cannot_raise`: `AtomicUsize::new` has no Python
-/// exception, so a transparent helper can residualize this as `CallN`.
-#[majit_macros::dont_look_inside_cannot_raise]
+/// (`rlist.py`) is a plain Signed. `AtomicUsize::new` is identity on
+/// the inner usize (`std_identity`), so looking inside records the
+/// field write rather than a residual.
 pub(crate) fn length_cell(n: usize) -> AtomicUsize {
     AtomicUsize::new(n)
 }

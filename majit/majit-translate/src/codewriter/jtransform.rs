@@ -9755,25 +9755,7 @@ impl<'a> Transformer<'a> {
             // `ItemsBlock` over IntegerListStrategy storage.
             "newlist" => {
                 let length = args.first()?.clone();
-                let mut shape =
-                    newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref());
-                // `int_ll_newlist` returns `*mut TypedItemsBlock`. When the
-                // result variable has no rtyper annotation, `newlist_clear_shape`
-                // is Fallback and the oopspec residualizes as CallR+GuardNoException
-                // instead of `new_array`. Recover IntegerListStrategy storage from
-                // the callee (`typed_items_array_shape` leaf `TypedItemsBlock`).
-                if matches!(shape, NewlistClearShape::Fallback)
-                    && let OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } = &op.kind
-                    && segments.last().is_some_and(|s| s == "int_ll_newlist")
-                {
-                    shape = NewlistClearShape::Fixed {
-                        item_ty: ValueType::Int,
-                        array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                    };
-                }
+                let shape = newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref());
                 let (detail, kind) = match shape {
                     NewlistClearShape::Fixed {
                         item_ty,
@@ -13717,43 +13699,58 @@ fn newlist_clear_shape(
     /// with `T` a word (`TypedItemsBlock`, the Rust owner of
     /// `GcArray(Signed|Float)`). `[i64]` / `[u64]` recover
     /// `LIST_INT_ITEMS_ARRAY`; `[f64]` recovers `LIST_FLOAT_ITEMS_ARRAY`.
-    /// The classdef leaf `TypedItemsBlock` is IntegerListStrategy storage
-    /// when the rust layout is not registered (`int_ll_newlist`).
+    /// Shape comes from the struct's own fields or the registered rust
+    /// layout, not from the type's last path segment.
     fn typed_items_array_shape(
         s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
         callcontrol: Option<&crate::call::CallControl>,
     ) -> Option<(ValueType, String)> {
+        if s._names.len() == 2
+            && let Some(fld) = s._arrayfld.as_ref()
+            && s._names.last() == Some(fld)
+            && let Some(first_ty) = s._flds.get(&s._names[0])
+            && matches!(
+                crate::model::try_getkind(first_ty, true, true, true),
+                Ok(crate::codewriter::type_state::ConcreteType::Signed)
+            )
+            && let Some(LowLevelType::Array(a)) = s._flds.get(fld)
+        {
+            match element_value_type(&a.OF) {
+                ValueType::Int => {
+                    return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
+                }
+                ValueType::Float => {
+                    return Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string()));
+                }
+                _ => {}
+            }
+        }
         let leaf = s._name.rsplit("::").next().unwrap_or(s._name.as_str());
         let fields = callcontrol.and_then(|cc| {
             cc.struct_field_entries(&s._name)
                 .or_else(|| cc.struct_field_entries(leaf))
-        });
-        if let Some(fields) = fields
-            && fields.len() == 2
-        {
-            let (_, first_ty) = fields.first()?;
-            if matches!(
-                crate::front::mir::tuple_field_value_type(first_ty),
-                ValueType::Int | ValueType::Unsigned
-            ) {
-                let (_, ty) = fields.last()?;
-                if let Some((item, 0)) = crate::front::mir::shaped_array_parts(ty) {
-                    match item {
-                        "i64" | "u64" | "isize" | "usize" => {
-                            return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
-                        }
-                        "f64" => {
-                            return Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string()));
-                        }
-                        _ => {}
-                    }
-                }
+        })?;
+        if fields.len() != 2 {
+            return None;
+        }
+        let (_, first_ty) = fields.first()?;
+        if !matches!(
+            crate::front::mir::tuple_field_value_type(first_ty),
+            ValueType::Int | ValueType::Unsigned
+        ) {
+            return None;
+        }
+        let (_, ty) = fields.last()?;
+        let (item, 0) = crate::front::mir::shaped_array_parts(ty)? else {
+            return None;
+        };
+        match item {
+            "i64" | "u64" | "isize" | "usize" => {
+                Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()))
             }
+            "f64" => Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string())),
+            _ => None,
         }
-        if leaf == "TypedItemsBlock" {
-            return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
-        }
-        None
     }
 
     fn instance_classdef_name(var: &crate::flowspace::model::Variable) -> Option<String> {
@@ -27126,6 +27123,46 @@ mod tests {
             other => panic!("expected NewArray, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// A call whose leaf is `int_ll_newlist` still needs the declared
+    /// `*mut TypedItemsBlock` result layout. The function name is not
+    /// a shape: an untyped result must residualize, same as any other
+    /// untyped `newlist`.
+    #[test]
+    fn handle_list_call_newlist_int_ll_newlist_untyped_result_does_not_lower() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_int_ll_untyped");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".into(),
+                        "listobject".into(),
+                        "int_ll_newlist".into(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(std::iter::once(count.clone())),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let mut transformer = Transformer::new(&config);
+        assert!(
+            transformer
+                ._handle_list_call(
+                    "newlist",
+                    &op,
+                    std::slice::from_ref(&count),
+                    &mut graph,
+                    "newlist_int_ll_untyped",
+                )
+                .is_none(),
+            "int_ll_newlist without a TypedItemsBlock result type must not fabricate an int array"
+        );
     }
 
     /// Untyped `OBJECTPTR` result: `newlist` does not rewrite. The

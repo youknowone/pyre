@@ -3808,14 +3808,20 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
 /// `length == 0` and a null object `items` block.
 ///
 /// Native path opens a RootScope so the block and class pins pop on
-/// return (`gct_fv_gc_malloc` would have inserted that bracket). The
-/// helper is `dont_look_inside_cannot_raise`: looking inside it hits
-/// `length_cell` / `from_block` residuals that abort a transparent
-/// BINARY_SLICE walk, and a `CallMayForceR` residual would abort the
-/// same way. The walked caller (`ll_listslice_new_int_list`) still
-/// records `new_array` + `OS_ARRAYCOPY`; this leaf is `CallN`.
+/// return (`gct_fv_gc_malloc` would have inserted that bracket).
+///
+/// Residual (`dont_look_inside`), same collector-heap allocation boundary
+/// as `w_int_gc_alloc` / `w_tuple_adopt_fixed_items`. Upstream
+/// `from_storage_and_strategy` is `instantiate` plus field stores, which
+/// records `new_with_vtable` + `setfield_gc`. The write-into-block
+/// `try_gc_alloc_nursery_raw` is not the `malloc_typed(%agg)` cluster
+/// `fuse_boxing_alloc` rewrites; a `malloc_typed` header would sit off
+/// the collector heap while `int_items.block` is a nursery array.
+/// The boundary goes when the write-into-block shape lowers. Allocation
+/// failure aborts rather than raising, so the residual carries no
+/// `guard_no_exception` — matching `new_with_vtable` upstream.
 #[inline(never)]
-#[majit_macros::dont_look_inside_cannot_raise]
+#[majit_macros::dont_look_inside]
 unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let block_slot = crate::gc_roots::shadow_stack_len();
