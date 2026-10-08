@@ -4208,12 +4208,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // None ref, so it is not a void call yet still mutates) — eager-everything +
     // commit is the single consistent rule, matching `do_residual_call`.
     //
-    // The standard virtualizable box pointer for a MayForce residual — a
-    // force inside the callee could escape the frame.  None for non-forces
-    // opcodes and when no live vable exists (the jitdriver has no standard
-    // virtualizable, or unit-test init disabled the heap pointer) — nothing
-    // the callee could force.  The token is armed further below, past every
-    // decline gate.
+    // The snapshot (`virtualizable_heap_ptr`) for a MayForce residual —
+    // rooted across the call so a collection can forward the sync target
+    // and the restore below can write it back.  None for non-force opcodes
+    // and when no vable exists.  The TOKEN_TRACING_RESCALL stamp is not
+    // this pointer: at root entry the heap pointer is the
+    // `snapshot_for_tracing` copy, and residual native readers
+    // (`gettopframe_nohidden` / `get_w_globals`) see the live identity.
+    // `tracing_before_residual_call` below arms `live_frame` instead.
+    // The token is armed further below, past every decline gate.
     let mut vable_obj_root = if is_may_force {
         ctx.trace_ctx
             .standard_virtualizable_box()
@@ -4745,7 +4748,22 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         }
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
-            info.tracing_before_residual_call(**obj as usize as *mut u8);
+            // `pyjitpl.py vable_and_vrefs_before_residual_call` unwraps
+            // `virtualizable_boxes[-1]` — the live identity residual native
+            // code reads. `**obj` is the snapshot sync target, a different
+            // object at root entry
+            // (`trace_ctx.rs merge_point_records_the_vable_identity_not_the_sync_target`).
+            // Arming the snapshot left `force_virtualizable_if_necessary` on
+            // the live frame looking at TOKEN_NONE while
+            // `tracing_after_residual_call` still saw TOKEN_TRACING_RESCALL
+            // on the copy, so `ABORT_ESCAPE` never fired
+            // (`virtualizable.py force_now`).
+            let token_ptr = if live_frame != 0 {
+                live_frame_root.current(live_frame) as *mut u8
+            } else {
+                **obj as usize as *mut u8
+            };
+            info.tracing_before_residual_call(token_ptr);
         }
         Some(root_depth)
     } else {
@@ -5024,7 +5042,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // cleared back to TOKEN_NONE.
     if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
+        let token_ptr = if live_frame != 0 {
+            live_frame_root.current(live_frame) as *mut u8
+        } else {
+            **obj as usize as *mut u8
+        };
+        let forced = unsafe { info.tracing_after_residual_call(token_ptr) };
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
@@ -5347,10 +5370,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     }
     // Not forced, so nothing above consumed the pre-call image.  The reachable
     // shape is the same `f_locals` write-through as the forced arm, one
-    // recording later: with the callee inlined the store IS the residual, and
-    // `framelocalsproxy_setitem`'s own force is gated on the live frame's
-    // `vable_token` -- which the walk arms on its snapshot instead -- so the
-    // store lands on the array with no escape raised and no shadow reload.
+    // recording later: a residual that stores through the array without
+    // forcing still lands on the heap with no escape and no shadow reload.
     // The walk would otherwise carry the box it held before the call all the
     // way into the jump arguments the loop closes on.
     //

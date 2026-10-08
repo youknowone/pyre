@@ -6916,11 +6916,10 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
 /// `#[inline(never)]` keeps the helper a separate graph so rustc does not
 /// fold it into `type_descr_new`.
 ///
-/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
-/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
-/// out) so the heap slot is already current.  A hand-placed
-/// `jit_force_virtualizable` here aborted compiles that create a type
-/// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
+/// `ensure_module_attr` reads `caller.get_w_globals()`. That method reads
+/// the redirected fields `debugdata` / `pycode`, so residual copies run
+/// `force_virtualizable_if_necessary` (`TOKEN_TRACING_RESCALL` →
+/// `TOKEN_NONE`, then `tracing_after_residual_call` aborts `ABORT_ESCAPE`).
 #[inline(never)]
 fn type_create_new_type(
     args: &[PyObjectRef],
@@ -7180,13 +7179,10 @@ fn type_create_new_type(
         //
         // `ensure_module_attr` reaches the caller through
         // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
-        // rather than through the `CURRENT_FRAME` thread-local.  No force is
-        // owed here: the walk only dereferences the vref and follows
-        // `f_backref`, and `force_frame` belongs to the consumers that hand a
-        // frame to application code.  `w_globals` is a declared virtualizable
-        // field, but no walk writes it on the live frame —
-        // `restore_resume_state_from` leaves it and `pycode` out of the resume
-        // restore as frame-invariant — so its heap slot is already current.
+        // rather than through the `CURRENT_FRAME` thread-local.  The walk
+        // itself only dereferences the vref and follows `f_backref`; the
+        // redirected-field force is on `get_w_globals` (`debugdata` /
+        // `pycode`), matching `hook_access_field` on the consumer.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;

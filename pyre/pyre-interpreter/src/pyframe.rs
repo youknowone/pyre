@@ -3879,6 +3879,11 @@ impl PyFrame {
     /// pyframe.py getdebug → self.debugdata
     #[inline]
     fn getdebug_data(&self) -> Option<&FrameDebugData> {
+        // `debugdata` is a redirected virtualizable field (`interp_jit.py
+        // _virtualizable_`). Residual (non-access_directly) reads go through
+        // `force_virtualizable_if_necessary`; looked-inside graphs delete
+        // that Call (`rewrite_op_jit_force_virtualizable`).
+        crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
         // Spelled without a closure: a closure aggregate lowers to a
         // synthetic ctor call the walker cannot bind, and upstream's
         // `getdebug` is a plain None-checked field read.
@@ -3892,6 +3897,7 @@ impl PyFrame {
     /// pyframe.py getorcreatedebug
     #[inline]
     fn getorcreate_debug_data(&mut self, init_lineno: isize) -> &mut FrameDebugData {
+        crate::executioncontext::force_virtualizable_if_necessary(self as *mut Self);
         if self.debugdata.is_null() {
             // The stable allocation below is still a collection point.  Keep
             // the owning frame rooted and reload it before publishing the new
@@ -3960,6 +3966,7 @@ impl PyFrame {
     /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
+        crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
         let pycode = majit_metainterp::jit::promote(self.pycode);
         unsafe {
             &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject)
@@ -3981,8 +3988,15 @@ impl PyFrame {
     /// `pyframe.py PyFrame.get_w_globals`: the normal case reads the
     /// promoted code object's first-seen globals. A frame executing a shared
     /// code object in another namespace carries the override in debugdata.
+    ///
+    /// Both arms read a redirected field (`debugdata` via [`Self::getdebug_data`],
+    /// else `pycode`). `hook_access_field` therefore inserts
+    /// `force_virtualizable_if_necessary` on the residual copies; the
+    /// `pycode` arm issues the same Call so a None `debugdata` still
+    /// clears `TOKEN_TRACING_RESCALL` during a residual.
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
+        crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
         if let Some(data) = self.getdebug_data() {
             return data.w_globals;
         }
@@ -7256,6 +7270,37 @@ mod tests {
             unsafe { crate::w_code_get_w_globals(w_code) },
             first_globals
         );
+    }
+
+    #[test]
+    fn residual_vable_field_reads_clear_tracing_rescall() {
+        // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: residual
+        // redirected-field readers store TOKEN_NONE so
+        // `tracing_after_residual_call` observes the escape. TOKEN_NONE
+        // stays idle.
+        let code = crate::compile_exec("x = 1\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code);
+        let globals = pyre_object::w_dict_new();
+        let mut frame =
+            super::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+                .expect("frame");
+        let tracing = majit_metainterp::virtualref::token_tracing_rescall() as usize;
+
+        frame.vable_token = tracing;
+        let _ = frame.get_w_globals();
+        assert_eq!(frame.vable_token, 0);
+
+        frame.vable_token = tracing;
+        let _ = frame.getdebug();
+        assert_eq!(frame.vable_token, 0);
+
+        frame.vable_token = tracing;
+        let _ = frame.getcode();
+        assert_eq!(frame.vable_token, 0);
+
+        frame.vable_token = 0;
+        let _ = frame.get_w_globals();
+        assert_eq!(frame.vable_token, 0);
     }
 
     fn nested_code_yields_inside_try(source: &str) -> bool {
