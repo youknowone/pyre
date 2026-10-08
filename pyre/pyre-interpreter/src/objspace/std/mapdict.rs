@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
@@ -201,9 +201,9 @@ pub struct Terminator {
     /// `kind == Dict`).
     pub devolved_dict_terminator: Cell<MapRef>,
     /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
-    /// cache `(name, attrkind) -> CachedAttributeHolder`. PyPy lazily inits it
-    /// to `{}`; the eager empty map here is equivalent.
-    pub cache_attrs: Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
+    /// cache `(name, attrkind) -> CachedAttributeHolder`. Starts as null
+    /// (`cache_attrs = None`) and is interned to `{}` on first write.
+    pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
     /// mapdict.py `AbstractAttribute.terminator` — a Terminator points to
     /// itself.
     pub terminator: MapRef,
@@ -339,8 +339,9 @@ pub struct PlainAttribute {
     /// mapdict.py:431 `order`.
     pub order: usize,
     /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
-    /// cache `(name, attrkind) -> CachedAttributeHolder`.
-    pub cache_attrs: Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
+    /// cache `(name, attrkind) -> CachedAttributeHolder`. Starts as null
+    /// (`cache_attrs = None`) and is interned to `{}` on first write.
+    pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
     /// mapdict.py `AbstractAttribute.terminator` (= `back.terminator`).
     pub terminator: MapRef,
     /// `Some` for an `UnboxedPlainAttribute` (mapdict.py); `None` for a
@@ -419,22 +420,22 @@ pub enum MapNode {
 }
 
 fn intern_node(node: MapNode) -> MapRef {
-    // Immortal: leak the box so the shared node lives for the process.
-    Box::into_raw(Box::new(node)) as MapRef
+    // Immortal raw allocation (`lltype.malloc(..., flavor='raw')`).
+    pyre_object::lltype::malloc_raw(node) as MapRef
 }
 
 /// mapdict.py `Terminator.__init__`. `AbstractAttribute.__init__(space,
 /// self)` makes the terminator its own `terminator`.
 pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
-    let raw = Box::into_raw(Box::new(MapNode::Terminator(Terminator {
+    let raw = pyre_object::lltype::malloc_raw(MapNode::Terminator(Terminator {
         w_cls,
         allow_unboxing: Cell::new(true),
         allow_unboxing_watchers: QuasiImmutField::new(),
         kind,
         devolved_dict_terminator: Cell::new(std::ptr::null()),
-        cache_attrs: Mutex::new(HashMap::new()),
+        cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: std::ptr::null(),
-    })));
+    }));
     // Patch the self-referential terminator now that the address is known
     // (still uniquely owned here, before it is shared).
     unsafe {
@@ -1004,7 +1005,7 @@ pub unsafe fn new_plain_attribute(
         ever_mutated: Cell::new(false),
         ever_mutated_watchers: QuasiImmutField::new(),
         order,
-        cache_attrs: Mutex::new(HashMap::new()),
+        cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: back_node.terminator(),
         unboxed: None,
     }))
@@ -1057,7 +1058,7 @@ pub unsafe fn new_unboxed_plain_attribute(
         ever_mutated: Cell::new(false),
         ever_mutated_watchers: QuasiImmutField::new(),
         order,
-        cache_attrs: Mutex::new(HashMap::new()),
+        cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: back_node.terminator(),
         unboxed: Some(UnboxedExtra {
             typ,
@@ -1189,10 +1190,48 @@ impl MapNode {
     }
 
     /// mapdict.py `AbstractAttribute.cache_attrs`.
-    pub fn cache_attrs(&self) -> &Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
+    ///
+    /// `None` is the starting `cache_attrs = None`. Allocation of `{}` is
+    /// inside [`get_new_attr`] (`_get_new_attr`), not on a general getter.
+    pub fn cache_attrs(
+        &self,
+    ) -> Option<&Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>> {
         match self {
-            MapNode::Terminator(t) => &t.cache_attrs,
-            MapNode::Plain(p) => &p.cache_attrs,
+            MapNode::Terminator(t) => load_cache_attrs(&t.cache_attrs),
+            MapNode::Plain(p) => load_cache_attrs(&p.cache_attrs),
+        }
+    }
+}
+
+fn load_cache_attrs(
+    slot: &AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
+) -> Option<&Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>> {
+    let ptr = slot.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+/// mapdict.py `_get_new_attr`: `if cache is None: cache = self.cache_attrs = {}`.
+fn intern_cache_attrs(
+    slot: &AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
+) -> &Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
+    if let Some(cache) = load_cache_attrs(slot) {
+        return cache;
+    }
+    let fresh = pyre_object::lltype::malloc_raw(Mutex::new(HashMap::new()));
+    match slot.compare_exchange(
+        std::ptr::null_mut(),
+        fresh,
+        Ordering::Release,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => unsafe { &*fresh },
+        Err(winner) => {
+            unsafe { drop(Box::from_raw(fresh)) };
+            unsafe { &*winner }
         }
     }
 }
@@ -5041,10 +5080,15 @@ unsafe fn get_new_attr(
 ) -> *const CachedAttributeHolder {
     let key = (name.to_owned(), attrkind);
     // PyPy mutates this ordinary per-node dict while holding the GIL
-    // (mapdict.py:149-156). Map nodes are process-global in pyre, so keep the
+    // (`_get_new_attr`). Map nodes are process-global in pyre, so keep the
     // lookup, holder construction, and insertion under one lock: parallel
     // interpreters must intern exactly one transition for a given key.
-    let mut cache = unsafe { (*self_node).cache_attrs() }.lock();
+    // Intern `{}` here, the only site `_get_new_attr` allocates.
+    let cache = match unsafe { &*self_node } {
+        MapNode::Terminator(t) => intern_cache_attrs(&t.cache_attrs),
+        MapNode::Plain(p) => intern_cache_attrs(&p.cache_attrs),
+    };
+    let mut cache = cache.lock();
     if let Some(&holder) = cache.get(&key) {
         return holder;
     }
@@ -5071,10 +5115,9 @@ unsafe fn find_branch_to_move_into(
     let mut current = self_node;
     let key = (name.to_owned(), attrkind);
     loop {
-        let holder = unsafe { (*current).cache_attrs() }
-            .lock()
-            .get(&key)
-            .copied();
+        // `_find_branch_to_move_into`: `if current.cache_attrs is not None`.
+        let holder =
+            unsafe { (*current).cache_attrs() }.and_then(|cache| cache.lock().get(&key).copied());
         let reached_top = match holder {
             None => true,
             Some(h) => (unsafe { (*h).order }) > current_order,
@@ -5125,15 +5168,15 @@ unsafe fn find_branch_to_move_into_readonly(
     let mut number_to_readd = 0usize;
     let mut current = self_node;
     loop {
-        let holder = {
-            let cache = unsafe { (*current).cache_attrs() }.lock();
+        let holder = unsafe { (*current).cache_attrs() }.and_then(|cache| {
             cache
+                .lock()
                 .iter()
                 .find(|((cached_name, cached_kind), _)| {
                     cached_kind == &attrkind && &**cached_name == name
                 })
                 .map(|(_, &holder)| holder)
-        };
+        });
         let reached_top = match holder {
             None => true,
             Some(h) => (unsafe { (*h).order }) > current_order,
@@ -6696,6 +6739,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_attrs_stays_none_until_get_new_attr() {
+        unsafe {
+            let term = new_dict_terminator(std::ptr::null_mut());
+            assert!(
+                (*term).cache_attrs().is_none(),
+                "_find_branch_to_move_into leaves cache_attrs as None"
+            );
+            let _ = get_new_attr(term, Wtf8::new("x"), DICT, None);
+            assert!((*term).cache_attrs().is_some());
+        }
+    }
+
+    #[test]
     fn new_attr_cache_interns_transitions_across_threads() {
         use std::sync::{Arc, Barrier};
 
@@ -6731,6 +6787,7 @@ mod tests {
         }
         assert_eq!(
             unsafe { (*(term_addr as MapRef)).cache_attrs() }
+                .expect("_get_new_attr interned the cache")
                 .lock()
                 .len(),
             64
