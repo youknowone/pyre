@@ -28,7 +28,7 @@ use majit_backend::{
     CpuDescrHandle, DeadFrame, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout,
     ExitVirtualLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
-use majit_gc::header::{GcHeader, TYPE_ID_MASK};
+use majit_gc::header::{GcHeader, TYPE_ID_BITS, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter};
 #[cfg(test)]
@@ -4696,10 +4696,12 @@ fn lookup_const_i64(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> O
     constants.get(&opref.raw()).copied()
 }
 
-/// Constant tid from the `gen_initialize_tid` store that follows
-/// `CallMallocNursery`. The store's base is that malloc's result, its
-/// offset is `-GcHeader::SIZE` (the header sits at `free`), and its
-/// width is one machine word.
+/// Constant tid from the `gen_initialize_tid` / `gen_initialize_tid_keep_flags`
+/// store that follows a nursery malloc. The store's base is that malloc's
+/// result and its offset is `-GcHeader::SIZE` (the header sits at `free`).
+/// Width is one machine word (`gen_initialize_tid`) or the type-id half
+/// (`gen_initialize_tid_keep_flags`); the fast path writes the tid as an
+/// I64 at `free` so the flags half is zero either way.
 fn following_nursery_tid(
     malloc: &Op,
     next: &Op,
@@ -4716,7 +4718,9 @@ fn following_nursery_tid(
         return None;
     }
     let width = lookup_const_i64(constants, next.arg(3).to_opref())?;
-    if width != std::mem::size_of::<usize>() as i64 {
+    let word = std::mem::size_of::<usize>() as i64;
+    let type_id_bytes = (TYPE_ID_BITS / 8) as i64;
+    if width != word && width != type_id_bytes {
         return None;
     }
     lookup_const_i64(constants, next.arg(2).to_opref())
@@ -16265,12 +16269,16 @@ impl CraneliftBackend {
                         builder.seal_block(fast_block);
                         builder.ins().store(flags, new_free, nf_ptr, 0);
                         // `gen_initialize_tid` writes this word at `free`.
+                        // Heap MemFlags match `GcStore` so the write aliases
+                        // the later header stamp; `trusted()` does not.
                         if op_idx + 1 < ops.len()
                             && let Some(tid) =
                                 following_nursery_tid(&ops[op_idx], &ops[op_idx + 1], &constants)
                         {
                             let tid_val = builder.ins().iconst(cl_types::I64, tid);
-                            builder.ins().store(flags, tid_val, free, 0);
+                            builder
+                                .ins()
+                                .store(heap_mem_flags(OpCode::GcStore), tid_val, free, 0);
                         }
                         let hdr_sz = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                         let obj = builder.ins().iadd(free, hdr_sz);
@@ -16466,7 +16474,11 @@ impl CraneliftBackend {
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
                     builder.ins().store(flags, new_free, nf_ptr, 0);
-                    builder.ins().store(flags, type_id, free, 0);
+                    // Heap MemFlags match `GcStore` so the tid word aliases
+                    // a later header stamp; `trusted()` does not.
+                    builder
+                        .ins()
+                        .store(heap_mem_flags(OpCode::GcStore), type_id, free, 0);
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let fast_result = builder.ins().iadd(free, header_size);
                     let mut fast_args: Vec<BlockArg> =
@@ -16587,16 +16599,19 @@ impl CraneliftBackend {
 
                     // fast: bump free pointer, zero the header word, return payload.
                     // `gen_initialize_tid_keep_flags` writes only the type-id
-                    // half. dynasm does `mov QWORD [rcx], 0` / `str xzr, [x0]`
-                    // first; without that, a recycled nursery slot keeps
-                    // `HAS_SHADOW` from the previous occupant.
+                    // half after the merge so a slow-path `YOUNG_RAWMALLOC`
+                    // survives. `malloc_cond_varsize_frame` writes the whole
+                    // header word first (`mov QWORD [rcx], 0` / `str xzr, [x0]`).
+                    // Heap MemFlags match `GcStore` so this store aliases the
+                    // later 4-byte heap tid stamp; `trusted()` does not, and a
+                    // recycled nursery slot would keep `HAS_SHADOW`.
                     builder.switch_to_block(fast_block);
                     builder.seal_block(fast_block);
                     builder.ins().store(flags, new_free, nf_ptr, 0);
                     let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
-                        .store(MemFlagsData::trusted(), zero_hdr, free, 0);
+                        .store(heap_mem_flags(OpCode::GcStore), zero_hdr, free, 0);
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
                     let mut fast_args: Vec<BlockArg> =
@@ -32358,6 +32373,70 @@ mod tests {
         );
     }
 
+    /// `CallMallocNurseryVarsizeFrame` fast path plus
+    /// `gen_initialize_tid_keep_flags`. `malloc_cond_varsize_frame` writes
+    /// the whole header word first so a recycled slot's `HAS_SHADOW` is
+    /// cleared before the 4-byte type-id store.
+    #[test]
+    fn varsize_frame_fast_path_clears_recycled_has_shadow() {
+        let mut backend = make_gc_backend();
+        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        consts.insert(10000, 32_i64);
+        consts.insert(10001, -8_i64);
+        consts.insert(10002, 7_i64);
+        consts.insert(10003, (TYPE_ID_BITS / 8) as i64);
+        backend.set_constants(consts);
+
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(
+                OpCode::CallMallocNurseryVarsizeFrame,
+                &[OpRef::int_op(10000)],
+                0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[
+                    OpRef::ref_op(0),
+                    OpRef::int_op(10001),
+                    OpRef::int_op(10002),
+                    OpRef::int_op(10003),
+                ],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(1506);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        with_cranelift_gc_required(|gc| {
+            let p = gc.nursery_free();
+            assert!(!p.is_null());
+            let mut dirty = GcHeader::new(99);
+            dirty.set_flag(GcFlags::GCFLAG_HAS_SHADOW);
+            unsafe {
+                std::ptr::write(p as *mut GcHeader, dirty);
+            }
+        });
+
+        let frame = backend.execute_token(&token, &[]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        let hdr = unsafe { *header_of(obj.0) };
+        assert_eq!(hdr.type_id(), 7);
+        assert!(
+            !hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW),
+            "varsize-frame fast path must clear HAS_SHADOW from a recycled slot, hdr={:#x}",
+            hdr.tid_and_flags
+        );
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            tid_store_address_op(&clif, 0, "load"),
+            "fast path must zero the header word at nursery free:\n{clif}"
+        );
+    }
+
     #[test]
     fn test_gc_batched_allocation_layout_with_configured_runtime() {
         let mut backend = make_gc_backend();
@@ -32469,6 +32548,21 @@ mod tests {
         assert_eq!(
             super::following_nursery_tid(&malloc, &inline, &constants),
             Some(9)
+        );
+
+        let keep_flags = mk_op(
+            OpCode::GcStore,
+            &[
+                OpRef::ref_op(0),
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(11),
+                OpRef::const_int((TYPE_ID_BITS / 8) as i64),
+            ],
+            OpRef::NONE.raw(),
+        );
+        assert_eq!(
+            super::following_nursery_tid(&malloc, &keep_flags, &constants),
+            Some(11)
         );
 
         let wrong_base = mk_op(
