@@ -365,6 +365,23 @@ pub unsafe fn reuse_off_gc_jitframe(frame: *mut JitFrame) {
     }
 }
 
+/// Whether `frame` is an [`alloc_off_gc_jitframe`] host block.
+///
+/// The mimic header at `frame - GcHeader::SIZE` is zeroed for a host
+/// block (`zero_off_gc_header`). A GC JITFRAME stores `GcHeader::new(type_id)`
+/// there.
+///
+/// # Safety
+/// `frame` is a jitframe payload: an off-GC block with the reserved
+/// header word, or a GC object with a `GcHeader` at the same offset.
+#[inline]
+pub(crate) unsafe fn jitframe_is_off_gc_host(frame: *mut JitFrame) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    unsafe { (*majit_gc::header::header_of(frame as usize)).tid_and_flags == 0 }
+}
+
 /// Release a frame from [`alloc_off_gc_jitframe`].
 ///
 /// The frame pointer is not the block base — the size slot and the header word

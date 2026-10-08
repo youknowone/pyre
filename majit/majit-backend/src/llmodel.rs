@@ -21,7 +21,10 @@
 use majit_gc::shadow_stack::OwnerRootGuard;
 use majit_ir::{FailDescr, GcRef};
 
-use crate::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
+use crate::jitframe::{
+    FIRST_ITEM_OFFSET, JitFrame, free_host_jitframe, jitframe_is_off_gc_host, malloc_host_jitframe,
+    reuse_off_gc_jitframe,
+};
 
 /// llmodel.py — get_latest_descr.
 ///
@@ -487,6 +490,116 @@ pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
     unsafe {
         (*ptr).jf_savedata = value;
     }
+}
+
+/// True when a raw finish entry must take the general `execute_token` path.
+///
+/// `llmodel.py execute_token` allocates through `gc_ll_descr`. The
+/// parked-frame path is only valid with no collector and no exec
+/// diagnostics that inspect the frame.
+#[inline]
+pub fn raw_done_entry_use_general(diag: bool) -> bool {
+    diag || majit_gc::collector_installed()
+}
+
+/// Take the token's parked off-GC frame when it fits, else allocate.
+///
+/// `llmodel.py execute_token` allocates a fresh frame; reuse is the
+/// off-GC stand-in for that bump.
+#[inline]
+pub fn take_or_alloc_parked_entry_frame(
+    token: &crate::JitCellToken,
+    size_bytes: usize,
+) -> *mut JitFrame {
+    match token.take_entry_frame(size_bytes) {
+        Some(p) => {
+            unsafe { reuse_off_gc_jitframe(p) };
+            p
+        }
+        None => malloc_host_jitframe(size_bytes),
+    }
+}
+
+/// Park a single unforwarded host frame on the token, else free each
+/// off-GC host link. A GC-owned replacement stays for the collector.
+///
+/// `llmodel.py execute_token` does not free. A chain, or a slot that
+/// already holds a frame, is still referenced or is a second live frame.
+#[inline]
+pub fn park_or_free_done_entry_frame(
+    token: &crate::JitCellToken,
+    head: *mut JitFrame,
+    tip: *mut JitFrame,
+) {
+    let single = tip == head && unsafe { (*head).jf_forward.is_null() };
+    if single && token.park_entry_frame(head) {
+        return;
+    }
+    unsafe { free_off_gc_host_done_entry_chain(head) };
+}
+
+/// Walk `jf_forward` (`jitframe.py jitframe_resolve`) and release each
+/// off-GC host block. `malloc_jitframe_no_collect` may mint a GC
+/// replacement onto a host head; that link is left for the collector.
+///
+/// Host vs GC is the header word at `obj - GcHeader::SIZE`.
+unsafe fn free_off_gc_host_done_entry_chain(head: *mut JitFrame) {
+    let mut cur = head;
+    while !cur.is_null() {
+        let next = unsafe { (*cur).jf_forward };
+        if unsafe { jitframe_is_off_gc_host(cur) } {
+            unsafe { free_host_jitframe(cur) };
+        }
+        cur = next;
+    }
+}
+
+/// Slot 0 of a `DoneWithThisFrameDescrInt` frame. `get_int_value(deadframe, 0)`.
+#[inline(always)]
+pub fn done_int_slot0(tip: *mut JitFrame) -> i64 {
+    unsafe { get_int_value_direct(tip, 0) as i64 }
+}
+
+/// Slot 0 of a `DoneWithThisFrameDescrRef` frame. `get_ref_value(deadframe, 0)`.
+#[inline(always)]
+pub fn done_ref_slot0(tip: *mut JitFrame) -> usize {
+    unsafe { get_ref_value_direct(tip, 0) }
+}
+
+/// Host-frame setup for a raw finish. `llmodel.py execute_token`.
+///
+/// Reuses the token's parked off-GC frame when it fits, else allocates.
+/// Inits the header and stores `args` at `first_slot`. The caller
+/// invokes compiled code under its own calling convention and reads
+/// slot 0 of the returned frame.
+///
+/// # Safety
+/// `num_slots` is the `jf_frame` length ([`JitFrame::alloc_size`]).
+/// `first_slot + args.len()` must fit in that length.
+#[inline(always)]
+pub unsafe fn prepare_done_raw_entry_frame(
+    token: &crate::JitCellToken,
+    args: &[i64],
+    first_slot: usize,
+    num_slots: usize,
+) -> *mut JitFrame {
+    assert!(
+        num_slots >= first_slot.saturating_add(args.len()),
+        "execute_token: frame depth {num_slots} < input top {} for {} args",
+        first_slot + args.len(),
+        args.len()
+    );
+    let clt = unsafe { &*token.compiled_loop_token_ptr() };
+    let fi_ptr = clt.frame_info.data_ptr() as *const crate::JitFrameInfo;
+    let frame_bytes = JitFrame::alloc_size(num_slots);
+    let jf_ptr = take_or_alloc_parked_entry_frame(token, frame_bytes);
+    unsafe {
+        JitFrame::init(jf_ptr, fi_ptr, num_slots);
+        for (i, &word) in args.iter().enumerate() {
+            set_int_value(jf_ptr, first_slot + i, word as isize);
+        }
+    }
+    jf_ptr
 }
 
 #[cfg(test)]

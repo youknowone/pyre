@@ -106,6 +106,16 @@ fn majit_verify_enabled() -> bool {
     *ENABLED
 }
 
+/// Logging and dump gates, read once per process. The raw DONE_REF
+/// entry falls back to the general path when any of these is on.
+#[inline]
+fn exec_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        majit_dump_enabled() || majit_verify_enabled() || majit_ir::debug::have_debug_prints()
+    });
+    *ENABLED
+}
+
 /// Whether `MAJIT_DUMP` is set, cached at first access.
 fn majit_dump_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
@@ -285,8 +295,13 @@ fn match_metainterp_finish_descr(
 use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
     BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
-    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, check_jitframe_descr, jitframe_is_gc_object,
-    jitframe_write_barrier, malloc_entry_jitframe, malloc_jitframe_no_collect,
+    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, check_jitframe_descr,
+    jitframe_is_gc_object, jitframe_write_barrier, malloc_entry_jitframe,
+    malloc_jitframe_no_collect,
+};
+use majit_backend::llmodel::{
+    done_ref_slot0, park_or_free_done_entry_frame, prepare_done_raw_entry_frame,
+    raw_done_entry_use_general,
 };
 /// Byte offset of `jf_frame_length` from JitFrame start
 /// (`jitframe.py:84` — `jf_frame`'s length word sits at the array base).
@@ -10784,6 +10799,10 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
+    /// Cell address of `done_with_this_frame_descr_ref`, published when
+    /// the singleton is attached. The raw finish entry compares `jf_descr`
+    /// to this word; `descr_attachments`' load is not taken on that path.
+    done_ref_cell: AtomicUsize,
     /// CLIF of the body most recently compiled by this backend.
     #[cfg(test)]
     last_body_clif: String,
@@ -11059,6 +11078,7 @@ impl CraneliftBackend {
             vtable_offset: None,
             w_class_offset: None,
             descr_attachments: Arc::new(majit_backend::CpuDescrCell::default()),
+            done_ref_cell: AtomicUsize::new(0),
             #[cfg(test)]
             last_body_clif: String::new(),
         }
@@ -20922,6 +20942,103 @@ impl CraneliftBackend {
             &family_entry,
         );
     }
+
+    /// `jf_descr` equals the `DoneWithThisFrameDescrRef` cell
+    /// `set_done_with_this_frame_descr_ref` published.
+    ///
+    /// `compile.py make_and_attach_done_descrs` attaches that singleton
+    /// before any compiled code runs, so the exit is one compare.
+    #[inline(always)]
+    fn finish_is_done_ref(&self, descr_raw: usize) -> bool {
+        let cached = self.done_ref_cell.load(Ordering::Acquire);
+        descr_raw != 0 && descr_raw == cached
+    }
+
+    /// Host-frame entry for a raw finish. Allocate, store `args`, call the
+    /// token, and return `(head, tip, num_slots, jf_descr)`.
+    ///
+    /// `llmodel.py execute_token`. Frame parking and the slot stores are
+    /// shared (`prepare_done_raw_entry_frame`); the call is this backend's
+    /// `(jitframe, dispatch_key)` convention. Key 0 is the peeled preamble.
+    #[inline(always)]
+    fn run_done_raw_entry(
+        token: &JitCellToken,
+        compiled: &CompiledLoop,
+        args: &[i64],
+    ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
+        let depth = compiled.max_output_slots.max(args.len()).max(1);
+        let num_slots = depth + compiled.num_ref_roots;
+        let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots) };
+        let code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
+        let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
+            unsafe { std::mem::transmute(code_ptr) };
+        let tip = unsafe { func(jf_ptr as *mut i64, 0) as *mut JitFrame };
+        let descr_raw = unsafe { majit_backend::llmodel::get_latest_descr(tip) };
+        (jf_ptr, tip, num_slots, descr_raw)
+    }
+
+    /// Any exit other than `DoneWithThisFrameDescrRef` builds the deadframe.
+    #[cold]
+    #[inline(never)]
+    fn raw_entry_deadframe(
+        compiled: &CompiledLoop,
+        head: *mut JitFrame,
+        tip: *mut JitFrame,
+    ) -> DeadFrame {
+        let descr_raw = unsafe { majit_backend::llmodel::get_latest_descr(tip) };
+        let attachments = compiled.cpu_attachments.read();
+        let (fail_index, direct_descr) =
+            resolve_exit_descr(descr_raw as i64, &compiled.fail_descrs, attachments);
+        let fail_descr = if let Some(descr) = direct_descr {
+            descr
+        } else if (fail_index as usize) < compiled.fail_descrs.len() {
+            ExitDescr::owned(compiled.fail_descrs[fail_index as usize].clone())
+        } else {
+            ExitDescr::owned(
+                compiled
+                    .fail_descrs
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| compiled.fail_descrs[0].clone()),
+            )
+        };
+        deadframe_from_jitframe(
+            GcRef(tip as usize),
+            fail_descr,
+            Some(FrameHeapOwner::of(head)),
+        )
+    }
+
+    /// Collector and diag entries keep the layered `execute_token` path.
+    #[cold]
+    #[inline(never)]
+    fn execute_token_done_ref_raw_general(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        let kinds = token.inputarg_types();
+        let n = args.len();
+        let mut stack = [Value::Void; 8];
+        if n <= stack.len() {
+            for (i, slot) in stack[..n].iter_mut().enumerate() {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                *slot = majit_backend::value_from_unspecialized_word(args[i], kind);
+            }
+            return <Self as majit_backend::Backend>::execute_token_done_ref(
+                self,
+                token,
+                &stack[..n],
+            );
+        }
+        let values: Vec<Value> = (0..n)
+            .map(|i| {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                majit_backend::value_from_unspecialized_word(args[i], kind)
+            })
+            .collect();
+        <Self as majit_backend::Backend>::execute_token_done_ref(self, token, &values)
+    }
 }
 
 // Backend trait implementation
@@ -21090,6 +21207,12 @@ impl majit_backend::Backend for CraneliftBackend {
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
             .update(|a| a.done_with_this_frame_descr_ref = Some(descr));
+        let ptr = self
+            .descr_attachments
+            .read()
+            .descr_ptrs()
+            .done_with_this_frame_descr_ref;
+        self.done_ref_cell.store(ptr, Ordering::Release);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
@@ -21510,6 +21633,38 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("compiled data is not CompiledLoop")
             .current();
         Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), 0, true)
+    }
+
+    /// `llmodel.py execute_token` / `warmstate.py execute_assembler` ref
+    /// finish: inline hot path, cold general fallback when a collector is
+    /// installed or exec diag is on. Slot 0 is `get_ref_value_direct`. The
+    /// call uses this backend's `(jitframe, dispatch_key)` convention.
+    #[inline]
+    fn execute_token_done_ref_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        if raw_done_entry_use_general(exec_diag_enabled()) {
+            return self.execute_token_done_ref_raw_general(token, args);
+        }
+        let compiled = token
+            .compiled
+            .get()
+            .expect("token has no compiled code")
+            .downcast_ref::<CompiledLoop>()
+            .expect("compiled data is not CompiledLoop")
+            .current();
+        let (jf_ptr, tip, _num_slots, descr_raw) = Self::run_done_raw_entry(token, compiled, args);
+        if self.finish_is_done_ref(descr_raw) {
+            // Host frames are off-GC: `jitframe.py jitframe_resolve` walks
+            // `jf_forward` only. `JitFrame::resolve` also chases a nursery
+            // stub via `gc_current_object_address`, which this path does not.
+            let value = done_ref_slot0(unsafe { JitFrame::resolve_forward(tip) });
+            park_or_free_done_entry_frame(token, jf_ptr, tip);
+            return Ok(value);
+        }
+        Err(Self::raw_entry_deadframe(compiled, jf_ptr, tip))
     }
 
     fn execute_token_with_dispatch_key(
