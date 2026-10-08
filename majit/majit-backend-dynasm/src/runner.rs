@@ -576,6 +576,8 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     }
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
     majit_gc::set_active_write_barrier_before_move(Some(dynasm_gc_write_barrier_before_move));
+    majit_gc::set_active_write_barrier_from_array(Some(dynasm_gc_write_barrier_from_array));
+    majit_gc::set_active_writebarrier_before_copy(Some(dynasm_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
     majit_gc::set_active_finalizer_hooks(
         Some(dynasm_register_finalizer),
@@ -1301,6 +1303,40 @@ fn dynasm_gc_write_barrier_before_move(obj: GcRef) {
     }
     // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
     majit_gc::gc_sync::gc_op(|g| g.writebarrier_before_move(obj.0));
+}
+
+fn dynasm_gc_write_barrier_from_array(obj: GcRef, index: usize) {
+    if gc_box::with_mut(|g| g.write_barrier_from_array(obj, index)).is_some() {
+        return;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.write_barrier_from_array(obj, index));
+}
+
+fn dynasm_gc_writebarrier_before_copy(
+    source: GcRef,
+    dest: GcRef,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) -> bool {
+    if let Some(handled) = gc_box::with_mut(|g| {
+        g.writebarrier_before_copy(source, dest, source_start, dest_start, length)
+    }) {
+        return handled;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|g| {
+            majit_gc::GcAllocator::writebarrier_before_copy(
+                g,
+                source,
+                dest,
+                source_start,
+                dest_start,
+                length,
+            )
+        });
+    }
+    true
 }
 
 fn dynasm_gc_write_barrier(obj: GcRef) {

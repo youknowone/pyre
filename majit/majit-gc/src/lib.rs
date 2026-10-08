@@ -890,6 +890,24 @@ pub trait GcAllocator: Send {
     /// collector without card marking wants.
     fn writebarrier_before_move(&mut self, _obj: GcRef) {}
 
+    /// incminimark.py `writebarrier_before_copy`: same effect as a barrier on
+    /// each copied element, except it may reset flags a bit too eagerly.
+    ///
+    /// The default is the generic answer every collector can give: a
+    /// write-barrier on `dest` and `true` (the copy is handled).
+    fn writebarrier_before_copy(
+        &mut self,
+        source: GcRef,
+        dest: GcRef,
+        source_start: usize,
+        dest_start: usize,
+        length: usize,
+    ) -> bool {
+        let _ = (source, source_start, dest_start, length);
+        self.write_barrier(dest);
+        true
+    }
+
     /// `llop.shrink_array(Bool, p, smallerlength)`, incminimark.py.
     ///
     /// Record in place that a varsize object is shorter than it was.  The
@@ -1802,9 +1820,25 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.write_barrier(obj))
     }
     fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
+        gc_sync::gc_op(|gc| gc.write_barrier_from_array(obj, index))
+    }
+    fn writebarrier_before_copy(
+        &mut self,
+        source: GcRef,
+        dest: GcRef,
+        source_start: usize,
+        dest_start: usize,
+        length: usize,
+    ) -> bool {
         gc_sync::gc_op(|gc| {
-            let shift = gc.card_page_shift();
-            gc.do_write_barrier_card(obj, index, shift);
+            GcAllocator::writebarrier_before_copy(
+                gc,
+                source,
+                dest,
+                source_start,
+                dest_start,
+                length,
+            )
         })
     }
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
@@ -4343,10 +4377,15 @@ pub fn gc_isenabled() -> bool {
 /// Process-global callback that performs a host-side write barrier through
 /// the currently active backend GC.
 pub type WriteBarrierFn = fn(obj: GcRef);
+pub type WriteBarrierFromArrayFn = fn(obj: GcRef, index: usize);
+pub type WritebarrierBeforeCopyFn =
+    fn(source: GcRef, dest: GcRef, source_start: usize, dest_start: usize, length: usize) -> bool;
 
 global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_MANAGED: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_BEFORE_MOVE: WriteBarrierFn);
+global_hook!(static ACTIVE_WRITE_BARRIER_FROM_ARRAY: WriteBarrierFromArrayFn);
+global_hook!(static ACTIVE_WRITEBARRIER_BEFORE_COPY: WritebarrierBeforeCopyFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
@@ -4361,6 +4400,16 @@ pub fn set_active_write_barrier_managed(hook: Option<WriteBarrierFn>) {
 /// Install the active backend's before-move barrier. Pass `None` to clear.
 pub fn set_active_write_barrier_before_move(hook: Option<WriteBarrierFn>) {
     ACTIVE_WRITE_BARRIER_BEFORE_MOVE.set(hook);
+}
+
+/// Install the active backend's `write_barrier_from_array`. Pass `None` to clear.
+pub fn set_active_write_barrier_from_array(hook: Option<WriteBarrierFromArrayFn>) {
+    ACTIVE_WRITE_BARRIER_FROM_ARRAY.set(hook);
+}
+
+/// Install the active backend's `writebarrier_before_copy`. Pass `None` to clear.
+pub fn set_active_writebarrier_before_copy(hook: Option<WritebarrierBeforeCopyFn>) {
+    ACTIVE_WRITEBARRIER_BEFORE_COPY.set(hook);
 }
 
 /// Perform a write barrier through the active backend.
@@ -4402,26 +4451,35 @@ pub fn gc_write_barrier_managed(obj: GcRef) {
 /// incminimark.py `write_barrier_from_array(addr_array, index)`.
 ///
 /// Host `setarrayitem_gc` uses this so a carded array records the written
-/// page rather than the whole object. A collector that is not yet
-/// initialized has no remembered set, so the store is unbarriered.
+/// page rather than the whole object. Upstream has one collector reached
+/// through `self.gcdata.gc` (`gct_gc_writebarrier_before_copy`,
+/// `transform_generic_set` in framework.py); the active hook is that
+/// dispatch point here, matching [`gc_write_barrier`]. A backend's
+/// `install_gc_box` stores a per-thread collector whose nursery differs
+/// from the process singleton, so the hook must win while both are present.
+/// `gc_sync` is the collector without a backend; with neither, the store
+/// is the whole-object barrier.
 pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
-    if !gc_sync::is_initialized() {
-        // Cranelift/wasm keep the collector in the backend TLS box.
-        gc_write_barrier(obj);
+    if let Some(f) = ACTIVE_WRITE_BARRIER_FROM_ARRAY.get() {
+        f(obj, index);
         return;
     }
-    gc_sync::gc_op(|gc| {
-        let shift = gc.card_page_shift();
-        gc.do_write_barrier_card(obj, index, shift);
-    });
+    if gc_sync::is_initialized() {
+        gc_sync::gc_op(|gc| gc.write_barrier_from_array(obj, index));
+        return;
+    }
+    gc_write_barrier(obj);
 }
 
 /// incminimark.py `writebarrier_before_copy`.
 ///
 /// `rgc.py ll_arraycopy` calls this before `raw_memcopy`. `false` means the
 /// bulk form cannot express the copy and the caller owes per-item
-/// `setarrayitem_gc`. A collector that is not yet initialized has no
-/// remembered set, so the copy is unbarriered.
+/// `setarrayitem_gc`. Upstream reaches `self.gcdata.gc` through
+/// `gct_gc_writebarrier_before_copy` (framework.py); the active hook is
+/// that dispatch point here, matching [`gc_write_barrier`]. `gc_sync` is
+/// the collector without a backend; with neither, dest is remembered the
+/// same way [`gc_write_barrier`] does and the copy is handled.
 pub fn gc_writebarrier_before_copy(
     source: GcRef,
     dest: GcRef,
@@ -4429,15 +4487,23 @@ pub fn gc_writebarrier_before_copy(
     dest_start: usize,
     length: usize,
 ) -> bool {
-    if !gc_sync::is_initialized() {
-        // Cranelift/wasm keep the collector in the backend TLS box, not
-        // `gc_sync`. Remember dest the same way `gc_write_barrier` does.
-        gc_write_barrier(dest);
-        return true;
+    if let Some(f) = ACTIVE_WRITEBARRIER_BEFORE_COPY.get() {
+        return f(source, dest, source_start, dest_start, length);
     }
-    gc_sync::gc_op(|gc| {
-        gc.writebarrier_before_copy(source.0, dest.0, source_start, dest_start, length)
-    })
+    if gc_sync::is_initialized() {
+        return gc_sync::gc_op(|gc| {
+            GcAllocator::writebarrier_before_copy(
+                gc,
+                source,
+                dest,
+                source_start,
+                dest_start,
+                length,
+            )
+        });
+    }
+    gc_write_barrier(dest);
+    true
 }
 
 // ── TEMPORARY DIAGNOSTIC: blackhole-materialized object registry ──
@@ -5125,5 +5191,144 @@ mod headerless_no_collect_tests {
             listed, ordered,
             "incminimark.py's GC_STATES is {listed:?} and this GC's states are {ordered:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod writebarrier_before_copy_default_tests {
+    use super::*;
+
+    /// A `GcAllocator` that only records `write_barrier`, so the trait
+    /// default of `writebarrier_before_copy` is the method under test.
+    struct RecordingGc {
+        barriered: Vec<GcRef>,
+    }
+
+    impl GcAllocator for RecordingGc {
+        fn alloc_nursery(&mut self, _size: usize) -> GcRef {
+            GcRef(0x1000)
+        }
+        fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
+            self.alloc_nursery(size)
+        }
+        fn alloc_varsize(&mut self, base: usize, item: usize, len: usize) -> GcRef {
+            self.alloc_nursery(base + item * len)
+        }
+        fn alloc_varsize_no_collect(&mut self, base: usize, item: usize, len: usize) -> GcRef {
+            self.alloc_varsize(base, item, len)
+        }
+        fn write_barrier(&mut self, obj: GcRef) {
+            self.barriered.push(obj);
+        }
+        fn jit_remember_young_pointer_from_array(&mut self, _obj: GcRef) {}
+        fn remember_young_pointer_from_array2(
+            &mut self,
+            _obj: GcRef,
+            _index: usize,
+            _card_page_shift: u32,
+        ) {
+        }
+        fn collect_nursery(&mut self) {}
+        fn collect_full(&mut self) {}
+        fn nursery_free(&self) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+        fn nursery_free_addr(&self) -> usize {
+            0
+        }
+        fn nursery_top(&self) -> *const u8 {
+            std::ptr::null()
+        }
+        fn nursery_top_addr(&self) -> usize {
+            0
+        }
+        fn max_nursery_object_size(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn trait_default_writebarrier_before_copy_remembers_dest_and_returns_true() {
+        let mut gc = RecordingGc {
+            barriered: Vec::new(),
+        };
+        let source = GcRef(0x1000);
+        let dest = GcRef(0x2000);
+        assert!(gc.writebarrier_before_copy(source, dest, 0, 0, 4));
+        assert_eq!(gc.barriered, vec![dest]);
+    }
+}
+
+#[cfg(test)]
+mod write_barrier_dispatch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static FROM_ARRAY_CALLED: AtomicBool = AtomicBool::new(false);
+    static FROM_ARRAY_OBJ: AtomicUsize = AtomicUsize::new(0);
+    static FROM_ARRAY_INDEX: AtomicUsize = AtomicUsize::new(0);
+    static BEFORE_COPY_CALLED: AtomicBool = AtomicBool::new(false);
+    static BEFORE_COPY_DEST: AtomicUsize = AtomicUsize::new(0);
+
+    fn stub_from_array(obj: GcRef, index: usize) {
+        FROM_ARRAY_CALLED.store(true, Ordering::SeqCst);
+        FROM_ARRAY_OBJ.store(obj.0, Ordering::SeqCst);
+        FROM_ARRAY_INDEX.store(index, Ordering::SeqCst);
+    }
+
+    fn stub_before_copy(
+        _source: GcRef,
+        dest: GcRef,
+        _source_start: usize,
+        _dest_start: usize,
+        _length: usize,
+    ) -> bool {
+        BEFORE_COPY_CALLED.store(true, Ordering::SeqCst);
+        BEFORE_COPY_DEST.store(dest.0, Ordering::SeqCst);
+        false
+    }
+
+    struct RestoreWriteBarrierHooks {
+        from_array: Option<WriteBarrierFromArrayFn>,
+        before_copy: Option<WritebarrierBeforeCopyFn>,
+    }
+    impl Drop for RestoreWriteBarrierHooks {
+        fn drop(&mut self) {
+            set_active_write_barrier_from_array(self.from_array);
+            set_active_writebarrier_before_copy(self.before_copy);
+        }
+    }
+
+    #[test]
+    fn active_from_array_and_before_copy_hooks_win_over_gc_sync() {
+        let _lock = GUARD_HOOKS_TEST_LOCK.lock();
+        if !gc_sync::is_initialized() {
+            gc_sync::store_singleton(Box::new(collector::MiniMarkGC::new()));
+        }
+        assert!(
+            gc_sync::is_initialized(),
+            "the singleton must be live so a reversed dispatch would skip the hook"
+        );
+
+        let _restore = RestoreWriteBarrierHooks {
+            from_array: ACTIVE_WRITE_BARRIER_FROM_ARRAY.get(),
+            before_copy: ACTIVE_WRITEBARRIER_BEFORE_COPY.get(),
+        };
+        FROM_ARRAY_CALLED.store(false, Ordering::SeqCst);
+        BEFORE_COPY_CALLED.store(false, Ordering::SeqCst);
+        set_active_write_barrier_from_array(Some(stub_from_array));
+        set_active_writebarrier_before_copy(Some(stub_before_copy));
+
+        let obj = GcRef(0xabc0);
+        gc_write_barrier_from_array(obj, 7);
+        assert!(FROM_ARRAY_CALLED.load(Ordering::SeqCst));
+        assert_eq!(FROM_ARRAY_OBJ.load(Ordering::SeqCst), 0xabc0);
+        assert_eq!(FROM_ARRAY_INDEX.load(Ordering::SeqCst), 7);
+
+        let source = GcRef(0x1000);
+        let dest = GcRef(0x2000);
+        assert!(!gc_writebarrier_before_copy(source, dest, 1, 2, 3));
+        assert!(BEFORE_COPY_CALLED.load(Ordering::SeqCst));
+        assert_eq!(BEFORE_COPY_DEST.load(Ordering::SeqCst), 0x2000);
     }
 }

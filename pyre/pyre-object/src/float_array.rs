@@ -88,27 +88,33 @@ impl FloatArray {
         arr
     }
 
-    /// `AbstractUnwrappedStrategy.mul`: `erase(l * times)` into one items array.
+    /// `ll_mul` / `ll_mul_loop`: `erase(l * times)` into one items array.
+    /// `length == 1` is `ll_alloc_and_set`; otherwise the non-gcptr doubling
+    /// copy (`f64` items hold no GC pointers).
     pub fn from_repeated(src: &[f64], times: usize) -> Option<Self> {
-        let len = src.len().checked_mul(times)?;
-        if len == 0 {
+        let length = src.len();
+        let resultlen = length.checked_mul(times)?;
+        if resultlen == 0 {
             return Some(Self::empty());
         }
         let arr = Self {
-            block: unsafe { try_alloc_typed_items_block(len, gc_float_array_gc_type_id())? },
-            len: crate::object_array::length_cell(len),
+            block: unsafe { try_alloc_typed_items_block(resultlen, gc_float_array_gc_type_id())? },
+            len: crate::object_array::length_cell(resultlen),
         };
         unsafe {
-            if src.len() == 1 {
-                std::slice::from_raw_parts_mut(arr.base(), len).fill(src[0]);
+            if length == 1 {
+                std::slice::from_raw_parts_mut(arr.base(), resultlen).fill(src[0]);
             } else {
-                for t in 0..times {
-                    std::ptr::copy_nonoverlapping(
-                        src.as_ptr(),
-                        arr.base().add(t * src.len()),
-                        src.len(),
-                    );
+                std::ptr::copy_nonoverlapping(src.as_ptr(), arr.base(), length);
+                let mut j = length;
+                while j < resultlen {
+                    let copy_length = std::cmp::min(resultlen - j, j);
+                    // `copy_length <= j`, so `res[0..copy_length]` and
+                    // `res[j..j + copy_length]` are disjoint.
+                    std::ptr::copy_nonoverlapping(arr.base(), arr.base().add(j), copy_length);
+                    j += copy_length;
                 }
+                debug_assert_eq!(j, resultlen);
             }
         }
         Some(arr)
@@ -349,5 +355,26 @@ impl IndexMut<usize> for FloatArray {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         unsafe { &mut *self.base().add(index) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_repeated_matches_naive_repeat() {
+        for length in [2usize, 3] {
+            let src: Vec<f64> = (0..length as i64).map(|n| n as f64).collect();
+            for times in [0usize, 1, 2, 5, 7] {
+                let expected: Vec<f64> = src.repeat(times);
+                let arr = FloatArray::from_repeated(&src, times).unwrap();
+                assert_eq!(
+                    arr.as_slice(),
+                    expected.as_slice(),
+                    "length={length} times={times}"
+                );
+            }
+        }
     }
 }
