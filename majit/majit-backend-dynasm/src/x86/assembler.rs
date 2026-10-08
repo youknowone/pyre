@@ -154,10 +154,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use majit_backend::{Backend, JitCellToken};
+    use majit_ir::forwarding::bound_operand_from_opref;
     use majit_ir::operand::Operand;
-    use majit_ir::{Op, OpCode, OpRc, OpRef, Type, make_array_descr_signed};
+    use majit_ir::{
+        GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr_signed,
+    };
 
+    use crate::regloc::{EDI, Loc, R10};
     use crate::runner::DynasmBackend;
+    use dynasmrt::dynasm;
 
     /// x86/regalloc.py `consider_call_malloc_nursery` binds the result with
     /// `force_allocate_reg(op, selected_reg=ecx)`; only FrameManager may spill
@@ -331,6 +336,174 @@ mod tests {
             bytes.windows(8).any(|window| window == bits)
         });
         assert!(parked, "float bits must live in the machine data block");
+    }
+
+    // ── COND_CALL_GC_WB_ARRAY inline card marking ──────────────────────
+
+    /// Array length that satisfies both clauses of the card question that a
+    /// fixture controls (incminimark.py:1017-1019). Same fixture as
+    /// aarch64/assembler.rs `CARD_ARRAY_LENGTH`.
+    const CARD_ARRAY_LENGTH: usize = 17024;
+
+    fn alloc_old_card_array(gc: &mut majit_gc::collector::MiniMarkGC, type_id: u32) -> GcRef {
+        let item_size = std::mem::size_of::<GcRef>();
+        let total_size = majit_gc::header::GcHeader::SIZE + 8 + item_size * CARD_ARRAY_LENGTH;
+        assert!(
+            total_size >= majit_gc::GcAllocator::max_nursery_object_size(gc),
+            "CARD_ARRAY_LENGTH no longer describes a large object, so it gets no cards"
+        );
+        let obj = gc.alloc_in_oldgen_with_cards(type_id, total_size, CARD_ARRAY_LENGTH, true);
+        assert!(
+            unsafe {
+                (*majit_gc::header::header_of(obj.0)).has_flag(majit_gc::GcFlags::GCFLAG_HAS_CARDS)
+            },
+            "the fixture array must carry cards"
+        );
+        unsafe { *(obj.0 as *mut usize) = CARD_ARRAY_LENGTH };
+        obj
+    }
+
+    fn run_cond_call_gc_wb_array(trace_id: u64, obj: GcRef, index: i64, index_in_register: bool) {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+
+        let mut inputargs = vec![InputArg::new_ref_rc(0)];
+        let mut values = vec![Value::Ref(obj)];
+        let index_operand = if index_in_register {
+            inputargs.push(InputArg::new_int_rc(1));
+            values.push(Value::Int(index));
+            bound_operand_from_opref(OpRef::input_arg_int(1))
+        } else {
+            bound_operand_from_opref(OpRef::const_int(index))
+        };
+
+        let barrier = Op::new(
+            OpCode::CondCallGcWbArray,
+            &[
+                bound_operand_from_opref(OpRef::input_arg_ref(0)),
+                index_operand,
+            ],
+        );
+        barrier.pos().set(OpRef::void_op(2));
+
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(3));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(trace_id);
+        backend
+            .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
+            .expect("compile COND_CALL_GC_WB_ARRAY trace");
+        let frame = backend.execute_token(&token, &values);
+        assert!(
+            backend.get_latest_descr(&frame).is_finish(),
+            "the barrier trace must run to its FINISH"
+        );
+    }
+
+    /// WriteBarrierSlowPath register arm: `SHR; XOR -8; BTS [header]`.
+    ///
+    /// r10 is in `ALL_CORE_REGS`. The previous byte-OR sequence copied
+    /// `loc_base` into r10 and then reloaded `loc_index` from r10, so an
+    /// index that already lived there became the array pointer. The
+    /// scratch-r11 BTS sequence must leave r10 untouched after the copy.
+    #[test]
+    fn wb_array_card_mark_reg_index_in_r10_matches_bts_sequence() {
+        let page_shift = majit_gc::collector::DEFAULT_CARD_PAGE_SHIFT;
+        let mut got = super::Assembler::new(0);
+        super::encode_wb_array_card_mark(&mut got, EDI.value, &Loc::Reg(R10), page_shift);
+        let got = got.finalize().unwrap();
+
+        // The previous byte-OR arm began `push r10` / `mov r10, loc_base`.
+        assert!(
+            !got.windows(2).any(|window| window == [0x41, 0x52]),
+            "must not push r10; the BTS arm uses scratch r11"
+        );
+        assert!(
+            got.windows(2).any(|window| window == [0x0F, 0xAB]),
+            "WriteBarrierSlowPath emits BTS [header], tmp"
+        );
+
+        let mut mov = super::Assembler::new(0);
+        dynasm!(mov ; .arch x64 ; mov r11, r10);
+        let mov = mov.finalize().unwrap();
+        assert!(
+            got.starts_with(&mov),
+            "index in r10 must be copied into scratch r11 before SHR/XOR/BTS"
+        );
+    }
+
+    /// opassembler.py:996-1015 / x86/assembler.py:2382-2386 inline card marking.
+    ///
+    /// The register arm shifts the index at runtime; the immediate arm folds
+    /// the same two quantities at assembly time. Both must dirty exactly the
+    /// card `mark_card` (incminimark.py:1574-1598) would dirty.
+    #[test]
+    fn cond_call_gc_wb_array_immed_index_marks_same_card_as_reg_index() {
+        let wb = crate::runner::dynasm_write_barrier_descr()
+            .expect("a write barrier descriptor must be resolvable");
+        assert_ne!(
+            wb.jit_wb_cards_set, 0,
+            "card marking must be enabled for this test to exercise the card arms"
+        );
+        let card_page_shift = wb.jit_wb_card_page_shift;
+
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let item_size = std::mem::size_of::<GcRef>();
+        let type_id = gc.register_type(majit_gc::TypeInfo::varsize(
+            8,
+            item_size,
+            0,
+            true,
+            Vec::new(),
+        ));
+        let obj_immed = alloc_old_card_array(&mut gc, type_id);
+        let obj_reg = alloc_old_card_array(&mut gc, type_id);
+        let obj_interp = alloc_old_card_array(&mut gc, type_id);
+
+        for obj in [obj_immed, obj_reg] {
+            unsafe {
+                (*majit_gc::header::header_of(obj.0)).set_flag(majit_gc::GcFlags::GCFLAG_CARDS_SET);
+            }
+        }
+        for obj in [obj_immed, obj_reg, obj_interp] {
+            assert!(
+                gc.dirty_cards(obj).is_empty(),
+                "a freshly allocated card array starts with every card clean"
+            );
+        }
+
+        const INDICES: [i64; 5] = [0, 5, 200, 1152, 2047];
+        for (n, &index) in INDICES.iter().enumerate() {
+            let trace_id = 9200 + 2 * n as u64;
+            run_cond_call_gc_wb_array(trace_id, obj_immed, index, false);
+            run_cond_call_gc_wb_array(trace_id + 1, obj_reg, index, true);
+            gc.do_write_barrier_card(obj_interp, index as usize, card_page_shift);
+            assert_eq!(
+                gc.dirty_cards(obj_immed),
+                gc.dirty_cards(obj_reg),
+                "index {index} must dirty the same cards through both arms"
+            );
+        }
+
+        let mut expected: Vec<usize> = INDICES
+            .iter()
+            .map(|&index| (index as usize) >> card_page_shift)
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+
+        let immed_cards = gc.dirty_cards(obj_immed);
+        let interp_cards = gc.dirty_cards(obj_interp);
+        assert_eq!(
+            immed_cards, interp_cards,
+            "the compiled card bits must match remember_young_pointer_from_array2"
+        );
+        assert_eq!(
+            immed_cards, expected,
+            "each index must dirty exactly its own card, and nothing else"
+        );
     }
 }
 
@@ -874,6 +1047,61 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
         ),
         Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
         Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
+    }
+}
+
+/// x86/assembler.py WriteBarrierSlowPath card-marking body.
+///
+/// Register and frame-index arms emit `SHR tmp, card_page_shift; XOR tmp, -8;
+/// BTS [header], tmp`. `tmp` is `X86_64_SCRATCH_REG` (r11), which is outside
+/// `ALL_CORE_REGS`, so the index register is never rewritten. A previous
+/// byte-OR sequence copied `loc_base` into r10 (an allocatable GPR) and then
+/// reloaded `loc_index` from that same register, so an index that already
+/// lived in r10 became the array pointer and the card bit was taken from the
+/// pointer instead of the index.
+///
+/// GCREF is the payload, so BTS uses displacement `-GcHeader::SIZE` — the
+/// same header-relative bias `WriteBarrierDescr::extract_flag_byte` and the
+/// Immed `byte_ofs` apply. Immediate indices keep the `OR8` fold
+/// (`x86/assembler.py` ImmedLoc).
+fn encode_wb_array_card_mark(mc: &mut Assembler, loc_base: u8, loc_index: &Loc, page_shift: u32) {
+    match loc_index {
+        Loc::Reg(idx) => {
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            if idx.value != scratch {
+                dynasm!(mc
+                    ; .arch x64
+                    ; mov Rq(scratch), Rq(idx.value as u8)
+                );
+            }
+            rx86::shr_ri(mc, scratch, page_shift as i32);
+            rx86::xor_ri(mc, scratch, -8);
+            rx86::bts_mr(
+                mc,
+                (loc_base, -(majit_gc::header::GcHeader::SIZE as i32)),
+                scratch,
+            );
+        }
+        Loc::Frame(idx) => {
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            rx86::mov_rb(mc, scratch, idx.ebp_loc.value);
+            rx86::shr_ri(mc, scratch, page_shift as i32);
+            rx86::xor_ri(mc, scratch, -8);
+            rx86::bts_mr(
+                mc,
+                (loc_base, -(majit_gc::header::GcHeader::SIZE as i32)),
+                scratch,
+            );
+        }
+        Loc::Immed(idx) | Loc::ImmedFloat(idx) => {
+            let byte_index = idx.value >> page_shift;
+            let byte_ofs = !((byte_index >> 3) as i64) - majit_gc::header::GcHeader::SIZE as i64;
+            let byte_val = 1_i64 << (byte_index & 7);
+            rx86::or8_mi(mc, (loc_base, byte_ofs as i32), i32::from(byte_val as i8));
+        }
+        // x86/assembler.py:2387-2388
+        // `raise AssertionError("index is neither RegLoc nor ImmedLoc")`
+        _ => panic!("index is neither RegLoc nor ImmedLoc"),
     }
 }
 
@@ -8753,135 +8981,15 @@ impl<'a> Assembler386<'a> {
             // Inline card bit set (x86/assembler.py WriteBarrierSlowPath parity)
             self.forget_scratch_register();
             dynasm!(self.mc ; .arch x64 ; =>card_mark);
-            match arglocs.get(1) {
-                Some(Loc::Reg(loc_index)) => {
-                    let page_shift = wb.jit_wb_card_page_shift as i8;
-                    let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
-                    dynasm!(self.mc ; .arch x64
-                    ; push r10
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; push rcx
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; push rdx
-                    );
-                    self.forget_scratch_register();
-                    dynasm!(self.mc ; .arch x64
-                    ; mov r11, Rq(loc_index.value as u8)
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; mov r10, Rq(loc_base.value as u8)
-                    );
-                    self.forget_if_scratch_written(rx86::R11);
-                    rx86::shr_ri(&mut self.mc, rx86::R11, i32::from(byte_shift));
-                    self.forget_scratch_register();
-                    dynasm!(self.mc ; .arch x64
-                    ; not r11
-                    );
-                    self.forget_if_scratch_written(rx86::R11);
-                    rx86::sub_ri(
-                        &mut self.mc,
-                        rx86::R11,
-                        majit_gc::header::GcHeader::SIZE as i32,
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; mov rcx, Rq(loc_index.value as u8)
-                    );
-                    rx86::shr_ri(&mut self.mc, rx86::ECX, i32::from(page_shift));
-                    dynasm!(self.mc ; .arch x64
-                    ; and rcx, 7
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; mov dl, 1
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; shl dl, cl
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; or BYTE [r10 + r11], dl
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; pop rdx
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; pop rcx
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; pop r10
-
-                    );
-                }
-                Some(Loc::Frame(loc_index)) => {
-                    let page_shift = wb.jit_wb_card_page_shift as i8;
-                    let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
-                    let index_offset = loc_index.ebp_loc.value;
-                    dynasm!(self.mc ; .arch x64
-                    ; push r10
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; push rcx
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; push rdx
-                    );
-                    self.forget_if_scratch_written(rx86::R11);
-                    rx86::mov_rb(&mut self.mc, rx86::R11, index_offset);
-                    dynasm!(self.mc ; .arch x64
-                                            ; mov r10, Rq(loc_base.value as u8)
-                    );
-                    self.forget_if_scratch_written(rx86::R11);
-                    rx86::shr_ri(&mut self.mc, rx86::R11, i32::from(byte_shift));
-                    self.forget_scratch_register();
-                    dynasm!(self.mc ; .arch x64
-                    ; not r11
-                    );
-                    self.forget_if_scratch_written(rx86::R11);
-                    rx86::sub_ri(
-                        &mut self.mc,
-                        rx86::R11,
-                        majit_gc::header::GcHeader::SIZE as i32,
-                    );
-                    rx86::mov_rb(&mut self.mc, rx86::ECX, index_offset);
-                    rx86::shr_ri(&mut self.mc, rx86::ECX, i32::from(page_shift));
-                    dynasm!(self.mc ; .arch x64
-                    ; and rcx, 7
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; mov dl, 1
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; shl dl, cl
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; or BYTE [r10 + r11], dl
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; pop rdx
-                    );
-                    dynasm!(self.mc ; .arch x64
-                    ; pop rcx
-                    );
-                    dynasm!(self.mc ; .arch x64
-                                            ; pop r10
-
-                    );
-                }
-                Some(Loc::Immed(loc_index) | Loc::ImmedFloat(loc_index)) => {
-                    let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
-                    let byte_ofs =
-                        !((byte_index >> 3) as i64) - majit_gc::header::GcHeader::SIZE as i64;
-                    let byte_val = 1_i64 << (byte_index & 7);
-                    rx86::or8_mi(
-                        &mut self.mc,
-                        (loc_base.value as u8, byte_ofs as i32),
-                        i32::from(byte_val as i8),
-                    );
-                }
-                // x86/assembler.py:2387-2388
-                // `raise AssertionError("index is neither RegLoc nor ImmedLoc")`
-                _ => panic!("index is neither RegLoc nor ImmedLoc"),
-            }
+            let loc_index = arglocs
+                .get(1)
+                .expect("COND_CALL_GC_WB_ARRAY card marking needs the index loc");
+            encode_wb_array_card_mark(
+                &mut self.mc,
+                loc_base.value as u8,
+                loc_index,
+                wb.jit_wb_card_page_shift,
+            );
         } else {
             // x86/assembler.py:2432-2436: non-array slow path.  The frame takes
             // the guarded entry; an ordinary store takes the one

@@ -861,6 +861,14 @@ pub fn or8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     writeimm8(mc, immed);
 }
 
+/// `BTS_mr` — `bts qword [base + ofs], r64`.
+///
+/// `rx86.py`: `BTS_mr = insn(rex_w, '\x0F\xAB', register(2,8), mem_reg_plus_const(1))`.
+/// WriteBarrierSlowPath uses this with a signed bit offset in the register.
+pub fn bts_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
+    op_mem(mc, RexKind::W, 0, &[0x0F, 0xAB], src, mem.0, mem.1);
+}
+
 /// `IMUL_rb` — `imul r64, [rbp + ofs]`.
 pub(crate) fn imul_rb(mc: &mut Assembler, dst: u8, offset: i32) {
     op_bp(mc, RexKind::W, 0, &[0x0F, 0xAF], dst, offset);
@@ -1501,5 +1509,25 @@ mod tests {
         let mut d = Assembler::new(0);
         dynasm!(d ; .arch x64 ; movq rax, xmm1 ; movq r8, xmm1 ; movq rax, xmm9 ; movq r8, xmm9);
         assert_same(&quad_rx(movdq_rx), &finish(d));
+    }
+
+    #[test]
+    fn bts_mr_matches_dynasm_header_displacement() {
+        // WriteBarrierSlowPath: `BTS [loc_base + (-GcHeader::SIZE)], r11`.
+        let got = enc(|mc| {
+            bts_mr(mc, (EDI, -8), R11);
+            bts_mr(mc, (R10, -8), R11);
+            bts_mr(mc, (R12, -8), R11);
+            bts_mr(mc, (R13, -8), R11);
+        });
+        let mut d = Assembler::new(0);
+        dynasm!(d
+            ; .arch x64
+            ; bts QWORD [rdi - 8], r11
+            ; bts QWORD [r10 - 8], r11
+            ; bts QWORD [r12 - 8], r11
+            ; bts QWORD [r13 - 8], r11
+        );
+        assert_same(&got, &finish(d));
     }
 }
