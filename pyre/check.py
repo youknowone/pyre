@@ -784,6 +784,12 @@ def child_env_base():
     return env
 
 
+# Both pyre and the PyPy baseline run under the same collector pins so the
+# ratio compares like with like.
+PYPY_GC_NURSERY_PIN = str(4 * 1024 * 1024)
+PYPY_GC_MIN_PIN = str(1024 * 1024 * 1024)
+
+
 def pyre_env():
     """Child environment for pyre runs: strict JIT plus one-line stats.
 
@@ -830,7 +836,7 @@ def pyre_env():
     # threshold pin below removes the collection those readings were counting,
     # and the baselines are recorded with both pins in place — but it still
     # fixes the minor schedule and the nursery term the threshold derives from.
-    env.setdefault("PYPY_GC_NURSERY", str(4 * 1024 * 1024))
+    env.setdefault("PYPY_GC_NURSERY", PYPY_GC_NURSERY_PIN)
     # Pin the major-collection threshold too, because the nursery pin above only
     # fixes one term of it. `min_heap_size` is `PYPY_GC_MIN`, else `nursery * 8`
     # (collector.rs:648), floored by `nursery * major_collection_threshold`
@@ -957,7 +963,7 @@ def pyre_env():
     # build_set_hashability/minmax_key_rooting: guards become 43/257 instead
     # of 42/256. Both the old and new guest reproduce those exact numbers
     # when changing only this minimum, so those baselines follow the preset.
-    env.setdefault("PYPY_GC_MIN", str(1024 * 1024 * 1024))
+    env.setdefault("PYPY_GC_MIN", PYPY_GC_MIN_PIN)
     # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
     # describe the fixture rather than the directory it happens to sit in.
     #
@@ -1032,6 +1038,14 @@ def pyre_env():
     # PYRE_WASM_ENGINE in the environment wins over the --wasm-engine default.
     if "PYRE_WASM_ENGINE" not in env:
         env["PYRE_WASM_ENGINE"] = WASM_ENGINE
+    return env
+
+
+def pypy_env():
+    """Inherited environment plus the collector pins `pyre_env` also sets."""
+    env = dict(os.environ)
+    env.setdefault("PYPY_GC_NURSERY", PYPY_GC_NURSERY_PIN)
+    env.setdefault("PYPY_GC_MIN", PYPY_GC_MIN_PIN)
     return env
 
 
@@ -3803,7 +3817,7 @@ class Check:
         try:
             targets = [
                 ("cpython", [python3(), empty_path], None),
-                ("pypy", [PYPY3, empty_path], None),
+                ("pypy", [PYPY3, empty_path], pypy_env()),
             ]
             samples = {}
             for key, cmd, env in targets:
@@ -4500,8 +4514,15 @@ class Check:
         # ratio compares a pinned run against an unpinned one. It was also the
         # one pyre spawn left outside `pyre_env()`, which is how a bytecode
         # cache still appeared under a run that pins PYTHONDONTWRITEBYTECODE.
+        # A pypy baseline keeps the inherited environment and overlays the
+        # same collector pins the first pypy run used.
         baseline_is_pyre = baseline_key in ALL_BACKENDS
-        baseline_env = pyre_env() if baseline_is_pyre else None
+        if baseline_is_pyre:
+            baseline_env = pyre_env()
+        elif baseline_key == "pypy":
+            baseline_env = pypy_env()
+        else:
+            baseline_env = None
         pyre_times = []
         baseline_times = []
         for _ in range(attempts):
@@ -5154,7 +5175,9 @@ class Check:
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
-        pypy_output, pypy_cpu, pypy_code, _ = run_timed([PYPY3, script])
+        pypy_output, pypy_cpu, pypy_code, _ = run_timed(
+            [PYPY3, script], env=pypy_env(),
+        )
         t_pypy = pypy_cpu if pypy_code == 0 else "-"
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
@@ -5514,7 +5537,7 @@ class Check:
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
         pypy_output, pypy_time, pypy_code, _ = run_timed(
-            [PYPY3, path], timeout_s=effective_timeout,
+            [PYPY3, path], timeout_s=effective_timeout, env=pypy_env(),
         )
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
