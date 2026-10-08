@@ -3617,11 +3617,20 @@ fn recognize_fused_question(
 /// A hop may forward the `Result` but must not read it, and every operand
 /// it does read is local to the block (an inputarg or an earlier result).
 fn is_transparent_result_hop(graph: &FunctionGraph, block: usize, tracked: &Variable) -> bool {
+    predecessor_exits(graph, block).len() == 1
+        && block_forwards_result_unread(graph, block, tracked)
+}
+
+/// [`is_transparent_result_hop`] without the single-predecessor requirement.
+///
+/// `catch_and_rewrap` lands both rebuilt shells on the same `with_roots!`
+/// restore chain (`RootScope::get` / `root_scope_close`), so the first hop
+/// has two predecessors until [`collapse_rebuilt_shell_match`] splits it.
+/// `exceptiontransform.py` `ExceptionTransformer.transform_completely`
+/// keeps those post-call restores on both the normal and except edges.
+fn block_forwards_result_unread(graph: &FunctionGraph, block: usize, tracked: &Variable) -> bool {
     let body = &graph.blocks[block];
     if body.exits.len() != 1 || body.exitswitch.is_some() {
-        return false;
-    }
-    if predecessor_exits(graph, block).len() != 1 {
         return false;
     }
     let mut defined = body.inputargs.clone();
@@ -3653,6 +3662,143 @@ fn is_transparent_result_hop(graph: &FunctionGraph, block: usize, tracked: &Vari
         }
     }
     carries
+}
+
+/// Restore hops from a rebuilt-shell edge to the `Result` discriminant match.
+struct RebuiltShellHopPath {
+    /// Exit that targets the match.
+    into_match: Link,
+    /// Shell variable on [`Self::into_match`] (the match's discriminant base).
+    shell_at_match: Variable,
+    /// Hop blocks in order, empty when [`Self::into_match`] is the start link.
+    hops: Vec<usize>,
+}
+
+/// Walk `with_roots!` restore hops from `start` to the `Result` match.
+///
+/// `getindex_w` is `match with_roots!(w_index => int_w(w_index))`. The
+/// call's successor is `RootScope::get`, not the discriminant switch;
+/// [`rewire_question_site`] already walks that shape for `?`.
+fn follow_hops_to_result_match(
+    graph: &FunctionGraph,
+    start: &Link,
+    shell: &Variable,
+) -> Result<RebuiltShellHopPath, String> {
+    let mut link = start.clone();
+    let mut var = shell.clone();
+    let mut hops = Vec::new();
+    for _ in 0..graph.blocks.len() {
+        let target = link.target.0;
+        let pos = link
+            .args
+            .iter()
+            .position(|arg| matches!(arg, LinkArg::Value(v) if v == &var))
+            .ok_or_else(|| format!("link to {target} drops the Result shell"))?;
+        let bound = graph.blocks[target]
+            .inputargs
+            .get(pos)
+            .cloned()
+            .ok_or_else(|| format!("block {target} lacks inputarg {pos}"))?;
+        if let Ok((_, _, shell_in)) = match_discriminant(graph, target) {
+            if shell_in != bound {
+                return Err(format!(
+                    "block {target} discriminant is not the forwarded Result shell"
+                ));
+            }
+            return Ok(RebuiltShellHopPath {
+                into_match: link,
+                shell_at_match: var,
+                hops,
+            });
+        }
+        if !block_forwards_result_unread(graph, target, &bound) {
+            return Err(format!("block {target} lacks a Result __discriminant read"));
+        }
+        hops.push(target);
+        let [exit] = graph.blocks[target].exits.as_slice() else {
+            return Err(format!("block {target} is not a single forwarding hop"));
+        };
+        link = exit.clone();
+        var = bound;
+    }
+    Err("no Result discriminant match reachable through restore hops".to_string())
+}
+
+fn snap_result_hop(graph: &FunctionGraph, block: usize, tracked: &Variable) -> Option<HopSnap> {
+    let body = &graph.blocks[block];
+    let [exit] = body.exits.as_slice() else {
+        return None;
+    };
+    let input_pos = body.inputargs.iter().position(|var| var == tracked)?;
+    let exit_pos = exit
+        .args
+        .iter()
+        .position(|arg| matches!(arg, LinkArg::Value(var) if var == tracked))?;
+    Some(HopSnap {
+        input_pos,
+        exit_pos,
+        inputargs: body.inputargs.clone(),
+        ops: body.operations.clone(),
+        exit_args: exit.args.clone(),
+    })
+}
+
+/// Clone a `with_roots!` restore chain, keeping the `Result` slot.
+///
+/// [`emit_result_hop_replay`] strips that slot and raises at the tail (`?`).
+/// The rebuilt-shell match still consumes the shell, so both edges have to
+/// restore then meet at the discriminant — `exceptiontransform.py`
+/// `ExceptionTransformer.transform_completely` runs the same post-call
+/// ops on the except edge.
+fn clone_result_hops(
+    graph: &mut FunctionGraph,
+    hops: &[HopSnap],
+    final_target: crate::model::BlockId,
+) -> crate::model::BlockId {
+    let mut first: Option<crate::model::BlockId> = None;
+    let mut pending: Option<(crate::model::BlockId, Vec<LinkArg>)> = None;
+    for (index, hop) in hops.iter().enumerate() {
+        let (id, inputs) = graph.create_block_with_arg_vars(hop.inputargs.len());
+        if first.is_none() {
+            first = Some(id);
+        }
+        if let Some((prev, args)) = pending.take() {
+            graph.set_goto_mixed(prev, id, args);
+        }
+        let mut map: Vec<(Variable, Variable)> = hop
+            .inputargs
+            .iter()
+            .zip(inputs.iter())
+            .map(|(from, to)| (from.clone(), to.clone()))
+            .collect();
+        for op in &hop.ops {
+            let kind = {
+                let remap = |var: &Variable| linear_remap(&map, var);
+                crate::inline::remap_op_kind(&op.kind, &remap)
+            };
+            let result = op.result.as_ref().map(|_| graph.alloc_value_var());
+            if let (Some(old), Some(fresh)) = (&op.result, &result) {
+                map.push((old.clone(), fresh.clone()));
+            }
+            graph.blocks[id.0]
+                .operations
+                .push(SpaceOperation { result, kind });
+        }
+        let exit_args: Vec<LinkArg> = hop
+            .exit_args
+            .iter()
+            .map(|arg| match arg {
+                LinkArg::Value(var) => LinkArg::Value(linear_remap(&map, var)),
+                LinkArg::Const(constant) => LinkArg::Const(constant.clone()),
+            })
+            .collect();
+        if index + 1 == hops.len() {
+            graph.set_goto_mixed(id, final_target, exit_args);
+        } else {
+            pending = Some((id, exit_args));
+        }
+    }
+    first.expect("clone_result_hops requires a non-empty hop chain")
 }
 
 fn walk_hops_to_question(
@@ -4864,6 +5010,141 @@ fn catch_and_rewrap(
     Ok(())
 }
 
+/// Horizontal phi merge of one block's duplicate inputargs
+/// (`simplify.py` `remove_identical_vars`).
+struct IdenticalInputargMerge {
+    /// Indices to drop, highest first so later `remove` calls stay valid.
+    kills: Vec<usize>,
+    /// Dropped inputarg → kept inputarg of the same phi.
+    renaming: Vec<(Variable, Variable)>,
+}
+
+fn rename_through(var: &Variable, renaming: &[(Variable, Variable)]) -> Variable {
+    renaming
+        .iter()
+        .find(|(dropped, _)| dropped == var)
+        .map(|(_, kept)| kept.clone())
+        .unwrap_or_else(|| var.clone())
+}
+
+fn drop_indices<T: Clone>(items: &[T], kills: &[usize]) -> Vec<T> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !kills.contains(i))
+        .map(|(_, item)| item.clone())
+        .collect()
+}
+
+/// Plan the merge of inputargs that every predecessor fills with the same
+/// value (`simplify.py` `remove_identical_vars`).
+///
+/// Front `FunctionGraph` cannot reuse `translator::simplify::remove_identical_vars`
+/// (that port is the flowspace `Hlvalue` model). This is the horizontal
+/// phi merge on one block: two slots merge only when every incoming link
+/// carries the same argument in both.
+fn plan_remove_identical_inputargs(graph: &FunctionGraph, block: usize) -> IdenticalInputargMerge {
+    let incoming = predecessor_exits(graph, block);
+    let n = graph.blocks[block].inputargs.len();
+    if incoming.is_empty() || n < 2 {
+        return IdenticalInputargMerge {
+            kills: Vec::new(),
+            renaming: Vec::new(),
+        };
+    }
+    if incoming
+        .iter()
+        .any(|&(pred, exit_i)| graph.blocks[pred].exits[exit_i].args.len() != n)
+    {
+        return IdenticalInputargMerge {
+            kills: Vec::new(),
+            renaming: Vec::new(),
+        };
+    }
+    let phi = |slot: usize| -> Vec<LinkArg> {
+        incoming
+            .iter()
+            .map(|&(pred, exit_i)| graph.blocks[pred].exits[exit_i].args[slot].clone())
+            .collect()
+    };
+    let mut first: Vec<(Vec<LinkArg>, usize)> = Vec::new();
+    let mut kills = Vec::new();
+    let mut renaming = Vec::new();
+    for slot in 0..n {
+        let args = phi(slot);
+        if let Some((_, keep)) = first.iter().find(|(seen, _)| seen == &args) {
+            kills.push(slot);
+            renaming.push((
+                graph.blocks[block].inputargs[slot].clone(),
+                graph.blocks[block].inputargs[*keep].clone(),
+            ));
+        } else {
+            first.push((args, slot));
+        }
+    }
+    kills.sort_unstable_by(|a, b| b.cmp(a));
+    IdenticalInputargMerge { kills, renaming }
+}
+
+fn rename_block_variables(graph: &mut FunctionGraph, block: usize, from: &Variable, to: &Variable) {
+    let remap = |var: &Variable| -> Variable { if var == from { to.clone() } else { var.clone() } };
+    let body = &mut graph.blocks[block];
+    body.inputargs = body.inputargs.iter().map(&remap).collect();
+    for op in &mut body.operations {
+        op.result = op.result.as_ref().map(&remap);
+        op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
+    }
+    let (sw, exits) =
+        crate::model::remap_control_flow_metadata_var(&body.exitswitch, &body.exits, remap, |b| b);
+    body.exitswitch = sw;
+    body.exits = exits;
+}
+
+fn apply_remove_identical_inputargs(
+    graph: &mut FunctionGraph,
+    block: usize,
+    plan: &IdenticalInputargMerge,
+) {
+    if plan.kills.is_empty() {
+        return;
+    }
+    let incoming = predecessor_exits(graph, block);
+    for (dropped, kept) in &plan.renaming {
+        if dropped != kept {
+            rename_block_variables(graph, block, dropped, kept);
+        }
+    }
+    for &i in &plan.kills {
+        graph.blocks[block].inputargs.remove(i);
+        for &(pred, exit_i) in &incoming {
+            graph.blocks[pred].exits[exit_i].args.remove(i);
+        }
+    }
+}
+
+fn arm_shell_vars_from_args(
+    graph: &FunctionGraph,
+    args: &[LinkArg],
+    target: usize,
+    shell_in_match: &Variable,
+) -> Result<Vec<Variable>, String> {
+    let mut vars = Vec::new();
+    for (pos, arg) in args.iter().enumerate() {
+        if matches!(arg, LinkArg::Value(v) if v == shell_in_match) {
+            let var = graph.blocks[target]
+                .inputargs
+                .get(pos)
+                .cloned()
+                .ok_or_else(|| format!("arm block {target} lacks inputarg {pos}"))?;
+            vars.push(var);
+        }
+    }
+    if vars.is_empty() {
+        return Err("match arm does not receive the shell".to_string());
+    }
+    Ok(vars)
+}
+
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
 ///
@@ -4871,6 +5152,17 @@ fn catch_and_rewrap(
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
 /// Bypassing the switch leaves the normal edge on the unwrapped `int` and
 /// the handler on the `PyError`, which is the value `err.match` reads.
+///
+/// `with_roots!(w_index => int_w(w_index))` puts `RootScope::get` /
+/// `root_scope_close` hops between the call and that match. Those hops
+/// have to run on both edges (`exceptiontransform.py`
+/// `ExceptionTransformer.transform_completely`); a shared chain is split
+/// the way [`rewire_question_site`] replays hops for `?`.
+///
+/// Duplicate match inputargs that every predecessor fills with the same
+/// variable are merged first (`simplify.py` `remove_identical_vars`), so
+/// the match has one shell slot. An arm that still reads a remaining copy
+/// as a `Result` declines.
 ///
 /// Fail-safe: any other use of the shell returns `Err` with the graph
 /// unchanged. Every check runs before the first edit.
@@ -4889,18 +5181,31 @@ fn collapse_rebuilt_shell_match(
 ) -> Result<(), String> {
     let n_exit = single_exit(graph, normal)?;
     let e_exit = single_exit(graph, handler)?;
-    // `catch_and_rewrap` writes the shell into every slot `r` occupied.
-    // A second slot becomes a second arm inputarg still bound to the
-    // shell, and deleting the build would leave that use undefined.
-    if value_occurrences(&n_exit.args, ok_shell) != 1
-        || value_occurrences(&e_exit.args, err_shell) != 1
-    {
-        return Err("rebuilt shell is threaded into more than one exit slot".to_string());
-    }
-    if n_exit.target != e_exit.target {
+    let n_path = follow_hops_to_result_match(graph, &n_exit, ok_shell)?;
+    let e_path = follow_hops_to_result_match(graph, &e_exit, err_shell)?;
+    if n_path.into_match.target != e_path.into_match.target {
         return Err("rebuilt shells do not meet at one match".to_string());
     }
-    let m = n_exit.target.0;
+    let m = n_path.into_match.target.0;
+    let merge = plan_remove_identical_inputargs(graph, m);
+    let n_args = drop_indices(&n_path.into_match.args, &merge.kills);
+    let e_args = drop_indices(&e_path.into_match.args, &merge.kills);
+    let n_occ = value_occurrences(&n_args, &n_path.shell_at_match);
+    let e_occ = value_occurrences(&e_args, &e_path.shell_at_match);
+    if n_occ != 1 || e_occ != 1 {
+        return Err(format!(
+            "rebuilt shell is threaded into more than one exit slot (n={n_occ} e={e_occ})"
+        ));
+    }
+    let merged_len = graph.blocks[m].inputargs.len() - merge.kills.len();
+    if n_args.len() != merged_len || e_args.len() != merged_len {
+        return Err(format!(
+            "link to match block {m} arity does not match inputargs"
+        ));
+    }
+    let n_last = n_path.hops.last().copied().unwrap_or(normal);
+    let e_last = e_path.hops.last().copied().unwrap_or(handler);
+    let shared_hops = !n_path.hops.is_empty() && n_path.hops == e_path.hops;
     let preds: Vec<usize> = graph
         .blocks
         .iter()
@@ -4908,16 +5213,25 @@ fn collapse_rebuilt_shell_match(
         .filter(|(_, block)| block.exits.iter().any(|link| link.target.0 == m))
         .map(|(i, _)| i)
         .collect();
-    if preds.len() != 2 || !preds.contains(&normal) || !preds.contains(&handler) {
+    if shared_hops {
+        if preds.len() != 1 || preds[0] != n_last {
+            return Err(format!(
+                "match block {m} is not private to the rebuilt shells"
+            ));
+        }
+    } else if preds.len() != 2 || !preds.contains(&n_last) || !preds.contains(&e_last) {
         return Err(format!(
             "match block {m} is not private to the rebuilt shells"
         ));
     }
-    let (_, disc, shell_in) = match_discriminant(graph, m)?;
+    let (_, _, shell_in) = match_discriminant(graph, m)?;
     let shell_binds = graph.blocks[m]
         .inputargs
         .iter()
-        .filter(|arg| *arg == &shell_in)
+        .enumerate()
+        .filter(|(i, _)| !merge.kills.contains(i))
+        .map(|(_, arg)| rename_through(arg, &merge.renaming))
+        .filter(|arg| arg == &shell_in)
         .count();
     if shell_binds != 1 {
         return Err(format!(
@@ -4932,10 +5246,50 @@ fn collapse_rebuilt_shell_match(
     let err_arm = err_link.target.0;
     assert_single_pred(graph, ok_arm, "rebuilt shell match")?;
     assert_single_pred(graph, err_arm, "rebuilt shell match")?;
-    let ok_shell_arm = arm_shell_var(graph, &ok_link, &shell_in)?;
-    let err_shell_arm = arm_shell_var(graph, &err_link, &shell_in)?;
-    let ok_walk = shell_pos0_reads(graph, ok_arm, &ok_shell_arm)?;
-    let err_walk = shell_pos0_reads(graph, err_arm, &err_shell_arm)?;
+    let ok_args_renamed: Vec<LinkArg> = ok_link
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Value(var) => LinkArg::Value(rename_through(var, &merge.renaming)),
+            other => other.clone(),
+        })
+        .collect();
+    let err_args_renamed: Vec<LinkArg> = err_link
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Value(var) => LinkArg::Value(rename_through(var, &merge.renaming)),
+            other => other.clone(),
+        })
+        .collect();
+    let ok_shell_arms = arm_shell_vars_from_args(graph, &ok_args_renamed, ok_arm, &shell_in)?;
+    let err_shell_arms = arm_shell_vars_from_args(graph, &err_args_renamed, err_arm, &shell_in)?;
+    let mut ok_walk = ShellPos0Walk {
+        reads: Vec::new(),
+        visited: Vec::new(),
+    };
+    for var in &ok_shell_arms {
+        let walk = shell_pos0_reads(graph, ok_arm, var)?;
+        ok_walk.reads.extend(walk.reads);
+        for block in walk.visited {
+            if !ok_walk.visited.contains(&block) {
+                ok_walk.visited.push(block);
+            }
+        }
+    }
+    let mut err_walk = ShellPos0Walk {
+        reads: Vec::new(),
+        visited: Vec::new(),
+    };
+    for var in &err_shell_arms {
+        let walk = shell_pos0_reads(graph, err_arm, var)?;
+        err_walk.reads.extend(walk.reads);
+        for block in walk.visited {
+            if !err_walk.visited.contains(&block) {
+                err_walk.visited.push(block);
+            }
+        }
+    }
     if ok_walk
         .visited
         .iter()
@@ -4958,35 +5312,100 @@ fn collapse_rebuilt_shell_match(
             read_result,
         });
     }
-    let ok_args = project_arm_args(
-        &n_exit.args,
-        &graph.blocks[m].inputargs,
-        &ok_link.args,
-        &shell_in,
-        ok_payload,
-        &disc,
-        0,
-    )?;
-    let err_args = project_arm_args(
-        &e_exit.args,
-        &graph.blocks[m].inputargs,
-        &err_link.args,
-        &shell_in,
-        err_payload,
-        &disc,
-        1,
-    )?;
     let ok_payload_is_void = ok_payload.concretetype()
         == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void);
     let ok_build = shell_build_ops(graph, normal, ok_shell, ok_payload_is_void)?;
     let err_build = shell_build_ops(graph, handler, err_shell, false)?;
     // Every check has run. The edits below do not fail.
+    apply_remove_identical_inputargs(graph, m, &merge);
+    let n_exit = single_exit(graph, normal).expect("normal still has one exit");
+    let e_exit = single_exit(graph, handler).expect("handler still has one exit");
+    let n_path = follow_hops_to_result_match(graph, &n_exit, ok_shell)
+        .expect("merged match still reachable from the Ok shell");
+    let mut e_path = follow_hops_to_result_match(graph, &e_exit, err_shell)
+        .expect("merged match still reachable from the Err shell");
+    let n_last = n_path.hops.last().copied().unwrap_or(normal);
+    let mut e_last = e_path.hops.last().copied().unwrap_or(handler);
+    let (_, disc, shell_in) = match_discriminant(graph, m).expect("match still a discriminant");
+    let (ok_link, err_link) = split_diamond_exits(&graph.blocks[m].exits, "rebuilt shell match")
+        .expect("match still a diamond");
+    let n_arm_payload = if n_path.hops.is_empty() {
+        ok_payload.clone()
+    } else {
+        n_path.shell_at_match.clone()
+    };
+    let e_arm_payload = if e_path.hops.is_empty() {
+        err_payload.clone()
+    } else {
+        e_path.shell_at_match.clone()
+    };
+    let ok_args = project_arm_args(
+        &n_path.into_match.args,
+        &graph.blocks[m].inputargs,
+        &ok_link.args,
+        &shell_in,
+        &n_arm_payload,
+        &disc,
+        0,
+    )
+    .expect("merged Ok args still project onto the Ok arm");
+    let mut err_args = project_arm_args(
+        &e_path.into_match.args,
+        &graph.blocks[m].inputargs,
+        &err_link.args,
+        &shell_in,
+        &e_arm_payload,
+        &disc,
+        1,
+    )
+    .expect("merged Err args still project onto the Err arm");
+    if shared_hops {
+        let mut tracked = err_shell.clone();
+        let mut link = e_exit.clone();
+        let mut snaps = Vec::with_capacity(e_path.hops.len());
+        for &block in &e_path.hops {
+            let pos = link
+                .args
+                .iter()
+                .position(|arg| matches!(arg, LinkArg::Value(v) if v == &tracked))
+                .expect("shared restore hop carries the Result shell");
+            let hop_var = graph.blocks[block].inputargs[pos].clone();
+            let snap = snap_result_hop(graph, block, &hop_var)
+                .expect("shared restore hop forwards the Result shell");
+            snaps.push(snap);
+            tracked = hop_var;
+            link = graph.blocks[block].exits[0].clone();
+        }
+        let first = clone_result_hops(graph, &snaps, n_path.into_match.target);
+        graph.blocks[handler].exits[0].target = first;
+        let e_exit = single_exit(graph, handler).expect("handler still has one exit");
+        e_path = follow_hops_to_result_match(graph, &e_exit, err_shell)
+            .expect("cloned restore hops still reach the match");
+        e_last = e_path.hops.last().copied().unwrap_or(handler);
+        let e_arm_payload = e_path.shell_at_match.clone();
+        err_args = project_arm_args(
+            &e_path.into_match.args,
+            &graph.blocks[m].inputargs,
+            &err_link.args,
+            &shell_in,
+            &e_arm_payload,
+            &disc,
+            1,
+        )
+        .expect("cloned hop args still project onto the Err arm");
+    }
     delete_ops(graph, normal, ok_build);
     delete_ops(graph, handler, err_build);
-    graph.blocks[normal].exits = vec![Link::new_mixed(ok_args, ok_link.target, None)];
-    graph.blocks[normal].exitswitch = None;
-    graph.blocks[handler].exits = vec![Link::new_mixed(err_args, err_link.target, None)];
-    graph.blocks[handler].exitswitch = None;
+    if !n_path.hops.is_empty() {
+        replace_exit_value(graph, normal, ok_shell, ok_payload);
+    }
+    if !e_path.hops.is_empty() {
+        replace_exit_value(graph, handler, err_shell, err_payload);
+    }
+    graph.blocks[n_last].exits = vec![Link::new_mixed(ok_args, ok_link.target, None)];
+    graph.blocks[n_last].exitswitch = None;
+    graph.blocks[e_last].exits = vec![Link::new_mixed(err_args, err_link.target, None)];
+    graph.blocks[e_last].exitswitch = None;
     for plan in collapses {
         apply_pos0_collapse(graph, &plan);
     }
@@ -10794,6 +11213,7 @@ mod rebuilt_shell_collapse_tests {
         ok_payload: Variable,
         err_payload: Variable,
         ok_arm: usize,
+        err_arm: usize,
     }
 
     fn fixture() -> Fixture {
@@ -10874,6 +11294,7 @@ mod rebuilt_shell_collapse_tests {
             ok_payload,
             err_payload,
             ok_arm: ok_id.0,
+            err_arm: err_id.0,
         }
     }
 
@@ -10913,15 +11334,125 @@ mod rebuilt_shell_collapse_tests {
         );
     }
 
-    #[test]
-    fn a_second_shell_slot_declines_before_the_build_is_removed() {
+    /// `with_roots!(x => int_w(x))` restore hops sit between the rebuilt
+    /// shells and the match (`getindex_w`). Both edges share that chain
+    /// until the collapse splits it.
+    fn hop_fixture() -> Fixture {
         let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        fix.graph
+            .set_goto(hop_id, match_id, vec![hop_args[0].clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        fix
+    }
+
+    #[test]
+    fn with_roots_restore_hops_still_drop_the_rebuilt_shells() {
+        let mut fix = hop_fixture();
+        collapse(&mut fix).expect("restore hops collapse");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_ne!(hop, fix.ok_arm, "the restore hop stays on the normal edge");
+        let hop_exit = &fix.graph.blocks[hop].exits[0];
+        assert_eq!(hop_exit.target.0, fix.ok_arm);
+        assert!(
+            matches!(&fix.graph.blocks[fix.normal].exits[0].args[0], LinkArg::Value(v) if *v == fix.ok_payload),
+            "the hop receives the unwrapped payload"
+        );
+        let err_hop = fix.graph.blocks[fix.handler].exits[0].target.0;
+        assert_ne!(err_hop, hop, "the except edge replays the restore hop");
+        assert_eq!(
+            fix.graph.blocks[err_hop].exits[0].target.0, fix.err_arm,
+            "cloned hop targets the Err arm"
+        );
+        assert!(
+            matches!(&fix.graph.blocks[fix.handler].exits[0].args[0], LinkArg::Value(v) if *v == fix.err_payload),
+            "the cloned hop receives the unwrapped payload"
+        );
+    }
+
+    /// Duplicate match inputargs that every predecessor fills with the
+    /// same variable (`simplify.py` `remove_identical_vars`) merge, then
+    /// the single remaining shell slot collapses.
+    #[test]
+    fn restore_hop_alias_copies_of_the_shell_still_drop() {
+        let mut fix = hop_fixture();
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        let shell = fix.graph.blocks[hop].exits[0].args[0].clone();
+        fix.graph.blocks[hop].exits[0].args.push(shell);
+        let match_id = fix.graph.blocks[hop].exits[0].target.0;
+        let alias = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id].inputargs.push(alias);
+        collapse(&mut fix).expect("identical hop copies merge then collapse");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm);
+    }
+
+    #[test]
+    fn a_second_shell_slot_is_the_same_payload() {
+        let mut fix = fixture();
+        let match_id = fix.graph.blocks[fix.normal].exits[0].target.0;
+        let alias = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id].inputargs.push(alias);
         fix.graph.blocks[fix.normal].exits[0]
             .args
             .push(LinkArg::Value(fix.ok_shell.clone()));
-        let err = collapse(&mut fix).expect_err("two shell slots decline");
-        assert!(err.contains("more than one exit slot"), "{err}");
-        assert_eq!(shell_ctors(&fix.graph), 2, "the shell builds stay");
+        fix.graph.blocks[fix.handler].exits[0]
+            .args
+            .push(LinkArg::Value(fix.err_shell.clone()));
+        collapse(&mut fix).expect("identical slots merge then collapse");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(exit.target.0, fix.ok_arm);
+        assert!(
+            matches!(&exit.args[0], LinkArg::Value(v) if *v == fix.ok_payload),
+            "the normal edge carries the unwrapped payload"
+        );
+    }
+
+    /// After the identical slots merge, the arm still receives a second
+    /// copy of the shell and reads it as a `Result`. Collapse declines.
+    #[test]
+    fn an_arm_result_read_of_a_second_shell_copy_declines() {
+        let mut fix = fixture();
+        let match_id = fix.graph.blocks[fix.normal].exits[0].target.0;
+        let alias = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id].inputargs.push(alias.clone());
+        fix.graph.blocks[fix.normal].exits[0]
+            .args
+            .push(LinkArg::Value(fix.ok_shell.clone()));
+        fix.graph.blocks[fix.handler].exits[0]
+            .args
+            .push(LinkArg::Value(fix.err_shell.clone()));
+        let extra = fix.graph.alloc_value_var();
+        let extra_read = fix.graph.alloc_value_var();
+        fix.graph.blocks[fix.ok_arm].inputargs.push(extra.clone());
+        fix.graph.blocks[fix.ok_arm].operations.insert(
+            0,
+            SpaceOperation {
+                result: Some(extra_read),
+                kind: OpKind::FieldRead {
+                    base: extra,
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+            },
+        );
+        fix.graph.blocks[match_id].exits[0]
+            .args
+            .push(LinkArg::Value(alias));
+        let err = collapse(&mut fix).expect_err("arm Result read of a second copy declines");
+        assert!(
+            err.contains("outside __pos_0") || err.contains("Result"),
+            "{err}"
+        );
+        assert_eq!(shell_ctors(&fix.graph), 2, "decline leaves the shells");
     }
 
     #[test]

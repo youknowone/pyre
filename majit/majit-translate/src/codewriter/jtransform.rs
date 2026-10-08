@@ -2645,7 +2645,10 @@ impl<'a> Transformer<'a> {
         // the first pass) and ensures `transform_graph` /
         // `transform_graph_with_callcontrol` entry points (test
         // fixtures, etc.) are also covered.
-        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten);
+        // After rtype: leftover `Call` ops never reach
+        // `InstanceRepr.convert_const`.  Match-arm graphs interned with
+        // the bookkeeper in `flowspace_adapter` before rtype.
+        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten, None);
 
         // RPython rtyper `specialize_call` rewrites a `we_are_jitted()`
         // `direct_call` to the `_we_are_jitted` symbolic constant

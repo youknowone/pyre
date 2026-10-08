@@ -228,6 +228,41 @@ fn a_rewrapped_call_site_retypes_its_call_to_the_payload() {
     }
 }
 
+/// `getindex_w` is `try: int_w(...) except OperationError`, spelled as a
+/// hand-written `match` on `with_roots!(w_index => int_w(w_index))`. The
+/// restore hops sit between the call and the discriminant; collapsing
+/// them must still drop the rebuilt `Result` shell so the rtyper sees
+/// the unwrapped `int` / caught `PyError`.
+#[test]
+fn getindex_w_match_does_not_rebuild_a_result_shell() {
+    let graph = lower_function(interp(), "pyre_interpreter::baseobjspace::getindex_w")
+        .unwrap_or_else(|e| panic!("lower: {e}"));
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                    let owner = field.owner_root.as_deref().unwrap_or("");
+                    assert!(
+                        !owner.contains("Result"),
+                        "Result discriminant still read: {owner}"
+                    );
+                }
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
+                    ..
+                } => {
+                    let owner = owner_path.join("::");
+                    assert!(
+                        !owner.contains("Result"),
+                        "Result shell ctor still built: {owner}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// `int_w`'s hand-written `match` is `getindex_w`'s
 /// `try/except OperationError`: the normal edge returns the `int`, and the
 /// handler reads `PyError.kind`. The rebuilt `Result` shell must not survive
@@ -1233,12 +1268,13 @@ fn lock_locked_returns_the_bool_word() {
 }
 
 /// `getindex_w_index` is `space_index(index)?` followed by a `match` on
-/// `int_w`. The `?` is a question hop: root reloads sit between the call
-/// and the raise, and the tail raises the caught carrier. Reminting that
-/// tail to `i64` would make the CFG return `void` while `FUNC.RESULT` is
-/// `i` (`func_result_kind`, `history.getkind`). The two `int_w` `Err` arms
-/// raise as well. `lower_error_carrier_edges` stores
-/// `pyerror_to_exc_object` on each of those raises.
+/// `with_roots!(index => int_w(w_index))`. Restore hops sit between the
+/// rebuilt shells and the discriminant; collapsing them forwards `int_w`'s
+/// `i64` to the Ok arm, so the function return is that call. The `?` tail
+/// still raises the caught carrier — reminting it to `i64` would make the
+/// CFG return `void` while `FUNC.RESULT` is `i` (`func_result_kind`,
+/// `history.getkind`). The two `int_w` `Err` arms raise as well.
+/// `lower_error_carrier_edges` stores `pyerror_to_exc_object` on each.
 #[test]
 fn getindex_w_index_from_residual_raises() {
     use majit_translate::model::{LinkArg, ValueType};
@@ -1285,16 +1321,16 @@ fn getindex_w_index_from_residual_raises() {
             let LinkArg::Value(var) = &link.args[0] else {
                 panic!("return arg is a value");
             };
-            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var) else {
-                panic!("return {var:?} is not the Ok payload");
-            };
-            let owner = field.owner_root.as_deref().unwrap_or("");
-            assert_eq!(field.name, "__pos_0", "owner {owner}");
-            assert!(
-                owner.ends_with("::Ok") && owner.contains("Result<i64,PyError>"),
-                "return owner {owner}"
-            );
-            assert_eq!(ty, &ValueType::Int, "Ok payload ty {ty:?}");
+            match return_producer(&g, var) {
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                }) if segments.last().map(String::as_str) == Some("int_w") => {
+                    assert_eq!(*result_ty, ValueType::Int, "int_w result_ty {result_ty:?}");
+                }
+                other => panic!("return {var:?} is not int_w's i64: {other:?}"),
+            }
             ok_returns += 1;
         }
     }
@@ -1303,7 +1339,8 @@ fn getindex_w_index_from_residual_raises() {
         exc_materialisers, 3,
         "two int_w Err arms plus the ? reraise"
     );
-    let mut raised_err_payload = false;
+    let mut raised_overflow_rewrite = false;
+    let mut raised_except_link = false;
     for (bi, block) in g.blocks.iter().enumerate() {
         if !reachable[bi] {
             continue;
@@ -1323,22 +1360,27 @@ fn getindex_w_index_from_residual_raises() {
             let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
                 continue;
             };
-            let Some(OpKind::FieldRead { field, .. }) = return_producer(&g, arg) else {
-                continue;
-            };
-            if field.name == "__pos_0"
-                && field
-                    .owner_root
-                    .as_deref()
-                    .is_some_and(|owner| owner.ends_with("::Err"))
-            {
-                raised_err_payload = true;
+            match return_producer(&g, arg) {
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                }) if segments.last().map(String::as_str) == Some("new")
+                    && segments.iter().any(|s| s == "PyError") =>
+                {
+                    raised_overflow_rewrite = true;
+                }
+                None => raised_except_link = true,
+                _ => {}
             }
         }
     }
     assert!(
-        raised_err_payload,
-        "an int_w Err arm raises the Result payload"
+        raised_overflow_rewrite,
+        "OverflowError arm raises PyError::new"
+    );
+    assert!(
+        raised_except_link,
+        "an int_w Err arm raises the LastException payload"
     );
 }
 

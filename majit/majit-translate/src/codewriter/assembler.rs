@@ -3571,13 +3571,27 @@ impl AssemblerEncode for Assembler {
         // `HostObject` lives only in the translator, so pool a
         // non-canonical sentinel plus a descriptor for the runtime load
         // pass to overwrite with the immortal discriminant cell.
-        if let ConstValue::HostObject(obj) = value
-            && let Some((qualname, tag)) =
+        //
+        // The discriminant is a class-level constant on the interned
+        // variant host (`ClassDesc.classdict` / `rclass.py`
+        // `initialize_prebuilt_data` `classdesc.read_attribute`).  Recover
+        // `(qualname, tag)` from the constant itself so a bookkeeper-path
+        // instance — which never enters `UNIT_VARIANT_PREBUILT_INSTANCES`
+        // — still takes this arm.  The identity-Vec lookup is the
+        // bookkeeper-less fallback.
+        if let ConstValue::HostObject(obj) = value {
+            if let Some((qualname, tag)) =
+                crate::translator::rtyper::unit_variant_fold::unit_variant_const_from_host(obj)
+            {
+                return self.emit_unit_variant_const_r(qualname, tag, state);
+            }
+            if let Some((qualname, tag)) =
                 crate::translator::rtyper::unit_variant_fold::unit_variant_const_by_identity(
                     obj.identity_id(),
                 )
-        {
-            return self.emit_unit_variant_const_r(qualname, tag, state);
+            {
+                return self.emit_unit_variant_const_r(qualname, tag, state);
+            }
         }
         if let ConstValue::HostObject(obj) = value
             && let Some((class_name, message)) = exception_instance_spec(obj)
@@ -7747,6 +7761,7 @@ mod tests {
             crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
                 "TestUnitVariantEnum.Only",
                 Some(7),
+                None,
             )
             .expect("unit variant instance");
         let mut flat = SSARepr {
@@ -7764,6 +7779,76 @@ mod tests {
         let d = &body.unit_variant_consts[0];
         assert_eq!(d.tag, 7);
         assert_eq!(d.qualname, "TestUnitVariantEnum.Only");
+        assert_eq!(
+            body.constants_r[d.constants_r_index].get(),
+            UNIT_VARIANT_CONST_SENTINEL_BASE,
+        );
+    }
+
+    #[test]
+    fn assemble_ref_return_with_bookkeeper_unit_variant_constant() {
+        // Production order: `fold_unit_variant_ctors(graph, Some(&bk))`
+        // then assemble.  The bookkeeper-path instance is not in
+        // `UNIT_VARIANT_PREBUILT_INSTANCES`; `emit_const_r` recovers
+        // `(qualname, tag)` from the interned variant class host.
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = FunctionGraph::new("return_bk_unit_variant");
+        let entry = graph.startblock;
+        graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_enum_variant_ctor(
+                        vec!["JitAction".into()],
+                        "Return",
+                        1,
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("JitAction::Return".into())),
+                },
+                true,
+            )
+            .expect("ctor result");
+        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
+            &mut graph,
+            Some(&bk),
+        );
+        let instance = graph
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block.operations.iter().find_map(|op| match &op.kind {
+                    OpKind::ConstRef(obj) => Some(obj.clone()),
+                    _ => None,
+                })
+            })
+            .expect("fold rewrote the ctor to ConstRef");
+        assert!(
+            crate::translator::rtyper::unit_variant_fold::unit_variant_const_by_identity(
+                instance.identity_id()
+            )
+            .is_none(),
+            "bookkeeper-path instance must not enter the global Vec"
+        );
+        let expected_class = bk.intern_enum_variant_host("JitAction", "Return");
+        let mut flat = SSARepr {
+            name: "return_bk_unit_variant".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(instance)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.unit_variant_consts.len(), 1);
+        let d = &body.unit_variant_consts[0];
+        assert_eq!(d.tag, 1);
+        assert_eq!(d.qualname, expected_class.qualname());
         assert_eq!(
             body.constants_r[d.constants_r_index].get(),
             UNIT_VARIANT_CONST_SENTINEL_BASE,

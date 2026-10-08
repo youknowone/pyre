@@ -6358,6 +6358,77 @@ mod tests {
     }
 
     #[test]
+    fn instance_repr_convert_const_generic_unit_variant_uses_interned_variant_classdef() {
+        // `InstanceRepr.convert_const` (`rclass.py`) does
+        // `bk.getuniqueclassdef(value.__class__)`.  A folded unit-variant
+        // instance of a generic enum used to carry a standalone class host
+        // (`HostObject::new_class` of the dotted ctor path) whose ClassDef
+        // was not the interned variant, so convert_const raised
+        // `not an instance of "...::Continue"`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::front::StructFieldRegistry;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyopcode::StepResult".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
+            vec![],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let variant_cd = bk
+            .getuniqueclassdef_for_enum_variant(
+                "pyre_interpreter::pyopcode::StepResult<*mut PyObject>",
+                "Continue",
+            )
+            .expect("variant classdef");
+        let interned_host = bk.intern_enum_variant_host(
+            "pyre_interpreter::pyopcode::StepResult<*mut PyObject>",
+            "Continue",
+        );
+
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let inst =
+            getinstancerepr(&rtyper, Some(&variant_cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        rtyper.call_all_setups().expect("call_all_setups");
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+
+        // Production intern attaches the prebuilt instance to the interned
+        // variant host. convert_const then does
+        // `bk.getuniqueclassdef(value.__class__)` (rclass.py) on that host.
+        let linked =
+            crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
+                Some(0),
+                Some(&bk),
+            )
+            .expect("linked prebuilt");
+        assert_eq!(
+            linked.class_of().as_ref(),
+            Some(&interned_host),
+            "prebuilt instance class must be intern_enum_variant_host"
+        );
+        let converted = (inst.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::HostObject(linked))
+            .expect("convert_const of generic unit-variant prebuilt");
+        assert!(
+            matches!(converted.value, ConstValue::LLPtr(_)),
+            "convert_const must produce LLPtr, got {:?}",
+            converted.value
+        );
+    }
+
+    #[test]
     fn classrepr_new_stores_classdef_and_unresolved_vtable_forward_reference() {
         let rtyper = fresh_rtyper();
         let classdef = ClassDef::new_standalone("pkg.C", None);

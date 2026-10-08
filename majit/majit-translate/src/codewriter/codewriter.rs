@@ -609,7 +609,15 @@ impl CodeWriter {
         // Catches both the Match-arm and Skip-arm graphs; the
         // companion fold in `flowspace_adapter::
         // legacy_const_define_hlvalue` only reaches Match-arm graphs.
-        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut graph_owned);
+        let bookkeeper = self
+            .real_rtyper_registry
+            .borrow()
+            .as_ref()
+            .map(|registry| registry.bookkeeper().clone());
+        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
+            &mut graph_owned,
+            bookkeeper.as_ref(),
+        );
         // `resolve_types` (called upstream by the rtyper) already
         // commits each backing Variable's `concretetype` cell as it
         // resolves, so jtransform reads kinds via
