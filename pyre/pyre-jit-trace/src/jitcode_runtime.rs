@@ -2580,7 +2580,10 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // already binds each key; without the slot, `setup_insns` never
     // records the byte and a guard-failure resume panics here.
     // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
-    // omits that key.
+    // omits that key. `setarrayitem_raw_i/iiid` is the store twin
+    // (`blackhole.py bhimpl_setarrayitem_raw_i`); looking inside
+    // `copy_object_slice_range_into_vec` emits it when the dest is a
+    // residual `ll_vec_alloc_and_set_r` Int header.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",

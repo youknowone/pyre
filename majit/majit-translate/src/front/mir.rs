@@ -9033,6 +9033,13 @@ impl<'a> Lowering<'a> {
         for (bb_idx, value_local) in &root_bracket.get_sites {
             extra_live[*bb_idx].push(*value_local);
         }
+        for (bb_idx, slice_local, _) in root_bracket
+            .slice_gets
+            .iter()
+            .chain(root_bracket.slice_copies.iter())
+        {
+            extra_live[*bb_idx].push(*slice_local);
+        }
         // The STR chars view aliases its slice to `base`, which the
         // `from_raw_parts` block does not spell. Keep `base` live there so
         // the alias names the block's own input, the same synthetic-use
@@ -10257,7 +10264,10 @@ impl<'a> Lowering<'a> {
             && self.root_bracket.is_erased_scope(scope)
             && matches!(
                 &rvalue,
-                Rvalue::Aggregate(..) | Rvalue::Ref { .. } | Rvalue::UnaryOp(..)
+                Rvalue::Aggregate(..)
+                    | Rvalue::Ref { .. }
+                    | Rvalue::UnaryOp(..)
+                    | Rvalue::Use(_, _)
             )
         {
             return Ok(());
@@ -21757,6 +21767,45 @@ impl<'a> Lowering<'a> {
                 None
             }
             "base" | "pin_roots" | "shadow_stack_len" if receiver_scope.is_some() => None,
+            "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec"
+                if receiver_scope.is_some() =>
+            {
+                let Some((slice, k)) = self.root_bracket.slice_copy_answer(mir_bb) else {
+                    return Ok(false);
+                };
+                let src = self.local_var[slice]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased copy_range reads unbound slice local {slice}"
+                        ))
+                    })?
+                    .one()?;
+                let dest_op = call.args.get(1).cloned().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased copy_range without a destination operand"
+                    ))
+                })?;
+                let dest = self.resolve_operand(mir_bb, dest_op)?;
+                let start = {
+                    let bb_id = self.block_id[mir_bb];
+                    let var = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(var.clone()),
+                        kind: OpKind::ConstInt(k as i64),
+                    });
+                    var
+                };
+                self.emit_path_call(
+                    mir_bb,
+                    "pyre_object::gc_roots::copy_object_slice_range_into_vec",
+                    vec![src, start, dest],
+                    ValueType::Void,
+                );
+                None
+            }
             "pin_root" if receiver_scope.is_some() => {
                 // Free `gc_roots::pin_root(value)` has one argument. The
                 // method form is `scope.pin_root(value)`.
@@ -21785,16 +21834,55 @@ impl<'a> Lowering<'a> {
                 let Some(scope) = receiver_scope else {
                     return Ok(false);
                 };
-                let value = self.root_bracket.get_answer(mir_bb).ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
-                    ))
-                })?;
-                Some(self.local_var[value].as_ref().ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
-                    ))
-                })?.one()?)
+                if let Some((slice, k)) = self.root_bracket.slice_get_answer(mir_bb) {
+                    let src = self.local_var[slice]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: erased slice get reads unbound local {slice}"
+                            ))
+                        })?
+                        .one()?;
+                    let bb_id = self.block_id[mir_bb];
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(k as i64),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: src,
+                            index,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    Some(loaded)
+                } else {
+                    let value = self.root_bracket.get_answer(mir_bb).ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
+                        ))
+                    })?;
+                    Some(
+                        self.local_var[value]
+                            .as_ref()
+                            .ok_or_else(|| {
+                                LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
+                                ))
+                            })?
+                            .one()?,
+                    )
+                }
             }
             _ => return Ok(false),
         };
@@ -43096,9 +43184,13 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
 /// free `pin_root(x)` inside that scope is the `k`-th pin exactly as
 /// `pin_roots` is, and the scope's close rewinds it, so the close is erased
 /// with the rest.  Then `get(base + k)` / `get(len + k)` is the value of the
-/// `k`-th pin, and nothing else observes the guard.  Every other call inside
-/// the bracket must leave the root stack as it found it
-/// ([`RootStackAnalyzer`]), which is the per-graph balance the upstream
+/// `k`-th pin, and nothing else observes the guard.  `pin_roots` of an
+/// incoming `&[PyObjectRef]` parameter is the same shape with the list itself
+/// as the source: `get(base + k)` is `getarrayitem` of that list, and
+/// `shadow_stack_copy_range(base + k, dest)` copies the live slice
+/// (`W_CData.call` / `cdataobj.py descr_call` passes `args_w` through).
+/// Every other call inside the bracket must leave the root stack as it found
+/// it ([`RootStackAnalyzer`]), which is the per-graph balance the upstream
 /// transformer guarantees.  Spanning a collecting call does not by itself
 /// keep the bracket: the three jitcode consumers already root the
 /// republished refs.  A bracket that pins in a loop, reads a slot this pass
@@ -43126,6 +43218,12 @@ struct RootBracketPlan {
     /// the array, its borrows and the unsizing cast -- mapped to their guard.
     /// They only ever fed the erased pin, so they bind nothing.
     pin_temps: std::collections::HashMap<usize, usize>,
+    /// `get(base + k)` of a `pin_roots` of an incoming `&[PyObjectRef]`.
+    /// `(block, slice local, k)`, answered with `getarrayitem`.
+    slice_gets: Vec<(usize, usize, u64)>,
+    /// `shadow_stack_copy_range(base + k, dest)` of that same pin.
+    /// `(block, slice local, k)`, rewritten as a copy from the live list.
+    slice_copies: Vec<(usize, usize, u64)>,
     /// Temporaries that only build a closure capture of an erased index: the
     /// borrow of the index, the closure aggregate, the receiver borrow and the
     /// argument tuple.  The closure call is answered by the pinned value, so
@@ -43151,6 +43249,23 @@ impl RootBracketPlan {
             .iter()
             .find(|(bb, _)| *bb == mir_bb)
             .map(|(_, value)| *value)
+    }
+
+    /// The incoming list and index an erased `get` in `mir_bb` answers with.
+    fn slice_get_answer(&self, mir_bb: usize) -> Option<(usize, u64)> {
+        self.slice_gets
+            .iter()
+            .find(|(bb, _, _)| *bb == mir_bb)
+            .map(|(_, slice, k)| (*slice, *k))
+    }
+
+    /// The incoming list and start an erased `shadow_stack_copy_range` in
+    /// `mir_bb` copies from.
+    fn slice_copy_answer(&self, mir_bb: usize) -> Option<(usize, u64)> {
+        self.slice_copies
+            .iter()
+            .find(|(bb, _, _)| *bb == mir_bb)
+            .map(|(_, slice, k)| (*slice, *k))
     }
 
     /// The erased guard a free pin or read-back in `mir_bb` acts on.
@@ -44165,6 +44280,13 @@ fn root_pin_value_is_stable_in_bracket(
 /// item the bracket hands out as a value, must be one `touches` proves leaves
 /// the stack as it found it.  Otherwise erasing the close leaks their pins or
 /// changes a later get.
+///
+/// `pins_are_incoming_slice` is the `W_CData.call` / `cdataobj.py descr_call`
+/// shape, and the `W_CTypeFunc._call` `n == 1` shape (`pin_root(args_w[0])`):
+/// the pins are the caller's argument array, already live, and the rewritten
+/// reads are `getarrayitem` of that array. A callee that opens and closes
+/// its own bracket cannot shift those reads, so its `touches` answer does
+/// not keep this bracket in the jitcode.
 fn root_bracket_stack_effects_are_known(
     llbc: &Llbc,
     body: &Unstructured,
@@ -44174,6 +44296,7 @@ fn root_bracket_stack_effects_are_known(
     free_sites: &std::collections::HashMap<usize, usize>,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
     touches: &impl Fn(&RegularCall) -> bool,
+    pins_are_incoming_slice: bool,
 ) -> bool {
     let fn_values_touch = |v: &serde_json::Value| {
         let mut found = false;
@@ -44238,14 +44361,15 @@ fn root_bracket_stack_effects_are_known(
                     if !own_leaf {
                         return false;
                     }
-                } else if touches(reg)
-                    || call.args.iter().any(|op| match op {
-                        Operand::Const(c) => {
-                            fn_def_of_const(llbc, c).is_some_and(|reg| touches(&reg))
-                                || fn_values_touch(c)
-                        }
-                        _ => false,
-                    })
+                } else if !pins_are_incoming_slice
+                    && (touches(reg)
+                        || call.args.iter().any(|op| match op {
+                            Operand::Const(c) => {
+                                fn_def_of_const(llbc, c).is_some_and(|reg| touches(&reg))
+                                    || fn_values_touch(c)
+                            }
+                            _ => false,
+                        }))
                 {
                     return false;
                 }
@@ -44357,6 +44481,248 @@ fn pin_roots_slice_values(
             _ => return None,
         }
     }
+}
+
+/// `scope.pin_roots(args)` when `args` is an incoming `&[PyObjectRef]`
+/// parameter, not a `[move _a, move _b]` aggregate.
+///
+/// The list is already a live argument the jitcode consumers root, so
+/// `get(base + k)` is `getarrayitem` of that list (`W_CData.call` /
+/// `cdataobj.py descr_call` passes `args_w` through).
+fn pin_roots_incoming_slice(
+    body: &Unstructured,
+    slice: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, Vec<usize>)> {
+    let arg_count = body.locals.arg_count as usize;
+    let definition = |local: usize| -> Option<Rvalue> {
+        if assigned.get(&local) != Some(&1) {
+            return None;
+        }
+        body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::Assign(place, value))
+                    if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            }
+        })
+    };
+    let mut temps = Vec::new();
+    let mut local = slice;
+    loop {
+        if temps.len() > 8 {
+            return None;
+        }
+        let assigns = assigned.get(&local).copied().unwrap_or(0);
+        if assigns == 0 {
+            return (1..=arg_count).contains(&local).then_some((local, temps));
+        }
+        if assigns != 1 {
+            return None;
+        }
+        temps.push(local);
+        match definition(local)? {
+            Rvalue::Use(operand, _) => local = operand_local(Some(&operand))?,
+            Rvalue::UnaryOp(kind, operand)
+                if kind
+                    .get("Cast")
+                    .is_some_and(|cast| cast.get("Unsize").is_some()) =>
+            {
+                local = operand_local(Some(&operand))?;
+            }
+            Rvalue::Ref { place, .. } => match place.kind {
+                PlaceKind::Local(src) => local = src as usize,
+                PlaceKind::Projection(base, ProjectionElem::Atom(elem)) if elem == "Deref" => {
+                    match base.kind {
+                        PlaceKind::Local(src) => local = src as usize,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+}
+
+/// The unique `Assign` of `local`, when it has exactly one.
+fn unique_assigned_rvalue(
+    body: &Unstructured,
+    local: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<Rvalue> {
+    if assigned.get(&local) != Some(&1) {
+        return None;
+    }
+    body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
+        match stmt.stmt_kind() {
+            Ok(StmtKind::Assign(place, value))
+                if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A `usize` constant held in `local`, walking `Use` copies.
+fn local_usize_literal(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<u64> {
+    let mut local = local;
+    for _ in 0..8 {
+        match unique_assigned_rvalue(body, local, assigned)? {
+            Rvalue::Use(operand, _) => {
+                if let Some(k) = operand_usize_literal(llbc, &operand) {
+                    return Some(k);
+                }
+                local = operand_local(Some(&operand))?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `offset` of an `Index` projection: a `usize` literal, or a local that
+/// holds one.
+fn index_offset_usize(
+    llbc: &Llbc,
+    body: &Unstructured,
+    offset: &serde_json::Value,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<u64> {
+    let op: Operand = serde_json::from_value(offset.clone()).ok()?;
+    if let Some(k) = operand_usize_literal(llbc, &op) {
+        return Some(k);
+    }
+    local_usize_literal(llbc, body, operand_local(Some(&op))?, assigned)
+}
+
+/// `(*args_w)[k]` / `args_w[k]` when `args_w` is an incoming parameter and
+/// `k` is a `usize` constant.
+fn place_incoming_slice_elem(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, u64)> {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+        return None;
+    };
+    let index = v.get("Index")?;
+    if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let k = index_offset_usize(llbc, body, index.get("offset")?, assigned)?;
+    let slice_place = match &inner.kind {
+        PlaceKind::Projection(base, ProjectionElem::Atom(atom)) if atom == "Deref" => base.as_ref(),
+        _ => inner.as_ref(),
+    };
+    let PlaceKind::Local(slice) = slice_place.kind else {
+        return None;
+    };
+    pin_roots_incoming_slice(body, slice as usize, assigned).map(|(slice, _)| (slice, k))
+}
+
+/// `pin_root(args_w[k])` / `pin_root(w_arg)` when `w_arg` was loaded from an
+/// incoming `&[PyObjectRef]` at a constant index. `W_CTypeFunc._call`
+/// (`ctypefunc.py` `_call`) pins one argument that way for `n == 1`; the
+/// value is already live in the caller's list, so `get(base)` is
+/// `getarrayitem` of that list at `k`. The pin's own local is
+/// `StorageDead` before the get (`do_call` discards `pin_root`'s result),
+/// so the answer has to be the list element, not that temporary.
+fn pin_value_incoming_slice_elem(
+    llbc: &Llbc,
+    body: &Unstructured,
+    value: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, u64)> {
+    let mut local = value;
+    for _ in 0..8 {
+        if let Some(rvalue) = unique_assigned_rvalue(body, local, assigned) {
+            match rvalue {
+                Rvalue::Use(operand, _) => {
+                    if let Some(place) = operand_place(&operand)
+                        && let Some(elem) = place_incoming_slice_elem(llbc, body, place, assigned)
+                    {
+                        return Some(elem);
+                    }
+                    local = operand_local(Some(&operand))?;
+                }
+                Rvalue::Ref { place, .. } => {
+                    if let Some(elem) = place_incoming_slice_elem(llbc, body, &place, assigned) {
+                        return Some(elem);
+                    }
+                    match place.kind {
+                        PlaceKind::Local(src) => local = src as usize,
+                        PlaceKind::Projection(base, ProjectionElem::Atom(elem))
+                            if elem == "Deref" =>
+                        {
+                            match base.kind {
+                                PlaceKind::Local(src) => local = src as usize,
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Pins of one guard that are all constant-index loads of the same
+/// incoming `&[PyObjectRef]`, in slot order. `None` unless every pin is
+/// one such load.
+fn incoming_elem_pins(
+    llbc: &Llbc,
+    body: &Unstructured,
+    scope_pins: &[(usize, usize)],
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, Vec<u64>)> {
+    if scope_pins.is_empty() {
+        return None;
+    }
+    let mut elems = Vec::with_capacity(scope_pins.len());
+    for &(_, value) in scope_pins {
+        elems.push(pin_value_incoming_slice_elem(llbc, body, value, assigned)?);
+    }
+    let slice = elems[0].0;
+    if elems.iter().any(|&(s, _)| s != slice) {
+        return None;
+    }
+    Some((slice, elems.into_iter().map(|(_, k)| k).collect()))
+}
+
+/// Slot `k` for a `base` or `base + k` index, without `shadow_stack_len`.
+fn root_read_const_slot(
+    index_local: usize,
+    scope: usize,
+    bases: &std::collections::HashMap<usize, usize>,
+    offsets: &std::collections::HashMap<usize, RootSlotSum>,
+) -> Option<usize> {
+    if bases.get(&index_local) == Some(&scope) {
+        return Some(0);
+    }
+    if let Some(slot) = offsets.get(&index_local)
+        && slot.scope == scope
+        && slot.from_len.is_none()
+    {
+        return usize::try_from(slot.k).ok();
+    }
+    None
 }
 
 /// How a closure body reads one shadow-stack slot.
@@ -45427,6 +45793,12 @@ fn analyze_root_brackets_with(
     // run (`zip_two_tuple_next` pins each cursor with its own `pin_roots`).
     let mut run_dests: std::collections::HashMap<usize, (usize, usize)> =
         std::collections::HashMap::new();
+    // Block of each `pin_roots` of an incoming `&[PyObjectRef]` parameter
+    // -> (guard, slice local, argument temporaries).
+    let mut slice_runs: std::collections::HashMap<usize, (usize, usize, Vec<usize>)> =
+        std::collections::HashMap::new();
+    // `shadow_stack_copy_range(base + k, dest)` -> (guard, index local).
+    let mut range_copies: Vec<(usize, usize, usize)> = Vec::new();
     // Free `pin_root(value)` -> (guard, published local). Its result is the
     // object it forwarded, not the slot base `pin_roots` returns.
     let mut single_pins: std::collections::HashMap<usize, (usize, usize)> =
@@ -45461,10 +45833,13 @@ fn analyze_root_brackets_with(
             let Some(scope) = open_scope_at(bb_idx) else {
                 continue;
             };
-            let Some(run) = pin_roots_slice_values(body, slice, &assigned) else {
+            if let Some(run) = pin_roots_slice_values(body, slice, &assigned) {
+                pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else if let Some(run) = pin_roots_incoming_slice(body, slice, &assigned) {
+                slice_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else {
                 continue;
-            };
-            pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            }
             free_sites.insert(bb_idx, scope);
             bases.insert(*dest as usize, scope);
             run_dests.insert(*dest as usize, (scope, bb_idx));
@@ -45532,10 +45907,13 @@ fn analyze_root_brackets_with(
             let Some(slice) = operand_local(call.args.get(1)) else {
                 continue;
             };
-            let Some(run) = pin_roots_slice_values(body, slice, &assigned) else {
+            if let Some(run) = pin_roots_slice_values(body, slice, &assigned) {
+                pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else if let Some(run) = pin_roots_incoming_slice(body, slice, &assigned) {
+                slice_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else {
                 continue;
-            };
-            pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            }
             run_dests.insert(*dest as usize, (scope, bb_idx));
         }
         bases.insert(*dest as usize, scope);
@@ -45911,6 +46289,21 @@ fn analyze_root_brackets_with(
                 {
                     continue;
                 }
+                if call.args.len() == 2
+                    && free_leaf.as_deref() == Some("shadow_stack_copy_range")
+                    && let Some(index) = operand_local(call.args.first())
+                {
+                    if let Some(scope) = bases
+                        .get(&index)
+                        .copied()
+                        .or_else(|| offsets.get(&index).map(|slot| slot.scope))
+                        && candidates.contains(scope)
+                    {
+                        range_copies.push((bb_idx, scope, index));
+                        free_sites.insert(bb_idx, scope);
+                        continue;
+                    }
+                }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
                         Some("pin_roots") => {
@@ -45920,6 +46313,12 @@ fn analyze_root_brackets_with(
                             {
                                 let entry = pins.entry(*scope).or_default();
                                 entry.extend(values.iter().map(|v| (bb_idx, *v)));
+                                continue;
+                            }
+                            if let Some((scope, _, _)) = slice_runs.get(&bb_idx)
+                                && free_sites.get(&bb_idx) == Some(scope)
+                                && candidates.contains(*scope)
+                            {
                                 continue;
                             }
                         }
@@ -45995,7 +46394,15 @@ fn analyze_root_brackets_with(
                                             entry.extend(values.iter().map(|v| (bb_idx, *v)));
                                             true
                                         }
-                                        _ => false,
+                                        _ => match slice_runs.get(&bb_idx) {
+                                            Some((run_scope, _, _))
+                                                if run_scope == scope
+                                                    && bases.get(&dest) == Some(scope) =>
+                                            {
+                                                true
+                                            }
+                                            _ => false,
+                                        },
                                     }
                                 }
                                 ("get", Some(_)) if call.args.len() == 2 => {
@@ -46034,6 +46441,13 @@ fn analyze_root_brackets_with(
     let surviving: Vec<usize> = candidates.iter().collect();
     for scope in surviving {
         let opener = opener_block[&scope];
+        let incoming_elem = pins
+            .get(&scope)
+            .and_then(|scope_pins| incoming_elem_pins(llbc, body, scope_pins, &assigned));
+        let pins_are_incoming_slice = slice_runs
+            .values()
+            .any(|(run_scope, _, _)| *run_scope == scope)
+            || incoming_elem.is_some();
         if !root_bracket_stack_effects_are_known(
             llbc,
             body,
@@ -46043,7 +46457,156 @@ fn analyze_root_brackets_with(
             &free_sites,
             &name_of,
             &touches,
+            pins_are_incoming_slice,
         ) {
+            continue;
+        }
+        if let Some((pin_bb, slice_local, temps)) =
+            slice_runs.iter().find_map(|(bb, (run_scope, loc, temps))| {
+                (*run_scope == scope).then_some((*bb, *loc, temps.clone()))
+            })
+        {
+            if !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb) {
+                continue;
+            }
+            let region = root_bracket_region(llbc, body, opener, scope, &name_of);
+            let own_get_bbs: Vec<usize> = gets
+                .iter()
+                .filter(|(_, get_scope, _, _)| *get_scope == scope)
+                .map(|(get_bb, _, _, _)| *get_bb)
+                .collect();
+            // `scope.pin_roots(args)` reborrows the incoming `&[PyObjectRef]`
+            // (`_t = &*args`). That Ref is the pin's argument, not a write of
+            // the fat pointer; `root_pin_value_is_stable` treats any Ref of a
+            // local as aliasing. A parameter with no Assign is still the same
+            // array `W_CData.call` received.
+            let slice_is_unassigned_param = assigned.get(&slice_local).copied().unwrap_or(0) == 0
+                && (1..=body.locals.arg_count as usize).contains(&slice_local);
+            if (!slice_is_unassigned_param
+                && !root_pin_value_is_stable_in_bracket(
+                    llbc,
+                    body,
+                    slice_local,
+                    &region,
+                    &own_get_bbs,
+                ))
+                || !region.contains(pin_bb)
+            {
+                continue;
+            }
+            let mut ok = true;
+            let mut sites = Vec::new();
+            for (get_bb, _, index_local, addend) in gets
+                .iter()
+                .filter(|(_, get_scope, _, _)| *get_scope == scope)
+            {
+                let slot =
+                    root_read_const_slot(*index_local, scope, &bases, &offsets).and_then(|base| {
+                        usize::try_from(*addend)
+                            .ok()
+                            .and_then(|extra| base.checked_add(extra))
+                    });
+                let Some(k) = slot else {
+                    ok = false;
+                    break;
+                };
+                if !region.contains(*get_bb) {
+                    ok = false;
+                    break;
+                }
+                sites.push((*get_bb, slice_local, k as u64));
+            }
+            let mut copies = Vec::new();
+            for (copy_bb, copy_scope, index_local) in &range_copies {
+                if *copy_scope != scope {
+                    continue;
+                }
+                let Some(k) = root_read_const_slot(*index_local, scope, &bases, &offsets) else {
+                    ok = false;
+                    break;
+                };
+                if !region.contains(*copy_bb) {
+                    ok = false;
+                    break;
+                }
+                copies.push((*copy_bb, slice_local, k as u64));
+            }
+            if !ok {
+                continue;
+            }
+            plan.scopes.insert(scope);
+            plan.slice_gets.extend(sites);
+            plan.slice_copies.extend(copies);
+            for (base_local, base_scope) in &bases {
+                if *base_scope == scope {
+                    base_results.insert(*base_local, scope);
+                }
+            }
+            for (temp, slot) in sums.iter().chain(offsets.iter()) {
+                if slot.scope == scope {
+                    slot_temps.insert(*temp, scope);
+                }
+            }
+            for (temp, (temp_scope, _)) in &len_index {
+                if *temp_scope == scope {
+                    slot_temps.insert(*temp, scope);
+                }
+            }
+            pin_temps.extend(temps.iter().map(|temp| (*temp, scope)));
+            continue;
+        }
+        if let Some((slice_local, elem_ks)) = incoming_elem {
+            let scope_pins: &[(usize, usize)] = pins.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
+            if scope_pins
+                .iter()
+                .any(|&(pin_bb, _)| !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb))
+            {
+                continue;
+            }
+            let region = root_bracket_region(llbc, body, opener, scope, &name_of);
+            if scope_pins
+                .iter()
+                .any(|(pin_bb, _)| !region.contains(*pin_bb))
+            {
+                continue;
+            }
+            let mut ok = true;
+            let mut sites = Vec::new();
+            for (get_bb, _, index_local, addend) in gets
+                .iter()
+                .filter(|(_, get_scope, _, _)| *get_scope == scope)
+            {
+                let slot =
+                    root_read_const_slot(*index_local, scope, &bases, &offsets).and_then(|base| {
+                        usize::try_from(*addend)
+                            .ok()
+                            .and_then(|extra| base.checked_add(extra))
+                    });
+                let Some(k) = slot.and_then(|i| elem_ks.get(i).copied()) else {
+                    ok = false;
+                    break;
+                };
+                if !region.contains(*get_bb) {
+                    ok = false;
+                    break;
+                }
+                sites.push((*get_bb, slice_local, k));
+            }
+            if !ok {
+                continue;
+            }
+            plan.scopes.insert(scope);
+            plan.slice_gets.extend(sites);
+            for (base_local, base_scope) in &bases {
+                if *base_scope == scope {
+                    base_results.insert(*base_local, scope);
+                }
+            }
+            for (temp, slot) in sums.iter().chain(offsets.iter()) {
+                if slot.scope == scope {
+                    slot_temps.insert(*temp, scope);
+                }
+            }
             continue;
         }
         let scope_pins: &[(usize, usize)] = pins.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
@@ -85489,6 +86052,270 @@ mod tests {
             !plan.scopes.contains(3),
             "first_dest + 1 must not answer a pin_roots that did not run"
         );
+    }
+
+    #[test]
+    fn root_bracket_erasure_answers_an_incoming_slice_pin() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `__majit_wrap_cdata_call`: `pin_roots(args)` of the incoming
+        // `&[PyObjectRef]` parameter, `get(base)` of slot 0, and
+        // `shadow_stack_copy_range(base + 1, rest)`.
+        //
+        //   bb0: _3 = push_roots()                            -> bb1
+        //   bb1: _4 = &_3; _5 = pin_roots(_4, copy _1)        -> bb2
+        //   bb2: _6 = &_3; _7 = copy _5; _8 = get(_6, _7)     -> bb3
+        //   bb3: _9 = AddChecked(copy _5, 1); assert          -> bb4
+        //   bb4: _10 = move _9.0; copy_range(_10, _2)         -> bb5
+        //   bb5: drop(_3)                                     -> bb6
+        //   bb6: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_roots",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    8 => "pyre_object::gc_roots::shadow_stack_copy_range",
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(
+                    vec![borrow(4, 3)],
+                    call(3, vec![copy(4), copy(1)], 5, 2),
+                ),
+                block(
+                    vec![borrow(6, 3), assign(7, serde_json::json!({"Use": [copy(5), "No"]}))],
+                    call(4, vec![copy(6), copy(7)], 8, 3),
+                ),
+                block(
+                    vec![assign(
+                        9,
+                        serde_json::json!({"BinaryOp": ["AddChecked", copy(5), usize_lit(1)]}),
+                    )],
+                    serde_json::json!({"Assert": {
+                        "assert": {
+                            "cond": {"Move": field(9, 1)},
+                            "expected": false,
+                            "check_kind": {"Overflow": [{"Add": "Wrap"}, copy(5), usize_lit(1)]}
+                        },
+                        "target": 4,
+                        "on_unwind": 99
+                    }}),
+                ),
+                block(
+                    vec![assign(10, serde_json::json!({"Use": [{"Move": field(9, 0)}, "No"]}))],
+                    call(8, vec![mv(10), copy(2)], 0, 5),
+                ),
+                block(vec![], drop_guard(3, 6)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &body,
+            &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "an incoming-slice pin_roots must be erased"
+        );
+        assert_eq!(plan.slice_gets, vec![(2usize, 1usize, 0u64)]);
+        assert_eq!(plan.slice_copies, vec![(4usize, 1usize, 1u64)]);
+        assert_eq!(
+            plan.free_sites.get(&4),
+            Some(&3),
+            "copy_range is this guard"
+        );
+    }
+
+    #[test]
+    fn root_bracket_erasure_answers_an_incoming_elem_pin() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `W_CTypeFunc._call` `n == 1` (`ctypefunc.py` `_call`): `base()`,
+        // `pin_root(args_w[0])`, `get(base)`. The pin's temporary is
+        // `StorageDead` before the get, so the answer is `getarrayitem` of
+        // the incoming list at 0, not that local.
+        //
+        //   bb0: _3 = push_roots()                                 -> bb1
+        //   bb1: _4 = &_3; _5 = base(_4)                           -> bb2
+        //   bb2: _6 = 0; _7 = (*_1)[copy _6]; _8 = &_3;
+        //        _9 = copy _7; pin_root(_8, move _9)               -> bb3
+        //   bb3: convert()                                         -> bb4
+        //   bb4: _10 = &_3; _11 = copy _5; get(_10, _11)           -> bb5
+        //   bb5: drop(_3)                                          -> bb6
+        //   bb6: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let deref =
+            |i: u64| serde_json::json!({"kind": {"Projection": [place(i), "Deref"]}, "ty": ty()});
+        let index_place = |slice: u64, offset: u64| {
+            serde_json::json!({"kind": {"Projection": [deref(slice), {"Index": {
+                "offset": copy(offset),
+                "from_end": false
+            }}]}, "ty": ty()})
+        };
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    2 => "pyre_object::gc_roots::{impl RootScope}::base",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_root",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    5 => {
+                        "pyre_module::module::_cffi_backend::ctypeobj::convert_argument_from_object"
+                    }
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(vec![borrow(4, 3)], call(2, vec![copy(4)], 5, 2)),
+                block(
+                    vec![
+                        assign(6, serde_json::json!({"Use": [usize_lit(0), "No"]})),
+                        assign(7, serde_json::json!({"Use": [{"Copy": index_place(1, 6)}, "Yes"]})),
+                        borrow(8, 3),
+                        assign(9, serde_json::json!({"Use": [copy(7), "Yes"]})),
+                    ],
+                    call(3, vec![mv(8), mv(9)], 10, 3),
+                ),
+                block(vec![], call(5, vec![], 14, 4)),
+                block(
+                    vec![
+                        borrow(12, 3),
+                        assign(11, serde_json::json!({"Use": [copy(5), "No"]})),
+                    ],
+                    call(4, vec![copy(12), copy(11)], 13, 5),
+                ),
+                block(vec![], drop_guard(3, 6)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let moved = super::MovedOutLocals::with_set(&body, bit_set::BitSet::new());
+        for touches_callees in [false, true] {
+            let touches = |reg: &RegularCall| {
+                touches_callees
+                    && matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if *id == 5)
+            };
+            let plan =
+                super::analyze_root_brackets_with(&fixture_llbc(), &body, &moved, name_of, touches);
+            assert!(
+                plan.scopes.contains(3),
+                "n==1 incoming-elem pin must be erased (touches={touches_callees})"
+            );
+            assert_eq!(
+                plan.slice_gets,
+                vec![(4usize, 1usize, 0u64)],
+                "get(base) answers with args_w[0] (touches={touches_callees})"
+            );
+        }
     }
 
     #[test]

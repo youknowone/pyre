@@ -408,6 +408,12 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// allocator (`insn_byte_opt` answers `None`), as the `StringBuilderRepr`
 /// helper graphs (`rbuilder.py ll_append` / `ll_grow_by` / `ll_build`) emit
 /// them.  No walked body builds through those graphs yet.
+///
+/// `setarrayitem_raw_i/iiid` is the same kind of dynamic key: the
+/// codewriter numbers it through the `setdefault` allocator
+/// (`insn_byte_opt` answers `None`; `DYNAMIC_INSN_KEYS` binds the byte
+/// this build emitted).  The load twin `getarrayitem_raw_i/iid>i` is
+/// numbered the same way and has no walker arm, so it never appears here.
 #[test]
 fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let root = repo_root();
@@ -433,6 +439,7 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
         "copystrcontent/rrcic",
         "copystrcontent/rricc",
         "copystrcontent/rrccc",
+        "setarrayitem_raw_i/iiid",
     ]
     .into_iter()
     .map(str::to_string)
