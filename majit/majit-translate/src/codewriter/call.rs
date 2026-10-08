@@ -5987,6 +5987,22 @@ impl CallControl {
         true
     }
 
+    /// Intersection of every recorded AccessDirect call site.
+    /// A rescan of `caller` drops that caller's earlier observations
+    /// first (`default_specialize` rebuilds the `AccessDirect` graph);
+    /// sites from distinct callers still intersect (`SomeInstance.union`).
+    fn intersect_access_direct_seeds(sites: &[(CallPath, Vec<u64>)]) -> Vec<u64> {
+        let mut iter = sites.iter().map(|(_, seeds)| seeds);
+        let Some(first) = iter.next() else {
+            return Vec::new();
+        };
+        let mut acc = first.clone();
+        for seeds in iter {
+            acc.retain(|id| seeds.contains(id));
+        }
+        acc
+    }
+
     /// Formals of `callee` whose actual is in `hinted`.
     ///
     /// Call arguments and start-block `inputargs` are the same source
@@ -6154,7 +6170,7 @@ impl CallControl {
         // Annotator union of AccessDirect formals finishes before any
         // body forwards them. Collect every flagged call site, then
         // write the intersection and rescan.
-        let mut access_direct_sites: HashMap<CallPath, Vec<u64>> = HashMap::new();
+        let mut access_direct_sites: HashMap<CallPath, Vec<(CallPath, Vec<u64>)>> = HashMap::new();
         let mut published: HashSet<CallPath> = HashSet::new();
         loop {
             while let Some(path) = todo.pop() {
@@ -6177,6 +6193,9 @@ impl CallControl {
                 // `mergeinputargs`).
                 let caller_ready =
                     published.contains(&path) || !access_direct_sites.contains_key(&path);
+                for sites in access_direct_sites.values_mut() {
+                    sites.retain(|(caller, _)| caller != &path);
+                }
                 let access_directly_vars = Self::access_directly_result_ids(&graph);
                 // RPython call.py:77-90: scan all Call ops in the graph.
                 // For each call, check guess_call_kind (with BFS-aware
@@ -6404,14 +6423,10 @@ impl CallControl {
                                 );
                                 drop(graph_ref);
                                 if self.stamp_access_directly_flag(&callee_path) {
-                                    match access_direct_sites.entry(callee_path.clone()) {
-                                        std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                            entry.get_mut().retain(|id| seeded.contains(id));
-                                        }
-                                        std::collections::hash_map::Entry::Vacant(entry) => {
-                                            entry.insert(seeded);
-                                        }
-                                    }
+                                    access_direct_sites
+                                        .entry(callee_path.clone())
+                                        .or_default()
+                                        .push((path.clone(), seeded));
                                 }
                                 if already_candidate {
                                     continue;
@@ -6447,13 +6462,14 @@ impl CallControl {
                 }
             }
             let mut progressed = false;
-            for (path, seeds) in &access_direct_sites {
+            for (path, sites) in &access_direct_sites {
+                let seeds = Self::intersect_access_direct_seeds(sites);
                 let Some(graph) = self.function_graphs.get_mut(path) else {
                     continue;
                 };
-                let inputs_changed = graph.access_directly_inputs != *seeds;
+                let inputs_changed = graph.access_directly_inputs != seeds;
                 if inputs_changed {
-                    graph.access_directly_inputs.clone_from(seeds);
+                    graph.access_directly_inputs = seeds;
                 }
                 let first_publish = published.insert(path.clone());
                 if self.candidate_graphs.contains(path) && (first_publish || inputs_changed) {
@@ -12503,6 +12519,127 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::function_path(h_path.segments.iter().map(String::as_str)),
                 args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+    }
+
+    /// An ordinary call can discover `H` first. That scan records
+    /// `M(local_hint, H_formal)` with an unflagged formal. A later
+    /// AccessDirect call into `H` rescans with both arguments hinted;
+    /// the observation from `H` is replaced, not retained, so the
+    /// second formal stays (`AccessDirect` is a distinct specialized
+    /// graph in `default_specialize`).
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn ordinary_call_then_accessdirect_replaces_the_caller_site() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let m_path = CallPath::from_segments(["M"]);
+        let mut m = FunctionGraph::new("M");
+        let entry = m.startblock;
+        let mp0 = m.alloc_value_var();
+        let mp1 = m.alloc_value_var();
+        m.block_mut(entry).inputargs.push(mp0);
+        m.block_mut(entry).inputargs.push(mp1.clone());
+        m.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([mp1]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(m_path.clone(), m);
+
+        let h_path = CallPath::from_segments(["H"]);
+        let mut h = FunctionGraph::new("H");
+        let entry = h.startblock;
+        let hp0 = h.alloc_value_var();
+        h.block_mut(entry).inputargs.push(hp0.clone());
+        let frame = h.alloc_value_var();
+        let local_hint = h.alloc_value_var();
+        h.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(local_hint.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        h.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(m_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([local_hint, hp0]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(h_path.clone(), h);
+
+        let helper_plain = CallPath::from_segments(["helper_plain"]);
+        let mut plain = FunctionGraph::new("helper_plain");
+        let entry = plain.startblock;
+        let arg = plain.alloc_value_var();
+        plain.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(h_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([arg]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(helper_plain.clone(), plain);
+
+        let helper_flagged = CallPath::from_segments(["helper_flagged"]);
+        let mut flagged = FunctionGraph::new("helper_flagged");
+        let entry = flagged.startblock;
+        let frame = flagged.alloc_value_var();
+        let hinted = flagged.alloc_value_var();
+        flagged.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        flagged.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(h_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(helper_flagged.clone(), flagged);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        // LIFO pops `helper_plain` first so `H` is scanned as a regular
+        // graph before the AccessDirect call is seen.
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(
+                    helper_flagged.segments.iter().map(String::as_str),
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(helper_plain.segments.iter().map(String::as_str)),
+                args: Vec::new(),
                 result_ty: ValueType::Void,
             },
         });
