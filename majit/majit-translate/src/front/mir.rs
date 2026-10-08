@@ -59600,21 +59600,17 @@ fn const_eval_init_body_with_locals(
                     // RPython hands already-folded module constants to the
                     // flowspace.  Charon instead leaves a `Place::Global`
                     // inside computed const MIR (`MASK = (1 << SHIFT) - 1`).
-                    // Evaluate an immutable NamedConst initializer
+                    // Evaluate an immutable NamedConst / AnonConst initializer
                     // recursively so the resulting flow graph still carries
                     // one literal Constant rather than a synthetic accessor
-                    // call.
+                    // call. AnonConst is rustc's promoted use of a const
+                    // (`PathElem::Builtin(PromotedConst)`).
                     PlaceKind::Global { id, .. } => {
                         let global = llbc.global_by_id(*id)?;
                         // `AnonConst` is rustc's promoted `&FLAG` for a
                         // NamedConst used by reference (`FLAG.bits()`).
-                        match global
-                            .rest
-                            .get("global_kind")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            Some("NamedConst") | Some("AnonConst") => {}
-                            _ => return None,
+                        if !global.is_const_value() {
+                            return None;
                         }
                         let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
                         let init = llbc.fn_by_id(init_id)?;

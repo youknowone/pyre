@@ -5491,6 +5491,18 @@ where
             //    non-NULL again, and every reader gates on
             //    `last_exc_value` first.
             self.clear_exception();
+            // A target we will not call must not stamp force tokens.
+            // `aborted_tracing` leaves `TOKEN_TRACING_RESCALL` set.
+            if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
+                return report_symbolic_residual_call_target(
+                    ctx,
+                    fnaddr_word,
+                    Some(&calldescr.arg_classes),
+                );
+            }
+            if concrete_ptr.is_null() {
+                return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+            }
             // pyjitpl.py `vable_and_vrefs_before_residual_call`
             // walks vrefs FIRST (stamps TOKEN_TRACING_RESCALL), then the
             // virtualizable.  Pyre splits the call into
@@ -5511,24 +5523,15 @@ where
             //    through the void-typed dispatcher instead of
             //    `bh_call_i_dispatch` (which transmutes to
             //    `extern "C" fn(...) -> i64` and reads garbage from
-            //    rax/x0).
-            if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                return report_symbolic_residual_call_target(
-                    ctx,
-                    fnaddr_word,
-                    Some(&calldescr.arg_classes),
+            //    rax/x0). The null target already returned.
+            unsafe {
+                majit_backend::call_stub::bh_call_v_by_classes(
+                    concrete_ptr as usize,
+                    &calldescr.arg_classes,
+                    Some(&raw_i),
+                    Some(&raw_r),
+                    Some(&raw_f),
                 );
-            }
-            if !concrete_ptr.is_null() {
-                unsafe {
-                    majit_backend::call_stub::bh_call_v_by_classes(
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
-                    );
-                }
             }
             if let Some(action) =
                 host_requested_walk_abort(ctx, concrete_ptr as usize, &calldescr.arg_classes)
@@ -5849,7 +5852,18 @@ where
             //     clear_exception  ← FIRST
             //     vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
+            // Decline a target we will not call before that stamp.
             self.clear_exception();
+            if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
+                return report_symbolic_residual_call_target(
+                    ctx,
+                    fnaddr_word,
+                    Some(&calldescr.arg_classes),
+                );
+            }
+            if concrete_ptr.is_null() {
+                return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+            }
             let active_vable = if is_forces {
                 ctx.vrefs_before_residual_call();
                 self.prepare_standard_virtualizable_before_residual_call(ctx)
@@ -5858,26 +5872,15 @@ where
             };
             // Concrete execute via `bh_call_i_dispatch` (i64
             // return) — RPython `executor.execute_varargs` →
-            // `cpu.bh_call_i`.
-            if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
-                return report_symbolic_residual_call_target(
-                    ctx,
-                    fnaddr_word,
-                    Some(&calldescr.arg_classes),
-                );
-            }
-            let concrete = if concrete_ptr.is_null() {
-                0
-            } else {
-                unsafe {
-                    majit_backend::call_stub::bh_call_i_by_classes(
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
-                    )
-                }
+            // `cpu.bh_call_i`. The null target already returned.
+            let concrete = unsafe {
+                majit_backend::call_stub::bh_call_i_by_classes(
+                    concrete_ptr as usize,
+                    &calldescr.arg_classes,
+                    Some(&raw_i),
+                    Some(&raw_r),
+                    Some(&raw_f),
+                )
             };
             if let Some(action) =
                 host_requested_walk_abort(ctx, concrete_ptr as usize, &calldescr.arg_classes)
@@ -6214,13 +6217,8 @@ where
             // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
             // clear_exception precedes vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
+            // Decline a target we will not call before that stamp.
             self.clear_exception();
-            let active_vable = if is_forces {
-                ctx.vrefs_before_residual_call();
-                self.prepare_standard_virtualizable_before_residual_call(ctx)
-            } else {
-                None
-            };
             if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                 return report_symbolic_residual_call_target(
                     ctx,
@@ -6228,18 +6226,23 @@ where
                     Some(&calldescr.arg_classes),
                 );
             }
-            let concrete = if concrete_ptr.is_null() {
-                0
+            if concrete_ptr.is_null() {
+                return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+            }
+            let active_vable = if is_forces {
+                ctx.vrefs_before_residual_call();
+                self.prepare_standard_virtualizable_before_residual_call(ctx)
             } else {
-                unsafe {
-                    majit_backend::call_stub::bh_call_i_by_classes(
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
-                    )
-                }
+                None
+            };
+            let concrete = unsafe {
+                majit_backend::call_stub::bh_call_i_by_classes(
+                    concrete_ptr as usize,
+                    &calldescr.arg_classes,
+                    Some(&raw_i),
+                    Some(&raw_r),
+                    Some(&raw_f),
+                )
             };
             if let Some(action) =
                 host_requested_walk_abort(ctx, concrete_ptr as usize, &calldescr.arg_classes)
@@ -6519,13 +6522,8 @@ where
             // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_F branch parity:
             // clear_exception precedes vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
+            // Decline a target we will not call before that stamp.
             self.clear_exception();
-            let active_vable = if is_forces {
-                ctx.vrefs_before_residual_call();
-                self.prepare_standard_virtualizable_before_residual_call(ctx)
-            } else {
-                None
-            };
             if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                 return report_symbolic_residual_call_target(
                     ctx,
@@ -6533,18 +6531,23 @@ where
                     Some(&calldescr.arg_classes),
                 );
             }
-            let concrete = if concrete_ptr.is_null() {
-                0.0f64
+            if concrete_ptr.is_null() {
+                return refuse_null_residual_call_target(ctx, &calldescr.arg_classes);
+            }
+            let active_vable = if is_forces {
+                ctx.vrefs_before_residual_call();
+                self.prepare_standard_virtualizable_before_residual_call(ctx)
             } else {
-                unsafe {
-                    majit_backend::call_stub::bh_call_f_by_classes(
-                        concrete_ptr as usize,
-                        &calldescr.arg_classes,
-                        Some(&raw_i),
-                        Some(&raw_r),
-                        Some(&raw_f),
-                    )
-                }
+                None
+            };
+            let concrete = unsafe {
+                majit_backend::call_stub::bh_call_f_by_classes(
+                    concrete_ptr as usize,
+                    &calldescr.arg_classes,
+                    Some(&raw_i),
+                    Some(&raw_r),
+                    Some(&raw_f),
+                )
             };
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
@@ -6719,16 +6722,21 @@ where
             .current_mut()
             .jitcode
             .call_assembler_target(fn_ptr_idx);
-        // 1. clear_exception (pyjitpl.py)
+        // 1. `clear_exception`.
         self.clear_exception();
-        // 2. vable_and_vrefs_before_residual_call (pyjitpl.py)
-        //    — vrefs walk FIRST stamps TOKEN_TRACING_RESCALL on every
-        //    live vref so `vrefs_after_residual_call` distinguishes
-        //    forced vs untouched; then the virtualizable half.
-        ctx.vrefs_before_residual_call();
-        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-        // 3. execute (pyjitpl.py, tp == 'v') — `executor.execute_varargs`
-        //    → `cpu.bh_call_v`.
+        // Refusals with no `do_residual_call` counterpart, before
+        // `vable_and_vrefs_before_residual_call`. `aborted_tracing`
+        // leaves `TOKEN_TRACING_RESCALL` in place.
+        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+            return report_symbolic_residual_call_target(
+                ctx,
+                concrete_ptr as i64,
+                Some(&arg_classes),
+            );
+        }
+        if concrete_ptr.is_null() {
+            return refuse_null_residual_call_target(ctx, &arg_classes);
+        }
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
             concrete_ptr as usize,
@@ -6739,39 +6747,34 @@ where
         ) {
             return action;
         }
-        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-            return report_symbolic_residual_call_target(
-                ctx,
-                concrete_ptr as i64,
-                Some(&arg_classes),
-            );
-        }
-        if !concrete_ptr.is_null() {
-            unsafe {
-                majit_backend::call_stub::bh_call_v_by_classes(
-                    concrete_ptr as usize,
-                    &arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
-                );
-            }
-        }
-        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
-            return action;
-        }
-        // 4. `pyjitpl.py vrefs_after_residual_call` —
-        //    fire VIRTUAL_REF_FINISH for any vref forced by the
-        //    callee BEFORE the CALL_ASSEMBLER record below.
-        ctx.vrefs_after_residual_call();
-        // 5. record CALL_ASSEMBLER_N (pyjitpl.py MetaInterp.direct_assembler_call
-        //    → history.record_nospec)
-        // A standalone runtime (or a token number not yet attached to
-        // warmstate) resolves to `None`; the concrete call already ran,
-        // so abort this trace rather than panic.
+        // `direct_assembler_call` reads the token before it records. A
+        // missing token aborts here, before the stamp and the concrete
+        // call, so a replay of this opcode does not run the call twice.
         let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
             return TraceAction::Abort;
         };
+        // 2. `vable_and_vrefs_before_residual_call`: vrefs first, then
+        //    the virtualizable.
+        ctx.vrefs_before_residual_call();
+        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        // 3. execute, tp == 'v'. The null target already returned.
+        unsafe {
+            majit_backend::call_stub::bh_call_v_by_classes(
+                concrete_ptr as usize,
+                &arg_classes,
+                Some(&raw_i),
+                Some(&raw_r),
+                Some(&raw_f),
+            );
+        }
+        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
+            ctx.vrefs_after_residual_call();
+            let _ = Self::escaped_standard_virtualizable(ctx, active_vable);
+            return action;
+        }
+        // 4. `vrefs_after_residual_call` before the CALL_ASSEMBLER record.
+        ctx.vrefs_after_residual_call();
+        // 5. record `CALL_ASSEMBLER_N`.
         ctx.call_assembler_void_arc_typed(arc, &args, &arg_types);
         // 6. vable_after_residual_call + GUARD_NOT_FORCED
         //    (pyjitpl.py)
@@ -7737,9 +7740,16 @@ where
             .jitcode
             .call_assembler_target(fn_ptr_idx);
         self.clear_exception();
-        // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
-        ctx.vrefs_before_residual_call();
-        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+            return report_symbolic_residual_call_target(
+                ctx,
+                concrete_ptr as i64,
+                Some(&arg_classes),
+            );
+        }
+        if concrete_ptr.is_null() {
+            return refuse_null_residual_call_target(ctx, &arg_classes);
+        }
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
             concrete_ptr as usize,
@@ -7750,34 +7760,26 @@ where
         ) {
             return action;
         }
-        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-            return report_symbolic_residual_call_target(
-                ctx,
-                concrete_ptr as i64,
-                Some(&arg_classes),
-            );
-        }
-        let concrete = if concrete_ptr.is_null() {
-            0
-        } else {
-            unsafe {
-                majit_backend::call_stub::bh_call_i_by_classes(
-                    concrete_ptr as usize,
-                    &arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
-                )
-            }
-        };
-        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
-            return action;
-        }
-        // `pyjitpl.py vrefs_after_residual_call`.
-        ctx.vrefs_after_residual_call();
         let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
             return TraceAction::Abort;
         };
+        ctx.vrefs_before_residual_call();
+        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        let concrete = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                &arg_classes,
+                Some(&raw_i),
+                Some(&raw_r),
+                Some(&raw_f),
+            )
+        };
+        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
+            ctx.vrefs_after_residual_call();
+            let _ = Self::escaped_standard_virtualizable(ctx, active_vable);
+            return action;
+        }
+        ctx.vrefs_after_residual_call();
         let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
         self.set_int_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
@@ -7880,9 +7882,16 @@ where
             .jitcode
             .call_assembler_target(fn_ptr_idx);
         self.clear_exception();
-        // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
-        ctx.vrefs_before_residual_call();
-        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+            return report_symbolic_residual_call_target(
+                ctx,
+                concrete_ptr as i64,
+                Some(&arg_classes),
+            );
+        }
+        if concrete_ptr.is_null() {
+            return refuse_null_residual_call_target(ctx, &arg_classes);
+        }
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
             concrete_ptr as usize,
@@ -7893,36 +7902,27 @@ where
         ) {
             return action;
         }
-        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-            return report_symbolic_residual_call_target(
-                ctx,
-                concrete_ptr as i64,
-                Some(&arg_classes),
-            );
-        }
-        // 3. execute (pyjitpl.py, tp == 'r') — `executor.execute_varargs`
-        //    → `cpu.bh_call_r` / leftover `bh_call_i_by_classes`.
-        let concrete = if concrete_ptr.is_null() {
-            0
-        } else {
-            unsafe {
-                majit_backend::call_stub::bh_call_i_by_classes(
-                    concrete_ptr as usize,
-                    &arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
-                )
-            }
-        };
-        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
-            return action;
-        }
-        // `pyjitpl.py vrefs_after_residual_call`.
-        ctx.vrefs_after_residual_call();
         let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
             return TraceAction::Abort;
         };
+        ctx.vrefs_before_residual_call();
+        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        // tp == 'r' — leftover wrappers use `bh_call_i_by_classes`.
+        let concrete = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                &arg_classes,
+                Some(&raw_i),
+                Some(&raw_r),
+                Some(&raw_f),
+            )
+        };
+        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
+            ctx.vrefs_after_residual_call();
+            let _ = Self::escaped_standard_virtualizable(ctx, active_vable);
+            return action;
+        }
+        ctx.vrefs_after_residual_call();
         let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
         self.set_ref_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
@@ -8025,9 +8025,16 @@ where
             .jitcode
             .call_assembler_target(fn_ptr_idx);
         self.clear_exception();
-        // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
-        ctx.vrefs_before_residual_call();
-        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+            return report_symbolic_residual_call_target(
+                ctx,
+                concrete_ptr as i64,
+                Some(&arg_classes),
+            );
+        }
+        if concrete_ptr.is_null() {
+            return refuse_null_residual_call_target(ctx, &arg_classes);
+        }
         if let Some(action) = refuse_walk_local_ref_args(
             ctx,
             concrete_ptr as usize,
@@ -8038,36 +8045,27 @@ where
         ) {
             return action;
         }
-        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-            return report_symbolic_residual_call_target(
-                ctx,
-                concrete_ptr as i64,
-                Some(&arg_classes),
-            );
-        }
-        // 3. execute (pyjitpl.py, tp == 'f') — leftover wrappers
-        //    return packed i64 bits (`f64::to_bits`); `cpu.bh_call_i`.
-        let concrete = if concrete_ptr.is_null() {
-            0
-        } else {
-            unsafe {
-                majit_backend::call_stub::bh_call_i_by_classes(
-                    concrete_ptr as usize,
-                    &arg_classes,
-                    Some(&raw_i),
-                    Some(&raw_r),
-                    Some(&raw_f),
-                )
-            }
-        };
-        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
-            return action;
-        }
-        // `pyjitpl.py vrefs_after_residual_call`.
-        ctx.vrefs_after_residual_call();
         let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
             return TraceAction::Abort;
         };
+        ctx.vrefs_before_residual_call();
+        let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
+        // tp == 'f' — leftover wrappers return packed bits via `bh_call_i`.
+        let concrete = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                &arg_classes,
+                Some(&raw_i),
+                Some(&raw_r),
+                Some(&raw_f),
+            )
+        };
+        if let Some(action) = host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes) {
+            ctx.vrefs_after_residual_call();
+            let _ = Self::escaped_standard_virtualizable(ctx, active_vable);
+            return action;
+        }
+        ctx.vrefs_after_residual_call();
         let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
         self.set_float_reg(ctx, dst, Some(traced), Some(concrete));
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);

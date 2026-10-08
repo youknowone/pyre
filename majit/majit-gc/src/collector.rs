@@ -1751,6 +1751,9 @@ impl MiniMarkGC {
                     .try_alloc_young_nonmoving_clear(type_id, total_size)
                     .unwrap_or(GcRef(0));
             }
+            // Otherwise it is born old, and a `CALL_MALLOC_NURSERY` caller
+            // then stamps the whole `HDR.tid` word over the old-generation
+            // flags (see `make_tid_field_descr`).
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
         if ptr.is_null() {

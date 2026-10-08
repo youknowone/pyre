@@ -2236,6 +2236,8 @@ fn wasm_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
         jf_frame_baseitemofs: FIRST_ITEM_OFFSET,
         jf_frame_lengthofs: JF_FRAME_OFS + LENGTHOFS,
         sign_size: SIGN_SIZE,
+        // The entry reads each input as an i64 from its slot.
+        jf_frame_itemsize: codegen::SLOT_SIZE as usize,
     }
 }
 

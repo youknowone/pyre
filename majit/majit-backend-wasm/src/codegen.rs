@@ -120,7 +120,7 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
 pub const FRAME_SLOT_BASE: u64 = 8;
-const SLOT_SIZE: u64 = 8;
+pub(crate) const SLOT_SIZE: u64 = 8;
 
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
@@ -346,6 +346,11 @@ impl ValueLocals {
             }
         }
 
+        // One wasm local per SSA root. A loop-carried Int whose last body
+        // read is before a later def must still occupy that local on the
+        // backedge. x86 `consider_label` force_spill parks it in a frame
+        // slot (`is_last_real_use_before`) so the register can be reused;
+        // wasm Ints have no such slot.
         let mut types = Vec::new();
         let mut root_locals = vec![None; num_vars as usize];
         for id in 0..by_id.len() {
@@ -13663,6 +13668,36 @@ mod tests {
             locals.local(10),
             locals.local(0),
             "New that only closes the JUMP must share the LABEL local"
+        );
+    }
+
+    #[test]
+    fn loop_invariant_keeps_its_local_across_the_backedge() {
+        let _cpu = cpu();
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let label = Op::new(OpCode::Label, &[]);
+        label.setdescr(descr.clone());
+        let use_inv = Op::new(
+            OpCode::IntAdd,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
+        );
+        use_inv.pos().set(OpRef::int_op(2));
+        let later = Op::new(
+            OpCode::IntAdd,
+            &[rb(OpRef::int_op(2)), rb(OpRef::const_int(1))],
+        );
+        later.pos().set(OpRef::int_op(3));
+        let jump = Op::new(OpCode::Jump, &[]);
+        jump.setdescr(descr);
+        let ops = vec![label, use_inv, later, jump];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let locals = ValueLocals::collect(&inputargs, &ops, 16, 1);
+        assert_ne!(
+            locals.local(0),
+            locals.local(3),
+            "a body result must not reuse a loop invariant's local"
         );
     }
 

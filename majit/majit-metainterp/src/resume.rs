@@ -6173,12 +6173,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vable_size > 0")]
-    fn test_consume_vref_and_vable_asserts_zero_vable_size_when_vinfo_present() {
-        let mut writer = crate::resumecode::Writer::new(3);
+    fn test_consume_vref_and_vable_skips_a_zero_vable_section() {
+        let mut writer = crate::resumecode::Writer::new(4);
         writer.append_int(0); // items_resume_section (patched below)
         writer.append_int(0); // count
-        writer.append_int(0); // vable_size
+        writer.append_int(0); // vable_size: no identity word follows
+        writer.append_int(0); // vref_array length
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
@@ -8389,7 +8389,14 @@ impl<'a> ResumeDataDirectReader<'a> {
 
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
-            if let Some(vi) = vinfo {
+            // A numbered section of length 0 has no identity word after it.
+            // Reading one anyway consumes the next section's count and the
+            // blackhole resumes on a non-pointer. Upstream never emits that
+            // length when `vinfo` is present; a guard whose snapshot carried
+            // no virtualizable boxes still does.
+            if let Some(vi) = vinfo
+                && vable_size > 0
+            {
                 self.consume_vable_info(vi, vable_size);
             }
             // resume.py:1429-1430

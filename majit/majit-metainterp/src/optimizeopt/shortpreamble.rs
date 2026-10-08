@@ -2920,6 +2920,14 @@ impl ExtendedShortPreambleBuilder {
                 self.extra_same_as.push(same_as);
             }
             self.label_args.push(resolved_key);
+            // `ExtendedShortPreambleBuilder.add_preamble_op` appends to the
+            // target LABEL's own `label_args`. The flattened `ShortPreamble`
+            // carries that LABEL extra tail as `used_boxes`, so it grows with
+            // `short_jump_args`: the bridge close keeps `inline_short_preamble`'s
+            // extra args only up to `used_boxes.len()` (constants dropped, as
+            // the assembled LABEL drops them), and a missing entry leaves the
+            // bridge JUMP one arg short of the LABEL `label_args` built.
+            self.used_boxes.push(resolved_key);
             // The flattened struct only needs the replay position; the replay
             // op itself is rooted by short_preamble_jump.
             self.short_jump_args.push(replay_op.pos().get());
@@ -4540,6 +4548,9 @@ mod tests {
 
         assert_eq!(builder.label_args(), &[OpRef::int_op(41)]);
         assert_eq!(builder.jump_args(), &[OpRef::int_op(14)]);
+        let short = builder.build_short_preamble_struct();
+        assert_eq!(short.used_boxes, vec![OpRef::int_op(41)]);
+        assert_eq!(short.jump_args, vec![OpRef::int_op(14)]);
         let extra = builder.extra_same_as();
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].opcode, OpCode::SameAsI);

@@ -235,6 +235,22 @@ pub struct GlobalDecl {
     pub rest: std::collections::BTreeMap<String, Value>,
 }
 
+impl GlobalDecl {
+    /// `"NamedConst"` / `"AnonConst"` / `"ThreadLocal"`, or `None` when
+    /// `global_kind` is an object (`{"Static": {..}}`).
+    pub fn global_kind_str(&self) -> Option<&str> {
+        self.rest.get("global_kind").and_then(Value::as_str)
+    }
+
+    /// A translation-time value: a named `const`, or rustc's promoted
+    /// anonymous const (`AnonConst`, Charon `PathElem::Builtin(PromotedConst)`).
+    /// The promoted form copies the named const and returns a shared
+    /// reference to it; both kinds fold as the same host value.
+    pub fn is_const_value(&self) -> bool {
+        matches!(self.global_kind_str(), Some("NamedConst" | "AnonConst"))
+    }
+}
+
 /// User-defined type (`struct` / `enum` / `type` alias / opaque
 /// forward-decl) the program references. The `kind` field is consumed
 /// to populate `SemanticProgram.{known_struct_names,
