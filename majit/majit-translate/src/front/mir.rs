@@ -8197,9 +8197,7 @@ fn pygraph_initial_block(
         // residual exclusion: a cell parameter is the `MutRef<T>` the
         // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
         let cell_root = if gc_mut_ref_params.contains(&i) {
-            tyref_mut_ref_pointee(&local.ty, llbc).and_then(|pointee| {
-                mut_ref_cell_root_of(&pointee, llbc, tombstoned_leaves, gc_struct_ids)
-            })
+            tyref_gc_mut_ref_cell_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
         } else {
             None
         };
@@ -8481,9 +8479,7 @@ impl<'a> Lowering<'a> {
             // Same membership as [`gc_mut_ref_param_locals`]: a cell
             // parameter is the `MutRef<T>` the caller passes, not `T`.
             let cell_root = if gc_mut_ref_params.contains(&i) {
-                tyref_mut_ref_pointee(&local.ty, llbc).and_then(|pointee| {
-                    mut_ref_cell_root_of(&pointee, llbc, tombstoned_leaves, gc_struct_ids)
-                })
+                tyref_gc_mut_ref_cell_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
             } else {
                 None
             };
@@ -11294,8 +11290,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let ty = &self.body.locals.locals.get(local)?.ty;
-        let pointee = tyref_mut_ref_pointee(ty, self.llbc)?;
-        self.mut_ref_cell_root(&pointee)
+        tyref_gc_mut_ref_cell_root(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
     }
 
     fn deref_cell_param_local(&self, place: &Place) -> Option<usize> {
@@ -11421,19 +11416,29 @@ impl<'a> Lowering<'a> {
                 }
                 let mut cells = Vec::new();
                 for (index, ty) in fd.signature.inputs.iter().enumerate() {
-                    let pointee = tyref_mut_ref_pointee(ty, self.llbc).or_else(|| {
+                    let root = tyref_gc_mut_ref_cell_root(
+                        ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    )
+                    .or_else(|| {
                         if !tyref_is_type_var(ty, self.llbc) {
                             return None;
                         }
                         call_arg_tys
                             .get(index)
                             .and_then(Option::as_ref)
-                            .and_then(|arg_ty| tyref_mut_ref_pointee(arg_ty, self.llbc))
+                            .and_then(|arg_ty| {
+                                tyref_gc_mut_ref_cell_root(
+                                    arg_ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                )
+                            })
                     });
-                    let Some(pointee) = pointee else {
-                        continue;
-                    };
-                    let Some(root) = self.mut_ref_cell_root(&pointee) else {
+                    let Some(root) = root else {
                         continue;
                     };
                     cells.push((index, root));
@@ -25875,7 +25880,12 @@ impl<'a> Lowering<'a> {
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = scalar_inherent_method_path(&reg, self.llbc) {
+                    } else if let Some(path) = scalar_inherent_method_path(
+                        &reg,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    ) {
                         CallTarget::FunctionPath {
                             segments: path,
                             fun_decl_id: None,
@@ -28611,6 +28621,24 @@ impl<'a> Lowering<'a> {
                     .first()
                     .is_some_and(|ty| ty_is_raw_address(ty, self.llbc, self.gc_struct_ids))
                 {
+                    return None;
+                }
+                // `&mut self` of a GC handle occupies a MutRef cell
+                // (`mut_ref_cell_root_of`). MethodDesc.func_args prepends
+                // SomeInstance(selfclassdef) of the owner, so the callee's
+                // getattr(self, "value") blocks on that instance. Decline
+                // the Method hint so the call stays FunctionPath and
+                // FunctionDesc.parse_arguments sees the cell
+                // `install_gc_mut_ref_call` already constructs.
+                if fd.signature.inputs.first().is_some_and(|ty| {
+                    tyref_gc_mut_ref_cell_root(
+                        ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    )
+                    .is_some()
+                }) {
                     return None;
                 }
                 // The ADT id above is still the wrapper. The name the
@@ -55818,6 +55846,20 @@ fn tyref_mut_ref_pointee(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     serde_json::from_value(reference.get(1)?.clone()).ok()
 }
 
+/// `&mut T` occupies a MutRef cell when `T` is a GC pointer.
+/// Shared by callee input seeding (`gc_mut_ref_param_locals`), caller
+/// wrapping (`gc_mut_ref_signature`), and Method routing
+/// (`impl_method_owner`).
+fn tyref_gc_mut_ref_cell_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    tyref_mut_ref_pointee(ty, llbc)
+        .and_then(|pointee| mut_ref_cell_root_of(&pointee, llbc, tombstoned, gc_struct_ids))
+}
+
 fn tyref_is_type_var(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc).is_some_and(|node| node.get("TypeVar").is_some())
 }
@@ -55857,10 +55899,7 @@ fn gc_mut_ref_param_locals(
         let Some(local) = locals.locals.get(index) else {
             continue;
         };
-        let Some(pointee) = tyref_mut_ref_pointee(&local.ty, llbc) else {
-            continue;
-        };
-        if mut_ref_cell_root_of(&pointee, llbc, tombstoned, gc_struct_ids).is_some() {
+        if tyref_gc_mut_ref_cell_root(&local.ty, llbc, tombstoned, gc_struct_ids).is_some() {
             params.insert(index);
         }
     }
@@ -56576,23 +56615,29 @@ fn tyref_to_field_layout_string(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> String {
-    // A transparent GC handle is one pointer to its `Deref::Target`.
-    // Spell that pointer before the reference / transparent-scalar arms:
-    // the bare wrapper leaf would project as the wrapper's class, and
-    // the target's own name would be laid out as the whole object.
-    if let Some(spelling) =
-        transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
-    {
-        return spelling;
-    }
     // A reference field is one pointer repr, not an inline copy of its
     // referent.  `tyref_to_ast_string` intentionally erases `&T` for nominal
     // annotation lookup, but feeding that erased spelling to the physical
     // layout registry makes `&Engine` recursively enumerate every `Engine`
     // field inside the containing struct.  RPython's lltype row here is
     // `Ptr(T)`, so retain the reference constructor at the layout boundary.
+    //
+    // Checked before handle spelling: `transparent_handle_field_spelling`
+    // peels `&` via `strip_ty_wrappers` and would paint a captured
+    // `&Handle` as `*mut {Deref::Target}`. The capture's declared type is
+    // the handle, whose class the live `self` already carries
+    // (`ClassDef.generalize_attr` with the value's `s_value`).
     if let Some(reference) = tyref_reference_layout_string(ty, llbc) {
         return reference;
+    }
+    // A transparent GC handle is one pointer to its `Deref::Target`.
+    // Spell that pointer before the transparent-scalar arms: the bare
+    // wrapper leaf would project as the wrapper's class, and the target's
+    // own name would be laid out as the whole object.
+    if let Some(spelling) =
+        transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
+    {
+        return spelling;
     }
     // An atomic wrapper is layout-transparent over its inner scalar, and the
     // typed side already models a field of one as that inner value
@@ -58178,7 +58223,12 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
 /// decisions as inherent helpers on a scalar tag.  Those helpers remain
 /// ordinary statically selected functions, not Python method lookups on the
 /// integer.
-fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
+fn scalar_inherent_method_path(
+    reg: &RegularCall,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<Vec<String>> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
@@ -58193,6 +58243,19 @@ fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<Str
         TypeDeclKind::Enum(variants) if variants.iter().all(|variant| variant.fields.is_empty())
     );
     if !owner_decl.is_repr_transparent() && !is_payload_free_enum {
+        return None;
+    }
+    // A transparent GC handle is a Ref instance (`gc_ref_pointer`), not
+    // a scalar. This intercept would emit a FunctionPath without a
+    // fun-decl id, so `install_gc_mut_ref_call` could not wrap `&mut
+    // self`, and `&self` would miss MethodDesc.func_args.
+    if gc_ref_pointer(
+        &TyRef::Other(node.clone()),
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        0,
+    ) {
         return None;
     }
     let mut path = crate::model::split_qualified_path(&owner);
@@ -76441,6 +76504,17 @@ mod tests {
             super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
             "*mut PyErrorObject"
         );
+        // A captured `&PyError` keeps the handle class, not the payload
+        // pointer `transparent_handle_field_spelling` would paint after
+        // peeling `&`.
+        let shared = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9104, {"Ref": ["Erased", adt_body(3), "Shared"]}]
+        }))
+        .expect("shared-borrow TyRef parses");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&shared, &llbc, &gc_struct_ids),
+            "&PyError"
+        );
         let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
             "Value": [9103, {"RawPtr": [adt_body(3), "Mut"]}]
         }))
@@ -85802,6 +85876,318 @@ mod tests {
             CallTarget::Method { name, .. } => name == "try_dispatch_binary_special",
             _ => false,
         }
+    }
+
+    /// `&mut self` on a transparent GC handle is a FunctionPath cell call.
+    /// `&self` on the same type stays `CallTarget::Method`.
+    #[test]
+    fn mut_ref_gc_handle_method_is_function_path_cell() {
+        use crate::model::{CallTarget, OpKind};
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+            serde_json::json!({
+                "name": path,
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+        let adt = |id: u64| {
+            serde_json::json!({
+                "Adt": {
+                    "id": id,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            })
+        };
+        let payload_ty = adt(1);
+        let handle_ty = adt(0);
+        let mut_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+        let shared_self = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Shared"]});
+        let unit = serde_json::json!({"Tuple": []});
+        let layout = |transparent: bool| {
+            serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"transparent": transparent}
+                }
+            }])
+        };
+        let field = |name: Option<&str>, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+        let impl_seg = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, handle_ty.clone()]},
+            "kind": "InherentImplBlock"
+        }}});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+            serde_json::json!({
+                "index": index,
+                "name": name,
+                "span": span,
+                "ty": ty
+            })
+        };
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let method_body = |self_ty: &serde_json::Value| {
+            serde_json::json!({
+                "Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            local(0, None, &unit),
+                            local(1, Some("self"), self_ty)
+                        ]
+                    },
+                    "body": [{
+                        "statements": [],
+                        "terminator": {"span": span, "kind": "Return"}
+                    }]
+                }
+            })
+        };
+        let method_decl = |id: u64, leaf: &str, self_ty: &serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(vec![
+                    ident("fixture"),
+                    ident("Handle"),
+                    impl_seg.clone(),
+                    ident(leaf),
+                ], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [self_ty.clone()],
+                    "output": unit
+                },
+                "body": method_body(self_ty)
+            })
+        };
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(vec![ident("fixture"), ident("caller")], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [handle_ty.clone()],
+                "output": unit
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            local(0, None, &unit),
+                            local(1, Some("h"), &handle_ty),
+                            local(2, None, &mut_self),
+                            local(3, None, &shared_self)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(2, &mut_self),
+                                    {"Ref": {
+                                        "place": place(1, &handle_ty),
+                                        "kind": "Mut",
+                                        "ptr_metadata": null
+                                    }}
+                                ]}
+                            }],
+                            "terminator": {
+                                "span": span,
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 1},
+                                                    "generics": {
+                                                        "regions": [],
+                                                        "types": [],
+                                                        "const_generics": [],
+                                                        "trait_refs": []
+                                                    }
+                                                }
+                                            },
+                                            "args": [{"Move": place(2, &mut_self)}],
+                                            "dest": place(0, &unit)
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span, "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [{
+                                "span": span,
+                                "kind": {"Assign": [
+                                    place(3, &shared_self),
+                                    {"Ref": {
+                                        "place": place(1, &handle_ty),
+                                        "kind": "Shared",
+                                        "ptr_metadata": null
+                                    }}
+                                ]}
+                            }],
+                            "terminator": {
+                                "span": span,
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 2},
+                                                    "generics": {
+                                                        "regions": [],
+                                                        "types": [],
+                                                        "const_generics": [],
+                                                        "trait_refs": []
+                                                    }
+                                                }
+                                            },
+                                            "args": [{"Move": place(3, &shared_self)}],
+                                            "dest": place(0, &unit)
+                                        },
+                                        "target": 3,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span, "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(vec![ident("fixture"), ident("Handle")], true),
+                        "kind": {"Struct": [field(
+                            None,
+                            serde_json::json!({"RawPtr": [payload_ty, "Mut"]})
+                        )]},
+                        "layout": layout(true)
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(vec![ident("fixture"), ident("Payload")], true),
+                        "kind": {"Struct": []}
+                    }
+                ],
+                "fun_decls": [
+                    caller,
+                    method_decl(1, "set_flag", &mut_self),
+                    method_decl(2, "get_flag", &shared_self)
+                ],
+                "global_decls": [],
+                "trait_decls": handle_trait_decls(),
+                "trait_impls": [gctype_impl_for_adt(1)]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+        let handle: TyRef = serde_json::from_value(handle_ty.clone()).unwrap();
+        let mut_ty: TyRef = serde_json::from_value(mut_self.clone()).unwrap();
+        let tomb = no_tombstoned_leaves();
+        let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        assert!(
+            super::mut_ref_cell_root_of(&handle, &llbc, tomb, &gc).is_some(),
+            "Handle behind &mut is a cell pointee"
+        );
+        assert!(
+            super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc).is_some(),
+            "&mut Handle is a cell parameter"
+        );
+        let graph = super::lower_function(&llbc, "caller").expect("lower caller");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let mut_call = ops
+            .iter()
+            .find(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => super::fmt_path_ends_with(segments, &["Handle", "set_flag"]),
+                _ => false,
+            })
+            .expect("set_flag is a FunctionPath");
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "set_flag"
+            )),
+            "set_flag must not route as Method"
+        );
+        let mut_idx = ops
+            .iter()
+            .position(|op| std::ptr::eq(*op, *mut_call))
+            .expect("set_flag index");
+        assert!(
+            ops[..mut_idx].iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name.starts_with("MutRef<")
+            )),
+            "a MutRef constructor precedes set_flag"
+        );
+        assert!(
+            ops[mut_idx + 1..].iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if mut_ref_value_field(field)
+            )),
+            "a value FieldRead follows set_flag"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "get_flag"
+            )),
+            "get_flag stays CallTarget::Method"
+        );
     }
 
     /// `<Option<*mut PyObject> as PartialEq>::ne` in `try_hash_value`
