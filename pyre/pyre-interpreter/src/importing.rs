@@ -2181,7 +2181,7 @@ fn set_extension_module_spec(
 fn fix_up_source_module_spec(
     mut ns: PyObjectRef,
     pathname: &rustpython_wtf8::Wtf8,
-    cpathname: Option<&str>,
+    cpathname: Option<&rustpython_wtf8::Wtf8>,
 ) -> Result<bool, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
@@ -2204,7 +2204,7 @@ fn fix_up_source_module_spec(
     let path_slot = shadow_stack_len();
     let _ = pin_root(w_path);
     let w_cpath = match cpathname {
-        Some(c) => pyre_object::w_str_new_managed(c),
+        Some(c) => pyre_object::w_str_from_wtf8_managed_borrowed(c),
         None => pyre_object::w_none(),
     };
     let cpath_slot = shadow_stack_len();
@@ -2240,7 +2240,7 @@ fn fix_up_source_module_spec(
 fn fix_up_source_module_spec(
     _ns: PyObjectRef,
     _pathname: &rustpython_wtf8::Wtf8,
-    _cpathname: Option<&str>,
+    _cpathname: Option<&rustpython_wtf8::Wtf8>,
 ) -> Result<bool, crate::PyError> {
     Ok(false)
 }
@@ -4669,7 +4669,7 @@ fn exec_code_module(
     mut w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
     pathname: Option<&rustpython_wtf8::Wtf8>,
-    cpathname: Option<&str>,
+    cpathname: Option<&rustpython_wtf8::Wtf8>,
     plain_dispatch: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     // importing.py:272-274 — setdefault('__builtins__', space.builtin).
@@ -4704,7 +4704,7 @@ fn exec_code_module(
         // import was not satisfied from a `.pyc`.  Pyre has no .pyc
         // path today so reachable callers still hit the None arm.
         let w_cpathname = match cpathname {
-            Some(c) => pyre_object::w_str_new_managed(c),
+            Some(c) => pyre_object::w_str_from_wtf8_managed_borrowed(c),
             None => pyre_object::w_none(),
         };
         unsafe {
@@ -4980,7 +4980,7 @@ fn load_source_module(
     // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path
     // and `__cached__` is the `.pyc` (`importing.py` `exec_code_module`).
     #[cfg(not(feature = "sandbox"))]
-    let mut timestamp_cpathname: Option<String> = None;
+    let mut timestamp_cpathname: Option<rustpython_wtf8::Wtf8Buf> = None;
     #[cfg(not(feature = "sandbox"))]
     let cached = if cache_ok {
         let frozen = cache_key
@@ -4989,7 +4989,11 @@ fn load_source_module(
             Some(code) => Some(code),
             None => crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?.map(
                 |(code, cpathname)| {
-                    timestamp_cpathname = Some(cpathname.to_string_lossy().into_owned());
+                    // `space.newfilename(cpathname)`: filesystem-decoded like
+                    // `pathname`, so undecodable bytes round-trip.
+                    timestamp_cpathname = Some(crate::gateway::fsdecode_filename_wtf8(
+                        &crate::gateway::fsencode_os_str(cpathname.as_os_str()),
+                    ));
                     code
                 },
             ),
@@ -5142,7 +5146,7 @@ fn load_source_module(
     #[cfg(not(feature = "sandbox"))]
     let cpathname = timestamp_cpathname.as_deref();
     #[cfg(feature = "sandbox")]
-    let cpathname: Option<&str> = None;
+    let cpathname: Option<&rustpython_wtf8::Wtf8> = None;
     if let Err(e) = exec_code_module(
         roots.get(code_slot),
         roots.get(globals_slot),
