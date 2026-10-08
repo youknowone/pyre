@@ -2550,13 +2550,13 @@ fn marshal_aggregate_arg(
 /// Create a fresh instance of aggregate type `ty` whose owned buffer holds the
 /// returned `bytes`.
 fn make_aggregate_instance(
-    ty: PyObjectRef,
+    mut ty: PyObjectRef,
     bytes: &[u8],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let size = stginfo::stginfo_of(ty)
         .map(stginfo::stginfo_size)
         .unwrap_or(bytes.len());
-    let mut ba = pyre_object::w_bytearray_new(size);
+    let mut ba = pyre_object::with_roots!(ty => pyre_object::w_bytearray_new(size));
     let n = bytes.len().min(size);
     unsafe {
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
