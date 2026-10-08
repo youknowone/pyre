@@ -5398,7 +5398,7 @@ fn label_operand_offset(key: &str) -> Option<usize> {
 pub(crate) enum ExcHandlerShape {
     /// Reaches `jit_merge_point`.
     Rejoins,
-    /// A path returns out of the frame (`*_return`).
+    /// Every scanned path returns (`*_return`); none reraise.
     Returns,
     /// Clears state and `reraise`s, and no path returns.
     Reraise,
@@ -5454,11 +5454,14 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
             _ => work.push(op.next_pc),
         }
     }
-    if saw_return {
+    if saw_return && !saw_reraise {
         ExcHandlerShape::Returns
-    } else if saw_reraise {
+    } else if saw_reraise && !saw_return {
         ExcHandlerShape::Reraise
     } else {
+        // Mixed return-and-reraise is Unproven: except-as-return
+        // admit does not install `inline_poison_pcs`, so a re-raise
+        // after a mutation would replay the outer CALL.
         ExcHandlerShape::Unproven
     }
 }
@@ -5473,8 +5476,52 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
 /// refusing the walk at exactly those pcs leaves the traced `try` body free
 /// of them. An empty set, a poison pc on the happy path, a poison pc a
 /// non-`Reraise` handler can reach, or a body this scan cannot decode all
-/// decline — a returning handler stays residual.
+/// decline.
 pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize]) -> bool {
+    poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Reraise)
+}
+
+/// Whether every pc in `poison` sits on a `Returns` handler and off both the
+/// happy path and every other handler.
+///
+/// `can_inline_callable` (`warmstate.py`) does not residualize a callee
+/// because an `except E as e: return` arm exists. `perform_call`
+/// (`pyjitpl.py`) traces that arm when it is the taken path — classify's
+/// `_check_surrogate` reject is that shape. Unlike a reraise arm, the walk
+/// must enter these pcs, so the matching admit does not put them in
+/// `inline_poison_pcs`.
+pub(crate) fn poison_confined_to_returning_handlers(code: &[u8], poison: &[usize]) -> bool {
+    poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Returns)
+}
+
+/// Whether any `catch_exception` target is a returning handler.
+///
+/// `except E as e: return` compiles to `ExcHandlerShape::Returns`. The
+/// try body may still carry happy-path poison (`BUILD_MAP` for `type(name,
+/// (), {})`), so the except-as admit asks this instead of
+/// [`poison_confined_to_returning_handlers`].
+pub(crate) fn body_has_returning_handler(code: &[u8]) -> bool {
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let Some(op) = decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.key == "catch_exception/L" {
+            let target = read_label(code, &op, 0);
+            if exc_handler_shape(code, target) == ExcHandlerShape::Returns {
+                return true;
+            }
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
+fn poison_confined_to_handler_shape(
+    code: &[u8],
+    poison: &[usize],
+    wanted: ExcHandlerShape,
+) -> bool {
     if poison.is_empty() {
         return false;
     }
@@ -5484,9 +5531,9 @@ pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize])
     if poison.iter().any(|pc| happy.contains(pc)) {
         return false;
     }
-    let mut reraise_reach = std::collections::HashSet::new();
+    let mut wanted_reach = std::collections::HashSet::new();
     let mut other_reach = std::collections::HashSet::new();
-    let mut saw_reraise = false;
+    let mut saw_wanted = false;
     let mut pc = 0usize;
     while pc < code.len() {
         let Some(op) = decode_op_at(code, pc) else {
@@ -5495,15 +5542,15 @@ pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize])
         if op.key == "catch_exception/L" {
             let target = read_label(code, &op, 0);
             match exc_handler_shape(code, target) {
-                ExcHandlerShape::Reraise => {
-                    saw_reraise = true;
+                ExcHandlerShape::Unproven => return false,
+                shape if shape == wanted => {
+                    saw_wanted = true;
                     let Some(reach) = reachable_op_pcs(code, target) else {
                         return false;
                     };
-                    reraise_reach.extend(reach);
+                    wanted_reach.extend(reach);
                 }
-                ExcHandlerShape::Unproven => return false,
-                ExcHandlerShape::Returns | ExcHandlerShape::Rejoins => {
+                _ => {
                     let Some(reach) = reachable_op_pcs(code, target) else {
                         return false;
                     };
@@ -5513,10 +5560,10 @@ pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize])
         }
         pc = op.next_pc;
     }
-    saw_reraise
+    saw_wanted
         && poison
             .iter()
-            .all(|pc| reraise_reach.contains(pc) && !other_reach.contains(pc))
+            .all(|pc| wanted_reach.contains(pc) && !other_reach.contains(pc))
 }
 
 /// Ops reachable from `start` by ordinary control edges.
