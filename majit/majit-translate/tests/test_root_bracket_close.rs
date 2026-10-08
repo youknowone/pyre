@@ -29,6 +29,11 @@
 //! is stated over the brackets that survive that pass, which is why the
 //! fixtures below are bodies whose brackets it keeps.
 
+mod common;
+
+use common::{
+    INTERPRETER_LLBC, OBJECT_LLBC, interpreter_llbc, lower_context_for, module_llbc, object_llbc,
+};
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
 use majit_translate::CallPath;
@@ -36,57 +41,18 @@ use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{LowerContext, erased_root_bracket_guards, lower_fun_decl};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
-use std::sync::OnceLock;
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
-);
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
-);
-const MODULE_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-module.ullbc"
-);
-
-/// `None` means the artefact is absent, which degrades the tests to a skip
-/// rather than a failure on a tree that has not run the extraction.
-fn llbc(path: &'static str, slot: &'static OnceLock<Option<Llbc>>) -> Option<&'static Llbc> {
-    slot.get_or_init(|| {
-        if !std::path::Path::new(path).is_file() {
-            eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
-            return None;
-        }
-        Some(Llbc::load(path).expect("load llbc"))
-    })
-    .as_ref()
-}
-
-fn object_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    llbc(OBJECT_LLBC, &LLBC)
-}
-
-fn interpreter_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    llbc(INTERPRETER_LLBC, &LLBC)
-}
-
-fn module_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    llbc(MODULE_LLBC, &LLBC)
-}
-
-fn lower_named(llbc: &Llbc, leaf: &str) -> FunctionGraph {
-    let context = LowerContext::new(llbc);
+fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGraph {
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
-    lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
+    lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
+}
+
+fn lower_named(llbc: &'static Llbc, leaf: &str) -> FunctionGraph {
+    lower_fun(llbc, lower_context_for(llbc), leaf)
 }
 
 /// Count calls whose path ends with `leaf`, over every block of the graph.
@@ -105,7 +71,7 @@ fn calls_to(graph: &FunctionGraph, leaf: &str) -> usize {
         .count()
 }
 
-fn assert_bracket_closes(llbc: &Llbc, leaf: &str) {
+fn assert_bracket_closes(llbc: &'static Llbc, leaf: &str) {
     let graph = lower_named(llbc, leaf);
     let opened = calls_to(&graph, "push_roots");
     let closed = calls_to(&graph, "root_scope_close");
@@ -162,7 +128,7 @@ fn bracket_closes_for_each_caller_shape() {
 fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
     let Some(llbc) = object_llbc() else { return };
     let mut bodies = 0usize;
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
@@ -233,7 +199,7 @@ fn opener_blocks(llbc: &Llbc, body: &Unstructured) -> std::collections::HashMap<
 fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
     let Some(llbc) = object_llbc() else { return };
     let mut dropping = 0usize;
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     let mut left_open: Vec<String> = Vec::new();
     let mut moved_out = 0usize;
     for fd in llbc.iter_local_fns() {
@@ -333,7 +299,7 @@ fn nearly_every_dropped_bracket_closes() {
     let programs: Vec<_> = [object_llbc(), interpreter_llbc()]
         .into_iter()
         .flatten()
-        .map(|llbc| (llbc, LowerContext::new(llbc)))
+        .map(|llbc| (llbc, lower_context_for(llbc)))
         .collect();
     let mut work: Vec<(
         &LowerContext<'_>,
@@ -608,6 +574,7 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     }
     let object = Llbc::load(OBJECT_LLBC).expect("load object llbc");
     let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load interpreter llbc");
+    let context = LowerContext::new(&interpreter);
     let mut sensitive = majit_translate::front::mir::discover_stack_sensitive_fns(&object);
     let mut neutral = majit_translate::front::mir::discover_depth_neutral_fns(&object);
     interpreter.register_stack_sensitive_fns(sensitive.iter().cloned());
@@ -621,7 +588,7 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     interpreter.register_stack_sensitive_fns(sensitive);
     interpreter.register_stack_depth_neutral_fns(neutral);
     interpreter.mark_stack_sensitive_fns_complete();
-    let graph = lower_named(&interpreter, "binary_slice_values_inner");
+    let graph = lower_fun(&interpreter, &context, "binary_slice_values_inner");
     for leaf in [
         "push_roots",
         "shadow_stack_len",
@@ -770,7 +737,8 @@ fn slice_unpack_erases_the_len_named_free_pin_bracket() {
     let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
     let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
     interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
-    let graph = lower_named(&interpreter, "slice_unpack");
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "slice_unpack");
     for leaf in [
         "push_roots",
         "pin_root",

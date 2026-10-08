@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=45
+# pyre-check: max-pypy-ratio=16
 # pyre-check: spec-folds=format_with_spec_int
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept from its former standalone file with module-level names prefixed by the

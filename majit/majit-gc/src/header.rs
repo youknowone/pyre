@@ -33,6 +33,32 @@ pub const MEMORY_ALIGNMENT: usize = if GcHeader::ALIGN > std::mem::size_of::<usi
 /// Equivalent to incminimark's `tid = -42` in a native Signed word.
 pub const FORWARDED_MARKER: u64 = (usize::MAX - 41) as u64;
 
+/// Mimic-header word of an off-GC host jitframe (`alloc_off_gc_jitframe`).
+///
+/// `TypeRegistry::register` assigns `id = entries.len()`, so the first type
+/// is 0. A nursery object is `GcHeader::new(type_id)` (`init_gc_object`
+/// flags=0), so a type-0 JITFRAME's header word is also 0. Host blocks
+/// used to zero that word, and `jitframe_is_off_gc_host` then handed the
+/// GC replacement to `free_host_jitframe`.
+///
+/// Flag bit 16 of the header flag half: `_GCFLAG_FIRST_UNUSED` is bit 13,
+/// and this GC already claimed 13/14/15 (`FINALIZER_REGISTERED`,
+/// `FINALIZER_RUN`, `YOUNG_RAWMALLOC`). No `GcHeader::new` / `with_flags`
+/// allocation sets it. `GCFLAG_NO_HEAP_PTRS` marks a prebuilt that still
+/// holds no heap pointer (`init_gc_object_immortal`), not an off-heap
+/// malloc, and pairing it with `GCFLAG_TRACK_YOUNG_PTRS` would enter the
+/// write-barrier fast path. `GCFLAG_TRACK_YOUNG_PTRS` stays clear here so
+/// that path still skips. On wasm32 the 16-bit flag half is full, so the
+/// bit occupies the first padding bit of the physical `u64`, which a live
+/// GC object leaves zero.
+pub const OFF_GC_HOST_MARKER: u64 = 1u64 << (16 + FLAG_SHIFT);
+
+const _: () = assert!(OFF_GC_HOST_MARKER != 0);
+const _: () = assert!(OFF_GC_HOST_MARKER != FORWARDED_MARKER);
+const _: () = assert!(
+    OFF_GC_HOST_MARKER & (crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits() << FLAG_SHIFT) == 0
+);
+
 /// GC object header, placed immediately before the object payload.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -313,6 +339,16 @@ mod tests {
         let hdr = GcHeader::new(42);
         assert_eq!(hdr.type_id(), 42);
         assert_eq!(hdr.flags(), GcFlags::empty());
+    }
+
+    #[test]
+    fn off_gc_host_marker_is_not_a_live_gc_header() {
+        assert_ne!(GcHeader::new(0).tid_and_flags, OFF_GC_HOST_MARKER);
+        let host = GcHeader {
+            tid_and_flags: OFF_GC_HOST_MARKER,
+        };
+        assert!(!host.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(!host.is_forwarded());
     }
 
     #[test]

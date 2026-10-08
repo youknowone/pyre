@@ -1,21 +1,12 @@
 //! Result-of-PyError → exception-link lowering: production-LLBC
 //! regression tests for `front::result_exc`.
 
+mod common;
+
+use common::{INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_named_with_static_addrs};
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::lower_function_with_static_addrs;
 use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
-use std::sync::OnceLock;
-
-const INTERP: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc",
-);
-
-const MODULE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-module.ullbc",
-);
 
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
 ///
@@ -26,9 +17,8 @@ const MODULE: &str = concat!(
 /// the 16GB CI hosts; the resulting OOM/swap-thrash gets the job killed
 /// (Linux), where a developer machine with more headroom only runs
 /// slowly.  `Llbc` is read-only after `load`, so a single shared parse
-/// behind a `OnceLock` is sufficient: `get_or_init` runs the load
-/// exactly once even under the concurrent test threads, and
-/// `lower_function` only borrows it.
+/// behind `common::load_llbc` is sufficient, and `lower_function` only
+/// borrows it.
 /// The carrier the pass under test lowers, spelled the way the production
 /// driver spells it (`pyre-jit-trace/build/prepass.rs`).  `majit-translate`
 /// names no carrier of its own, so a test that expects `Result<T, PyError>`
@@ -42,10 +32,10 @@ const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
 };
 
 fn lower_function(
-    llbc: &Llbc,
+    llbc: &'static Llbc,
     function_name: &str,
 ) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
-    lower_function_with_static_addrs(
+    lower_named_with_static_addrs(
         llbc,
         function_name,
         HostStaticAddrs {
@@ -59,7 +49,7 @@ fn lower_function(
 /// exception edges into the runtime exception value
 /// (`codewriter::error_carrier_edges`): the raise paths the JitCode holds.
 fn lower_function_to_runtime_edges(
-    llbc: &Llbc,
+    llbc: &'static Llbc,
     function_name: &str,
 ) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
     let mut graph = lower_function(llbc, function_name)?;
@@ -71,13 +61,11 @@ fn lower_function_to_runtime_edges(
 }
 
 fn interp() -> &'static Llbc {
-    static LLBC: OnceLock<Llbc> = OnceLock::new();
-    LLBC.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))
+    load_llbc(INTERPRETER_LLBC)
 }
 
 fn optional_module() -> &'static Llbc {
-    static LLBC: OnceLock<Llbc> = OnceLock::new();
-    LLBC.get_or_init(|| Llbc::load(MODULE).expect("load pyre-module.ullbc"))
+    load_llbc(MODULE_LLBC)
 }
 
 fn is_root_scope_close(op: &OpKind) -> bool {

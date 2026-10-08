@@ -167,6 +167,8 @@ impl GraphBodyProvider {
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
             gc_struct_ids,
+            None,
+            None,
         );
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());
@@ -201,6 +203,8 @@ impl GraphBodyProvider {
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
             &gc_struct_ids,
+            None,
+            Some(&function_filter),
         );
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());

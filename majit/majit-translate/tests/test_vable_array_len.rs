@@ -7,42 +7,21 @@
 //! a call argument, a link argument — reaches `_check_no_vable_array` and
 //! aborts the build with "a virtualizable array is passed around".
 
+mod common;
+
+use common::{interpreter_llbc, lower_context_for};
 use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
 use majit_translate::front::mir::{LowerContext, lower_fun_decl};
 use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
-use std::sync::OnceLock;
-
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
-);
 
 /// Load the shipped interpreter LLBC once and share it across every test.
-/// `Llbc` is read-only after `load`, so a single parse behind a `OnceLock` is
-/// sufficient: `get_or_init` runs the load exactly once even under the
-/// concurrent test threads, and the lowering entry points only borrow it.
-/// `None` means the artefact is absent, which degrades the tests to a skip
-/// rather than a failure on a tree that has not run the extraction.
-fn interpreter_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    LLBC.get_or_init(|| {
-        if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-            eprintln!(
-                "skipping: {INTERPRETER_LLBC} is missing; run \
-                 `python3 scripts/extract-llbc.py pyre-interpreter`"
-            );
-            return None;
-        }
-        Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
-    })
-    .as_ref()
-}
-
+/// `Llbc` is read-only after `load`, so a single parse behind
+/// `common::interpreter_llbc` is sufficient. `None` means the artefact is
+/// absent, which degrades the tests to a skip rather than a failure on a
+/// tree that has not run the extraction.
 fn interpreter_context() -> Option<&'static LowerContext<'static>> {
-    static CONTEXT: OnceLock<LowerContext<'static>> = OnceLock::new();
-    let llbc = interpreter_llbc()?;
-    Some(CONTEXT.get_or_init(|| LowerContext::new(llbc)))
+    Some(lower_context_for(interpreter_llbc()?))
 }
 
 /// Lower `pyframe::<Impl>::<leaf>` out of the shipped interpreter LLBC.

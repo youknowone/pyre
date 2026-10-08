@@ -21,7 +21,10 @@
 use majit_gc::shadow_stack::OwnerRootGuard;
 use majit_ir::{FailDescr, GcRef};
 
-use crate::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
+use crate::jitframe::{
+    FIRST_ITEM_OFFSET, JitFrame, JitframeDescrFacts, free_host_jitframe, jitframe_is_off_gc_host,
+    malloc_gc_jitframe, malloc_host_jitframe, reuse_off_gc_jitframe,
+};
 
 /// llmodel.py — get_latest_descr.
 ///
@@ -489,6 +492,141 @@ pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
     }
 }
 
+/// True when a raw finish entry must take the general `execute_token` path.
+///
+/// `llmodel.py` `AbstractLLCPU.make_execute_token` always allocates through
+/// `self.gc_ll_descr.malloc_jitframe` (`GcLLDescription.malloc_jitframe`).
+/// The raw path does that too: a descr with a `JITFRAME` type id bumps a
+/// nursery frame (`malloc_gc_jitframe`); `HostHeapGc` keeps the
+/// host-block arm, which is what its `malloc_jitframe` is. `diag` is the
+/// remaining reason to leave that path — exec logging and dumps walk the
+/// typed `execute_token` frame.
+#[inline]
+pub fn raw_done_entry_use_general(diag: bool) -> bool {
+    diag
+}
+
+/// Take the token's parked off-GC frame when it fits, else allocate.
+///
+/// `HostHeapGc.malloc_jitframe` is [`malloc_host_jitframe`]. Reuse is the
+/// stand-in for a nursery bump on that descr only.
+#[inline]
+pub fn take_or_alloc_parked_entry_frame(
+    token: &crate::JitCellToken,
+    size_bytes: usize,
+) -> *mut JitFrame {
+    match token.take_entry_frame(size_bytes) {
+        Some(p) => {
+            unsafe { reuse_off_gc_jitframe(p) };
+            p
+        }
+        None => malloc_host_jitframe(size_bytes),
+    }
+}
+
+/// Park a single unforwarded host frame on the token, else free each
+/// off-GC host link. A GC-owned frame is left for the collector.
+///
+/// `llmodel.py` `execute_token` does not free: `jitframe_allocate` is
+/// `lltype.malloc(JITFRAME)` and the frame becomes garbage after the
+/// call. A descr that owns jitframes matches that. `HostHeapGc` still
+/// parks, because its malloc is a host block.
+#[inline]
+pub fn park_or_free_done_entry_frame(
+    token: &crate::JitCellToken,
+    head: *mut JitFrame,
+    tip: *mut JitFrame,
+    is_gc_object: bool,
+) {
+    if is_gc_object {
+        return;
+    }
+    let single = tip == head && unsafe { (*head).jf_forward.is_null() };
+    if single && token.park_entry_frame(head) {
+        return;
+    }
+    unsafe { free_off_gc_host_done_entry_chain(head) };
+}
+
+/// Walk `jf_forward` (`jitframe.py jitframe_resolve`) and release each
+/// off-GC host block. `malloc_jitframe_no_collect` may mint a GC
+/// replacement onto a host head; that link is left for the collector.
+///
+/// Host vs GC is [`crate::jitframe::jitframe_is_off_gc_host`]: the mimic
+/// header word equals [`majit_gc::header::OFF_GC_HOST_MARKER`], not a
+/// zero word (`GcHeader::new(0)` is also zero).
+unsafe fn free_off_gc_host_done_entry_chain(head: *mut JitFrame) {
+    let mut cur = head;
+    while !cur.is_null() {
+        let next = unsafe { (*cur).jf_forward };
+        if unsafe { jitframe_is_off_gc_host(cur) } {
+            unsafe { free_host_jitframe(cur) };
+        }
+        cur = next;
+    }
+}
+
+/// Slot 0 of a `DoneWithThisFrameDescrInt` frame. `get_int_value(deadframe, 0)`.
+#[inline(always)]
+pub fn done_int_slot0(tip: *mut JitFrame) -> i64 {
+    unsafe { get_int_value_direct(tip, 0) as i64 }
+}
+
+/// Slot 0 of a `DoneWithThisFrameDescrRef` frame. `get_ref_value(deadframe, 0)`.
+#[inline(always)]
+pub fn done_ref_slot0(tip: *mut JitFrame) -> usize {
+    unsafe { get_ref_value_direct(tip, 0) }
+}
+
+/// Frame setup for a raw finish. `llmodel.py` `AbstractLLCPU.make_execute_token`.
+///
+/// A descr that owns jitframes allocates through `gc_ll_descr.malloc_jitframe`
+/// (`GcLLDescription.malloc_jitframe` / `jitframe_allocate`) on every call.
+/// `facts` is that descr's answers on this CPU (`AbstractLLCPU.gc_ll_descr`).
+/// `HostHeapGc` reuses the token's parked off-GC frame when it fits, else
+/// allocates a host block — that descr's `malloc_jitframe`. Inits the header
+/// and stores `args` at `first_slot`. A GC frame then gets
+/// `llop.gc_writebarrier` when the allocation spilled out of the nursery.
+/// The caller invokes compiled code under its own calling convention and
+/// reads slot 0 of the returned frame.
+///
+/// # Safety
+/// `num_slots` is the `jf_frame` length ([`JitFrame::alloc_size`]).
+/// `first_slot + args.len()` must fit in that length.
+#[inline(always)]
+pub unsafe fn prepare_done_raw_entry_frame(
+    token: &crate::JitCellToken,
+    args: &[i64],
+    first_slot: usize,
+    num_slots: usize,
+    facts: JitframeDescrFacts,
+) -> *mut JitFrame {
+    assert!(
+        num_slots >= first_slot.saturating_add(args.len()),
+        "execute_token: frame depth {num_slots} < input top {} for {} args",
+        first_slot + args.len(),
+        args.len()
+    );
+    let clt = unsafe { &*token.compiled_loop_token_ptr() };
+    let fi_ptr = clt.frame_info.data_ptr() as *const crate::JitFrameInfo;
+    let frame_bytes = JitFrame::alloc_size(num_slots);
+    let (jf_ptr, needs_wb) = if facts.is_gc_object {
+        malloc_gc_jitframe(facts, frame_bytes)
+    } else {
+        (take_or_alloc_parked_entry_frame(token, frame_bytes), false)
+    };
+    unsafe {
+        JitFrame::init(jf_ptr, fi_ptr, num_slots);
+        for (i, &word) in args.iter().enumerate() {
+            set_int_value(jf_ptr, first_slot + i, word as isize);
+        }
+    }
+    if needs_wb {
+        majit_gc::gc_write_barrier(GcRef(jf_ptr as usize));
+    }
+    jf_ptr
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FailArgSource, decode_rd_loc_slot, get_int_value, set_int_value};
@@ -574,6 +712,63 @@ mod tests {
             assert_eq!(get_int_value(frame, fd, 0), 7);
             assert_eq!(get_int_value(frame, fd, 1), 9);
             free_off_gc_jitframe(frame);
+        }
+    }
+
+    /// A host entry forwarded (`jf_forward`) to a type-id-0 GC JITFRAME
+    /// must free only the host link. `GcHeader::new(0)` is word 0, which
+    /// used to look like an off-GC mimic header.
+    #[test]
+    fn free_off_gc_host_done_entry_chain_leaves_type0_gc_replacement() {
+        use crate::jitframe::{
+            JitFrameInfo, jitframe_is_off_gc_host, jitframe_type_info, malloc_host_jitframe,
+            malloc_jitframe,
+        };
+        use majit_gc::GcAllocator;
+
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        assert_eq!(tid, 0, "this case is the first registered type");
+        gc.set_jitframe_type_id(tid);
+
+        let depth = 4;
+        let bytes = JitFrame::alloc_size(depth);
+        let host = malloc_host_jitframe(bytes);
+        let gc_frame = malloc_jitframe(&mut gc, bytes);
+        assert!(!host.is_null() && !gc_frame.is_null());
+        let info = JitFrameInfo::default();
+        unsafe {
+            JitFrame::init(host, &info, depth);
+            JitFrame::init(gc_frame, &info, depth);
+            *JitFrame::slot_ptr(gc_frame, 0) = 0x11C0_FFEE;
+            (*host).jf_forward = gc_frame;
+            assert!(jitframe_is_off_gc_host(host));
+            assert!(
+                !jitframe_is_off_gc_host(gc_frame),
+                "a type-id-0 nursery JITFRAME must not be classified as a host block"
+            );
+            majit_gc::shadow_stack::register_libc_jitframe(host as usize);
+            super::free_off_gc_host_done_entry_chain(host);
+            #[cfg(not(debug_assertions))]
+            assert!(
+                !majit_gc::shadow_stack::is_libc_jitframe(host as usize),
+                "host frame must have been released by free_host_jitframe"
+            );
+            // Debug `free_host_jitframe` unregisters only when a collector is
+            // installed; drop the test registration so a freed address is
+            // not left in the set.
+            majit_gc::shadow_stack::unregister_libc_jitframe(host as usize);
+            assert!(
+                gc.is_in_nursery(gc_frame as usize),
+                "GC replacement must stay for the collector"
+            );
+            assert_eq!(
+                (*majit_gc::header::header_of(gc_frame as usize)).type_id(),
+                0
+            );
+            assert_eq!(*JitFrame::slot_ptr(gc_frame, 0), 0x11C0_FFEE);
+            assert!((*gc_frame).jf_forward.is_null());
+            assert!(!jitframe_is_off_gc_host(gc_frame));
         }
     }
 

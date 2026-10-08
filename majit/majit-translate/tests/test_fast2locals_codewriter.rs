@@ -8,6 +8,9 @@
 //! with that shape, and driving it here rather than waiting for a policy that
 //! admits it is what surfaced the element-type defect below.
 
+mod common;
+
+use common::{interpreter_llbc, lower_context_for};
 use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
@@ -17,26 +20,6 @@ use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 use majit_translate::{
     CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs, VirtualizableFieldDescriptor,
 };
-use std::sync::OnceLock;
-
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
-);
-
-/// Shared parse — the corpus is several GB resident, and each test parsing
-/// its own copy in parallel took the binary past 12 GB.
-fn interpreter_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    LLBC.get_or_init(|| {
-        if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-            eprintln!("skipping: {INTERPRETER_LLBC} is missing");
-            return None;
-        }
-        Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
-    })
-    .as_ref()
-}
 
 fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGraph {
     let suffix = format!("::{leaf}");
@@ -67,7 +50,7 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
 /// when the artefact is absent so the tests degrade to a skip.
 fn lower_fast2locals() -> Option<FunctionGraph> {
     let llbc = interpreter_llbc()?;
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     Some(lower_named(llbc, &context, "fast2locals"))
 }
 
@@ -97,7 +80,7 @@ fn the_access_directly_marker_folds_out_of_the_type_lookup() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     let graph = lower_named(llbc, &context, "typedef::type");
     assert!(
         call_leafs(&graph)
@@ -116,7 +99,7 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     let gateway = lower_named(
         llbc,
         &context,
@@ -166,7 +149,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     for leaf in [
         "__majit_wrap_descr_typecheck_get_w_globals",
         "__majit_wrap_descr_typecheck_fget_f_lasti",
@@ -218,7 +201,7 @@ fn the_gateways_outside_the_redirected_set_carry_no_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(llbc);
+    let context = lower_context_for(llbc);
     for leaf in [
         "__majit_wrap_descr_typecheck_fget_f_code",
         "__majit_wrap_descr_typecheck_fget_f_back",

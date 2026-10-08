@@ -106,6 +106,16 @@ fn majit_verify_enabled() -> bool {
     *ENABLED
 }
 
+/// Logging and dump gates, read once per process. The raw DONE_REF
+/// entry falls back to the general path when any of these is on.
+#[inline]
+fn exec_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        majit_dump_enabled() || majit_verify_enabled() || majit_ir::debug::have_debug_prints()
+    });
+    *ENABLED
+}
+
 /// Whether `MAJIT_DUMP` is set, cached at first access.
 fn majit_dump_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
@@ -285,8 +295,14 @@ fn match_metainterp_finish_descr(
 use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
     BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
-    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, check_jitframe_descr, jitframe_is_gc_object,
+    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, JitframeDescrFacts,
+    check_jitframe_descr, jitframe_facts_at_cpu_init, jitframe_is_gc_object,
     jitframe_write_barrier, malloc_entry_jitframe, malloc_jitframe_no_collect,
+    publish_standalone_jitframe_facts,
+};
+use majit_backend::llmodel::{
+    done_ref_slot0, park_or_free_done_entry_frame, prepare_done_raw_entry_frame,
+    raw_done_entry_use_general,
 };
 /// Byte offset of `jf_frame_length` from JitFrame start
 /// (`jitframe.py:84` — `jf_frame`'s length word sits at the array base).
@@ -300,15 +316,17 @@ const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
 /// without requiring a `CraneliftBackend` instance.
 /// Install a GC box into TLS and register all `set_active_*` hooks.
 /// Used by tests and embedders whose whole managed heap is thread-confined.
-fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
+fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    check_jitframe_descr(gc.as_ref());
+    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
+    let facts = check_jitframe_descr(gc.as_ref());
     gc.freeze_types();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     set_cranelift_active_gc(Some(gc));
     register_active_hooks(supports_guard_gc_type);
+    facts
 }
 
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
@@ -436,9 +454,8 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// closes it at translation; pyre closes it before the first reader so
 /// JIT-only types can still be registered after startup.
 pub fn install_gc_standalone() {
-    majit_gc::gc_sync::gc_op(|gc| {
-        check_jitframe_descr(gc);
-    });
+    let facts = majit_gc::gc_sync::gc_op(|gc| check_jitframe_descr(gc));
+    publish_standalone_jitframe_facts(facts);
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
     register_active_hooks(supports_guard_gc_type);
 }
@@ -3086,6 +3103,129 @@ fn expect_deadframe(result: Result<usize, DeadFrame>) -> DeadFrame {
         // `release_ref_finish` is false on every caller of this.
         Ok(_) => unreachable!("ref-finish release is off on this entry"),
     }
+}
+
+/// Post-call handling for one compiled entry. Shared by
+/// `execute_with_inputs_at_dispatch_key` and the raw done-ref miss path.
+///
+/// `llmodel.py execute_token` returns the frame; `warmstate.py
+/// execute_assembler` then tests `isinstance(fail_descr,
+/// DoneWithThisFrameDescrRef)`. An external JUMP (`assembler.py
+/// closing_jump` fall-through) re-enters the target; `assembler.py
+/// call_assembler` consumes the sentinel and keeps the caller prefix.
+enum CompiledExit {
+    Done(Result<usize, DeadFrame>),
+    Jump {
+        dispatch_key: u32,
+        code_ptr: *const u8,
+        fail_descrs: Box<[DescrRef]>,
+        num_ref_roots: usize,
+        max_output_slots: usize,
+        inputs: Vec<i64>,
+    },
+}
+
+fn handle_compiled_exit(
+    compiled: &CompiledLoop,
+    mut exec: JitExecResult,
+    cur_fail_descrs: &[DescrRef],
+    cur_inputs: &FrameInputs<'_>,
+    cur_max_output_slots: usize,
+    release_ref_finish: bool,
+) -> CompiledExit {
+    let fail_index = exec.fail_index;
+    let direct_descr = exec.direct_descr.take();
+
+    if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
+        return CompiledExit::Done(Err(wrap_call_assembler_deadframe_with_caller_prefix(
+            frame,
+            &CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs.to_ints()),
+        )));
+    }
+
+    let fail_descr = if let Some(descr) = direct_descr {
+        descr
+    } else if (fail_index as usize) < cur_fail_descrs.len() {
+        ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone())
+    } else {
+        let found = compiled.fail_descrs.iter().find_map(|d| {
+            let guard = fail_descr_bridge_ref(as_fd(d));
+            guard.as_ref().and_then(|b| {
+                find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
+            })
+        });
+        ExitDescr::owned(found.unwrap_or_else(|| {
+            cur_fail_descrs
+                .last()
+                .cloned()
+                .unwrap_or_else(|| compiled.fail_descrs[0].clone())
+        }))
+    };
+    // `compile.py` `_DoneWithThisFrameDescr.final_descr = True` is a
+    // class attribute, i.e. a field load after translation. The FINISH
+    // family answers `fail_index()` with `u32::MAX`
+    // (`majit-backend/src/finish_descrs.rs`) and the resolution above
+    // already keyed on that, so the three trait queries below would
+    // ask the descr what this word has already said. The arm is a
+    // SUPERSET of `is_finish()` — a `PropagateExceptionDescr` answers
+    // `u32::MAX` too and is not final — and it is right only because
+    // the fall-through return is byte-identical and
+    // `maybe_increment_fail_count` is inert on both. Anything added
+    // between the two returns below has to be re-checked here.
+    debug_assert!(
+        fail_index != u32::MAX || {
+            let fd = fail_descr.as_fail_descr();
+            !fd.is_external_jump() && !fd.is_resume_guard() && !fd.is_resume_guard_copied()
+        },
+        "a u32::MAX fail_index must be a final or propagate descr, never a guard"
+    );
+    if fail_index == u32::MAX {
+        return CompiledExit::Done(release_ref_finish_or_deadframe(
+            release_ref_finish,
+            exec,
+            fail_descr,
+        ));
+    }
+    let fail_descr_fd = fail_descr.as_fail_descr();
+
+    if fail_descr_fd.is_external_jump() {
+        slice_x2_probe::record_execute_with_inputs_hit();
+        let target_descr = fail_descr_fd.target_descr();
+        let target_entry = target_descr
+            .as_ref()
+            .and_then(lookup_loop_target)
+            .expect("external JUMP target must be a registered LoopTargetDescr");
+        let dispatch_key = target_descr
+            .as_ref()
+            .map(host_reentry_dispatch_key)
+            .unwrap_or(0);
+        let inputs = exec.extract_outputs(cur_max_output_slots.max(1));
+        return CompiledExit::Jump {
+            dispatch_key,
+            code_ptr: target_entry.code_ptr,
+            fail_descrs: target_entry.fail_descrs,
+            num_ref_roots: target_entry.num_ref_roots,
+            max_output_slots: target_entry.max_output_slots,
+            inputs,
+        };
+    }
+    if fail_descr_fd.is_finish() {
+        return CompiledExit::Done(release_ref_finish_or_deadframe(
+            release_ref_finish,
+            exec,
+            fail_descr,
+        ));
+    }
+
+    maybe_increment_fail_count(fail_descr_fd);
+    // llgraph/runner.py fail_guard → ExecutionFinished (LLDeadFrame).
+    // Attached bridges dispatch in-code (`emit_attached_bridge_dispatch`);
+    // reaching here means the descr has no bridge.
+    CompiledExit::Done(Err(deadframe_from_jitframe(
+        exec.jf_gcref,
+        fail_descr,
+        exec.heap_owner,
+    )))
 }
 
 pub fn set_savedata_ref_on_deadframe(
@@ -10784,6 +10924,15 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
+    /// Cell address of `done_with_this_frame_descr_ref`, published when
+    /// the singleton is attached. The raw finish entry compares `jf_descr`
+    /// to this word; `descr_attachments`' load is not taken on that path.
+    done_ref_cell: AtomicUsize,
+    /// `llmodel.py` `AbstractLLCPU.gc_ll_descr` answers used by raw DONE
+    /// (`make_execute_token` / `malloc_jitframe`). Replaced with the descr
+    /// in [`Self::set_gc_allocator`]; [`JitframeDescrFacts::HOST`] when the
+    /// descr has no `JITFRAME` type id.
+    jitframe_facts: JitframeDescrFacts,
     /// CLIF of the body most recently compiled by this backend.
     #[cfg(test)]
     last_body_clif: String,
@@ -11059,6 +11208,8 @@ impl CraneliftBackend {
             vtable_offset: None,
             w_class_offset: None,
             descr_attachments: Arc::new(majit_backend::CpuDescrCell::default()),
+            done_ref_cell: AtomicUsize::new(0),
+            jitframe_facts: jitframe_facts_at_cpu_init(),
             #[cfg(test)]
             last_body_clif: String::new(),
         }
@@ -11152,7 +11303,7 @@ impl CraneliftBackend {
     }
 
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
-        install_gc_box(gc);
+        self.jitframe_facts = install_gc_box(gc);
     }
 
     /// No-op: cranelift already routes `New` through the active GC when one
@@ -11440,7 +11591,7 @@ impl CraneliftBackend {
         }
 
         loop {
-            let mut exec = run_compiled_code(
+            let exec = run_compiled_code(
                 cur_code_ptr,
                 &cur_fail_descrs,
                 cur_num_ref_roots,
@@ -11449,130 +11600,31 @@ impl CraneliftBackend {
                 attachments,
                 cur_dispatch_key,
             );
-            let fail_index = exec.fail_index;
-            // Taken, not cloned: this is the field's only reader, and what is
-            // left of `exec` is the frame and its owner.
-            let direct_descr = exec.direct_descr.take();
-
-            // CALL_ASSEMBLER deadframe interception.
-            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
-                return Err(wrap_call_assembler_deadframe_with_caller_prefix(
-                    frame,
-                    &CallAssemblerCallerContext::from_compiled_loop(
-                        compiled,
-                        &cur_inputs.to_ints(),
-                    ),
-                ));
+            match handle_compiled_exit(
+                compiled,
+                exec,
+                &cur_fail_descrs,
+                &cur_inputs,
+                cur_max_output_slots,
+                release_ref_finish,
+            ) {
+                CompiledExit::Done(result) => return result,
+                CompiledExit::Jump {
+                    dispatch_key,
+                    code_ptr,
+                    fail_descrs,
+                    num_ref_roots,
+                    max_output_slots,
+                    inputs,
+                } => {
+                    cur_dispatch_key = dispatch_key;
+                    cur_code_ptr = code_ptr;
+                    cur_fail_descrs = Cow::Owned(fail_descrs.into_vec());
+                    cur_num_ref_roots = num_ref_roots;
+                    cur_inputs = FrameInputs::OwnedInts(inputs);
+                    cur_max_output_slots = max_output_slots;
+                }
             }
-
-            // llmodel.py get_latest_descr: resolve fail_descr from
-            // jf_descr pointer (direct_descr) or fail_index lookup.
-            let fail_descr = if let Some(descr) = direct_descr {
-                descr
-            } else if (fail_index as usize) < cur_fail_descrs.len() {
-                ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone())
-            } else {
-                // Search bridge fail_descrs for nested guard failures.
-                let found = compiled.fail_descrs.iter().find_map(|d| {
-                    let guard = fail_descr_bridge_ref(as_fd(d));
-                    guard.as_ref().and_then(|b| {
-                        find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
-                    })
-                });
-                ExitDescr::owned(found.unwrap_or_else(|| {
-                    cur_fail_descrs
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| compiled.fail_descrs[0].clone())
-                }))
-            };
-            // `compile.py` `_DoneWithThisFrameDescr.final_descr = True` is a
-            // class attribute, i.e. a field load after translation. The FINISH
-            // family answers `fail_index()` with `u32::MAX`
-            // (`majit-backend/src/finish_descrs.rs`) and the resolution above
-            // already keyed on that, so the three trait queries below would
-            // ask the descr what this word has already said. The arm is a
-            // SUPERSET of `is_finish()` — a `PropagateExceptionDescr` answers
-            // `u32::MAX` too and is not final — and it is right only because
-            // the fall-through return is byte-identical and
-            // `maybe_increment_fail_count` is inert on both. Anything added
-            // between the two returns below has to be re-checked here.
-            debug_assert!(
-                fail_index != u32::MAX || {
-                    let fd = fail_descr.as_fail_descr();
-                    !fd.is_external_jump() && !fd.is_resume_guard() && !fd.is_resume_guard_copied()
-                },
-                "a u32::MAX fail_index must be a final or propagate descr, never a guard"
-            );
-            if fail_index == u32::MAX {
-                // Same helper as the `is_finish` return below, so the two
-                // exits stay the pair the comment above requires.
-                return release_ref_finish_or_deadframe(release_ref_finish, exec, fail_descr);
-            }
-            let fail_descr_fd = fail_descr.as_fail_descr();
-
-            // llgraph/runner.py Jump exception caught by execute():
-            // cross-loop JUMP — switch to the target loop trace identified
-            // by the TargetToken stored on the fail descriptor.
-            // assembler.py closing_jump: raw JMP to
-            // `target_token._ll_loop_code`. Cranelift can't emit inter-
-            // function JMPs, so we return and re-enter the target loop here.
-            if fail_descr_fd.is_external_jump() {
-                slice_x2_probe::record_execute_with_inputs_hit();
-                let target_descr = fail_descr_fd.target_descr();
-                let target_entry = target_descr
-                    .as_ref()
-                    .and_then(lookup_loop_target)
-                    .expect("external JUMP target must be a registered LoopTargetDescr");
-                cur_dispatch_key = target_descr
-                    .as_ref()
-                    .map(host_reentry_dispatch_key)
-                    .unwrap_or(0);
-                cur_code_ptr = target_entry.code_ptr;
-                cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.into_vec());
-                cur_num_ref_roots = target_entry.num_ref_roots;
-                // Extracted here, on the one arm that consumes it. Every other
-                // exit out of this loop returns the frame itself as the
-                // deadframe and reads its slots through the accessors
-                // (`llmodel.py grab_exc_value`), so a vector taken beside `fail_index`
-                // was built and dropped unread on each of them.
-                cur_inputs =
-                    FrameInputs::OwnedInts(exec.extract_outputs(cur_max_output_slots.max(1)));
-                cur_max_output_slots = target_entry.max_output_slots;
-                continue;
-            }
-            // llgraph/runner.py execute_finish → ExecutionFinished.
-            if fail_descr_fd.is_finish() {
-                // Real FINISH — function completed.
-                // jf_savedata already correct in jf_frame memory.
-                // jf_guard_exc already written by emit_guard_exit.
-                return release_ref_finish_or_deadframe(release_ref_finish, exec, fail_descr);
-            }
-
-            maybe_increment_fail_count(fail_descr_fd);
-
-            // llgraph/runner.py fail_guard → ExecutionFinished
-            // (LLDeadFrame).
-            //
-            // The host-loop bridge dispatch branch that
-            // previously sat between `increment_fail_count` and this
-            // deadframe return has been removed.  After
-            // `fail_descr_attach_bridge` was reordered (compiler.rs)
-            // to publish the bridge code cache before the BridgeData Arc
-            // swap, every guard exit observing a non-null cache reaches
-            // the in-code dispatch (`emit_attached_bridge_dispatch`,
-            // compiler.rs).  The bridge prologue
-            // (`_check_frame_depth`, compiler.rs) handles frame
-            // growth on entry, so the in-code path covers every attached
-            // bridge.  A counter probe confirmed zero host-loop fires in
-            // production traces; when control reaches this return the
-            // descr genuinely has no bridge attached (cache was null at
-            // guard exit time → in-code dispatch returned deadframe).
-            return Err(deadframe_from_jitframe(
-                exec.jf_gcref,
-                fail_descr,
-                exec.heap_owner,
-            ));
         } // end loop
     }
 
@@ -20922,6 +20974,160 @@ impl CraneliftBackend {
             &family_entry,
         );
     }
+
+    /// `jf_descr` equals the `DoneWithThisFrameDescrRef` cell
+    /// `set_done_with_this_frame_descr_ref` published.
+    ///
+    /// `compile.py make_and_attach_done_descrs` attaches that singleton
+    /// before any compiled code runs, so the exit is one compare.
+    #[inline(always)]
+    fn finish_is_done_ref(&self, descr_raw: usize) -> bool {
+        let cached = self.done_ref_cell.load(Ordering::Acquire);
+        descr_raw != 0 && descr_raw == cached
+    }
+
+    /// Raw finish entry. Allocate, store `args`, call the token, and return
+    /// `(head, tip, num_slots, jf_descr)`.
+    ///
+    /// `llmodel.py` `AbstractLLCPU.make_execute_token`. Allocation and the
+    /// slot stores are shared (`prepare_done_raw_entry_frame`); the call is
+    /// this backend's `(jitframe, dispatch_key)` convention. Key 0 is the
+    /// peeled preamble.
+    #[inline(always)]
+    fn run_done_raw_entry(
+        &self,
+        token: &JitCellToken,
+        compiled: &CompiledLoop,
+        args: &[i64],
+    ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
+        let depth = compiled.max_output_slots.max(args.len()).max(1);
+        let num_slots = depth + compiled.num_ref_roots;
+        let facts = self.jitframe_facts;
+        let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots, facts) };
+        let code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
+        let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
+            unsafe { std::mem::transmute(code_ptr) };
+        // Raw entry does not set the runtime JIT flag; rlib/jit.py `_we_are_jitted` is 0 in residual helpers.
+        let returned = unsafe { func(jf_ptr as *mut i64, 0) as *mut JitFrame };
+        // Host frames keep the descr load on the pointer the run returned
+        // (`done_ref_from_ran`). A moving nursery may come back as a
+        // forwarding stub (`emit_call_footer_shadowstack` then
+        // `return_(&[jf_ptr])`; `rooted_call_assembler_frame`);
+        // `JitframeDescrFacts::resolve_returned_frame` chases that when
+        // the descr has a gcrootmap, else `jitframe_resolve` (`jf_forward`).
+        let tip = if facts.is_gc_object {
+            facts.resolve_returned_frame(returned)
+        } else {
+            returned
+        };
+        let descr_raw = unsafe { majit_backend::llmodel::get_latest_descr(tip) };
+        (jf_ptr, tip, num_slots, descr_raw)
+    }
+
+    /// Non-matching raw exit: the frame already ran, so continue from the
+    /// shared post-call handler (`handle_compiled_exit`). An external JUMP
+    /// (`assembler.py closing_jump` fall-through) re-enters the target
+    /// without re-running this entry; `warmstate.py execute_assembler`
+    /// still answers `Ok` for `DoneWithThisFrameDescrRef`.
+    #[cold]
+    #[inline(never)]
+    fn continue_raw_done_ref_exit(
+        &self,
+        compiled: &CompiledLoop,
+        head: *mut JitFrame,
+        tip: *mut JitFrame,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        let attachments: &'static CpuDescrAttachments = compiled.cpu_attachments.read();
+        // Host frames keep the descr load on the pointer the run returned
+        // (`done_ref_from_ran`). A nursery frame may come back as a
+        // forwarding stub (`rooted_call_assembler_frame`), so its descr
+        // is read from `JitFrame::resolve`.
+        let resolved = jitframe_resolve(tip as *mut i64);
+        let gc_object = self.jitframe_facts.is_gc_object;
+        let descr_ptr = if gc_object { resolved } else { tip as *mut i64 };
+        let descr_raw =
+            unsafe { majit_backend::llmodel::get_latest_descr(descr_ptr as *const JitFrame) };
+        let (fail_index, direct_descr) =
+            resolve_exit_descr(descr_raw as i64, &compiled.fail_descrs, attachments);
+        let mut exec = JitExecResult {
+            jf_gcref: GcRef(resolved as usize),
+            heap_owner: if gc_object {
+                None
+            } else {
+                Some(FrameHeapOwner::of(head))
+            },
+            fail_index,
+            direct_descr,
+        };
+        let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
+        let mut cur_inputs = FrameInputs::Ints(args);
+        let mut cur_max_output_slots = compiled.max_output_slots;
+        loop {
+            match handle_compiled_exit(
+                compiled,
+                exec,
+                &cur_fail_descrs,
+                &cur_inputs,
+                cur_max_output_slots,
+                true,
+            ) {
+                CompiledExit::Done(result) => return result,
+                CompiledExit::Jump {
+                    dispatch_key,
+                    code_ptr,
+                    fail_descrs,
+                    num_ref_roots,
+                    max_output_slots,
+                    inputs,
+                } => {
+                    cur_fail_descrs = Cow::Owned(fail_descrs.into_vec());
+                    cur_inputs = FrameInputs::OwnedInts(inputs);
+                    cur_max_output_slots = max_output_slots;
+                    exec = run_compiled_code(
+                        code_ptr,
+                        &cur_fail_descrs,
+                        num_ref_roots,
+                        cur_max_output_slots,
+                        &cur_inputs,
+                        attachments,
+                        dispatch_key,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collector and diag entries keep the layered `execute_token` path.
+    #[cold]
+    #[inline(never)]
+    fn execute_token_done_ref_raw_general(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        let kinds = token.inputarg_types();
+        let n = args.len();
+        let mut stack = [Value::Void; 8];
+        if n <= stack.len() {
+            for (i, slot) in stack[..n].iter_mut().enumerate() {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                *slot = majit_backend::value_from_unspecialized_word(args[i], kind);
+            }
+            return <Self as majit_backend::Backend>::execute_token_done_ref(
+                self,
+                token,
+                &stack[..n],
+            );
+        }
+        let values: Vec<Value> = (0..n)
+            .map(|i| {
+                let kind = kinds.get(i).copied().unwrap_or(Type::Int);
+                majit_backend::value_from_unspecialized_word(args[i], kind)
+            })
+            .collect();
+        <Self as majit_backend::Backend>::execute_token_done_ref(self, token, &values)
+    }
 }
 
 // Backend trait implementation
@@ -21090,6 +21296,12 @@ impl majit_backend::Backend for CraneliftBackend {
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
             .update(|a| a.done_with_this_frame_descr_ref = Some(descr));
+        let ptr = self
+            .descr_attachments
+            .read()
+            .descr_ptrs()
+            .done_with_this_frame_descr_ref;
+        self.done_ref_cell.store(ptr, Ordering::Release);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
@@ -21510,6 +21722,42 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("compiled data is not CompiledLoop")
             .current();
         Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), 0, true)
+    }
+
+    /// `llmodel.py` `execute_token` / `warmstate.py execute_assembler` ref
+    /// finish: inline hot path, cold general fallback when exec diag is on.
+    /// Slot 0 is `get_ref_value_direct`. The call uses this backend's
+    /// `(jitframe, dispatch_key)` convention.
+    #[inline]
+    fn execute_token_done_ref_raw(
+        &self,
+        token: &JitCellToken,
+        args: &[i64],
+    ) -> Result<usize, DeadFrame> {
+        if raw_done_entry_use_general(exec_diag_enabled()) {
+            return self.execute_token_done_ref_raw_general(token, args);
+        }
+        let compiled = token
+            .compiled
+            .get()
+            .expect("token has no compiled code")
+            .downcast_ref::<CompiledLoop>()
+            .expect("compiled data is not CompiledLoop")
+            .current();
+        let (jf_ptr, tip, _num_slots, descr_raw) = self.run_done_raw_entry(token, compiled, args);
+        if self.finish_is_done_ref(descr_raw) {
+            // A GC frame was already resolved in `run_done_raw_entry`.
+            // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
+            let live = if self.jitframe_facts.is_gc_object {
+                tip
+            } else {
+                unsafe { JitFrame::resolve_forward(tip) }
+            };
+            let value = done_ref_slot0(live);
+            park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
+            return Ok(value);
+        }
+        self.continue_raw_done_ref_exit(compiled, jf_ptr, tip, args)
     }
 
     fn execute_token_with_dispatch_key(
@@ -32199,6 +32447,69 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "sets the process-global MAJIT_CL_NO_CLOSING_JUMP env var to force the \
+        host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
+        `MAJIT_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
+        test_raw_done_ref_external_jump_matches_general -- --ignored --test-threads=1`"]
+    fn test_raw_done_ref_external_jump_matches_general() {
+        unsafe { std::env::set_var("MAJIT_CL_NO_CLOSING_JUMP", "1") };
+
+        let mut backend = CraneliftBackend::new();
+        let target_descr = make_label_descr(1_500_410);
+        let target_inputargs = vec![InputArg::new_ref_rc(0)];
+        let target_ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+                target_descr.clone(),
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let target_token = JitCellToken::new(1_500_411);
+        backend
+            .compile_loop(&target_inputargs, &target_ops, &target_token)
+            .unwrap();
+
+        let source_inputargs = vec![InputArg::new_ref_rc(0)];
+        let source_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+                target_descr,
+            ),
+        ];
+        let source_token = JitCellToken::new(1_500_412);
+        backend
+            .compile_loop(&source_inputargs, &source_ops, &source_token)
+            .unwrap();
+
+        let referent = 0xCAFEusize;
+        let ptr = &referent as *const usize as i64;
+        let general = match backend
+            .execute_token_done_ref(&source_token, &[Value::Ref(GcRef(ptr as usize))])
+        {
+            Ok(value) => value,
+            Err(_) => panic!("general done-ref after JUMP"),
+        };
+        let raw = match backend.execute_token_done_ref_raw(&source_token, &[ptr]) {
+            Ok(value) => value,
+            Err(_) => panic!("raw done-ref after JUMP"),
+        };
+
+        unsafe { std::env::remove_var("MAJIT_CL_NO_CLOSING_JUMP") };
+
+        assert_eq!(raw, general);
+        assert_eq!(general, ptr as usize);
+    }
+
+    #[test]
     fn test_jump_to_mismatched_local_label_lowers_as_external_jump() {
         let mut backend = CraneliftBackend::new();
         let start_descr = majit_ir::make_loop_target_descr(1_500_360, true);
@@ -33317,6 +33628,64 @@ mod tests {
         assert_ne!(moved_root, root);
         assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0xABCDEF01);
         assert_eq!(call_result, 123);
+    }
+
+    /// Raw `DONE_REF` after a residual that forces a minor collection.
+    /// The entry jitframe is a nursery object (`emit_call_header_shadowstack`);
+    /// `emit_call_footer_shadowstack` pops that slot then `return_(&[jf_ptr])`,
+    /// which may still name the corpse. Slot 0 is the moved input ref.
+    #[test]
+    fn test_raw_done_ref_returns_moved_object_after_minor_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let root = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(root.0));
+        unsafe {
+            *(root.0 as *mut u64) = 0xABCDEF01;
+        }
+
+        let mut backend = backend_with_gc(gc);
+        backend.set_done_with_this_frame_descr_ref(super::DONE_WITH_THIS_FRAME_DESCR_REF.clone());
+
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef::int_op(100), OpRef::int_op(101)],
+                OpRef::NONE.raw(),
+                descr,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(
+            100,
+            collect_nursery_via_runtime_void as *const () as usize as i64,
+        );
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1508);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let raw = match backend.execute_token_done_ref_raw(&token, &[root.0 as i64]) {
+            Ok(value) => value,
+            Err(_) => panic!("raw done-ref after collecting residual"),
+        };
+        assert_ne!(raw, root.0, "minor collection must move the nursery ref");
+        assert_eq!(unsafe { *(raw as *const u64) }, 0xABCDEF01);
     }
 
     #[test]

@@ -21,27 +21,22 @@
 //! on: swapping two `&str`s for one enum also changes the count, but
 //! restoring a single `&str` would not.
 
+mod common;
+
+use common::{INTERPRETER_LLBC, load_llbc, lower_named_with_static_addrs};
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::lower_function_with_static_addrs;
 use majit_translate::model::{OpKind, ValueType};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
-use std::sync::OnceLock;
 
-const INTERP: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc",
-);
-
-/// Shared parse — the corpus is several GB resident, so one parse behind a
-/// `OnceLock` is what keeps concurrent tests off the runner's swap.
+/// Shared parse — the corpus is several GB resident, so one parse behind
+/// `common::load_llbc` is what keeps concurrent tests off the runner's swap.
 fn interp() -> &'static Llbc {
-    static L: OnceLock<Llbc> = OnceLock::new();
-    L.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))
+    load_llbc(INTERPRETER_LLBC)
 }
 
 /// Every parameter of `name`, as the front banks it.
 fn parameter_banks(name: &str) -> Vec<(String, ValueType)> {
-    let graph = lower_function_with_static_addrs(
+    let graph = lower_named_with_static_addrs(
         interp(),
         name,
         HostStaticAddrs {

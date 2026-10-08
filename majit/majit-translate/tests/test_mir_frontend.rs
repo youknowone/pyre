@@ -3,6 +3,9 @@
 //! The corpus snapshot at `majit/charon-corpus/corpus.ullbc` is the
 //! input and the regression fixture for the production MIR frontend.
 
+mod common;
+
+use common::{INTERPRETER_LLBC, load_llbc, lower_context_for, lower_named};
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
 use std::sync::OnceLock;
@@ -2592,11 +2595,7 @@ fn a_closure_indexes_its_captured_slice_through_the_pair() {
 fn code_flags_methods_lower_to_integer_ops() {
     use majit_translate::model::{CallTarget, OpKind};
 
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
-    );
-    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let llbc = load_llbc(INTERPRETER_LLBC);
     let tails: &[&[&str]] = &[
         &["CodeFlags", "contains"],
         &["CodeFlags", "intersects"],
@@ -2606,7 +2605,7 @@ fn code_flags_methods_lower_to_integer_ops() {
         "fill_user_function_args",
         "pyre_interpreter::pyframe::code_flags_make_generator",
     ] {
-        let graph = lower_function(&llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        let graph = lower_named(llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
         let calls: Vec<Vec<String>> = graph
             .blocks
             .iter()
@@ -2685,14 +2684,10 @@ fn code_flags_methods_lower_to_integer_ops() {
 /// That write becomes one field store per registered field.
 #[test]
 fn frame_box_new_ptr_write_lowers_to_field_stores() {
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{CallTarget, OpKind};
 
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
-    );
-    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let llbc = load_llbc(INTERPRETER_LLBC);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -2702,7 +2697,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                 .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
         })
         .expect("FrameBox::new");
-    let context = LowerContext::new(&llbc);
+    let context = lower_context_for(llbc);
     let graph = lower_fun_decl(&context, fd).expect("lower FrameBox::new");
     assert!(
         !graph
@@ -2785,12 +2780,8 @@ fn frame_box_owner_root_word_roundtrips() {
     use majit_translate::front::mir::{LowerContext, lower_fun_decl};
     use majit_translate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation};
 
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
-    );
-    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
-    let context = LowerContext::new(&llbc);
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let context = lower_context_for(llbc);
 
     fn value_id(arg: &LinkArg) -> Option<u64> {
         match arg {
@@ -3048,14 +3039,10 @@ fn frame_box_owner_root_word_roundtrips() {
 /// lowered graph keeps the reference and does not call the guard.
 #[test]
 fn frame_box_owner_root_guard_lowers_without_guard_calls() {
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::OpKind;
 
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
-    );
-    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let llbc = load_llbc(INTERPRETER_LLBC);
     let sources = [
         "pub fn new(mut frame: PyFrame)",
         "fn frame_ptr(&self)",
@@ -3063,7 +3050,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
         "pub fn into_raw(mut self)",
         "pub unsafe fn from_raw(ptr: *mut PyFrame)",
     ];
-    let context = LowerContext::new(&llbc);
+    let context = lower_context_for(llbc);
     for source in sources {
         let fd = llbc
             .iter_local_fns()
