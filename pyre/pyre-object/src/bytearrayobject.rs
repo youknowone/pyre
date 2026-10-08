@@ -189,8 +189,13 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     // `raw_malloc_memory_pressure` charges it. Explicit `collect(0)`
     // would pass `force_enabled=True` and advance a major while
     // `gc.disable()` is in effect.
-    if alloc > 0 {
-        majit_gc::maybe_collect_for_external_malloc(alloc);
+    //
+    // `major_collection_step` raises `MemoryError` out of `external_malloc`
+    // when the heap limit is hit. The body is already allocated here, so
+    // there is no allocation to fail: the exception is owed at the next
+    // dispatch, as for any collection with none waiting.
+    if alloc > 0 && majit_gc::maybe_collect_for_external_malloc(alloc) {
+        majit_ir::eval_breaker_word::set_memory_error();
     }
     account_buffer_growth(crate::gc_roots::shadow_stack_get(obj_slot), alloc);
     crate::gc_roots::shadow_stack_get(obj_slot)
