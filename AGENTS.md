@@ -129,8 +129,12 @@ Its only prerequisite beyond the native backends is the
 `wasm32-unknown-unknown` target — wasmtime is linked into `pyre-wasm-runner`,
 and the guest builds on stable with no `-Z build-std`. Once the target is
 installed `DEFAULT_BACKENDS` **adds wasm by itself**, so a bare
-`python3 pyre/check.py` runs three backends and `--backend dynasm,cranelift`
-*narrows* it.
+`python3 pyre/check.py` runs dynasm, cranelift, and wasm; `--backend dynasm,cranelift`
+drops wasm.
+
+Local verification names backends explicitly (`--backend dynasm` or
+`--backend dynasm,wasm`). Cranelift runs locally when the work is cranelift
+(see “How much to verify”).
 
 CI installs that target on the ubuntu leg alone because wasm output is
 platform-independent — **a cost decision, not a capability limit.** Never defer
@@ -295,7 +299,7 @@ them out:
 export CHARON_TARGET_DIR=$HOME/Projects/.pyre-build/charon-target-<worktree>
 pyre/scripts/build-jit-core.sh           # extract the 4 core crates, pyre-dynasm without pyre-module (`jit-core` profile)
 pyre/scripts/build-jit-core.sh --check   # same extraction, `cargo check` only
-python3 pyre/check.py --backend cranelift   # check.py's cranelift leg is the core build
+python3 pyre/check.py --backend dynasm      # local default; cranelift when the work is cranelift
 cargo test -p pyre-jit --no-default-features --features dynasm,prepass
 ```
 
@@ -319,8 +323,9 @@ cargo test -p pyre-jit --no-default-features --features dynasm,prepass
   there: without `_heapq` it runs the pure-Python `heapq`, which only its
   cranelift baseline records.
 - The core loop does not replace the full gate below. When the full gate is
-  due (see "How much to verify"), it is the product `cargo test` and a bare
-  `python3 pyre/check.py`, not their core variants.
+  due (see "How much to verify"), it is the product `cargo test` and
+  `python3 pyre/check.py --backend dynasm` (add wasm when the target is
+  installed), not their core variants.
 - **Which crate owns a module has three criteria, and PyPy's
   `default_modules` tier is not one of them.** A module belongs in
   `pyre-interpreter` when the interpreter reaches it by name -- `import`,
@@ -347,9 +352,16 @@ cargo test -p pyre-jit --no-default-features --features dynasm,prepass
 
 ## How much to verify
 
-The full gate (`cargo test --all` plus a bare `pyre/check.py`) costs over an
-hour. It is not the default for every commit. Scale verification to what
-changed since the last green signal, local or CI:
+The full gate (`cargo test --all` plus `pyre/check.py --backend dynasm`) costs
+over an hour. It is not the default for every commit. Scale verification to
+what changed since the last green signal, local or CI.
+
+**Local backends.** Local `pyre/check.py` and `cargo test` use **dynasm**. Add
+**wasm** when the `wasm32-unknown-unknown` target is installed and the work can
+affect it. Run **cranelift** locally when the current work is cranelift: a
+change in `majit-backend-cranelift` or the cranelift backend ABI, a
+cranelift-only failure, or a red cranelift CI job. CI still runs cranelift on
+every OS that builds it.
 
 - **Rebase, cherry-pick or history rewrite of a tree that was green.** Do not
   rerun the tests. Confirm the rewrite kept the work: the commit list, and the
@@ -364,8 +376,9 @@ changed since the last green signal, local or CI:
   helper), and once before opening a PR.
 - **The last CI run on this branch was red.** Before the next push, run every
   failed job's command locally and see it pass. Use `/apple-container` for an
-  ubuntu-only red. A push that only hopes the red is fixed spends another CI
-  run.
+  ubuntu-only red. A red cranelift job is cranelift work, so that local
+  command includes cranelift. A push that only hopes the red is fixed spends
+  another CI run.
 - **Before every push**, which takes seconds: `cargo fmt --all -- --check` and
   codespell. The `pre-commit` job gates every other CI job. Also make sure the
   tip contains `origin/main` (`git merge-base --is-ancestor origin/main HEAD`).
@@ -386,13 +399,14 @@ changed since the last green signal, local or CI:
   launcher the integration tests run. CI's cargo test steps pass it, and the
   tests that need those modules are gated on the feature, so leaving it out
   here does not fail — it silently runs fewer tests than CI does.
-- `python3 pyre/check.py` — every backend the host can build. A perf regression
-  is a finding to explain, not an automatic veto: if the slower code is the
-  line-by-line port and the faster was a shortcut, **the port stands** — record
-  it and name the upstream optimization that would recover it (`/parity`
-  Principle 4). Revert only when the regression has no such explanation. This
-  file is loaded every session and Principle 4 is not, so do not restate that
-  rule here in a form that contradicts it.
+- `python3 pyre/check.py --backend dynasm` locally (add wasm when the target
+  is installed). CI runs every backend the host can build, including cranelift.
+  A perf regression is a finding to explain, not an automatic veto: if the
+  slower code is the line-by-line port and the faster was a shortcut, **the
+  port stands** — record it and name the upstream optimization that would
+  recover it (`/parity` Principle 4). Revert only when the regression has no
+  such explanation. This file is loaded every session and Principle 4 is not,
+  so do not restate that rule here in a form that contradicts it.
 - Re-record a `.jitstats` baseline only when the new number is the one that
   should hold. "The recorded number no longer matches" is never on its own a
   reason: a gate is a target to reach, not a figure to refit.
