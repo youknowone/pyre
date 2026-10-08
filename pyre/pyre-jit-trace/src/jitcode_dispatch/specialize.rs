@@ -1246,39 +1246,6 @@ pub(crate) fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
         .vable_array_region_write_back(frame_op, 0, &slots)
 }
 
-/// Same stores as [`walker_write_back_standard_frame_locals`], skipping slots
-/// the shadow cannot answer instead of declining the read.
-pub(crate) fn walker_write_back_known_frame_locals<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    frame_op: OpRef,
-    concrete_frame: usize,
-) -> bool {
-    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
-        return false;
-    };
-    let base = info.num_static_extra_boxes;
-    let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
-        return false;
-    };
-    crate::jitcode_dispatch::fbw_note_locals_mirror_undo(concrete_frame, nlocals);
-    let written = crate::state::flush_known_locals_region_to_frame(ctx.trace_ctx, concrete_frame);
-    if written.is_empty() {
-        return false;
-    }
-    let mut slots = Vec::with_capacity(written.len());
-    for slot in written {
-        let Some((opref, _)) = ctx.trace_ctx.virtualizable_entry_at(base + slot as usize) else {
-            continue;
-        };
-        slots.push((slot, opref));
-    }
-    if slots.is_empty() {
-        return false;
-    }
-    ctx.trace_ctx
-        .vable_array_region_write_back(frame_op, 0, &slots)
-}
-
 /// Publish every local the proxy can observe.
 ///
 /// `fast2locals` reads `locals_cells_stack_w[i]` for every varname. A shadow
@@ -6015,20 +5982,6 @@ fn walker_const_bool<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, observed:
     const_bool
 }
 
-/// Write an immortal `bool` singleton into a residual call's Ref dst.  An
-/// immediately following `is_true` (`POP_JUMP_IF_*`) reads that constant
-/// W_Bool.
-fn walker_write_const_bool_result<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    value: bool,
-    dst: usize,
-    dst_bank: char,
-) -> Result<(), DispatchError> {
-    let const_bool = walker_const_bool(ctx, value);
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)
-}
-
 /// MAKE_FUNCTION inline emission: replace the
 /// `jit_make_function_from_globals(globals, code)` residual with the
 /// `NewWithVtable` + `SetfieldGc` set `function.py Function.__init__`
@@ -6189,39 +6142,6 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, func_op)?;
     Ok(Some(()))
-}
-
-/// Two-sided bounds guard `0 <= raw_index < len` for a direct element access.
-///
-/// The trace is recorded from a non-negative observed index, but a later
-/// NEGATIVE index would still satisfy `raw_index < len` and reach the element
-/// having proved nothing about its sign.  `space.getitem` / `space.setitem`
-/// remap a negative index to `index + len` (listobject.py, tupleobject.py), so
-/// the direct access would address before the start of the array; the
-/// lower-bound guard deopts such an index to re-execute that remap generically.
-///
-/// Both halves are emitted here so that an indexing arm cannot take one without
-/// the other.
-fn walker_emit_index_bounds_guards<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    raw_index: OpRef,
-    index: i64,
-    lenbox: OpRef,
-    concrete_len: usize,
-) -> Result<(), DispatchError> {
-    let zero = ctx.trace_ctx.const_int(0);
-    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-    ctx.trace_ctx
-        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
-    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
-    ctx.trace_ctx.set_opref_concrete(
-        in_bounds,
-        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
-    );
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
-    Ok(())
 }
 
 /// #62: walker-native speculative specialization for the `BINARY_SUBSCR`

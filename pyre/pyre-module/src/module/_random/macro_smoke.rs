@@ -353,14 +353,8 @@ mod tests {
         use pyre_object::lltype::PyreClassPyTypeOf;
         assert!(!crate::module::_random::W_Random::HAS_MAPDICT_MIXIN);
         assert!(!super::Demo::HAS_MAPDICT_MIXIN);
-        assert_eq!(
-            unsafe { crate::module::_random::RANDOM_TYPE.mapdict_offset },
-            0
-        );
-        assert_ne!(
-            unsafe { crate::module::_random::RANDOM_USER_TYPE.mapdict_offset },
-            0
-        );
+        assert_eq!(crate::module::_random::RANDOM_TYPE.mapdict_offset, 0);
+        assert_ne!(crate::module::_random::RANDOM_USER_TYPE.mapdict_offset, 0);
     }
 
     /// `typedef.py` `_getusercls`: a `_random.Random` subclass instance is

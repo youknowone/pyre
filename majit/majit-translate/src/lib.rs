@@ -394,7 +394,15 @@ fn build_semantic_program_via_active_frontend(
             return (program, gc_struct_ids);
         }
     }
-    let _ = module_paths; // silence unused warning when the feature is off
+    let _ = (
+        module_paths,
+        static_addrs,
+        jitdriver_receiver_roots,
+        explicit_llbc_paths,
+        funcobj_declarations,
+        lowering_skips,
+        &mut *prof,
+    );
     // The MIR front-end is the only graph builder.  Reaching this
     // point means neither an explicit path set nor
     // `MAJIT_MIR_FRONTEND_LLBC` supplied an LLBC source. Surface the

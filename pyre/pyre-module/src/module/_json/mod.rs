@@ -804,7 +804,7 @@ fn encode_float(
 /// Attach the PEP 678 context notes emitted by Python 3.14's
 /// `json.encoder._make_iterencode`.  The original exception remains
 /// authoritative if a pathological `add_note` override itself fails.
-fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
+fn add_json_note(err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let roots = gc_roots::push_roots();
     // `to_exc_object` allocates the Python exception and can collect. The
     // handle is the `OperationError` object; pin it across that call, then

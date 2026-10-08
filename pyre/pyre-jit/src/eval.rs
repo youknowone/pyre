@@ -12199,7 +12199,7 @@ fn execute_assembler(
             ref exit_layout,
             guard_exc,
             savedata,
-            ref deadframe,
+            deadframe: _,
         } => {
             match dispatch_handle_fail(
                 &mut frame_root,
@@ -12685,7 +12685,7 @@ fn bound_reached(
             ref exit_layout,
             guard_exc,
             savedata,
-            ref deadframe,
+            deadframe: _,
         } = outcome
         {
             match dispatch_handle_fail(
@@ -12970,7 +12970,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref exit_layout,
             guard_exc,
             savedata,
-            ref deadframe,
+            deadframe: _,
         } = outcome
         {
             match dispatch_handle_fail(

@@ -189,7 +189,6 @@ pub use jit_state::{
 pub use jitcode::{
     BC_GOTO, EmbeddedJitCodeTable, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
     RuntimeDescrTable, init_global_build_descr_pool, insns, live_slots_for_state_field_jit,
-    set_runtime_jitcode_at,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "gc_box"))]
 pub use jitdriver::install_jitframe_gc;

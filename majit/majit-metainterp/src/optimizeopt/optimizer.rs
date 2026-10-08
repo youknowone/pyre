@@ -5262,6 +5262,7 @@ impl Optimizer {
     /// RPython optimizer.py: _emit_operation calls force_box(arg)
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
+    #[cfg(test)]
     fn emit_operation(
         &mut self,
         op: Op,

@@ -2861,6 +2861,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
     /// The host-API view of OS bytes — a filename, or a half of an environment
     /// entry. Unix spells both in bytes and takes them back unchanged.
+    #[cfg(not(all(unix, feature = "host_env")))]
     fn os_str_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
         #[cfg(unix)]
         {
@@ -2890,6 +2891,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }
     }
 
+    #[cfg(not(all(unix, feature = "host_env")))]
     fn path_from_bytes(path: &[u8]) -> std::borrow::Cow<'_, std::path::Path> {
         match os_str_from_bytes(path) {
             std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(std::path::Path::new(s)),

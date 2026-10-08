@@ -3535,18 +3535,15 @@ fn describe_var_residence(graph: &FunctionGraph, r: &Variable) -> VarResidence {
 /// exception edge have to run it (`guessexception` still raises at the call).
 struct QuestionHop {
     block: usize,
-    tracked: Variable,
-    /// Index of `tracked` in this block's inputargs.
+    /// Index of the tracked `Result` in this block's inputargs.
     input_pos: usize,
-    /// Index of `tracked` in this block's single exit.
+    /// Index of the tracked `Result` in this block's single exit.
     exit_pos: usize,
 }
 
 struct QuestionSite {
     hops: Vec<QuestionHop>,
     branch_block: usize,
-    /// `Result` inputarg of the branch block.
-    r_branch: Variable,
     /// `Result` variable in the block immediately before the branch.
     /// The call's `r` when `hops` is empty; the last hop's inputarg otherwise.
     r_src: Variable,
@@ -3685,7 +3682,6 @@ fn walk_hops_to_question(
         let next_tracked = graph.blocks[next].inputargs.get(exit_pos)?.clone();
         let hop = QuestionHop {
             block: current,
-            tracked: current_tracked.clone(),
             input_pos,
             exit_pos,
         };
@@ -3699,7 +3695,6 @@ fn walk_hops_to_question(
             return Some(QuestionSite {
                 hops,
                 branch_block: next,
-                r_branch: next_tracked,
                 r_src: current_tracked,
                 branch_op_idx,
                 fused,
@@ -4258,7 +4253,6 @@ fn rewire_one_call_site(
             QuestionSite {
                 hops: Vec::new(),
                 branch_block: b,
-                r_branch: r_b.clone(),
                 r_src: r.clone(),
                 branch_op_idx,
                 fused: true,

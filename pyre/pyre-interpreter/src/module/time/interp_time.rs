@@ -1473,31 +1473,70 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
     }
 }
 
+/// `_init_timezone` POSIX non-Cygwin arm: copy `-p.c_tm_gmtoff` and
+/// `charp2str(p.c_tm_zone)` off the raw `struct tm` into scalars. A null
+/// `c_localtime` keeps the zero/empty defaults.
+#[cfg(unix)]
+fn tm_gmtoff_zone(tm: &libc::tm) -> (i64, String) {
+    let zone = if tm.tm_zone.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    (tm.tm_gmtoff as i64, zone)
+}
+
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
+    let mut t = seconds as majit_rlib::rtime::TIME_T;
+    let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
+    if p.is_null() {
+        return None;
+    }
+    Some(tm_gmtoff_zone(unsafe { &*p }))
+}
+
+#[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
+fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
+    host_time::localtime_from_timestamp(seconds as host_time::TimeT).map(|tm| tm_gmtoff_zone(&tm))
+}
+
+#[cfg(all(unix, not(feature = "host_env")))]
+fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
+    let t = seconds as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let p = unsafe { libc::localtime_r(&t, &mut tm) };
+    if p.is_null() {
+        return None;
+    }
+    Some(tm_gmtoff_zone(&tm))
+}
+
 /// `interp_time.py _init_timezone` — derive the module's four
 /// timezone attributes from libc's January/July broken-down times.  This
 /// preserves the standard-vs-DST ordering in both hemispheres.
 #[cfg(unix)]
-pub(crate) fn init_timezone(mut ns: PyObjectRef) {
+pub(crate) fn init_timezone(ns: PyObjectRef) {
     const YEAR: i64 = (365 * 24 + 6) * 3600;
     let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
-    let (january, july) = pyre_object::with_roots!(ns => {
-        let january = _c_localtime(start).ok();
-        (january, _c_localtime(start + YEAR / 2).ok())
-    });
+    let january = localtime_gmtoff_zone(start);
+    let july = localtime_gmtoff_zone(start + YEAR / 2);
 
     let (timezone, altzone, daylight, standard_name, daylight_name) = match (january, july) {
-        (Some(january), Some(july)) => {
-            let january_offset = -january.tm_gmtoff;
-            let july_offset = -july.tm_gmtoff;
-            let january_name = if january.tm_zone.is_empty() {
+        (Some((january_gmtoff, january_zone)), Some((july_gmtoff, july_zone))) => {
+            let january_offset = -january_gmtoff;
+            let july_offset = -july_gmtoff;
+            let january_name = if january_zone.is_empty() {
                 "   ".to_string()
             } else {
-                january.tm_zone
+                january_zone
             };
-            let july_name = if july.tm_zone.is_empty() {
+            let july_name = if july_zone.is_empty() {
                 "   ".to_string()
             } else {
-                july.tm_zone
+                july_zone
             };
             if january_offset < july_offset {
                 // DST is reversed in the southern hemisphere.

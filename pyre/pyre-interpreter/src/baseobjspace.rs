@@ -2255,11 +2255,27 @@ pub(crate) unsafe fn set_name(
     w_name: PyObjectRef,
     w_value: PyObjectRef,
 ) -> Result<(), PyError> {
+    // typeobject.py `_set_names` — `space.lookup(w_value, '__set_name__')`
+    // then `space.get_and_call_function(w_meth, w_value, w_type, key)`.
+    // The lookup intern-boxes the name when jitted and may collect; pin the
+    // owner, name, value, and value-type before it (`gc_push_roots`) and
+    // restore them for the call (`gc_restore_root`).
     let w_valtype = match crate::typedef::r#type(w_value) {
         Some(t) => t,
         None => return Ok(()),
     };
-    let set_name_meth = match unsafe { lookup_in_type_where(w_valtype.as_ptr(), "__set_name__") } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let owner_slot =
+        pyre_object::gc_roots::pin_roots(&[w_owner, w_name, w_value, w_valtype.as_ptr()]);
+    let name_slot = owner_slot + 1;
+    let value_slot = owner_slot + 2;
+    let valtype_slot = owner_slot + 3;
+    let set_name_meth = match unsafe {
+        lookup_in_type_where(
+            pyre_object::gc_roots::shadow_stack_get(valtype_slot),
+            "__set_name__",
+        )
+    } {
         Some(m) => m,
         None => return Ok(()),
     };
@@ -2267,19 +2283,17 @@ pub(crate) unsafe fn set_name(
     // is the descriptor instance (bound as the receiver), and the call args
     // are `(owner, name)`: `__set_name__(self, owner, name)`.
     //
-    // The hook is arbitrary Python, so the three operands cannot stay in Rust
+    // The hook is arbitrary Python, so the operands cannot stay in Rust
     // locals across it: the failure arm below names the descriptor, its type
     // and the owner, and reading any of them from a pre-call address would
     // build the note out of reclaimed memory.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let owner_slot = pyre_object::gc_roots::pin_roots(&[w_owner, w_name, w_value]);
-    let name_slot = owner_slot + 1;
-    let value_slot = owner_slot + 2;
+    let meth_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(set_name_meth);
     match unsafe {
         get_and_call_function(
-            set_name_meth,
+            pyre_object::gc_roots::shadow_stack_get(meth_slot),
             pyre_object::gc_roots::shadow_stack_get(value_slot),
-            w_valtype.as_ptr(),
+            pyre_object::gc_roots::shadow_stack_get(valtype_slot),
             &[
                 pyre_object::gc_roots::shadow_stack_get(owner_slot),
                 pyre_object::gc_roots::shadow_stack_get(name_slot),
@@ -2323,18 +2337,40 @@ pub(crate) unsafe fn set_name(
 
 #[majit_macros::dont_look_inside]
 pub(crate) fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    // dictmultiobject.py `W_DictMultiObject.descr_getitem` — after
+    // `self.getitem(w_key)` misses, `space.lookup(self, '__missing__')` then
+    // `space.get_and_call_function(w_missing, self, w_key)`.  RPython's
+    // shadowstack (`gc_push_roots` / `gc_restore_root`) keeps `self` and
+    // `w_key` live across that lookup; reload both and the type from slots
+    // here after `lookup_in_type` (it intern-boxes the name when jitted).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
+    let index_slot = obj_slot + 1;
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if let Some(w_type_obj) = crate::typedef::r#type(obj) {
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_type_obj.as_ptr());
         let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+        let w_type_obj = pyre_object::gc_roots::shadow_stack_get(type_slot);
         if !dict_type.is_null()
-            && !std::ptr::eq(w_type_obj.as_ptr(), dict_type)
-            && let Some(w_missing) = unsafe { lookup_in_type(w_type_obj.as_ptr(), "__missing__") }
+            && !std::ptr::eq(w_type_obj, dict_type)
+            && let Some(w_missing) = unsafe { lookup_in_type(w_type_obj, "__missing__") }
         {
             // dictmultiobject.py:166 space.get_and_call_function(
             //     w_missing, self, w_key)
-            return unsafe { get_and_call_function(w_missing, obj, w_type_obj.as_ptr(), &[index]) };
+            return unsafe {
+                get_and_call_function(
+                    w_missing,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    pyre_object::gc_roots::shadow_stack_get(type_slot),
+                    &[pyre_object::gc_roots::shadow_stack_get(index_slot)],
+                )
+            };
         }
     }
-    Err(PyError::key_error_with_key(index))
+    Err(PyError::key_error_with_key(
+        pyre_object::gc_roots::shadow_stack_get(index_slot),
+    ))
 }
 
 /// Get item by index: `obj[index]`.
@@ -2387,15 +2423,30 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         if is_dict(obj) {
             // `pypy/objspace/std/dictmultiobject.py W_DictMultiObject
-            // .descr_getitem` → `space.getitem(self, w_key)` → strategy
-            return match pyre_object::dictmultiobject::w_dict_lookup_checked(obj, index) {
+            // .descr_getitem` → `self.getitem(w_key)` then, on miss,
+            // `space.lookup(self, '__missing__')`.  `w_dict_lookup_checked`
+            // runs the key's `__hash__`/`__eq__` and may collect; the dict
+            // and key are raw locals.  Pin them and reload after the probe
+            // (`gc_restore_root`) before `type(self)` / `__missing__`.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
+            let index_slot = obj_slot + 1;
+            return match pyre_object::dictmultiobject::w_dict_lookup_checked(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::gc_roots::shadow_stack_get(index_slot),
+            ) {
                 Ok(Some(val)) => Ok(val),
                 Ok(None) => {
                     // dictmultiobject.py:166-170 — dict subclass
                     // __missing__ dispatch before KeyError
-                    dict_missing_or_key_error(obj, index)
+                    dict_missing_or_key_error(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        pyre_object::gc_roots::shadow_stack_get(index_slot),
+                    )
                 }
-                Err(_) => Err(take_pending_dict_key_error(index)),
+                Err(_) => Err(take_pending_dict_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(index_slot),
+                )),
             };
         }
         if is_str(obj) {
@@ -2417,15 +2468,31 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // whose type defines `__getitem__` on its MRO is subscriptable
         // (the arms above are fast paths for builtin sequence/mapping
         // types).  Covers W_Root types like `re.Match` whose typedef
-        // registers `__getitem__`.
-        if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = lookup_in_type_where(w_type.as_ptr(), "__getitem__")
+        // registers `__getitem__`.  The lookup may collect; pin the
+        // receiver, key, and type and reload them for the call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
+        let index_slot = obj_slot + 1;
+        if let Some(w_type) =
+            crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
         {
-            return get_and_call_function(method, obj, w_type.as_ptr(), &[index]);
+            let type_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
+            if let Some(method) = lookup_in_type_where(
+                pyre_object::gc_roots::shadow_stack_get(type_slot),
+                "__getitem__",
+            ) {
+                return get_and_call_function(
+                    method,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    pyre_object::gc_roots::shadow_stack_get(type_slot),
+                    &[pyre_object::gc_roots::shadow_stack_get(index_slot)],
+                );
+            }
         }
         Err(PyError::type_error(format!(
             "'{}' object is not subscriptable",
-            crate::error::type_name_of(obj),
+            crate::error::type_name_of(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
         )))
     }
 }
@@ -3038,16 +3105,36 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    // descroperation.py `DescrOperation.getitem` — `space.lookup(w_obj,
+    // '__getitem__')` then, for a type, `space.getattr(w_obj,
+    // '__class_getitem__')`.  Each lookup may collect; pin the class and
+    // key (`gc_push_roots`) and reload them after (`gc_restore_root`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index]);
+    let index_slot = obj_slot + 1;
     // A metaclass `__getitem__` (resolved on `type(cls)`'s MRO, e.g.
     // `EnumMeta.__getitem__`) applies before the PEP 560
     // `__class_getitem__` fallback: `Color['RED']` is `type(Color)
     // .__getitem__(Color, 'RED')`.  `type` itself defines no `__getitem__`,
     // so an ordinary class still takes the `__class_getitem__` path below.
-    if let Some(w_meta) = crate::typedef::r#type(obj)
-        && let Some(method) = lookup_in_type_where(w_meta.as_ptr(), "__getitem__")
+    if let Some(w_meta) = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
     {
-        return get_and_call_function(method, obj, w_meta.as_ptr(), &[index]);
+        let meta_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_meta.as_ptr());
+        if let Some(method) = lookup_in_type_where(
+            pyre_object::gc_roots::shadow_stack_get(meta_slot),
+            "__getitem__",
+        ) {
+            return get_and_call_function(
+                method,
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::gc_roots::shadow_stack_get(meta_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(index_slot)],
+            );
+        }
     }
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let index = pyre_object::gc_roots::shadow_stack_get(index_slot);
     // descroperation.py:362 — `type[X]` (the operand is exactly `type`) builds
     // a GenericAlias even though `type` defines no `__class_getitem__`.
     if std::ptr::eq(obj, crate::typedef::w_type()) {
@@ -3059,6 +3146,8 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // PyPy's generic lookup treats an explicit None as disabling the
         // inherited subscription hook.  Other non-callable values still
         // reach the call and raise their ordinary not-callable TypeError.
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let index = pyre_object::gc_roots::shadow_stack_get(index_slot);
         if !pyre_object::is_none(method) {
             return get_and_call_function(method, obj, obj, &[index]);
         }
@@ -3067,20 +3156,34 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // __getitem__ nor __class_getitem__ is not subscriptable.
     Err(PyError::type_error(format!(
         "type '{}' is not subscriptable",
-        w_type_get_name(obj),
+        w_type_get_name(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
     )))
 }
 
 #[inline(never)]
 unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    // descroperation.py __getitem__
+    // descroperation.py `DescrOperation.getitem` — `space.lookup(w_obj,
+    // '__getitem__')`.  The lookup may collect; pin the instance, key, and
+    // class and reload them for the call.
+    let _roots = pyre_object::gc_roots::push_roots();
     let w_type = w_instance_get_type(obj);
-    if let Some(method) = lookup_in_type_where(w_type, "__getitem__") {
-        return get_and_call_function(method, obj, w_type, &[index]);
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, index, w_type]);
+    let index_slot = obj_slot + 1;
+    let type_slot = obj_slot + 2;
+    if let Some(method) = lookup_in_type_where(
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
+        "__getitem__",
+    ) {
+        return get_and_call_function(
+            method,
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(index_slot)],
+        );
     }
     Err(PyError::type_error(format!(
         "'{}' object is not subscriptable",
-        w_type_get_name(w_instance_get_type(obj)),
+        w_type_get_name(pyre_object::gc_roots::shadow_stack_get(type_slot)),
     )))
 }
 

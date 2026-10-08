@@ -263,7 +263,7 @@ fn pickle_type_name(w_obj: PyObjectRef) -> Result<String, PyError> {
 /// lookup and `add_note` call; `expand_pop_roots` reloads it before the
 /// instance is written back.
 fn add_pickle_object_note(
-    mut err: PyError,
+    err: PyError,
     w_obj: PyObjectRef,
     role: &rustpython_wtf8::Wtf8,
 ) -> PyError {
@@ -531,13 +531,13 @@ impl W_Pickler {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self as *mut W_Pickler as PyObjectRef);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let file = pyre_object::gc_roots::pin_root(file);
+        let _ = pyre_object::gc_roots::pin_root(file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let protocol = pyre_object::gc_roots::pin_root(protocol);
+        let _ = pyre_object::gc_roots::pin_root(protocol);
         let protocol_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let _ = pyre_object::gc_roots::pin_root(fix_imports);
         let fix_imports_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let buffer_callback = pyre_object::gc_roots::pin_root(buffer_callback);
+        let _ = pyre_object::gc_roots::pin_root(buffer_callback);
         let buffer_callback_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if cur_pickler(self_slot).running {
             return Err(PyError::runtime_error("Pickler object is already used"));
@@ -2429,7 +2429,7 @@ fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
 fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
     let next_item =
         pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot));
-    let mut err = match next_item {
+    let err = match next_item {
         Ok(item) => {
             let _ = pyre_object::gc_roots::pin_root(item);
             return Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1));
@@ -2463,7 +2463,7 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
                 None
             }
         };
-        if let Some(mut e) = stop_err {
+        if let Some(e) = stop_err {
             let (stop, e) = e.matches_stop_iteration_keep();
             if stop {
                 break;
@@ -2602,7 +2602,7 @@ fn pinned_pair_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
             None
         }
     };
-    if let Some(mut e) = stop_err {
+    if let Some(e) = stop_err {
         let (stop, e) = e.matches_stop_iteration_keep();
         return if stop { Ok(None) } else { Err(e) };
     }
@@ -2636,7 +2636,7 @@ fn save_pair(
     save(ctx, buf, pinned_get(pair_slot, 0))?;
     match save(ctx, buf, pinned_get(pair_slot, 1)) {
         Ok(()) => Ok(()),
-        Err(mut err) => {
+        Err(err) => {
             // pickle.py only invokes the key's arbitrary __repr__ while
             // annotating a value-save failure. Successful dictionary saves
             // must not gain an observable repr call.

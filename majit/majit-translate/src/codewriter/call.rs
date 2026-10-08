@@ -1052,6 +1052,7 @@ pub(crate) struct DeclaredFuncObj {
 pub(crate) struct FuncObjDeclarations(std::rc::Rc<std::cell::RefCell<Vec<DeclaredFuncObj>>>);
 
 impl FuncObjDeclarations {
+    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn push(&self, declared: DeclaredFuncObj) {
         self.0.borrow_mut().push(declared);
     }
@@ -3574,6 +3575,7 @@ impl CallControl {
     /// `symbolic.get_array_token` places items at [`Self::array_items_base`]:
     /// the length word rounded up to `T`'s alignment. That is where
     /// `GcEntries.items` sits (`length: usize`, then `[Entry; 0]`).
+    #[cfg(test)]
     fn gc_typed_array_items_base(&self) -> usize {
         self.array_header_size
     }

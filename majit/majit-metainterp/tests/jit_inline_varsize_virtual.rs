@@ -15,9 +15,7 @@ pub type Bytecode = [u8];
 const OP_FILL: u8 = 1;
 const OP_TICK: u8 = 2;
 
-struct Cell {
-    word: i64,
-}
+struct Cell;
 
 type Slot = *mut Cell;
 
