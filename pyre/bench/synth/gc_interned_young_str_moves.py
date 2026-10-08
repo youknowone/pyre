@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-interpreted
+# pyre-check: requires-modules=gc
 import gc
 import sys
 
