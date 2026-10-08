@@ -4453,7 +4453,7 @@ impl ResumeDataLoopMemo {
         // resume.py number: if minimum_virtualizable_size != -1, the
         // virtualizable itself is one entry in the array too, so use '>'.
         if minimum_virtualizable_size != -1 {
-            debug_assert!(
+            assert!(
                 vable_len > minimum_virtualizable_size,
                 "vable_array length {} not > minimum_virtualizable_size {}",
                 vable_len,

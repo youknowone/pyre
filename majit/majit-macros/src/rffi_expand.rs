@@ -441,6 +441,7 @@ impl LlexternalInput {
             // `jit_trace_fnaddrs` must carry that path or the funcbox stays a
             // symbolic hash and the tracer cannot run the wrapper.
             let ccall_fnaddr = self.ccall_fnaddr_registration();
+            let identity = crate::icf_identity_tokens(&call_name);
             quote! {
                 #deriv
                 #eci
@@ -450,6 +451,7 @@ impl LlexternalInput {
                 #ccall_fnaddr
                 #header
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
+                    #identity
                     #body
                 }
                 #vis unsafe fn #name(#(#params),*) -> #result {

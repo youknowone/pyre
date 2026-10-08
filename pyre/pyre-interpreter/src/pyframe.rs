@@ -4968,9 +4968,10 @@ impl PyFrame {
     /// PyPy-compatible `settopvalue()`.
     #[inline]
     pub fn settopvalue(&mut self, value: PyObjectRef, index_from_top: usize) {
-        let index = self.valuestackdepth.saturating_sub(index_from_top + 1);
+        let depth = self.valuestackdepth;
+        let index = depth.saturating_sub(index_from_top + 1);
         self.assert_stack_index(index);
-        assert!(index < self.valuestackdepth);
+        assert!(index < depth);
         self.set_locals_w(index, value);
     }
 
@@ -5535,6 +5536,10 @@ impl PyFrame {
     /// completed.  This is the internal `_PyFrame_ClearExceptCode` half used
     /// by generator completion; unlike public `frame.clear()`, it must not
     /// re-enter `_PyGen_Finalize` on the generator that is doing the clearing.
+    ///
+    /// Allocates a fresh locals dict and empty cells. The walk residualizes
+    /// the call, so the address has to be a registered fnaddr.
+    #[majit_macros::dont_look_inside]
     pub(crate) fn clear_references(&mut self) {
         if let Some(debug) = self.getdebug() {
             let had_locals = !debug.w_locals.is_null();

@@ -6012,7 +6012,11 @@ fn assemble_peeled_trace_with_jump_args(
                 }
             }
         }
-        if let Some(label_idx) = current_inner_label_index {
+        // Jump args fill existing label slots. The `full_label_args` scan
+        // skips Jump so those args are not appended as extra live-ins.
+        if new_op.opcode != OpCode::Jump
+            && let Some(label_idx) = current_inner_label_index
+        {
             let mut extra_live_args = Vec::new();
             let label_args: smallvec::SmallVec<[OpRef; 3]> = result[label_idx]
                 .args_slice()

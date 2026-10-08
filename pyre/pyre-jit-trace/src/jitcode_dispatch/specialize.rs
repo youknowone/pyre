@@ -16034,7 +16034,8 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
                 }
             }
         };
-    if !nested_helper && sym.owns_virtualizable_shadow() {
+    let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
+        let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -16050,7 +16051,10 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             vsd_op,
             Value::Int(vsd_value),
         );
-    }
+        Some(saved)
+    } else {
+        None
+    };
     let (active, class_guard_resume) = if nested_helper {
         (ctx.frame_state.borrow().outer_active_boxes.clone(), None)
     } else {
@@ -16147,6 +16151,9 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    if let Some(saved) = saved_vable {
+        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
+    }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
     // as a symbolic residual (`try_execute_residual_call_via_executor` →

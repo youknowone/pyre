@@ -1,3 +1,6 @@
+#[macro_use]
+mod icf;
+pub use icf::{icf_identity_token, icf_path_hash};
 pub mod bitstring;
 pub mod debug;
 pub mod descr;

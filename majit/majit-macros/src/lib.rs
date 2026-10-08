@@ -1385,6 +1385,24 @@ fn report_helper_fnaddr_skip(name: &Ident, reason: HelperFnAddrSkip) {
     }
 }
 
+/// A unique side-effect so LLVM MergeFunctions cannot fold two residual-call
+/// targets that would otherwise have identical bodies. `drain_list_append`
+/// keeps a forwarding call for the same reason: one published address must
+/// name one function (`registered_paths_sharing_an_address_are_alias_spellings`).
+///
+/// Expands to [`majit_ir::icf_identity`]: empty `nomem` asm whose comment
+/// carries a unique const immediate (native) or a volatile read of that
+/// immediate (wasm32), never `black_box` of a pointer.
+fn icf_identity_tokens(name: &Ident) -> proc_macro2::TokenStream {
+    quote! {
+        ::majit_ir::icf_identity!(::core::concat!(
+            ::core::module_path!(),
+            "::",
+            stringify!(#name),
+        ));
+    }
+}
+
 fn emit_helper_fnaddr_registration(
     path_name: &Ident,
     trampoline_ident: &Ident,
@@ -1736,12 +1754,15 @@ fn emit_helper_call_target_fn(
         ReturnType::Type(_, ty) => Some(ty.as_ref()),
         ReturnType::Default => None,
     });
+    let trace_identity = icf_identity_tokens(&trace_target_name);
+    let concrete_identity = icf_identity_tokens(&concrete_target_name);
     let wrapper = match return_kind {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
             #[allow(non_snake_case)]
             #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) {
                 #shim_registration
+                #trace_identity
                 #call_expr;
             }
         },
@@ -1762,6 +1783,7 @@ fn emit_helper_call_target_fn(
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
                     #shim_registration
+                    #trace_identity
                     #converted_return
                 }
             }
@@ -1775,6 +1797,7 @@ fn emit_helper_call_target_fn(
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
                     #shim_registration
+                    #trace_identity
                     #call_expr
                 }
             };
@@ -1785,6 +1808,7 @@ fn emit_helper_call_target_fn(
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #concrete_target_name(#(#wrapper_params),*) -> i64 {
+                    #concrete_identity
                     #concrete_return
                 }
             };
@@ -1801,12 +1825,14 @@ fn emit_helper_call_target_fn(
         let registration =
             emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_name, arity);
         let ctor = emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_name, arity);
+        let fnaddr_identity = icf_identity_tokens(&fnaddr_name);
         let float_abi = match return_kind {
             HelperCallKind::Void => quote! {
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) {
                     #registration
+                    #fnaddr_identity
                     #fnaddr_call_expr;
                 }
             },
@@ -1815,6 +1841,7 @@ fn emit_helper_call_target_fn(
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) -> f64 {
                     #registration
+                    #fnaddr_identity
                     #fnaddr_call_expr
                 }
             },
@@ -1835,6 +1862,7 @@ fn emit_helper_call_target_fn(
                     #[allow(non_snake_case)]
                     #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) -> i64 {
                         #registration
+                        #fnaddr_identity
                         #converted_return
                     }
                 }
@@ -2439,6 +2467,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
     let body_markers = rpython_attribute_body_markers(attr_name, sig);
+    let identity = icf_identity_tokens(&sig.ident);
 
     let expanded = quote! {
         #(#attrs)*
@@ -2450,6 +2479,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
             #[allow(dead_code)]
             const _MAJIT_ELIDABLE: bool = true;
             #body_markers
+            #identity
             #block
         }
 
@@ -2606,6 +2636,7 @@ fn expand_dont_look_inside_attribute(
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
     let body_markers = rpython_attribute_body_markers(attr_name, sig);
+    let identity = icf_identity_tokens(&sig.ident);
 
     // No-op inline-prebuild fn.  A residual (opaque) helper has no inline
     // body, hence no per-marker `-live-` triples to pre-register.  But a
@@ -2641,7 +2672,9 @@ fn expand_dont_look_inside_attribute(
     // so no `dont_look_inside` body is folded into a traced caller regardless.
     // Residual call targets are likewise unaffected: they resolve through the
     // function-item coercions `pyre-interpreter/src/jit_fnaddr.rs` writes by
-    // hand, not through a linker symbol.
+    // hand, not through a linker symbol. [`majit_ir::icf_identity`] still
+    // sits in the body so LLVM MergeFunctions cannot fold two published
+    // helpers that would otherwise be byte-identical (`drain_list_append`).
     //
     // `#[elidable]` keeps its `#[inline(never)]` and this family drops it, and
     // the split follows upstream's inlining budget rather than the attribute.
@@ -2663,6 +2696,7 @@ fn expand_dont_look_inside_attribute(
             #[allow(dead_code)]
             const _MAJIT_OPAQUE: bool = true;
             #body_markers
+            #identity
             #block
         }
 
@@ -2713,6 +2747,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
 
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
     let body_markers = rpython_attribute_body_markers(attr_name, sig);
+    let identity = icf_identity_tokens(&sig.ident);
 
     // `jit_may_force` and `loop_invariant` keep `#[inline(never)]` for the
     // reason recorded on [`elidable`]: their bodies are past the inlining
@@ -2728,6 +2763,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
             #[allow(dead_code)]
             const #marker: bool = true;
             #body_markers
+            #identity
             #block
         }
 
@@ -3519,6 +3555,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         None
     };
+    let identity = icf_identity_tokens(&sig.ident);
 
     let expanded = quote! {
         #(#attrs)*
@@ -3531,6 +3568,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(non_upper_case_globals, dead_code)]
             const #body_name: &'static str = #spec_value;
+            #identity
             #block
         }
 

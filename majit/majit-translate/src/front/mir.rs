@@ -6211,6 +6211,7 @@ fn struct_ctor_kind_has_whole_value_use(kind: &OpKind, result: &Variable) -> boo
             args.iter().any(|arg| arg.as_variable() == Some(result))
                 && !call_target_is_gc_malloc(target)
         }
+        OpKind::IndirectCall { args, .. } => args.iter().any(|arg| arg == result),
         kind => crate::inline::op_variable_refs(kind)
             .iter()
             .any(|var| var == result),
@@ -7363,6 +7364,36 @@ fn replace_whole_value_uses_in_kind(
             OpKind::Call {
                 target: target.clone(),
                 args,
+                result_ty: result_ty.clone(),
+            }
+        }
+        OpKind::IndirectCall {
+            funcptr,
+            args,
+            graphs,
+            family_key,
+            result_ty,
+        } => {
+            // `get_eval_fn` is an `indirect_call` (`rpbc.py FunctionReprBase.call`).
+            // `execute_generator_frame` builds `FrameResumeArgs` and passes
+            // `&mut resume`; a stack address would be the walker's C frame.
+            // Materialise one `New` so the residual sees a heap pointer, the
+            // same escape `Call` already takes.
+            let args = args
+                .iter()
+                .map(|arg| {
+                    if arg == result {
+                        emit_materialized_struct_copy(graph, out, owner, fields, has_vtable)
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            OpKind::IndirectCall {
+                funcptr: funcptr.clone(),
+                args,
+                graphs: graphs.clone(),
+                family_key: family_key.clone(),
                 result_ty: result_ty.clone(),
             }
         }
@@ -59600,21 +59631,17 @@ fn const_eval_init_body_with_locals(
                     // RPython hands already-folded module constants to the
                     // flowspace.  Charon instead leaves a `Place::Global`
                     // inside computed const MIR (`MASK = (1 << SHIFT) - 1`).
-                    // Evaluate an immutable NamedConst initializer
+                    // Evaluate an immutable NamedConst / AnonConst initializer
                     // recursively so the resulting flow graph still carries
                     // one literal Constant rather than a synthetic accessor
-                    // call.
+                    // call. AnonConst is rustc's promoted use of a const
+                    // (`PathElem::Builtin(PromotedConst)`).
                     PlaceKind::Global { id, .. } => {
                         let global = llbc.global_by_id(*id)?;
                         // `AnonConst` is rustc's promoted `&FLAG` for a
                         // NamedConst used by reference (`FLAG.bits()`).
-                        match global
-                            .rest
-                            .get("global_kind")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            Some("NamedConst") | Some("AnonConst") => {}
-                            _ => return None,
+                        if !global.is_const_value() {
+                            return None;
                         }
                         let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
                         let init = llbc.fn_by_id(init_id)?;
@@ -68743,6 +68770,72 @@ mod tests {
                 } if segments.as_slice() == ["slice", "index"] => {
                     args.first().and_then(LinkArg::as_variable).cloned()
                 }
+                _ => None,
+            });
+        assert_eq!(call_arg.as_ref(), Some(&news[0]));
+    }
+
+    /// `execute_generator_frame` residualizes `get_eval_fn` as `indirect_call`.
+    /// The resume struct is the argument; a stack alias would be the walker's
+    /// C frame. Materialise `New` at that escape the same way `Call` does.
+    #[test]
+    fn aggregate_passed_by_value_to_an_indirect_call() {
+        let mut graph = FunctionGraph::new("struct_ctor_indirect");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let funcptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("funcptr");
+        graph.push_op_var(
+            entry,
+            OpKind::IndirectCall {
+                funcptr,
+                args: vec![result],
+                graphs: None,
+                family_key: None,
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_return(entry, None);
+
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 1);
+        let call_arg = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall { args, .. } => args.first().cloned(),
                 _ => None,
             });
         assert_eq!(call_arg.as_ref(), Some(&news[0]));

@@ -22085,6 +22085,11 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
         None => None,
     };
+    // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
+    // `execute_generator_frame` is look-inside and dispatches through
+    // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver
+    // to every frame. `pyframe.py execute_frame` / `resume_execute_frame`
+    // carry no `dont_look_inside`.
     let executed = (*crate::eval::frame_anchor_live(frame_depth)).execute_generator_frame(
         w_inputvalue,
         operr,

@@ -586,8 +586,16 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
         # test framework got to report anything, so the last line the
         # interpreter wrote is all the evidence there is — and dropping it
         # left CI runs that could only be re-run, never diagnosed.
-        detail = f"signal/abort {death_signal(rc)} rc={rc} {last_stderr_line(err)}"
-        return "CRASH", detail.strip()[:200]
+        # The last line of a Rust abort is the backtrace note. Keep the
+        # lines above it too; the location is not in that trailer, and a
+        # 200-character cut dropped it on the only run that sees the crash.
+        tail = [
+            line.strip()
+            for line in err.splitlines()
+            if line.strip() and not line.lstrip().startswith("[jit-stats]")
+        ]
+        detail = f"signal/abort {death_signal(rc)} rc={rc} " + " || ".join(tail[-8:])
+        return "CRASH", detail.strip()
     if rc == 0:
         denied = next(
             (

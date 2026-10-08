@@ -1,3 +1,8 @@
+# pyre-check: jitstats-band=guard_failures=5
+# `guard_failures` depends on the GC nursery size. Measured with
+# MAJIT_STATS=1 and PYPY_GC_NURSERY on main 08b7c10aeb7 and on PR #1996 alike:
+# 1MB 30667 (cranelift 30669), 2MB 30663 (cranelift 30665),
+# 3MB/4MB/8MB/16MB/default 30664. CI's cranelift leg reads 30665.
 # A frame whose residual call raises must still run its own `finally`, and must
 # contribute exactly one traceback node.
 #

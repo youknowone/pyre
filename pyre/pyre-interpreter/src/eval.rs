@@ -322,17 +322,22 @@ pub fn frame_anchor_release(depth: usize) {
 /// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
 /// address back as one function: two unrelated paths sharing an address is
 /// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
+/// [`majit_ir::icf_identity`] keeps LLVM MergeFunctions from folding these
+/// bridges onto `shadow_stack_*_word` (`drain_list_append`).
 pub extern "C" fn frame_anchor_push_jit_abi(frame: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("eval::frame_anchor_push_jit_abi");
     frame_anchor_push(frame) as i64
 }
 
 /// One-word residual-call ABI for [`frame_anchor_live`].
 pub extern "C" fn frame_anchor_live_jit_abi(depth: i64) -> i64 {
+    majit_ir::icf_identity!("eval::frame_anchor_live_jit_abi");
     frame_anchor_live(depth as usize) as i64
 }
 
 /// One-word residual-call ABI for [`frame_anchor_release`].
 pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
+    majit_ir::icf_identity!("eval::frame_anchor_release_jit_abi");
     frame_anchor_release(depth as usize);
 }
 
@@ -343,6 +348,7 @@ pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
 /// handed back without running `Drop`, exactly as the aggregate return did
 /// when the method itself was the registered target.
 pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("eval::frame_anchor_new_jit_abi");
     // SAFETY: the residual's slot holds the frame the walked graph read it
     // from, or null, which `from_raw` anticipates.
     let anchor = unsafe { FrameAnchor::from_raw(frame) };
@@ -358,6 +364,7 @@ pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
 /// the residual as the one-word anchor's value — the depth — rather than a
 /// pointer to it.
 pub extern "C" fn frame_anchor_live_method_jit_abi(anchor: i64) -> i64 {
+    majit_ir::icf_identity!("eval::frame_anchor_live_method_jit_abi");
     let anchor = std::mem::ManuallyDrop::new(FrameAnchor {
         depth: anchor as usize,
         _not_send: std::marker::PhantomData,
@@ -2627,7 +2634,15 @@ pub(crate) fn eval_frame_plain_with_resume(
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
         // the handle across the hook and write it back before the resume
-        // reads it.
+        // reads it. `w_inputvalue` is `resume_execute_frame`'s `w_arg_or_err`
+        // (`pyframe.py`); the hook can move it, so the shadow-stack slot is
+        // the live word after `call_trace`.
+        let input_pin = resume.w_inputvalue.map(|value| {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = roots.base();
+            let _ = roots.pin_root(value);
+            (roots, slot)
+        });
         if let Some(err) = resume.operr.take() {
             let roots = pyre_object::gc_roots::push_roots();
             let mut err = err;
@@ -2637,10 +2652,20 @@ pub(crate) fn eval_frame_plain_with_resume(
             resume.operr = Some(err);
             drop(roots);
             if let Err(e) = trace {
+                drop(input_pin);
                 return (Err(e), pyre_object::w_none());
             }
         } else if let Err(e) = execution_context.call_trace(frame_anchor.live()) {
+            drop(input_pin);
             return (Err(e), pyre_object::w_none());
+        }
+        if let Some((roots, slot)) = &input_pin {
+            let current = roots.get(*slot);
+            resume.w_inputvalue = if current.is_null() {
+                None
+            } else {
+                Some(current)
+            };
         }
         let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };

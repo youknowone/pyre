@@ -1751,6 +1751,9 @@ impl MiniMarkGC {
                     .try_alloc_young_nonmoving_clear(type_id, total_size)
                     .unwrap_or(GcRef(0));
             }
+            // Otherwise it is born old, and a `CALL_MALLOC_NURSERY` caller
+            // then stamps the whole `HDR.tid` word over the old-generation
+            // flags (see `make_tid_field_descr`).
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
         if ptr.is_null() {
@@ -17042,6 +17045,68 @@ cache size\t: 8192 kB\n";
         assert_eq!(after.0, target_root.0);
 
         gc.roots.clear();
+    }
+
+    /// `intern_table_custom_trace` / `collect_oldrefs_to_nursery`: a young
+    /// WEAKREF reached only through a remembered old object's custom trace,
+    /// whose target is live via a root, must have `weakptr` rewritten
+    /// (`invalidate_young_weakrefs`). Extra-rooting the WEAKREF itself would
+    /// copy it outside that path; word 0 is `weakptr` and forwarding overwrites
+    /// it on the nursery corpse.
+    #[test]
+    fn test_minor_custom_trace_young_weakref_live_target() {
+        use std::cell::Cell;
+        thread_local! {
+            static WEAKREF_SLOT: Cell<usize> = const { Cell::new(0) };
+        }
+        unsafe fn trace_weakref_slot(_obj_addr: usize, f: &mut dyn FnMut(*mut GcRef)) {
+            WEAKREF_SLOT.with(|slot| {
+                let addr = slot.get();
+                if addr == 0 {
+                    return;
+                }
+                let mut gcref = GcRef(addr);
+                f(&mut gcref);
+                slot.set(gcref.0);
+            });
+        }
+
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::with_custom_trace(8, trace_weakref_slot));
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + 8);
+        let target = gc.alloc_with_type(target_tid, 16);
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+        WEAKREF_SLOT.with(|slot| slot.set(wref.0));
+        gc.do_write_barrier(holder);
+
+        let mut target_root = target;
+        unsafe {
+            gc.roots.add(&mut target_root);
+        }
+
+        gc.do_collect_nursery();
+
+        let wref_after = WEAKREF_SLOT.with(|slot| slot.get());
+        assert!(
+            gc.oldgen.contains(wref_after),
+            "custom-trace must copy the young WEAKREF"
+        );
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_after as *const crate::weakref::Weakref)
+        };
+        assert_eq!(
+            after.0, target_root.0,
+            "live target's weakptr must be forwarded"
+        );
+
+        gc.roots.clear();
+        WEAKREF_SLOT.with(|slot| slot.set(0));
     }
 
     /// incminimark.py `invalidate_young_weakrefs`: a clean prebuilt target is

@@ -82,14 +82,17 @@ impl<T> ResidualRet for *mut T {}
 /// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
 /// call, so the raw functions are a different table type there.
 extern "C" fn shadow_stack_push_word(gcref: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_push_word");
     majit_gc::shadow_stack::push(majit_ir::GcRef(gcref as usize)) as i64
 }
 
 extern "C" fn shadow_stack_get_word(index: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_get_word");
     majit_gc::shadow_stack::get(index as usize).as_usize() as i64
 }
 
 extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_try_pop_to_word");
     majit_gc::shadow_stack::try_pop_to(depth as usize);
 }
 
@@ -2699,6 +2702,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::call::eval_current_frame_raw",
         crate::call::eval_current_frame_raw,
+    );
+    // Generator completion residualizes `PyFrame::clear_references`. The
+    // symbolic path the codewriter records is the impl-method key.
+    p1(
+        &mut entries,
+        "pyframe::PyFrame::clear_references",
+        crate::pyframe::PyFrame::clear_references,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::clear_references",
+        crate::pyframe::PyFrame::clear_references,
     );
     p1(
         &mut entries,
@@ -6433,7 +6448,39 @@ mod tests {
         // rule: `module::a::type_object` and `module::b::type_object` would
         // read as aliases while address-keyed patching between them stays
         // ambiguous. Those are related by no suffix here and are reported.
-        if extends(a, b) || drops_one_segment(a, b) || jit_wrapper_leaf(a, b) {
+        // `pyframe::PyFrame::clear_references` and
+        // `pyre_interpreter::PyFrame::clear_references` are the two ends of
+        // one re-export. Each is one segment away from
+        // `pyre_interpreter::pyframe::PyFrame::clear_references`, and the
+        // tails after that one segment are the same path. Two crate names
+        // in that position are two items.
+        fn crate_root_and_defining_module(a: &str, b: &str) -> bool {
+            let Some((head_a, rest_a)) = split_head(a) else {
+                return false;
+            };
+            let Some((head_b, rest_b)) = split_head(b) else {
+                return false;
+            };
+            if rest_a != rest_b {
+                return false;
+            }
+            let module_head = if head_a == "pyre_interpreter" {
+                head_b
+            } else if head_b == "pyre_interpreter" {
+                head_a
+            } else {
+                return false;
+            };
+            !matches!(
+                module_head,
+                "pyre_interpreter" | "pyre_object" | "pyre_jit" | "majit_rlib"
+            )
+        }
+        if extends(a, b)
+            || drops_one_segment(a, b)
+            || jit_wrapper_leaf(a, b)
+            || crate_root_and_defining_module(a, b)
+        {
             return true;
         }
         match (split_head(a), split_head(b)) {
@@ -6450,6 +6497,15 @@ mod tests {
         assert!(!are_alias_spellings(
             "pyre_interpreter::module::a::type_object",
             "pyre_interpreter::module::b::type_object",
+        ));
+        // Dropping one segment is not transitive. Each hop is an alias of the
+        // middle path, and the endpoints are two functions.
+        assert!(are_alias_spellings("crate::a::f", "crate::a::b::f"));
+        assert!(are_alias_spellings("crate::a::b::f", "crate::b::f"));
+        assert!(!are_alias_spellings("crate::a::f", "crate::b::f"));
+        assert!(are_alias_spellings(
+            "pyframe::PyFrame::clear_references",
+            "pyre_interpreter::PyFrame::clear_references",
         ));
         // Both shapes the registry actually produces.
         assert!(are_alias_spellings(
@@ -6512,13 +6568,26 @@ mod tests {
         // the loop reports whichever collision the hash order reached first
         // and hides the rest, so each repair looks complete and the next run
         // names a different pair.
+        //
+        // `are_alias_spellings` is pairwise. A chain can connect two paths
+        // that the predicate itself rejects: `crate::a::f` drops one segment
+        // to `crate::a::b::f`, and that drops another to `crate::b::f`, while
+        // the endpoints are two functions. A union of accepted pairs would
+        // hide that. Every pair on one address has to be a spelling of the
+        // same item.
         let mut collisions: Vec<String> = Vec::new();
         for (addr, paths) in &by_addr {
+            let n = paths.len();
+            if n < 2 {
+                continue;
+            }
             let mut unrelated: Vec<(&str, &str)> = Vec::new();
-            for (i, a) in paths.iter().enumerate() {
-                for b in &paths[i + 1..] {
-                    if !are_alias_spellings(a, b) {
-                        unrelated.push((a, b));
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if !are_alias_spellings(paths[i], paths[j]) {
+                        let mut pair = [paths[i], paths[j]];
+                        pair.sort_unstable();
+                        unrelated.push((pair[0], pair[1]));
                     }
                 }
             }

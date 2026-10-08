@@ -224,6 +224,42 @@ pub extern "C" fn jit_force_vref(
     pyre_interpreter::executioncontext::force_vref(frame)
 }
 
+/// `space.newdict(kwargs=True)`, the mapping `_match_signature`
+/// (`argument.py`) binds to a callee's `**kwargs` local.  Reached as a residual
+/// because the kwargs strategy keeps its keys and values in Rust `Vec`s.
+pub extern "C" fn jit_kwargs_dict_new() -> i64 {
+    pyre_object::w_dict_new_kwargs() as i64
+}
+
+/// `space.setitem(w_kwds, w_key, w_value)` for one keyword `_match_signature`
+/// (`argument.py`) collects into a `**kwargs` mapping.
+///
+/// Returns `dict` so a chain of stores threads the (possibly forwarded)
+/// mapping from one call to the next instead of holding a raw address across
+/// an allocating call.
+///
+/// # Safety
+/// `dict` must be a live dict, `key` a live `str` and `value` a live non-null
+/// `W_Root`.
+pub extern "C" fn jit_kwargs_dict_setitem(dict: i64, key: i64, value: i64) -> i64 {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[
+        dict as PyObjectRef,
+        key as PyObjectRef,
+        value as PyObjectRef,
+    ]);
+    unsafe {
+        pyre_object::w_dict_store(roots.get(base), roots.get(base + 1), roots.get(base + 2));
+    }
+    roots.get(base) as i64
+}
+
+/// `W_DictMultiObject.length()` of a dict whose strategy the trace has
+/// already pinned.
+pub extern "C" fn jit_dict_len(dict: i64) -> i64 {
+    unsafe { pyre_object::dictmultiobject::w_dict_len(dict as PyObjectRef) as i64 }
+}
+
 /// `objspace.py space.getexecutioncontext()` as a residual callee: the
 /// running thread's ExecutionContext, read out of its thread-local slot.
 ///

@@ -5903,6 +5903,27 @@ fn write_ref_reg<Sym: WalkSym>(
     Ok(())
 }
 
+/// Write a Ref register for a link renaming (`flatten.py insert_renamings`:
+/// `ref_copy` / `ref_pop`) without stamping operand TOS.
+///
+/// A renaming moves a value that is already live into the target block's
+/// register; it is not the result of the Python opcode it happens to be
+/// flattened into.  The opcode's own push stamped `vstack_last_ref` at its
+/// `setarrayitem_vable_r` or residual result, and a following renaming of an
+/// unrelated local (a loop-carried constant, say) must not replace it.
+fn write_renaming_ref_reg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let saved = ctx.frame_state.borrow().vstack_last_ref;
+    write_ref_reg(ctx, pc, dst, value, concrete)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
+    Ok(())
+}
+
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
@@ -7853,8 +7874,9 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
 /// interpreter at the wrong bytecode (permutation state never reaches its
 /// exit condition → non-crashing infinite loop).
 ///
-/// No heap writeback: the vable stays virtual across the merge edge and is
-/// rebuilt from guard resume-data on failure, matching the loop-close path.
+/// `interp_jit.py` `jump_absolute` writes `frame.last_instr` before
+/// `can_enter_jit`. Snapshot capture save/restores the boxes; this merge
+/// write is the live-frame header pc.
 fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize) {
     if ctx.standard_virtualizable_box().is_none() {
         return;
@@ -8808,6 +8830,11 @@ struct FbwNamespaceStore {
     name: pyre_object::PyObjectRef,
     displaced: pyre_object::PyObjectRef,
     loop_var: bool,
+    /// `Some` for a `STORE_SUBSCR` into a dict another thread can write.
+    /// Rollback restores only while the entry is still this exact object.
+    /// The root walker forwards it: a nursery value moves, and a stale
+    /// pointer would look like a concurrent replacement.
+    written: Option<pyre_object::PyObjectRef>,
 }
 
 struct FbwStoreJournalRootArea {
@@ -9192,6 +9219,8 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // dict slot, so the entry can be that value's only remaining owner, and the
     // rollback reads the dict and the name back to put it there — forward all
     // three.  A null `displaced` is the unbound case and names no object.
+    // `written` is the object a `STORE_SUBSCR` rollback compares by identity;
+    // it has to move with the dict entry or the comparison misses.
     let namespace_stores = unsafe { &mut *(*area.namespace_stores).as_ptr() };
     for entry in namespace_stores.iter_mut() {
         for slot in [
@@ -9203,6 +9232,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 continue;
             }
             visitor(unsafe { &mut *slot.cast() });
+        }
+        if let Some(written) = entry.written.as_mut() {
+            if !written.is_null() {
+                visitor(unsafe { &mut *(written as *mut pyre_object::PyObjectRef).cast() });
+            }
         }
     }
     // The displaced `sys_exc_value` entries are exception objects that may be
@@ -14879,7 +14913,7 @@ fn handle<Sym: WalkSym>(
                 (val, concrete)
             };
             let dst = code[op.pc + 1] as usize;
-            write_ref_reg(ctx, op.pc, dst, val, concrete)?;
+            write_renaming_ref_reg(ctx, op.pc, dst, val, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "int_push/i" => {
@@ -14962,15 +14996,10 @@ fn handle<Sym: WalkSym>(
             let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
             // A copy is a link renaming (`flatten.py insert_renamings`,
-            // `same_as`), never the result of the Python opcode it sits in:
-            // every operand-stack push goes through `setarrayitem_vable_r`,
-            // which stamps the TOS candidate itself.  Letting the copy stamp
-            // it made the block-exit move of `output = ''` into its register,
-            // emitted after GET_ITER, stand in for GET_ITER's iterator, and a
-            // later branch guard published `''` as the FOR_ITER operand.
-            let saved = ctx.frame_state.borrow().vstack_last_ref;
-            write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
-            ctx.frame_state.borrow_mut().vstack_last_ref = saved;
+            // `same_as`). Restoring TOS after the write is what keeps
+            // GET_ITER's iterator from being replaced by a later
+            // `output = ''` block-exit copy.
+            write_renaming_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {

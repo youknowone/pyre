@@ -1249,6 +1249,21 @@ fn report_symbolic_residual_call_target(
     TraceAction::Abort
 }
 
+/// Refuse a residual call whose target address is null.
+///
+/// A path hash is refused above. Address 0 is the same hole with no hash:
+/// recording it compiles a call of address 0. Decline the trace so the
+/// interpreter runs the call.
+fn refuse_null_residual_call_target(ctx: &mut TraceCtx, arg_classes: &str) -> TraceAction {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("residual call target is null (arg classes {arg_classes:?}); refusing the trace");
+    }
+    ctx.symbolic_residual_abort = true;
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TraceAction::Abort
+}
+
 /// A walk-local `Dynamic` arrives as a small integer in a Ref register,
 /// not a live cell. Residual-calling a helper that drops `Union` through
 /// that address is `EXC_BAD_ACCESS`. Abort the walk the same way an
@@ -7167,6 +7182,164 @@ mod tests {
             .position(|o| o.opcode == OpCode::GuardNotForced)
             .expect("CALL_ASSEMBLER[Void] must record a GUARD_NOT_FORCED");
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
+    }
+
+    /// `BC_CALL_ASSEMBLER_VOID` with `num_args == 0` and descr 0 naming
+    /// `concrete_ptr`. One ref register holds the virtualizable.
+    fn call_assembler_void_jitcode(concrete_ptr: *const ()) -> JitCode {
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0usize);
+        let mut jitcode = JitCode::new("call_assembler_void");
+        jitcode.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code: vec![
+                jitcode::insns::BC_CALL_ASSEMBLER_VOID,
+                0,
+                0, // fn_ptr_idx
+                0,
+                0, // num_args
+            ],
+            c_num_regs_r: 1,
+            startpoints: Some(startpoints),
+            ..Default::default()
+        });
+        jitcode.exec.descrs = vec![crate::jitcode::RuntimeBhDescr::AssemblerToken(
+            crate::jitcode::JitCallAssemblerTarget::new(7, concrete_ptr),
+        )];
+        jitcode
+    }
+
+    /// Drive `BC_CALL_ASSEMBLER_VOID` with a live token-bearing virtualizable
+    /// in ref register 0, matching `virtualizable_boxes[-1]`.
+    ///
+    /// `initialize_virtualizable` (pyjitpl.py) mints the identity as a Ref
+    /// inputarg (`original_boxes[index_of_virtualizable]`) and appends that
+    /// same box as `virtualizable_boxes[-1]`. A recorder with no inputargs
+    /// leaves `OpRef::input_arg_ref(0)` without a `*FrontendOp`, so
+    /// `box_bits` fails and `prepare_standard_virtualizable_before_residual_call`
+    /// records no `FORCE_TOKEN`.
+    fn trace_call_assembler_void<R: JitCodeRuntime>(
+        concrete_ptr: *const (),
+        runtime: &R,
+    ) -> (TraceAction, crate::virtualizable::VableToken, Vec<OpCode>) {
+        #[repr(C)]
+        struct VableObj {
+            token: usize,
+        }
+        let mut obj = VableObj { token: 0 };
+        let addr = std::hint::black_box(std::ptr::addr_of_mut!(obj) as usize);
+        let info = VirtualizableInfo::new(0).finalize_arc(majit_ir::descr::make_size_descr(
+            std::mem::size_of::<VableObj>(),
+        ));
+        let jitcode = call_assembler_void_jitcode(concrete_ptr);
+        let asm = majit_jitcode::codewriter::assembler::Assembler::new();
+        let mut ctx = context_with_liveness(&[Type::Ref], &asm);
+        ctx.install_virtualizable_info(info.clone());
+        let vable_ref = OpRef::input_arg_ref(0);
+        let vable_value = Value::Ref(majit_ir::GcRef(addr));
+        ctx.stamp_live_inputargs(&[vable_value]);
+        ctx.init_virtualizable_boxes(info.as_ref(), vable_ref, vable_value, &[], &[], &[]);
+        let mut sym = DummySym;
+        let _ = crate::take_walk_abort();
+        let action = trace_jitcode_with_args_and_runtime(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            runtime,
+            &[(JitArgKind::Ref, vable_ref, addr as i64)],
+        );
+        let token = unsafe { info.read_token(addr as *const u8) };
+        let opcodes = ctx
+            .into_recorder()
+            .ops()
+            .iter()
+            .map(|op| op.opcode)
+            .collect();
+        std::hint::black_box(obj);
+        (action, token, opcodes)
+    }
+
+    struct LabelOnlyRuntime;
+
+    impl JitCodeRuntime for LabelOnlyRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+    }
+
+    /// A null `BC_CALL_ASSEMBLER_VOID` target aborts before
+    /// `vable_and_vrefs_before_residual_call`, so the vable token stays
+    /// `TOKEN_NONE` and the trace records no `FORCE_TOKEN`.
+    #[test]
+    fn call_assembler_void_null_target_aborts_without_vable_token() {
+        let (action, token, opcodes) =
+            trace_call_assembler_void(std::ptr::null(), &LabelOnlyRuntime);
+        assert!(
+            matches!(action, TraceAction::Abort),
+            "null CALL_ASSEMBLER target must abort, got {action:?}"
+        );
+        assert_eq!(token, crate::virtualizable::VableToken::None);
+        assert!(
+            !opcodes.contains(&OpCode::ForceToken),
+            "null target must refuse before tracing_before_residual_call, ops={opcodes:?}"
+        );
+    }
+
+    std::thread_local! {
+        static CALL_ASSEMBLER_VOID_HOST_ABORT_RAN: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    extern "C" fn call_assembler_void_host_abort() {
+        CALL_ASSEMBLER_VOID_HOST_ABORT_RAN.with(|ran| ran.set(true));
+        crate::request_walk_abort();
+    }
+
+    struct AssemblerTokenRuntime {
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+    }
+
+    impl JitCodeRuntime for AssemblerTokenRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn jitcell_token_arc_for_number(
+            &self,
+            token_number: u64,
+        ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+            (token_number == self.token.number).then(|| self.token.clone())
+        }
+    }
+
+    /// A host walk-abort is latched during the call, after the stamp.
+    /// `escaped_standard_virtualizable` must clear `TOKEN_TRACING_RESCALL`
+    /// before the trace returns `Abort`.
+    #[test]
+    fn call_assembler_void_host_abort_clears_vable_token() {
+        CALL_ASSEMBLER_VOID_HOST_ABORT_RAN.with(|ran| ran.set(false));
+        let runtime = AssemblerTokenRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let (action, token, opcodes) =
+            trace_call_assembler_void(call_assembler_void_host_abort as *const (), &runtime);
+        assert!(
+            CALL_ASSEMBLER_VOID_HOST_ABORT_RAN.with(|ran| ran.get()),
+            "the concrete void target must run before the host abort"
+        );
+        assert!(
+            matches!(action, TraceAction::Abort),
+            "host walk-abort must abort the trace, got {action:?}"
+        );
+        assert!(
+            opcodes.contains(&OpCode::ForceToken),
+            "prepare_standard_virtualizable_before_residual_call must stamp, ops={opcodes:?}"
+        );
+        assert_eq!(
+            token,
+            crate::virtualizable::VableToken::None,
+            "escaped_standard_virtualizable must clear TOKEN_TRACING_RESCALL"
+        );
     }
 
     /// A `jit_merge_point` reached INSIDE an inlined recursive
