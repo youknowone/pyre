@@ -14636,6 +14636,9 @@ fn handle<Sym: WalkSym>(
             let is_ref_array = descr
                 .as_array_descr()
                 .map_or(false, |a| a.is_array_of_pointers());
+            let is_float_array = descr
+                .as_array_descr()
+                .is_some_and(|a| a.is_array_of_floats());
             // pyjitpl.py `_opimpl_new_array`.
             ctx.trace_ctx
                 .profiler()
@@ -14643,7 +14646,9 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx
                 .profiler()
                 .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
-            let resbox = ctx.trace_ctx.record_op_with_descr(opcode, &[length], descr);
+            let resbox = ctx
+                .trace_ctx
+                .record_op_with_descr(opcode, &[length], descr.clone());
             // heapcache.py `new_array(box, lengthbox)` adds
             // the virtual/unescaped flags only when `lengthbox` is a
             // Const ("only constant-length arrays are virtuals").
@@ -14672,20 +14677,64 @@ fn handle<Sym: WalkSym>(
             // then marked the array escaped); if any element/index is
             // non-concrete it reverts the array to the no-concrete sentinel
             // so the residual declines (abort, as before).
-            // Non-ref arrays and an unknown length keep the Null posture.
+            // An unknown length keeps the Null posture. Signed/Float
+            // arrays stamp a typed items block so `OS_ARRAYCOPY` can run.
             let mut concrete = ConcreteValue::Null;
-            if is_ref_array {
-                if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
-                    if let Ok(cap) = usize::try_from(n) {
-                        if let Some(block) = unsafe {
+            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
+                if let Ok(cap) = usize::try_from(n) {
+                    // Ref arrays: BUILD_LIST / tuple slice. Signed/Float
+                    // arrays: IntegerListStrategy `newlist` (`int_ll_newlist`
+                    // → `new_array`). A later void `OS_ARRAYCOPY` into that
+                    // dest (`ll_listslice_new_int_list`) needs a concrete
+                    // block or the walk aborts `ResidualCallArgUnbound`.
+                    // `bh_new_array` (`llmodel.py`) passes the live
+                    // `arraydescr` to `gc_malloc_array`. Item width and
+                    // type id come from that descr. A layout this path
+                    // cannot represent leaves the result unbound (decline
+                    // the concrete step) rather than allocating a wrong
+                    // integer block. Zero length is a valid empty array.
+                    let block: Option<*mut u8> = if is_ref_array {
+                        unsafe {
                             pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap)
-                        } {
-                            if ctx.trace_ctx.try_set_opref_concrete(
-                                resbox,
-                                majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
-                            ) {
-                                concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
+                                .map(|p| p as *mut u8)
+                        }
+                    } else if let Some(ad) = descr.as_array_descr() {
+                        if ad.is_array_of_structs() || ad.item_size() != std::mem::size_of::<u64>()
+                        {
+                            None
+                        } else {
+                            let tid = ad.type_id();
+                            let tid = if tid != 0 {
+                                tid
+                            } else if is_float_array {
+                                pyre_object::object_array::gc_float_array_gc_type_id()
+                            } else {
+                                pyre_object::object_array::gc_int_array_gc_type_id()
+                            };
+                            if tid == 0 {
+                                None
+                            } else {
+                                let p = unsafe {
+                                    pyre_object::object_array::alloc_typed_items_block_nursery(
+                                        cap, tid,
+                                    )
+                                };
+                                if p.is_null() {
+                                    None
+                                } else {
+                                    Some(p as *mut u8)
+                                }
                             }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(block) = block {
+                        if ctx.trace_ctx.try_set_opref_concrete(
+                            resbox,
+                            majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+                        ) {
+                            concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
                         }
                     }
                 }

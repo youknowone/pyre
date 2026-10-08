@@ -7998,9 +7998,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && r_args.len() == 3
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinarySlice
     {
-        if let Some(outcome) = try_walker_orthodox_binary_slice(
-            ctx, code, op, funcptr, &r_args, call_descr, dst, dst_bank,
-        )? {
+        if let Some(outcome) = try_walker_orthodox_binary_slice(ctx, op, &r_args, dst, dst_bank)? {
             return Ok((outcome, op.next_pc));
         }
     }

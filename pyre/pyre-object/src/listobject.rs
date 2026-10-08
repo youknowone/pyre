@@ -3722,10 +3722,13 @@ pub unsafe fn w_list_iter_item(obj: PyObjectRef, index: i64) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`. `start` and `stop` are
 /// already normalised machine bounds (a `stop` past the length is clamped).
+///
+/// Opaque: acquire, copy, and release finish inside this call, matching
+/// `list_iter_getitem_locked`. The BINARY_SLICE descent walks
+/// [`ll_listslice_inner`] while `gil_ready` is still unpublished and
+/// residualizes this wrapper once threads exist.
+#[majit_macros::dont_look_inside]
 pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
-    // Same wrapper/inner split as `w_list_getitem`: the BINARY_SLICE
-    // descent walks the lock-free body. The lock stays on the interpreter
-    // wrapper and on [`binary_slice_values`].
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
@@ -3734,36 +3737,44 @@ pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObj
     ll_listslice_inner(obj, start, stop)
 }
 
-/// [`ll_listslice`]'s body, run with the list's guard already held.
+/// [`ll_listslice`]'s body, run with the list's guard already held, or
+/// with `gil_ready` still unpublished (`list_iter_descr_next`).
 ///
 /// The arms address the backing array directly instead of boxing one item
 /// at a time through `w_list_getitem`, so the length, the strategy and the
 /// copy have to see one state.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_ListObject`, and the caller must hold
-/// `w_list_lock(obj)`. `start` and `stop` are already normalised machine
-/// bounds (a `stop` past the length is clamped).
+/// `obj` must point to a valid `W_ListObject`. The caller holds
+/// `w_list_lock(obj)`, or no other thread can run (`gil_ready` is 0).
+/// `start` and `stop` are already normalised machine bounds (a `stop`
+/// past the length is clamped).
 pub unsafe fn ll_listslice_inner(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
+    // Own RootScope so a BINARY_SLICE caller can erase its bracket:
+    // this body is depth-neutral even though strategy helpers are in
+    // the sensitive set. One return so the Drop is a regular close.
+    let _roots = crate::gc_roots::push_roots();
+    let obj = crate::gc_roots::pin_root(obj);
     let length = w_list_len(obj);
     let start = start.min(length);
     let stop = if stop > length { length } else { stop };
     let newlength = stop.saturating_sub(start);
     if newlength == 0 {
-        return w_list_new(Vec::new());
-    }
-    let strategy = (*(obj as *const W_ListObject)).strategy;
-    match strategy {
-        ListStrategy::Integer => ll_listslice_ints(obj, start, newlength),
-        ListStrategy::Float => ll_listslice_floats(obj, start, newlength),
-        ListStrategy::Object => ll_listslice_objects(obj, start, newlength),
-        ListStrategy::SimpleRange | ListStrategy::Range => {
-            // `BaseRangeListStrategy.getslice`: `switch_to_integer_strategy`
-            // then `IntegerListStrategy.getslice`.
-            let obj = switch_range_to_integer_strategy(&mut *(obj as *mut W_ListObject));
-            ll_listslice_ints(obj, start, newlength)
+        w_list_new(Vec::new())
+    } else {
+        let strategy = (*(obj as *const W_ListObject)).strategy;
+        match strategy {
+            ListStrategy::Integer => ll_listslice_ints(obj, start, newlength),
+            ListStrategy::Float => ll_listslice_floats(obj, start, newlength),
+            ListStrategy::Object => ll_listslice_objects(obj, start, newlength),
+            ListStrategy::SimpleRange | ListStrategy::Range => {
+                // `BaseRangeListStrategy.getslice`: `switch_to_integer_strategy`
+                // then `IntegerListStrategy.getslice`.
+                let obj = switch_range_to_integer_strategy(&mut *(obj as *mut W_ListObject));
+                ll_listslice_ints(obj, start, newlength)
+            }
+            _ => ll_listslice_boxed(obj, start, newlength),
         }
-        _ => ll_listslice_boxed(obj, start, newlength),
     }
 }
 
@@ -3796,12 +3807,23 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
 /// `wraptuple` adopts `tuple_ll_newlist`'s array. Typed strategies keep
 /// `length == 0` and a null object `items` block.
 ///
-/// No `push_roots`: that helper has no jitcode and aborts the BINARY_SLICE
-/// subwalk. `pin_root` is `dont_look_inside_cannot_raise` and is bound; the
-/// caller's `RootScope` (interpreter) or the JIT gcmap (trace) keeps the
-/// block live across the header malloc.
+/// Native path opens a RootScope so the block and class pins pop on
+/// return (`gct_fv_gc_malloc` would have inserted that bracket).
+///
+/// Residual (`dont_look_inside`), same collector-heap allocation boundary
+/// as `w_int_gc_alloc` / `w_tuple_adopt_fixed_items`. Upstream
+/// `from_storage_and_strategy` is `instantiate` plus field stores, which
+/// records `new_with_vtable` + `setfield_gc`. The write-into-block
+/// `try_gc_alloc_nursery_raw` is not the `malloc_typed(%agg)` cluster
+/// `fuse_boxing_alloc` rewrites; a `malloc_typed` header would sit off
+/// the collector heap while `int_items.block` is a nursery array.
+/// The boundary goes when the write-into-block shape lowers. Allocation
+/// failure aborts rather than raising, so the residual carries no
+/// `guard_no_exception` — matching `new_with_vtable` upstream.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
     let block_slot = crate::gc_roots::shadow_stack_len();
     if !block.is_null() {
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
@@ -3831,12 +3853,15 @@ unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObj
         bytes_items: BytesArray::empty(),
         ascii_items: UnicodeArray::empty(),
     };
+    // One return so the RootScope Drop is a regular close, not an
+    // unwind-edge cleanup `stack_sensitivity` does not follow.
     if !raw.is_null() {
         std::ptr::write(raw as *mut W_ListObject, built);
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        return raw as PyObjectRef;
+        raw as PyObjectRef
+    } else {
+        Box::into_raw(Box::new(built)) as PyObjectRef
     }
-    Box::into_raw(Box::new(built)) as PyObjectRef
 }
 
 /// `rlist.py ll_listslice_startstop`: `ll_newlist` plus `ll_arraycopy`.
@@ -3846,17 +3871,21 @@ unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObj
 /// is two words (`jit_fnaddr.rs` `ResidualSlot`) and is never an argument;
 /// the copy addresses the typed blocks through `jit_ll_arraycopy`.
 ///
-/// No `push_roots` in this body (`rlist.py ll_listslice_startstop` has
-/// none). Pins land on the caller's `RootScope`.
+/// Native path opens a RootScope so the source/dest pins pop on return.
+/// `rlist.py ll_listslice_startstop` has no bracket (gctransform inserts
+/// it); `shadow_stack_erase` scalar-replaces this one the same way it
+/// does `binary_slice_values_inner`, so the walked jitcode is
+/// `newlist` + `ll_items` + `OS_ARRAYCOPY` with no residual root calls.
 #[inline(never)]
 pub unsafe fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _obj = crate::gc_roots::pin_root(obj);
     let dest = int_ll_newlist(n as i64);
     let dest_slot = crate::gc_roots::shadow_stack_len();
-    if !dest.is_null() {
-        let _ = crate::gc_roots::pin_root(dest as PyObjectRef);
-    }
+    // Pin even a null dest so both CFG arms share one shadow-stack
+    // depth; `shadow_stack_erase` refuses a merge that disagrees.
+    let _ = crate::gc_roots::pin_root(dest as PyObjectRef);
     if n > 0 {
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         // rlist.py `ll_arraycopy`: `rgc.ll_arraycopy(source.ll_items(), ...)`.

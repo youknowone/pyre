@@ -265,12 +265,15 @@ fn build_semantic_program_via_active_frontend(
             // Paths are in dependency order, so a crate's callees from
             // earlier artefacts are already classified when it is.
             let mut stack_sensitive: Vec<String> = Vec::new();
+            let mut stack_depth_neutral: Vec<String> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
+                llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 stack_sensitive.extend(front::mir::discover_stack_sensitive_fns(&llbc));
+                stack_depth_neutral.extend(front::mir::discover_depth_neutral_fns(&llbc));
                 crate_names.push(llbc.crate_name().to_string());
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 root_stack_touching.extend(front::mir::harvest_root_stack_touching_paths(&llbc));
@@ -331,6 +334,7 @@ fn build_semantic_program_via_active_frontend(
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
+                llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.mark_stack_sensitive_fns_complete();
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);

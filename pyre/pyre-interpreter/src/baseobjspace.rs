@@ -2647,6 +2647,8 @@ pub(crate) unsafe fn tuple_slice_startstop(
     start: usize,
     stop: usize,
 ) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let slicelength = stop.saturating_sub(start) as i64;
     let block = if slicelength == 0 {
         tuple_ll_newlist(0)

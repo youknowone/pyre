@@ -910,10 +910,10 @@ pub fn store_slice_values(
 /// `__getitem__`) falls back to a `slice` object dispatched through
 /// `getitem`. A `None` start/stop defaults to `0` / `len`.
 ///
-/// `push_roots` lives here so the inner graph a trace descends does not
-/// start on that `dont_look_inside` residual (`specialize.rs
-/// try_walker_orthodox_binary_slice`). The inner pins with `pin_root`
-/// (`dont_look_inside_cannot_raise`, bound in `jit_trace_fnaddrs`).
+/// Residual wrapper around [`binary_slice_values_inner`]. The inner owns
+/// the operand-root bracket. This extra scope is empty once the inner
+/// returns; a residual that still calls the wrapper does not start the
+/// inner with no live RootScope on the native path.
 #[inline(never)]
 pub fn binary_slice_values(
     obj: PyObjectRef,
@@ -921,51 +921,46 @@ pub fn binary_slice_values(
     stop: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    // Same wrapper/inner split as `w_list_getitem`: the list lock lives
-    // here so `binary_slice_values_inner` holds no `w_list_lock` pair.
-    // Flatten residual-calls the inner, so a compiled trace matches
-    // getitem and does not enter this wrapper.
-    if unsafe { pyre_object::is_list(obj) } {
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let obj = pyre_object::gc_roots::pin_root(obj);
-        let start_slot = pyre_object::gc_roots::shadow_stack_len();
-        let start = pyre_object::gc_roots::pin_root(start);
-        let stop_slot = pyre_object::gc_roots::shadow_stack_len();
-        let stop = pyre_object::gc_roots::pin_root(stop);
-        let _list_guard = unsafe { pyre_object::listobject::w_list_lock(obj) };
-        return binary_slice_values_inner(
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            pyre_object::gc_roots::shadow_stack_get(start_slot),
-            pyre_object::gc_roots::shadow_stack_get(stop_slot),
-        );
-    }
     binary_slice_values_inner(obj, start, stop)
 }
 
 /// Body of [`binary_slice_values`]. The public function stays
 /// `inline(never)` so this split has its own graph; the residual C ABI
 /// wrapper calls this directly so compiled traces do not pay the
-/// `push_roots` hop. `inline(never)` is load-bearing: rustc otherwise
+/// wrapper's hop. `inline(never)` is load-bearing: rustc otherwise
 /// folds this body into the wrapper and the codewriter never mints the
 /// graph a trace descends (`specialize.rs try_walker_orthodox_binary_slice`).
+///
+/// The `push_roots` bracket lives here so the native path publishes the
+/// three operands as one livevar set before any safepoint (`pin_roots`).
+/// `shadow_stack_erase` scalar-replaces that Open/Publish/Close
+/// (`w_range_iter_one_arg_new`), so the descended jitcode has no residual
+/// root calls. Integer-list copy then walks `ll_listslice_inner`; that
+/// helper's `new_int_list` bracket is erased the same way, leaving
+/// `new_array` + `OS_ARRAYCOPY` in the compiled loop.
 #[inline(never)]
 pub(crate) fn binary_slice_values_inner(
     obj: PyObjectRef,
     start: PyObjectRef,
     stop: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     unsafe {
         // `eval_slice_index` may run a user `__index__`, and every arm below
         // allocates: any of the three operands relocates across either.  They
         // are published as one livevar set, and each consumer that follows a
         // collection point reads its operand back off the root slot — the
         // receiver included, since its type says nothing about whether it moves.
+        // Sequential `pin_root` would query after the first write and leave
+        // the later words unpublished at that safepoint (`pin_roots`).
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let obj = pyre_object::gc_roots::pin_root(obj);
-        let start_slot = pyre_object::gc_roots::shadow_stack_len();
-        let start = pyre_object::gc_roots::pin_root(start);
-        let stop_slot = pyre_object::gc_roots::shadow_stack_len();
-        let stop = pyre_object::gc_roots::pin_root(stop);
+        let start_slot = obj_slot + 1;
+        let stop_slot = obj_slot + 2;
+        pyre_object::gc_roots::publish_roots(&[obj, start, stop]);
+        pyre_object::gc_roots::normalize_roots(obj_slot, 3);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let start = pyre_object::gc_roots::shadow_stack_get(start_slot);
+        let stop = pyre_object::gc_roots::shadow_stack_get(stop_slot);
         if pyre_object::is_list(obj) {
             let s = if pyre_object::is_none(start) {
                 0
@@ -988,17 +983,17 @@ pub(crate) fn binary_slice_values_inner(
             let e = raw_e.unwrap_or(len);
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-            // Bounds are normalised here, outside `ll_listslice_inner`: a user
+            // Bounds are normalised here, outside the copy: a user
             // `__index__` may have resized this list, and the operand roots
-            // above are what keep it alive across that call. The leaf
-            // allocates once and copies; it does not convert bounds. The
-            // list lock is the wrapper's (`binary_slice_values` /
-            // `ll_listslice`), so this body has no `w_list_lock` pair.
-            return Ok(pyre_object::listobject::ll_listslice_inner(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                s,
-                e,
-            ));
+            // above are what keep it alive across that call. The lock covers
+            // only the copy, matching `list_iter_descr_next`: unpublished
+            // `gil_ready` is lock-free; once threads exist, `ll_listslice`
+            // acquires, copies, and releases as one residual.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if pyre_object::gil_ready::gil_ready_word() != 0 {
+                return Ok(pyre_object::listobject::ll_listslice(obj, s, e));
+            }
+            return Ok(pyre_object::listobject::ll_listslice_inner(obj, s, e));
         }
         if pyre_object::is_str(obj) {
             // Slice on code-point boundaries over the WTF-8 view, so a

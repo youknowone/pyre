@@ -9165,6 +9165,11 @@ impl<'a> Transformer<'a> {
                     NewlistClearShape::Resized { .. } => None,
                 }
             });
+            // rgc.py `ll_arraycopy` `_canraise` is False (`call.py`).
+            // The Rust body still has `assert!` on negative starts, which
+            // the graph analyser reports as CanRaise; a transparent
+            // helper walk then declines the residual as CallMayForceR.
+            // Pass CannotRaise so OS_ARRAYCOPY records as CallN.
             let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
@@ -9173,7 +9178,7 @@ impl<'a> Transformer<'a> {
                 &ValueType::Void,
                 graph_name,
                 OopSpecIndex::Arraycopy,
-                None,
+                Some(majit_ir::descr::ExtraEffect::CannotRaise),
                 array_descrs,
             );
             return Some(match rewritten {
@@ -9750,45 +9755,52 @@ impl<'a> Transformer<'a> {
             // `ItemsBlock` over IntegerListStrategy storage.
             "newlist" => {
                 let length = args.first()?.clone();
-                let (detail, kind) =
-                    match newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref()) {
-                        NewlistClearShape::Fixed {
-                            item_ty,
-                            array_type_id,
-                        } => {
-                            let array_type_id = match (&item_ty, array_type_id) {
-                                (_, Some(id)) => Some(id),
-                                (ValueType::Int, None) => Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                                (ValueType::Float, None) => {
-                                    Some(LIST_FLOAT_ITEMS_ARRAY.to_string())
-                                }
-                                (_, None) => None,
-                            };
-                            if matches!(item_ty, ValueType::Ref(_)) {
-                                (
-                                    "newlist → new_array_clear(length, arraydescr) \
-                                 [fixed array of GC pointers]",
-                                    OpKind::NewArrayClear {
-                                        length,
-                                        item_ty,
-                                        array_type_id,
-                                    },
-                                )
-                            } else {
-                                (
-                                    "newlist → new_array(length, arraydescr) [fixed array]",
-                                    OpKind::NewArray {
-                                        length,
-                                        item_ty,
-                                        array_type_id,
-                                    },
-                                )
+                let shape = newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref());
+                let (detail, kind) = match shape {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    } => {
+                        let array_type_id = match (&item_ty, array_type_id) {
+                            (_, Some(id)) => Some(id),
+                            (ValueType::Int, None) => Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                            (ValueType::Float, None) => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+                            // `do_fixed_newlist` (jtransform.py): a GC-pointer
+                            // OF emits `new_array_clear` with
+                            // `cpu.arraydescrof(ARRAY)`. An identity-less
+                            // Ref descr cannot trace the block; name the
+                            // same `GcArray(OBJECTPTR)` identity the
+                            // `newlist_clear` Fallback uses.
+                            (ValueType::Ref(_), None) => {
+                                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
                             }
+                            (_, None) => None,
+                        };
+                        if matches!(item_ty, ValueType::Ref(_)) {
+                            (
+                                "newlist → new_array_clear(length, arraydescr) \
+                                 [fixed array of GC pointers]",
+                                OpKind::NewArrayClear {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                },
+                            )
+                        } else {
+                            (
+                                "newlist → new_array(length, arraydescr) [fixed array]",
+                                OpKind::NewArray {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                },
+                            )
                         }
-                        NewlistClearShape::Resized { .. } | NewlistClearShape::Fallback => {
-                            return None;
-                        }
-                    };
+                    }
+                    NewlistClearShape::Resized { .. } | NewlistClearShape::Fallback => {
+                        return None;
+                    }
+                };
                 (
                     detail,
                     vec![SpaceOperation {
@@ -13687,43 +13699,58 @@ fn newlist_clear_shape(
     /// with `T` a word (`TypedItemsBlock`, the Rust owner of
     /// `GcArray(Signed|Float)`). `[i64]` / `[u64]` recover
     /// `LIST_INT_ITEMS_ARRAY`; `[f64]` recovers `LIST_FLOAT_ITEMS_ARRAY`.
-    /// The classdef leaf `TypedItemsBlock` is IntegerListStrategy storage
-    /// when the rust layout is not registered (`int_ll_newlist`).
+    /// Shape comes from the struct's own fields or the registered rust
+    /// layout, not from the type's last path segment.
     fn typed_items_array_shape(
         s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
         callcontrol: Option<&crate::call::CallControl>,
     ) -> Option<(ValueType, String)> {
+        if s._names.len() == 2
+            && let Some(fld) = s._arrayfld.as_ref()
+            && s._names.last() == Some(fld)
+            && let Some(first_ty) = s._flds.get(&s._names[0])
+            && matches!(
+                crate::model::try_getkind(first_ty, true, true, true),
+                Ok(crate::codewriter::type_state::ConcreteType::Signed)
+            )
+            && let Some(LowLevelType::Array(a)) = s._flds.get(fld)
+        {
+            match element_value_type(&a.OF) {
+                ValueType::Int => {
+                    return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
+                }
+                ValueType::Float => {
+                    return Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string()));
+                }
+                _ => {}
+            }
+        }
         let leaf = s._name.rsplit("::").next().unwrap_or(s._name.as_str());
         let fields = callcontrol.and_then(|cc| {
             cc.struct_field_entries(&s._name)
                 .or_else(|| cc.struct_field_entries(leaf))
-        });
-        if let Some(fields) = fields
-            && fields.len() == 2
-        {
-            let (_, first_ty) = fields.first()?;
-            if matches!(
-                crate::front::mir::tuple_field_value_type(first_ty),
-                ValueType::Int | ValueType::Unsigned
-            ) {
-                let (_, ty) = fields.last()?;
-                if let Some((item, 0)) = crate::front::mir::shaped_array_parts(ty) {
-                    match item {
-                        "i64" | "u64" | "isize" | "usize" => {
-                            return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
-                        }
-                        "f64" => {
-                            return Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string()));
-                        }
-                        _ => {}
-                    }
-                }
+        })?;
+        if fields.len() != 2 {
+            return None;
+        }
+        let (_, first_ty) = fields.first()?;
+        if !matches!(
+            crate::front::mir::tuple_field_value_type(first_ty),
+            ValueType::Int | ValueType::Unsigned
+        ) {
+            return None;
+        }
+        let (_, ty) = fields.last()?;
+        let (item, 0) = crate::front::mir::shaped_array_parts(ty)? else {
+            return None;
+        };
+        match item {
+            "i64" | "u64" | "isize" | "usize" => {
+                Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()))
             }
+            "f64" => Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string())),
+            _ => None,
         }
-        if leaf == "TypedItemsBlock" {
-            return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
-        }
-        None
     }
 
     fn instance_classdef_name(var: &crate::flowspace::model::Variable) -> Option<String> {
@@ -26973,6 +27000,64 @@ mod tests {
         assert_eq!(ops[0].result, Some(result));
     }
 
+    /// `do_fixed_newlist` (jtransform.py): `Ptr(GcArray(GCREF))` emits
+    /// `new_array_clear` with the `GcArray(OBJECTPTR)` identity, so the
+    /// collector can trace the items.
+    #[test]
+    fn handle_list_call_newlist_fixed_gcref_assigns_object_ref_array_id() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let array_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+        }));
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_fixed_gcref");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = variable_with_lltype("a", array_ptr);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist",
+                &op,
+                std::slice::from_ref(&count),
+                &mut graph,
+                "newlist_fixed_gcref",
+            )
+            .expect("newlist must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(
+                    matches!(item_ty, ValueType::Ref(None)),
+                    "GCREF-element fixed array must recover ValueType::Ref, got {item_ty:?}"
+                );
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "fixed GCREF array must name the GcArray(OBJECTPTR) identity"
+                );
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
     /// `TypedItemsBlock` rust layout `{capacity: usize, items: [u64; 0]}`
     /// is IntegerListStrategy storage (`GcArray(Signed)`). `newlist(length)`
     /// emits `new_array` with `LIST_INT_ITEMS_ARRAY`, not the object
@@ -27038,6 +27123,46 @@ mod tests {
             other => panic!("expected NewArray, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// A call whose leaf is `int_ll_newlist` still needs the declared
+    /// `*mut TypedItemsBlock` result layout. The function name is not
+    /// a shape: an untyped result must residualize, same as any other
+    /// untyped `newlist`.
+    #[test]
+    fn handle_list_call_newlist_int_ll_newlist_untyped_result_does_not_lower() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_int_ll_untyped");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".into(),
+                        "listobject".into(),
+                        "int_ll_newlist".into(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(std::iter::once(count.clone())),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let mut transformer = Transformer::new(&config);
+        assert!(
+            transformer
+                ._handle_list_call(
+                    "newlist",
+                    &op,
+                    std::slice::from_ref(&count),
+                    &mut graph,
+                    "newlist_int_ll_untyped",
+                )
+                .is_none(),
+            "int_ll_newlist without a TypedItemsBlock result type must not fabricate an int array"
+        );
     }
 
     /// Untyped `OBJECTPTR` result: `newlist` does not rewrite. The

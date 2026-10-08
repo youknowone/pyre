@@ -31,6 +31,9 @@
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
+use majit_translate::CallPath;
+use majit_translate::call::CallControl;
+use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{LowerContext, erased_root_bracket_guards, lower_fun_decl};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 use std::sync::OnceLock;
@@ -507,6 +510,217 @@ fn a_constant_offset_bracket_is_scalar_replaced() {
     }
 }
 
+/// `ll_listslice_inner` opens, pins, and closes on every return so a
+/// BINARY_SLICE caller can erase its own bracket and walk this body.
+#[test]
+fn ll_listslice_inner_is_depth_neutral() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("::ll_listslice_inner") || n.ends_with("ll_listslice_inner")),
+        "ll_listslice_inner must be depth-neutral, got {names:?}"
+    );
+}
+
+/// The inner list-copy body is scalar-replaced: the walk records the
+/// strategy copy, not residual `push_roots`.
+#[test]
+fn ll_listslice_inner_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let graph = lower_named(llbc, "ll_listslice_inner");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "ll_listslice_inner still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
+/// `eval_slice_index` opens, pins, and closes on every return. The
+/// path-sensitive walk classifies that body as depth-neutral.
+#[test]
+fn eval_slice_index_is_depth_neutral() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("::eval_slice_index") || n.ends_with("eval_slice_index")),
+        "eval_slice_index must be depth-neutral, got {names:?}"
+    );
+}
+
+/// `binary_slice_values_inner` opens a RootScope, batch-publishes the three
+/// operands, and calls `eval_slice_index`. A stack-sensitive callee used
+/// to refuse the whole rewrite; the walker then aborted on `push_roots`.
+#[test]
+fn binary_slice_values_inner_bracket_is_scalar_replaced() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let graph = lower_named(llbc, "binary_slice_values_inner");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "binary_slice_values_inner still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
+/// The linked translation publishes `pyre-object`'s sensitive set onto
+/// the interpreter artefact. Inner still erases: its object callees that
+/// open-and-close a `RootScope` are depth-neutral, not a name exemption.
+#[test]
+fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load object llbc");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load interpreter llbc");
+    let mut sensitive = majit_translate::front::mir::discover_stack_sensitive_fns(&object);
+    let mut neutral = majit_translate::front::mir::discover_depth_neutral_fns(&object);
+    interpreter.register_stack_sensitive_fns(sensitive.iter().cloned());
+    interpreter.register_stack_depth_neutral_fns(neutral.iter().cloned());
+    sensitive.extend(majit_translate::front::mir::discover_stack_sensitive_fns(
+        &interpreter,
+    ));
+    neutral.extend(majit_translate::front::mir::discover_depth_neutral_fns(
+        &interpreter,
+    ));
+    interpreter.register_stack_sensitive_fns(sensitive);
+    interpreter.register_stack_depth_neutral_fns(neutral);
+    interpreter.mark_stack_sensitive_fns_complete();
+    let graph = lower_named(&interpreter, "binary_slice_values_inner");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "binary_slice_values_inner still calls {leaf} after the linked object set was published"
+        );
+    }
+}
+
+/// `ll_listslice_new_int_list` pins source and dest around `newlist` +
+/// `ll_arraycopy`. The native RootScope is scalar-replaced so a
+/// BINARY_SLICE sub-walk records the copy, not residual `pin_root`.
+#[test]
+fn ll_listslice_new_int_list_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "ll_listslice_new_int_list");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "ll_listslice_new_int_list still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
+/// `int_ll_newlist` is `@oopspec("newlist(length)")`. After jtransform the
+/// call in `ll_listslice_new_int_list` is `new_array` of
+/// `LIST_INT_ITEMS_ARRAY`, not a residual Call.
+#[test]
+fn ll_listslice_new_int_list_newlist_becomes_new_array() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "ll_listslice_new_int_list");
+    let mut cc = CallControl::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().is_some_and(|s| s == "int_ll_newlist") {
+            cc.mark_oopspec(
+                CallPath::from_segments(segments.iter().map(String::as_str)),
+                "newlist(length)".to_string(),
+            );
+        }
+    }
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::NewArray { .. } => Some("NewArray".to_string()),
+            OpKind::NewArrayClear { .. } => Some("NewArrayClear".to_string()),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!(
+                "Call:{}",
+                segments.last().cloned().unwrap_or_default()
+            )),
+            OpKind::CallResidual { .. } => Some("CallResidual".to_string()),
+            _ => None,
+        })
+        .collect();
+    let new_arrays = kinds.iter().filter(|k| *k == "NewArray").count();
+    assert!(
+        new_arrays > 0,
+        "int_ll_newlist oopspec must become NewArray, ops={kinds:?} notes={:?}",
+        out.notes
+    );
+    assert_eq!(
+        calls_to(&out.graph, "int_ll_newlist"),
+        0,
+        "int_ll_newlist must not remain a residual call after newlist(length) rewrite"
+    );
+}
+
 /// Print how many bracketed bodies the scalar replacement rewrites, and why it
 /// refuses the rest.  A measurement, not a gate.
 #[test]
@@ -526,8 +740,16 @@ fn shadow_stack_erase_census() {
             eprintln!("[census {name}] {bucket} {}", bodies.len());
         }
         if let Ok(filter) = std::env::var("CENSUS_LIST") {
-            for body in census.get(filter.as_str()).into_iter().flatten() {
-                eprintln!("[census {name}] {filter}: {body}");
+            if filter == "*" {
+                for (bucket, bodies) in &census {
+                    for body in bodies {
+                        eprintln!("[census {name}] {bucket}: {body}");
+                    }
+                }
+            } else {
+                for body in census.get(filter.as_str()).into_iter().flatten() {
+                    eprintln!("[census {name}] {filter}: {body}");
+                }
             }
         }
     }

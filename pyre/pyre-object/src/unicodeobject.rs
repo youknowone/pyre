@@ -1005,14 +1005,14 @@ pub fn interned_size_immortal() -> usize {
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     {
         let table = STRING_INTERN_TABLE.lock();
-        if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
-            return existing;
+        if let Some(InternSlot::Immortal(addr)) = table.get(value) {
+            return *addr as PyObjectRef;
         }
     }
     let obj = w_str_from_wtf8_immortal(value.to_owned());
     let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
-        return existing;
+    if let Some(InternSlot::Immortal(addr)) = table.get(value) {
+        return *addr as PyObjectRef;
     }
     table.insert(value.to_owned(), InternSlot::Immortal(obj as usize));
     obj
@@ -1021,24 +1021,27 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
 /// Resolve a trace constant that aliases a `&Wtf8` / rstr `STR` to the
 /// interned immortal wrapper. Prebuilt STR constants materialize as the
 /// `_utf8` storage pointer (`runtime_fnaddr_patch.rs`
-/// `materialize_prebuilt_str`), so `is_str` is false for those Refs.
+/// `materialize_prebuilt_str`). The intern table is probed first: that
+/// pointer is storage, not a `PyObject`, so `is_str` would read it as
+/// an object header.
 pub fn interned_str_from_const_ptr(ptr: usize) -> Option<PyObjectRef> {
     if ptr == 0 {
         return None;
     }
+    {
+        let table = STRING_INTERN_TABLE.lock();
+        for slot in table.values() {
+            let Some(wrapper) = intern_slot_alive(slot) else {
+                continue;
+            };
+            if unsafe { w_str_storage(wrapper) as usize } == ptr {
+                return Some(wrapper);
+            }
+        }
+    }
     let obj = ptr as PyObjectRef;
     if unsafe { is_str(obj) } {
         return Some(box_str_constant(unsafe { w_str_get_wtf8(obj) }));
-    }
-    let table = STRING_INTERN_TABLE.lock();
-    for slot in table.values() {
-        let InternSlot::Immortal(wrapper) = slot else {
-            continue;
-        };
-        let wrapper = *wrapper as PyObjectRef;
-        if unsafe { w_str_storage(wrapper) as usize } == ptr {
-            return Some(wrapper);
-        }
     }
     None
 }

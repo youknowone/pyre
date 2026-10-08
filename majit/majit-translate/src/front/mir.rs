@@ -4380,8 +4380,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
-    let mut u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
+    let mut u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
     lower_unstructured_with_static_addrs_and_attrs(
@@ -4499,7 +4499,9 @@ fn splice_recorded_fat_dyn_returns(
 #[path = "shadow_stack_erase.rs"]
 mod shadow_stack_erase;
 pub use shadow_stack_erase::census as shadow_stack_erase_census;
-pub use shadow_stack_erase::{discover_stack_sensitive_fns, ensure_stack_sensitive_fns};
+pub use shadow_stack_erase::{
+    discover_depth_neutral_fns, discover_stack_sensitive_fns, ensure_stack_sensitive_fns,
+};
 
 #[path = "owner_root_guard.rs"]
 mod owner_root_guard;
@@ -21515,7 +21517,9 @@ impl<'a> Lowering<'a> {
                         tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)?;
                     root.rsplit("::")
                         .next()
-                        .is_some_and(|leaf| matches!(leaf, "ClassDictStrategy" | "SysState"))
+                        .is_some_and(|leaf| {
+                            matches!(leaf, "ClassDictStrategy" | "SysState" | "TypedItemsBlock")
+                        })
                         .then_some(root)
                 }),
             _ => None,
@@ -26945,6 +26949,28 @@ impl<'a> Lowering<'a> {
         let result_var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        // `*mut TypedItemsBlock` is `GcArray(Signed)` storage. Keep that
+        // ARRAY layout on the call result so `do_fixed_newlist` reads
+        // `op.result.concretetype.TO` instead of the callee's leaf name.
+        if result_narrow_root
+            .as_deref()
+            .is_some_and(|root| root.rsplit("::").next() == Some("TypedItemsBlock"))
+        {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, LowLevelType, Ptr, PtrTarget, Struct,
+            };
+            let items = LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed)));
+            let block = Struct::gc(
+                "TypedItemsBlock",
+                vec![
+                    ("capacity".to_string(), LowLevelType::Unsigned),
+                    ("items".to_string(), items),
+                ],
+            );
+            result_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(block),
+            }))));
+        }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
         // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of

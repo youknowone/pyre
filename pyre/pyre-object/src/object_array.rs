@@ -6,8 +6,9 @@ use crate::pyobject::PyObject;
 use crate::{PY_NULL, PyObjectRef};
 
 /// Host constructor for a 3.14t length cell. Upstream `l.length`
-/// (`rlist.py`) is a plain Signed; minting the atomic word is residual.
-#[majit_macros::dont_look_inside]
+/// (`rlist.py`) is a plain Signed. `AtomicUsize::new` is identity on
+/// the inner usize (`std_identity`), so looking inside records the
+/// field write rather than a residual.
 pub(crate) fn length_cell(n: usize) -> AtomicUsize {
     AtomicUsize::new(n)
 }
@@ -296,6 +297,11 @@ pub extern "C" fn jit_ll_arraymove(
 /// `raw_memcopy`. `false` from the barrier is the per-item `copy_item`
 /// slow path. `rgc.py ll_arraycopy`'s `@jit.oopspec`: a call from an
 /// interpreter body is the `OS_ARRAYCOPY` residual, never a look-inside.
+/// `dont_look_inside_cannot_raise` matches `_canraise` False on that
+/// helper (`call.py`): the `assert!` on negative starts is a native
+/// contract, not a Python exception. Without it the residual is
+/// `CallMayForceR` and a transparent BINARY_SLICE walk declines.
+#[majit_macros::dont_look_inside_cannot_raise]
 #[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub extern "C" fn jit_ll_arraycopy(
     source: crate::PyObjectRef,
