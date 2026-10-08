@@ -5207,6 +5207,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // test admits it and the `Function.code` read below is the same load.
     // One-argument `type(x)` enters `type_descr_call_impl`'s graph
     // (`__majit_wrap_type_query`) instead of the instantiation emit.
+    // Three-argument `type(name, bases, dict)` walks `type_descr_new`
+    // (`descr__new__`); `_create_new_type` is residual because
+    // `look_inside_graph` refuses its loops, so `_check_surrogate` is
+    // not in-trace.
     let type_query = !method_form
         && !bound_method
         && !is_call_kw
@@ -7782,8 +7786,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // does not residualize that callee because an `except: raise` arm
     // exists: the arm is a guard side exit. Refuse the walk only at
     // `scan.poison`, which is that arm. The call inside the `try` stays
-    // on the traced path. A handler that returns keeps the callee
-    // residual, because its dirty ops are outside every reraise arm.
+    // on the traced path. An `except E as e: return` arm is the taken
+    // path when the `try` raises, so `handler_except_as_return_admit`
+    // walks those dirty ops instead of residualizing the callee.
     //
     // A `FOR_ITER` in that callee is the structural abort the branchy gate
     // exists to keep behind the decline: the walk raises, then
@@ -7803,12 +7808,39 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             inline_poison_pcs = Some(scan.poison.clone().into());
         }
     }
+    // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline`
+    // and `JC_DONT_TRACE_HERE`. `perform_call` (`pyjitpl.py`) traces the
+    // taken path, including `except UnicodeEncodeError as e: return`
+    // when `_check_surrogate` raises into classify. That arm is the
+    // recorded path on the reject site, so the walk must enter it —
+    // unlike `except: raise`, whose arm is a guard side exit and stays
+    // in `inline_poison_pcs`. `code_has_for_iter` still residualizes: a
+    // `LoopBearingCalleeInlineUnsupported` inside the handler re-executes
+    // the outer CALL.
+    //
+    // A Dirty happy path with an unrelated `except E: return` could abort
+    // after a mutation and re-execute the outer CALL, so Dirty is admitted
+    // only when poison is confined to returning handlers.
+    let handler_except_as_return_admit = seeded_inline
+        && !branchy_poison_admit
+        && !pyre_interpreter::code_has_for_iter(callee_code)
+        && branchy_handler_scan.as_ref().is_some_and(|scan| {
+            scan.enforceable()
+                && body_has_returning_handler(body.code)
+                && (scan.safety != CalleeReplaySafety::Dirty
+                    || poison_confined_to_returning_handlers(body.code, &scan.poison))
+        });
     if fbw_inline_diag_enabled() {
         if let Some(scan) = branchy_handler_scan.as_ref() {
             eprintln!(
                 "[inline-reraise-admit] pc={} admit={handler_reraise_admit} \
-                 seeded={seeded_inline} safety={:?} poison={:?}",
-                op.pc, scan.safety, scan.poison,
+                 except_as={handler_except_as_return_admit} seeded={seeded_inline} \
+                 safety={:?} poison={:?} confined_return={} has_return={}",
+                op.pc,
+                scan.safety,
+                scan.poison,
+                poison_confined_to_returning_handlers(body.code, &scan.poison),
+                body_has_returning_handler(body.code),
             );
         }
     }
@@ -7817,6 +7849,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         && !branchy_poison_admit
         && !seeded_deferred
         && !handler_reraise_admit
+        && !handler_except_as_return_admit
     {
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {

@@ -6678,7 +6678,7 @@ fn min_max_multiple_args(
 pub fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // The class-definition keywords arrive as a trailing `__pyre_kw__`
     // dict (the builtin kwargs ABI); strip it before the arity check and
-    // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
+    // hand it to __init_subclass__ via `type_create_new_type`.
     let (pos, kwargs) = split_builtin_kwargs(args);
     // `type_new` receives the metatype separately from the tuple parsed by
     // `PyArg_ParseTuple`.  Pyre's flat builtin ABI has to reproduce the
@@ -6701,7 +6701,7 @@ pub fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         )));
     }
 
-    type_descr_new_with_metaclass(arguments_w, w_typetype, kwargs)
+    type_create_new_type(arguments_w, w_typetype, kwargs)
 }
 /// Python 3.14 `type_new`: the inherited slot keeps the defining type's name
 /// in its error, even when invoked through a metaclass subclass.  PyPy 3.11's
@@ -6881,7 +6881,23 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
     ))
 }
 
-fn type_descr_new_with_metaclass(
+/// typeobject.py `_create_new_type`.
+///
+/// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
+/// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
+/// `_create_new_type` has no `@dont_look_inside`; `JitPolicy.look_inside_graph`
+/// residualizes it because the body has loops (`contains_loop` /
+/// `find_backedges`).  `W_TypeObject.__init__` is `@dont_look_inside`.
+/// `#[inline(never)]` keeps the helper a separate graph so rustc does not
+/// fold it into `type_descr_new`.
+///
+/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
+/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
+/// out) so the heap slot is already current.  A hand-placed
+/// `jit_force_virtualizable` here aborted compiles that create a type
+/// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
+#[inline(never)]
+fn type_create_new_type(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
     kwargs: Option<PyObjectRef>,
@@ -7107,10 +7123,9 @@ fn type_descr_new_with_metaclass(
                 unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, name) };
             }
         }
-        // typeobject.py:ensure_common_attributes / ensure_module_attr.  Direct
-        // three-argument type() calls do not pass through __build_class__, so
-        // fill __module__ from the live caller frame when the namespace did
-        // not supply it.
+        // typeobject.py ensure_module_attr.  Direct three-argument type()
+        // calls do not pass through __build_class__, so fill __module__ from
+        // the live caller frame when the namespace did not supply it.
         //
         // `ensure_module_attr` reaches the caller through
         // `getexecutioncontext().gettopframe_nohidden()`, so read it that way

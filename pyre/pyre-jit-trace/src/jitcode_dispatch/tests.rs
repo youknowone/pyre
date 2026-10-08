@@ -1615,6 +1615,63 @@ fn inline_caller_frame_declines_only_a_returning_handler() {
     );
 }
 
+#[test]
+fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let catch_exception = insns["catch_exception/L"];
+    let void_return = insns["void_return/"];
+    let reraise = insns["reraise/"];
+    let int_copy = insns["int_copy/i>i"];
+    // Happy path: copy then catch fall-through return. Handler at pc=7.
+    let returns_body = [
+        int_copy,
+        0,
+        1,
+        catch_exception,
+        7,
+        0,
+        void_return,
+        int_copy,
+        0,
+        1,
+        void_return,
+    ];
+    assert!(poison_confined_to_returning_handlers(&returns_body, &[7]));
+    assert!(!poison_confined_to_reraise_handlers(&returns_body, &[7]));
+    assert!(!poison_confined_to_returning_handlers(&returns_body, &[]));
+    assert!(!poison_confined_to_returning_handlers(&returns_body, &[0]));
+    assert!(body_has_returning_handler(&returns_body));
+
+    let reraise_body = [int_copy, 0, 1, catch_exception, 7, 0, void_return, reraise];
+    assert!(poison_confined_to_reraise_handlers(&reraise_body, &[7]));
+    assert!(!poison_confined_to_returning_handlers(&reraise_body, &[7]));
+    assert!(!body_has_returning_handler(&reraise_body));
+
+    // Mixed return/reraise: goto_if_not from the handler to void_return,
+    // fall-through reraise. Classify as Unproven so except-as-return
+    // admit does not walk it without `inline_poison_pcs`.
+    let goto_if_not = insns["goto_if_not/iL"];
+    let mixed_body = [
+        int_copy,
+        0,
+        1,
+        catch_exception,
+        7,
+        0,
+        void_return,
+        goto_if_not,
+        0,
+        12,
+        0,
+        reraise,
+        void_return,
+    ];
+    assert_eq!(exc_handler_shape(&mixed_body, 7), ExcHandlerShape::Unproven);
+    assert!(!body_has_returning_handler(&mixed_body));
+    assert!(!poison_confined_to_returning_handlers(&mixed_body, &[7]));
+    assert!(!poison_confined_to_reraise_handlers(&mixed_body, &[7]));
+}
+
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard
