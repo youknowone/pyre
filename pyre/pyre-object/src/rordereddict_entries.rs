@@ -202,6 +202,12 @@ fn entries_payload_bytes<K, V>(n: usize) -> usize {
 ///
 /// `n == 0` is the empty array, represented by null (an empty `RDict` holds
 /// no array until the first insert).
+///
+/// Upstream's `lltype.malloc` is young. The block stays non-moving because
+/// mutator code hands out `&K` / `&V` into the array (`external_malloc`
+/// `alloc_young=True`). An old-gen `DICTENTRYARRAY` that holds a heap
+/// type's `__dict__` / `__weakref__` GetSet copies (`w_objclass`) enters
+/// the remembered set and promotes the type on every minor.
 pub fn alloc_entries<K, V>(n: usize) -> *mut GcEntries<K, V>
 where
     (K, V): GcEntriesType,

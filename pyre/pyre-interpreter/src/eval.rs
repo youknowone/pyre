@@ -1700,10 +1700,15 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // interp_posix.ApplevelForkCallbacks is another object-space cache.
         #[cfg(not(target_arch = "wasm32"))]
         crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);
-        // `space.sys.modules` and its authoritative dictionary belong to the
-        // process/interpreter import state.  Keep them in the global
-        // non-stack-root walk so incminimark's end-of-marking rescan sees
-        // modules and bindings installed after the initial root snapshot.
+        // `space.sys.modules`, `w_default_importlib_import`, and
+        // `space.builtin_modules` are process-owned prebuilt slots
+        // (`SysModuleState` / `space`). Mutator stores into them take
+        // `mark_prebuilt_roots_dirty`
+        // (`incminimark.py remember_young_pointer_from_prebuilt`); this
+        // gated walk is the `prebuilt_root_objects` scan. Interior
+        // immortal-module cell words live here too, so a major's
+        // end-of-marking rescan still sees modules installed after the
+        // initial root snapshot.
         crate::importing::walk_process_import_roots(&mut forward);
     }
     if is_minor {

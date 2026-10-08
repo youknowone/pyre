@@ -1533,49 +1533,55 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             .collect()
     }
 
-    /// `celldict.py copy` — produce a fresh W_DictObject that
-    /// owns unwrapped cell values keyed by str objects.
+    /// `celldict.py ModuleDictStrategy.copy` — a fresh `W_DictObject`
+    /// on `UnicodeDictStrategy` filled from unwrapped cells.
     ///
-    /// The destination is born on `UnicodeDictStrategy` over that
-    /// strategy's own empty storage, matching `:208-209`'s
-    /// `fromcache(UnicodeDictStrategy)` / `get_empty_storage()` pair rather
-    /// than starting the copy on the object strategy.  Every key below is a
+    /// `fromcache(UnicodeDictStrategy)` / `get_empty_storage()`, then
+    /// `str_dict[newtext(key)] = unwrap_cell(cell)`. Every key is a
     /// str, so the fill stays on the strategy it was born with.
     ///
-    /// A dict that has already promoted to object storage takes the
-    /// `AbstractTypedStrategy.copy` route instead — upstream leaves
-    /// `ModuleDictStrategy` when it switches, so that is the `copy` it
-    /// reaches.  Cloning the backing keeps each key's cached hash, where a
-    /// re-store would call `__hash__` again and drop the entry (silently,
-    /// this being an infallible surface) once the key's hash started raising.
+    /// `switch_to_object_strategy` replaces `mstrategy` with
+    /// `ObjectDictStrategy`, so this method is not reached after the
+    /// switch; that state copies through `AbstractTypedStrategy.copy`.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-            let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-                entries.clone(),
-                crate::dictmultiobject::object_dict_storage_gc_type_id(),
-            );
-            return crate::dictmultiobject::w_dict_new_with(
-                &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF,
-                new_storage as *mut u8,
-            );
-        }
-        let strategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
-        let new_dict =
-            crate::dictmultiobject::w_dict_new_with(strategy, strategy.get_empty_storage());
-        let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
-        for (key, &cell) in storage.entries.iter() {
-            let unwrapped = unwrap_cell(cell);
-            // An empty cell names nothing — `getitem_str` reads a null unwrap
-            // as absence — so it does not become a null-valued entry of the
-            // ordinary dict this hands back.
-            if unwrapped.is_null() {
-                continue;
+        let roots = crate::gc_roots::push_roots();
+        let dict_slot = roots.pin_roots(&[w_dict]);
+        // Snapshot names and unwrapped values while the source is pinned and
+        // nothing collects, then publish the values before minting the dest.
+        // `_wrapkey` / `w_dict_store` collect; the dest is a moving nursery
+        // `W_Dict` (`w_dict_new_with`), so each store reloads it.
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        {
+            let storage =
+                crate::dictmultiobject::w_module_dict_module_storage(roots.get(dict_slot));
+            for (key, &cell) in storage.entries.iter() {
+                let unwrapped = unwrap_cell(cell);
+                // An empty cell names nothing — `getitem_str` reads a null unwrap
+                // as absence — so it does not become a null-valued entry of the
+                // ordinary dict this hands back.
+                if unwrapped.is_null() {
+                    continue;
+                }
+                keys.push(key.as_str().to_owned());
+                values.push(unwrapped);
             }
-            let key_obj = _wrapkey(key.as_str());
-            crate::dictmultiobject::w_dict_store(new_dict, key_obj, unwrapped);
         }
-        new_dict
+        let values_base = roots.pin_roots(&values);
+        let strategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+        let new_slot = roots.publish(&[crate::dictmultiobject::w_dict_new_with(
+            strategy,
+            strategy.get_empty_storage(),
+        )]);
+        for (i, key) in keys.iter().enumerate() {
+            let key_slot = roots.pin_roots(&[_wrapkey(key)]);
+            crate::dictmultiobject::w_dict_store(
+                roots.get(new_slot),
+                roots.get(key_slot),
+                roots.get(values_base + i),
+            );
+        }
+        roots.get(new_slot)
     }
 }
 

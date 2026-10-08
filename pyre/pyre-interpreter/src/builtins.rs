@@ -10518,7 +10518,14 @@ pub fn new_exception_class(
 /// it is what `getweakref` / `setweakref` read.
 fn add_weakref_slot(cls: PyObjectRef, base: PyObjectRef) {
     if !unsafe { pyre_object::w_type_get_weakrefable(base) } {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let save = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        let cls = pyre_object::gc_roots::shadow_stack_get(save);
+        let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
         crate::type_dict_store(cls, "__weakref__", descr);
     }
     unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
@@ -12323,7 +12330,14 @@ fn make_exception_group_type(
         // carrying none of the heap-type flag bits. Its instances still take
         // the ordinary weakref slot; pyre constructs the type directly, so
         // install the copied descriptor and flag explicitly.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let save = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        let cls = pyre_object::gc_roots::shadow_stack_get(save);
+        let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
         crate::type_dict_store(cls, "__weakref__", descr);
         unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
     }

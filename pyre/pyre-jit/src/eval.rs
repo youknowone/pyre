@@ -546,9 +546,10 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///   * the managed namespace object for heap types, or the off-GC
 ///     `DictStorage` values for static builtin types.
 ///
-/// Heap types are stable old-gen GC objects, so this trace keeps their owned
-/// GC edges live and forwards their slots.  The separate builtin-type walk
-/// covers Box-immortal builtin types, whose custom trace never fires.
+/// Heap types are GC-managed (`w_type_new` / young-nonmoving
+/// `malloc_fixedsize`), so this trace keeps their owned GC edges live and
+/// forwards their slots.  The separate builtin-type walk covers Box-immortal
+/// builtin types, whose custom trace never fires.
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);

@@ -2706,6 +2706,7 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
         if std::ptr::eq(bound, pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
             continue;
         }
+        let bound = pyre_object::gc_roots::pin_root(bound);
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
         if let Some(text) = pyre_object::w_str_get_value_opt(key) {
@@ -2823,7 +2824,7 @@ pub(crate) fn init_builtin_typeobject(
 fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::w_dict_new();
+    let ns = pyre_object::w_dict_new_nonmoving();
     let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
     // `object`'s own methods are descriptors of `object` just like every other
@@ -3307,7 +3308,7 @@ fn new_typeobject_with_metatype_and_layout(
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::w_dict_new();
+    let ns = pyre_object::w_dict_new_nonmoving();
     let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
     // `type_ready_set_dict` — a type whose `tp_name` is qualified publishes the
@@ -3484,7 +3485,7 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     let base = bases[0];
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let ns = pyre_object::w_dict_new();
+    let ns = pyre_object::w_dict_new_nonmoving();
     let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
     let bases_tuple = w_tuple_new(bases.to_vec());
@@ -12949,94 +12950,92 @@ fn patch_getset_descriptor_metadata() {
     //     qualname = "%s.%s" % (type_qualname, self.name)
     //     return space.newtext(qualname)
     // ```
-    crate::type_dict_store(
-        tp,
-        "__qualname__",
-        copy_for_type(
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "__qualname__",
-                    |args| {
-                        let mut descr = args[1];
-                        if descr.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        unsafe {
-                            let cached = pyre_object::typedef::w_getset_get_qualname(descr);
-                            if !cached.is_null() {
-                                return Ok(cached);
-                            }
-                            // typedef.py _calculate_qualname:
-                            //   if self.reqcls is None: type_qualname = '?'
-                            //   else:
-                            //       w_type = space.gettypeobject(self.reqcls.typedef)
-                            //       type_qualname = space.text_w(
-                            //           space.getattr(w_type, space.newtext('__qualname__')))
-                            //
-                            // PyPy reads the bound class's `__qualname__`
-                            // (which respects nested-class scoping and any
-                            // explicit `__qualname__` assignment in the class
-                            // body), NOT the bare `__name__`.  Pyre's
-                            // `getattr(w_type, '__qualname__')` resolves
-                            // through the type-side __qualname__ getset that
-                            // already mirrors PyPy's lookup-then-fallback
-                            // chain (`baseobjspace.rs`).
-                            // PyPy's original only consults `reqcls`. During type
-                            // materialisation `copy_for_type` deliberately leaves
-                            // reqcls null and records the concrete owner in
-                            // `w_objclass`; CPython 3.14 uses that owner for both
-                            // __objclass__ and __qualname__, so prefer it here.
-                            let owner = getset_descriptor_owner(descr);
-                            let type_qualname = if owner.is_null() {
-                                "?".to_string()
-                            } else {
-                                descriptor_owner_qualname(owner)
-                            };
-                            let name_obj = pyre_object::typedef::w_getset_get_name(descr);
-                            let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
-                                pyre_object::with_roots!(descr => crate::baseobjspace::str_utf8_w(name_obj))?.to_string()
-                            } else {
-                                "<generic property>".to_string()
-                            };
-                            let combined =
-                                pyre_object::w_str_new_managed(&format!("{type_qualname}.{name}"));
-                            pyre_object::typedef::w_getset_set_qualname(descr, combined);
-                            Ok(combined)
-                        }
-                    },
-                    2,
-                ),
+    let _roots = pyre_object::gc_roots::push_roots();
+    let tp = pyre_object::gc_roots::pin_root(tp);
+    let descr = copy_for_type(
+        make_getset_descriptor_named(
+            make_builtin_function_with_arity(
                 "__qualname__",
+                |args| {
+                    let mut descr = args[1];
+                    if descr.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    unsafe {
+                        let cached = pyre_object::typedef::w_getset_get_qualname(descr);
+                        if !cached.is_null() {
+                            return Ok(cached);
+                        }
+                        // typedef.py _calculate_qualname:
+                        //   if self.reqcls is None: type_qualname = '?'
+                        //   else:
+                        //       w_type = space.gettypeobject(self.reqcls.typedef)
+                        //       type_qualname = space.text_w(
+                        //           space.getattr(w_type, space.newtext('__qualname__')))
+                        //
+                        // PyPy reads the bound class's `__qualname__`
+                        // (which respects nested-class scoping and any
+                        // explicit `__qualname__` assignment in the class
+                        // body), NOT the bare `__name__`.  Pyre's
+                        // `getattr(w_type, '__qualname__')` resolves
+                        // through the type-side __qualname__ getset that
+                        // already mirrors PyPy's lookup-then-fallback
+                        // chain (`baseobjspace.rs`).
+                        // PyPy's original only consults `reqcls`. During type
+                        // materialisation `copy_for_type` deliberately leaves
+                        // reqcls null and records the concrete owner in
+                        // `w_objclass`; CPython 3.14 uses that owner for both
+                        // __objclass__ and __qualname__, so prefer it here.
+                        let owner = getset_descriptor_owner(descr);
+                        let type_qualname = if owner.is_null() {
+                            "?".to_string()
+                        } else {
+                            descriptor_owner_qualname(owner)
+                        };
+                        let name_obj = pyre_object::typedef::w_getset_get_name(descr);
+                        let name = if !name_obj.is_null() && pyre_object::is_str(name_obj) {
+                            pyre_object::with_roots!(descr => crate::baseobjspace::str_utf8_w(name_obj))?.to_string()
+                        } else {
+                            "<generic property>".to_string()
+                        };
+                        let combined =
+                            pyre_object::w_str_new_managed(&format!("{type_qualname}.{name}"));
+                        pyre_object::typedef::w_getset_set_qualname(descr, combined);
+                        Ok(combined)
+                    }
+                },
+                2,
             ),
-            tp,
+            "__qualname__",
         ),
-    );
-    // typedef.py __doc__ = interp_attrproperty('doc', ...)
-    crate::type_dict_store(
         tp,
-        "__doc__",
-        copy_for_type(
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "__doc__",
-                    |args| {
-                        let descr = args[1];
-                        if descr.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
-                        if doc.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        Ok(doc)
-                    },
-                    2,
-                ),
-                "__doc__",
-            ),
-            tp,
-        ),
     );
+    let descr = pyre_object::gc_roots::pin_root(descr);
+    crate::type_dict_store(tp, "__qualname__", descr);
+    // typedef.py __doc__ = interp_attrproperty('doc', ...)
+    let descr = copy_for_type(
+        make_getset_descriptor_named(
+            make_builtin_function_with_arity(
+                "__doc__",
+                |args| {
+                    let descr = args[1];
+                    if descr.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    let doc = unsafe { pyre_object::typedef::w_getset_get_doc(descr) };
+                    if doc.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    Ok(doc)
+                },
+                2,
+            ),
+            "__doc__",
+        ),
+        tp,
+    );
+    let descr = pyre_object::gc_roots::pin_root(descr);
+    crate::type_dict_store(tp, "__doc__", descr);
 }
 
 #[inline]

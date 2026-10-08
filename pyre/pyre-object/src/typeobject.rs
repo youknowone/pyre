@@ -580,8 +580,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
     // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
     // snapshot tools) keeps a `malloc_raw` name that an immortal holder can never
-    // grey — the non-collecting old-gen alloc above cannot sweep this box before
-    // it is stored into the type below.
+    // grey.
     let name_value = name.to_string();
     let (name, qualname) = if raw.is_null() {
         (
@@ -666,9 +665,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         (crate::lltype::malloc_typed(value) as PyObjectRef, false)
     };
     if gc_managed {
-        // Old-gen header; `bases` / name boxes may still be young.
-        // Remember the type so the next minor scans it and
-        // `type_object_custom_trace` forwards those children.
+        // Young-nonmoving header ignores the barrier (no TRACK_YOUNG_PTRS);
+        // the old-gen fallback (no young hook) still needs it so `bases` /
+        // name boxes that are young get forwarded.
         crate::gc_hook::try_gc_write_barrier(w_type as *mut u8);
     } else {
         // Immortal fallback type (pre-GC): its trace never fires, so root its
