@@ -96,10 +96,11 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`) for
     // the allocation below. `w_type` is a `W_TypeObject`
     // (`pyre-object::typeobject` GC type id 33) — user-defined types
-    // are stable old-gen GC objects, so the pinned typeptr remains a live,
-    // non-moving GC reference across the instance allocation. The
-    // `is_in_nursery` filter in the walker (`majit-gc/src/collector.rs`)
-    // keeps the built-in static `PyType` case (e.g. `INT_TYPE`) untouched.
+    // are young-nonmoving GC objects (`external_malloc(..., alloc_young=True)`),
+    // so the pinned typeptr remains a live, non-moving GC reference across
+    // the instance allocation. The `is_in_nursery` filter in the walker
+    // (`majit-gc/src/collector.rs`) keeps the built-in static `PyType` case
+    // (e.g. `INT_TYPE`) untouched.
     let _roots = crate::gc_roots::push_roots();
     let w_type = crate::gc_roots::pin_root(w_type);
     let obj = alloc_instance_object(w_type);
