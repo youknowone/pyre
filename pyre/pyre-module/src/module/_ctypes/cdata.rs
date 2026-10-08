@@ -830,16 +830,18 @@ pub(super) fn new_simplecdata_obj(
 }
 
 pub(super) fn new_cdata_obj_from_bytes(
-    cls: PyObjectRef,
+    mut cls: PyObjectRef,
     size: usize,
     bytes: &[u8],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // Until the store below links them, the bytearray and the instance are
-    // reachable only from this frame, and `w_instance_new`, `getdict_native`
-    // and the store each allocate.  The instance does not move, so its pin only
-    // keeps it live; the bytearray is a nursery object, so it is filled before
-    // anything else allocates and read back from its pin at the store.
-    let ba = pyre_object::w_bytearray_new(size);
+    // reachable only from this frame, and `w_bytearray_new`, `w_instance_new`,
+    // `getdict_native` and the store each allocate.  `w_bytearray_new` can
+    // collect, so `cls` is rooted across it.  The instance does not move, so
+    // its pin only keeps it live; the bytearray is a nursery object, so it is
+    // filled before anything else allocates and read back from its pin at the
+    // store.
+    let ba = pyre_object::with_roots!(cls => pyre_object::w_bytearray_new(size));
     unsafe {
         let n = bytes.len().min(size);
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
@@ -2138,8 +2140,8 @@ pub(super) fn encode_value(
 /// `_objects_`; every other case defers to [`encode_value`].
 pub(super) fn encode_value_into(
     tc: &str,
-    value: PyObjectRef,
-    dest: PyObjectRef,
+    mut value: PyObjectRef,
+    mut dest: PyObjectRef,
     key: &str,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
@@ -2165,8 +2167,9 @@ pub(super) fn encode_value_into(
     }
     if tc == "Z" && unsafe { pyre_object::is_str(value) } {
         let raw = unsafe { pyre_object::w_str_get_wtf8(value) };
+        let wide = host_ctypes::clone_wchar_null_terminated(raw);
         let copy =
-            pyre_object::w_bytearray_from_bytes(&host_ctypes::clone_wchar_null_terminated(raw));
+            pyre_object::with_roots!(dest, value => pyre_object::w_bytearray_from_bytes(&wide));
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[copy, dest]);
         keep_ref(roots.get(base + 1), key, value);

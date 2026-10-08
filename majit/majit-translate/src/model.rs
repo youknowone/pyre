@@ -7754,26 +7754,20 @@ pub struct FunctionGraph {
     /// carrier directly. Empty for graphs with no hints (the common case
     /// and all `FunctionGraph::new` fixtures).
     pub hints: Vec<String>,
-    /// RPython `graph.access_directly`, on the graph for the same reason
-    /// `hints` is: `policy.py look_inside_graph` reads it off the graph, and
-    /// the codewriter's BFS reaches a callee as a `FunctionGraph` and
-    /// synthesizes the `SemanticFunction` around it, so a field anywhere else
-    /// cannot travel to the gate.
-    ///
-    /// Upstream writes it at exactly one place, `specialize.py
-    /// default_specialize`, for a graph whose ARGUMENT annotation arrived
-    /// carrying the flag that the `hint` ExtRegistryEntry in `rlib/jit.py`
-    /// mints on `SomeInstance.flags`. That is ported on the annotator's
-    /// `PyGraph::access_directly`; the prepass annotator runs after
-    /// `find_all_graphs`, so its flag is checked by
-    /// `cutover::check_access_directly_sanity` and nothing sets this field
-    /// before the policy reads it.
+    /// RPython `graph.access_directly`. `specialize.py default_specialize`
+    /// writes it on the `(AccessDirect, key)` graph. Pyre keeps one
+    /// `FunctionGraph` for both specializations, so `find_all_graphs` stamps
+    /// this field when its BFS reaches the AccessDirect specialization, right
+    /// before `look_inside_graph` reads it. An AccessDirect graph the final
+    /// call graph never reaches is never stamped.
     pub access_directly: bool,
-    /// Start-block input ids that arrived already carrying
-    /// `access_directly`. `default_specialize` binds the flagged actual
-    /// onto that formal, and `hint_fresh_virtualizable` copies the flag
-    /// from it. Empty until a caller passes a hinted actual.
-    pub access_directly_inputs: Vec<u64>,
+    /// Formals of the AccessDirect specialization whose binding still carries
+    /// the flag. `None` means that specialization was never bound
+    /// (`default_specialize` never built the `(AccessDirect, key)` graph /
+    /// `bindinputargs` never ran on its startblock). `Some(ids)` is the
+    /// startblock binding after the annotator fixpoint (`bindinputargs` then
+    /// `mergeinputargs` / `unionof`); ids only ever shrink.
+    pub access_directly_inputs: Option<Vec<u64>>,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
     /// (all unset) for `FunctionGraph::new` fixtures; production
@@ -7886,16 +7880,16 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_is_str: graph.return_is_str,
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
-        access_directly_inputs: graph
-            .access_directly_inputs
-            .iter()
-            .filter_map(|id| {
-                varmap
-                    .iter()
-                    .find(|(var, _)| var.id() == *id)
-                    .map(|(_, copied)| copied.id())
-            })
-            .collect(),
+        access_directly_inputs: graph.access_directly_inputs.as_ref().map(|ids| {
+            ids.iter()
+                .filter_map(|id| {
+                    varmap
+                        .iter()
+                        .find(|(var, _)| var.id() == *id)
+                        .map(|(_, copied)| copied.id())
+                })
+                .collect()
+        }),
         func: graph.func.clone(),
     }
 }
@@ -7966,7 +7960,7 @@ impl FunctionGraph {
             fun_decl_id: None,
             hints: Vec::new(),
             access_directly: false,
-            access_directly_inputs: Vec::new(),
+            access_directly_inputs: None,
             func: FuncEffects::default(),
         }
     }

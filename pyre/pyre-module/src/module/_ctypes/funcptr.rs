@@ -919,10 +919,13 @@ fn wrap_pointer_result(
     // The instance dict moves, and the bytearray allocated below is a
     // collection point, so the dict word is read back out of a root slot at the
     // store.  The null check stays ahead of the bracket, leaving the error path
-    // rootless.
+    // rootless.  The instance is rooted here too because nothing else
+    // references it until it is returned.
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(d);
+    let obj_slot = dict_slot + 1;
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let psize = host_ctypes::pointer_size();
     let ba = pyre_object::w_bytearray_new(psize);
     let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
@@ -939,7 +942,7 @@ fn wrap_pointer_result(
             ba,
         );
     }
-    Ok(obj)
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 /// The `_argtypes_` sequence as a Vec, or `None` when unset (ConvParam
@@ -2550,13 +2553,13 @@ fn marshal_aggregate_arg(
 /// Create a fresh instance of aggregate type `ty` whose owned buffer holds the
 /// returned `bytes`.
 fn make_aggregate_instance(
-    ty: PyObjectRef,
+    mut ty: PyObjectRef,
     bytes: &[u8],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let size = stginfo::stginfo_of(ty)
         .map(stginfo::stginfo_size)
         .unwrap_or(bytes.len());
-    let mut ba = pyre_object::w_bytearray_new(size);
+    let mut ba = pyre_object::with_roots!(ty => pyre_object::w_bytearray_new(size));
     let n = bytes.len().min(size);
     unsafe {
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
