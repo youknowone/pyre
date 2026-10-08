@@ -327,9 +327,17 @@ pub(crate) fn register_struct_fields_with_layout(
                 // field's type, not the generic `ValueType` of `T`.
                 // Seeding Unsigned from the type parameter made
                 // `Option<i64>::Some.__pos_0` disagree with the annotator.
+                // A fieldless enum is Int-colored (`tyref_to_value_type`)
+                // even when its discriminant layout is `u8`; seeding
+                // Unsigned from that layout makes `eq` of the field
+                // against a by-value enum param fail as mixed signedness.
                 if let Some(s_value) = someshell_from_primitive_layout(ty) {
-                    entry.insert(name.clone(), s_value);
-                    continue;
+                    let keep_signed_int = matches!(vt, crate::model::ValueType::Int)
+                        && matches!(&s_value, SomeValue::Integer(i) if i.unsigned);
+                    if !keep_signed_int {
+                        entry.insert(name.clone(), s_value);
+                        continue;
+                    }
                 }
             }
             let Some(s_value) = crate::codewriter::annotation_state::valuetype_to_someshell(vt)
@@ -4159,6 +4167,48 @@ mod tests {
         assert!(b.contains_key("valuestackdepth"));
         // No lossy bare-leaf alias is registered.
         assert!(forced_attributes_for("FrameBlock").is_none());
+    }
+
+    #[test]
+    fn fieldless_enum_u8_layout_keeps_signed_int_force() {
+        use crate::annotator::model::SomeValue;
+        use crate::model::ValueType;
+        register_struct_fields_with_layout(
+            "DictStrategyRef",
+            &[("kind".to_string(), ValueType::Int)],
+            Some(&[("kind".to_string(), "u8".to_string())]),
+        );
+        let attrs =
+            forced_attributes_for("DictStrategyRef").expect("DictStrategyRef FORCE entry present");
+        match attrs.get("kind") {
+            Some(SomeValue::Integer(i)) => assert!(
+                !i.unsigned,
+                "u8 discriminant layout of an Int-colored fieldless enum \
+                 stays signed, got unsigned={}",
+                i.unsigned
+            ),
+            other => panic!("expected signed Integer FORCE for kind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instantiated_i64_layout_overrides_unsigned_valuetype() {
+        use crate::annotator::model::SomeValue;
+        use crate::model::ValueType;
+        register_struct_fields_with_layout(
+            "OptionSomeI64",
+            &[("__pos_0".to_string(), ValueType::Unsigned)],
+            Some(&[("__pos_0".to_string(), "i64".to_string())]),
+        );
+        let attrs =
+            forced_attributes_for("OptionSomeI64").expect("OptionSomeI64 FORCE entry present");
+        match attrs.get("__pos_0") {
+            Some(SomeValue::Integer(i)) => assert!(
+                !i.unsigned,
+                "i64 layout of a generic Unsigned param becomes signed"
+            ),
+            other => panic!("expected signed Integer FORCE for __pos_0, got {other:?}"),
+        }
     }
 
     #[test]
