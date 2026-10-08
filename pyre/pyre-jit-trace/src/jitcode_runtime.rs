@@ -1655,34 +1655,23 @@ fn register_synthetic_struct_tids() {
 /// Deferring pass 2 or pass 3 therefore buys an unmeasured amount of memory
 /// against a silent optimizer downgrade that surfaces only as
 /// `descr_set_absent` rising off zero.
-/// Type id of each packed parent, in `descr_layouts.bin` order.
-fn packed_layout_type_ids() -> &'static [u64] {
-    static IDS: OnceLock<Box<[u64]>> = OnceLock::new();
-    IDS.get_or_init(|| {
-        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
-        let mut ids = Vec::new();
-        let mut rest = BYTES;
-        while !rest.is_empty() {
-            let (type_id, _) = majit_jitcode::jitcode::BhSizeSpec::peek_header(rest);
-            ids.push(type_id);
-            let consumed = majit_jitcode::jitcode::BhSizeSpec::skip_record(rest);
-            rest = &rest[consumed..];
-        }
-        ids.into_boxed_slice()
-    })
+/// Type id of the packed parent at `index` in `descr_layouts.bin`.
+fn descr_layout_type_id(index: usize) -> u64 {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let start = descr_layout_offsets()[index] as usize;
+    majit_jitcode::jitcode::BhSizeSpec::peek_header(&BYTES[start..]).0
 }
 
 /// `descr.py` `get_field_descr`: mint the opcode Field into
 /// `_cache_field[STRUCT][fieldname]` with `parent_descr = get_size_descr`.
 /// Packed parent `all_fielddescrs` already holds `heaptracker.all_fielddescrs`.
 fn publish_kind0_field(struct_id: u64, field_name: &str) {
-    let layouts = packed_layout_type_ids();
     let index = descrs_index();
     for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
         if index.kinds[slot] != 0 || layout_index == u32::MAX {
             continue;
         }
-        if layouts.get(layout_index as usize).copied() != Some(struct_id) {
+        if descr_layout_type_id(layout_index as usize) != struct_id {
             continue;
         }
         let bh = load_descr_with_parent(slot, descr_layout_at);
