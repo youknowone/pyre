@@ -78,15 +78,21 @@ impl Drop for ListGuard {
     }
 }
 
-/// Keep the ownership bracket opaque until generated Drop and helper-frame
-/// forward resume both preserve its release. In particular, a guard inside
-/// this bracket must not resume at the enclosing Python subscription and
-/// acquire again. The scalar acquire/release ABI below is necessary but is
-/// not, by itself, permission to admit this body into tracing.
-#[majit_macros::dont_look_inside]
+/// PyPy runs every list operation under the GIL, so no trace of a list
+/// operation carries a lock.  Compiled code keeps that shape: under
+/// `we_are_jitted()` the guard holds the zero word and its release does
+/// nothing, so a traced body records no lock call and a list the trace
+/// allocated stays virtual across it.  The blackhole resumes such a body
+/// with the zero word too, and runs a call it reaches through the call's
+/// host address, which acquires and releases as the interpreter does.
 pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
+    let lock = if majit_rlib::jit::we_are_jitted() {
+        0
+    } else {
+        w_list_lock_acquire(obj)
+    };
     ListGuard {
-        lock: w_list_lock_acquire(obj),
+        lock,
         not_send: std::marker::PhantomData,
     }
 }
@@ -159,8 +165,22 @@ fn acquire_list_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> u
 ///
 /// # Safety
 /// `lock` must be an unreleased handle from w_list_lock_acquire on this thread.
-#[majit_macros::dont_look_inside_cannot_raise]
+///
+/// The zero word is the guard [`w_list_lock`] hands compiled code; it
+/// releases nothing.
 pub unsafe fn w_list_lock_release(lock: usize) {
+    if lock != 0 {
+        unsafe { w_list_lock_release_held(lock) };
+    }
+}
+
+/// [`w_list_lock_release`] of an acquired handle.
+///
+/// # Safety
+/// `lock` must be an unreleased, nonzero handle from w_list_lock_acquire on
+/// this thread.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub unsafe fn w_list_lock_release_held(lock: usize) {
     unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
 }
 

@@ -6490,6 +6490,8 @@ mod inline_call_targets {
     pub const NOT: &str = "pyre_interpreter::baseobjspace::not_";
     /// IS_OP — `lower_compare_op_hlop_to_insn`.
     pub const IS_OP: &str = "pyre_interpreter::runtime_ops::is_op";
+    /// LIST_EXTEND — `lower_list_extend_hlop_to_insn`.
+    pub const LIST_EXTEND: &str = "pyre_interpreter::opcode_ops::list_extend_value";
     /// FORMAT_SIMPLE — `lower_format_simple_hlop_to_insn`.
     pub const FORMAT_SIMPLE_W: &str = "pyre_interpreter::type_methods::format_simple_w";
     /// CONVERT_VALUE — `lower_convert_value_hlop_to_insn`.
@@ -7434,8 +7436,9 @@ where
 
 /// Lower the LIST_EXTEND pyre HLOp `list_extend(list, iterable)` → void
 /// — the same two-Ref void shape as [`lower_delsubscr_hlop_to_insn`] — to
-/// `residual_call_r_v(ConstInt(list_extend_fn_idx), ListR([list,
-/// iterable]), Descr)`.  `bh_list_extend_fn(list, iterable)` runs
+/// `inline_call_r_v` of `opcode_ops::list_extend_value` when this build
+/// binds that body fully, else `residual_call_r_v(ConstInt(list_extend_fn_idx),
+/// ListR([list, iterable]), Descr)`.  `bh_list_extend_fn(list, iterable)` runs
 /// `opcode_ops::list_extend_value` (the same code the interpreter's
 /// `list_extend` runs); iterating an arbitrary iterable may invoke user
 /// `__iter__`/`__next__` → `MayForce`.
@@ -7463,6 +7466,13 @@ where
     }
     let list_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let iterable_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    // pyopcode.py LIST_EXTEND → `space.call_method(v, 'extend', w)`.
+    if let Some(insn) = build_orthodox_inline_call_r_v(
+        inline_call_targets::LIST_EXTEND,
+        vec![list_operand.clone(), iterable_operand.clone()],
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.list_extend_fn_idx,
         vec![list_operand, iterable_operand],
