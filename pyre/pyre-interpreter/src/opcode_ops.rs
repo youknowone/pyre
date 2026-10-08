@@ -1287,6 +1287,17 @@ pub extern "C" fn jit_baseobjspace_delitem(obj: PyObjectRef, key: PyObjectRef) -
 }
 
 #[inline(never)]
+pub extern "C" fn jit_opcode_ops_list_extend_value(
+    list: PyObjectRef,
+    iterable: PyObjectRef,
+) -> i64 {
+    match list_extend_value(list, iterable) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
 pub extern "C" fn jit_type_methods_format_simple_w(value: PyObjectRef) -> PyObjectRef {
     match crate::type_methods::format_simple_w(value) {
         Ok(result) => result,

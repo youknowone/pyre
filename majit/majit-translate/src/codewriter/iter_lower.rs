@@ -45,6 +45,20 @@ use crate::runtime_names::shims::{ENUMERATE, RANGE};
 /// Scalarise every lowerable iterator site in `graph`, one at a time —
 /// each rewrite invalidates the link classes the next site is judged by.
 pub fn lower_iterators(graph: &mut FunctionGraph) {
+    // The rtyper's `rtype_next` meets SSI graphs, where every block of a
+    // loop carries the iterator it steps through its inputargs.  The front
+    // emits global SSA instead: a block inside the loop body passes the
+    // constructor's iterator straight back to the loop head.  Thread it
+    // first (`ssa.py SSA_to_SSI`) so those blocks are loop members.
+    let has_site = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| is_slice_iter_call(&op.kind))
+    });
+    if has_site {
+        crate::model_ssa::ssa_to_ssi(graph);
+    }
     // More sites than any real graph carries; a backstop, not a budget.
     for _ in 0..64 {
         if !lower_one_site(graph) {

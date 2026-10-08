@@ -663,17 +663,20 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
     Ok(())
 }
 
-/// `listobject.py ListStrategy._extend_from_tuple`.
-///
-/// PRE-EXISTING-ADAPTATION: upstream is
-/// `@jit.look_inside_iff(loop_unrolling_heuristic(tup_w, len(tup_w),
-/// UNROLL_CUTOFF))`.  Here it is residual, because the body's
-/// `w_list_reserve_for_extend` and `w_list_append_preallocated` both take
-/// `w_list_lock`, an un-lowered helper, and the descent scan of
-/// `descr_init` reaches this body whatever the tuple's length and so refuses
-/// every `list(x)` descent.  Restoring `look_inside_iff` needs those two
-/// storage writes without the lock helper in the traced graph.
-#[majit_macros::dont_look_inside]
+/// `listobject.py ListStrategy._extend_from_tuple`:
+/// `@jit.look_inside_iff(lambda self, w_list, tup_w:
+/// jit.loop_unrolling_heuristic(tup_w, len(tup_w), UNROLL_CUTOFF))`.
+/// `tup_w` is `w_any.tolist()`; the tuple owns those items in every
+/// variant, so its `isvirtual` is the probe.
+fn extend_from_tuple_iff(_list: PyObjectRef, other: PyObjectRef) -> bool {
+    let len = unsafe { w_tuple_len(other) };
+    majit_rlib::jit::loop_unrolling_heuristic(unsafe { &*other }, len, LIST_UNROLL_CUTOFF)
+}
+
+/// `listobject.py UNROLL_CUTOFF`.
+const LIST_UNROLL_CUTOFF: usize = 5;
+
+#[majit_macros::look_inside_iff(extend_from_tuple_iff)]
 fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
     // An integer- or float-specialised tuple boxes each item as it is read,
     // so `w_tuple_getitem` allocates and both operands can move under the
@@ -682,6 +685,8 @@ fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate:
     let base = pyre_object::gc_roots::pin_roots(&[list, other]);
     unsafe {
         let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(base + 1));
+        // `w_list._resize_hint(w_list.length() + len(tup_w))`, sized as the
+        // `list_extend` reservation `__sizeof__` reports.
         pyre_object::listobject::w_list_reserve_for_extend(
             pyre_object::gc_roots::shadow_stack_get(base),
             n,

@@ -445,77 +445,105 @@ pub extern "C" fn jit_ll_arraycopy(
 
 /// rgc.py `ll_arraycopy` for the object `ItemsBlock` ARRAY.
 ///
-/// Upstream's `@specialize.ll()` gives every ARRAY its own `ll_arraycopy`
-/// graph, and the `length <= 1` `copy_item` head ("Hack to ensure that we
-/// get a proper effectinfo.write_descrs_arrays") is the getarrayitem /
-/// setarrayitem writeanalyze reads that ARRAY's effects off.
-/// [`jit_ll_arraycopy`] picks its layout at run time, so a graph that calls
-/// it names no ARRAY; a resize graph copies through this one instead.
+/// `@specialize.ll()` gives every ARRAY its own `ll_arraycopy` graph, and its
+/// `length <= 1` `copy_item` head ("Hack to ensure that we get a proper
+/// effectinfo.write_descrs_arrays") is the getarrayitem / setarrayitem
+/// writeanalyze reads that ARRAY's effects off. Longer copies run the shared
+/// barrier-plus-memcpy body, [`jit_ll_arraycopy`].
 ///
 /// # Safety
 /// `source` and `dest` are live `ItemsBlock`s and both ranges are in bounds.
+#[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub unsafe fn ll_arraycopy_items_block(
     source: *mut ItemsBlock,
     dest: *mut ItemsBlock,
-    source_start: usize,
-    dest_start: usize,
-    length: usize,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
 ) {
     if length <= 1 {
         if length == 1 {
             // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
-            let item = unsafe { *items_block_items_base(source).add(source_start) };
+            let item = unsafe { *items_block_items_base(source).add(source_start as usize) };
             let dest_managed = majit_gc::gc_varsize_layout(dest as usize).is_some();
-            unsafe { arraycopy_store_item(dest, dest_start, item, dest_managed) };
+            unsafe { arraycopy_store_item(dest, dest_start as usize, item, dest_managed) };
         }
         return;
     }
     jit_ll_arraycopy(
         source as PyObjectRef,
         dest as PyObjectRef,
-        source_start as i64,
-        dest_start as i64,
-        length as i64,
+        source_start,
+        dest_start,
+        length,
     );
 }
 
-/// [`ll_arraycopy_items_block`] for the `GcArray(Signed)` /
-/// `GcArray(Float)` blocks; `tid` says which ARRAY the blocks are.
+/// [`ll_arraycopy_items_block`] for the `GcArray(Signed)` ARRAY.
 ///
 /// # Safety
-/// `source` and `dest` are live `TypedItemsBlock`s of type `tid` and both
-/// ranges are in bounds.
-pub unsafe fn ll_arraycopy_typed_items_block(
+/// `source` and `dest` are live int `TypedItemsBlock`s and both ranges are in
+/// bounds.
+#[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
+pub unsafe fn ll_arraycopy_int_items_block(
     source: *mut TypedItemsBlock,
     dest: *mut TypedItemsBlock,
-    source_start: usize,
-    dest_start: usize,
-    length: usize,
-    tid: u32,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
 ) {
     if length <= 1 {
         if length == 1 {
             // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
-            if tid == gc_float_array_gc_type_id() {
-                let item = unsafe {
-                    *(typed_items_block_items_base(source) as *const f64).add(source_start)
-                };
-                unsafe { *(typed_items_block_items_base(dest) as *mut f64).add(dest_start) = item };
-            } else {
-                let item = unsafe {
-                    *(typed_items_block_items_base(source) as *const i64).add(source_start)
-                };
-                unsafe { *(typed_items_block_items_base(dest) as *mut i64).add(dest_start) = item };
-            }
+            let item = unsafe {
+                *(typed_items_block_items_base(source) as *const i64).add(source_start as usize)
+            };
+            unsafe {
+                *(typed_items_block_items_base(dest) as *mut i64).add(dest_start as usize) = item
+            };
         }
         return;
     }
     jit_ll_arraycopy(
         source as PyObjectRef,
         dest as PyObjectRef,
-        source_start as i64,
-        dest_start as i64,
-        length as i64,
+        source_start,
+        dest_start,
+        length,
+    );
+}
+
+/// [`ll_arraycopy_items_block`] for the `GcArray(Float)` ARRAY.
+///
+/// # Safety
+/// `source` and `dest` are live float `TypedItemsBlock`s and both ranges are
+/// in bounds.
+#[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
+pub unsafe fn ll_arraycopy_float_items_block(
+    source: *mut TypedItemsBlock,
+    dest: *mut TypedItemsBlock,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) {
+    if length <= 1 {
+        if length == 1 {
+            // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
+            let item = unsafe {
+                *(typed_items_block_items_base(source) as *const f64).add(source_start as usize)
+            };
+            unsafe {
+                *(typed_items_block_items_base(dest) as *mut f64).add(dest_start as usize) = item
+            };
+        }
+        return;
+    }
+    jit_ll_arraycopy(
+        source as PyObjectRef,
+        dest as PyObjectRef,
+        source_start,
+        dest_start,
+        length,
     );
 }
 
@@ -944,7 +972,7 @@ pub unsafe fn try_grow_list_items_block_gc(
                 crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock,
                 0,
                 0,
-                live_len,
+                live_len as i64,
             );
         }
     }
@@ -1344,82 +1372,104 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
     }
 }
 
-/// Grow a `TypedItemsBlock` to `new_cap`, copying `live_len` words from `old`,
-/// zero-filling the rest, and deallocating `old`. `old` may be null.
-/// rlist.py:262-267 parity. `old` is allocated `stable` (old-gen, non-moving),
-/// so it keeps its address across the (possibly collecting) allocation of
-/// `fresh` and the live words are copied directly; it also stays reachable
-/// through its owner's `block` field for that whole span, since the caller only
-/// overwrites that field with the returned value.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn grow_typed_items_block(
-    old: *mut TypedItemsBlock,
-    new_cap: usize,
-    live_len: usize,
-    tid: u32,
-) -> *mut TypedItemsBlock {
-    unsafe {
-        try_grow_typed_items_block(old, new_cap, live_len, tid)
-            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
-    }
+// rlist.py `_ll_list_resize_hint_really` is specialized per LIST type, so the
+// int and float grows are two graphs, each copying through its own ARRAY's
+// `ll_arraycopy`.
+macro_rules! typed_items_block_grow {
+    ($grow:ident, $try_grow:ident, $tid:path, $arraycopy:ident) => {
+        /// Grow a `TypedItemsBlock` to `new_cap`, copying `live_len` words from
+        /// `old`, zero-filling the rest, and deallocating `old`. `old` may be
+        /// null. rlist.py `_ll_list_resize_hint_really` parity. `old` is
+        /// allocated `stable` (old-gen, non-moving), so it keeps its address
+        /// across the (possibly collecting) allocation of `fresh` and the live
+        /// words are copied directly; it also stays reachable through its
+        /// owner's `block` field for that whole span, since the caller only
+        /// overwrites that field with the returned value.
+        /// # Safety
+        /// The caller must uphold every validity, runtime-type, aliasing, and
+        /// lifetime invariant required by the object and pointer arguments for
+        /// the entire call.
+        pub unsafe fn $grow(
+            old: *mut TypedItemsBlock,
+            new_cap: usize,
+            live_len: usize,
+        ) -> *mut TypedItemsBlock {
+            unsafe {
+                $try_grow(old, new_cap, live_len).unwrap_or_else(|| {
+                    std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>())
+                })
+            }
+        }
+
+        /// The grow for a capacity that came from Python.  The fresh block is
+        /// the first step and the only fallible one, so a refusal leaves `old`
+        /// allocated and still owned by its list.
+        /// # Safety
+        /// The caller must uphold every validity, runtime-type, aliasing, and
+        /// lifetime invariant required by the object and pointer arguments for
+        /// the entire call.
+        pub unsafe fn $try_grow(
+            old: *mut TypedItemsBlock,
+            new_cap: usize,
+            live_len: usize,
+        ) -> Option<*mut TypedItemsBlock> {
+            unsafe {
+                let fresh = try_alloc_typed_items_block(new_cap, $tid())?;
+                // `fresh` has no owner field yet, so nothing on the heap names
+                // it for the span below. Old-gen is mark-sweep and a block born
+                // outside `GcState::Marking` carries no `VISITED`, so the next
+                // cycle sweeps an unreachable one — root it for the span, as
+                // `gct_fv_gc_malloc` roots every livevar it brackets a malloc
+                // with (`framework.py gct_fv_gc_malloc`).
+                let _roots = crate::gc_roots::push_roots();
+                let fresh_root = crate::gc_roots::shadow_stack_len();
+                let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
+                // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy`
+                // then `l.items = newitems`. The copy's `copy_item` head is
+                // what writeanalyze records as this ARRAY's read and write, so
+                // `force_from_effectinfo` flushes lazy SETARRAYITEM_GC before
+                // the residual COND_CALL.
+                let old_root = if !old.is_null() {
+                    let slot = crate::gc_roots::shadow_stack_len();
+                    let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
+                    Some(slot)
+                } else {
+                    None
+                };
+                if let Some(old_root) = old_root
+                    && live_len > 0
+                {
+                    $arraycopy(
+                        crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock,
+                        crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock,
+                        0,
+                        0,
+                        live_len as i64,
+                    );
+                }
+                if let Some(old_root) = old_root {
+                    dealloc_typed_items_block(
+                        crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
+                    );
+                }
+                Some(crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock)
+            }
+        }
+    };
 }
 
-/// [`grow_typed_items_block`] for a capacity that came from Python.  The fresh
-/// block is the first step and the only fallible one, so a refusal leaves
-/// `old` allocated and still owned by its list.
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn try_grow_typed_items_block(
-    old: *mut TypedItemsBlock,
-    new_cap: usize,
-    live_len: usize,
-    tid: u32,
-) -> Option<*mut TypedItemsBlock> {
-    unsafe {
-        let fresh = try_alloc_typed_items_block(new_cap, tid)?;
-        // `fresh` has no owner field yet, so nothing on the heap names it for
-        // the span below. Old-gen is mark-sweep and a block born outside
-        // `GcState::Marking` carries no `VISITED`, so the next cycle sweeps an
-        // unreachable one — root it for the span, as `gct_fv_gc_malloc` roots
-        // every livevar it brackets a malloc with (`framework.py gct_fv_gc_malloc`).
-        let _roots = crate::gc_roots::push_roots();
-        let fresh_root = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
-        // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy` then
-        // `l.items = newitems`. The copy's `copy_item` head is what
-        // writeanalyze records as this ARRAY's read and write, so
-        // `force_from_effectinfo` flushes lazy SETARRAYITEM_GC before the
-        // residual COND_CALL.
-        let old_root = if !old.is_null() {
-            let slot = crate::gc_roots::shadow_stack_len();
-            let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
-            Some(slot)
-        } else {
-            None
-        };
-        if let Some(old_root) = old_root
-            && live_len > 0
-        {
-            ll_arraycopy_typed_items_block(
-                crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock,
-                crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock,
-                0,
-                0,
-                live_len,
-                tid,
-            );
-        }
-        if let Some(old_root) = old_root {
-            dealloc_typed_items_block(
-                crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
-            );
-        }
-        Some(crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock)
-    }
-}
+typed_items_block_grow!(
+    grow_int_items_block,
+    try_grow_int_items_block,
+    gc_int_array_gc_type_id,
+    ll_arraycopy_int_items_block
+);
+typed_items_block_grow!(
+    grow_float_items_block,
+    try_grow_float_items_block,
+    gc_float_array_gc_type_id,
+    ll_arraycopy_float_items_block
+);
 
 /// Deallocate a `TypedItemsBlock`. No-op on null. A GC-managed block is reclaimed
 /// by the collector and must never be freed here. `try_gc_owns_object` gates the

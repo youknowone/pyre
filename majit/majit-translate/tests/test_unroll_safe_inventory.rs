@@ -344,6 +344,15 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "_orig_str_join_many_items",
         "rlib/jit.py look_inside_iff unroll_safe(_str_join_many_items)",
     ),
+    // Same `func = unroll_safe(func)`, for `listobject.py
+    // ListStrategy._extend_from_tuple`, which is `@jit.look_inside_iff(...
+    // loop_unrolling_heuristic(tup_w, len(tup_w), UNROLL_CUTOFF))`.  With the
+    // descent, no synth fixture's recorded `fbw_rolled_back_with_effects`
+    // moved.
+    (
+        "_orig_extend_from_tuple",
+        "rlib/jit.py look_inside_iff unroll_safe(_extend_from_tuple)",
+    ),
     // Same `func = unroll_safe(func)`, for `intobject.py _pow_nomod`, which is
     // `@jit.look_inside_iff(lambda iv, iw: jit.isconstant(iw))`.
     (

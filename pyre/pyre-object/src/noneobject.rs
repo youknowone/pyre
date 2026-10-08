@@ -25,8 +25,10 @@ impl crate::lltype::GcType for W_NoneObject {
 /// owner used by the other pyre prebuilt objects.
 static NONE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Get the None singleton as a PyObjectRef.
-#[majit_macros::dont_look_inside]
+/// `space.w_None`, the prebuilt singleton.  The body reads the static, which
+/// the translator resolves to the registered prebuilt address, so a traced
+/// call is that constant.
+#[inline]
 pub fn w_none() -> PyObjectRef {
     *NONE_SINGLETON.get_or_init(|| {
         crate::lltype::malloc_typed_immortal(W_NoneObject {

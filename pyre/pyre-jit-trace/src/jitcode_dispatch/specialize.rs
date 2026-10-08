@@ -4750,8 +4750,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     value: OpRef,
     w_code_ptr: usize,
     name_idx: usize,
-    original_effect: &majit_ir::EffectInfo,
-) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
+) -> Result<Option<()>, DispatchError> {
     if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
@@ -4868,7 +4867,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 raw_live,
             )
         };
-        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
+        return Ok(Some(()));
     }
 
     if let Some((slot, kind, w_type, version_tag, _stored)) = unsafe {
@@ -5000,7 +4999,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 }
             }
         }
-        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
+        return Ok(Some(()));
     }
 
     // The attribute is not in the map yet: fold the `map -> PlainAttribute`
@@ -5103,7 +5102,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 concrete_value,
             )
         };
-        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
+        return Ok(Some(()));
     }
 
     let Some((w_type, version_tag, map, storageindex, attr)) = (unsafe {
@@ -5114,33 +5113,26 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
     unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
-    let helper = ctx
-        .trace_ctx
-        .const_int(crate::helpers::jit_mapdict_boxed_write as *const () as usize as i64);
-
-    // Unlike the unboxed arm, this write stores a GC reference, so the
-    // residual's original may-force effect is kept: only the opaque `setattr_fn`
-    // MRO walk is replaced by the direct slot write, while the force token, the
-    // virtualizable spill, and the trailing force/exception guards stay exactly
-    // as the generic setattr emitted them.
-    let mut effect = original_effect.clone();
-    effect.runtime_helper = majit_ir::RuntimeHelperKind::StoreAttr;
-    let descr = majit_metainterp::make_call_descr_with_effect(
-        &[
-            majit_ir::Type::Ref,
-            majit_ir::Type::Int,
-            majit_ir::Type::Ref,
-        ],
-        majit_ir::Type::Void,
-        effect,
-    );
-    // ABI order follows `jit_mapdict_boxed_write`: receiver, guarded green
-    // storage index, and the original symbolic object reference.  The value is
-    // neither unboxed nor guarded by type.
-    Ok(Some(WalkerStoreAttrSpecialization::Residual(
-        descr,
-        vec![helper, obj, storageindex_const, value],
-    )))
+    // mapdict.py `PlainAttribute._direct_write` →
+    // `obj._mapdict_write_storage(self.storageindex, w_value)`: one
+    // `setarrayitem_gc` into the storage list the guarded map sizes.  Like the
+    // unboxed same-type update above, it publishes no `map`/`storage` pair, so
+    // it holds for an escaped receiver too, and the reference store gets its
+    // `cond_call_gc_wb` from the GC rewrite pass.
+    let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
+        crate::descr::mapdict_storage_descr(concrete_obj)
+    });
+    crate::state::trace_mapdict_storage_setitem(ctx.trace_ctx, block, storageindex_const, value);
+    // The walk is the authoritative execution path, so apply the write now;
+    // the ops above reproduce it in compiled code.
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::write_boxed_storage(
+            concrete_obj,
+            storageindex,
+            concrete_value,
+        )
+    };
+    Ok(Some(()))
 }
 
 /// #171: FBW virtualization of a non-escaping BUILD_LIST.

@@ -13964,11 +13964,12 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         Ok((Some(OpKind::ConstUInt(0)), res))
                     }
+                    // `Constant(None, Void)`, defined as `emit_unit` defines it.
                     AggregateShape::Void => {
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Void);
-                        Ok((None, res))
+                        Ok((Some(OpKind::ConstNone), res))
                     }
                     AggregateShape::NicheNull => {
                         let nullc = self.push_niche_null_ptr(mir_bb, dest_ty);
@@ -19368,9 +19369,10 @@ impl<'a> Lowering<'a> {
             return Ok(AggregateShape::Discriminant(tag));
         }
         // A fieldless struct, unit `()`, or a borrow of one is
-        // `lltype.Void` (`getkind == 'void'`). No constructor and
-        // no register. Fieldless enums stay discriminant integers
-        // and are handled above.
+        // `lltype.Void` (`getkind == 'void'`): no constructor and no
+        // register, only the `Constant(None, Void)` definition.
+        // Fieldless enums stay discriminant integers and are handled
+        // above.
         if tyref_is_void_zst(dest_ty, self.llbc) {
             return Ok(AggregateShape::Void);
         }

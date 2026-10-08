@@ -11707,13 +11707,14 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // BhDescrs are always `BhDescr::Array` / `BhDescr::Field`
             // (`BhDescr::from_interior_field_descr`); a short stream is an
             // encoder bug surfaced here rather than silently mis-typed.
-            let (base_size, itemsize, len_offset, type_id, item_type, interior_fields) =
+            let (base_size, itemsize, len_offset, type_id, ei_index, item_type, interior_fields) =
                 match array.as_ref() {
                     BhDescr::Array {
                         base_size,
                         itemsize,
                         len_offset,
                         type_id,
+                        ei_index,
                         item_type,
                         interior_fields,
                         ..
@@ -11722,6 +11723,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                         *itemsize,
                         *len_offset,
                         *type_id,
+                        *ei_index,
                         *item_type,
                         interior_fields,
                     ),
@@ -11777,6 +11779,12 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 array_descr.is_array_of_structs(),
                 "BhDescr::InteriorField arraydescr must be FLAG_STRUCT (descr.py:389)"
             );
+            // `effectinfo.py compute_bitstrings` republish, as the
+            // `BhDescr::Array` arm does: the struct array is the descr the
+            // frozen array bitstrings name.
+            if ei_index != u32::MAX {
+                array_descr.set_ei_index(ei_index);
+            }
             let (offset, field_size, field_type, field_flag, index_in_parent, name) =
                 match field.as_ref() {
                     BhDescr::Field {

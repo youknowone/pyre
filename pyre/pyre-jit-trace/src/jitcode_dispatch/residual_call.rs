@@ -9211,17 +9211,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(outcome);
                 }
-                // The resolver below COMMITS before it answers: the
-                // `Direct` arm performs the write and returns, reaching no
-                // hook that could refuse it afterwards.  A `BINARY_OP` /
+                // The resolver below COMMITS before it answers: it performs
+                // the write and returns, reaching no hook that could refuse
+                // it afterwards.  A `BINARY_OP` /
                 // `COMPARE_OP` rewind region has to be asked first, then,
-                // rather than at the residual arm the `Residual` answer would
+                // rather than at the generic residual arm it would
                 // eventually take.
                 //
                 // Reached from a `for` body since `store_attr` joined the
                 // deferred-helper list in `fbw_state.rs`: a callee that stores
                 // an attribute now descends there as it always did from a
-                // `while` body, and the `Direct` arm below is what erases its
+                // `while` body, and the fold below is what erases its
                 // residual.
                 //
                 // A body carrying `STORE_ATTR` scans `Dirty`, which the
@@ -9233,7 +9233,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // passed rather than the region being asked about the write
                 // alone.
                 fbw_binop_rewind_refuse_commit(ctx, op.pc, Some(obj_opref))?;
-                if let Some(specialization) = spec_gate_store_attr(|| {
+                if spec_gate(SpecFold::StoreAttrDirect, || {
                     try_walker_specialize_store_attr(
                         ctx,
                         op.pc,
@@ -9241,23 +9241,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         value_opref,
                         w_code_ptr,
                         namei as usize,
-                        original_call_descr.get_extra_info(),
                     )
-                })? {
-                    match specialization {
-                        WalkerStoreAttrSpecialization::Residual(
-                            specialized_descr,
-                            specialized_allboxes,
-                        ) => {
-                            descr = specialized_descr;
-                            allboxes = specialized_allboxes;
-                        }
-                        WalkerStoreAttrSpecialization::Direct => {
-                            fbw_mark_foriter_body_effect_since_consume();
-                            fbw_bump_executed_effect("store_attr_direct");
-                            return Ok((DispatchOutcome::Continue, op.next_pc));
-                        }
-                    }
+                })?
+                .is_some()
+                {
+                    fbw_mark_foriter_body_effect_since_consume();
+                    fbw_bump_executed_effect("store_attr_direct");
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
         }

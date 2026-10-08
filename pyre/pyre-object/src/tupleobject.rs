@@ -845,9 +845,11 @@ pub const UNROLL_CUTOFF: usize = 10;
 
 /// `W_TupleObject._unroll_condition` —
 /// `jit.loop_unrolling_heuristic(self.wrappeditems, self.length(), UNROLL_CUTOFF)`.
+/// The specialised variants carry their items inline, so the tuple itself is
+/// the `isvirtual` probe for every variant.
 pub fn unroll_condition(obj: PyObjectRef) -> bool {
     let len = unsafe { w_tuple_len(obj) };
-    majit_rlib::jit::loop_unrolling_heuristic(&len, len, UNROLL_CUTOFF)
+    majit_rlib::jit::loop_unrolling_heuristic(unsafe { &*obj }, len, UNROLL_CUTOFF)
 }
 
 /// Snapshot the tuple's items as an owned `Vec<PyObjectRef>`.
