@@ -794,11 +794,11 @@ pub struct RegisterManager {
     /// RPython calls self.assembler.regalloc_mov() directly; in Rust we
     /// collect moves here and flush them to the assembler's output.
     pub spill_moves: Vec<(Loc, Loc)>,
-    /// `X86XMMRegisterManager.assembler.datablockwrapper`. `0` on the GPR
-    /// manager and on aarch64. The x86 assembler installs the pointer on
-    /// the XMM manager after `prepare_loop` / `prepare_bridge` (those
-    /// rebuild this manager) and after `emit_check_frame_depth`, immediately
-    /// before `walk_operations`.
+    /// `X86XMMRegisterManager` / `VFPRegisterManager`
+    /// `assembler.datablockwrapper`. `0` on the GPR manager. The assembler
+    /// installs the pointer on the XMM / VFP manager after `prepare_loop` /
+    /// `prepare_bridge` (those rebuild this manager) and after
+    /// `emit_check_frame_depth`, immediately before `walk_operations`.
     datablockwrapper: usize,
     /// First `MachineDataBlockWrapper.malloc_aligned` failure.
     /// `open_malloc` raises `MemoryError`; `walk_operations` returns it as
@@ -883,6 +883,20 @@ fn box_type_or_temp(known: Option<Type>, v: OpRef) -> Type {
     }
 }
 
+/// `X86XMMRegisterManager.convert_to_imm` / `VFPRegisterManager.convert_to_imm`:
+/// `malloc_aligned(8, 8)`, write `getfloatstorage()`, return `ConstFloatLoc(adr)`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn park_float_const(
+    wrapper: &mut majit_backend::MachineDataBlockWrapper,
+    bits: u64,
+) -> Result<ConstFloatLoc, std::io::Error> {
+    let adr = wrapper.malloc_aligned(8, 8)?;
+    // `compile_loop` / `compile_bridge` hold `AssemblerWriting::enter`
+    // across the walk, so this store is inside the write window.
+    unsafe { (adr as *mut u64).write(bits) };
+    Ok(ConstFloatLoc { value: adr })
+}
+
 impl RegisterManager {
     /// regalloc.py:368
     pub fn new(
@@ -914,7 +928,8 @@ impl RegisterManager {
         }
     }
 
-    /// Attach `X86XMMRegisterManager.assembler.datablockwrapper` for this walk.
+    /// Attach `X86XMMRegisterManager` / `VFPRegisterManager`
+    /// `assembler.datablockwrapper` for this walk.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_datablockwrapper(&mut self, wrapper: &mut majit_backend::MachineDataBlockWrapper) {
         self.datablockwrapper = wrapper as *mut majit_backend::MachineDataBlockWrapper as usize;
@@ -1322,7 +1337,8 @@ impl RegisterManager {
         if v.is_constant() {
             // `RegisterManager.loc`: a Const goes through `convert_to_imm`.
             // With `datablockwrapper` set this is
-            // `X86XMMRegisterManager.convert_to_imm` (`ConstFloatLoc`).
+            // `X86XMMRegisterManager.convert_to_imm` /
+            // `VFPRegisterManager.convert_to_imm` (`ConstFloatLoc`).
             // The GPR manager has no wrapper and keeps an `ImmedLoc`.
             if self.datablockwrapper != 0 {
                 return self.convert_to_imm(v, constants);
@@ -1646,9 +1662,10 @@ impl RegisterManager {
 
     // ── x86-specific methods ──
 
-    /// `X86RegisterManager.convert_to_imm` / `X86XMMRegisterManager.convert_to_imm`.
+    /// `X86RegisterManager.convert_to_imm` / `X86XMMRegisterManager.convert_to_imm`
+    /// / `VFPRegisterManager.convert_to_imm`.
     ///
-    /// The XMM manager (`datablockwrapper` installed) does
+    /// The XMM / VFP manager (`datablockwrapper` installed) does
     /// `malloc_aligned(8, 8)`, writes `getfloatstorage()`, and returns
     /// `ConstFloatLoc`. A `MemoryError` from `open_malloc` is kept in
     /// `pool_error` and surfaced by `walk_operations`. The GPR manager
@@ -1679,9 +1696,10 @@ impl RegisterManager {
         }
     }
 
-    /// `X86XMMRegisterManager.convert_to_imm` when this manager owns the
-    /// data block; otherwise the bit pattern stays an `ImmedFloat`.
-    fn float_const_loc(&mut self, bits: u64) -> Loc {
+    /// `X86XMMRegisterManager.convert_to_imm` / `VFPRegisterManager.convert_to_imm`
+    /// when this manager owns the data block; otherwise the bit pattern stays
+    /// an `ImmedFloat`.
+    pub(crate) fn float_const_loc(&mut self, bits: u64) -> Loc {
         if self.datablockwrapper == 0 {
             return Loc::immed_float(bits as i64);
         }
@@ -1690,13 +1708,8 @@ impl RegisterManager {
             let wrapper = unsafe {
                 &mut *(self.datablockwrapper as *mut majit_backend::MachineDataBlockWrapper)
             };
-            match wrapper.malloc_aligned(8, 8) {
-                Ok(adr) => {
-                    // `compile_loop` / `compile_bridge` hold `AssemblerWriting::enter`
-                    // across the walk, so this store is inside the write window.
-                    unsafe { (adr as *mut u64).write(bits) };
-                    Loc::ConstFloat(ConstFloatLoc { value: adr })
-                }
+            match park_float_const(wrapper, bits) {
+                Ok(loc) => Loc::ConstFloat(loc),
                 Err(err) => {
                     if self.pool_error.is_none() {
                         self.pool_error = Some(err);
@@ -2273,8 +2286,9 @@ impl<'a> RegAlloc<'a> {
         // `selected_reg` / `need_lower_byte` do not apply on that path.
         // aarch64/regalloc.py `Regalloc.make_sure_var_in_reg` has no such
         // short-circuit: `ARMRegisterManager.return_constant` loads
-        // `ConstFloatLoc` into a VFP scratch, and with no data block that
-        // load is still `convert_to_imm`'s `ImmedFloat`.
+        // `VFPRegisterManager.convert_to_imm`'s `ConstFloatLoc` into a VFP
+        // scratch (`AssemblerARM64.load`). The walk installs the data block
+        // on `xrm`, so that immediate is `Loc::ConstFloat`.
         #[cfg(target_arch = "x86_64")]
         if tp == Type::Float && v.is_constant() {
             return Loc::immed_float(self.const_value(v));
