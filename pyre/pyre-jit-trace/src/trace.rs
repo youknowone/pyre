@@ -1993,33 +1993,25 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
     let resumed_stack_concretes =
         &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
-    // `finishframe_exception` (`pyjitpl.py`): an exception-guard bridge
-    // resumes the failing frame at the no-exception fallthrough. When that
-    // frame's own try covers the raising call, enter the handler with the
-    // exception already raised. No local catch stays on the fallthrough.
-    let handler_entry = if ctx.bridge_source_is_exception_guard() {
-        let exc_ptr = sym.last_exc_value();
-        let exc_box = sym.last_exc_box();
-        if exc_ptr.is_null() || exc_box.is_none() {
-            None
-        } else {
-            carrier_catch_target(
-                callee_pjc.jitcode.code.as_slice(),
-                recipe.jitcode_pc as usize,
-                "deepest",
-            )
-            .or_else(|| {
-                carrier_catch_target(callee_pjc.jitcode.code.as_slice(), entry, "deepest-entry")
-            })
-            .map(|catch_target| crate::jitcode_dispatch::FrameHandlerEntry::Caught {
-                exc: exc_box,
-                exc_concrete: crate::state::ConcreteValue::Ref(exc_ptr),
-                catch_target,
-            })
-        }
-    } else {
-        None
-    };
+    // `_prepare_exception_resumption` / `finishframe_exception`: on an
+    // exception-guard bridge the deepest callee is the frame whose residual
+    // call raised. `Restored` replays the already-recorded exception
+    // (`bridge_saved_exc_op` once `prepare_resume_from_failure` ran) and
+    // either enters this frame's handler or propagates when it has none.
+    // `Caught` would push the trace-time exception constant, and a missing
+    // handler would resume the no-exception fallthrough because a prepared
+    // resume disables the fallback route.
+    let handler_entry = (ctx.is_bridge_trace
+        && ctx.bridge_source_is_exception_guard()
+        && !sym.last_exc_box().is_none()
+        && !sym.last_exc_value().is_null())
+    .then(|| crate::jitcode_dispatch::FrameHandlerEntry::Restored {
+        exc_concrete: sym.last_exc_value(),
+        catch_target: crate::jitcode_dispatch::find_catch_for_exc_resume(
+            callee_pjc.jitcode.code.as_slice(),
+            entry,
+        ),
+    });
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
     // `SubReturn` instead of the top-level `Finish` pyre's own-portal model

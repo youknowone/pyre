@@ -4308,16 +4308,17 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     // below it. `Cls_ii` / `Cls_ff` box on each read, and the bind can
     // allocate while those boxes are still only in a `Vec`.
     let extract_roots = pyre_object::gc_roots::push_roots();
-    // Publish the tuple and the mapping together. Sequential `pin_root`
-    // normalizes after the first word, and a collection there relocates the
-    // mapping before the second publish. Later reads reload these slots.
-    let (tuple_slot, kwargs_slot) = if let Some(obj) = kwargs {
-        let base = extract_roots.pin_roots(&[starargs_obj, obj]);
-        (base, Some(base + 1))
+    // Publish the tuple, the mapping, and the code object together.
+    // Sequential `pin_root` normalizes after the first word, and a collection
+    // there relocates the next pointer before it is published. `w_code` is
+    // read again after `w_tuple_getitem`, which boxes and can collect.
+    let code_obj = w_code as pyre_object::PyObjectRef;
+    let (tuple_slot, kwargs_slot, code_slot) = if let Some(obj) = kwargs {
+        let base = extract_roots.pin_roots(&[starargs_obj, obj, code_obj]);
+        (base, Some(base + 1), base + 2)
     } else {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = extract_roots.pin_root(starargs_obj);
-        (slot, None)
+        let base = extract_roots.pin_roots(&[starargs_obj, code_obj]);
+        (base, None, base + 1)
     };
     let mut extracted_base: Option<usize> = None;
     let (mut args, mut concretes, mut star) = if let Some(block) = ctx
@@ -4402,6 +4403,7 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     let kwargs_live = kwargs_slot
         .map(|slot| extract_roots.get(slot))
         .unwrap_or(kwargs);
+    let w_code = extract_roots.get(code_slot) as *const ();
     let mut star_kwargs =
         unsafe { fbw_bind_star_kwargs(r_args[3], kwargs_live, w_code, args.len(), nparams) }?;
     let bound_live: Vec<pyre_object::PyObjectRef> =
@@ -4887,7 +4889,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // `space.lookup` promotes, instead of read off a `Method`'s immutable
     // fields.
     let mut instance_call_pin = None;
-    let (resolved_callable, w_code, nparams, has_closure) = match unsafe {
+    let (mut resolved_callable, mut w_code, nparams, has_closure) = match unsafe {
         resolve_inlinable_callee(resolved_callable)
     } {
         Some((w_code, nparams, has_closure)) => (resolved_callable, w_code, nparams, has_closure),
@@ -4971,9 +4973,23 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        let Some((args, concretes, star, kwargs)) =
-            fbw_unpack_call_function_ex_args(ctx, op.pc, r_args, &arg_concretes, w_code, nparams)
-        else {
+        // `w_tuple_getitem` on a specialised tuple allocates. Pin the callee
+        // and its code across that unpack, then reload the forwarded
+        // addresses. The unpack also reloads `w_code` before keyword binding.
+        let callee_roots = pyre_object::gc_roots::push_roots();
+        let callee_base =
+            callee_roots.pin_roots(&[resolved_callable, w_code as pyre_object::PyObjectRef]);
+        let unpacked = fbw_unpack_call_function_ex_args(
+            ctx,
+            op.pc,
+            r_args,
+            &arg_concretes,
+            callee_roots.get(callee_base + 1) as *const (),
+            nparams,
+        );
+        resolved_callable = callee_roots.get(callee_base);
+        w_code = callee_roots.get(callee_base + 1) as *const ();
+        let Some((args, concretes, star, kwargs)) = unpacked else {
             return Ok(None);
         };
         star_args = star;

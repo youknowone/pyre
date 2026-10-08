@@ -15714,21 +15714,34 @@ fn resume_reconstructed_callee_frame(
     if arr_ptr.is_null() || unsafe { (*arr_ptr).len() } < stack_base {
         return None;
     }
-    store_reconstructed_callee_array_image(ctx, frame, concrete_frame, recipe, stack_base);
+    store_reconstructed_callee_array_image(
+        ctx,
+        frame,
+        concrete_frame,
+        recipe,
+        &recipe.concrete_r,
+        stack_base,
+    );
     Some((frame, concrete_frame))
 }
 
-/// Store the recipe's locals/cells prefix into a concrete `PyFrame` the walk
-/// is about to run. Operand-stack temps stay as the deopt restore left them:
-/// a mid-CALL `-live-` drops them from the recipe, so writing that image
-/// would publish `ConstPtr(0)` into callable/arg slots. `valuestackdepth`
+/// Store the locals/cells prefix in `concrete_r` into a concrete `PyFrame`
+/// the walk is about to run. Operand-stack temps stay as the deopt restore
+/// left them: a mid-CALL `-live-` drops them from the recipe, so writing that
+/// image would publish `ConstPtr(0)` into callable/arg slots. `valuestackdepth`
 /// stays the recipe's captured depth so a blackhole that resumes the CALL
 /// opcode still sees those restored operands.
+///
+/// `concrete_r` is the image to write now: a minor collection between capture
+/// and this store can move young objects, so the caller passes the current
+/// words (re-read from roots taken before the allocation) rather than the
+/// addresses captured in `recipe.concrete_r`.
 fn store_reconstructed_callee_array_image(
     ctx: &mut TraceCtx,
     frame: OpRef,
     concrete_frame: *mut pyre_interpreter::PyFrame,
     recipe: &ReconstructRecipe,
+    concrete_r: &[majit_ir::Value],
     stack_base: usize,
 ) {
     let arr_ptr = unsafe { (*concrete_frame).locals_cells_stack_w };
@@ -15761,7 +15774,7 @@ fn store_reconstructed_callee_array_image(
             );
             ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, value);
         }
-        if let Some(&majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k)
+        if let Some(&majit_ir::Value::Ref(gc)) = concrete_r.get(k)
             && !gc.is_null()
             && gc != majit_ir::GcRef::NO_CONCRETE
         {
@@ -15845,6 +15858,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     if w_code.is_null() {
         return None;
     }
+    let mut live_stack_concrete: Option<Vec<majit_ir::Value>> = None;
     let concrete_frame_ptr = if let Some((_, ptr)) = resumed {
         ptr
     } else {
@@ -15951,13 +15965,37 @@ pub(crate) fn setup_reconstructed_callee_frame(
             frame_vable,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
         );
+        // FrameBox::new (and w_tuple_new) may have moved young objects; the
+        // pinned slots hold the forwarded addresses, recipe.concrete_r does not.
+        let live_prefix: Vec<majit_ir::Value> = (0..stack_base)
+            .map(|k| {
+                majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(
+                    root_base + 2 + k,
+                ) as usize))
+            })
+            .collect();
+        let stack_temp_root = closure_root
+            .map(|i| i + 1)
+            .unwrap_or(root_base + 2 + stack_base);
+        let mut live_stack = vec![majit_ir::Value::Void; valuestackdepth];
+        for k in stack_base..valuestackdepth.min(recipe.concrete_r.len()) {
+            live_stack[k] = match recipe.concrete_r[k] {
+                majit_ir::Value::Ref(_) => majit_ir::Value::Ref(majit_ir::GcRef(
+                    pyre_object::gc_roots::shadow_stack_get(stack_temp_root + (k - stack_base))
+                        as usize,
+                )),
+                other => other,
+            };
+        }
         store_reconstructed_callee_array_image(
             ctx,
             frame_vable,
             concrete_frame_ptr,
             recipe,
+            &live_prefix,
             stack_base,
         );
+        live_stack_concrete = Some(live_stack);
         drop(concrete_frame);
         drop(concrete_roots);
         concrete_frame_ptr
@@ -16003,6 +16041,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
+    // The allocate path re-reads Refs from roots taken before FrameBox::new;
+    // the resume path captured with no allocation in between, so
+    // recipe.concrete_r is still current.
+    let slot_concrete = live_stack_concrete.as_deref().unwrap_or(&recipe.concrete_r);
     for k in stack_base..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
@@ -16032,9 +16074,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // any resumed operand. Skips constants (`constants.get_value` is
         // authoritative) and non-value (`Void`) slots.
         if !opref.is_constant() {
-            if let Some(v @ majit_ir::Value::Int(_)) = recipe.concrete_r.get(k).copied() {
+            if let Some(v @ majit_ir::Value::Int(_)) = slot_concrete.get(k).copied() {
                 ctx.set_opref_concrete(opref, v);
-            } else if let Some(v @ majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k).copied()
+            } else if let Some(v @ majit_ir::Value::Ref(gc)) = slot_concrete.get(k).copied()
                 && !gc.is_null()
                 && gc != majit_ir::GcRef::NO_CONCRETE
             {

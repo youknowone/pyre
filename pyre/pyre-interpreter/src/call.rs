@@ -197,6 +197,10 @@ use crate::pyframe::PyFrame;
 /// one caller that resumes a frame.
 pub struct FrameResumeArgs {
     pub w_inputvalue: Option<PyObjectRef>,
+    /// Shadow-stack slot holding `w_inputvalue` when the caller published it.
+    /// `prepare_frame_resume_for_dispatch` reloads from here after callbacks
+    /// that can move the object. `None` means the pointer was not published.
+    pub input_root_slot: Option<usize>,
     pub operr: Option<crate::PyError>,
     pub throw_args: Option<([PyObjectRef; 3], usize)>,
 }
@@ -498,11 +502,11 @@ pub fn eval_resumed_frame_raw(frame: &mut PyFrame, w_inputvalue: PyObjectRef) ->
     let slot = pyre_object::gc_roots::publish_roots(&[w_inputvalue]);
     let rooted = pyre_object::gc_roots::shadow_stack_get(slot);
     let mut resume = FrameResumeArgs {
-        w_inputvalue: if rooted.is_null() {
-            None
-        } else {
-            Some(rooted)
-        },
+        w_inputvalue: if rooted.is_null() { None } else { Some(rooted) },
+        // Profiling callbacks inside the evaluator can collect before the
+        // resume payload is consumed. The slot is what the collector
+        // forwards; the copy above is only the pre-callback value.
+        input_root_slot: Some(slot),
         operr: None,
         throw_args: None,
     };

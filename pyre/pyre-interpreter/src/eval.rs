@@ -2545,6 +2545,14 @@ pub fn prepare_frame_resume_for_dispatch(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    if let Some(slot) = resume.input_root_slot {
+        let current = pyre_object::gc_roots::shadow_stack_get(slot);
+        resume.w_inputvalue = if current.is_null() {
+            None
+        } else {
+            Some(current)
+        };
+    }
     match prepare_frame_resume(
         frame,
         resume.w_inputvalue.take(),
@@ -2583,6 +2591,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     frame.fix_array_ptrs();
     let mut resume = crate::call::FrameResumeArgs {
         w_inputvalue,
+        input_root_slot: None,
         operr,
         throw_args,
     };

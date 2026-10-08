@@ -5152,6 +5152,7 @@ impl PyFrame {
     ) -> crate::PyResult {
         let mut resume = crate::call::FrameResumeArgs {
             w_inputvalue,
+            input_root_slot: None,
             operr,
             throw_args,
         };
