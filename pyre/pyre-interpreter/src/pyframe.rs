@@ -433,7 +433,17 @@ pub mod frame_locals_proxy {
         /// frame, which is exactly when the write has a shadow to reach.
         fn force_locals(&self) {
             let frame = self.w_frame as *mut PyFrame;
-            if unsafe { (*frame).vable_token } == 0 {
+            let token = unsafe { (*frame).vable_token };
+            // `virtualizable.py force_virtualizable_if_necessary`: force only
+            // when a compiled loop owns the frame. TOKEN_NONE (0) is idle.
+            if token == 0 {
+                return;
+            }
+            // `virtualizable.py force_now`: TOKEN_TRACING_RESCALL values are
+            // already correct during tracing; reset to TOKEN_NONE as the
+            // escape marker `tracing_after_residual_call` reads.
+            if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
+                unsafe { (*frame).vable_token = 0 };
                 return;
             }
             // The force materializes through a backend hook this crate cannot
