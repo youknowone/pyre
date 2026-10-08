@@ -5238,6 +5238,11 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                     self.meta.single_pass_finish = true;
+                    // `virtualizable.py write_from_resume_data_partial` writes
+                    // every static field before the portal runner continues.
+                    // A `void_return` Finish has no resultbox; the native
+                    // suffix reads these reds (`compile_done_with_this_frame`
+                    // then `DoneWithThisFrameVoid`).
                     if let Some(scalars) = self
                         .meta
                         .trace_ctx()
@@ -5248,6 +5253,18 @@ impl<S: JitState> JitDriver<S> {
                         let scalars = S::collect_scalar_state_field_values(sym);
                         if !scalars.is_empty() {
                             self.meta.single_pass_scalar_values = Some(scalars);
+                        }
+                    }
+                    if let Some(ref_scalars) = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.close_ref_scalar_values.take())
+                    {
+                        self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
+                    } else if let Some(sym) = self.sym.as_ref() {
+                        let ref_scalars = S::collect_ref_scalar_state_field_values(sym);
+                        if !ref_scalars.is_empty() {
+                            self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
                         }
                     }
                     let virt_elems = self

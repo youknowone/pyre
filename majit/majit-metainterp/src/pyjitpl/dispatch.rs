@@ -3256,11 +3256,20 @@ where
         // `reached_loop_header` builds a fresh `live_arg_boxes` each visit
         // from the `jit_merge_point` operands (`prepare_list_of_boxes`).
         // Scalar writeback values still come off the portal frame.
-        ctx.close_scalar_values = None;
-        ctx.close_ref_scalar_values = None;
+        //
+        // `pyjitpl.py finishframe` compiles with the portal frame's boxes
+        // still live (`compile_done_with_this_frame`); `virtualizable.py`
+        // `write_from_resume_data_partial` then writes every static field
+        // back. The typed-return opimpls stash those identity-slot values
+        // before popping the frame. `run_to_end` restashes on every
+        // non-Continue; with the stack already drained that restash must
+        // not clear the return snapshot, or a `void_return` Finish writes
+        // nothing and the native suffix reads the trace-start reds.
         let Some(root) = self.frames.frames.first() else {
             return;
         };
+        ctx.close_scalar_values = None;
+        ctx.close_ref_scalar_values = None;
         let scalars = sym.collect_portal_scalar_values(root, ctx);
         if !scalars.is_empty() {
             ctx.close_scalar_values = Some(scalars);

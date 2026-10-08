@@ -4306,6 +4306,15 @@ pub(crate) fn lower_dispatch_body(
     // committed prefix would leave the prefix in the JitCode and still
     // terminate in `void_return`, so the native suffix -- the prefix included
     // -- would run a second time once the `Finish` breaks the dispatch loop.
+    // Lowering the tail alone when the prefix refuses would emit `int_return`
+    // (`flatten.py GraphFlattener.make_return`) while dropping the prefix from
+    // the JitCode; the Finish drain then returns without running the native
+    // suffix, so prefix side effects vanish on the JIT path.  The native
+    // suffix is the prefix's owner when it cannot be represented.  A
+    // `void_return` Finish still has to write every live red back first
+    // (`pyjitpl.py compile_done_with_this_frame` /
+    // `virtualizable.py write_from_resume_data_partial`), or the suffix reads
+    // the trace-start `state`.
     //
     // A portal whose declared return type has no finish projection lowers no
     // epilogue at all.  The two drains that make a lowered epilogue run once --
@@ -4485,6 +4494,80 @@ mod insn_op_fetch_tests {
         assert!(
             !text.contains("goto_if_not_int_eq"),
             "no opcode binding must emit no dispatch arms:\n{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod suffix_loop_int_return_tests {
+    use super::*;
+
+    fn config() -> LowererConfig {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_type_name = "Machine".to_string();
+        config.env_type_name = "Program".to_string();
+        config.state_scalars.insert("pos".to_string(), 0);
+        config.state_scalars.insert("n".to_string(), 1);
+        config.state_scalars.insert("a".to_string(), 2);
+        config
+    }
+
+    /// An iterator `for` after the portal loop is unlowerable
+    /// (`lower_for_loop` only unrolls a literal range). The prefix stays
+    /// with the native suffix, so the walk must end in `void_return`
+    /// (`pyjitpl.py finishframe` with `result_type == VOID` when the
+    /// epilogue is not in the graph). Lowering the tail alone would drop
+    /// the prefix from the JitCode.
+    #[test]
+    fn unlowerable_suffix_loop_emits_void_return() {
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Program) -> i64 {
+                while state.pos < state.n {
+                    jit_merge_point!(driver, program, pc; state);
+                    state.pos = state.pos + 1i64;
+                }
+                for _ in [0].iter() {}
+                state.a
+            }
+        };
+        let generated = lower_dispatch_body(&config(), &func.block, &[], &func.sig.output)
+            .expect("dispatch lowering must produce a body");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("void_return"),
+            "an unlowerable suffix prefix must leave void_return so the \
+             native suffix runs that prefix: {body}"
+        );
+        assert!(
+            !body.contains("int_return"),
+            "lowering only the tail would drop the prefix: {body}"
+        );
+    }
+
+    /// A suffix that is only `return state.a` still follows
+    /// `GraphFlattener.make_return` / `getkind`.
+    #[test]
+    fn lowerable_suffix_still_emits_int_return() {
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Program) -> i64 {
+                while state.pos < state.n {
+                    jit_merge_point!(driver, program, pc; state);
+                    state.pos = state.pos + 1i64;
+                }
+                state.a
+            }
+        };
+        let generated = lower_dispatch_body(&config(), &func.block, &[], &func.sig.output)
+            .expect("dispatch lowering must produce a body");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("int_return"),
+            "a lowerable int tail must emit int_return \
+             (flatten.py GraphFlattener.make_return / getkind): {body}"
+        );
+        assert!(
+            !body.contains("void_return"),
+            "a lowerable int tail must not emit void_return: {body}"
         );
     }
 }
