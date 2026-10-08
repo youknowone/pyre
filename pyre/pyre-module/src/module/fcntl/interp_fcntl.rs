@@ -312,7 +312,6 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 fn fcntl(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-
     #[cfg(all(unix, feature = "host_env"))]
     {
         if !(2..=3).contains(&args.len()) {
@@ -359,8 +358,7 @@ fn fcntl(
                     raise_error_maybe("fcntl")?;
                 } else {
                     guard_intact(staged.raw, data.len())?;
-                    let out =
-                        unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) };
+                    let out = unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) };
                     return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
                 }
             }
@@ -389,7 +387,6 @@ fn fcntl(
             "fcntl.fcntl requires host_env feature",
         ))
     }
-
 }
 
 /// interp2app wrapper for `ioctl`. `interp_fcntl.ioctl` has no retry loop,
@@ -410,7 +407,6 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 fn ioctl(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-
     #[cfg(all(unix, feature = "host_env"))]
     {
         // `interp_fcntl.py ioctl(space, w_fd, w_request, w_arg,
@@ -454,15 +450,15 @@ fn ioctl(
             } else {
                 true
             };
-            let immutable = unsafe {
-                pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg)
-            };
-            if mutate
-                && !immutable
-                && let Ok((slice, _owner, _made_view)) =
-                    unsafe { pyre_interpreter::builtins::fileio_writebuf(arg) }
-            {
-                return ioctl_mutable(fd, request, slice);
+            let immutable =
+                unsafe { pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg) };
+            if mutate && !immutable {
+                let written = pyre_object::with_roots!(arg => unsafe {
+                    pyre_interpreter::builtins::fileio_writebuf(arg)
+                });
+                if let Ok((slice, _owner, _made_view)) = written {
+                    return ioctl_mutable(fd, request, slice);
+                }
             }
             return ioctl_readonly(fd, request, arg_readbuf(arg, "ioctl")?);
         }
@@ -485,7 +481,6 @@ fn ioctl(
             "fcntl.ioctl requires host_env feature",
         ))
     }
-
 }
 
 /// interp2app wrapper for `lockf`. The body retries with `while True`.

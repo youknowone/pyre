@@ -4414,7 +4414,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         ))
     })?;
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
-    let mut u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
+    let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
     lower_unstructured_with_static_addrs_and_attrs(

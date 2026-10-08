@@ -5635,12 +5635,32 @@ pub fn builtin_kwargs_marker_tail(last: PyObjectRef) -> bool {
 /// distinct types on one `TakeWhile` graph's input has no common base class.
 #[majit_macros::unroll_safe]
 pub fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
-    // PyPy `argument.py:_match_signature` keeps `num_args`, `upfront`, and
-    // every derived argument count as ordinary RPython Signed values.  Rust
-    // slice indexing needs `usize`, but that is an indexing adapter, not the
-    // semantic type of the gateway count.
+    builtin_positional_count(args, false)
+}
+
+/// Positional count of a flat builtin argument list.
+///
+/// `Arguments._match_signature` keeps `num_args` as a Signed and counts the
+/// positional prefix in place. A trailing `__pyre_kw__` marker is not a
+/// positional: `has_kwargs` stops the scan one slot early, which is the
+/// leading non-null run of `split_builtin_kwargs`'s prefix. The wrapper
+/// therefore does not build that sub-slice. `interp2app` already passes
+/// positionals and keywords separately, so the marker dict is the flat ABI's
+/// stand-in and the slice was only there to drop it before counting.
+///
+/// `Arguments._match_signature` is `@jit.unroll_safe`; the hint belongs
+/// on this graph, which owns the positional-prefix loop. A caller hint
+/// does not transfer (`look_inside_graph`).
+#[majit_macros::unroll_safe]
+pub fn builtin_positional_count(args: &[PyObjectRef], has_kwargs: bool) -> i64 {
+    // `Arguments._match_signature` keeps `num_args` as a Signed. Rust
+    // indexing needs `usize`; that is an adapter, not the gateway count's type.
+    // Ordinary Signed subtraction: `saturating_sub` is not in the
+    // translator CallRegistry, so the graph never becomes a prepass subject.
+    let len = args.len() as i64;
+    let limit = if has_kwargs { len - 1 } else { len };
     let mut count = 0i64;
-    while count < args.len() as i64 && !args[count as usize].is_null() {
+    while count < limit && !args[count as usize].is_null() {
         count += 1;
     }
     count
@@ -19918,9 +19938,11 @@ unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyErro
         if len == 0 {
             return Ok(XXPRIME_5);
         }
-        // `tuple_hash_w_type` does not allocate. Pin afterwards so the
-        // element boxes and `try_hash_value` reload both words.
-        let w_type = tuple_hash_w_type(obj);
+        // `tuple_hash_w_type` reaches `w_tuple_getitem`, whose body boxes
+        // an `_ii` / `_ff` payload. Reload `obj` before the element walk
+        // pins both words for those boxes and for `try_hash_value`.
+        let mut obj = obj;
+        let w_type = pyre_object::with_roots!(obj => tuple_hash_w_type(obj));
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[obj, w_type]);
         let mut acc = XXPRIME_5;
@@ -28141,6 +28163,46 @@ mod tests {
         let one_code =
             unsafe { pyre_object::interp_exceptions::w_exception_get_code(roots.get(one_slot)) };
         assert!(std::ptr::eq(one_code, roots.get(arg_slot)));
+    }
+
+    #[test]
+    fn builtin_positional_count_matches_the_peeled_prefix() {
+        let _ = new_builtin_module_dict();
+        let a = pyre_object::w_int_new(1);
+        let b = pyre_object::w_int_new(2);
+        let marker = pyre_object::w_dict_new();
+        unsafe {
+            pyre_object::w_dict_store(
+                marker,
+                pyre_object::kw_marker::w_kw_marker_key(),
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+        }
+        let null = pyre_object::PY_NULL;
+        let cases = [
+            vec![],
+            vec![a],
+            vec![a, b],
+            vec![a, null],
+            vec![null, a],
+            vec![a, null, b],
+            vec![marker],
+            vec![a, marker],
+            vec![a, b, marker],
+            vec![a, null, marker],
+            vec![null, marker],
+            vec![a, b, null, marker],
+        ];
+        for args in &cases {
+            let has_kwargs = has_builtin_kwargs(args);
+            let peeled = leading_non_null_count(split_builtin_kwargs(args).0);
+            assert_eq!(
+                builtin_positional_count(args, has_kwargs),
+                peeled,
+                "has_kwargs={has_kwargs} len={}",
+                args.len()
+            );
+        }
     }
 
     #[test]

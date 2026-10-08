@@ -2826,10 +2826,7 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
 /// `pypy/objspace/std/dictmultiobject.py W_DictMultiObject.getitem`
-/// — `w_dict.get_strategy().getitem(w_dict, w_key)`.  Dispatches
-/// through the polymorphic strategy slot so module dicts go through
-/// `ModuleDictStrategy::getitem` and regular dicts through
-/// `ObjectDictStrategy::getitem`.
+/// — `w_dict.get_strategy().getitem(w_dict, w_key)`.
 pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
     w_dict_get_strategy(obj).getitem(obj, key)

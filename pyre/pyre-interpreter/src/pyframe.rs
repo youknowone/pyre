@@ -80,6 +80,9 @@ pub mod frame_locals_proxy {
         w_frame: PyObjectRef,
     }
 
+    /// Offset of `w_frame` for the JIT field descr.
+    pub const W_FRAME_OFFSET: usize = std::mem::offset_of!(FrameLocalsProxy, w_frame);
+
     /// The frame `obj` is a live proxy onto, or `None` for anything else.
     ///
     /// The proxy reads the frame's array lazily rather than copying out of it,
@@ -430,7 +433,17 @@ pub mod frame_locals_proxy {
         /// frame, which is exactly when the write has a shadow to reach.
         fn force_locals(&self) {
             let frame = self.w_frame as *mut PyFrame;
-            if unsafe { (*frame).vable_token } == 0 {
+            let token = unsafe { (*frame).vable_token };
+            // `virtualizable.py force_virtualizable_if_necessary`: force only
+            // when a compiled loop owns the frame. TOKEN_NONE (0) is idle.
+            if token == 0 {
+                return;
+            }
+            // `virtualizable.py force_now`: TOKEN_TRACING_RESCALL values are
+            // already correct during tracing; reset to TOKEN_NONE as the
+            // escape marker `tracing_after_residual_call` reads.
+            if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
+                unsafe { (*frame).vable_token = 0 };
                 return;
             }
             // The force materializes through a backend hook this crate cannot
@@ -4303,9 +4316,15 @@ impl PyFrame {
     /// residual after `proxy_list_new`.
     #[inline]
     pub fn get_extra_locals(&self) -> PyObjectRef {
-        match self.getdebug_data() {
-            None => pyre_object::PY_NULL,
-            Some(data) => data.w_extra_locals,
+        // A call through `getdebug_data` residualizes as a symbolic
+        // `Option<&FrameDebugData>` ctor the walker cannot bind
+        // (`getdebug_data` at the first byte of this body). Read the
+        // debug payload field directly, the same None-checked getfield
+        // `pyframe.py getdebug` is.
+        if self.debugdata.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            unsafe { (*self.debugdata).w_extra_locals }
         }
     }
 

@@ -628,6 +628,12 @@ unsafe fn wchar_ord(w: CWCHARP, index: usize) -> u32 {
     unsafe { *w.add(index) as u32 }
 }
 
+/// `llmemory.raw_memcopy` (`llmemory.py ann_raw_memcopy`): a void memcpy.
+/// The body is `ptr::copy_nonoverlapping`; residualizing the helper keeps
+/// that std leaf as the `ExtRegistryEntry` already registered for it,
+/// matching `ll_raw_free`'s `dont_look_inside_cannot_raise` around
+/// `raw_free`.
+#[majit_macros::dont_look_inside_cannot_raise]
 unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
     if n > 0 {
         unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };

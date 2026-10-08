@@ -245,7 +245,8 @@ fn mmap_flush(
     offset: usize,
     size: usize,
 ) -> std::io::Result<()> {
-    let start = unsafe { mmap_mapped(obj)?.as_ptr().add(offset) };
+    let mapped = pyre_object::with_roots!(obj => mmap_mapped(obj));
+    let start = unsafe { mapped?.as_ptr().add(offset) };
     // `c_msync` saves errno and releases the GIL. The pointer is the mapping,
     // not a GC object; `obj` is pinned so a move during the call is reloaded.
     let res = pyre_object::with_roots!(obj => unsafe {
@@ -363,14 +364,26 @@ pub fn __majit_wrap_mmap_flush(
             "flush() missing self",
         ));
     }
-    let obj = args[0];
-    let (p, len) = mmap_ptr(obj)?;
-    if args.len() > 1 && unsafe { !pyre_object::is_int(args[1]) } {
+    let n_args = args.len();
+    let mut obj = args[0];
+    let mut w_off = if n_args > 1 {
+        args[1]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let mut w_size = if n_args > 2 {
+        args[2]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let mapped = pyre_object::with_roots!(obj, w_off, w_size => mmap_ptr(obj));
+    let (p, len) = mapped?;
+    if n_args > 1 && unsafe { !pyre_object::is_int(w_off) } {
         return Err(pyre_interpreter::PyError::type_error(
             "flush: offset must be an integer",
         ));
     }
-    if args.len() > 2 && unsafe { !pyre_object::is_int(args[2]) } {
+    if n_args > 2 && unsafe { !pyre_object::is_int(w_size) } {
         return Err(pyre_interpreter::PyError::type_error(
             "flush: size must be an integer",
         ));
@@ -378,13 +391,13 @@ pub fn __majit_wrap_mmap_flush(
     // Read as signed so negative user input does not wrap into
     // a huge `usize` and underflow the `len - off` subtraction
     // below (Critical: previously panicked / arbitrary length).
-    let off_raw = if args.len() >= 2 {
-        unsafe { pyre_object::w_int_get_value(args[1]) }
+    let off_raw = if n_args >= 2 {
+        unsafe { pyre_object::w_int_get_value(w_off) }
     } else {
         0
     };
-    let raw_size_raw = if args.len() >= 3 {
-        unsafe { pyre_object::w_int_get_value(args[2]) }
+    let raw_size_raw = if n_args >= 3 {
+        unsafe { pyre_object::w_int_get_value(w_size) }
     } else {
         0
     };
@@ -1028,11 +1041,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "size",
-            pyre_interpreter::make_builtin_function_with_arity(
-                "size",
-                __majit_wrap_mmap_size,
-                1,
-            ),
+            pyre_interpreter::make_builtin_function_with_arity("size", __majit_wrap_mmap_size, 1),
         )
     };
 

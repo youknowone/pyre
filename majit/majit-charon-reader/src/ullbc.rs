@@ -1077,6 +1077,29 @@ pub fn is_closure_leaf(leaf: &str) -> bool {
     leaf == "closure" || leaf.starts_with("closure#")
 }
 
+/// Whether a path leaf is a Charon `PathElem::Builtin` const initializer
+/// (`PromotedConst` / `AnonConst`), spelled `promoted` / `promoted#N` /
+/// `anon_const` / `anon_const#N`.
+///
+/// Charon's default `--consts initializers` emits uses of these as
+/// 0-arg calls to the synthesised FunDecl; they are values, not JIT
+/// call targets.
+pub fn is_const_initializer_leaf(leaf: &str) -> bool {
+    leaf == "promoted"
+        || leaf.starts_with("promoted#")
+        || leaf == "anon_const"
+        || leaf.starts_with("anon_const#")
+}
+
+/// Numbered Charon `PathElem::Builtin` leaf: `kind` at `n == 0`, `kind#n` else.
+fn numbered_builtin_leaf(kind: &str, n: u64) -> String {
+    if n == 0 {
+        kind.to_string()
+    } else {
+        format!("{kind}#{n}")
+    }
+}
+
 /// The segment label of a `PathElem::Builtin(kind, n)`, spelled
 /// `{"Builtin": [kind, n]}`.
 ///
@@ -1085,21 +1108,22 @@ pub fn is_closure_leaf(leaf: &str) -> bool {
 /// - `DropGlue` renders as `drop_in_place`, the method of the drop-glue
 ///   impl.
 /// - `VTable` renders as `{vtable}`, the leaf of a trait's vtable struct.
+/// - `PromotedConst` / `AnonConst` / `ClosureAsFn` / `VTableMethod` keep
+///   distinct leaves so CallRegistry does not collapse them onto one
+///   `<Builtin>` path.
 ///
 /// Other builtins stay on the `<Builtin>` label.
 pub fn builtin_path_label(seg: &Value) -> Option<String> {
     let arr = seg.as_object()?.get("Builtin")?.as_array()?;
+    let n = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
     match arr.first().and_then(Value::as_str)? {
-        "Closure" => {
-            let n = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
-            Some(if n == 0 {
-                "closure".to_string()
-            } else {
-                format!("closure#{n}")
-            })
-        }
+        "Closure" => Some(numbered_builtin_leaf("closure", n)),
         "DropGlue" => Some("drop_in_place".to_string()),
         "VTable" => Some("{vtable}".to_string()),
+        "PromotedConst" => Some(numbered_builtin_leaf("promoted", n)),
+        "AnonConst" => Some(numbered_builtin_leaf("anon_const", n)),
+        "ClosureAsFn" => Some(numbered_builtin_leaf("closure_as_fn", n)),
+        "VTableMethod" => Some(numbered_builtin_leaf("{vtable_method}", n)),
         _ => None,
     }
 }
@@ -2417,6 +2441,45 @@ mod tests {
         ]));
         assert_eq!(generic.name_path(), "core::ptr::null");
         assert_eq!(generic.instantiation(), None);
+    }
+
+    #[test]
+    fn builtin_path_kinds_keep_distinct_leaves() {
+        let cases = [
+            (r#"{"Builtin":["Closure",0]}"#, "closure"),
+            (r#"{"Builtin":["Closure",2]}"#, "closure#2"),
+            (r#"{"Builtin":["DropGlue",0]}"#, "drop_in_place"),
+            (r#"{"Builtin":["VTable",0]}"#, "{vtable}"),
+            (r#"{"Builtin":["PromotedConst",0]}"#, "promoted"),
+            (r#"{"Builtin":["PromotedConst",3]}"#, "promoted#3"),
+            (r#"{"Builtin":["AnonConst",0]}"#, "anon_const"),
+            (r#"{"Builtin":["AnonConst",1]}"#, "anon_const#1"),
+            (r#"{"Builtin":["ClosureAsFn",0]}"#, "closure_as_fn"),
+            (r#"{"Builtin":["VTableMethod",0]}"#, "{vtable_method}"),
+        ];
+        for (json, want) in cases {
+            let v: Value = serde_json::from_str(json).unwrap();
+            assert_eq!(builtin_path_label(&v).as_deref(), Some(want), "{json}");
+        }
+        let unknown: Value = serde_json::from_str(r#"{"Builtin":["OtherKind",0]}"#).unwrap();
+        assert_eq!(builtin_path_label(&unknown), None);
+
+        let meta = item_meta(serde_json::json!([
+            {"Ident": ["pyre_interpreter", 0]},
+            {"Ident": ["baseobjspace", 0]},
+            {"Ident": ["getattr_str_impl", 0]},
+            {"Builtin": ["AnonConst", 0]}
+        ]));
+        assert_eq!(
+            meta.name_path(),
+            "pyre_interpreter::baseobjspace::getattr_str_impl::anon_const"
+        );
+        assert!(is_const_initializer_leaf("promoted"));
+        assert!(is_const_initializer_leaf("promoted#11"));
+        assert!(is_const_initializer_leaf("anon_const"));
+        assert!(is_const_initializer_leaf("anon_const#1"));
+        assert!(!is_const_initializer_leaf("closure"));
+        assert!(!is_const_initializer_leaf("getindex_w_index"));
     }
 
     /// A call to a monomorphized copy reads the copy's instance arguments
