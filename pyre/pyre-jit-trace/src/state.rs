@@ -9862,7 +9862,7 @@ fn materialize_concrete_virtual_ptr(
             // slot is `virtual_token`, not `w_class`, so it returns None and
             // this seeding is skipped.
             let gcref = majit_ir::GcRef(ptr as usize);
-            // resume.py:620 cache BEFORE filling fields (circular ref safe)
+            // VirtualInfo.allocate stores the struct in virtuals_cache before setfields so a circular reference resolves to it
             cache.set_concrete_ptr(vidx, gcref);
             let ptr = live_concrete_addr(cache, vidx, ptr);
             if let Some(w_class) = size_descr.w_class_obj() {
