@@ -3174,9 +3174,8 @@ impl TraceCtx {
     /// `jitcode_index` and `pc` of the frame the guard belongs to so
     /// downstream layout matching (`jit_state.rs::*` keys on these
     /// fields) sees real coordinates rather than the previous
-    /// `0/0` placeholder.  `vable_boxes` and `vref_boxes` are empty:
-    /// callers using this path don't manage virtualizables or virtual
-    /// refs.
+    /// `0/0` placeholder.  Virtualizable / virtualref arrays come from
+    /// `build_snapshot_vable_vref_boxes` (`pyjitpl.py capture_resumedata`).
     ///
     /// Convergence: once `S::Sym` is lifted into
     /// `MIFrame::populate_for_guard`, both call sites can route through
@@ -3196,13 +3195,19 @@ impl TraceCtx {
         jitcode_index: u32,
         pc: u32,
     ) {
+        // `pyjitpl.py capture_resumedata` always passes
+        // `self.virtualizable_boxes` / `self.virtualref_boxes` when the
+        // jitdriver has a virtualizable. Hardcoding empty arrays here
+        // numbered a 0-length vable section that `consume_vable_info`
+        // then refused (`assert vable_size`).
+        let (vable_boxes, vref_boxes) = self.build_snapshot_vable_vref_boxes();
         self.capture_snapshot_for_last_guard_with_vable_vref(
             active_boxes,
             jitcode_index,
             pc,
             pc,
-            &[],
-            &[],
+            &vable_boxes,
+            &vref_boxes,
         );
     }
 
@@ -3296,7 +3301,14 @@ impl TraceCtx {
         &mut self,
         frames: &[(u32, u32, u32, &[OpRef])],
     ) {
-        self.capture_snapshot_for_last_guard_multi_frame_with_vable_vref(frames, &[], &[]);
+        // `pyjitpl.py capture_resumedata` prefixes the top snapshot with
+        // the live virtualizable / virtualref arrays.
+        let (vable_boxes, vref_boxes) = self.build_snapshot_vable_vref_boxes();
+        self.capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
+            frames,
+            &vable_boxes,
+            &vref_boxes,
+        );
     }
 
     /// `capture_snapshot_for_last_guard_multi_frame` extended with

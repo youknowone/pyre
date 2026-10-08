@@ -4438,6 +4438,11 @@ impl TraceCtx {
         Vec<crate::recorder::SnapshotTagged>,
         Vec<crate::recorder::SnapshotTagged>,
     ) {
+        // `pyjitpl.py capture_resumedata` passes `self.virtualizable_boxes`
+        // when the jitdriver has a virtualizable (or greenfield). The list
+        // is identity-appended by `initialize_virtualizable`;
+        // `_list_of_boxes_virtualizable` encodes an empty array only when
+        // that list is absent.
         let vable_slice: &[OpRef] = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
         let vable_boxes = crate::pyjitpl::build_vable_snapshot_boxes(vable_slice);
         let vref_boxes = crate::pyjitpl::build_vref_snapshot_boxes(&self.virtualref_boxes);

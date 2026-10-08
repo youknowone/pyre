@@ -509,6 +509,65 @@ pub(crate) fn mirror_vable_static_to_boxes(
     }
 }
 
+/// Snapshot-only write of a STANDARD static: update the boxes the snapshot
+/// copies, and do not write the live `PyFrame`. `pyjitpl.py`
+/// `capture_resumedata` overrides `frame.pc` for the snapshot and restores
+/// it; the heap `pushvalue`/`popvalue` depth stays the walk's.
+pub(crate) fn mirror_vable_static_to_boxes_nosync(
+    ctx: &mut TraceCtx,
+    static_field_name: &str,
+    opref: OpRef,
+    concrete: Value,
+) {
+    if !ctx.has_virtualizable_shadow() {
+        return;
+    }
+    let idx = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name(static_field_name));
+    if let Some(idx) = idx {
+        ctx.set_virtualizable_entry_at(idx, opref, concrete);
+    }
+}
+
+/// Live STANDARD `last_instr` / `valuestackdepth` boxes saved across a
+/// resume-image publish.
+///
+/// `pyjitpl.py` `capture_resumedata` saves `frame.pc` before rewriting it for
+/// the snapshot and restores it afterwards. The walker publishes those
+/// scalars into `virtualizable_boxes` because `build_snapshot_vable_vref_boxes`
+/// reads that shadow. Restore is boxes-only (`nosync`): the heap copy stays
+/// whatever `mirror_vable_static_to_boxes` / `_opimpl_setfield_vable`
+/// `synchronize_virtualizable` last wrote.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SavedVableResumeScalars {
+    last_instr: Option<(OpRef, Value)>,
+    valuestackdepth: Option<(OpRef, Value)>,
+}
+
+fn vable_static_entry(ctx: &TraceCtx, static_field_name: &str) -> Option<(OpRef, Value)> {
+    let idx = ctx
+        .virtualizable_info()?
+        .static_field_index_by_name(static_field_name)?;
+    ctx.virtualizable_entry_at(idx)
+}
+
+pub(crate) fn save_vable_resume_scalars(ctx: &TraceCtx) -> SavedVableResumeScalars {
+    SavedVableResumeScalars {
+        last_instr: vable_static_entry(ctx, "last_instr"),
+        valuestackdepth: vable_static_entry(ctx, "valuestackdepth"),
+    }
+}
+
+pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVableResumeScalars) {
+    if let Some((opref, concrete)) = saved.last_instr {
+        mirror_vable_static_to_boxes_nosync(ctx, "last_instr", opref, concrete);
+    }
+    if let Some((opref, concrete)) = saved.valuestackdepth {
+        mirror_vable_static_to_boxes_nosync(ctx, "valuestackdepth", opref, concrete);
+    }
+}
+
 /// Resolve the mutable frame-mirror index for a stack slot.
 ///
 /// RPython `pyjitpl.py` keeps each kind-specific register bank indexed by
@@ -2020,6 +2079,9 @@ impl MIFrame {
                 s.owns_virtualizable_shadow()
             };
             if owns {
+                // `interp_jit.py` `jump_absolute` writes `frame.last_instr`
+                // before `can_enter_jit`. The merge image is that live-frame
+                // write; snapshot capture still save/restores the boxes.
                 mirror_vable_static_to_boxes(
                     ctx,
                     "last_instr",

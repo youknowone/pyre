@@ -7210,6 +7210,13 @@ mod tests {
 
     /// Drive `BC_CALL_ASSEMBLER_VOID` with a live token-bearing virtualizable
     /// in ref register 0, matching `virtualizable_boxes[-1]`.
+    ///
+    /// `initialize_virtualizable` (pyjitpl.py) mints the identity as a Ref
+    /// inputarg (`original_boxes[index_of_virtualizable]`) and appends that
+    /// same box as `virtualizable_boxes[-1]`. A recorder with no inputargs
+    /// leaves `OpRef::input_arg_ref(0)` without a `*FrontendOp`, so
+    /// `box_bits` fails and `prepare_standard_virtualizable_before_residual_call`
+    /// records no `FORCE_TOKEN`.
     fn trace_call_assembler_void<R: JitCodeRuntime>(
         concrete_ptr: *const (),
         runtime: &R,
@@ -7225,17 +7232,12 @@ mod tests {
         ));
         let jitcode = call_assembler_void_jitcode(concrete_ptr);
         let asm = majit_jitcode::codewriter::assembler::Assembler::new();
-        let mut ctx = context_with_liveness(&[], &asm);
+        let mut ctx = context_with_liveness(&[Type::Ref], &asm);
         ctx.install_virtualizable_info(info.clone());
         let vable_ref = OpRef::input_arg_ref(0);
-        ctx.init_virtualizable_boxes(
-            info.as_ref(),
-            vable_ref,
-            Value::Ref(majit_ir::GcRef(addr)),
-            &[],
-            &[],
-            &[],
-        );
+        let vable_value = Value::Ref(majit_ir::GcRef(addr));
+        ctx.stamp_live_inputargs(&[vable_value]);
+        ctx.init_virtualizable_boxes(info.as_ref(), vable_ref, vable_value, &[], &[], &[]);
         let mut sym = DummySym;
         let _ = crate::take_walk_abort();
         let action = trace_jitcode_with_args_and_runtime(

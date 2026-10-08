@@ -1770,7 +1770,20 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             vstack_reorder_ceiling: u32::MAX,
 
             vstack_handler_landing_py: None,
-            live_before_jit_pc: usize::MAX,
+            // `get_list_of_active_boxes` (`pyjitpl.py`) reads
+            // `pc = self.pc - SIZE_LIVE_OP`. `setup_resume_at_op` leaves
+            // `MIFrame.pc` at the rebuilt resume coordinate, so a plain
+            // guard in this carrier walk snapshots that same `-live-`.
+            live_before_jit_pc: if callee_pjc
+                .jitcode
+                .can_decode_live_vars(entry, crate::state::op_live())
+            {
+                entry
+            } else {
+                super::preceding_live_marker(callee_pjc, entry)
+                    .or_else(|| callee_pjc.resume_marker_for_jitcode_pc(entry))
+                    .unwrap_or(usize::MAX)
+            },
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             is_top_level: false,

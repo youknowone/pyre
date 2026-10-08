@@ -6328,7 +6328,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
 
-    if !nested_helper && sym.owns_virtualizable_shadow() {
+    let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
+        let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
         let last_instr = call_site_py_pc as i64 - 1;
         let last_instr_op = ctx.trace_ctx.const_int(last_instr);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -6344,7 +6345,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             vsd_op,
             Value::Int(vsd_value),
         );
-    }
+        Some(saved)
+    } else {
+        None
+    };
 
     // Build-time canonical helper JitCodes use the one global Assembler
     // descriptor pool.  Temporarily give the wrapper sub-frame that pool;
@@ -6433,6 +6437,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    if let Some(saved) = saved_vable {
+        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
+    }
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
@@ -6834,7 +6841,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
 
-    if !nested_helper && sym.owns_virtualizable_shadow() {
+    let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
+        let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
         let last_instr = call_site_py_pc as i64 - 1;
         let last_instr_op = ctx.trace_ctx.const_int(last_instr);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -6850,7 +6858,10 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             vsd_op,
             Value::Int(vsd_value),
         );
-    }
+        Some(saved)
+    } else {
+        None
+    };
 
     let saved_entry = ctx.entry_py_pc;
     let saved_marker = ctx.outer_resume_marker_jit_pc;
@@ -6897,6 +6908,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    if let Some(saved) = saved_vable {
+        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
+    }
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
