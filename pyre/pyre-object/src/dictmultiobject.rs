@@ -2495,14 +2495,14 @@ unsafe fn w_module_dict_setitem_str_internal(
             w_dict_bump_keys_version(obj);
         } else {
             dict_entries_value_set_at(entries, idx as usize, roots.get(value_slot));
-        };
+        }
         return;
     }
     {
         let strategy = w_module_dict_module_strategy_mut(obj);
-        let old_len = w_module_dict_module_storage(obj).len();
         // `_setitem_str_cell_known` barriers whichever object it stores
         // into: the cell for an in-place rewrite, the storage otherwise.
+        let old_len = w_module_dict_module_storage(obj).len();
         crate::with_roots!(obj => strategy.setitem_str(obj, key, w_value));
         if w_module_dict_module_storage(obj).len() != old_len {
             w_dict_bump_keys_version(obj);
@@ -3290,7 +3290,7 @@ pub unsafe fn w_dict_store_hashed_checked(
 
 unsafe fn w_dict_store_checked_inner(
     mut obj: PyObjectRef,
-    key: PyObjectRef,
+    mut key: PyObjectRef,
     mut value: PyObjectRef,
     keyhash: i64,
     hash_known: i64,
@@ -3302,11 +3302,15 @@ unsafe fn w_dict_store_checked_inner(
     let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
     let strategy = dstrategy.imp;
     if strategy_is(dstrategy, StrategyKind::Empty) {
-        crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
+        crate::with_roots!(obj, key, value => {
+            crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key)
+        });
         return w_dict_store_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::EmptyKwargs) {
-        crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
+        crate::with_roots!(obj, key, value => {
+            crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key)
+        });
         return w_dict_store_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Object) {
@@ -3426,12 +3430,20 @@ pub unsafe fn w_dict_setdefault_checked(
     // post-hoc `take_hash_error()` would observe no pending error.
     if strategy_is(dstrategy, StrategyKind::Empty) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
-        w_dict_store_checked(obj, key, value)?;
+        w_dict_store_checked(
+            _dict_guard.root(0),
+            _dict_guard.root(1),
+            _dict_guard.root(2),
+        )?;
         return Ok(_dict_guard.root(2));
     }
     if strategy_is(dstrategy, StrategyKind::EmptyKwargs) {
         crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
-        w_dict_store_checked(obj, key, value)?;
+        w_dict_store_checked(
+            _dict_guard.root(0),
+            _dict_guard.root(1),
+            _dict_guard.root(2),
+        )?;
         return Ok(_dict_guard.root(2));
     }
     if strategy_is(dstrategy, StrategyKind::Object) {
@@ -7299,20 +7311,27 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.getitem(w_dict, w_key)
     }
 
-    unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
+    unsafe fn setitem(
+        &self,
+        mut w_dict: PyObjectRef,
+        mut w_key: PyObjectRef,
+        mut w_value: PyObjectRef,
+    ) {
         // `dictmultiobject.py setitem` — promote via the subclass's
         // `switch_to_correct_strategy`, then setitem on the new
         // strategy.  The kwargs override redirects the unicode
         // branch to KwargsDictStrategy.
-        self.switch_to_correct_strategy(w_dict, w_key);
+        crate::with_roots!(w_dict, w_key, w_value => {
+            self.switch_to_correct_strategy(w_dict, w_key)
+        });
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
+    unsafe fn setitem_str(&self, mut w_dict: PyObjectRef, key: &str, mut w_value: PyObjectRef) {
         // `dictmultiobject.py` setitem_str — caller already
         // chose the str-keyed path, so promote directly to
         // KwargsDictStrategy via the subclass override.
-        self.switch_to_kwargs_strategy(w_dict);
+        crate::with_roots!(w_dict, w_value => self.switch_to_kwargs_strategy(w_dict));
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
@@ -7423,11 +7442,13 @@ impl DictStrategy for EmptyDictStrategy {
     // dictmultiobject.py setdefault
     unsafe fn setdefault(
         &self,
-        w_dict: PyObjectRef,
-        w_key: PyObjectRef,
-        w_value: PyObjectRef,
+        mut w_dict: PyObjectRef,
+        mut w_key: PyObjectRef,
+        mut w_value: PyObjectRef,
     ) -> PyObjectRef {
-        self.switch_to_correct_strategy(w_dict, w_key);
+        crate::with_roots!(w_dict, w_key, w_value => {
+            self.switch_to_correct_strategy(w_dict, w_key)
+        });
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
         w_value
     }
@@ -7446,21 +7467,30 @@ impl DictStrategy for EmptyDictStrategy {
         }
     }
 
-    unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
+    unsafe fn setitem(
+        &self,
+        mut w_dict: PyObjectRef,
+        mut w_key: PyObjectRef,
+        mut w_value: PyObjectRef,
+    ) {
         // `dictmultiobject.py setitem`:
         //   self.switch_to_correct_strategy(w_dict, w_key)
         //   w_dict.setitem(w_key, w_value)
-        self.switch_to_correct_strategy(w_dict, w_key);
+        crate::with_roots!(w_dict, w_key, w_value => {
+            self.switch_to_correct_strategy(w_dict, w_key)
+        });
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
+    unsafe fn setitem_str(&self, mut w_dict: PyObjectRef, key: &str, mut w_value: PyObjectRef) {
         // `dictmultiobject.py setitem_str`:
         //   self.switch_to_unicode_strategy(w_dict)
         //   w_dict.setitem_str(key, w_value)
         // Unicode-strategy promotion is direct since the caller has
         // already chosen the str-keyed path.
-        install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY_REF);
+        crate::with_roots!(w_dict, w_value => {
+            install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY_REF)
+        });
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 

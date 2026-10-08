@@ -854,6 +854,45 @@ pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     if ptr as usize != addr {
         INTERN_TABLE_OBJ.store(ptr as usize, Ordering::Release);
     }
+    // The table object is old. A minor's extra-root walk forwards that
+    // pointer and does not run its custom trace unless the write barrier
+    // remembered it (`intern_exact_str`). Publish each WEAKREF here so the
+    // same walk copies it; `invalidate_young_weakrefs` then rewrites
+    // `weakptr` to the surviving string. A weakref left unvisited keeps the
+    // pre-move address, and the next `sys.intern` of an equal value misses.
+    // `try_lock`: `intern_table_custom_trace` locks this table while a
+    // collection is already walking it.
+    if INTERN_WEAK_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let Some(mut table) = STRING_INTERN_TABLE.try_lock() else {
+        return;
+    };
+    for slot in table.values_mut() {
+        let InternSlot::Weak(addr) = *slot else {
+            continue;
+        };
+        if addr == 0 {
+            continue;
+        }
+        // Read the target before the weakref moves: forwarding overwrites
+        // payload word 0, which is `weakptr`. Visit the string first so a
+        // major marks it and a minor copies it, then publish both addresses.
+        // `sys.intern` keeps the canonical object alive for the process.
+        let mut target =
+            unsafe { crate::weakref::w_weakref_deref(addr as *const crate::weakref::Weakref) };
+        if !target.is_null() {
+            visitor(&mut target);
+        }
+        let mut wptr = addr as PyObjectRef;
+        visitor(&mut wptr);
+        if !wptr.is_null() && !target.is_null() {
+            unsafe {
+                (*(wptr as *mut crate::weakref::Weakref)).weakptr = target;
+            }
+        }
+        *slot = InternSlot::Weak(wptr as usize);
+    }
 }
 
 /// Return the process-wide canonical exact `str` for `obj`'s value.

@@ -79,6 +79,15 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
     (marker.opname == "live").then_some(marker.pc)
 }
 
+/// The `-live-` directly before `op_pc`: the liveness a plain guard reads
+/// (`get_list_of_active_boxes`, `pc = self.pc - SIZE_LIVE_OP`).
+fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
+    let pc = op_pc.checked_sub(SIZE_LIVE_OP)?;
+    let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
+    (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
+}
+
 /// Select the resume marker for an after-residual-call guard.  The bytecode's
 /// immediate trailing `-live-` is the RPython authority; metadata twins are
 /// compatibility fallbacks for incomplete/fixture bodies.
@@ -1835,7 +1844,7 @@ enum CallerOperandSlots {
 }
 
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
-/// caller whose operand stack ends at `stack_end`. The two CALL forms name
+/// caller whose operand stack ends at `stack_end`. The CALL forms name
 /// their synthetic `null_or_self` sentinel and callable proof; every other
 /// shape names only how many operands it consumes, and the deepest of those
 /// plays the role the callable plays for CALL. `None` keeps the conservative
@@ -1893,12 +1902,12 @@ fn caller_operand_slots<Sym: WalkSym>(
     // so the two shapes differ only in where the stack ends above the
     // arguments, and both name the same synthetic sentinel and callable proof.
     let call_shape = match instruction {
-        pyre_interpreter::Instruction::Call { argc } => Some((argc, 1usize)),
-        pyre_interpreter::Instruction::CallKw { argc } => Some((argc, 2usize)),
+        pyre_interpreter::Instruction::Call { argc } => Some((argc.get(op_arg) as usize, 1usize)),
+        pyre_interpreter::Instruction::CallKw { argc } => Some((argc.get(op_arg) as usize, 2usize)),
         _ => None,
     };
     if let Some((argc, slots_above_args)) = call_shape {
-        let null_or_self = stack_end.checked_sub(argc.get(op_arg) as usize + slots_above_args)?;
+        let null_or_self = stack_end.checked_sub(argc + slots_above_args)?;
         return Some(CallerOperandSlots::Call {
             null_or_self,
             callable: null_or_self.checked_sub(1)?,
@@ -3287,36 +3296,52 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // on a miss, while plain guards retain the raw `callee_op_pc` on a miss.
     // Computed before box collection so encoder liveness and decoder resume
     // use the same coordinate.
-    let callee_jitcode_pc: i32 = match after_residual_call {
-        true => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
-            .or_else(|| {
-                // Fallback only, for the same reason as the single-frame path:
-                // the sticky cursor names this frame's op only while no other
-                // residual has passed, so it may not displace the twin.
-                (ctx.live_after_jit_pc != usize::MAX
-                    && callee_pjc
-                        .jitcode
-                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
-                .then_some(ctx.live_after_jit_pc)
-            })
-            .map(|m| m as i32)
-            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
-        // No `-live-` BEFORE anchor arm here, unlike the single-frame path.
-        // The marker below is `callee_op_pc`'s codewrite-time twin: the
-        // coordinate whose liveness window the boxes this frame is about to
-        // collect were emitted against. `ctx.live_before_jit_pc` is merely
-        // another `-live-` byte the walk stepped over, and passing
-        // `can_decode_live_vars` only says its window decodes, not that it is
-        // the one those boxes belong to. Carrying it makes
-        // `collect_callee_active_boxes` size the section from one coordinate
-        // while reading the values out of the sub-walk registers at another.
-        // The single-frame path can substitute the anchor because it re-reads
-        // the owning frame's vable shadow at the carried coordinate; the callee
-        // sub-walk owns no shadow to re-read.
-        false => callee_pjc
-            .resume_marker_for_jitcode_pc(callee_op_pc)
-            .map(|m| m as i32)
-            .unwrap_or(callee_op_pc as i32),
+    // `GuardCaptureScope::carried_resume_jit_pc` is already the post-call
+    // `-live-` (`pyjitpl.py` `generate_guard` / `capture_resumedata`,
+    // `after_residual_call=True`, `resumepc=-1` leaves `MIFrame.pc` after
+    // the call). `resume_marker_for_jitcode_pc` is the opcode-start
+    // `-live-`; resuming there re-executes the call from the `in_a_call`
+    // image whose operands `get_list_of_active_boxes` has cleared.
+    let callee_jitcode_pc: i32 = if let Some(carried) = scope.carried_resume_jit_pc {
+        carried as i32
+    } else {
+        match after_residual_call {
+            true => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
+                .or_else(|| {
+                    // Fallback only, for the same reason as the single-frame path:
+                    // the sticky cursor names this frame's op only while no other
+                    // residual has passed, so it may not displace the twin.
+                    (ctx.live_after_jit_pc != usize::MAX
+                        && callee_pjc
+                            .jitcode
+                            .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
+                    .then_some(ctx.live_after_jit_pc)
+                })
+                .map(|m| m as i32)
+                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+            // No `-live-` BEFORE anchor arm here, unlike the single-frame path.
+            // The marker below is `callee_op_pc`'s codewrite-time twin: the
+            // coordinate whose liveness window the boxes this frame is about to
+            // collect were emitted against. `ctx.live_before_jit_pc` is merely
+            // another `-live-` byte the walk stepped over, and passing
+            // `can_decode_live_vars` only says its window decodes, not that it is
+            // the one those boxes belong to. Carrying it makes
+            // `collect_callee_active_boxes` size the section from one coordinate
+            // while reading the values out of the sub-walk registers at another.
+            // The single-frame path can substitute the anchor because it re-reads
+            // the owning frame's vable shadow at the carried coordinate; the callee
+            // sub-walk owns no shadow to re-read.  `orgpc_live_resume` names a
+            // different coordinate: the `-live-` directly before `callee_op_pc`,
+            // which is this op's own liveness window, so nothing has run between it
+            // and the registers read below.
+            false => scope
+                .orgpc_live_resume
+                .then(|| preceding_live_marker(&callee_pjc, callee_op_pc))
+                .flatten()
+                .or_else(|| callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc))
+                .map(|m| m as i32)
+                .unwrap_or(callee_op_pc as i32),
+        }
     };
     let mf_diag = fbw_mf_diag_enabled();
     let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();

@@ -1892,6 +1892,18 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let root_ec = sym.concrete_execution_context();
     let root_ec_box = sym.execution_context();
     let root_frame_box = sym.frame();
+    // The scope the guard left open, as `setup_bridge_sym` published it.  The
+    // sub-walk enters and leaves frames on the live `topframeref`, so a drain
+    // that hands the guard back to the blackhole restores this first: the
+    // blackhole resumes the innermost frame with its scope still open.
+    let _entry_topframeref_roots = pyre_object::gc_roots::push_roots();
+    let entry_topframeref_slot = (!root_ec.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(
+            unsafe { (*root_ec).topframeref } as pyre_object::PyObjectRef
+        );
+        slot
+    });
     let recursive_carrier = carrier_contains_recursive_portal(w_code, carrier);
     if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
@@ -1983,10 +1995,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
     // `finishframe_exception` (`pyjitpl.py`): an exception-guard bridge
     // resumes the failing frame at the no-exception fallthrough. When that
-    // frame's own try covers the raising call, `ChangeFrame` into the
-    // handler instead of recording the fallthrough (`else` of
-    // `assert_index_same`, outside the try).
-    let deepest_handler = if ctx.bridge_source_is_exception_guard() {
+    // frame's own try covers the raising call, enter the handler with the
+    // exception already raised. No local catch stays on the fallthrough.
+    let handler_entry = if ctx.bridge_source_is_exception_guard() {
         let exc_ptr = sym.last_exc_value();
         let exc_box = sym.last_exc_box();
         if exc_ptr.is_null() || exc_box.is_none() {
@@ -2000,12 +2011,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             .or_else(|| {
                 carrier_catch_target(callee_pjc.jitcode.code.as_slice(), entry, "deepest-entry")
             })
-            .map(|catch_target| {
-                (
-                    exc_box,
-                    crate::state::ConcreteValue::Ref(exc_ptr),
-                    catch_target,
-                )
+            .map(|catch_target| crate::jitcode_dispatch::FrameHandlerEntry::Caught {
+                exc: exc_box,
+                exc_concrete: crate::state::ConcreteValue::Ref(exc_ptr),
+                catch_target,
             })
         }
     } else {
@@ -2047,7 +2056,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         } else {
             &[]
         },
-        deepest_handler,
+        handler_entry,
     );
     let deepest_got_exception = matches!(
         &walk,
@@ -2056,8 +2065,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             _
         )))
     );
-    // `SwitchToBlackhole` already left `_interpret`. Recording this leave
-    // would be another step after the raise.
+    // `execute_frame`'s `finally: ec.leave(...)` runs once the frame has
+    // returned or raised. Any other outcome leaves the frame unfinished.
+    // `SwitchToBlackhole` already left `_interpret`, so a too-long walk
+    // must not record a second leave.
     let deepest_too_long = session.borrow().trace_too_long
         || matches!(
             walk,
@@ -2065,7 +2076,15 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
             ))
         );
-    if !deepest_too_long {
+    let deepest_finished = deepest_got_exception
+        || matches!(
+            &walk,
+            Some(Ok((
+                crate::jitcode_dispatch::DispatchOutcome::SubReturn { .. },
+                _
+            )))
+        );
+    if deepest_finished && !deepest_too_long {
         crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
     }
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
@@ -2320,6 +2339,12 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // cursors back on the same condition.
         crate::jitcode_dispatch::fbw_store_journal_rollback();
         crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+        if let Some(slot) = entry_topframeref_slot {
+            unsafe {
+                (*(root_ec as *mut pyre_interpreter::PyExecutionContext)).topframeref =
+                    pyre_object::gc_roots::shadow_stack_get(slot) as *mut pyre_interpreter::PyFrame;
+            }
+        }
     }
     // An inlined `TraceTooLong` is `SwitchToBlackhole(ABORT_TOO_LONG)` on
     // the outer walk (`full_body_walk_trace`). The carrier drain used to

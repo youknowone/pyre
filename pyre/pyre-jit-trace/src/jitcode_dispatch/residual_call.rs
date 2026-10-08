@@ -6566,6 +6566,15 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     if !ctx.is_authoritative_executor {
         return None;
     }
+    // `dict[str] = value` that `try_walker_orthodox_store_subscr` declined
+    // (exact list + int index only).  The generic residual still writes the
+    // live dict.  Snapshot the displaced item on the namespace journal so a
+    // non-commit epilogue puts it back and the entry replay applies the store
+    // once.  A dict or str subclass may override `__setitem__`, so only the
+    // exact builtin pair is reversible through `w_dict_setitem_wtf8_no_proxy`.
+    if helper == K::StoreSubscr {
+        return journal_walker_dict_store_subscr(ctx, r_args);
+    }
     let binds_name = matches!(helper, K::StoreName | K::DeleteName);
     if !binds_name && !matches!(helper, K::StoreGlobal | K::DeleteGlobal) {
         return None;
@@ -6610,7 +6619,78 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     // An in-flight delivery re-runs the body from that pc, so this one binding
     // is re-applied by the delivery itself and its rollback closes no road.
     let loop_var = is_loop_var_binding_store(ctx, helper);
-    fbw_namespace_store_journal_push(namespace, name, displaced, loop_var);
+    fbw_namespace_store_journal_push(namespace, name, displaced, loop_var, None);
+    Some(())
+}
+
+/// Journal an exact-dict `STORE_SUBSCR` whose key is an exact `str`.
+///
+/// Rollback restores through [`fbw_namespace_store_journal_rollback`], which
+/// reads the key with `w_str_get_wtf8`.  A missing item is stored as null so
+/// the rollback deletes the binding the residual is about to create.
+///
+/// The snapshot lookup must not run a stored key's Python `__eq__`.
+/// `ObjectDictStrategy` does, and the residual store plus a rollback would
+/// then run it again.  Only an empty dict, a `UnicodeDictStrategy` dict, or a
+/// module dict still on `ModuleDictStrategy` is snapshotted.  Rollback
+/// restores that entry only while it is still the object this walk stored.
+fn journal_walker_dict_store_subscr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<()> {
+    let (&dict_op, &key_op) = (r_args.first()?, r_args.get(1)?);
+    let (
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(dict_ptr))),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(key_ptr))),
+    ) = (
+        ctx.trace_ctx.box_value(dict_op),
+        ctx.trace_ctx.box_value(key_op),
+    )
+    else {
+        return None;
+    };
+    if dict_ptr == 0 || key_ptr == 0 {
+        return None;
+    }
+    let dict = dict_ptr as pyre_object::PyObjectRef;
+    let key = key_ptr as pyre_object::PyObjectRef;
+    // SAFETY: both addresses are live trace-box references.
+    let reversible = unsafe {
+        (pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE)
+            || pyre_object::is_module_dict(dict))
+            && pyre_object::is_exact_type(key, &pyre_object::STR_TYPE)
+    };
+    if !reversible {
+        return None;
+    }
+    let displaced = unsafe {
+        if pyre_object::is_module_dict(dict) {
+            if pyre_object::w_module_dict_is_object_strategy(dict) {
+                return None;
+            }
+            let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
+            pyre_object::w_module_dict_getitem_str(dict, key_text).unwrap_or(std::ptr::null_mut())
+        } else if pyre_object::w_dict_is_empty_strategy(dict) {
+            std::ptr::null_mut()
+        } else {
+            pyre_object::w_dict_lookup_str_keyed(dict, key, std::ptr::null_mut())?
+        }
+    };
+    let &value_op = r_args.get(2)?;
+    let Some(majit_ir::Value::Ref(majit_ir::GcRef(value_ptr))) = ctx.trace_ctx.box_value(value_op)
+    else {
+        return None;
+    };
+    if value_ptr == 0 {
+        return None;
+    }
+    fbw_namespace_store_journal_push(
+        dict,
+        key,
+        displaced,
+        false,
+        Some(value_ptr as pyre_object::PyObjectRef),
+    );
     Some(())
 }
 

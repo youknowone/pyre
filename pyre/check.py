@@ -784,6 +784,10 @@ def child_env_base():
     return env
 
 
+# 4MB: env.py NURSERY_SIZE_UNKNOWN_CACHE / collector.rs DEFAULT_NURSERY_SIZE
+PYPY_GC_NURSERY_PIN = str(4 * 1024 * 1024)
+
+
 def pyre_env():
     """Child environment for pyre runs: strict JIT plus one-line stats.
 
@@ -830,7 +834,7 @@ def pyre_env():
     # threshold pin below removes the collection those readings were counting,
     # and the baselines are recorded with both pins in place — but it still
     # fixes the minor schedule and the nursery term the threshold derives from.
-    env.setdefault("PYPY_GC_NURSERY", str(4 * 1024 * 1024))
+    env.setdefault("PYPY_GC_NURSERY", PYPY_GC_NURSERY_PIN)
     # Pin the major-collection threshold too, because the nursery pin above only
     # fixes one term of it. `min_heap_size` is `PYPY_GC_MIN`, else `nursery * 8`
     # (collector.rs:648), floored by `nursery * major_collection_threshold`
@@ -1032,6 +1036,26 @@ def pyre_env():
     # PYRE_WASM_ENGINE in the environment wins over the --wasm-engine default.
     if "PYRE_WASM_ENGINE" not in env:
         env["PYRE_WASM_ENGINE"] = WASM_ENGINE
+    return env
+
+
+def pypy_env():
+    """Child environment for pypy oracle runs: inherited env plus a pinned nursery.
+
+    PyPy sizes its nursery from the host cache: `get_L2cache_linux2_system_cpu_index`
+    (env.py) sums L2+L3, and `best_nursery_size_for_L2cache` halves it when it
+    is over 8MB, else `NURSERY_SIZE_UNKNOWN_CACHE` (4MB). Ubuntu runners with a
+    32MB L3 therefore run a ~16MB nursery, so allocation-heavy fixtures depend
+    on the runner CPU. Measured: `pypy3 pyre/bench/synth/type_name_surrogate_reject.py`
+    takes 0.05s at PYPY_GC_NURSERY=1MB, 0.06s at 4MB, 0.13s at 32MB —
+    `W_TypeObject.add_subclass` (typeobject.py) scans `weak_subclasses` for a
+    dead slot, and a larger nursery leaves more dead types uncollected.
+
+    pyre runs under the same 4MB pin (`pyre_env`), so both sides of a ratio
+    see the same minor-collection schedule.
+    """
+    env = dict(os.environ)
+    env.setdefault("PYPY_GC_NURSERY", PYPY_GC_NURSERY_PIN)
     return env
 
 
@@ -3803,7 +3827,7 @@ class Check:
         try:
             targets = [
                 ("cpython", [python3(), empty_path], None),
-                ("pypy", [PYPY3, empty_path], None),
+                ("pypy", [PYPY3, empty_path], pypy_env()),
             ]
             samples = {}
             for key, cmd, env in targets:
@@ -4501,7 +4525,12 @@ class Check:
         # one pyre spawn left outside `pyre_env()`, which is how a bytecode
         # cache still appeared under a run that pins PYTHONDONTWRITEBYTECODE.
         baseline_is_pyre = baseline_key in ALL_BACKENDS
-        baseline_env = pyre_env() if baseline_is_pyre else None
+        if baseline_is_pyre:
+            baseline_env = pyre_env()
+        elif baseline_key == "pypy":
+            baseline_env = pypy_env()
+        else:
+            baseline_env = None
         pyre_times = []
         baseline_times = []
         for _ in range(attempts):
@@ -5154,7 +5183,9 @@ class Check:
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
-        pypy_output, pypy_cpu, pypy_code, _ = run_timed([PYPY3, script])
+        pypy_output, pypy_cpu, pypy_code, _ = run_timed(
+            [PYPY3, script], env=pypy_env(),
+        )
         t_pypy = pypy_cpu if pypy_code == 0 else "-"
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")
@@ -5514,7 +5545,7 @@ class Check:
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
         pypy_output, pypy_time, pypy_code, _ = run_timed(
-            [PYPY3, path], timeout_s=effective_timeout,
+            [PYPY3, path], timeout_s=effective_timeout, env=pypy_env(),
         )
         if pypy_code != 0:
             print(f"{red('CRASH')} (exit {pypy_code})")

@@ -483,6 +483,39 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     }
 }
 
+/// Resume a suspended frame through the same one-word residual ABI.
+///
+/// `w_inputvalue` null means no sent value (`Option::None`). A sent `None`
+/// is `w_none`, not null. `operr` / `throw_args` stay with the caller: this
+/// residual is only the `next`/`send` path, whose resume payload is one
+/// object. A pointer to the caller's `FrameResumeArgs` would be the stack
+/// address observed while tracing, and the compiled loop would keep calling
+/// it after that frame is gone.
+#[majit_macros::dont_look_inside]
+pub fn eval_resumed_frame_raw(frame: &mut PyFrame, w_inputvalue: PyObjectRef) -> PyObjectRef {
+    // `get_eval_fn` can collect while the sent value is still live.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::publish_roots(&[w_inputvalue]);
+    let rooted = pyre_object::gc_roots::shadow_stack_get(slot);
+    let mut resume = FrameResumeArgs {
+        w_inputvalue: if rooted.is_null() {
+            None
+        } else {
+            Some(rooted)
+        },
+        operr: None,
+        throw_args: None,
+    };
+    clear_call_error();
+    match get_eval_fn()(frame, Some(&mut resume)) {
+        Ok(value) => value,
+        Err(error) => {
+            set_call_error(error);
+            PY_NULL
+        }
+    }
+}
+
 // ── JIT parameter injection ──────────────────────────────────────
 //
 // `pypy/interpreter/executioncontext.py settrace` invokes
@@ -5767,6 +5800,134 @@ mod pack_varargs_tests {
             "positional kept the pre-collection address {:p}, live address is {:p}",
             before, after
         );
+    }
+
+    /// A still-young probe with room for one `W_DictObject` nursery bump, but
+    /// not for the dummy `alloc_with_type` `collecting_stable_hook` runs when
+    /// `KwargsDictStrategy.get_empty_storage` takes the young-nonmoving path.
+    fn young_probe_leaving_room_for_kwargs_dict() -> (pyre_object::gc_roots::RootScope, usize) {
+        let step = majit_gc::header::GcHeader::SIZE + PROBE_PAYLOAD;
+        let dict_needed =
+            majit_gc::header::GcHeader::SIZE + pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE;
+        let young = majit_gc::gc_sync::gc_op(|gc| {
+            while (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize)
+                >= dict_needed + step * 2
+            {
+                let _ = gc.alloc_with_type_no_collect(0, PROBE_PAYLOAD);
+            }
+            gc.alloc_with_type(0, PROBE_PAYLOAD)
+        });
+        assert_ne!(young.0, 0, "probe allocation failed");
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        let _ = roots.pin_root(young.0 as pyre_object::PyObjectRef);
+        majit_gc::gc_sync::gc_op(|gc| {
+            while (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize)
+                >= dict_needed + step
+            {
+                let _ = gc.alloc_with_type_no_collect(0, PROBE_PAYLOAD);
+            }
+        });
+        assert!(
+            majit_gc::gc_is_nursery_object(roots.get(slot) as usize),
+            "probe left the nursery before resolve_kwargs"
+        );
+        let gap = nursery_gap();
+        assert!(
+            gap >= dict_needed,
+            "nursery has no room for the kwargs dict header"
+        );
+        assert!(
+            gap < dict_needed + step,
+            "nursery still has room after the dict for the storage-trigger alloc"
+        );
+        (roots, slot)
+    }
+
+    /// `EmptyKwargsDictStrategy.switch_to_correct_strategy` for an exact str
+    /// key allocates young `KwargsDictStrategy` storage. The kwargs dict that
+    /// `resolve_kwargs` just minted is still young, so that allocation must
+    /// move it; `store_collected_keyword` then stores into the forwarded dict.
+    #[test]
+    fn resolve_kwargs_moves_the_young_kwargs_dict_across_empty_storage_alloc() {
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let module =
+            crate::compile_exec("def f(**kw):\n    pass\n").expect("varkw function should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("nested function code");
+        assert!(code.flags.contains(crate::CodeFlags::VARKEYWORDS));
+        assert_eq!(code.arg_count, 0);
+        crate::test_hooks::install_hash_hook();
+        let w_code = crate::pycode::box_code_object(code);
+        let func = crate::function::function_new_from_code(w_code, pyre_object::w_dict_new());
+        let names = pyre_object::w_tuple_new(vec![
+            pyre_object::w_str_new("a"),
+            pyre_object::w_str_new("b"),
+        ]);
+        let value_a = pyre_object::w_int_new(1);
+        let value_b = pyre_object::w_int_new(2);
+        install_collecting_heap();
+        majit_gc::gc_sync::gc_op(|gc| {
+            while gc.types.len() <= pyre_object::dictmultiobject::W_DICT_GC_TYPE_ID as usize {
+                let _ = gc.register_type(TypeInfo::simple(
+                    pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE.max(PROBE_PAYLOAD),
+                ));
+            }
+        });
+        // Non-zero tid so `get_empty_storage` takes `gc_alloc_young_storage_box`
+        // instead of the `malloc_raw` fallback. Type 1 is already registered.
+        pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id(1);
+        let (roots, slot) = young_probe_leaving_room_for_kwargs_dict();
+        let before = roots.get(slot);
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                COLLECT_ON_ALLOC.with(|flag| flag.set(false));
+                pyre_object::gc_hook::clear_gc_alloc_hook();
+                pyre_object::gc_hook::clear_gc_alloc_stable_hook();
+                pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id(0);
+            }
+        }
+        COLLECT_ON_ALLOC.with(|flag| flag.set(true));
+        pyre_object::gc_hook::register_gc_alloc_hook(collecting_alloc_hook);
+        pyre_object::gc_hook::register_gc_alloc_stable_hook(collecting_stable_hook);
+        let _clear = ClearHook;
+        let resolved = super::resolve_kwargs(func, &[value_a, value_b], names)
+            .expect("keyword binding should succeed");
+        drop(_clear);
+        let after = roots.get(slot);
+        assert_ne!(
+            before, after,
+            "the kwargs empty-storage allocation did not collect, so the test did not run"
+        );
+        assert_eq!(resolved.len(), 1, "def f(**kw) binds only the kwargs dict");
+        let w_kw = resolved[0];
+        unsafe {
+            assert_eq!(
+                pyre_object::dictmultiobject::w_dict_get_strategy(w_kw).strategy_kind(),
+                pyre_object::dictmultiobject::StrategyKind::Kwargs
+            );
+            assert_eq!(
+                pyre_object::w_int_get_value(
+                    pyre_object::dictmultiobject::w_dict_lookup(w_kw, pyre_object::w_str_new("a"))
+                        .unwrap()
+                ),
+                1
+            );
+            assert_eq!(
+                pyre_object::w_int_get_value(
+                    pyre_object::dictmultiobject::w_dict_lookup(w_kw, pyre_object::w_str_new("b"))
+                        .unwrap()
+                ),
+                2
+            );
+        }
     }
 }
 

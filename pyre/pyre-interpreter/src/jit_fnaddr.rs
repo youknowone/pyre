@@ -2700,6 +2700,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::call::eval_current_frame_raw",
         crate::call::eval_current_frame_raw,
     );
+    p2(
+        &mut entries,
+        "pyre_interpreter::call::eval_resumed_frame_raw",
+        crate::call::eval_resumed_frame_raw,
+    );
+    // Generator completion residualizes `PyFrame::clear_references`. The
+    // symbolic path the codewriter records is the impl-method key.
+    p1(
+        &mut entries,
+        "pyframe::PyFrame::clear_references",
+        crate::pyframe::PyFrame::clear_references,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::pyframe::PyFrame::clear_references",
+        crate::pyframe::PyFrame::clear_references,
+    );
     p1(
         &mut entries,
         "pyre_interpreter::display::jit_format_float_repr_rstr",
@@ -6512,19 +6529,59 @@ mod tests {
         // the loop reports whichever collision the hash order reached first
         // and hides the rest, so each repair looks complete and the next run
         // names a different pair.
+        //
+        // Alias spellings are transitive. `pyframe::PyFrame::clear_references`
+        // extends to `pyre_interpreter::pyframe::PyFrame::clear_references`,
+        // which drops one segment to reach `pyre_interpreter::PyFrame::
+        // clear_references`. The endpoints are one function; only two
+        // components on one address is a fold of unrelated functions.
         let mut collisions: Vec<String> = Vec::new();
         for (addr, paths) in &by_addr {
-            let mut unrelated: Vec<(&str, &str)> = Vec::new();
-            for (i, a) in paths.iter().enumerate() {
-                for b in &paths[i + 1..] {
-                    if !are_alias_spellings(a, b) {
-                        unrelated.push((a, b));
+            let n = paths.len();
+            if n < 2 {
+                continue;
+            }
+            let mut parent: Vec<usize> = (0..n).collect();
+            fn find(parent: &mut [usize], mut i: usize) -> usize {
+                while parent[i] != i {
+                    parent[i] = parent[parent[i]];
+                    i = parent[i];
+                }
+                i
+            }
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if are_alias_spellings(paths[i], paths[j]) {
+                        let ra = find(&mut parent, i);
+                        let rb = find(&mut parent, j);
+                        if ra != rb {
+                            parent[rb] = ra;
+                        }
                     }
                 }
             }
-            if !unrelated.is_empty() {
-                unrelated.sort_unstable();
-                collisions.push(format!("{addr:#x} {unrelated:?}"));
+            let mut roots = vec![0; n];
+            for i in 0..n {
+                roots[i] = find(&mut parent, i);
+            }
+            let mut groups: Vec<Vec<&str>> = Vec::new();
+            let mut seen = vec![false; n];
+            for i in 0..n {
+                let root = roots[i];
+                if seen[root] {
+                    continue;
+                }
+                seen[root] = true;
+                let mut group: Vec<&str> = (0..n)
+                    .filter(|&k| roots[k] == root)
+                    .map(|k| paths[k])
+                    .collect();
+                group.sort_unstable();
+                groups.push(group);
+            }
+            if groups.len() > 1 {
+                groups.sort();
+                collisions.push(format!("{addr:#x} {groups:?}"));
             }
         }
         collisions.sort();

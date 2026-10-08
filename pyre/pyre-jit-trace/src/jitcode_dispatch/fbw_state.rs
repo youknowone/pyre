@@ -1097,6 +1097,7 @@ pub(crate) fn fbw_namespace_store_journal_push(
     name: pyre_object::PyObjectRef,
     displaced: pyre_object::PyObjectRef,
     loop_var: bool,
+    written: Option<pyre_object::PyObjectRef>,
 ) {
     if fbw_debug_abort_enabled() {
         eprintln!(
@@ -1111,6 +1112,7 @@ pub(crate) fn fbw_namespace_store_journal_push(
             name,
             displaced,
             loop_var,
+            written,
         })
     });
 }
@@ -1128,6 +1130,30 @@ fn fbw_namespace_store_mark_rolled_back() {
     FBW_NAMESPACE_STORE_ROLLED_BACK.with(|c| c.set(true));
 }
 
+/// Current value of an exact-str dict entry, or `None` when reading it would
+/// run a stored key's Python `__eq__`. A null pointer inside `Some` is a miss.
+fn store_subscr_current_if_callback_free(
+    namespace: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> Option<pyre_object::PyObjectRef> {
+    unsafe {
+        if pyre_object::is_module_dict(namespace) {
+            if pyre_object::w_module_dict_is_object_strategy(namespace) {
+                return None;
+            }
+            let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
+            return Some(
+                pyre_object::w_module_dict_getitem_str(namespace, key_text)
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+        }
+        if pyre_object::w_dict_is_empty_strategy(namespace) {
+            return Some(std::ptr::null_mut());
+        }
+        pyre_object::w_dict_lookup_str_keyed(namespace, key, std::ptr::null_mut())
+    }
+}
+
 /// Non-commit epilogue for the namespace bindings the walked region wrote:
 /// restore each displaced value — or unbind the name that had none — in reverse
 /// push order, so the replay re-derives the region's bindings from the pre-walk
@@ -1136,6 +1162,15 @@ fn fbw_namespace_store_journal_rollback() {
     FBW_NAMESPACE_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some(entry) = entries.pop() {
+            // A `STORE_SUBSCR` entry is shared. Restore it only while it is
+            // still the object this walk wrote; a later store from another
+            // thread stays in place.
+            if let Some(written) = entry.written {
+                match store_subscr_current_if_callback_free(entry.namespace, entry.name) {
+                    Some(current) if current == written => {}
+                    _ => continue,
+                }
+            }
             if !entry.loop_var {
                 fbw_namespace_store_mark_rolled_back();
             }
