@@ -35491,67 +35491,67 @@ mod tests {
     }
 
     #[test]
-    fn stamp_method_owners_names_list_append() {
+    fn stamp_method_owners_and_descr_self() {
         crate::test_hooks::install_hash_hook();
         super::init_typeobjects();
-        let list_ty = super::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
-        let append = crate::baseobjspace::getattr_str(list_ty, "append").expect("list.append");
-        let qualname = unsafe { crate::function::function_get_qualname(append) };
-        assert_eq!(qualname.to_string(), "list.append");
-        // `TypeCache.build` stamps `__objclass__` from the dict value it
-        // already holds. `init_typeobjects` is that walk.
-        let objclass = crate::baseobjspace::getattr_str(append, "__objclass__").expect("objclass");
-        assert!(std::ptr::eq(objclass, list_ty));
+        {
+            // stamp_method_owners_names_list_append
+            let list_ty = super::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
+            let append = crate::baseobjspace::getattr_str(list_ty, "append").expect("list.append");
+            let qualname = unsafe { crate::function::function_get_qualname(append) };
+            assert_eq!(qualname.to_string(), "list.append");
+            // `TypeCache.build` stamps `__objclass__` from the dict value it
+            // already holds. `init_typeobjects` is that walk.
+            let objclass =
+                crate::baseobjspace::getattr_str(append, "__objclass__").expect("objclass");
+            assert!(std::ptr::eq(objclass, list_ty));
+        }
+        {
+            // stamp_new_descr_self_names_code_replace
+            let code_ty = super::gettypeobject(&crate::pycode::CODE_TYPE);
+            let replace =
+                crate::baseobjspace::getattr_str(code_ty, "replace").expect("code.replace");
+            let qualname = unsafe { crate::function::function_get_qualname(replace) };
+            assert_eq!(qualname.to_string(), "code.replace");
+            let objclass =
+                crate::baseobjspace::getattr_str(replace, "__objclass__").expect("objclass");
+            assert!(std::ptr::eq(objclass, code_ty));
+        }
+        {
+            // stamp_new_descr_self_sets_member_cls
+            let md = super::gettypeobject(&crate::function::METHOD_DESCRIPTOR_TYPE);
+            let member = crate::type_dict_lookup_no_unwrapping(md, "__objclass__")
+                .expect("method_descriptor.__objclass__");
+            assert!(unsafe { pyre_object::is_member(member) });
+            assert!(std::ptr::eq(
+                unsafe { pyre_object::w_member_get_cls(member) },
+                md
+            ));
+        }
     }
 
     #[test]
-    fn stamp_new_descr_self_names_code_replace() {
+    fn copy_getset_properties_and_type_annotations() {
         crate::test_hooks::install_hash_hook();
         super::init_typeobjects();
-        let code_ty = super::gettypeobject(&crate::pycode::CODE_TYPE);
-        let replace = crate::baseobjspace::getattr_str(code_ty, "replace").expect("code.replace");
-        let qualname = unsafe { crate::function::function_get_qualname(replace) };
-        assert_eq!(qualname.to_string(), "code.replace");
-        let objclass = crate::baseobjspace::getattr_str(replace, "__objclass__").expect("objclass");
-        assert!(std::ptr::eq(objclass, code_ty));
-    }
-
-    #[test]
-    fn stamp_new_descr_self_sets_member_cls() {
-        crate::test_hooks::install_hash_hook();
-        super::init_typeobjects();
-        let md = super::gettypeobject(&crate::function::METHOD_DESCRIPTOR_TYPE);
-        let member = crate::type_dict_lookup_no_unwrapping(md, "__objclass__")
-            .expect("method_descriptor.__objclass__");
-        assert!(unsafe { pyre_object::is_member(member) });
-        assert!(std::ptr::eq(
-            unsafe { pyre_object::w_member_get_cls(member) },
-            md
-        ));
-    }
-
-    #[test]
-    fn copy_getset_properties_binds_tb_next() {
-        crate::test_hooks::install_hash_hook();
-        super::init_typeobjects();
-        let tb = super::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE);
-        let descr = crate::type_dict_lookup_no_unwrapping(tb, "tb_next").expect("tb_next");
-        assert!(unsafe { pyre_object::typedef::is_getset_property(descr) });
-        let objclass = unsafe { pyre_object::typedef::w_getset_get_objclass(descr) };
-        assert!(std::ptr::eq(objclass, tb));
-    }
-
-    #[test]
-    fn add_entries_names_type_annotations() {
-        crate::test_hooks::install_hash_hook();
-        super::init_typeobjects();
-        let ty = super::w_type();
-        let descr =
-            crate::type_dict_lookup_no_unwrapping(ty, "__annotations__").expect("__annotations__");
-        assert!(unsafe { pyre_object::typedef::is_getset_property(descr) });
-        let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
-        let text = unsafe { pyre_object::w_str_get_value_opt(name) }.expect("name");
-        assert_eq!(text, "__annotations__");
+        {
+            // copy_getset_properties_binds_tb_next
+            let tb = super::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE);
+            let descr = crate::type_dict_lookup_no_unwrapping(tb, "tb_next").expect("tb_next");
+            assert!(unsafe { pyre_object::typedef::is_getset_property(descr) });
+            let objclass = unsafe { pyre_object::typedef::w_getset_get_objclass(descr) };
+            assert!(std::ptr::eq(objclass, tb));
+        }
+        {
+            // add_entries_names_type_annotations
+            let ty = super::w_type();
+            let descr = crate::type_dict_lookup_no_unwrapping(ty, "__annotations__")
+                .expect("__annotations__");
+            assert!(unsafe { pyre_object::typedef::is_getset_property(descr) });
+            let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
+            let text = unsafe { pyre_object::w_str_get_value_opt(name) }.expect("name");
+            assert_eq!(text, "__annotations__");
+        }
     }
 
     /// `init_typeobjects` publishes iterator TypeDefs through

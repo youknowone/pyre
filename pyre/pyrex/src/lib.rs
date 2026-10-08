@@ -2192,77 +2192,53 @@ mod tests {
         body()
     }
 
-    #[test]
-    fn command_startup_sees_sys_path_from_getbuiltinmodule() {
-        with_command_startup_lock(|| command_startup_sees_sys_path_from_getbuiltinmodule_body())
-    }
-
-    fn command_startup_sees_sys_path_from_getbuiltinmodule_body() {
+    fn command_startup_prepare() {
         pyre_jit::eval::init_jit_hooks();
         pyre_interpreter::importing::set_no_site(true);
         let cwd = std::env::current_dir().expect("cwd");
         pyre_interpreter::importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
         pyre_interpreter::importing::set_sys_argv(&[std::ffi::OsString::from("-c")]);
-        let session = run_source(
-            "import sys\nassert sys.path\nby_name = {f.__name__: f for f in sys.meta_path}\nassert 'BuiltinImporter' in by_name and 'FrozenImporter' in by_name and 'PathFinder' in by_name, list(by_name)\nassert by_name['BuiltinImporter'].find_spec('sys') is not None\nassert by_name['FrozenImporter'].find_spec('token') is None\nassert by_name['PathFinder'].find_spec('token') is not None\nassert by_name['PathFinder'].find_spec('not_a_real_module_zz') is None\nassert list.append.__qualname__ == 'list.append'\n",
-            Mode::Exec,
-            "<string>",
-            true,
-            true,
-        );
-        assert!(session.is_none());
     }
 
     #[test]
-    fn command_startup_reuses_the_import_name_object() {
-        with_command_startup_lock(|| command_startup_reuses_the_import_name_object_body())
-    }
-
-    fn command_startup_reuses_the_import_name_object_body() {
-        pyre_jit::eval::init_jit_hooks();
-        pyre_interpreter::importing::set_no_site(true);
-        let cwd = std::env::current_dir().expect("cwd");
-        pyre_interpreter::importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
-        pyre_interpreter::importing::set_sys_argv(&[std::ffi::OsString::from("-c")]);
-        let session = run_source(
-            "import sys\nboot = sys.modules['_frozen_importlib']\nseen = []\nreal = boot.__import__\ndef wrap(name, globals=None, locals=None, fromlist=(), level=0):\n    seen.append(name)\n    return real(name, globals, locals, fromlist, level)\nboot.__import__ = wrap\ndef f():\n    import token\nname = f.__code__.co_names[f.__code__.co_names.index('token')]\nf()\nassert seen and seen[0] is name, (seen, name)\n",
-            Mode::Exec,
-            "<string>",
-            true,
-            true,
-        );
-        assert!(session.is_none());
-    }
-
-    #[test]
-    fn command_startup_runs_user_del_at_shutdown() {
-        with_command_startup_lock(|| command_startup_runs_user_del_at_shutdown_body())
-    }
-
-    fn command_startup_runs_user_del_at_shutdown_body() {
-        let path = std::env::temp_dir().join(format!(
-            "pyre-shutdown-del-{}-{}.txt",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let source = format!(
-            "class A:\n    def __del__(self):\n        open({:?}, 'w').write('ran')\nA()\n",
-            path
-        );
-        pyre_jit::eval::init_jit_hooks();
-        pyre_interpreter::importing::set_no_site(true);
-        let cwd = std::env::current_dir().expect("cwd");
-        pyre_interpreter::importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
-        pyre_interpreter::importing::set_sys_argv(&[std::ffi::OsString::from("-c")]);
-        let session = run_source(&source, Mode::Exec, "<string>", true, true);
-        assert!(session.is_none());
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(text, "ran");
+    fn command_startup_sys_path_import_name_and_user_del() {
+        with_command_startup_lock(|| {
+            {
+                // command_startup_sees_sys_path_from_getbuiltinmodule
+                // command_startup_reuses_the_import_name_object
+                command_startup_prepare();
+                let session = run_source(
+                    "import sys\nassert sys.path\nby_name = {f.__name__: f for f in sys.meta_path}\nassert 'BuiltinImporter' in by_name and 'FrozenImporter' in by_name and 'PathFinder' in by_name, list(by_name)\nassert by_name['BuiltinImporter'].find_spec('sys') is not None\nassert by_name['FrozenImporter'].find_spec('token') is None\nassert by_name['PathFinder'].find_spec('token') is not None\nassert by_name['PathFinder'].find_spec('not_a_real_module_zz') is None\nassert list.append.__qualname__ == 'list.append'\nboot = sys.modules['_frozen_importlib']\nseen = []\nreal = boot.__import__\ndef wrap(name, globals=None, locals=None, fromlist=(), level=0):\n    seen.append(name)\n    return real(name, globals, locals, fromlist, level)\nboot.__import__ = wrap\ndef f():\n    import token\nname = f.__code__.co_names[f.__code__.co_names.index('token')]\nf()\nassert seen and seen[0] is name, (seen, name)\n",
+                    Mode::Exec,
+                    "<string>",
+                    true,
+                    true,
+                );
+                assert!(session.is_none());
+            }
+            {
+                // command_startup_runs_user_del_at_shutdown
+                let path = std::env::temp_dir().join(format!(
+                    "pyre-shutdown-del-{}-{}.txt",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                ));
+                let _ = std::fs::remove_file(&path);
+                let source = format!(
+                    "class A:\n    def __del__(self):\n        open({:?}, 'w').write('ran')\nA()\n",
+                    path
+                );
+                command_startup_prepare();
+                let session = run_source(&source, Mode::Exec, "<string>", true, true);
+                assert!(session.is_none());
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let _ = std::fs::remove_file(&path);
+                assert_eq!(text, "ran");
+            }
+        })
     }
 
     #[test]

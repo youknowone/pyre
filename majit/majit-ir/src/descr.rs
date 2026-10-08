@@ -8843,48 +8843,104 @@ mod register_keyed_size_authority_tests {
 
     /// Kind-0 bake supplies one complete layout (`descr.py` `get_size_descr`
     /// miss: vtable plus `heaptracker.all_fielddescrs`). A later fieldless
-    /// vtable does not replace that owner.
+    /// vtable does not replace that owner. `get_field_descr` keeps the first
+    /// SizeDescr as `parent_descr`, and a STRUCT that was not in `GcCache`
+    /// wires that size as parent once.
     #[test]
-    fn a_complete_first_insert_is_not_replaced_by_a_fieldless_vtable() {
-        let mut gc = GcCache::new();
-        let key = LLType::Struct(0xC671_67BF_FAEE_020E);
-        gc.register_keyed_size(key.clone(), size_descr_at(9, 0x1000, &[16]));
-        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x2000, &[]));
-        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
-        assert_eq!(cached.vtable(), 0x1000);
-        assert_eq!(cached.all_fielddescrs().len(), 1);
-    }
-
-    /// `descr.py` `get_size_descr` never clones the cached descr to stamp a
-    /// later vtable. Fields minted through `get_field_descr` keep the first
-    /// SizeDescr as `parent_descr`.
-    #[test]
-    fn a_later_vtable_does_not_rebind_cached_fields_onto_a_clone() {
-        let mut gc = GcCache::new();
-        let key = LLType::Struct(0xC671_67BF_FAEE_020F);
-        gc.register_keyed_size(key.clone(), size_descr_at(9, 0x1000, &[16]));
-        let field = gc.get_field_descr(
-            key.clone(),
-            "f16",
-            Some("Owner.f16"),
-            16,
-            8,
-            Type::Int,
-            false,
-            false,
-            ArrayFlag::Signed,
-            0,
-            false,
-            Some(0),
-        );
-        let parent_before = field.get_parent_descr().expect("parent before");
-        assert_eq!(parent_before.as_size_descr().unwrap().vtable(), 0x1000);
-        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x2000, &[]));
-        let cached = gc._cache_size.get(&key).unwrap().clone();
-        assert_eq!(cached.as_size_descr().unwrap().vtable(), 0x1000);
-        let parent_after = field.get_parent_descr().expect("parent after");
-        assert!(Arc::ptr_eq(&parent_after, &cached));
-        assert!(Arc::ptr_eq(&parent_after, &parent_before));
+    fn register_keyed_size_first_insert_and_vtable() {
+        {
+            // a_complete_first_insert_is_not_replaced_by_a_fieldless_vtable
+            let mut gc = GcCache::new();
+            let key = LLType::Struct(0xC671_67BF_FAEE_020E);
+            gc.register_keyed_size(key.clone(), size_descr_at(9, 0x1000, &[16]));
+            gc.register_keyed_size(key.clone(), size_descr_at(7, 0x2000, &[]));
+            let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+            assert_eq!(cached.vtable(), 0x1000);
+            assert_eq!(cached.all_fielddescrs().len(), 1);
+        }
+        {
+            // a_later_vtable_does_not_rebind_cached_fields_onto_a_clone
+            let mut gc = GcCache::new();
+            let key = LLType::Struct(0xC671_67BF_FAEE_020F);
+            gc.register_keyed_size(key.clone(), size_descr_at(9, 0x1000, &[16]));
+            let field = gc.get_field_descr(
+                key.clone(),
+                "f16",
+                Some("Owner.f16"),
+                16,
+                8,
+                Type::Int,
+                false,
+                false,
+                ArrayFlag::Signed,
+                0,
+                false,
+                Some(0),
+            );
+            let parent_before = field.get_parent_descr().expect("parent before");
+            assert_eq!(parent_before.as_size_descr().unwrap().vtable(), 0x1000);
+            gc.register_keyed_size(key.clone(), size_descr_at(7, 0x2000, &[]));
+            let cached = gc._cache_size.get(&key).unwrap().clone();
+            assert_eq!(cached.as_size_descr().unwrap().vtable(), 0x1000);
+            let parent_after = field.get_parent_descr().expect("parent after");
+            assert!(Arc::ptr_eq(&parent_after, &cached));
+            assert!(Arc::ptr_eq(&parent_after, &parent_before));
+        }
+        {
+            // a_fresh_struct_wires_the_size_as_parent_once
+            let cache_key = 0xF1E1_E001;
+            let spec = || SimpleFieldDescrSpec {
+                index: 0,
+                field_key: "fresh_slot".to_string(),
+                name: "Fresh.fresh_slot".to_string(),
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            };
+            let group = make_simple_descr_group_keyed_with_headerless(
+                u32::MAX,
+                24,
+                1,
+                cache_key,
+                0x1000,
+                true,
+                false,
+                &[spec()],
+                &[],
+            );
+            let field = &group.field_descrs[0];
+            let parent = FieldDescr::get_parent_descr(field.as_ref()).expect("parent");
+            let size_ref = group.size_descr.clone() as DescrRef;
+            assert!(Arc::ptr_eq(&parent, &size_ref));
+            assert_eq!(FieldDescr::index_in_parent(field.as_ref()), 0);
+            let cached = gc_cache()
+                .lock()
+                ._cache_field
+                .get(&LLType::Struct(cache_key))
+                .expect("field map")
+                .get("fresh_slot")
+                .expect("field")
+                .clone();
+            assert!(Arc::ptr_eq(&cached, field));
+            let again = make_simple_descr_group_keyed_with_headerless(
+                u32::MAX,
+                24,
+                1,
+                cache_key,
+                0x1000,
+                true,
+                false,
+                &[spec()],
+                &[],
+            );
+            assert!(Arc::ptr_eq(&again.field_descrs[0], field));
+        }
     }
 
     /// The upgrade rule itself is unchanged when both sides carry a vtable.
@@ -9332,152 +9388,69 @@ mod tests {
         );
     }
 
-    /// `descr.py` `get_field_descr` points `parent_descr` at the size it just
-    /// cached. A STRUCT that was not in `GcCache` takes that path once.
-    #[test]
-    fn a_fresh_struct_wires_the_size_as_parent_once() {
-        let cache_key = 0xF1E1_E001;
-        let spec = || SimpleFieldDescrSpec {
-            index: 0,
-            field_key: "fresh_slot".to_string(),
-            name: "Fresh.fresh_slot".to_string(),
-            offset: 16,
-            field_size: 8,
-            field_type: Type::Int,
-            is_immutable: false,
-            is_quasi_immutable: false,
-            flag: ArrayFlag::Signed,
-            virtualizable: false,
-            index_in_parent: 0,
-            is_class_word: Some(false),
-        };
-        let group = make_simple_descr_group_keyed_with_headerless(
-            u32::MAX,
-            24,
-            1,
-            cache_key,
-            0x1000,
-            true,
-            false,
-            &[spec()],
-            &[],
-        );
-        let field = &group.field_descrs[0];
-        let parent = FieldDescr::get_parent_descr(field.as_ref()).expect("parent");
-        let size_ref = group.size_descr.clone() as DescrRef;
-        assert!(Arc::ptr_eq(&parent, &size_ref));
-        assert_eq!(FieldDescr::index_in_parent(field.as_ref()), 0);
-        let cached = gc_cache()
-            .lock()
-            ._cache_field
-            .get(&LLType::Struct(cache_key))
-            .expect("field map")
-            .get("fresh_slot")
-            .expect("field")
-            .clone();
-        assert!(Arc::ptr_eq(&cached, field));
-        let again = make_simple_descr_group_keyed_with_headerless(
-            u32::MAX,
-            24,
-            1,
-            cache_key,
-            0x1000,
-            true,
-            false,
-            &[spec()],
-            &[],
-        );
-        assert!(Arc::ptr_eq(&again.field_descrs[0], field));
-    }
-
     /// `descr.py` `get_field_descr` fills `_cache_field[STRUCT][fieldname]`
-    /// when the STRUCT is first published. A packed parent is that miss.
+    /// when the STRUCT is first published, and keeps the fieldname it was
+    /// given. A packed parent is that miss; a borrowed name is that string.
     #[test]
-    fn a_packed_parent_stores_fields_through_get_field_descr() {
-        let name: &'static str = "PackedParent.packed_slot";
-        let key: &'static str = "packed_slot";
-        let cache_key = 0xF1E1_E301;
-        let group = publish_borrowed_struct_layout(
-            u32::MAX,
-            24,
-            1,
-            cache_key,
-            0,
-            true,
-            false,
-            &[],
-            vec![BorrowedField {
-                index: 0,
-                name: Cow::Borrowed(name),
-                field_key: key,
-                offset: 16,
-                field_size: 8,
-                field_type: Type::Int,
-                flag: ArrayFlag::Signed,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                index_in_parent: 0,
-                is_class_word: Some(false),
-            }],
-        );
-        let struct_key = LLType::struct_key(cache_key);
-        let cached = gc_cache()
-            .lock()
-            ._cache_field
-            .get(&struct_key)
-            .and_then(|fields| fields.get(key))
-            .cloned()
-            .expect("packed parent stores the field through get_field_descr");
-        assert!(Arc::ptr_eq(&cached, &group.field_descrs[0]));
-        let again = gc_cache().lock().get_field_descr(
-            struct_key,
-            key,
-            Some(name),
-            16,
-            8,
-            Type::Int,
-            false,
-            false,
-            ArrayFlag::Signed,
-            u32::MAX,
-            false,
-            Some(0),
-        );
-        assert!(Arc::ptr_eq(&again, &group.field_descrs[0]));
-    }
-
-    /// `descr.py` `get_field_descr` keeps the fieldname it was given.
-    /// A borrowed name is that string, not a copy.
-    #[test]
-    fn a_borrowed_field_name_is_the_callers_string() {
-        let name: &'static str = "BorrowedOwner.borrowed_slot";
-        let key: &'static str = "borrowed_slot";
-        let group = publish_borrowed_struct_layout(
-            u32::MAX,
-            24,
-            1,
-            0xF1E1_E101,
-            0x1000,
-            true,
-            false,
-            &[],
-            vec![BorrowedField {
-                index: 0,
-                name: Cow::Borrowed(name),
-                field_key: key,
-                offset: 16,
-                field_size: 8,
-                field_type: Type::Int,
-                flag: ArrayFlag::Signed,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                index_in_parent: 0,
-                is_class_word: Some(false),
-            }],
-        );
-        let field = &group.field_descrs[0];
-        assert!(
-            publish_borrowed_struct_layout_if_absent(
+    fn packed_parent_and_borrowed_field_name() {
+        {
+            // a_packed_parent_stores_fields_through_get_field_descr
+            let name: &'static str = "PackedParent.packed_slot";
+            let key: &'static str = "packed_slot";
+            let cache_key = 0xF1E1_E301;
+            let group = publish_borrowed_struct_layout(
+                u32::MAX,
+                24,
+                1,
+                cache_key,
+                0,
+                true,
+                false,
+                &[],
+                vec![BorrowedField {
+                    index: 0,
+                    name: Cow::Borrowed(name),
+                    field_key: key,
+                    offset: 16,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    flag: ArrayFlag::Signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            );
+            let struct_key = LLType::struct_key(cache_key);
+            let cached = gc_cache()
+                .lock()
+                ._cache_field
+                .get(&struct_key)
+                .and_then(|fields| fields.get(key))
+                .cloned()
+                .expect("packed parent stores the field through get_field_descr");
+            assert!(Arc::ptr_eq(&cached, &group.field_descrs[0]));
+            let again = gc_cache().lock().get_field_descr(
+                struct_key,
+                key,
+                Some(name),
+                16,
+                8,
+                Type::Int,
+                false,
+                false,
+                ArrayFlag::Signed,
+                u32::MAX,
+                false,
+                Some(0),
+            );
+            assert!(Arc::ptr_eq(&again, &group.field_descrs[0]));
+        }
+        {
+            // a_borrowed_field_name_is_the_callers_string
+            let name: &'static str = "BorrowedOwner.borrowed_slot";
+            let key: &'static str = "borrowed_slot";
+            let group = publish_borrowed_struct_layout(
                 u32::MAX,
                 24,
                 1,
@@ -9499,35 +9472,61 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: Some(false),
                 }],
-            )
-            .is_none(),
-            "get_size_descr keeps the row it already holds"
-        );
-        assert_eq!(
-            FieldDescr::field_name(field.as_ref()).as_ptr(),
-            name.as_ptr()
-        );
-        let parent = FieldDescr::get_parent_descr(field.as_ref()).expect("parent");
-        assert!(Arc::ptr_eq(
-            &parent,
-            &(group.size_descr.clone() as DescrRef)
-        ));
-        let mut gc = gc_cache().lock();
-        let again = gc.get_field_descr(
-            LLType::struct_key(0xF1E1_E101),
-            key,
-            Some(name),
-            16,
-            8,
-            Type::Int,
-            false,
-            false,
-            ArrayFlag::Signed,
-            u32::MAX,
-            false,
-            Some(0),
-        );
-        assert!(Arc::ptr_eq(&again, field));
+            );
+            let field = &group.field_descrs[0];
+            assert!(
+                publish_borrowed_struct_layout_if_absent(
+                    u32::MAX,
+                    24,
+                    1,
+                    0xF1E1_E101,
+                    0x1000,
+                    true,
+                    false,
+                    &[],
+                    vec![BorrowedField {
+                        index: 0,
+                        name: Cow::Borrowed(name),
+                        field_key: key,
+                        offset: 16,
+                        field_size: 8,
+                        field_type: Type::Int,
+                        flag: ArrayFlag::Signed,
+                        is_immutable: false,
+                        is_quasi_immutable: false,
+                        index_in_parent: 0,
+                        is_class_word: Some(false),
+                    }],
+                )
+                .is_none(),
+                "get_size_descr keeps the row it already holds"
+            );
+            assert_eq!(
+                FieldDescr::field_name(field.as_ref()).as_ptr(),
+                name.as_ptr()
+            );
+            let parent = FieldDescr::get_parent_descr(field.as_ref()).expect("parent");
+            assert!(Arc::ptr_eq(
+                &parent,
+                &(group.size_descr.clone() as DescrRef)
+            ));
+            let mut gc = gc_cache().lock();
+            let again = gc.get_field_descr(
+                LLType::struct_key(0xF1E1_E101),
+                key,
+                Some(name),
+                16,
+                8,
+                Type::Int,
+                false,
+                false,
+                ArrayFlag::Signed,
+                u32::MAX,
+                false,
+                Some(0),
+            );
+            assert!(Arc::ptr_eq(&again, field));
+        }
     }
 
     #[test]

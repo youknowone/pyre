@@ -1654,20 +1654,4 @@ mod tests {
         bytes[4] = 1;
         assert!(timestamp_pyc_payload(&bytes, 5, 9).is_none());
     }
-
-    #[test]
-    fn try_load_timestamp_pyc_reads_a_stdlib_pyc() {
-        crate::test_hooks::install_hash_hook();
-        crate::typedef::init_typeobjects();
-        let Some(stdlib) = crate::importing::detect_stdlib_path() else {
-            return;
-        };
-        let path = stdlib.join("encodings/utf_8.py");
-        // A clean checkout has no generated `.pyc`. The header parser is
-        // covered by `timestamp_pyc_payload_accepts_only_a_matching_timestamp_header`.
-        let Ok(Some((code, _cpathname))) = super::try_load_timestamp_pyc(&path) else {
-            return;
-        };
-        assert!(unsafe { crate::is_code(code) });
-    }
 }

@@ -1934,14 +1934,31 @@ mod tests {
     }
 
     #[test]
-    fn managed_string_length_uses_ascii_byte_count() {
-        let ascii = w_str_from_wtf8_managed(Wtf8Buf::from("stat_result"));
-        let wide = w_str_from_wtf8_managed(Wtf8Buf::from("é"));
-        unsafe {
-            assert_eq!(w_str_len(ascii), 11);
-            assert_eq!(w_str_get_wtf8(ascii), "stat_result");
-            assert_eq!(w_str_len(wide), 1);
-            assert_eq!(w_str_get_wtf8(wide), "é");
+    fn string_length_uses_ascii_byte_count() {
+        {
+            // managed_string_length_uses_ascii_byte_count
+            let ascii = w_str_from_wtf8_managed(Wtf8Buf::from("stat_result"));
+            let wide = w_str_from_wtf8_managed(Wtf8Buf::from("é"));
+            unsafe {
+                assert_eq!(w_str_len(ascii), 11);
+                assert_eq!(w_str_get_wtf8(ascii), "stat_result");
+                assert_eq!(w_str_len(wide), 1);
+                assert_eq!(w_str_get_wtf8(wide), "é");
+            }
+        }
+        {
+            // ascii_length_matches_byte_length
+            let ascii = w_str_new("abc");
+            let accented = w_str_new("é");
+            let mixed = intern_str_value("café");
+            unsafe {
+                assert_eq!(w_str_len(ascii), 3);
+                assert_eq!(w_str_get_wtf8(ascii), "abc");
+                assert_eq!(w_str_len(accented), 1);
+                assert_eq!(w_str_get_wtf8(accented), "é");
+                assert_eq!(w_str_len(mixed), 4);
+                assert_eq!(w_str_get_wtf8(mixed), "café");
+            }
         }
     }
 
@@ -1959,41 +1976,28 @@ mod tests {
     }
 
     #[test]
-    fn intern_str_value_returns_one_object() {
-        let first = intern_str_value("startup-name");
-        let second = intern_str_value("startup-name");
-        assert!(std::ptr::eq(first, second));
-        unsafe {
-            assert_eq!(w_str_get_wtf8(first), "startup-name");
-            assert_eq!(w_str_len(first), 12);
+    fn intern_str_value_and_table_key() {
+        {
+            // intern_str_value_returns_one_object
+            let first = intern_str_value("startup-name");
+            let second = intern_str_value("startup-name");
+            assert!(std::ptr::eq(first, second));
+            unsafe {
+                assert_eq!(w_str_get_wtf8(first), "startup-name");
+                assert_eq!(w_str_len(first), 12);
+            }
         }
-    }
-
-    #[test]
-    fn intern_table_key_is_the_wrapped_text() {
-        let created = unsafe { intern_exact_str(w_str_new("fresh-key")) };
-        let hit = intern_str_value("fresh-key");
-        let again = unsafe { intern_exact_str(w_str_new("fresh-key")) };
-        assert!(std::ptr::eq(created, hit));
-        assert!(std::ptr::eq(hit, again));
-        unsafe {
-            assert_eq!(w_str_get_wtf8(hit), "fresh-key");
-            assert_eq!(w_str_len(hit), 9);
-        }
-    }
-
-    #[test]
-    fn ascii_length_matches_byte_length() {
-        let ascii = w_str_new("abc");
-        let accented = w_str_new("é");
-        let mixed = intern_str_value("café");
-        unsafe {
-            assert_eq!(w_str_len(ascii), 3);
-            assert_eq!(w_str_get_wtf8(ascii), "abc");
-            assert_eq!(w_str_len(accented), 1);
-            assert_eq!(w_str_get_wtf8(accented), "é");
-            assert_eq!(w_str_len(mixed), 4);
-            assert_eq!(w_str_get_wtf8(mixed), "café");
+        {
+            // intern_table_key_is_the_wrapped_text
+            let created = unsafe { intern_exact_str(w_str_new("fresh-key")) };
+            let hit = intern_str_value("fresh-key");
+            let again = unsafe { intern_exact_str(w_str_new("fresh-key")) };
+            assert!(std::ptr::eq(created, hit));
+            assert!(std::ptr::eq(hit, again));
+            unsafe {
+                assert_eq!(w_str_get_wtf8(hit), "fresh-key");
+                assert_eq!(w_str_len(hit), 9);
+            }
         }
     }
 

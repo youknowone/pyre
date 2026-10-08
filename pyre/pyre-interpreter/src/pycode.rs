@@ -5263,18 +5263,68 @@ mod tests {
     /// from `linetable` on the first reader, matching the table the compiler
     /// expanded up front.
     #[test]
-    fn deferred_locations_rebuild_from_the_line_table() {
-        let mut code = compile_exec("a = 1\nb = 2\n").expect("compile failed");
-        let expanded = code.locations.to_vec();
-        assert!(!expanded.is_empty());
-        code.locations = Vec::new().into_boxed_slice();
-        let firstlineno = code.first_line_number.map_or(1, |line| line.get()) as i32;
-        release_code_locations(&mut code, firstlineno);
-        assert!(code.locations.is_empty());
-        assert_eq!(code_locations(&code), expanded.as_slice());
-        code_locations_cache()
-            .lock()
-            .remove(&(&code as *const crate::CodeObject as usize));
+    fn co_names_w_and_deferred_locations() {
+        {
+            // deferred_locations_rebuild_from_the_line_table
+            let mut code = compile_exec("a = 1\nb = 2\n").expect("compile failed");
+            let expanded = code.locations.to_vec();
+            assert!(!expanded.is_empty());
+            code.locations = Vec::new().into_boxed_slice();
+            let firstlineno = code.first_line_number.map_or(1, |line| line.get()) as i32;
+            release_code_locations(&mut code, firstlineno);
+            assert!(code.locations.is_empty());
+            assert_eq!(code_locations(&code), expanded.as_slice());
+            code_locations_cache()
+                .lock()
+                .remove(&(&code as *const crate::CodeObject as usize));
+        }
+        {
+            // co_names_w_matches_pycode_init
+            let code = compile_exec("answer = 42\n").expect("compile failed");
+            let idx = code
+                .names
+                .iter()
+                .position(|name| name == "answer")
+                .expect("answer");
+            let w_code = box_code_object(code);
+            let py = unsafe { &*(w_code as *const PyCode) };
+            let slot = unsafe { &*py.co_names_w };
+            let published = slot[idx];
+            assert!(!published.is_null());
+            assert_eq!(
+                published,
+                pyre_object::unicodeobject::intern_str_value("answer")
+            );
+        }
+        {
+            // interned_co_names_keep_the_marshal_object
+            let module = compile_exec("def f(x):\n    return len(x)\n").expect("compile");
+            let code = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    crate::bytecode::ConstantData::Code { code } => Some((**code).clone()),
+                    _ => None,
+                })
+                .expect("function");
+            assert!(!code.names.is_empty(), "co_names");
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut slots = Vec::new();
+            for name in &code.names {
+                let obj = unsafe { pyre_object::unicodeobject::intern_str_value(name.as_ref()) };
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(obj);
+                slots.push(slot);
+            }
+            let expected = pyre_object::gc_roots::shadow_stack_get(slots[0]);
+            let w_code = box_code_object_with_interned_name_slots(code, &slots);
+            let stored = unsafe {
+                let py = &*(w_code as *const PyCode);
+                assert!(!py.co_names_w.is_null());
+                (*py.co_names_w).as_slice()[0]
+            };
+            assert!(std::ptr::eq(stored, expected));
+        }
     }
 
     /// The entry payload is peeked, not consumed: `advance` moves by the
@@ -5289,25 +5339,6 @@ mod tests {
         assert!(bounds.advance());
         assert_eq!((bounds.ar_start, bounds.ar_end, bounds.ar_line), (2, 4, 3));
         assert!(!bounds.advance());
-    }
-
-    #[test]
-    fn co_names_w_matches_pycode_init() {
-        let code = compile_exec("answer = 42\n").expect("compile failed");
-        let idx = code
-            .names
-            .iter()
-            .position(|name| name == "answer")
-            .expect("answer");
-        let w_code = box_code_object(code);
-        let py = unsafe { &*(w_code as *const PyCode) };
-        let slot = unsafe { &*py.co_names_w };
-        let published = slot[idx];
-        assert!(!published.is_null());
-        assert_eq!(
-            published,
-            pyre_object::unicodeobject::intern_str_value("answer")
-        );
     }
 
     #[test]
@@ -5636,35 +5667,5 @@ mod tests {
             values.iter().all(|value| *value == values[0]),
             "all readers must observe one canonical co_consts_w wrapper"
         );
-    }
-
-    #[test]
-    fn interned_co_names_keep_the_marshal_object() {
-        let module = compile_exec("def f(x):\n    return len(x)\n").expect("compile");
-        let code = module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                crate::bytecode::ConstantData::Code { code } => Some((**code).clone()),
-                _ => None,
-            })
-            .expect("function");
-        assert!(!code.names.is_empty(), "co_names");
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut slots = Vec::new();
-        for name in &code.names {
-            let obj = unsafe { pyre_object::unicodeobject::intern_str_value(name.as_ref()) };
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            slots.push(slot);
-        }
-        let expected = pyre_object::gc_roots::shadow_stack_get(slots[0]);
-        let w_code = box_code_object_with_interned_name_slots(code, &slots);
-        let stored = unsafe {
-            let py = &*(w_code as *const PyCode);
-            assert!(!py.co_names_w.is_null());
-            (*py.co_names_w).as_slice()[0]
-        };
-        assert!(std::ptr::eq(stored, expected));
     }
 }

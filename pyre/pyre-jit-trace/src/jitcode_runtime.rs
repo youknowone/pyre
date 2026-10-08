@@ -3145,156 +3145,161 @@ mod tests {
 
     /// `descr.py` `get_size_descr` returns a STRUCT that already lists fields.
     /// The parentless size slot must not bincode that list again, even when
-    /// the published vtable word is 0. An empty shell still decodes.
+    /// the published vtable word is 0. An empty shell still decodes. A declared
+    /// STRUCT's field stays the group's descr when kind-0 does not re-decode
+    /// the slot.
     #[test]
-    fn kind0_size_with_fields_skips_the_parentless_slot() {
-        let published = 0xF1E1_E201;
-        assert!(!crate::descr::kind0_size_already_published(published));
-        majit_ir::descr::publish_borrowed_struct_layout(
-            u32::MAX,
-            24,
-            1,
-            published,
-            0,
-            true,
-            false,
-            &[],
-            vec![majit_ir::descr::BorrowedField {
-                index: 0,
-                name: std::borrow::Cow::Borrowed("Parentless.slot"),
-                field_key: "slot",
-                offset: 16,
-                field_size: 8,
-                field_type: majit_ir::value::Type::Int,
-                flag: majit_ir::descr::ArrayFlag::Signed,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                index_in_parent: 0,
-                is_class_word: Some(false),
-            }],
-        );
-        assert!(crate::descr::kind0_size_already_published(published));
-        assert!(
-            crate::descr::kind0_published_size_ids()
-                .binary_search(&published)
-                .is_ok()
-        );
-        let shell = 0xF1E1_E202;
-        majit_ir::descr::publish_borrowed_struct_layout(
-            u32::MAX,
-            16,
-            1,
-            shell,
-            0,
-            true,
-            false,
-            &[],
-            Vec::new(),
-        );
-        assert!(!crate::descr::kind0_size_already_published(shell));
-        assert!(
-            crate::descr::kind0_published_size_ids()
-                .binary_search(&shell)
-                .is_err()
-        );
-        assert!(!crate::descr::kind0_size_already_published(0));
+    fn kind0_size_and_materialize() {
+        {
+            // kind0_size_with_fields_skips_the_parentless_slot
+            let published = 0xF1E1_E201;
+            assert!(!crate::descr::kind0_size_already_published(published));
+            majit_ir::descr::publish_borrowed_struct_layout(
+                u32::MAX,
+                24,
+                1,
+                published,
+                0,
+                true,
+                false,
+                &[],
+                vec![majit_ir::descr::BorrowedField {
+                    index: 0,
+                    name: std::borrow::Cow::Borrowed("Parentless.slot"),
+                    field_key: "slot",
+                    offset: 16,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            );
+            assert!(crate::descr::kind0_size_already_published(published));
+            assert!(
+                crate::descr::kind0_published_size_ids()
+                    .binary_search(&published)
+                    .is_ok()
+            );
+            let shell = 0xF1E1_E202;
+            majit_ir::descr::publish_borrowed_struct_layout(
+                u32::MAX,
+                16,
+                1,
+                shell,
+                0,
+                true,
+                false,
+                &[],
+                Vec::new(),
+            );
+            assert!(!crate::descr::kind0_size_already_published(shell));
+            assert!(
+                crate::descr::kind0_published_size_ids()
+                    .binary_search(&shell)
+                    .is_err()
+            );
+            assert!(!crate::descr::kind0_size_already_published(0));
+        }
+        {
+            // kind0_materialize_publishes_declared_int_field
+            materialize_gccache_owned_descrs();
+            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(
+                "intobject::W_IntObject",
+            ));
+            let cached = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_field
+                .get(&key)
+                .and_then(|fields| fields.get("intval"))
+                .cloned()
+                .expect("W_IntObject.intval published before user code");
+            let cached = cached as majit_ir::DescrRef;
+            assert!(std::sync::Arc::ptr_eq(
+                &cached,
+                &crate::descr::int_intval_descr()
+            ));
+        }
     }
 
     /// `descr.py` `get_size_descr` reads the STRUCT row. A nonzero `type_id`
     /// slot is that packed row, not a bincode `BhDescr` enum.
     #[test]
-    fn packed_size_slot_decodes_without_bincode() {
-        use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec};
-        let mut spec = BhSizeSpec {
-            size: 24,
-            type_id: 0xA11C_E501,
-            vtable: 0,
-            owner: String::new(),
-            is_gc_managed: true,
-            headerless: false,
-            all_fielddescrs: vec![BhFieldSpec {
-                index: 0,
-                field_key: "slot".to_string(),
-                name: "Packed.slot".to_string(),
-                offset: 16,
-                field_size: 8,
-                field_type: majit_ir::value::Type::Int,
-                field_flag: majit_ir::descr::ArrayFlag::Signed,
-                is_field_signed: true,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                index_in_parent: 0,
-                is_class_word: Some(false),
-            }],
-        };
-        let mut bytes = Vec::new();
-        spec.pack_into(&mut bytes);
-        let BhDescr::Size {
-            type_id,
-            all_fielddescrs,
-            owner,
-            ..
-        } = descr_from_indexed_bytes(&bytes, spec.type_id)
-        else {
-            panic!("packed size slot must be a Size");
-        };
-        assert_eq!(type_id, spec.type_id);
-        assert!(owner.is_empty());
-        assert_eq!(all_fielddescrs.len(), 1);
-        assert_eq!(all_fielddescrs[0].field_key(), "slot");
+    fn packed_size_slot_and_parent_layouts() {
+        {
+            // packed_size_slot_decodes_without_bincode
+            use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec};
+            let mut spec = BhSizeSpec {
+                size: 24,
+                type_id: 0xA11C_E501,
+                vtable: 0,
+                owner: String::new(),
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: vec![BhFieldSpec {
+                    index: 0,
+                    field_key: "slot".to_string(),
+                    name: "Packed.slot".to_string(),
+                    offset: 16,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    field_flag: majit_ir::descr::ArrayFlag::Signed,
+                    is_field_signed: true,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            };
+            let mut bytes = Vec::new();
+            spec.pack_into(&mut bytes);
+            let BhDescr::Size {
+                type_id,
+                all_fielddescrs,
+                owner,
+                ..
+            } = descr_from_indexed_bytes(&bytes, spec.type_id)
+            else {
+                panic!("packed size slot must be a Size");
+            };
+            assert_eq!(type_id, spec.type_id);
+            assert!(owner.is_empty());
+            assert_eq!(all_fielddescrs.len(), 1);
+            assert_eq!(all_fielddescrs[0].field_key(), "slot");
 
-        spec.owner = "INT_TYPE".into();
-        spec.vtable = 0x7fff_ff00;
-        let mut named = Vec::new();
-        spec.pack_into(&mut named);
-        let BhDescr::Size {
-            owner: named_owner,
-            vtable: named_vtable,
-            ..
-        } = descr_from_indexed_bytes(&named, spec.type_id)
-        else {
-            panic!("packed size slot must keep owner");
-        };
-        assert_eq!(named_owner, "INT_TYPE");
-        assert_eq!(named_vtable, 0x7fff_ff00);
+            spec.owner = "INT_TYPE".into();
+            spec.vtable = 0x7fff_ff00;
+            let mut named = Vec::new();
+            spec.pack_into(&mut named);
+            let BhDescr::Size {
+                owner: named_owner,
+                vtable: named_vtable,
+                ..
+            } = descr_from_indexed_bytes(&named, spec.type_id)
+            else {
+                panic!("packed size slot must keep owner");
+            };
+            assert_eq!(named_owner, "INT_TYPE");
+            assert_eq!(named_vtable, 0x7fff_ff00);
 
-        let raw = bincode::serialize(&BhDescr::VableField { index: 3 }).unwrap();
-        assert!(matches!(
-            descr_from_indexed_bytes(&raw, 0),
-            BhDescr::VableField { index: 3 }
-        ));
-    }
-
-    #[test]
-    fn kind0_materialize_publishes_declared_int_field() {
-        // Startup path. A declared STRUCT's field stays the group's descr
-        // (`descr.py get_field_descr`) when kind-0 does not re-decode the slot.
-        materialize_gccache_owned_descrs();
-        let key =
-            majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("intobject::W_IntObject"));
-        let cached = majit_ir::descr::gc_cache()
-            .lock()
-            ._cache_field
-            .get(&key)
-            .and_then(|fields| fields.get("intval"))
-            .cloned()
-            .expect("W_IntObject.intval published before user code");
-        let cached = cached as majit_ir::DescrRef;
-        assert!(std::sync::Arc::ptr_eq(
-            &cached,
-            &crate::descr::int_intval_descr()
-        ));
-    }
-
-    #[test]
-    fn packed_parent_layouts_match_descr_layout_at() {
-        let mut count = 0usize;
-        for_each_packed_parent_layout(|spec| {
-            assert_eq!(*descr_layout_at(count), spec);
-            count += 1;
-        });
-        assert_eq!(count, descr_layout_offsets().len() - 1);
-        assert!(count > 0, "translation stored no parent layout");
+            let raw = bincode::serialize(&BhDescr::VableField { index: 3 }).unwrap();
+            assert!(matches!(
+                descr_from_indexed_bytes(&raw, 0),
+                BhDescr::VableField { index: 3 }
+            ));
+        }
+        {
+            // packed_parent_layouts_match_descr_layout_at
+            let mut count = 0usize;
+            for_each_packed_parent_layout(|spec| {
+                assert_eq!(*descr_layout_at(count), spec);
+                count += 1;
+            });
+            assert_eq!(count, descr_layout_offsets().len() - 1);
+            assert!(count > 0, "translation stored no parent layout");
+        }
     }
 
     #[test]

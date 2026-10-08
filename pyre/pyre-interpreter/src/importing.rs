@@ -8812,133 +8812,133 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_exec_stores_file_from_the_path_buffer() {
+    fn frozen_startup_body_and_alias_spec() {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
-        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
-        let code =
-            crate::compile::compile_source("x = 1\n", crate::compile::Mode::Exec).expect("compile");
-        let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
-        let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
-        let path = rustpython_wtf8::Wtf8Buf::from("/tmp/m.py");
-        exec_code_module(
-            w_code,
-            w_globals,
-            std::rc::Rc::as_ptr(&ec),
-            Some(&path),
-            None,
-            false,
-        )
-        .expect("exec");
-        let file =
-            unsafe { pyre_object::w_dict_getitem_str(w_globals, "__file__") }.expect("__file__");
-        unsafe {
-            assert_eq!(pyre_object::w_str_len(file), 9);
-            assert_eq!(pyre_object::w_str_get_wtf8(file), "/tmp/m.py");
-        }
-        let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "x") }.expect("x");
-        assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 1);
-    }
-
-    #[test]
-    fn frozen_startup_body_runs_on_the_plain_dispatch() {
-        crate::test_hooks::install_hash_hook();
-        crate::typedef::init_typeobjects();
-        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
-        let code =
-            crate::compile::compile_source("y = 2\n", crate::compile::Mode::Exec).expect("compile");
-        let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
-        let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
-        let path = rustpython_wtf8::Wtf8Buf::from("<frozen importlib._bootstrap>");
-        exec_code_module(
-            w_code,
-            w_globals,
-            std::rc::Rc::as_ptr(&ec),
-            Some(&path),
-            None,
-            true,
-        )
-        .expect("plain exec");
-        let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "y") }.expect("y");
-        assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 2);
-    }
-
-    #[test]
-    fn frozen_alias_keeps_an_installed_frozen_spec() {
-        crate::test_hooks::install_hash_hook();
-        crate::typedef::init_typeobjects();
-        let loader = pyre_object::w_module_new("FrozenImporter");
-        let spec = pyre_object::w_module_new("spec");
-        let module = pyre_object::w_module_new("_frozen_importlib");
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                pyre_object::w_module_get_w_dict(spec),
-                "loader",
-                loader,
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                pyre_object::w_module_get_w_dict(module),
-                "__spec__",
-                spec,
-            );
-        }
-        set_frozen_alias_metadata(module, "_frozen_importlib", module).expect("origname");
-        let kept = unsafe {
-            pyre_object::w_dict_getitem_str(pyre_object::w_module_get_w_dict(module), "__spec__")
-        }
-        .expect("spec");
-        assert!(std::ptr::eq(kept, spec));
-        let origname = unsafe {
-            pyre_object::w_dict_getitem_str(
-                pyre_object::w_module_get_w_dict(module),
-                "__origname__",
+        {
+            // source_exec_stores_file_from_the_path_buffer
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let code = crate::compile::compile_source("x = 1\n", crate::compile::Mode::Exec)
+                .expect("compile");
+            let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+            let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
+            let path = rustpython_wtf8::Wtf8Buf::from("/tmp/m.py");
+            exec_code_module(
+                w_code,
+                w_globals,
+                std::rc::Rc::as_ptr(&ec),
+                Some(&path),
+                None,
+                false,
             )
+            .expect("exec");
+            let file = unsafe { pyre_object::w_dict_getitem_str(w_globals, "__file__") }
+                .expect("__file__");
+            unsafe {
+                assert_eq!(pyre_object::w_str_len(file), 9);
+                assert_eq!(pyre_object::w_str_get_wtf8(file), "/tmp/m.py");
+            }
+            let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "x") }.expect("x");
+            assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 1);
         }
-        .expect("origname");
-        unsafe {
-            assert_eq!(
-                pyre_object::w_str_get_wtf8(origname),
-                "importlib._bootstrap"
-            );
+        {
+            // frozen_startup_body_runs_on_the_plain_dispatch
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let code = crate::compile::compile_source("y = 2\n", crate::compile::Mode::Exec)
+                .expect("compile");
+            let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+            let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
+            let path = rustpython_wtf8::Wtf8Buf::from("<frozen importlib._bootstrap>");
+            exec_code_module(
+                w_code,
+                w_globals,
+                std::rc::Rc::as_ptr(&ec),
+                Some(&path),
+                None,
+                true,
+            )
+            .expect("plain exec");
+            let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "y") }.expect("y");
+            assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 2);
+        }
+        {
+            // frozen_alias_keeps_an_installed_frozen_spec
+            let loader = pyre_object::w_module_new("FrozenImporter");
+            let spec = pyre_object::w_module_new("spec");
+            let module = pyre_object::w_module_new("_frozen_importlib");
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    pyre_object::w_module_get_w_dict(spec),
+                    "loader",
+                    loader,
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    pyre_object::w_module_get_w_dict(module),
+                    "__spec__",
+                    spec,
+                );
+            }
+            set_frozen_alias_metadata(module, "_frozen_importlib", module).expect("origname");
+            let kept = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::w_module_get_w_dict(module),
+                    "__spec__",
+                )
+            }
+            .expect("spec");
+            assert!(std::ptr::eq(kept, spec));
+            let origname = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::w_module_get_w_dict(module),
+                    "__origname__",
+                )
+            }
+            .expect("origname");
+            unsafe {
+                assert_eq!(
+                    pyre_object::w_str_get_wtf8(origname),
+                    "importlib._bootstrap"
+                );
+            }
         }
     }
 
-    #[cfg(feature = "host_env")]
     #[test]
-    fn bootstrap_seed_registers_builtins_via_getbuiltinmodule() {
+    fn bootstrap_seed_and_appleveldef_install() {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
-        install_builtin_modules();
-        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
-        seed_importlib_bootstrap_builtins(std::rc::Rc::as_ptr(&ec)).expect("seed");
-        for name in ["sys", "_imp", "_thread", "_warnings", "_weakref"] {
-            assert!(
-                check_sys_modules(name).is_some(),
-                "{name} is in sys.modules"
-            );
+        {
+            // appleveldef_install_binds_through_the_plain_dispatch
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let ns = pyre_object::dictmultiobject::w_dict_new();
+            appleveldef_install(
+                ns,
+                "answer = 1\n",
+                "app_answer.py",
+                "app_answer",
+                &["answer"],
+            )
+            .expect("applevel body binds answer");
+            let bound = unsafe { pyre_object::w_dict_getitem_str(ns, "answer") };
+            assert!(bound.is_some(), "answer is copied into the module dict");
         }
-    }
-
-    #[test]
-    fn appleveldef_install_binds_through_the_plain_dispatch() {
-        crate::test_hooks::install_hash_hook();
-        crate::typedef::init_typeobjects();
-        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
-        let ns = pyre_object::dictmultiobject::w_dict_new();
-        appleveldef_install(
-            ns,
-            "answer = 1\n",
-            "app_answer.py",
-            "app_answer",
-            &["answer"],
-        )
-        .expect("applevel body binds answer");
-        let bound = unsafe { pyre_object::w_dict_getitem_str(ns, "answer") };
-        assert!(bound.is_some(), "answer is copied into the module dict");
+        #[cfg(feature = "host_env")]
+        {
+            // bootstrap_seed_registers_builtins_via_getbuiltinmodule
+            install_builtin_modules();
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            seed_importlib_bootstrap_builtins(std::rc::Rc::as_ptr(&ec)).expect("seed");
+            for name in ["sys", "_imp", "_thread", "_warnings", "_weakref"] {
+                assert!(
+                    check_sys_modules(name).is_some(),
+                    "{name} is in sys.modules"
+                );
+            }
+        }
     }
 
     #[cfg(all(

@@ -941,36 +941,38 @@ mod field_display_name_tests {
     use super::field_display_name;
 
     #[test]
-    fn a_qualified_key_is_not_prefixed_again() {
-        assert_eq!(
-            field_display_name("PyFrame", "PyFrame.flags"),
-            "PyFrame.flags"
-        );
-        assert_eq!(field_display_name("PyFrame", "flags"), "PyFrame.flags");
-        assert_eq!(field_display_name("", "flags"), "flags");
-        assert_eq!(
-            field_display_name("Py", "PyFrame.flags"),
-            "Py.PyFrame.flags"
-        );
-    }
-
-    #[test]
-    fn a_qualified_static_key_is_the_published_name() {
-        let key: &'static str = "QualStaticOwner.slot";
-        let group = super::build_object_descr_group_with_def_path(
-            24,
-            0x5155_A701,
-            0x1000,
-            &[(key, 16, 8, majit_ir::value::Type::Int, true, false, false)],
-            "QualStaticOwner",
-            "pyre_jit_trace::descr::QualStaticOwner",
-        );
-        let field = &group.field_descrs[0];
-        assert!(std::ptr::eq(
-            majit_ir::descr::FieldDescr::field_name(field.as_ref()),
-            key
-        ));
-        assert_eq!(majit_ir::descr::FieldDescr::field_key(field.as_ref()), key);
+    fn a_qualified_key_is_the_published_name() {
+        {
+            // a_qualified_key_is_not_prefixed_again
+            assert_eq!(
+                field_display_name("PyFrame", "PyFrame.flags"),
+                "PyFrame.flags"
+            );
+            assert_eq!(field_display_name("PyFrame", "flags"), "PyFrame.flags");
+            assert_eq!(field_display_name("", "flags"), "flags");
+            assert_eq!(
+                field_display_name("Py", "PyFrame.flags"),
+                "Py.PyFrame.flags"
+            );
+        }
+        {
+            // a_qualified_static_key_is_the_published_name
+            let key: &'static str = "QualStaticOwner.slot";
+            let group = super::build_object_descr_group_with_def_path(
+                24,
+                0x5155_A701,
+                0x1000,
+                &[(key, 16, 8, majit_ir::value::Type::Int, true, false, false)],
+                "QualStaticOwner",
+                "pyre_jit_trace::descr::QualStaticOwner",
+            );
+            let field = &group.field_descrs[0];
+            assert!(std::ptr::eq(
+                majit_ir::descr::FieldDescr::field_name(field.as_ref()),
+                key
+            ));
+            assert_eq!(majit_ir::descr::FieldDescr::field_key(field.as_ref()), key);
+        }
     }
 }
 
@@ -10039,101 +10041,102 @@ mod tests {
     }
 
     #[test]
-    fn make_descr_from_bh_size_reuses_declared_int_group() {
+    fn make_descr_from_bh_size_and_kind0_parent_layout() {
         use majit_ir::descr::ArrayFlag;
         use majit_jitcode::jitcode::BhDescr;
 
-        let bh = BhDescr::Size {
-            size: std::mem::size_of::<pyre_object::intobject::W_IntObject>(),
-            type_id: majit_ir::descr::path_hash("intobject::W_IntObject"),
-            vtable: 1,
-            owner: "intobject::W_IntObject".into(),
-            is_gc_managed: true,
-            all_fielddescrs: vec![majit_jitcode::jitcode::BhFieldSpec {
-                index: 0,
-                field_key: "intval".into(),
-                name: "W_IntObject.intval".into(),
-                offset: 16,
-                field_size: 8,
-                field_type: Type::Int,
-                field_flag: ArrayFlag::Signed,
-                is_field_signed: true,
-                is_immutable: true,
-                is_quasi_immutable: false,
-                index_in_parent: 0,
-                is_class_word: None,
-            }],
-        };
-        let descr = make_descr_from_bh(&bh);
-        assert!(std::sync::Arc::ptr_eq(&descr, &w_int_size_descr()));
-    }
+        {
+            // make_descr_from_bh_size_reuses_declared_int_group
+            let bh = BhDescr::Size {
+                size: std::mem::size_of::<pyre_object::intobject::W_IntObject>(),
+                type_id: majit_ir::descr::path_hash("intobject::W_IntObject"),
+                vtable: 1,
+                owner: "intobject::W_IntObject".into(),
+                is_gc_managed: true,
+                all_fielddescrs: vec![majit_jitcode::jitcode::BhFieldSpec {
+                    index: 0,
+                    field_key: "intval".into(),
+                    name: "W_IntObject.intval".into(),
+                    offset: 16,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    field_flag: ArrayFlag::Signed,
+                    is_field_signed: true,
+                    is_immutable: true,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: None,
+                }],
+            };
+            let descr = make_descr_from_bh(&bh);
+            assert!(std::sync::Arc::ptr_eq(&descr, &w_int_size_descr()));
+        }
+        {
+            // publish_kind0_parent_layout_inserts_an_undeclared_field_once
+            use majit_jitcode::jitcode::BhFieldSpec;
 
-    #[test]
-    fn publish_kind0_parent_layout_inserts_an_undeclared_field_once() {
-        use majit_ir::descr::ArrayFlag;
-        use majit_jitcode::jitcode::BhFieldSpec;
-
-        let type_id = majit_ir::descr::path_hash("startup_probe::NotARealStruct");
-        let spec = majit_jitcode::jitcode::BhSizeSpec {
-            size: 16,
-            type_id,
-            vtable: 1,
-            owner: String::new(),
-            is_gc_managed: true,
-            headerless: false,
-            all_fielddescrs: vec![BhFieldSpec {
-                index: 0,
-                field_key: "probe".into(),
-                name: "NotARealStruct.probe".into(),
-                offset: 8,
-                field_size: 8,
-                field_type: Type::Int,
-                field_flag: ArrayFlag::Signed,
-                is_field_signed: true,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                index_in_parent: 0,
-                is_class_word: None,
-            }],
-        };
-        publish_kind0_parent_layout(spec.clone());
-        let key = majit_ir::descr::LLType::Struct(type_id);
-        let first = majit_ir::descr::gc_cache()
-            .lock()
-            ._cache_field
-            .get(&key)
-            .and_then(|fields| fields.get("probe"))
-            .cloned()
-            .expect("undeclared parent layout publishes its field");
-        publish_kind0_parent_layout(spec.clone());
-        let second = majit_ir::descr::gc_cache()
-            .lock()
-            ._cache_field
-            .get(&key)
-            .and_then(|fields| fields.get("probe"))
-            .cloned()
-            .expect("second publish keeps the field");
-        assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert!(kind0_size_already_published(type_id));
-        assert!(!kind0_size_already_published(0));
-        // Same field count as the cached size: the packed names are the
-        // row `get_field_descr` already stored.
-        assert!(kind0_layout_already_published(type_id, 1));
-        assert!(!kind0_layout_already_published(type_id, 2));
-        assert!(!kind0_layout_already_published(0, 1));
-        // The miss path forces module user layouts once (`descr.py`
-        // `get_size_descr`). Their size rows are already cached.
-        for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
-            let laid_out =
-                majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(entry.def_path));
-            assert!(
-                majit_ir::descr::gc_cache()
-                    .lock()
-                    ._cache_size
-                    .contains_key(&laid_out),
-                "{}",
-                entry.def_path
-            );
+            let type_id = majit_ir::descr::path_hash("startup_probe::NotARealStruct");
+            let spec = majit_jitcode::jitcode::BhSizeSpec {
+                size: 16,
+                type_id,
+                vtable: 1,
+                owner: String::new(),
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: vec![BhFieldSpec {
+                    index: 0,
+                    field_key: "probe".into(),
+                    name: "NotARealStruct.probe".into(),
+                    offset: 8,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    field_flag: ArrayFlag::Signed,
+                    is_field_signed: true,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: None,
+                }],
+            };
+            publish_kind0_parent_layout(spec.clone());
+            let key = majit_ir::descr::LLType::Struct(type_id);
+            let first = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_field
+                .get(&key)
+                .and_then(|fields| fields.get("probe"))
+                .cloned()
+                .expect("undeclared parent layout publishes its field");
+            publish_kind0_parent_layout(spec.clone());
+            let second = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_field
+                .get(&key)
+                .and_then(|fields| fields.get("probe"))
+                .cloned()
+                .expect("second publish keeps the field");
+            assert!(std::sync::Arc::ptr_eq(&first, &second));
+            assert!(kind0_size_already_published(type_id));
+            assert!(!kind0_size_already_published(0));
+            // Same field count as the cached size: the packed names are the
+            // row `get_field_descr` already stored.
+            assert!(kind0_layout_already_published(type_id, 1));
+            assert!(!kind0_layout_already_published(type_id, 2));
+            assert!(!kind0_layout_already_published(0, 1));
+            // The miss path forces module user layouts once (`descr.py`
+            // `get_size_descr`). Their size rows are already cached.
+            for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+                let laid_out =
+                    majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(entry.def_path));
+                assert!(
+                    majit_ir::descr::gc_cache()
+                        .lock()
+                        ._cache_size
+                        .contains_key(&laid_out),
+                    "{}",
+                    entry.def_path
+                );
+            }
         }
     }
 
@@ -13467,53 +13470,102 @@ mod set_member_lookup_tests {
 
     /// The EffectInfo member for the shared header is `pyobject::PyObject.w_class`.
     /// That spelling is not in the `make_descr_from_bh` name bridge, so the
-    /// stamp answers with `w_class_descr` itself.
+    /// stamp answers with `w_class_descr` itself. `with_extra_gc_fielddescr`
+    /// keeps the inherited header out of `all_fielddescrs`; EffectInfo still
+    /// names that field `w_class`. A borrowed parent layout stores `w_class`
+    /// on the size and `stamp_effect_info_descr` adopts that arc.
     #[test]
-    fn pyobject_header_w_class_is_the_shared_descr() {
-        let struct_id = majit_ir::descr::path_hash("pyobject::PyObject");
-        let found = descr_from_set_member(&DescrSetMember::Field {
-            struct_id,
-            field_name: "w_class".to_string(),
-        });
-        let SetMemberLookup::Resolved(descr) = found else {
-            panic!("pyobject::PyObject.w_class did not resolve");
-        };
-        assert!(std::sync::Arc::ptr_eq(&descr, &w_class_descr()));
-    }
+    fn w_class_is_the_shared_effectinfo_field() {
+        {
+            // pyobject_header_w_class_is_the_shared_descr
+            let struct_id = majit_ir::descr::path_hash("pyobject::PyObject");
+            let found = descr_from_set_member(&DescrSetMember::Field {
+                struct_id,
+                field_name: "w_class".to_string(),
+            });
+            let SetMemberLookup::Resolved(descr) = found else {
+                panic!("pyobject::PyObject.w_class did not resolve");
+            };
+            assert!(std::sync::Arc::ptr_eq(&descr, &w_class_descr()));
+        }
+        {
+            // a_gc_only_w_class_on_the_size_is_the_effectinfo_field
+            let struct_id = 0x7e57_0000_0000_0004u64;
+            let field: std::sync::Arc<dyn majit_ir::descr::FieldDescr> =
+                std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                    0,
+                    8,
+                    8,
+                    majit_ir::Type::Ref,
+                    false,
+                    majit_ir::ArrayFlag::Pointer,
+                    "PyObject.w_class".to_string(),
+                    "w_class",
+                ));
+            let size = majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, 32, 0, 0x1000)
+                .with_extra_gc_fielddescr(field.clone());
+            majit_ir::descr::gc_cache().lock().register_keyed_size(
+                majit_ir::descr::LLType::Struct(struct_id),
+                std::sync::Arc::new(size) as DescrRef,
+            );
+            let found = descr_from_set_member(&DescrSetMember::Field {
+                struct_id,
+                field_name: "w_class".to_string(),
+            });
+            let SetMemberLookup::Resolved(descr) = found else {
+                panic!("gc-only w_class was not adopted");
+            };
+            assert!(std::sync::Arc::ptr_eq(
+                &descr,
+                &(field as majit_ir::DescrRef)
+            ));
+        }
+        {
+            // stamp_adopts_w_class_already_stored_on_the_size
+            use majit_ir::descr::{ArrayFlag, LLType, SimpleFieldDescr, SimpleSizeDescr};
+            use majit_ir::value::Type;
 
-    /// `with_extra_gc_fielddescr` keeps the inherited header out of
-    /// `all_fielddescrs`. EffectInfo still names that field `w_class`.
-    #[test]
-    fn a_gc_only_w_class_on_the_size_is_the_effectinfo_field() {
-        let struct_id = 0x7e57_0000_0000_0004u64;
-        let field: std::sync::Arc<dyn majit_ir::descr::FieldDescr> =
-            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+            // Distinct from `a_gc_only_w_class_on_the_size_is_the_effectinfo_field`:
+            // both tests publish into the process-global `gc_cache`.
+            let struct_id = 0x7e57_0000_0000_0005u64;
+            let key = "Owner.w_class";
+            let field = Arc::new(SimpleFieldDescr::new_with_name(
                 0,
                 8,
                 8,
-                majit_ir::Type::Ref,
+                Type::Ref,
                 false,
-                majit_ir::ArrayFlag::Pointer,
-                "PyObject.w_class".to_string(),
-                "w_class",
+                ArrayFlag::Struct,
+                key.to_string(),
+                key,
             ));
-        let size = majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, 32, 0, 0x1000)
-            .with_extra_gc_fielddescr(field.clone());
-        majit_ir::descr::gc_cache().lock().register_keyed_size(
-            majit_ir::descr::LLType::Struct(struct_id),
-            std::sync::Arc::new(size) as DescrRef,
-        );
-        let found = descr_from_set_member(&DescrSetMember::Field {
-            struct_id,
-            field_name: "w_class".to_string(),
-        });
-        let SetMemberLookup::Resolved(descr) = found else {
-            panic!("gc-only w_class was not adopted");
-        };
-        assert!(std::sync::Arc::ptr_eq(
-            &descr,
-            &(field as majit_ir::DescrRef)
-        ));
+            let size = SimpleSizeDescr::with_vtable(u32::MAX, 16, 0, 0).with_all_fielddescrs(vec![
+                field.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
+            ]);
+            // Do not insert a `_cache_field` row. That is the borrowed publish.
+            majit_ir::descr::gc_cache().lock().register_keyed_size(
+                LLType::Struct(struct_id),
+                Arc::new(size) as majit_ir::DescrRef,
+            );
+
+            let member = DescrSetMember::Field {
+                struct_id,
+                field_name: "w_class".to_string(),
+            };
+            let SetMemberLookup::Resolved(descr) = descr_from_set_member(&member) else {
+                panic!("w_class on the size must resolve without a name-cache row");
+            };
+            let resolved = descr
+                .as_field_descr()
+                .expect("a Field member resolves to a FieldDescr");
+            assert_eq!(resolved.offset(), 8);
+            assert_eq!(resolved.field_name(), key);
+
+            stamp_effect_info_descr(&member, 7);
+            // The atomic lives on the size's FieldDescr. A minted replacement
+            // would leave this one at u32::MAX.
+            assert_eq!(field.get_ei_index(), 7);
+        }
     }
 
     /// The label is what `PYRE_DESCR_SPELLING_GATE` prints, and it has to name
@@ -13582,58 +13634,6 @@ mod set_member_lookup_tests {
         assert_eq!(field.offset(), 16);
         assert_eq!(field.field_size(), 8);
         assert_eq!(field.index_in_parent(), 1);
-    }
-
-    /// A borrowed parent layout stores `w_class` on the size and leaves
-    /// `_cache_field` empty until `get_field_descr` looks the name up.
-    /// `stamp_effect_info_descr` must adopt that arc (`descr.py`
-    /// `get_field_descr`), the same object `heaptracker.py`
-    /// `get_fielddescr_index_in` indexes.
-    #[test]
-    fn stamp_adopts_w_class_already_stored_on_the_size() {
-        use majit_ir::descr::{ArrayFlag, LLType, SimpleFieldDescr, SimpleSizeDescr};
-        use majit_ir::value::Type;
-
-        // Distinct from `a_gc_only_w_class_on_the_size_is_the_effectinfo_field`:
-        // both tests publish into the process-global `gc_cache`.
-        let struct_id = 0x7e57_0000_0000_0005u64;
-        let key = "Owner.w_class";
-        let field = Arc::new(SimpleFieldDescr::new_with_name(
-            0,
-            8,
-            8,
-            Type::Ref,
-            false,
-            ArrayFlag::Struct,
-            key.to_string(),
-            key,
-        ));
-        let size = SimpleSizeDescr::with_vtable(u32::MAX, 16, 0, 0).with_all_fielddescrs(vec![
-            field.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
-        ]);
-        // Do not insert a `_cache_field` row. That is the borrowed publish.
-        majit_ir::descr::gc_cache().lock().register_keyed_size(
-            LLType::Struct(struct_id),
-            Arc::new(size) as majit_ir::DescrRef,
-        );
-
-        let member = DescrSetMember::Field {
-            struct_id,
-            field_name: "w_class".to_string(),
-        };
-        let SetMemberLookup::Resolved(descr) = descr_from_set_member(&member) else {
-            panic!("w_class on the size must resolve without a name-cache row");
-        };
-        let resolved = descr
-            .as_field_descr()
-            .expect("a Field member resolves to a FieldDescr");
-        assert_eq!(resolved.offset(), 8);
-        assert_eq!(resolved.field_name(), key);
-
-        stamp_effect_info_descr(&member, 7);
-        // The atomic lives on the size's FieldDescr. A minted replacement
-        // would leave this one at u32::MAX.
-        assert_eq!(field.get_ei_index(), 7);
     }
 }
 

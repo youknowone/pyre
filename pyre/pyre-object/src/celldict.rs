@@ -1674,26 +1674,30 @@ mod tests {
     }
 
     #[test]
-    fn module_dict_store_dirties_prebuilt_roots() {
-        let w_dict = crate::dictmultiobject::w_module_dict_new();
-        let storage = unsafe { crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict) };
-        crate::gc_roots::clear_prebuilt_roots_dirty();
-        storage.set("k", crate::w_str_new("v"));
-        assert!(crate::gc_roots::prebuilt_roots_dirty());
-        let cell = crate::w_str_new("cell") as *mut u8;
-        crate::gc_roots::clear_prebuilt_roots_dirty();
-        object_mutable_cell_write_barrier(cell);
-        assert!(crate::gc_roots::prebuilt_roots_dirty());
-    }
-
-    #[test]
-    fn global_cache_insert_dirties_prebuilt_roots() {
-        let w_dict = crate::dictmultiobject::w_module_dict_new();
-        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
-        strat.setitem_str(w_dict, "kept", crate::w_str_new("kept"));
-        crate::gc_roots::clear_prebuilt_roots_dirty();
-        let _cache = strat.get_global_cache(w_dict, "kept", crate::pyobject::PY_NULL);
-        assert!(crate::gc_roots::prebuilt_roots_dirty());
+    fn module_dict_store_and_global_cache_insert_dirties_prebuilt_roots() {
+        {
+            // module_dict_store_dirties_prebuilt_roots
+            let w_dict = crate::dictmultiobject::w_module_dict_new();
+            let storage =
+                unsafe { crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict) };
+            crate::gc_roots::clear_prebuilt_roots_dirty();
+            storage.set("k", crate::w_str_new("v"));
+            assert!(crate::gc_roots::prebuilt_roots_dirty());
+            let cell = crate::w_str_new("cell") as *mut u8;
+            crate::gc_roots::clear_prebuilt_roots_dirty();
+            object_mutable_cell_write_barrier(cell);
+            assert!(crate::gc_roots::prebuilt_roots_dirty());
+        }
+        {
+            // global_cache_insert_dirties_prebuilt_roots
+            let w_dict = crate::dictmultiobject::w_module_dict_new();
+            let strat =
+                unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
+            strat.setitem_str(w_dict, "kept", crate::w_str_new("kept"));
+            crate::gc_roots::clear_prebuilt_roots_dirty();
+            let _cache = strat.get_global_cache(w_dict, "kept", crate::pyobject::PY_NULL);
+            assert!(crate::gc_roots::prebuilt_roots_dirty());
+        }
     }
 
     #[test]

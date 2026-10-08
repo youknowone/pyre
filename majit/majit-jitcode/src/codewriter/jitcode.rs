@@ -2203,69 +2203,71 @@ mod layout_pack_tests {
     use super::{BhFieldSpec, BhSizeSpec};
 
     #[test]
-    fn pack_roundtrip_keeps_the_parent_layout() {
-        let spec = BhSizeSpec {
-            size: 24,
-            type_id: 0xabc,
-            vtable: 0,
-            owner: String::new(),
-            is_gc_managed: true,
-            headerless: false,
-            all_fielddescrs: vec![BhFieldSpec {
-                index: 1,
-                field_key: "intval".to_string(),
-                name: "W_IntObject.intval".to_string(),
-                offset: 16,
-                field_size: 8,
-                field_type: majit_ir::value::Type::Int,
-                field_flag: majit_ir::descr::ArrayFlag::Signed,
-                is_field_signed: true,
-                is_immutable: false,
-                is_quasi_immutable: true,
-                index_in_parent: 0,
-                is_class_word: Some(false),
-            }],
-        };
-        let mut bytes = Vec::new();
-        spec.pack_into(&mut bytes);
-        let (decoded, consumed) = BhSizeSpec::unpack_from(&bytes);
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, spec);
-        assert_eq!(BhSizeSpec::skip_record(&bytes), bytes.len());
-        let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
-        assert_eq!(type_id, spec.type_id);
-        assert_eq!(nfields as usize, spec.all_fielddescrs.len());
-        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
-        assert_eq!(static_consumed, leaked.len());
-        assert_eq!(decoded.owner, spec.owner);
-        assert_eq!(layout.fields[0].name, "W_IntObject.intval");
-        assert!(
-            leaked
-                .as_ptr_range()
-                .contains(&layout.fields[0].name.as_ptr())
-        );
-    }
-
-    #[test]
-    fn pack_roundtrip_keeps_the_type_static_owner() {
-        let spec = BhSizeSpec {
-            size: 16,
-            type_id: 0xdef,
-            vtable: 0x7fff_ff00,
-            owner: "INT_TYPE".into(),
-            is_gc_managed: true,
-            headerless: false,
-            all_fielddescrs: Vec::new(),
-        };
-        let mut bytes = Vec::new();
-        spec.pack_into(&mut bytes);
-        let (decoded, consumed) = BhSizeSpec::unpack_from(&bytes);
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, spec);
-        let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
-        assert_eq!(type_id, spec.type_id);
-        assert_eq!(nfields, 0);
+    fn pack_roundtrip_keeps_parent_layout_and_owner() {
+        {
+            // pack_roundtrip_keeps_the_parent_layout
+            let spec = BhSizeSpec {
+                size: 24,
+                type_id: 0xabc,
+                vtable: 0,
+                owner: String::new(),
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: vec![BhFieldSpec {
+                    index: 1,
+                    field_key: "intval".to_string(),
+                    name: "W_IntObject.intval".to_string(),
+                    offset: 16,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    field_flag: majit_ir::descr::ArrayFlag::Signed,
+                    is_field_signed: true,
+                    is_immutable: false,
+                    is_quasi_immutable: true,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            };
+            let mut bytes = Vec::new();
+            spec.pack_into(&mut bytes);
+            let (decoded, consumed) = BhSizeSpec::unpack_from(&bytes);
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(decoded, spec);
+            assert_eq!(BhSizeSpec::skip_record(&bytes), bytes.len());
+            let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
+            assert_eq!(type_id, spec.type_id);
+            assert_eq!(nfields as usize, spec.all_fielddescrs.len());
+            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
+            assert_eq!(static_consumed, leaked.len());
+            assert_eq!(decoded.owner, spec.owner);
+            assert_eq!(layout.fields[0].name, "W_IntObject.intval");
+            assert!(
+                leaked
+                    .as_ptr_range()
+                    .contains(&layout.fields[0].name.as_ptr())
+            );
+        }
+        {
+            // pack_roundtrip_keeps_the_type_static_owner
+            let spec = BhSizeSpec {
+                size: 16,
+                type_id: 0xdef,
+                vtable: 0x7fff_ff00,
+                owner: "INT_TYPE".into(),
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: Vec::new(),
+            };
+            let mut bytes = Vec::new();
+            spec.pack_into(&mut bytes);
+            let (decoded, consumed) = BhSizeSpec::unpack_from(&bytes);
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(decoded, spec);
+            let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
+            assert_eq!(type_id, spec.type_id);
+            assert_eq!(nfields, 0);
+        }
     }
 }
 
