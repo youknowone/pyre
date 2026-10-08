@@ -5110,25 +5110,22 @@ impl PyFrame {
         // builtin/object-space calls remain usable while an existing frame is
         // handling RecursionError and every newly entered Python frame is
         // still guarded.
-        crate::stack_check::drain_jit_pending_exception()?;
+        let mut resume = crate::call::FrameResumeArgs {
+            w_inputvalue,
+            operr,
+            throw_args: None,
+        };
+        // `w_arg_or_err` is a GC local from this entry through `call_trace`
+        // and `resume_execute_frame` (`pyframe.py execute_frame`).
         // `stack_check`'s overflow arm allocates `RecursionError` while a
-        // thrown `OperationError` is still the argument. `OperationError`
-        // (`error.py`) is a GC object. Pin the native carrier only when this
-        // entry holds one, and write the slots back before the resume reads it.
-        let mut operr = operr;
-        let operr_pin = operr.as_mut().map(|err| {
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin(&roots);
-            (roots, slot)
-        });
+        // thrown `OperationError` (`error.py`) and the sent value are still
+        // the argument. One shadow-stack bracket covers the whole span.
+        let pins = crate::eval::ResumeArgPins::try_pin(&mut resume);
+        crate::stack_check::drain_jit_pending_exception()?;
+        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), &mut resume);
         crate::stack_check::stack_check()?;
-        if let Some((roots, slot)) = &operr_pin
-            && let Some(err) = operr.as_mut()
-        {
-            err.reload(roots, *slot);
-        }
-        drop(operr_pin);
-        crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
+        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), &mut resume);
+        crate::eval::eval_frame_plain_with_resume(self, &mut resume, pins.as_ref())
     }
 
     /// Generator/coroutine execution entry carrying the original throw
@@ -5184,27 +5181,15 @@ impl PyFrame {
         &mut self,
         resume: &mut crate::call::FrameResumeArgs,
     ) -> crate::PyResult {
+        // Same `w_arg_or_err` bracket as `execute_frame`: the overflow arm
+        // allocates before `call_trace` / `resume_execute_frame` consume the
+        // sent value and the thrown `OperationError`.
+        let pins = crate::eval::ResumeArgPins::try_pin(resume);
         crate::stack_check::drain_jit_pending_exception()?;
-        // Same carrier pin as `execute_frame`: the overflow arm allocates
-        // before `eval_frame_plain_with_resume` takes `operr`.
-        let operr_pin = resume.operr.as_mut().map(|err| {
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin(&roots);
-            (roots, slot)
-        });
+        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), resume);
         crate::stack_check::stack_check()?;
-        if let Some((roots, slot)) = &operr_pin
-            && let Some(err) = resume.operr.as_mut()
-        {
-            err.reload(roots, *slot);
-        }
-        drop(operr_pin);
-        crate::eval::eval_frame_plain_with_resume(
-            self,
-            resume.w_inputvalue.take(),
-            resume.operr.take(),
-            resume.throw_args.take(),
-        )
+        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), resume);
+        crate::eval::eval_frame_plain_with_resume(self, resume, pins.as_ref())
     }
 
     /// pyframe.py `hide(self): return self.pycode.hidden_applevel`.

@@ -881,6 +881,76 @@ assert result == 300, result
     );
 }
 
+/// `generator.py _invoke_execute_frame` / `pyframe.py execute_frame` keep
+/// `w_arg_or_err` live from entry through `stack_check`, `call_trace` and
+/// `resume_execute_frame`. A young send/throw payload is copied into
+/// `FrameResumeArgs`; a moving collection in that span leaves the copy stale
+/// unless the value is re-read from its shadow-stack slot after every
+/// allocating call. The child uses the tree's nursery-stress harness
+/// (`PYPY_GC_NURSERY=1`): a one-byte nursery collects on almost every
+/// alloc, so a nursery-born list sent or thrown through the generator must
+/// come back as the same object with its contents intact.
+#[test]
+fn generator_send_throw_keeps_young_value_across_collection() {
+    const CHILD: &str = "PYRE_GENERATOR_RESUME_GC_ROOT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "generator_send_throw_keeps_young_value_across_collection",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated generator-resume GC-root regression");
+        assert!(
+            output.status.success(),
+            "generator send/throw lost a young value across a collecting alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    const PROGRAM: &str = r#"
+def echo():
+    v = None
+    while True:
+        try:
+            v = yield v
+        except ValueError as e:
+            v = e.args[0]
+
+def run():
+    g = echo()
+    g.send(None)
+    ok = 0
+    n = 0
+    while n < 300:
+        junk = [0] * 16
+        payload = [n, n + 1, n + 2]
+        got = g.send(payload)
+        if got is payload and got[0] == n and got[2] == n + 2:
+            ok = ok + 1
+        thrown = [n + 100, n + 101]
+        got = g.throw(ValueError(thrown))
+        if got is thrown and got[0] == n + 100 and got[1] == n + 101:
+            ok = ok + 1
+        n = n + 1
+    return ok
+
+result = run()
+assert result == 600, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<generator_send_throw_young_value_gc_stress>",
+        "generator send/throw young-value survival check",
+        "generator send/throw young-value gc stress program failed",
+    );
+}
+
 /// A `bytes` / `bytearray` object's `data` buffer is a GC-managed leaf storage
 /// box (off-GC storage): `bytes_object_custom_trace` /
 /// `bytearray_object_custom_trace` grey it through the `data` field slot, and
