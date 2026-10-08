@@ -2306,8 +2306,6 @@ pub(crate) unsafe fn set_name(
             let mut e = e;
             let err_slot = e.pin(&_note_roots);
             let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
-            let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
-            let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             // `%R` on the key: a namespace entry stored under a non-string
             // key is named in the note by its own repr.
             let name_repr = if unsafe { is_str(w_name) } {
@@ -2318,6 +2316,10 @@ pub(crate) unsafe fn set_name(
                     .and_then(|repr| repr.as_str().ok().map(str::to_owned))
                     .unwrap_or_default()
             };
+            // `typeobject.py _set_names` still names `w_value` and `w_type`
+            // after `space.repr`. Reload both from the pin; repr may collect.
+            let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
             let val_type_name = match crate::typedef::r#type(w_value) {
                 Some(t) => unsafe { pyre_object::w_type_get_name(t.as_ptr()) }.to_string(),
                 None => String::new(),

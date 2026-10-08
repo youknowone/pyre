@@ -329,13 +329,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // resuming through the single-frame collapse, whose caller-boundary
             // re-execute both mis-sizes the resumed frame (a decode/`LOAD_FAST`
             // out-of-bounds) and re-applies the callee's committed side effect.
+            // The caller names the guard (`GuardFromEnd` when the guard is
+            // not the last op). Overwriting that with `LastOp` attaches the
+            // snapshot to a later op and leaves the guard at `resume_pos == -1`.
+            let guard_stamp = scope.guard_stamp;
             return walker_capture_multi_frame_inline_snapshot(
                 ctx,
                 op_pc,
                 after_residual_call,
                 parent_frames,
                 scope,
-                GuardStampTarget::LastOp,
+                guard_stamp,
             );
         }
     }
