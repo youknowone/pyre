@@ -2,8 +2,9 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=3557ad4a6b13932a platform=linux
+# corpus=41e02e4e5208c3a5 platform=linux
 # Attributed joins after getitem pin_roots / timezone re-extract.
+# Attributed join after eval_slice_index moved to baseobjspace getindex_w (#2219).
 direct-skip (never reaches unported_category)	pyre_interpreter::rsocket_rffi::sockaddr_in_get_addr
 direct-skip (never reaches unported_category)	pyre_module::module::mmap::interp_mmap::<Impl>::as_ptr
 direct-skip (never reaches unported_category)	pyre_module::module::mmap::interp_mmap::<Impl>::len
@@ -158,6 +159,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::getdict
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getdict_backing
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getdict_native
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getindex_repeat
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::getindex_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getindex_w_index
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getindex_w_written
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem
@@ -2013,7 +2015,6 @@ two-phase-never-a-subject	pyre_object::listobject::ll_listslice_inner
 two-phase-never-a-subject	pyre_object::listobject::ll_listslice_ints
 two-phase-never-a-subject	pyre_object::listobject::ll_listslice_new_int_list
 two-phase-never-a-subject	pyre_object::listobject::switch_to_correct_strategy
-two-phase-never-a-subject	pyre_object::listobject::w_list_adopt_int_items
 two-phase-never-a-subject	pyre_object::listobject::w_list_append
 two-phase-never-a-subject	pyre_object::listobject::w_list_append_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_getitem_inner
