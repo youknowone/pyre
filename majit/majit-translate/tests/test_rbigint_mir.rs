@@ -5,6 +5,11 @@
 //! flow graphs under the same `[module::RBigInt, method]` keys emitted at
 //! call sites.
 
+mod common;
+
+use common::{
+    INTERPRETER_LLBC, MODULE_LLBC, load_llbc, load_llbc_if_present, lower_named, rbigint_llbcs,
+};
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
@@ -12,55 +17,16 @@ use majit_translate::{
         llbc_hints::harvest_hints_from_llbcs,
         mir::{
             build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-            build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, lower_function,
+            build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
         },
     },
     model::{CallTarget, OpKind, ValueType},
 };
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
-);
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
-);
-const MODULE_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-module.ullbc"
-);
-const RLIB_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/majit-rlib.ullbc"
-);
 const RBIGINT_RS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../majit/majit-rlib/src/rbigint.rs"
 );
-
-/// rbigint's bodies and hints are in `majit-rlib.ullbc`, its callers
-/// (`longobject`) in `pyre-object.ullbc`. The front end merges both
-/// (`MANDATORY`), so a test reading either side loads the same pair, owner
-/// first — the per-type tables are first-writer-wins.
-///
-/// `None` means an artefact is missing and the caller skips, which is the
-/// pre-existing behaviour for a tree that has not been extracted.
-fn load_rbigint_llbcs() -> Option<Vec<Llbc>> {
-    for path in [RLIB_LLBC, OBJECT_LLBC] {
-        if !std::path::Path::new(path).is_file() {
-            eprintln!(
-                "skipping: {path} is missing; run \
-                 `python3 scripts/extract-llbc.py majit-rlib pyre-object`"
-            );
-            return None;
-        }
-    }
-    Some(vec![
-        Llbc::load(RLIB_LLBC).expect("load majit-rlib.ullbc"),
-        Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"),
-    ])
-}
 
 /// `_AsDouble` consumes `bit_length()` with `?`, so the `Result<i64,
 /// RBigIntError>` it returns is destructured by a live `Try::branch` /
@@ -70,11 +36,11 @@ fn load_rbigint_llbcs() -> Option<Vec<Llbc>> {
 /// matching upstream, which mints no residual for them either.
 #[test]
 fn as_double_effect_graph_keeps_upstream_bit_length_call() {
-    let Some(llbcs) = load_rbigint_llbcs() else {
+    let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
-    let graph = lower_function(&llbcs[0], "rbigint::_AsDouble")
-        .or_else(|_| lower_function(&llbcs[0], "_AsDouble"))
+    let graph = lower_named(llbcs[0], "rbigint::_AsDouble")
+        .or_else(|_| lower_named(llbcs[0], "_AsDouble"))
         .expect("lower rbigint::_AsDouble");
     let calls: Vec<String> = graph
         .blocks
@@ -111,7 +77,7 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
 /// (`integer_divmod_pair`) keep the pair residual.
 #[test]
 fn floordiv_keeps_divmod_result_for_try_branch() {
-    let Some(llbcs) = load_rbigint_llbcs() else {
+    let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
     let call_leaves = |graph: &majit_translate::model::FunctionGraph| -> Vec<String> {
@@ -148,7 +114,7 @@ fn floordiv_keeps_divmod_result_for_try_branch() {
         })
     };
 
-    let graph = lower_function(&llbcs[0], "floordiv").expect("lower floordiv");
+    let graph = lower_named(llbcs[0], "floordiv").expect("lower floordiv");
     let calls = call_leaves(&graph);
     assert!(
         calls.iter().any(|name| name == "divmod"),
@@ -175,7 +141,7 @@ fn floordiv_keeps_divmod_result_for_try_branch() {
         "floordiv's ? must read the Err payload"
     );
 
-    let divmod = lower_function(&llbcs[0], "divmod").expect("lower divmod");
+    let divmod = lower_named(llbcs[0], "divmod").expect("lower divmod");
     let divmod_calls = call_leaves(&divmod);
     assert!(
         divmod_calls.iter().any(|name| name == "int_divmod"),
@@ -204,9 +170,9 @@ fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
         );
         return;
     }
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
-    let graph = lower_function(&llbc, "rbigint_to_compiler_bigint")
-        .expect("lower rbigint_to_compiler_bigint");
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph =
+        lower_named(llbc, "rbigint_to_compiler_bigint").expect("lower rbigint_to_compiler_bigint");
     let residuals: Vec<String> = graph
         .blocks
         .iter()
@@ -232,11 +198,11 @@ fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
 /// unary `abs` and no residual `core::num::<Impl>::abs`.
 #[test]
 fn numdigits_lowers_i64_abs_to_the_abs_op() {
-    let Some(llbcs) = load_rbigint_llbcs() else {
+    let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
-    let graph = lower_function(&llbcs[0], "rbigint::<Impl>::numdigits")
-        .or_else(|_| lower_function(&llbcs[0], "numdigits"))
+    let graph = lower_named(llbcs[0], "rbigint::<Impl>::numdigits")
+        .or_else(|_| lower_named(llbcs[0], "numdigits"))
         .expect("lower RBigInt::numdigits");
     let ops: Vec<_> = graph
         .blocks
@@ -516,7 +482,7 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
 
 #[test]
 fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
-    let Some(llbcs) = load_rbigint_llbcs() else {
+    let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
     let hints = harvest_hints_from_llbcs(&llbcs);
@@ -747,7 +713,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
 
 #[test]
 fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
-    let Some(llbcs) = load_rbigint_llbcs() else {
+    let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
@@ -1464,12 +1430,9 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         return;
     }
 
-    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
-    let module = std::path::Path::new(MODULE_LLBC)
-        .is_file()
-        .then(|| Llbc::load(MODULE_LLBC).expect("load pyre-module.ullbc"));
-    let mut llbcs = vec![interpreter];
-    if let Some(module) = module {
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let mut llbcs: Vec<&Llbc> = vec![interpreter];
+    if let Some(module) = load_llbc_if_present(MODULE_LLBC) {
         llbcs.push(module);
     }
     let hints = harvest_hints_from_llbcs(&llbcs);
@@ -2043,15 +2006,16 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
 
 #[test]
 fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
-    let Some(llbcs) = load_rbigint_llbcs() else {
+    let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
-    let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &llbcs,
         HostStaticAddrs::default(),
         &["longobject"],
+        &["jit_bigint_add", "w_long_from_i64", "box_bigint_constant"],
     )
-    .expect("lower longobject module");
+    .expect("lower longobject::jit_bigint_add and w_long_from_i64");
     let wrapper = program
         .functions
         .iter()
@@ -2136,8 +2100,8 @@ fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
     // of `I32`. The place-only constructor gate used to leave that call as
     // `rbigint::RBigInt::from`.
     if std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
-        let long_pow = lower_function(&interpreter, "long_pow").expect("lower long_pow");
+        let interpreter = load_llbc(INTERPRETER_LLBC);
+        let long_pow = lower_named(interpreter, "long_pow").expect("lower long_pow");
         let long_pow_calls: Vec<Vec<String>> = long_pow
             .blocks
             .iter()

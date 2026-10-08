@@ -21,6 +21,7 @@ use majit_charon_reader::{
     Llbc,
     ullbc::{GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
 };
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 
 /// Marker-const name prefix → the JIT hint strings it implies.  The
@@ -59,9 +60,10 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
 /// the marker consts present in `llbcs`.
-pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> {
+pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for llbc in llbcs {
+        let llbc = llbc.borrow();
         let function_paths: HashSet<String> = llbc
             .iter_local_fns()
             .map(|fd| strip_crate_prefix(&fd.item_meta.name_path()))

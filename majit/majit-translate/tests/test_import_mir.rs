@@ -1,28 +1,20 @@
-use majit_charon_reader::Llbc;
+mod common;
+
+use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
 use majit_translate::{
     HostStaticAddrs,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
     model::{CallTarget, OpKind},
 };
 
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
-);
-
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
-);
-
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
 /// `name.find('.')` and `name[:dotindex]`; `dunder_import` itself delegates
 /// to it and carries neither call.
 #[test]
 fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
-    let interpreter_llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
     // The tuple decl is owned by pyre-object.
-    let object_llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let object_llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[interpreter_llbc, object_llbc],
         HostStaticAddrs::default(),
@@ -79,7 +71,7 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
 /// resizable list's `ll_items` pointer.
 #[test]
 fn tuple_len_reads_the_fixed_list_not_the_items_block() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[llbc],
         HostStaticAddrs::default(),
@@ -126,7 +118,7 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
 /// call stays.
 #[test]
 fn list_items_capacity_stays_on_the_items_block() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[llbc],
         HostStaticAddrs::default(),

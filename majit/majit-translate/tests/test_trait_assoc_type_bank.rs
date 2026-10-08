@@ -11,27 +11,22 @@
 //! Without the resolution the two disagree on the bank of one value, and no
 //! kind for the caller's variable satisfies both callees.
 
+mod common;
+
+use common::{INTERPRETER_LLBC, load_llbc, lower_named_with_static_addrs};
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::lower_function_with_static_addrs;
 use majit_translate::model::{CallTarget, OpKind, ValueType};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
-use std::sync::OnceLock;
-
-const INTERP: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc",
-);
 
 /// Shared parse — see the same note on `test_result_exc_lowering.rs`: the
-/// corpus is several GB resident, so one parse behind a `OnceLock` is what
-/// keeps concurrent tests off the runner's swap.
+/// corpus is several GB resident, so one parse behind `common::load_llbc`
+/// is what keeps concurrent tests off the runner's swap.
 fn interp() -> &'static Llbc {
-    static L: OnceLock<Llbc> = OnceLock::new();
-    L.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))
+    load_llbc(INTERPRETER_LLBC)
 }
 
 fn lower(name: &str) -> majit_translate::model::FunctionGraph {
-    lower_function_with_static_addrs(
+    lower_named_with_static_addrs(
         interp(),
         name,
         HostStaticAddrs {

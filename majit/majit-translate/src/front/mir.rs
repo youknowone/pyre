@@ -239,8 +239,10 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     )
 }
 
-pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
-    llbcs: &[Llbc],
+pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths<
+    L: std::borrow::Borrow<Llbc>,
+>(
+    llbcs: &[L],
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -254,8 +256,10 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
     )
 }
 
-pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
-    llbcs: &[Llbc],
+pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots<
+    L: std::borrow::Borrow<Llbc>,
+>(
+    llbcs: &[L],
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
     jitdriver_receiver_roots: &[String],
@@ -320,8 +324,10 @@ pub(crate) fn prelink_crate(
 /// Only the bodies are dropped, so a fixture that reaches for a graph it
 /// forgot to list fails loudly on the missing lookup rather than
 /// silently asserting over a smaller program.
-pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-    llbcs: &[Llbc],
+pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names<
+    L: std::borrow::Borrow<Llbc>,
+>(
+    llbcs: &[L],
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
     function_names: &[&str],
@@ -425,8 +431,8 @@ pub(crate) fn absorb_semantic_program(
     }
 }
 
-fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
-    llbcs: &[Llbc],
+fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::Borrow<Llbc>>(
+    llbcs: &[L],
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
@@ -434,6 +440,8 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     link_scalars: bool,
     cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
+    let llbcs: &[&Llbc] = &llbc_refs;
     if link_scalars {
         link_transparent_scalar_types(llbcs);
     }
@@ -475,7 +483,14 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     for llbc in llbcs {
         let published = llbc.eval_hook_graphs();
         let paths = if published.is_empty() {
-            discover_eval_hook_graphs(llbc)
+            // A leaf-name filter keeps this fixture from lowering the
+            // eval-hook family; discovering it walks every body in the
+            // crate. The unfiltered production path still harvests.
+            if function_filter.is_some() {
+                Vec::new()
+            } else {
+                discover_eval_hook_graphs(llbc)
+            }
         } else {
             published
         };
@@ -709,7 +724,12 @@ fn ref_enum_instantiation_of_adt(
 /// sources, both filtered through [`adt_head_instantiation_suffix`] so the
 /// discovered set agrees with what the constructor / field-read / receiver
 /// sites project (a non-enum `Vec<T>` / `Box<T>` yields `None`; only the
-/// intended `Option`/`Result`-family enums seed):
+/// intended `Option`/`Result`-family enums seed).
+///
+/// A module or leaf-name filter walks only the declarations that filter
+/// admits: those are the bodies whose constructors and locals can mention
+/// an instantiation this program will lower. No filter still walks every
+/// local function, including global initialisers.
 ///   - CONSTRUCTOR heads — a `Result::Ok` / `Option::Some` payload
 ///     `setattr("__pos_0")` carries its concrete generics inline on the
 ///     `Rvalue::Aggregate(AggregateKind::Adt, …)` head.
@@ -722,9 +742,23 @@ fn ref_enum_instantiation_of_adt(
 fn collect_ref_enum_instantiations(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    module_filter: Option<&std::collections::HashSet<String>>,
+    function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Vec<RefEnumInst> {
     let mut found: std::collections::HashSet<RefEnumInst> = std::collections::HashSet::new();
+    let filtered = module_filter.is_some() || function_filter.is_some();
     for fd in llbc.iter_local_fns() {
+        if filtered {
+            if fd.is_global_initializer().is_some() {
+                continue;
+            }
+            let (module_path, name) = decl_module_path_and_name(fd);
+            if !should_lower_module(module_filter, &module_path)
+                || !should_lower_function(function_filter, &name)
+            {
+                continue;
+            }
+        }
         let Some(u) = fd.unstructured() else {
             continue;
         };
@@ -1234,6 +1268,8 @@ impl CrateLoweringState {
         func_hints: std::collections::HashMap<String, Vec<String>>,
         skipped: LoweringSkips,
         gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+        module_filter: Option<&std::collections::HashSet<String>>,
+        function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Self {
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
@@ -1281,7 +1317,8 @@ impl CrateLoweringState {
         // per-instantiation roots) and numbers the variant subclasses before
         // `assign_inheritance_ids`, so the split classes drain rather than
         // landing unnumbered (per-graph Skip).
-        let ref_enum_insts = collect_ref_enum_instantiations(llbc, gc_struct_ids);
+        let ref_enum_insts =
+            collect_ref_enum_instantiations(llbc, gc_struct_ids, module_filter, function_filter);
         for inst in &ref_enum_insts {
             let leaf = inst
                 .name_path
@@ -2045,6 +2082,8 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         std::collections::HashMap::new(),
         skips.clone(),
         &gc_struct_ids,
+        module_filter,
+        function_filter,
     );
     let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
         .lower_all(module_filter, function_filter);
@@ -54757,7 +54796,9 @@ fn external_transparent_scalar_kinds() -> Vec<(String, majit_charon_reader::Tran
     )]
 }
 
-fn link_transparent_scalar_types(llbcs: &[Llbc]) {
+fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) {
+    let llbc_refs: Vec<&Llbc> = llbcs.iter().map(std::borrow::Borrow::borrow).collect();
+    let llbcs: &[&Llbc] = &llbc_refs;
     let mut discovered = Vec::new();
     let mut foldable_cross = Vec::new();
     let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();

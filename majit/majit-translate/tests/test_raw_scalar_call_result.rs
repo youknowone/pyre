@@ -55,23 +55,19 @@
 //! address is not lowered: the free would run before the caller
 //! dereferences it.
 
+mod common;
+
+use common::{
+    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_context_for, lower_named,
+};
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
     ErrorCarrierSpec, HostStaticAddrs,
-    front::mir::{LowerContext, lower_fun_decl, lower_function, lower_function_with_static_addrs},
+    front::mir::{lower_fun_decl, lower_function, lower_function_with_static_addrs},
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
 };
 use serde_json::{Value, json};
-
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
-);
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
-);
 
 fn defining_op<'a>(
     graph: &'a FunctionGraph,
@@ -205,8 +201,8 @@ fn assert_returned_call(graph: &FunctionGraph, leaf: &str) {
 
 #[test]
 fn call_returned_raw_scalar_pointer_is_int() {
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("pyre-interpreter.ullbc is already extracted");
-    let context = LowerContext::new(&llbc);
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let context = lower_context_for(llbc);
 
     let inner = lower_fun_decl(&context, find_method(&llbc, "ticker_addr", "ActionFlag"))
         .expect("lower ActionFlag::ticker_addr");
@@ -222,8 +218,8 @@ fn call_returned_raw_scalar_pointer_is_int() {
 
 #[test]
 fn typed_array_base_call_stays_ref() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
-    let context = LowerContext::new(&llbc);
+    let llbc = load_llbc(OBJECT_LLBC);
+    let context = lower_context_for(llbc);
     for path in [
         "pyre_object::int_array::<Impl>::index",
         "pyre_object::float_array::<Impl>::index",
@@ -246,12 +242,8 @@ fn typed_array_base_call_stays_ref() {
 
 #[test]
 fn integer_cast_to_raw_scalar_stays_int() {
-    let llbc = Llbc::load(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-module.ullbc"
-    ))
-    .expect("pyre-module.ullbc is already extracted");
-    let context = LowerContext::new(&llbc);
+    let llbc = load_llbc(MODULE_LLBC);
+    let context = lower_context_for(llbc);
     let graph = lower_fun_decl(&context, find_method(&llbc, "as_ptr", "HashStateStorage"))
         .expect("lower HashStateStorage::as_ptr");
     let leaves: Vec<_> = ops(&graph)
@@ -285,8 +277,8 @@ fn integer_cast_to_raw_scalar_stays_int() {
 
 #[test]
 fn sizehint_i64_cast_stays_gcarray_write() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
-    let graph = lower_function(&llbc, "pyre_object::listobject::set_sizehint_state_value")
+    let llbc = load_llbc(OBJECT_LLBC);
+    let graph = lower_named(llbc, "pyre_object::listobject::set_sizehint_state_value")
         .expect("lower set_sizehint_state_value");
     let raw_stores = ops(&graph)
         .filter(|op| matches!(op.kind, OpKind::RawStore { .. }))
@@ -317,8 +309,8 @@ fn sizehint_i64_cast_stays_gcarray_write() {
 
 #[test]
 fn call_returned_byte_pointer_stays_ref() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
-    let graph = lower_function(&llbc, "gc_hook::try_gc_alloc_young_nonmoving_raw")
+    let llbc = load_llbc(OBJECT_LLBC);
+    let graph = lower_named(llbc, "gc_hook::try_gc_alloc_young_nonmoving_raw")
         .expect("lower try_gc_alloc_young_nonmoving_raw");
     let byte_calls: Vec<_> = ops(&graph)
         .filter_map(|op| call_result(&op.kind))
