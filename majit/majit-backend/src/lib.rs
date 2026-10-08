@@ -1548,11 +1548,12 @@ pub struct JitCellToken {
     pub target_tokens: parking_lot::Mutex<Vec<majit_ir::DescrRef>>,
     /// One off-GC frame parked after `DoneWithThisFrameDescrInt`.
     ///
-    /// `llmodel.py execute_token` bump-allocates out of the nursery and never
-    /// frees. With no collector the frame is a host block; the steady
-    /// finish-with-an-int entry takes this slot instead of a thread-local
-    /// free list. A frame a deadframe or a guard-failure resume still names
-    /// is not stored here, so it cannot be handed out again.
+    /// `llmodel.py` `execute_token` bump-allocates out of the nursery and
+    /// never frees. `HostHeapGc.malloc_jitframe` is a host block; the
+    /// steady finish-with-an-int entry takes this slot instead of a
+    /// thread-local free list. A descr that owns jitframes does not park.
+    /// A frame a deadframe or a guard-failure resume still names is not
+    /// stored here, so it cannot be handed out again.
     entry_frame: AtomicPtr<crate::jitframe::JitFrame>,
 }
 

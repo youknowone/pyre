@@ -295,9 +295,10 @@ fn match_metainterp_finish_descr(
 use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
     BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
-    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, check_jitframe_descr,
-    jitframe_is_gc_object, jitframe_write_barrier, malloc_entry_jitframe,
-    malloc_jitframe_no_collect,
+    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, JitframeDescrFacts,
+    check_jitframe_descr, jitframe_facts_at_cpu_init, jitframe_is_gc_object,
+    jitframe_write_barrier, malloc_entry_jitframe, malloc_jitframe_no_collect,
+    publish_standalone_jitframe_facts,
 };
 use majit_backend::llmodel::{
     done_ref_slot0, park_or_free_done_entry_frame, prepare_done_raw_entry_frame,
@@ -315,15 +316,17 @@ const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
 /// without requiring a `CraneliftBackend` instance.
 /// Install a GC box into TLS and register all `set_active_*` hooks.
 /// Used by tests and embedders whose whole managed heap is thread-confined.
-fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
+fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    check_jitframe_descr(gc.as_ref());
+    majit_gc::note_gc_box_installed(gc.has_gcrootmap());
+    let facts = check_jitframe_descr(gc.as_ref());
     gc.freeze_types();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     set_cranelift_active_gc(Some(gc));
     register_active_hooks(supports_guard_gc_type);
+    facts
 }
 
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
@@ -451,9 +454,8 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// closes it at translation; pyre closes it before the first reader so
 /// JIT-only types can still be registered after startup.
 pub fn install_gc_standalone() {
-    majit_gc::gc_sync::gc_op(|gc| {
-        check_jitframe_descr(gc);
-    });
+    let facts = majit_gc::gc_sync::gc_op(|gc| check_jitframe_descr(gc));
+    publish_standalone_jitframe_facts(facts);
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
     register_active_hooks(supports_guard_gc_type);
 }
@@ -10926,6 +10928,11 @@ pub struct CraneliftBackend {
     /// the singleton is attached. The raw finish entry compares `jf_descr`
     /// to this word; `descr_attachments`' load is not taken on that path.
     done_ref_cell: AtomicUsize,
+    /// `llmodel.py` `AbstractLLCPU.gc_ll_descr` answers used by raw DONE
+    /// (`make_execute_token` / `malloc_jitframe`). Replaced with the descr
+    /// in [`Self::set_gc_allocator`]; [`JitframeDescrFacts::HOST`] when the
+    /// descr has no `JITFRAME` type id.
+    jitframe_facts: JitframeDescrFacts,
     /// CLIF of the body most recently compiled by this backend.
     #[cfg(test)]
     last_body_clif: String,
@@ -11202,6 +11209,7 @@ impl CraneliftBackend {
             w_class_offset: None,
             descr_attachments: Arc::new(majit_backend::CpuDescrCell::default()),
             done_ref_cell: AtomicUsize::new(0),
+            jitframe_facts: jitframe_facts_at_cpu_init(),
             #[cfg(test)]
             last_body_clif: String::new(),
         }
@@ -11295,7 +11303,7 @@ impl CraneliftBackend {
     }
 
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
-        install_gc_box(gc);
+        self.jitframe_facts = install_gc_box(gc);
     }
 
     /// No-op: cranelift already routes `New` through the active GC when one
@@ -20978,26 +20986,40 @@ impl CraneliftBackend {
         descr_raw != 0 && descr_raw == cached
     }
 
-    /// Host-frame entry for a raw finish. Allocate, store `args`, call the
-    /// token, and return `(head, tip, num_slots, jf_descr)`.
+    /// Raw finish entry. Allocate, store `args`, call the token, and return
+    /// `(head, tip, num_slots, jf_descr)`.
     ///
-    /// `llmodel.py execute_token`. Frame parking and the slot stores are
-    /// shared (`prepare_done_raw_entry_frame`); the call is this backend's
-    /// `(jitframe, dispatch_key)` convention. Key 0 is the peeled preamble.
+    /// `llmodel.py` `AbstractLLCPU.make_execute_token`. Allocation and the
+    /// slot stores are shared (`prepare_done_raw_entry_frame`); the call is
+    /// this backend's `(jitframe, dispatch_key)` convention. Key 0 is the
+    /// peeled preamble.
     #[inline(always)]
     fn run_done_raw_entry(
+        &self,
         token: &JitCellToken,
         compiled: &CompiledLoop,
         args: &[i64],
     ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
         let depth = compiled.max_output_slots.max(args.len()).max(1);
         let num_slots = depth + compiled.num_ref_roots;
-        let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots) };
+        let facts = self.jitframe_facts;
+        let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots, facts) };
         let code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
         let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
             unsafe { std::mem::transmute(code_ptr) };
         // Raw entry does not set the runtime JIT flag; rlib/jit.py `_we_are_jitted` is 0 in residual helpers.
-        let tip = unsafe { func(jf_ptr as *mut i64, 0) as *mut JitFrame };
+        let returned = unsafe { func(jf_ptr as *mut i64, 0) as *mut JitFrame };
+        // Host frames keep the descr load on the pointer the run returned
+        // (`done_ref_from_ran`). A moving nursery may come back as a
+        // forwarding stub (`emit_call_footer_shadowstack` then
+        // `return_(&[jf_ptr])`; `rooted_call_assembler_frame`);
+        // `JitframeDescrFacts::resolve_returned_frame` chases that when
+        // the descr has a gcrootmap, else `jitframe_resolve` (`jf_forward`).
+        let tip = if facts.is_gc_object {
+            facts.resolve_returned_frame(returned)
+        } else {
+            returned
+        };
         let descr_raw = unsafe { majit_backend::llmodel::get_latest_descr(tip) };
         (jf_ptr, tip, num_slots, descr_raw)
     }
@@ -21010,19 +21032,31 @@ impl CraneliftBackend {
     #[cold]
     #[inline(never)]
     fn continue_raw_done_ref_exit(
+        &self,
         compiled: &CompiledLoop,
         head: *mut JitFrame,
         tip: *mut JitFrame,
         args: &[i64],
     ) -> Result<usize, DeadFrame> {
         let attachments: &'static CpuDescrAttachments = compiled.cpu_attachments.read();
-        let tip = jitframe_resolve(tip as *mut i64);
-        let descr_raw = unsafe { majit_backend::llmodel::get_latest_descr(tip as *const JitFrame) };
+        // Host frames keep the descr load on the pointer the run returned
+        // (`done_ref_from_ran`). A nursery frame may come back as a
+        // forwarding stub (`rooted_call_assembler_frame`), so its descr
+        // is read from `JitFrame::resolve`.
+        let resolved = jitframe_resolve(tip as *mut i64);
+        let gc_object = self.jitframe_facts.is_gc_object;
+        let descr_ptr = if gc_object { resolved } else { tip as *mut i64 };
+        let descr_raw =
+            unsafe { majit_backend::llmodel::get_latest_descr(descr_ptr as *const JitFrame) };
         let (fail_index, direct_descr) =
             resolve_exit_descr(descr_raw as i64, &compiled.fail_descrs, attachments);
         let mut exec = JitExecResult {
-            jf_gcref: GcRef(tip as usize),
-            heap_owner: Some(FrameHeapOwner::of(head)),
+            jf_gcref: GcRef(resolved as usize),
+            heap_owner: if gc_object {
+                None
+            } else {
+                Some(FrameHeapOwner::of(head))
+            },
             fail_index,
             direct_descr,
         };
@@ -21690,10 +21724,10 @@ impl majit_backend::Backend for CraneliftBackend {
         Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), 0, true)
     }
 
-    /// `llmodel.py execute_token` / `warmstate.py execute_assembler` ref
-    /// finish: inline hot path, cold general fallback when a collector is
-    /// installed or exec diag is on. Slot 0 is `get_ref_value_direct`. The
-    /// call uses this backend's `(jitframe, dispatch_key)` convention.
+    /// `llmodel.py` `execute_token` / `warmstate.py execute_assembler` ref
+    /// finish: inline hot path, cold general fallback when exec diag is on.
+    /// Slot 0 is `get_ref_value_direct`. The call uses this backend's
+    /// `(jitframe, dispatch_key)` convention.
     #[inline]
     fn execute_token_done_ref_raw(
         &self,
@@ -21710,16 +21744,20 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop")
             .current();
-        let (jf_ptr, tip, _num_slots, descr_raw) = Self::run_done_raw_entry(token, compiled, args);
+        let (jf_ptr, tip, _num_slots, descr_raw) = self.run_done_raw_entry(token, compiled, args);
         if self.finish_is_done_ref(descr_raw) {
-            // Host frames are off-GC: `jitframe.py jitframe_resolve` walks
-            // `jf_forward` only. `JitFrame::resolve` also chases a nursery
-            // stub via `gc_current_object_address`, which this path does not.
-            let value = done_ref_slot0(unsafe { JitFrame::resolve_forward(tip) });
-            park_or_free_done_entry_frame(token, jf_ptr, tip);
+            // A GC frame was already resolved in `run_done_raw_entry`.
+            // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
+            let live = if self.jitframe_facts.is_gc_object {
+                tip
+            } else {
+                unsafe { JitFrame::resolve_forward(tip) }
+            };
+            let value = done_ref_slot0(live);
+            park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
             return Ok(value);
         }
-        Self::continue_raw_done_ref_exit(compiled, jf_ptr, tip, args)
+        self.continue_raw_done_ref_exit(compiled, jf_ptr, tip, args)
     }
 
     fn execute_token_with_dispatch_key(
@@ -33590,6 +33628,64 @@ mod tests {
         assert_ne!(moved_root, root);
         assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0xABCDEF01);
         assert_eq!(call_result, 123);
+    }
+
+    /// Raw `DONE_REF` after a residual that forces a minor collection.
+    /// The entry jitframe is a nursery object (`emit_call_header_shadowstack`);
+    /// `emit_call_footer_shadowstack` pops that slot then `return_(&[jf_ptr])`,
+    /// which may still name the corpse. Slot 0 is the moved input ref.
+    #[test]
+    fn test_raw_done_ref_returns_moved_object_after_minor_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let root = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(root.0));
+        unsafe {
+            *(root.0 as *mut u64) = 0xABCDEF01;
+        }
+
+        let mut backend = backend_with_gc(gc);
+        backend.set_done_with_this_frame_descr_ref(super::DONE_WITH_THIS_FRAME_DESCR_REF.clone());
+
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef::int_op(100), OpRef::int_op(101)],
+                OpRef::NONE.raw(),
+                descr,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(
+            100,
+            collect_nursery_via_runtime_void as *const () as usize as i64,
+        );
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1508);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let raw = match backend.execute_token_done_ref_raw(&token, &[root.0 as i64]) {
+            Ok(value) => value,
+            Err(_) => panic!("raw done-ref after collecting residual"),
+        };
+        assert_ne!(raw, root.0, "minor collection must move the nursery ref");
+        assert_eq!(unsafe { *(raw as *const u64) }, 0xABCDEF01);
     }
 
     #[test]

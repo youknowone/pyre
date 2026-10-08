@@ -635,6 +635,222 @@ pub fn jitframe_write_barrier(gc: &mut dyn majit_gc::GcAllocator, frame: *mut Ji
     }
 }
 
+/// Facts of the descr this CPU currently holds.
+///
+/// `llmodel.py` `AbstractLLCPU` stores `self.gc_ll_descr`; `make_execute_token`
+/// reads `self.gc_ll_descr.malloc_jitframe` from the CPU it closes over. These
+/// are that descr's answers, replaced together with the descr in
+/// `set_gc_allocator` / `install_gc_standalone` and reset to [`Self::HOST`]
+/// (`HostHeapGc`) when the descr has no `JITFRAME` type id.
+#[derive(Clone, Copy)]
+pub struct JitframeDescrFacts {
+    /// `GcAllocator::jitframe_type_id` is `Some`; [`malloc_jitframe`] then
+    /// takes the typed arm rather than [`malloc_host_jitframe`].
+    pub is_gc_object: bool,
+    type_id: u32,
+    /// `gc.py` `get_nursery_free_addr` / `get_nursery_top_addr` of this descr.
+    /// A box install snapshots this thread's pair (`AbstractLLCPU.gc_ll_descr`);
+    /// compiled `malloc_fast` bakes the same two addresses.
+    nursery_free_addr: usize,
+    nursery_top_addr: usize,
+    /// `assembler.py` `_call_header_shadowstack` is on only when
+    /// `gcrootmap and gcrootmap.is_shadow_stack`. That footer can return a
+    /// nursery forwarding stub; [`JitFrame::resolve`] chases it.
+    /// A descr without a gcrootmap never installs one (`CelGc`) and uses
+    /// [`JitFrame::resolve_forward`] — `jitframe.py` `jitframe_resolve`.
+    chases_forwarding_stubs: bool,
+}
+
+impl JitframeDescrFacts {
+    /// `HostHeapGc` / `get_ll_description(None)` (gc.py): frames are host
+    /// blocks, no type id, no nursery cells.
+    pub const HOST: Self = Self {
+        is_gc_object: false,
+        type_id: 0,
+        nursery_free_addr: 0,
+        nursery_top_addr: 0,
+        chases_forwarding_stubs: false,
+    };
+
+    /// Snapshot of `gc`'s `JITFRAME` answers, including this thread's nursery
+    /// cell addresses (`gc.py` `get_nursery_free_addr` / `get_nursery_top_addr`).
+    /// A later `set_gc_allocator` replaces the whole value with the new descr.
+    pub fn from_gc(gc: &dyn majit_gc::GcAllocator) -> Self {
+        match gc.jitframe_type_id() {
+            Some(id) => Self {
+                is_gc_object: true,
+                type_id: id,
+                nursery_free_addr: gc.nursery_free_addr(),
+                nursery_top_addr: gc.nursery_top_addr(),
+                chases_forwarding_stubs: gc.has_gcrootmap(),
+            },
+            None => Self::HOST,
+        }
+    }
+
+    /// Frame the compiled run returned, ready for `jf_descr` and slot 0.
+    ///
+    /// `jitframe.py` `jitframe_resolve` walks `jf_forward`. A moving nursery
+    /// can also leave a forwarding stub on the pointer the footer returned;
+    /// [`JitFrame::resolve`] chases that. A descr that never moves has no stub.
+    #[inline(always)]
+    pub fn resolve_returned_frame(self, frame: *mut JitFrame) -> *mut JitFrame {
+        if self.chases_forwarding_stubs {
+            unsafe { JitFrame::resolve(frame) }
+        } else {
+            unsafe { JitFrame::resolve_forward(frame) }
+        }
+    }
+}
+
+/// Process-global copy of the standalone descr's facts.
+///
+/// `install_gc_standalone` has no CPU (`AbstractLLCPU`) to store
+/// `self.gc_ll_descr` on; production constructs the backend later
+/// (`pyjitpl.py` `MetaInterp.__init__`). Written on every standalone install
+/// with the complete facts, including [`JitframeDescrFacts::HOST`] when the
+/// descr has no `JITFRAME` type id. There is no standalone-uninstall API;
+/// a later `install_gc_standalone` republishes. Box installs do not write
+/// these: they live on the CPU.
+static STANDALONE_DESCR_JITFRAME_IS_GC_OBJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static STANDALONE_JITFRAME_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static STANDALONE_NURSERY_FREE_ADDR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static STANDALONE_NURSERY_TOP_ADDR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static STANDALONE_CHASES_FORWARDING_STUBS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the standalone descr's facts. Always writes the full set.
+pub fn publish_standalone_jitframe_facts(facts: JitframeDescrFacts) {
+    STANDALONE_JITFRAME_TYPE_ID.store(facts.type_id, std::sync::atomic::Ordering::Relaxed);
+    STANDALONE_NURSERY_FREE_ADDR.store(
+        facts.nursery_free_addr,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    STANDALONE_NURSERY_TOP_ADDR.store(facts.nursery_top_addr, std::sync::atomic::Ordering::Relaxed);
+    STANDALONE_CHASES_FORWARDING_STUBS.store(
+        facts.chases_forwarding_stubs,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    STANDALONE_DESCR_JITFRAME_IS_GC_OBJECT
+        .store(facts.is_gc_object, std::sync::atomic::Ordering::Release);
+}
+
+/// Facts last published by `install_gc_standalone`, or [`JitframeDescrFacts::HOST`].
+pub fn standalone_jitframe_facts() -> JitframeDescrFacts {
+    if !STANDALONE_DESCR_JITFRAME_IS_GC_OBJECT.load(std::sync::atomic::Ordering::Acquire) {
+        return JitframeDescrFacts::HOST;
+    }
+    JitframeDescrFacts {
+        is_gc_object: true,
+        type_id: STANDALONE_JITFRAME_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed),
+        nursery_free_addr: STANDALONE_NURSERY_FREE_ADDR.load(std::sync::atomic::Ordering::Relaxed),
+        nursery_top_addr: STANDALONE_NURSERY_TOP_ADDR.load(std::sync::atomic::Ordering::Relaxed),
+        chases_forwarding_stubs: STANDALONE_CHASES_FORWARDING_STUBS
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// `AbstractLLCPU.__init__` reading the already-installed descr.
+///
+/// Production calls `install_gc_standalone` before constructing the CPU.
+/// Tests that never installed a process-global collector stay on
+/// [`JitframeDescrFacts::HOST`] until `set_gc_allocator`.
+pub fn jitframe_facts_at_cpu_init() -> JitframeDescrFacts {
+    if majit_gc::gc_sync::is_initialized() {
+        standalone_jitframe_facts()
+    } else {
+        JitframeDescrFacts::HOST
+    }
+}
+
+/// Bytes a nursery JITFRAME occupies, including the header.
+///
+/// `incminimark.py` `malloc_fixedsize` / `Nursery::alloc`: at least
+/// [`majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE`], then
+/// `MEMORY_ALIGNMENT`. `jitframe_allocate` is `lltype.malloc(JITFRAME, depth)`
+/// and a compiled frame is larger than the minimum, so this is `align(header
+/// + payload)`.
+#[inline]
+fn nursery_jitframe_total(size_bytes: usize) -> Option<usize> {
+    let total = majit_gc::header::GcHeader::SIZE.checked_add(size_bytes)?;
+    let total = total.max(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE);
+    let align = majit_gc::header::MEMORY_ALIGNMENT;
+    total.checked_add(align - 1).map(|n| n & !(align - 1))
+}
+
+/// `GcLLDescription.malloc_jitframe` (`gc.py`) / `jitframe_allocate`
+/// (`jitframe.py`) for the descr whose facts the CPU passed in.
+///
+/// `llmodel.py` `AbstractLLCPU.make_execute_token` calls that malloc on every
+/// `execute_token`. `GcLLDescr_framework` leaves it as `JITFRAME.allocate`,
+/// which is `lltype.malloc` and inlines to the nursery bump compiled code
+/// already performs (`rewrite.py` `gen_malloc_nursery_varsize_frame`). The
+/// bump reads the descr's `nursery_free` / `nursery_top` cells; the slow path
+/// is `alloc_nursery_typed` when the nursery cannot satisfy the request.
+///
+/// Returns `(frame, needs_write_barrier)`. A nursery result is young
+/// (`init_gc_object` leaves `GCFLAG_TRACK_YOUNG_PTRS` clear), so the
+/// `llop.gc_writebarrier` `execute_token` emits after the argument stores is
+/// a no-op flag check. An old-gen spill needs the helper.
+#[inline]
+pub fn malloc_gc_jitframe(facts: JitframeDescrFacts, size_bytes: usize) -> (*mut JitFrame, bool) {
+    if let Some(frame) = try_bump_nursery_jitframe(facts, size_bytes) {
+        return (frame, false);
+    }
+    malloc_gc_jitframe_via_descr(facts.type_id, size_bytes)
+}
+
+/// Inlined `malloc_fast` (`framework.py`) over the descr's nursery cells.
+#[inline]
+fn try_bump_nursery_jitframe(
+    facts: JitframeDescrFacts,
+    size_bytes: usize,
+) -> Option<*mut JitFrame> {
+    let total = nursery_jitframe_total(size_bytes)?;
+    let free_cell = facts.nursery_free_addr;
+    let top_cell = facts.nursery_top_addr;
+    if free_cell == 0 || top_cell == 0 {
+        return None;
+    }
+    unsafe {
+        let free = core::ptr::read(free_cell as *const *mut u8);
+        let top = core::ptr::read(top_cell as *const *mut u8);
+        if free.is_null() {
+            return None;
+        }
+        let new_free = free.wrapping_add(total);
+        if (new_free as usize) < (free as usize) || (new_free as usize) > (top as usize) {
+            return None;
+        }
+        core::ptr::write(free_cell as *mut *mut u8, new_free);
+        // `init_gc_object` / `GcHeader::new(type_id)`: flags clear.
+        core::ptr::write(free as *mut u64, u64::from(facts.type_id));
+        Some(free.add(majit_gc::header::GcHeader::SIZE) as *mut JitFrame)
+    }
+}
+
+/// `GcLLDescr_framework.malloc_jitframe` through the descr's own nursery
+/// hook. A per-thread box (CelGc) answers from this thread's heap; a
+/// process-global MiniMark answers from `gc_sync`.
+#[inline]
+fn malloc_gc_jitframe_via_descr(type_id: u32, size_bytes: usize) -> (*mut JitFrame, bool) {
+    let mut needs_wb = true;
+    let gcref =
+        unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size_bytes, &mut needs_wb) };
+    let gcref = if gcref.is_null() {
+        needs_wb = true;
+        majit_gc::alloc_nursery_typed(type_id, size_bytes)
+    } else {
+        gcref
+    };
+    assert!(!gcref.is_null(), "JITFRAME allocation failed");
+    (gcref.0 as *mut JitFrame, needs_wb)
+}
+
 /// Refuse an install whose descr cannot allocate frames the collector can
 /// trace.
 ///
@@ -647,22 +863,26 @@ pub fn jitframe_write_barrier(gc: &mut dyn majit_gc::GcAllocator, frame: *mut Ji
 /// a table is exempt: it has no shape to name, and its frames are host
 /// blocks. Registering here instead would mint an id in a table the frontend
 /// may already have frozen (`gctypelayout.py encode_type_shapes_now`).
-pub fn check_jitframe_descr(gc: &dyn majit_gc::GcAllocator) {
-    if !gc.has_type_registry() {
-        return;
-    }
-    let Some(id) = gc.jitframe_type_id() else {
-        panic!(
-            "installing a collector with a type registry requires the JITFRAME type id: \
-             register majit_backend::jitframe::jitframe_type_info() on that collector \
-             and pass the id to GcAllocator::set_jitframe_type_id() BEFORE the install"
+pub fn check_jitframe_descr(gc: &dyn majit_gc::GcAllocator) -> JitframeDescrFacts {
+    let jitframe_tid = gc.jitframe_type_id();
+    if gc.has_type_registry() {
+        let Some(id) = jitframe_tid else {
+            panic!(
+                "installing a collector with a type registry requires the JITFRAME type id: \
+                 register majit_backend::jitframe::jitframe_type_info() on that collector \
+                 and pass the id to GcAllocator::set_jitframe_type_id() BEFORE the install"
+            );
+        };
+        assert_eq!(
+            gc.type_size(id),
+            Some(jitframe_type_info().size),
+            "JITFRAME type id {id} does not name a JITFRAME in the collector being installed"
         );
-    };
-    assert_eq!(
-        gc.type_size(id),
-        Some(jitframe_type_info().size),
-        "JITFRAME type id {id} does not name a JITFRAME in the collector being installed"
-    );
+    }
+    // Always a complete snapshot: `HostHeapGc` / no type id is HOST, never
+    // a leftover of a previous descr. `GcLLDescription.malloc_jitframe`
+    // (gc.py) is the same `jitframe_type_id` decision.
+    JitframeDescrFacts::from_gc(gc)
 }
 
 /// The descr in force when no collector is installed: `GcLLDescr_boehm`

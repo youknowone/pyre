@@ -22,8 +22,8 @@ use majit_gc::shadow_stack::OwnerRootGuard;
 use majit_ir::{FailDescr, GcRef};
 
 use crate::jitframe::{
-    FIRST_ITEM_OFFSET, JitFrame, free_host_jitframe, jitframe_is_off_gc_host, malloc_host_jitframe,
-    reuse_off_gc_jitframe,
+    FIRST_ITEM_OFFSET, JitFrame, JitframeDescrFacts, free_host_jitframe, jitframe_is_off_gc_host,
+    malloc_gc_jitframe, malloc_host_jitframe, reuse_off_gc_jitframe,
 };
 
 /// llmodel.py — get_latest_descr.
@@ -494,18 +494,22 @@ pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
 
 /// True when a raw finish entry must take the general `execute_token` path.
 ///
-/// `llmodel.py execute_token` allocates through `gc_ll_descr`. The
-/// parked-frame path is only valid with no collector and no exec
-/// diagnostics that inspect the frame.
+/// `llmodel.py` `AbstractLLCPU.make_execute_token` always allocates through
+/// `self.gc_ll_descr.malloc_jitframe` (`GcLLDescription.malloc_jitframe`).
+/// The raw path does that too: a descr with a `JITFRAME` type id bumps a
+/// nursery frame (`malloc_gc_jitframe`); `HostHeapGc` keeps the
+/// host-block arm, which is what its `malloc_jitframe` is. `diag` is the
+/// remaining reason to leave that path — exec logging and dumps walk the
+/// typed `execute_token` frame.
 #[inline]
 pub fn raw_done_entry_use_general(diag: bool) -> bool {
-    diag || majit_gc::collector_installed()
+    diag
 }
 
 /// Take the token's parked off-GC frame when it fits, else allocate.
 ///
-/// `llmodel.py execute_token` allocates a fresh frame; reuse is the
-/// off-GC stand-in for that bump.
+/// `HostHeapGc.malloc_jitframe` is [`malloc_host_jitframe`]. Reuse is the
+/// stand-in for a nursery bump on that descr only.
 #[inline]
 pub fn take_or_alloc_parked_entry_frame(
     token: &crate::JitCellToken,
@@ -521,16 +525,22 @@ pub fn take_or_alloc_parked_entry_frame(
 }
 
 /// Park a single unforwarded host frame on the token, else free each
-/// off-GC host link. A GC-owned replacement stays for the collector.
+/// off-GC host link. A GC-owned frame is left for the collector.
 ///
-/// `llmodel.py execute_token` does not free. A chain, or a slot that
-/// already holds a frame, is still referenced or is a second live frame.
+/// `llmodel.py` `execute_token` does not free: `jitframe_allocate` is
+/// `lltype.malloc(JITFRAME)` and the frame becomes garbage after the
+/// call. A descr that owns jitframes matches that. `HostHeapGc` still
+/// parks, because its malloc is a host block.
 #[inline]
 pub fn park_or_free_done_entry_frame(
     token: &crate::JitCellToken,
     head: *mut JitFrame,
     tip: *mut JitFrame,
+    is_gc_object: bool,
 ) {
+    if is_gc_object {
+        return;
+    }
     let single = tip == head && unsafe { (*head).jf_forward.is_null() };
     if single && token.park_entry_frame(head) {
         return;
@@ -568,12 +578,17 @@ pub fn done_ref_slot0(tip: *mut JitFrame) -> usize {
     unsafe { get_ref_value_direct(tip, 0) }
 }
 
-/// Host-frame setup for a raw finish. `llmodel.py execute_token`.
+/// Frame setup for a raw finish. `llmodel.py` `AbstractLLCPU.make_execute_token`.
 ///
-/// Reuses the token's parked off-GC frame when it fits, else allocates.
-/// Inits the header and stores `args` at `first_slot`. The caller
-/// invokes compiled code under its own calling convention and reads
-/// slot 0 of the returned frame.
+/// A descr that owns jitframes allocates through `gc_ll_descr.malloc_jitframe`
+/// (`GcLLDescription.malloc_jitframe` / `jitframe_allocate`) on every call.
+/// `facts` is that descr's answers on this CPU (`AbstractLLCPU.gc_ll_descr`).
+/// `HostHeapGc` reuses the token's parked off-GC frame when it fits, else
+/// allocates a host block — that descr's `malloc_jitframe`. Inits the header
+/// and stores `args` at `first_slot`. A GC frame then gets
+/// `llop.gc_writebarrier` when the allocation spilled out of the nursery.
+/// The caller invokes compiled code under its own calling convention and
+/// reads slot 0 of the returned frame.
 ///
 /// # Safety
 /// `num_slots` is the `jf_frame` length ([`JitFrame::alloc_size`]).
@@ -584,6 +599,7 @@ pub unsafe fn prepare_done_raw_entry_frame(
     args: &[i64],
     first_slot: usize,
     num_slots: usize,
+    facts: JitframeDescrFacts,
 ) -> *mut JitFrame {
     assert!(
         num_slots >= first_slot.saturating_add(args.len()),
@@ -594,12 +610,19 @@ pub unsafe fn prepare_done_raw_entry_frame(
     let clt = unsafe { &*token.compiled_loop_token_ptr() };
     let fi_ptr = clt.frame_info.data_ptr() as *const crate::JitFrameInfo;
     let frame_bytes = JitFrame::alloc_size(num_slots);
-    let jf_ptr = take_or_alloc_parked_entry_frame(token, frame_bytes);
+    let (jf_ptr, needs_wb) = if facts.is_gc_object {
+        malloc_gc_jitframe(facts, frame_bytes)
+    } else {
+        (take_or_alloc_parked_entry_frame(token, frame_bytes), false)
+    };
     unsafe {
         JitFrame::init(jf_ptr, fi_ptr, num_slots);
         for (i, &word) in args.iter().enumerate() {
             set_int_value(jf_ptr, first_slot + i, word as isize);
         }
+    }
+    if needs_wb {
+        majit_gc::gc_write_barrier(GcRef(jf_ptr as usize));
     }
     jf_ptr
 }
