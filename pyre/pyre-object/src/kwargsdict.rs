@@ -210,6 +210,72 @@ impl KwargsDictStrategy {
     }
 }
 
+/// `kwargsdict.py KwargsDictStrategy._setitem_correct_indirection`
+/// `@jit.look_inside_iff(lambda self, w_dict, w_key, w_value:
+/// jit.isconstant(self.length(w_dict)) and jit.isconstant(w_key))`.
+fn kwargs_setitem_correct_indirection_iff(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+    _w_value: PyObjectRef,
+) -> bool {
+    let length = unsafe { KWARGS_DICT_STRATEGY.length(w_dict) };
+    majit_rlib::jit::isconstant(&length) && majit_rlib::jit::isconstant(&w_key)
+}
+
+/// `kwargsdict.py _setitem_correct_indirection` — linear scan, overwrite
+/// on hit, else append or promote at 16.
+#[majit_macros::look_inside_iff(kwargs_setitem_correct_indirection_iff)]
+unsafe fn kwargs_setitem_correct_indirection(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+    w_value: PyObjectRef,
+) {
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
+    crate::dictmultiobject::dict_write_barrier(w_dict);
+    for i in 0..storage.0.len() {
+        if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
+            // Direct element store in this body. A helper that
+            // returns `&mut items[i]` leaves an opaque `index_mut`
+            // whose destination is not a single deref here.
+            storage.1[i] = w_value;
+            return;
+        }
+    }
+    if storage.0.len() >= KWARGS_PROMOTE_THRESHOLD {
+        KWARGS_DICT_STRATEGY.switch_to_unicode_strategy(w_dict);
+        crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
+        return;
+    }
+    storage.0.push(w_key);
+    storage.1.push(w_value);
+    crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+}
+
+/// `kwargsdict.py KwargsDictStrategy._getitem_correct_indirection`
+/// `@jit.look_inside_iff(lambda self, w_dict, w_key:
+/// jit.isconstant(self.length(w_dict)) and jit.isconstant(w_key))`.
+fn kwargs_getitem_correct_indirection_iff(w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
+    let length = unsafe { KWARGS_DICT_STRATEGY.length(w_dict) };
+    majit_rlib::jit::isconstant(&length) && majit_rlib::jit::isconstant(&w_key)
+}
+
+/// `kwargsdict.py _getitem_correct_indirection` — linear scan of
+/// `keys_w` / `values_w`.
+#[majit_macros::look_inside_iff(kwargs_getitem_correct_indirection_iff)]
+unsafe fn kwargs_getitem_correct_indirection(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    let (keys_w, values_w) = kwargs_storage(w_dict);
+    for i in 0..keys_w.len() {
+        if crate::dictmultiobject::dict_keys_equal(kwargs_at(keys_w, i), w_key) {
+            return Some(kwargs_at(values_w, i));
+        }
+    }
+    None
+}
+
 impl DictStrategy for KwargsDictStrategy {
     fn strategy_kind(&self) -> crate::dictmultiobject::StrategyKind {
         crate::dictmultiobject::StrategyKind::Kwargs
@@ -233,16 +299,11 @@ impl DictStrategy for KwargsDictStrategy {
     }
 
     /// `kwargsdict.py getitem` — `is_correct_type` →
-    /// linear scan, else `_never_equal_to` short-circuit or promote.
+    /// `getitem_correct` / `_getitem_correct_indirection`, else
+    /// `_never_equal_to` short-circuit or promote.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if Self::is_correct_type(w_key) {
-            let (keys_w, values_w) = kwargs_storage(w_dict);
-            for i in 0..keys_w.len() {
-                if crate::dictmultiobject::dict_keys_equal(kwargs_at(keys_w, i), w_key) {
-                    return Some(kwargs_at(values_w, i));
-                }
-            }
-            return None;
+            return kwargs_getitem_correct_indirection(w_dict, w_key);
         }
         // `kwargsdict.py _never_equal_to` returns False — no
         // short-circuit; always promote and retry.
@@ -272,31 +333,11 @@ impl DictStrategy for KwargsDictStrategy {
         crate::dictmultiobject::w_dict_get_strategy(w_dict).setdefault(w_dict, w_key, w_default)
     }
 
-    /// `kwargsdict.py setitem` + `_setitem_correct_indirection`.
+    /// `kwargsdict.py setitem` — `is_correct_type` → `setitem_correct` /
+    /// `_setitem_correct_indirection`, else promote to object strategy.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
-            let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-            let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
-            crate::dictmultiobject::dict_write_barrier(w_dict);
-            for i in 0..storage.0.len() {
-                if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
-                    // Direct element store in this body. A helper that
-                    // returns `&mut items[i]` leaves an opaque `index_mut`
-                    // whose destination is not a single deref here.
-                    storage.1[i] = w_value;
-
-                    return;
-                }
-            }
-            if storage.0.len() >= KWARGS_PROMOTE_THRESHOLD {
-                self.switch_to_unicode_strategy(w_dict);
-                crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
-                return;
-            }
-            storage.0.push(w_key);
-            storage.1.push(w_value);
-            crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-
+            kwargs_setitem_correct_indirection(w_dict, w_key, w_value);
             return;
         }
         self.switch_to_object_strategy(w_dict);

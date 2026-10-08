@@ -6704,6 +6704,24 @@ struct HelperDescent {
     decline_tag: &'static str,
 }
 
+/// `argument.py` `_match_signature` `space.newdict(kwargs=True)` —
+/// `dictmultiobject.py allocate_and_init_instance` kwargs branch.
+const W_DICT_NEW_KWARGS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::dictmultiobject::w_dict_new_kwargs",
+    commit_label: "w_dict_new_kwargs_commit",
+    call_site_label: "w_dict_new_kwargs_call_site",
+    decline_tag: "KWARGS-DICT-NEW-SUBWALK",
+};
+
+/// `argument.py` `_match_signature` `space.setitem(w_kwds, w_key, w_value)`
+/// — `dictmultiobject.py W_DictMultiObject.setitem`.
+const W_DICT_STORE_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::dictmultiobject::w_dict_store",
+    commit_label: "w_dict_store_commit",
+    call_site_label: "w_dict_store_call_site",
+    decline_tag: "KWARGS-DICT-SETITEM-SUBWALK",
+};
+
 /// The `BINARY_OP` helper itself: the operator tag is a trace-time constant,
 /// so its `match` folds and only the selected operator's body is traced.
 const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
@@ -8090,6 +8108,12 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     };
     let result =
         match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
+            // Void helpers (`opimpl_residual_call_*_v`) have no dst
+            // register; `write_residual_call_result_to_dst` no-ops `'v'`.
+            DispatchOutcome::SubReturn { result: None } if dst_bank == 'v' => {
+                let _ = finish_inline_callee_return(ctx, None);
+                return Ok(Some(DispatchOutcome::Continue));
+            }
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
                 .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
             // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
@@ -8121,6 +8145,97 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
         )?;
     }
     Ok(Some(DispatchOutcome::Continue))
+}
+
+/// Descend a helper and return its result box without writing a caller
+/// dst register.  `allow_void` accepts `void_return` (`SubReturn` with
+/// no box) and yields `Ok(Some(None))`.  Walks through
+/// [`try_walker_orthodox_descent_ex`] (`dst_bank` `'v'`); a `SubRaise`
+/// declines without an extra cut — `run_prepared_orthodox_descent`
+/// already returns that outcome.
+fn orthodox_helper_boxed<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    int_args: &[(OpRef, i64)],
+    ref_args: &[(OpRef, pyre_object::PyObjectRef)],
+    descent: &HelperDescent,
+    allow_void: bool,
+) -> Result<Option<Option<OpRef>>, DispatchError> {
+    let mut boxed = None;
+    match try_walker_orthodox_descent_ex(
+        ctx,
+        op_pc,
+        int_args,
+        ref_args,
+        &[],
+        0,
+        'v',
+        descent,
+        Some(&mut boxed),
+        false,
+    )? {
+        Some(DispatchOutcome::Continue) => {
+            if allow_void {
+                Ok(Some(boxed))
+            } else {
+                match boxed {
+                    Some(op) => Ok(Some(Some(op))),
+                    None => Ok(None),
+                }
+            }
+        }
+        Some(DispatchOutcome::SubRaise { .. }) | None => Ok(None),
+        Some(_) => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    }
+}
+
+/// Walk `w_dict_new_kwargs` (`argument.py` `_match_signature`
+/// `space.newdict(kwargs=True)`).  Returns the mapping's box; a decline
+/// leaves the trace cut back to the call site.  The descent itself must
+/// produce the concrete; missing it declines rather than allocating a
+/// second shadow.
+pub(crate) fn try_walker_orthodox_kwargs_dict_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<Option<OpRef>, DispatchError> {
+    match orthodox_helper_boxed(ctx, op_pc, &[], &[], &W_DICT_NEW_KWARGS_DESCENT, false)? {
+        Some(Some(dict_op)) => {
+            if walker_concrete_ref_object(ctx, dict_op).is_none() {
+                return Ok(None);
+            }
+            Ok(Some(dict_op))
+        }
+        Some(None) | None => Ok(None),
+    }
+}
+
+/// Walk `w_dict_store` for one `_match_signature` keyword that named no
+/// parameter (`space.setitem(w_kwds, w_key, w_value)`).
+pub(crate) fn try_walker_orthodox_kwargs_dict_setitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dict_op: OpRef,
+    dict_obj: pyre_object::PyObjectRef,
+    key_op: OpRef,
+    key_obj: pyre_object::PyObjectRef,
+    value_op: OpRef,
+    value_obj: pyre_object::PyObjectRef,
+) -> Result<Option<()>, DispatchError> {
+    match orthodox_helper_boxed(
+        ctx,
+        op_pc,
+        &[],
+        &[
+            (dict_op, dict_obj),
+            (key_op, key_obj),
+            (value_op, value_obj),
+        ],
+        &W_DICT_STORE_DESCENT,
+        true,
+    )? {
+        Some(_) => Ok(Some(())),
+        None => Ok(None),
+    }
 }
 
 /// `SubReturn` that [`run_prepared_orthodox_descent`] already wrote to `dst`.

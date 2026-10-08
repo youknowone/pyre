@@ -357,12 +357,6 @@ struct KwonlyDefaultInline {
     value: pyre_object::PyObjectRef,
 }
 
-/// `_match_signature` allocates a fresh kwargs dict on every call
-/// (`space.newdict(kwargs=True)` / `w_dict_new_kwargs`).
-extern "C" fn jit_empty_kwargs_dict() -> i64 {
-    pyre_object::dictmultiobject::w_dict_new_kwargs() as i64
-}
-
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
 /// the emit so it re-establishes the same shape instead of re-deriving it.
 struct KwonlyDefaultsInline {
@@ -2949,17 +2943,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if has_varkeywords {
         // `_match_signature` does `space.newdict(kwargs=True)` on every call.
         // The dict is mutable, so it cannot be the shared empty constant.
-        let dict_op = crate::helpers::emit_trace_call_ref_typed(
-            ctx.trace_ctx,
-            jit_empty_kwargs_dict as *const (),
-            &[],
-            &[],
-        );
-        let concrete = pyre_object::dictmultiobject::w_dict_new_kwargs();
-        ctx.trace_ctx.set_opref_concrete(
-            dict_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-        );
+        // Walk `w_dict_new_kwargs` so the constructor records instead of a
+        // residual helper standing in for it.
+        let Some(dict_op) = super::specialize::try_walker_orthodox_kwargs_dict_new(ctx, op.pc)?
+        else {
+            return Ok(None);
+        };
         param_boxes.push(dict_op);
     }
 
@@ -9431,17 +9420,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         let pre_kw_roots = pyre_object::gc_roots::push_roots();
         let pre_kw_base = pre_kw_roots.pin_roots(&live);
-        let effect = majit_ir::EffectInfo::new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        );
-        let mut concrete_dict = crate::helpers::jit_kwargs_dict_new();
-        let mut dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
-            crate::helpers::jit_kwargs_dict_new as *const (),
-            &[],
-            &[],
-            effect.clone(),
-        );
+        // `argument.py` `_match_signature`: `w_kwds = space.newdict(kwargs=True)`
+        // then one `space.setitem` per unmatched keyword.  Walk those
+        // interpreter calls so the kwargs strategy's construction records.
+        let Some(dict_op) = super::specialize::try_walker_orthodox_kwargs_dict_new(ctx, op.pc)?
+        else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+        let Some(concrete_dict) = walker_concrete_ref_object(ctx, dict_op) else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+        // `argument.py` `_match_signature`: `w_kwds` is stored in `scope_w`
+        // at `space.newdict(kwargs=True)` and stays live through every
+        // `space.setitem` (`_collect_keyword_args`). Pin the freshly
+        // allocated mapping before the stores, which may allocate, and
+        // re-read the slot after each one.
+        let concrete_dict = pre_kw_roots.pin_root(concrete_dict);
+        let dict_root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         ctx.trace_ctx.set_opref_concrete(
             dict_op,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize)),
@@ -9449,21 +9444,35 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         for (extra, (name_slot, value_slot)) in varkw_extra.iter().zip(extra_slots) {
             let name = pyre_object::gc_roots::shadow_stack_get(pre_kw_base + name_slot);
             let value = match value_slot {
-                Some(slot) => pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot) as i64,
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot),
                 None => match ctx.trace_ctx.concrete_of_opref(extra.value) {
-                    Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as i64,
+                    Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => {
+                        gcref.0 as pyre_object::PyObjectRef
+                    }
                     _ => unreachable!("checked by the resolve above"),
                 },
             };
-            concrete_dict =
-                crate::helpers::jit_kwargs_dict_setitem(concrete_dict, name as i64, value);
-            let name_op = ctx.trace_ctx.const_ref(name as i64);
-            dict_op = ctx.trace_ctx.call_ref_typed_with_effect(
-                crate::helpers::jit_kwargs_dict_setitem as *const (),
-                &[dict_op, name_op, extra.value],
-                &[Type::Ref, Type::Ref, Type::Ref],
-                effect.clone(),
+            let concrete_dict = pyre_object::gc_roots::shadow_stack_get(dict_root_slot);
+            ctx.trace_ctx.set_opref_concrete(
+                dict_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize)),
             );
+            let name_op = ctx.trace_ctx.const_ref(name as i64);
+            if super::specialize::try_walker_orthodox_kwargs_dict_setitem(
+                ctx,
+                op.pc,
+                dict_op,
+                concrete_dict,
+                name_op,
+                name,
+                extra.value,
+                value,
+            )?
+            .is_none()
+            {
+                return resolved_inline_decline(op.pc, line!());
+            }
+            let concrete_dict = pyre_object::gc_roots::shadow_stack_get(dict_root_slot);
             ctx.trace_ctx.set_opref_concrete(
                 dict_op,
                 majit_ir::Value::Ref(majit_ir::GcRef(concrete_dict as usize)),
@@ -9478,6 +9487,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `pre_kw_roots` only covers the dict build. Frame setup still
         // allocates (closure cells), so the finished mapping joins the
         // argument roots that live until the frame is built.
+        let concrete_dict = pyre_object::gc_roots::shadow_stack_get(dict_root_slot);
         drop(pre_kw_roots);
         adopt_rooted_ref(
             &_arg_roots,
@@ -9486,7 +9496,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             &mut varkw_extra,
             &varkw_root_slots,
             varkw_index,
-            concrete_dict as pyre_object::PyObjectRef,
+            concrete_dict,
         );
     }
 
