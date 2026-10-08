@@ -6176,79 +6176,76 @@ impl CallControl {
                 {
                     self.stamp_method_resolved_path(caller, block_idx, op_idx, callee_path.clone());
                 }
-                // `call.py:119-120`
-                // jitdriver_sd_from_portal_runner_ptr → recursive.
-                if self.is_portal_recursive_call(&callee_path) {
-                    // Not a refusal — the portal is already a
-                    // candidate and re-walking it would loop —
-                    // but recorded so the BFS's skip rows add up
-                    // to every call site it saw.
-                    if bfs_phase {
+                // `guess_call_kind` classifications apply only to the
+                // `find_all_graphs` walk; the annotator follows every
+                // call into a graph (`annrpython.py recursivecall`).
+                if bfs_phase {
+                    // `call.py:119-120`
+                    // jitdriver_sd_from_portal_runner_ptr → recursive.
+                    if self.is_portal_recursive_call(&callee_path) {
+                        // Not a refusal — the portal is already a
+                        // candidate and re-walking it would loop —
+                        // but recorded so the BFS's skip rows add up
+                        // to every call site it saw.
                         crate::decline::record(
                             BFS_GATE,
                             "callee-is-portal-recursive",
                             format_args!("{callee_path} in {caller}"),
                         );
+                        return Vec::new();
                     }
-                    return Vec::new();
-                }
-                // `call.py:129-134`
-                // `_gctransformer_hint_close_stack_` → residual.
-                // `get_jitcode` asserts such a graph never
-                // reaches it, so following one here would turn
-                // a residual classification into a panic.
-                if self
-                    .func_effects(&callee_path)
-                    .is_some_and(|f| f.close_stack)
-                {
-                    if bfs_phase {
+                    // `call.py:129-134`
+                    // `_gctransformer_hint_close_stack_` → residual.
+                    // `get_jitcode` asserts such a graph never
+                    // reaches it, so following one here would turn
+                    // a residual classification into a panic.
+                    if self
+                        .func_effects(&callee_path)
+                        .is_some_and(|f| f.close_stack)
+                    {
                         crate::decline::record(
                             BFS_GATE,
                             "callee-close-stack-residual",
                             format_args!("{callee_path} in {caller}"),
                         );
+                        return Vec::new();
                     }
-                    return Vec::new();
-                }
-                // `call.py:135-136`
-                // `hasattr(targetgraph.func, 'oopspec')` → builtin.
-                if self
-                    .func_effects_with_crate_alias(&callee_path)
-                    .is_some_and(|f| f.recorded_oopspec().is_some())
-                {
-                    if bfs_phase {
+                    // `call.py:135-136`
+                    // `hasattr(targetgraph.func, 'oopspec')` → builtin.
+                    if self
+                        .func_effects_with_crate_alias(&callee_path)
+                        .is_some_and(|f| f.recorded_oopspec().is_some())
+                    {
                         crate::decline::record(
                             BFS_GATE,
                             "callee-oopspec-builtin",
                             format_args!("{callee_path} in {caller}"),
                         );
+                        return Vec::new();
                     }
-                    return Vec::new();
-                }
-                // `#[pyre_class]`'s `allocate`/`allocate_stable`
-                // constructors build the object then call the
-                // non-numeric `lltype::malloc_typed[_stable]`, which
-                // has no ported general `malloc->new` lowering.  The
-                // caller resolves them to the
-                // `collect_marked_class_ctor_stubs_from_llbc` residual
-                // stub, so — like a builtin — the BFS must not follow
-                // the constructor body: otherwise the two-phase census
-                // annotates its unliftable body (and its transitive
-                // `malloc_typed_stable`) standalone and reports a
-                // spurious Phase-A failure for a graph no caller ever
-                // traces into.
-                if matches!(
-                    callee_path.last_segment(),
-                    Some("allocate") | Some("allocate_stable")
-                ) {
-                    if bfs_phase {
+                    // `#[pyre_class]`'s `allocate`/`allocate_stable`
+                    // constructors build the object then call the
+                    // non-numeric `lltype::malloc_typed[_stable]`, which
+                    // has no ported general `malloc->new` lowering.  The
+                    // caller resolves them to the
+                    // `collect_marked_class_ctor_stubs_from_llbc` residual
+                    // stub, so — like a builtin — the BFS must not follow
+                    // the constructor body: otherwise the two-phase census
+                    // annotates its unliftable body (and its transitive
+                    // `malloc_typed_stable`) standalone and reports a
+                    // spurious Phase-A failure for a graph no caller ever
+                    // traces into.
+                    if matches!(
+                        callee_path.last_segment(),
+                        Some("allocate") | Some("allocate_stable")
+                    ) {
                         crate::decline::record(
                             BFS_GATE,
                             "callee-pyre-class-ctor",
                             format_args!("{callee_path} in {caller}"),
                         );
+                        return Vec::new();
                     }
-                    return Vec::new();
                 }
                 vec![callee_path]
             }
@@ -6267,13 +6264,12 @@ impl CallControl {
     /// into it (`unionof`), and the block is reflowed only if the union
     /// changed. Bindings only ever generalize.
     ///
-    /// The annotation domain is the codewriter's reach (same call
-    /// classification as `find_all_graphs`, regular graphs filtered by the
-    /// policy), whereas upstream annotates every graph reachable from the
-    /// entry point; therefore an AccessDirect call made from a graph the
-    /// policy declines does not join the union here, which can leave a
-    /// formal flagged that upstream would clear.
-    fn annotate_access_directly(&mut self, policy: &mut dyn JitPolicy, roots: &[CallPath]) {
+    /// Phase 1 annotates every graph reachable from the codewriter roots
+    /// through calls, regardless of the policy and of `guess_call_kind`,
+    /// as the annotator does from the entry point; the codewriter roots
+    /// (portals, builtin wrappers, inline helpers, helper seeds) stand in
+    /// for the entry point.
+    fn annotate_access_directly(&mut self, roots: &[CallPath]) {
         let builtin_wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
         let mut todo: Vec<(CallPath, Specialization)> = roots
             .iter()
@@ -6344,9 +6340,7 @@ impl CallControl {
                                 }
                             }
                             Specialization::Regular => {
-                                if entered.insert((callee_path.clone(), Specialization::Regular))
-                                    && policy.look_inside_graph(&callee_graph)
-                                {
+                                if entered.insert((callee_path.clone(), Specialization::Regular)) {
                                     todo.push((callee_path, Specialization::Regular));
                                 }
                             }
@@ -6484,7 +6478,7 @@ impl CallControl {
         }
         // Phase 1: annotator-analog AccessDirect fixpoint. Phase 2 is
         // `call.py find_all_graphs`, which only reads the final bindings.
-        self.annotate_access_directly(policy, &todo);
+        self.annotate_access_directly(&todo);
         let mut todo: Vec<(CallPath, Specialization)> = todo
             .iter()
             .cloned()
@@ -12546,6 +12540,121 @@ mod tests {
         let stored_mid = cc.function_graphs().get(&mid_path).expect("mid");
         assert!(stored_mid.access_directly);
         assert_eq!(stored_mid.access_directly_inputs, Some(vec![]));
+        let stored_inner = cc.function_graphs().get(&inner_path).expect("inner");
+        assert!(!stored_inner.access_directly);
+        assert!(!cc.is_candidate(&inner_path));
+    }
+
+    /// A policy-declined Regular graph still joins AccessDirect unions
+    /// (`annrpython.py recursivecall` / `addpendingblock`). `declined` is
+    /// loopy, so `JitPolicy.look_inside_graph` rejects it as Regular; it
+    /// still calls `mid(hint_access_directly(a), plain)`. The root also
+    /// calls `mid(hint_access_directly(x), hint_access_directly(y))`.
+    /// Both calls bind `mid`'s AccessDirect graph; the union keeps only
+    /// `p0`, so `leaf` (reached through `p1`) is not flagged.
+    #[test]
+    fn a_policy_declined_graph_still_joins_the_accessdirect_union() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let leaf_path = CallPath::from_segments(["leaf"]);
+        cc.register_function_graph(leaf_path.clone(), loopy_graph("leaf"));
+
+        let mid_path = CallPath::from_segments(["mid"]);
+        let mut mid = FunctionGraph::new("mid");
+        let entry = mid.startblock;
+        let p0 = mid.alloc_value_var();
+        let p0_id = p0.id();
+        let p1 = mid.alloc_value_var();
+        mid.block_mut(entry).inputargs.push(p0);
+        mid.block_mut(entry).inputargs.push(p1.clone());
+        mid.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(leaf_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([p1]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(mid_path.clone(), mid);
+
+        let declined_path = CallPath::from_segments(["declined"]);
+        let mut declined = loopy_graph("declined");
+        let entry = declined.startblock;
+        let a = declined.alloc_value_var();
+        let hinted = declined.alloc_value_var();
+        declined.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([a]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let plain = declined.alloc_value_var();
+        declined.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted, plain]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(declined_path.clone(), declined);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(
+                    declined_path.segments.iter().map(String::as_str),
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        });
+        let x = caller.alloc_value_var();
+        let hinted_x = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted_x.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([x]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let y = caller.alloc_value_var();
+        let hinted_y = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted_y.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([y]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted_x, hinted_y]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        let stored_mid = cc.function_graphs().get(&mid_path).expect("mid");
+        assert!(stored_mid.access_directly);
+        assert_eq!(stored_mid.access_directly_inputs, Some(vec![p0_id]));
+        let stored_leaf = cc.function_graphs().get(&leaf_path).expect("leaf");
+        assert!(!stored_leaf.access_directly);
+        assert!(!cc.is_candidate(&leaf_path));
+        assert!(!cc.is_candidate(&declined_path));
         let stored_inner = cc.function_graphs().get(&inner_path).expect("inner");
         assert!(!stored_inner.access_directly);
         assert!(!cc.is_candidate(&inner_path));
