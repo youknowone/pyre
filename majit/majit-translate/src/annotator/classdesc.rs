@@ -299,6 +299,25 @@ fn someshell_from_primitive_layout(ty: &str) -> Option<SomeValue> {
     }
 }
 
+/// Charon lays a fieldless-enum value out as `u8`/`u32` while every
+/// value site colours it `ValueType::Int` (`tyref_is_fieldless_enum_free`).
+/// `scalar_value_type` maps an unsigned integer to `Unsigned`, so the
+/// Int + unsigned-layout pair is that discriminant — including a struct
+/// field whose type is a fieldless enum (`Utf16Or32Form.order: ByteOrder`
+/// spelled `u8`). The layout row is the discriminant width, so the
+/// registry cannot look the field type up; owner-level `is_enum_base &&
+/// !enum_base_has_payload` covers only the enum's own `__discriminant`
+/// row. Signed primitives keep a signed layout spelling (`s_value`
+/// already Signed). A raw-address `Int` uses a pointer layout that
+/// `someshell_from_primitive_layout` rejects.
+fn layout_is_fieldless_enum_discriminant(
+    vt: &crate::model::ValueType,
+    s_value: &SomeValue,
+) -> bool {
+    matches!(vt, crate::model::ValueType::Int)
+        && matches!(s_value, SomeValue::Integer(i) if i.unsigned)
+}
+
 /// Seed FORCE from `fields`, skipping a row whose declared layout is a
 /// one-word `Vec` header. Layout keeps `ValueType::Int` (the header
 /// address); the annotator projects `SomeRustVec` from the `*mut Vec<…>`
@@ -328,6 +347,15 @@ pub(crate) fn register_struct_fields_with_layout(
                 // Seeding Unsigned from the type parameter made
                 // `Option<i64>::Some.__pos_0` disagree with the annotator.
                 if let Some(s_value) = someshell_from_primitive_layout(ty) {
+                    // Keep the signed shell: rint.py
+                    // `_rtype_compare_template` refuses Signed vs
+                    // Unsigned. Physical layout size stays on the
+                    // Charon row (`from_type_strings`).
+                    let s_value = if layout_is_fieldless_enum_discriminant(vt, &s_value) {
+                        super::model::s_int()
+                    } else {
+                        s_value
+                    };
                     entry.insert(name.clone(), s_value);
                     continue;
                 }
@@ -3378,6 +3406,59 @@ mod tests {
                 Some(SomeValue::Integer(i)) => assert!(
                     !i.unsigned,
                     "instantiated i64 must seed Signed, got unsigned"
+                ),
+                other => panic!("expected Signed Integer, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn register_struct_fields_keeps_fieldless_enum_signed_over_unsigned_layout() {
+        // StrategyKind is Int at every value site; Charon spells the
+        // discriminant `u8`. Seeding Unsigned made strategy_is compare
+        // getattr kind (Ruint) against the Signed expected parameter
+        // (`rint.py` `_rtype_compare_template`).
+        register_struct_fields_with_layout(
+            "dictmultiobject::StrategyKind",
+            &[("__discriminant".into(), crate::model::ValueType::Int)],
+            Some(&[("__discriminant".into(), "u8".into())]),
+        );
+        FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+            let table = cell.borrow();
+            let entry = table
+                .get("dictmultiobject::StrategyKind")
+                .expect("FORCE row for fieldless enum");
+            match entry.get("__discriminant") {
+                Some(SomeValue::Integer(i)) => assert!(
+                    !i.unsigned,
+                    "fieldless-enum Int + u8 layout must seed Signed, got unsigned"
+                ),
+                other => panic!("expected Signed Integer, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn register_struct_fields_keeps_fieldless_enum_typed_field_signed() {
+        // A struct field whose type is a fieldless enum (`ByteOrder` on
+        // `Utf16Or32Form.order`) is Int at the value site and `u8` in
+        // the Charon layout. Owner-level `is_enum_base` is false for
+        // the struct; the Int + unsigned-layout pair is still the
+        // discriminant.
+        register_struct_fields_with_layout(
+            "type_methods::Utf16Or32Form",
+            &[("order".into(), crate::model::ValueType::Int)],
+            Some(&[("order".into(), "u8".into())]),
+        );
+        FORCE_ATTRIBUTES_INTO_CLASSES.with(|cell| {
+            let table = cell.borrow();
+            let entry = table
+                .get("type_methods::Utf16Or32Form")
+                .expect("FORCE row for struct with fieldless-enum field");
+            match entry.get("order") {
+                Some(SomeValue::Integer(i)) => assert!(
+                    !i.unsigned,
+                    "fieldless-enum-typed field Int + u8 layout must seed Signed, got unsigned"
                 ),
                 other => panic!("expected Signed Integer, got {other:?}"),
             }
