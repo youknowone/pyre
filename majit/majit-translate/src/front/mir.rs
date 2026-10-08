@@ -911,7 +911,10 @@ fn register_ref_enum_instantiation_rows(
             let mut rows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
-                let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                let fname = f
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc, gc_struct_ids);
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
@@ -2846,6 +2849,12 @@ fn note_raw_word_owner(
         .next()
         .unwrap_or(name.as_str())
         .to_string();
+    // Closure envs that only capture Copy words are raw storage, but they
+    // are not C structs. `raw_struct_ptr_annotation` must not mint SomePtr
+    // for them (`tyref_input_class_root`; RPython forbids closures).
+    if majit_charon_reader::ullbc::is_closure_leaf(&leaf) {
+        return;
+    }
     struct_fields
         .raw_word_owners
         .insert(strip_crate_prefix(&name));
@@ -2940,7 +2949,9 @@ fn derive_program_metadata(
                     .iter()
                     .enumerate()
                     .flat_map(|(i, f)| {
-                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        let fname = f.name.clone().unwrap_or_else(|| {
+                            majit_charon_reader::ullbc::positional_field_name(i)
+                        });
                         if tyref_pair_field_kind(&f.ty, llbc).is_some() {
                             let len = pair_len_field_name(&fname);
                             return vec![(fname, "usize".to_string()), (len, "usize".to_string())];
@@ -2989,7 +3000,9 @@ fn derive_program_metadata(
                 if let Some(layout) = td.layout_for_target(llbc, &target) {
                     let mut field_offsets = std::collections::HashMap::new();
                     for (i, f) in fields.iter().enumerate() {
-                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        let fname = f.name.clone().unwrap_or_else(|| {
+                            majit_charon_reader::ullbc::positional_field_name(i)
+                        });
                         let Some(off) = layout.struct_field_offset(i) else {
                             continue;
                         };
@@ -3048,7 +3061,9 @@ fn derive_program_metadata(
                     .iter()
                     .enumerate()
                     .flat_map(|(i, f)| {
-                        let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        let fname = f.name.clone().unwrap_or_else(|| {
+                            majit_charon_reader::ullbc::positional_field_name(i)
+                        });
                         if tyref_pair_field_kind(&f.ty, llbc).is_some() {
                             let len = pair_len_field_name(&fname);
                             return vec![(fname, ValueType::Unsigned), (len, ValueType::Unsigned)];
@@ -3365,7 +3380,9 @@ fn derive_program_metadata(
                         // The shell's next free payload word.
                         let mut shell_word = 0u64;
                         for (i, f) in v.fields.iter().enumerate() {
-                            let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                            let fname = f.name.clone().unwrap_or_else(|| {
+                                majit_charon_reader::ullbc::positional_field_name(i)
+                            });
                             // A pair-slice payload is its pointer and length
                             // words, the length under `pair_len_field_name`.
                             if tyref_pair_field_kind(&f.ty, llbc).is_some() {
@@ -19643,7 +19660,9 @@ impl<'a> Lowering<'a> {
                     .enumerate()
                     .map(|(i, f)| {
                         (
-                            f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
+                            f.name.clone().unwrap_or_else(|| {
+                                majit_charon_reader::ullbc::positional_field_name(i)
+                            }),
                             tyref_to_ast_string(&f.ty, self.llbc),
                             Some(clone_tyref(&f.ty)),
                         )
@@ -19708,7 +19727,9 @@ impl<'a> Lowering<'a> {
                     .enumerate()
                     .map(|(i, f)| {
                         (
-                            f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
+                            f.name.clone().unwrap_or_else(|| {
+                                majit_charon_reader::ullbc::positional_field_name(i)
+                            }),
                             tyref_to_ast_string(&f.ty, self.llbc),
                             Some(clone_tyref(&f.ty)),
                         )
@@ -19932,10 +19953,9 @@ impl<'a> Lowering<'a> {
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
                 let f = fields.get(field_idx)?;
-                let name = f
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let name = f.name.clone().unwrap_or_else(|| {
+                    majit_charon_reader::ullbc::positional_field_name(field_idx)
+                });
                 let ty = clone_tyref(&f.ty);
                 let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
                     &name_path,
@@ -19947,10 +19967,9 @@ impl<'a> Lowering<'a> {
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
                 let variant = variants.get(vidx as usize)?;
                 let f = variant.fields.get(field_idx)?;
-                let name = f
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("__pos_{field_idx}"));
+                let name = f.name.clone().unwrap_or_else(|| {
+                    majit_charon_reader::ullbc::positional_field_name(field_idx)
+                });
                 let ty = clone_tyref(&f.ty);
                 // owner_root = the variant subclass `{enum_leaf}::{variant}`
                 // — the read resolves the variant's own field at its exact
@@ -29650,7 +29669,10 @@ impl<'a> Lowering<'a> {
                     if itemsize == 0 || itemsize > 8 {
                         return None;
                     }
-                    let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                    let name = field
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
                     let value_ty = tyref_to_value_type_with(
                         &field.ty,
                         self.llbc,
@@ -29734,7 +29756,9 @@ impl<'a> Lowering<'a> {
                         if itemsize > 8 {
                             return None;
                         }
-                        let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                        let name = field.name.clone().unwrap_or_else(|| {
+                            majit_charon_reader::ullbc::positional_field_name(i)
+                        });
                         let value_ty = tyref_to_value_type_with(
                             &field.ty,
                             self.llbc,
@@ -51757,7 +51781,7 @@ fn opaque_struct_field_name(
     registry
         .field_name_at(owner, field_idx)
         .map(str::to_string)
-        .unwrap_or_else(|| format!("__pos_{field_idx}"))
+        .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(field_idx))
 }
 
 fn scalar_value_type(scalar: &serde_json::Value) -> Option<ValueType> {
@@ -53806,7 +53830,10 @@ fn collect_by_value_struct_leaves(
     let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
     let mut leaves = Vec::new();
     for (i, f) in fields.iter().enumerate() {
-        let name = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+        let name = f
+            .name
+            .clone()
+            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
         if tyref_is_void_zst(&f.ty, llbc) {
             continue;
         }
@@ -54086,7 +54113,7 @@ fn transparent_nonzst_field(decl: &TypeDecl, llbc: &Llbc) -> Option<(usize, Stri
         let name = field
             .name
             .clone()
-            .unwrap_or_else(|| format!("__pos_{index}"));
+            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
         found = Some((index, name));
     }
     found

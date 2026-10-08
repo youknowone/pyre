@@ -4876,6 +4876,27 @@ mod tests {
     }
 
     #[test]
+    fn someptr_getattr_as_ref_is_identity_bound_method() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new("MappedObj", vec![])),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("as_ref")));
+        let result = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect("SomePtr.getattr as_ref");
+        match result {
+            SomeValue::BuiltinMethod(m) => {
+                assert_eq!(m.analyser_name, "ptr_method_as_ref");
+                assert!(matches!(m.s_self.as_ref(), SomeValue::Ptr(_)));
+            }
+            other => panic!("as_ref must bind ptr_method_as_ref, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn someptr_setattr_checks_struct_field_annotation() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             LowLevelType, Ptr, PtrTarget, Struct,

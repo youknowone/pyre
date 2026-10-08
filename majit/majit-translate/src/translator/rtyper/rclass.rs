@@ -3976,6 +3976,12 @@ impl Repr for InstanceRepr {
             let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
             return Ok(hop.genop("ptr_iszero", vlist, GenopResult::LLType(LowLevelType::Bool)));
         }
+        // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref` on a
+        // pointer-carrying instance: the receiver is already the
+        // nullable pointer word (`ptr_method_as_ref`). Identity.
+        if method_name == "as_ref" || method_name == "as_mut" {
+            return hop.inputarg(self, 0).map(Some);
+        }
         if method_name == "to_exc_object" {
             let is_pyerror = self.classdef.as_ref().is_some_and(|classdef| {
                 classdef.borrow().name.rsplit('.').next() == Some("PyError")

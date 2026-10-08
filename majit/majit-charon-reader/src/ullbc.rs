@@ -878,10 +878,29 @@ pub enum TypeDeclKind {
     Unknown,
 }
 
+/// Fallback name the front assigns when [`FieldDecl::name`] is `None`.
+/// Charon spells a positional field `"_N"` with `is_positional: true`;
+/// the reader drops that spelling so a positional field and a named `_0`
+/// stay distinct, and the front numbers the slot as `{prefix}{index}`.
+pub const POSITIONAL_FIELD_PREFIX: &str = "__pos_";
+
+/// `{POSITIONAL_FIELD_PREFIX}{index}` — the front's name for positional
+/// field `index`.
+pub fn positional_field_name(index: usize) -> String {
+    format!("{POSITIONAL_FIELD_PREFIX}{index}")
+}
+
+/// Whether `name` is a positional-field fallback ([`positional_field_name`]).
+pub fn is_positional_field_name(name: &str) -> bool {
+    name.strip_prefix(POSITIONAL_FIELD_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `name` is `None` for a positional field (tuple struct / tuple variant
 /// payload). Charon spells such a field `"_N"` with `is_positional: true`;
 /// the name is dropped here so a positional field and a named field that
-/// happens to be called `_0` stay distinct.
+/// happens to be called `_0` stay distinct. The front then assigns
+/// [`positional_field_name`].
 #[derive(Debug, Deserialize)]
 #[serde(from = "RawFieldDecl")]
 pub struct FieldDecl {
@@ -2571,6 +2590,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(named.name.as_deref(), Some("_0"));
+        assert_eq!(positional_field_name(0), "__pos_0");
+        assert!(is_positional_field_name("__pos_0"));
+        assert!(is_positional_field_name("__pos_12"));
+        assert!(!is_positional_field_name("__pos_"));
+        assert!(!is_positional_field_name("_0"));
     }
 
     /// A struct's field offsets are the single `variant_layouts[0]` entry.

@@ -1769,13 +1769,16 @@ fn cast_instance_intrinsic(
     }
     // A pointer to a declared-Raw ADT is an int-bank `SomePtr`. Retargeting
     // `*mut A as *mut B` must replace that pointee, not mint a GC instance.
-    // An operand that is already the instance (`push_roots()` → `RootScope`)
-    // is that class, not an address word, so it keeps the classdef arm.
-    if let Some(raw_ptr) = bk.raw_struct_ptr_annotation(&root)
-        && !matches!(operand, SomeValue::Instance(_))
-    {
+    // A by-value operand (`push_roots()` → `RootScope`, `VersionTag`) is
+    // the same raw ADT: FieldRead already projects SomePtr
+    // (`project_struct_field_type`), and `llannotation.py`
+    // `pairtype(SomePtr, SomeObject).union` refuses Instance ∪ Ptr.
+    if let Some(raw_ptr) = bk.raw_struct_ptr_annotation(&root) {
         return match operand {
-            SomeValue::Ptr(_) | SomeValue::Address(_) | SomeValue::Integer(_) => Ok(raw_ptr),
+            SomeValue::Ptr(_)
+            | SomeValue::Address(_)
+            | SomeValue::Integer(_)
+            | SomeValue::Instance(_) => Ok(raw_ptr),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-address operand for raw root {root:?}: {other:?}"
             ))),
@@ -3191,6 +3194,72 @@ mod tests {
         )
         .expect("a SomeTuple operand passes through");
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_raw_root_narrows_instance_to_someptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let owner = "rawcast::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        reg.raw_word_owners.insert(owner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let classdef = ClassDef::new_standalone(owner, None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str(owner))
+            .expect("raw root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("raw-root cast_instance_intrinsic must accept a SomeInstance operand");
+        let SomeValue::Ptr(ptr) = out else {
+            panic!("raw root must project dest as SomePtr, got {out:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("raw-root SomePtr must point at a Struct");
+        };
+        assert_eq!(st._name, owner);
+        assert_eq!(st._gckind, GcKind::Raw);
     }
 
     #[test]

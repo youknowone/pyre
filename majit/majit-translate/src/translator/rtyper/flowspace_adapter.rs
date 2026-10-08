@@ -4423,6 +4423,17 @@ pub(crate) fn derive_subject_inputcells(
                             cells.push(bk.project_struct_field_type(root));
                             continue;
                         }
+                        // A `&RawStruct` is the address of that struct
+                        // (`Ptr` of a raw `Struct`, `history.getkind`).
+                        // FieldRead of the same owner already seeds
+                        // SomePtr (`project_struct_field_type`); minting
+                        // SomeInstance here made mergeinputargs raise
+                        // Instance(X) ∪ Ptr(X) (`llannotation.py`
+                        // pairtype(SomePtr, SomeObject).union).
+                        if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
+                            cells.push(cell);
+                            continue;
+                        }
                         let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
                             TyperError::message(format!(
                                 "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -6122,6 +6133,75 @@ mod tests {
         assert_eq!(tuple.items.len(), 2);
         assert!(matches!(tuple.items[0], SomeValue::Integer(_)));
         assert!(matches!(tuple.items[1], SomeValue::Float(_)));
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_ref_of_raw_struct_as_someptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let owner = "rawref::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut graph = LegacyGraph::new("scope_get");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "scope".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        bk.set_struct_fields(Rc::new(fields));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("&RawStruct input must seed");
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!("&RawStruct must seed SomePtr, got {:?}", cells[0]);
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("raw Ref input must point at a Struct");
+        };
+        assert_eq!(st._name, owner);
+        assert_eq!(st._gckind, GcKind::Raw);
     }
 
     #[test]
