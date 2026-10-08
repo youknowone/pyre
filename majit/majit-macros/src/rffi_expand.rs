@@ -450,6 +450,12 @@ impl LlexternalInput {
                 #ccall_fnaddr
                 #header
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
+                    let _ = ::core::hint::black_box(::core::concat!(
+                        ::core::module_path!(),
+                        "::",
+                        stringify!(#call_name),
+                    )
+                    .as_ptr());
                     #body
                 }
                 #vis unsafe fn #name(#(#params),*) -> #result {

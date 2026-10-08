@@ -322,17 +322,22 @@ pub fn frame_anchor_release(depth: usize) {
 /// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
 /// address back as one function: two unrelated paths sharing an address is
 /// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
+/// The unique `black_box` keeps LLVM MergeFunctions from folding these
+/// bridges onto `shadow_stack_*_word` (`drain_list_append`).
 pub extern "C" fn frame_anchor_push_jit_abi(frame: *mut PyFrame) -> i64 {
+    let _ = core::hint::black_box("eval::frame_anchor_push_jit_abi".as_ptr());
     frame_anchor_push(frame) as i64
 }
 
 /// One-word residual-call ABI for [`frame_anchor_live`].
 pub extern "C" fn frame_anchor_live_jit_abi(depth: i64) -> i64 {
+    let _ = core::hint::black_box("eval::frame_anchor_live_jit_abi".as_ptr());
     frame_anchor_live(depth as usize) as i64
 }
 
 /// One-word residual-call ABI for [`frame_anchor_release`].
 pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
+    let _ = core::hint::black_box("eval::frame_anchor_release_jit_abi".as_ptr());
     frame_anchor_release(depth as usize);
 }
 
@@ -343,6 +348,7 @@ pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
 /// handed back without running `Drop`, exactly as the aggregate return did
 /// when the method itself was the registered target.
 pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
+    let _ = core::hint::black_box("eval::frame_anchor_new_jit_abi".as_ptr());
     // SAFETY: the residual's slot holds the frame the walked graph read it
     // from, or null, which `from_raw` anticipates.
     let anchor = unsafe { FrameAnchor::from_raw(frame) };
@@ -358,6 +364,7 @@ pub extern "C" fn frame_anchor_new_jit_abi(frame: *mut PyFrame) -> i64 {
 /// the residual as the one-word anchor's value — the depth — rather than a
 /// pointer to it.
 pub extern "C" fn frame_anchor_live_method_jit_abi(anchor: i64) -> i64 {
+    let _ = core::hint::black_box("eval::frame_anchor_live_method_jit_abi".as_ptr());
     let anchor = std::mem::ManuallyDrop::new(FrameAnchor {
         depth: anchor as usize,
         _not_send: std::marker::PhantomData,
