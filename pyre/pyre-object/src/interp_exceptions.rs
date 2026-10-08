@@ -1408,18 +1408,19 @@ pub fn is_canonical_exc_class(cls: PyObjectRef) -> bool {
 
 /// Canonical `ExcKind` for `cls` when `cls` is a registered builtin
 /// exception class.  Heap subclasses are not registered and answer `None`.
+///
+/// The atomic slot read stays in [`lookup_exc_class_for_kind`] (`@jit.elidable`
+/// on that helper, same as the process-global class table). This body is a
+/// signed trip over the contiguous discriminants so the prepass lifts the
+/// graph (`rpython/annotator/builtin.py` `builtin_range`).
 pub fn kind_of_canonical_exc_class(cls: PyObjectRef) -> Option<ExcKind> {
     if cls.is_null() {
         return None;
     }
-    for (index, slot) in EXC_CLASS_BY_KIND.iter().enumerate() {
-        if slot.load(std::sync::atomic::Ordering::Acquire) == cls as usize {
-            let raw = index as u8;
-            if raw > ExcKind::MAX_DISCRIMINANT {
-                return None;
-            }
-            // Discriminants are contiguous `0..=MAX_DISCRIMINANT`.
-            return Some(unsafe { std::mem::transmute::<u8, ExcKind>(raw) });
+    for raw in 0..=ExcKind::MAX_DISCRIMINANT {
+        let kind = unsafe { std::mem::transmute::<u8, ExcKind>(raw) };
+        if lookup_exc_class_for_kind(kind) == cls {
+            return Some(kind);
         }
     }
     None

@@ -2995,8 +2995,7 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     }
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
         return Some(
-            pyre_object::bytesobject::bytes_like_data(a)
-                == pyre_object::bytesobject::bytes_like_data(b),
+            pyre_object::bytesobject::w_bytes_data(a) == pyre_object::bytesobject::w_bytes_data(b),
         );
     }
     None

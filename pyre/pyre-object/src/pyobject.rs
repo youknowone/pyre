@@ -2028,6 +2028,10 @@ pub unsafe fn is_ellipsis(obj: PyObjectRef) -> bool {
 /// Two machine ints never build a bigint. `W_LongObject` shares the `int`
 /// `w_class`, so `is_exact_type(..., INT_TYPE)` is true for it; the long
 /// is told apart by `is_long` (`LONG_TYPE`), not by that gate.
+///
+/// `inline(never)` keeps this graph off `W_IntObject.is_w`'s body: that
+/// method does not call `bigint_w`.
+#[inline(never)]
 fn abstract_int_is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     unsafe {
         let one_long = int_operand_is_long(w_one);
@@ -2074,6 +2078,11 @@ fn int_operand_is_long(obj: PyObjectRef) -> bool {
 ///
 /// The dispatch is on `w_two`, as `w_two.is_w(space, w_one)` is: every gate
 /// reads `w_two`'s type first, so `x is CONST` never reads `x`'s class.
+///
+/// Exact `int` splits the way `intobject.py` does: `W_IntObject.is_w`
+/// compares `intval`; `W_AbstractIntObject.is_w` (`abstract_int_is_w`)
+/// is the long/`i64::MIN` path that may build a bigint. Both return
+/// `bool` — an `Option<bool>` merge is `int ∪ r_uint` at the return block.
 pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     if std::ptr::eq(w_one, w_two) {
         return true;
@@ -2097,7 +2106,11 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
         {
-            return abstract_int_is_w(w_one, w_two);
+            if int_operand_is_long(w_one) || int_operand_is_long(w_two) {
+                return abstract_int_is_w(w_one, w_two);
+            }
+            return crate::intobject::w_int_get_value(w_one)
+                == crate::intobject::w_int_get_value(w_two);
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal

@@ -316,7 +316,8 @@ pub unsafe fn write_cell(
     // value stored below and the cell rewritten in place stay rooted
     // across the classification.
     let mut w_cell_word = w_cell.unwrap_or(std::ptr::null_mut());
-    let write = crate::with_roots!(w_cell_word, w_value => classify_cell_write(w_cell, w_value));
+    let write =
+        crate::with_roots!(w_cell_word, w_value => classify_cell_write(w_cell_word, w_value));
     match write {
         CellWrite::InPlaceObject(_) => {
             let cell = w_cell_word;
@@ -363,11 +364,11 @@ enum CellWrite {
 }
 
 /// The decision half of [`write_cell`]; performs no store.
-unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> CellWrite {
-    let Some(w_cell) = w_cell else {
+unsafe fn classify_cell_write(w_cell: PyObjectRef, w_value: PyObjectRef) -> CellWrite {
+    if w_cell.is_null() {
         // attribute does not exist at all, write it without a cell first
         return CellWrite::StoreBare;
-    };
+    }
     if is_object_mutable_cell(w_cell) {
         return CellWrite::InPlaceObject(w_cell);
     }
@@ -400,7 +401,7 @@ unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef)
 /// `w_cell` (when `Some`) and `w_value` must point at live objects.
 pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> bool {
     matches!(
-        classify_cell_write(w_cell, w_value),
+        classify_cell_write(w_cell.unwrap_or(std::ptr::null_mut()), w_value),
         CellWrite::StoreBare | CellWrite::Replace
     )
 }
