@@ -2,11 +2,13 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=9e843d85f5b4f9da platform=linux
-# Attributed joins after the LIST_EXTEND inline call reached list_extend_value and
-# extend_from_tuple, and grow_typed_items_block split per ARRAY (#2239).
-# Attributed joins after the *_iff predicates and descroperation int ops became
-# reachable callees (#1996).
+# corpus=ed22488953c3253d platform=linux
+# Attributed joins after getitem pin_roots / timezone re-extract.
+# Attributed join after eval_slice_index moved to baseobjspace getindex_w (#2219).
+# Attributed joins after #2238 raw-struct/fieldless-enum return to rtyper,
+# #2239 look_inside tuple list-extend / _iff, #2240 cell ABI / Result shells.
+# Combined tree first showed the 64 added names in #2231 dispatcher-graph
+# job 113586429198 (743248fa2f1); main 37856557223 job 113586687125 inherited them.
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
 two-phase-never-a-subject	error::PyError::oefmt_name_error_text__spec_String_0f8488b534c96dc1
 two-phase-never-a-subject	error::PyError::oefmt_name_error_text__spec__str_57a0acd0311bcd80

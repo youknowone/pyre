@@ -8575,12 +8575,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let handler_except_as_return_admit = seeded_inline
         && !branchy_poison_admit
         && !pyre_interpreter::code_has_for_iter(callee_code)
-        && branchy_handler_scan.as_ref().is_some_and(|scan| {
-            scan.enforceable()
-                && body_has_returning_handler(body.code)
-                && (scan.safety != CalleeReplaySafety::Dirty
-                    || poison_confined_to_returning_handlers(body.code, &scan.poison))
-        });
+        && branchy_handler_scan
+            .as_ref()
+            .is_some_and(|scan| handler_except_as_return_scan_admits(scan, body.code));
     if fbw_inline_diag_enabled() {
         if let Some(scan) = branchy_handler_scan.as_ref() {
             eprintln!(

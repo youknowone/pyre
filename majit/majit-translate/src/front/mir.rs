@@ -2737,7 +2737,16 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
 }
 
 pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
-    match type_name.trim() {
+    let type_name = type_name.trim();
+    // A one-word-item Vec is `Ptr(Struct(raw) "RustVec")`
+    // (`rrustvec.rs rust_vec_lltype`); `getkind` of a raw pointer is
+    // `'int'`. Same recognizer as `Bookkeeper::project_rust_vec`.
+    if majit_ir::rvec::rust_vec_item_kind_for_spelling(type_name, crate::layout::target_word_size())
+        .is_some()
+    {
+        return ValueType::Int;
+    }
+    match type_name {
         "()" => ValueType::Void,
         "f64" => ValueType::Float,
         // 128-bit fields are twice the machine word, so they carry their own
@@ -67411,6 +67420,20 @@ mod tests {
             Some(super::IntCastAction::RUint)
         );
         assert_eq!(super::int_cast_action(128, false, 64, false), None);
+    }
+
+    /// A one-word-item Vec header pointer is int-banked, matching
+    /// `descr.py get_type_flag` of a raw Ptr and `rrustvec.rs rust_vec_lltype`.
+    #[test]
+    fn rust_vec_header_pointer_tuple_field_is_int_banked() {
+        use crate::model::ValueType;
+        for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
+            assert_eq!(
+                super::tuple_field_value_type(spelling),
+                ValueType::Int,
+                "{spelling}"
+            );
+        }
     }
 
     use super::harden_duplicate_leaf_metadata;

@@ -6979,35 +6979,6 @@ fn type_create_new_type(
         pyre_object::gc_roots::normalize_roots(name_slot, 3 + n_args + 2);
         let name_obj = || pyre_object::gc_roots::shadow_stack_get(name_slot);
         let meta = || pyre_object::gc_roots::shadow_stack_get(meta_slot);
-        // Mixed NUL+surrogate is UnicodeEncodeError: `type_new_set_name`
-        // encodes with `PyUnicode_AsUTF8AndSize` before the `strlen` NUL
-        // test (Objects/typeobject.c, read at v3.14.6 in
-        // ~/Projects/cpython-3146). `_create_new_type` does `'\x00' in name`
-        // then `_check_surrogate` and answers ValueError. The exception type
-        // is observable, so `_check_surrogate` runs first; both checks stay
-        // before the namespace copy. `_check_utf8` `@jit.elidable` governs
-        // the utf8 scan, not this order. `W_TypeObject.__init__`
-        // `@dont_look_inside` and `name?` sit after a successful name.
-        // U+0000 is a single 0x00 byte in WTF-8.
-        check_surrogate(name_obj())?;
-        if unsafe { pyre_object::w_str_get_wtf8(name_obj()) }
-            .as_bytes()
-            .contains(&0)
-        {
-            return Err(crate::PyError::value_error(
-                "type name must not contain null characters",
-            ));
-        }
-        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
-        // Resolve and pin the backing immediately. Later regions dispatch
-        // through user code (`lookup`, metaclass `__new__`) and would
-        // otherwise leave this word unrooted.
-        let backing_root = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(unsafe {
-            crate::type_methods::resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(
-                namespace_root,
-            ))
-        });
 
         // typeobject.py `_create_new_type` — direct three-argument
         // `type()` never performs PEP 560 base rewriting.  A non-type base
@@ -7029,45 +7000,100 @@ fn type_create_new_type(
             }
         }
 
-        // CPython: calculate_metaclass — if bases have a custom metaclass,
-        // delegate to that metaclass instead of using type.__new__ directly.
-        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
-        if meta().is_null() && !bases.is_null() && unsafe { is_tuple(bases) } {
-            let n = unsafe { w_tuple_len(bases) };
-            for i in 0..n {
-                if let Some(base) = unsafe { pyre_object::w_tuple_getitem(bases, i as i64) }
-                    && unsafe { pyre_object::is_type(base) }
-                {
-                    // baseobjspace.py — metaclass from w_class
-                    let w_metaclass = unsafe {
-                        let w_class = (*base).w_class;
-                        let w_type_type = crate::typedef::w_type();
-                        if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
-                            Some(w_class)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(w_metaclass) = w_metaclass {
-                        // Delegate: call metaclass(name, bases, dict, **kwds)
-                        // Pass extra args from the original call
-                        let mut metaclass_args = vec![
-                            name_obj(),
-                            bases,
-                            pyre_object::gc_roots::shadow_stack_get(namespace_root),
-                        ];
-                        for index in 3..n_args {
-                            metaclass_args
-                                .push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
-                        }
-                        return crate::call::call_function_impl_result(
-                            w_metaclass,
-                            &metaclass_args,
-                        );
-                    }
+        // `_calculate_metaclass` then, when the winner differs, maybe
+        // `space.call_obj_args(newfunc, w_winner, __args__)`. Delegation
+        // sits before name validation and the namespace copy, matching
+        // `_create_new_type` and `type_new_get_bases`. `getattr` and the
+        // delegated `__new__` collect, so every live word is a slot.
+        let w_winner = crate::call::calculate_metaclass(
+            if meta().is_null() {
+                crate::typedef::w_type()
+            } else {
+                meta()
+            },
+            pyre_object::gc_roots::shadow_stack_get(bases_slot),
+        )?;
+        let winner_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_winner);
+        let default_meta = if meta().is_null() {
+            crate::typedef::w_type()
+        } else {
+            meta()
+        };
+        if !crate::baseobjspace::is_w(
+            pyre_object::gc_roots::shadow_stack_get(winner_slot),
+            default_meta,
+        ) {
+            // Delegate only when the winner's resolved `__new__` is not
+            // `type.__new__` itself; otherwise `w_typetype = w_winner`.
+            let newfunc = crate::baseobjspace::getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(winner_slot),
+                "__new__",
+            )?;
+            let newfunc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(newfunc);
+            let type_new = crate::baseobjspace::getattr_str(crate::typedef::w_type(), "__new__")?;
+            let type_new_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(type_new);
+            if !crate::baseobjspace::is_w(
+                pyre_object::gc_roots::shadow_stack_get(newfunc_slot),
+                pyre_object::gc_roots::shadow_stack_get(type_new_slot),
+            ) {
+                let kw_entries = builtin_kwarg_entries(
+                    has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot)),
+                );
+                let mut new_args = vec![
+                    pyre_object::gc_roots::shadow_stack_get(winner_slot),
+                    name_obj(),
+                    pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                    pyre_object::gc_roots::shadow_stack_get(namespace_root),
+                ];
+                for index in 3..n_args {
+                    new_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
                 }
+                return if kw_entries.is_empty() {
+                    crate::call::call_function_impl_result(
+                        pyre_object::gc_roots::shadow_stack_get(newfunc_slot),
+                        &new_args,
+                    )
+                } else {
+                    crate::call::call_with_kwargs_in_ctx(
+                        crate::call::take_last_exec_ctx(),
+                        pyre_object::gc_roots::shadow_stack_get(newfunc_slot),
+                        &new_args,
+                        &kw_entries,
+                    )
+                };
             }
         }
+        let w_metaclass = || pyre_object::gc_roots::shadow_stack_get(winner_slot);
+
+        // Mixed NUL+surrogate is UnicodeEncodeError: `type_new_set_name`
+        // encodes with `PyUnicode_AsUTF8AndSize` before the `strlen` NUL
+        // test (Objects/typeobject.c, read at v3.14.6 in
+        // ~/Projects/cpython-3146). `_create_new_type` does `'\x00' in name`
+        // then `_check_surrogate` and answers ValueError. The exception type
+        // is observable, so `_check_surrogate` runs first; both checks stay
+        // before the namespace copy. `_check_utf8` `@jit.elidable` governs
+        // the utf8 scan, not this order. `W_TypeObject.__init__`
+        // `@dont_look_inside` and `name?` sit after a successful name.
+        // U+0000 is a single 0x00 byte in WTF-8.
+        check_surrogate(name_obj())?;
+        if unsafe { pyre_object::w_str_get_wtf8(name_obj()) }
+            .as_bytes()
+            .contains(&0)
+        {
+            return Err(crate::PyError::value_error(
+                "type name must not contain null characters",
+            ));
+        }
+        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
+        let backing_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(unsafe {
+            crate::type_methods::resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(
+                namespace_root,
+            ))
+        });
 
         // Copy the namespace into the class-namespace scratch.
         // `w_dict_items` dispatches through `is_module_dict`, so the rare
@@ -7205,11 +7231,13 @@ fn type_create_new_type(
         // the bases as `bases_w or [space.w_object]`, so the `(object,)`
         // default belongs to construction and to nothing that runs before it.
         // On the empty-bases arm this is a `(object,)` tuple minted right here
-        // with no other referrer, and it has to survive `calculate_metaclass`,
-        // the namespace copy, `validate_c3_mro`, `create_all_slots`,
-        // `__set_name__` and `__init_subclass__` before anything else refers to
-        // it.  A tuple is nursery-allocated and every one of those collects,
-        // so each use below reads the slot back instead of carrying the word.
+        // with no other referrer, and it has to survive `validate_c3_mro`,
+        // `create_all_slots`, `__set_name__` and `__init_subclass__` before
+        // anything else refers to it.  A tuple is nursery-allocated and every
+        // one of those collects, so each use below reads the slot back instead
+        // of carrying the word. `_calculate_metaclass` already ran on the
+        // bases as written; substituting `(object,)` there would weigh an
+        // explicit metatype against `type(object)`.
         let _effective_bases_roots = pyre_object::gc_roots::push_roots();
         let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         let w_effective_bases =
@@ -7226,51 +7254,6 @@ fn type_create_new_type(
             };
         let effective_bases_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_effective_bases);
-        // calculate_metaclass — delegate to winner if different
-        let default_meta = if meta().is_null() {
-            crate::typedef::w_type()
-        } else {
-            meta()
-        };
-        // A metaclass conflict among the bases (or an explicit metaclass that
-        // is not a subclass of every base's metaclass) is a hard error, not a
-        // silent fall-back to `default_meta`.
-        //
-        // `_calculate_metaclass` (typeobject.py) sees the bases as written.
-        // `(object,)` is substituted for an empty tuple only in
-        // `W_TypeObject.__init__` (`bases_w or [space.w_object]`), which runs
-        // after the winner is settled — supplying it here would weigh an
-        // explicit metatype against `type(object)` and report a conflict where
-        // the metatype itself is what upstream goes on to refuse.
-        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
-        let w_winner = crate::call::calculate_metaclass(default_meta, bases)?;
-        if !std::ptr::eq(w_winner, default_meta) {
-            // Winner is a different metaclass — delegate to its __new__
-            if let Some(w_metaclass_new) =
-                unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
-            {
-                // `__new__` is stored as a staticmethod; unwrap before the
-                // direct delegation call.
-                let w_metaclass_new = unsafe {
-                    if pyre_object::function::is_staticmethod(w_metaclass_new) {
-                        pyre_object::function::w_staticmethod_get_func(w_metaclass_new)
-                    } else {
-                        w_metaclass_new
-                    }
-                };
-                let w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(namespace_root);
-                let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
-                let mut new_args = vec![w_winner, name_obj(), bases, w_namespace_dict];
-                for index in 3..n_args {
-                    new_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
-                }
-                return crate::call::call_function_impl_result(w_metaclass_new, &new_args);
-            }
-        }
-        let w_metaclass = w_winner;
-        let winner_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_metaclass);
-        let w_metaclass = || pyre_object::gc_roots::shadow_stack_get(winner_slot);
 
         // `_create_new_type` reaches the instance through
         // `space.allocate_instance(W_TypeObject, w_typetype)`, which runs

@@ -4062,6 +4062,11 @@ fn type_flag_from_str(
         "*const u8" | "*const CellFamily" | "*mut CellFamily" => {
             (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)
         }
+        // descr.py get_type_flag: raw Ptr → FLAG_UNSIGNED. Same recognizer
+        // as `Bookkeeper::project_rust_vec` / `rrustvec.rs rust_vec_lltype`.
+        s if majit_ir::rvec::rust_vec_item_kind_for_spelling(s, word).is_some() => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)
+        }
         s if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(s) => {
             (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 2 * word)
         }
@@ -5882,6 +5887,20 @@ mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
+
+    /// `descr.py get_type_flag` of the canonical RustVec header-pointer
+    /// spellings is FLAG_UNSIGNED / Int / word, matching `get_type_flag`.
+    #[test]
+    fn rust_vec_header_pointer_type_flag_is_int_banked() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let expected = (ArrayFlag::Unsigned, Type::Int, word);
+        for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
+            assert_eq!(type_flag_from_str(spelling), expected, "{spelling}");
+        }
+    }
 
     /// Index and len of an inline `Vec<u8>` / `Vec<i64>` field are
     /// `getfield` of the measured buffer pointer or length word, then a

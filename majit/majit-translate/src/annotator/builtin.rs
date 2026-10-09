@@ -1672,6 +1672,11 @@ fn cast_instance_intrinsic(
         )
     } else if majit_ir::descr::is_shaped_tuple_name(&root) {
         bk.project_shaped_tuple(&root)
+    } else if majit_ir::descr::is_list_container_spelling(&root) {
+        // `[T]` / `Vec<T>` dests are the current op's list (`Bookkeeper.getlistdef`),
+        // not a fresh ListDef per projection. `setbinding` then `contains`
+        // the same object on reflow (`TLS.no_side_effects_in_union`).
+        bk.project_list_spelling_at_position(&root)
     } else {
         bk.project_struct_field_type(&root)
     };
@@ -3314,6 +3319,44 @@ mod tests {
                 .as_ref()
                 .is_some_and(|got| Rc::ptr_eq(got, &classdef)),
             "object-items element must be the PyObject class"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_list_root_reuses_position_listdef() {
+        // The same `[PyObject]` dest at one op is `Bookkeeper.getlistdef`
+        // of that position, so a reflow `contains()` sees one ListDef.
+        use crate::annotator::bookkeeper::PositionKey;
+        let bk = bk();
+        bk.set_position_key(Some(PositionKey::new(7, 8, 9)));
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("list-root constant");
+        let first = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr.clone()), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("first [PyObject] cast");
+        let second = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("second [PyObject] cast");
+        let (SomeValue::List(a), SomeValue::List(b)) = (first, second) else {
+            panic!("[PyObject] must project to SomeList");
+        };
+        assert!(
+            a.listdef.same_as(&b.listdef),
+            "two casts of one list spelling at one position share a ListDef"
+        );
+        assert!(
+            a.listdef.same_as(&bk.getlistdef(None)),
+            "the cast ListDef is Bookkeeper.getlistdef of the current position"
         );
     }
 

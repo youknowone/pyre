@@ -5441,17 +5441,17 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
             saw_reraise = true;
             continue;
         }
-        match op.key {
-            "goto/L" => work.push(read_label(code, &op, 0)),
-            // Every member of the family spells its label as the FINAL
-            // operand (`iL`, `iiL`, `rL`, `rrL`, `ffL`), so the operand index
-            // is one less than the argcode count.
-            key if key.starts_with("goto_if_not") && op.argcodes.ends_with('L') => {
-                work.push(read_label(code, &op, op.argcodes.len() - 1));
-                work.push(op.next_pc);
-            }
-            key if key.starts_with("switch") => return ExcHandlerShape::Unproven,
-            _ => work.push(op.next_pc),
+        // Follow every jitcode branch that carries a target, the same
+        // edges [`control_successors`] already enumerates from the
+        // opcode table: `goto/L`, the `goto_if_not*` family,
+        // `goto_if_exception_mismatch/iL` (`pyjitpl.py`
+        // `opimpl_goto_if_exception_mismatch` jumps to `next_exc_target`),
+        // and `*_jump_if_ovf`. A mismatch arm that reraises must be
+        // seen, or a matching `ref_return` classifies the handler
+        // `Returns`. `switch` and an unmodelled label are Unproven.
+        match control_successors(code, &op) {
+            None => return ExcHandlerShape::Unproven,
+            Some(succs) => work.extend(succs),
         }
     }
     if saw_return && !saw_reraise {
@@ -5492,6 +5492,23 @@ pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize])
 /// `inline_poison_pcs`.
 pub(crate) fn poison_confined_to_returning_handlers(code: &[u8], poison: &[usize]) -> bool {
     poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Returns)
+}
+
+/// Whether a seeded except-as-return admit may keep this scan.
+///
+/// [`fbw_callee_body_replay_scan`] stores unsafe ops in `poison` and
+/// leaves `safety` as `Clean`/`DeferredCall`; [`CalleeReplayScan::verdict`]
+/// folds a non-empty poison set into `Dirty`. This admit does not install
+/// `inline_poison_pcs` (the walk must enter a taken `except E: return`
+/// arm), so it has to read `verdict()` — `safety != Dirty` is true for
+/// every enforceable scan and would admit a Dirty happy path as long as
+/// some returning handler exists. The reraise and branchy-poison siblings
+/// keep reading `safety` because they refuse the walk at `scan.poison`.
+pub(crate) fn handler_except_as_return_scan_admits(scan: &CalleeReplayScan, code: &[u8]) -> bool {
+    scan.enforceable()
+        && body_has_returning_handler(code)
+        && (scan.verdict() != CalleeReplaySafety::Dirty
+            || poison_confined_to_returning_handlers(code, &scan.poison))
 }
 
 /// Whether any `catch_exception` target is a returning handler.
