@@ -206,10 +206,18 @@ pub fn slice_item_spelling(ty: &str) -> Option<&str> {
 /// are one word, or `None`.
 pub fn rust_slice_item_kind_for_spelling(ty: &str, word: usize) -> Option<VecItemKind> {
     let item = slice_item_spelling(ty)?.trim();
-    if item == "PyObjectRef" || item.ends_with("::PyObjectRef") {
-        return Some(VecItemKind::Ref);
+    let kind = if item == "PyObjectRef" || item.ends_with("::PyObjectRef") {
+        VecItemKind::Ref
+    } else {
+        vec_item_kind_for_spelling(item, word)?
+    };
+    // GCREFs belong on a GC array or as individual boxes
+    // (`GETARRAYITEM_GC` / `push_roots`). A raw `{ptr, len}` view is
+    // an interior pointer the collector does not update.
+    match kind {
+        VecItemKind::Ref => None,
+        other => Some(other),
     }
-    vec_item_kind_for_spelling(item, word)
 }
 
 /// A `Vec` operation that lowers to one `ll_vec_*` helper.
@@ -679,13 +687,10 @@ mod tests {
         assert_eq!(slice_item_spelling("[usize; 4]"), None);
         assert_eq!(slice_item_spelling("[[usize; 2]]"), Some("[usize; 2]"));
         assert_eq!(slice_item_spelling("Vec<usize>"), None);
-        assert_eq!(
-            rust_slice_item_kind_for_spelling("&[PyObjectRef]", 8),
-            Some(VecItemKind::Ref)
-        );
+        assert_eq!(rust_slice_item_kind_for_spelling("&[PyObjectRef]", 8), None);
         assert_eq!(
             rust_slice_item_kind_for_spelling("[pyre_object::PyObjectRef]", 4),
-            Some(VecItemKind::Ref)
+            None
         );
         assert_eq!(
             rust_slice_item_kind_for_spelling("&mut [f64]", 4),
