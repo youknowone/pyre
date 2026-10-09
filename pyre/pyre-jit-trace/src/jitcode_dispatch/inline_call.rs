@@ -5819,17 +5819,45 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // Three-argument `type(name, bases, dict)` walks `type_descr_new`
     // (`descr__new__`); `_create_new_type` is residual because
     // `look_inside_graph` refuses its loops, so `_check_surrogate` is
-    // not in-trace.
-    let type_query = !method_form
+    // not in-trace. `resolve_type_call_builtin_new` returns None for
+    // `space.w_type` itself (that path is user-class `P()`), so the
+    // 3-arg metatype call has to select `__new__` here.
+    let type_is_metatype = unsafe {
+        pyre_object::is_type(callable_operand)
+            && std::ptr::eq(callable_operand, pyre_interpreter::typedef::w_type())
+    };
+    let type_query =
+        !method_form && !bound_method && !is_call_kw && r_args.len() == 3 && type_is_metatype;
+    let type_new_3arg = !method_form
         && !bound_method
         && !is_call_kw
-        && r_args.len() == 3
-        && unsafe {
-            pyre_object::is_type(callable_operand)
-                && std::ptr::eq(callable_operand, pyre_interpreter::typedef::w_type())
-        };
+        && r_args.len() == 5
+        && type_is_metatype
+        && arg_concretes.len() >= 5
+        && arg_concretes[2..5].iter().all(|value| match value {
+            ConcreteValue::Ref(obj) => !obj.is_null() && *obj != pyre_object::PY_NULL,
+            _ => false,
+        });
     let (callable, receiver) = if type_query {
         (callable, None)
+    } else if type_new_3arg {
+        let tp_new = unsafe {
+            let found = pyre_interpreter::baseobjspace::lookup_in_type(callable_operand, "__new__");
+            match found {
+                Some(w) if pyre_object::function::is_exact_staticmethod(w) => {
+                    let func = pyre_object::function::w_staticmethod_get_func(w);
+                    if func.is_null() { None } else { Some(func) }
+                }
+                other => other,
+            }
+        };
+        match tp_new {
+            Some(tp_new) if unsafe { pyre_interpreter::is_function_carrier(tp_new) } => {
+                type_call_class = Some(callable_operand);
+                (tp_new, Some(callable_operand))
+            }
+            _ => (callable, receiver),
+        }
     } else if method_form || bound_method || unsafe { pyre_interpreter::is_function(callable) } {
         (callable, receiver)
     } else {
@@ -11218,10 +11246,16 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         return Ok(None);
     }
     // `type(x)` is the one-argument class introspection shortcut, not an
-    // instantiation (`type_call_type_x_shortcut`).
+    // instantiation (`type_call_type_x_shortcut`). Three-argument
+    // `type(name, bases, dict)` is `descr__new__` (`type_descr_new`), walked
+    // by the builtin-gateway arm rather than this object-`__new__` emit.
     let w_metatype = pyre_interpreter::typedef::w_type();
     if std::ptr::eq(w_type, w_metatype) {
-        return type_call_decline("type(x) shortcut");
+        return type_call_decline(if r_args.len() == 3 {
+            "type(x) shortcut"
+        } else {
+            "type(name, bases, dict) is descr__new__"
+        });
     }
     // What follows is `type.__call__`.  A metaclass that overrides `__call__`
     // runs instead of it and may return anything at all, so it stays residual.
