@@ -7026,6 +7026,20 @@ fn type_create_new_type(
         } else {
             meta()
         };
+        {
+            let name_bytes = unsafe { pyre_object::w_str_get_wtf8(name_obj()) };
+            eprintln!(
+                "[type_new] name={:?} winner={:p} default_meta={:p} type()={:p} is_w_winner_meta={}",
+                name_bytes.as_bytes(),
+                pyre_object::gc_roots::shadow_stack_get(winner_slot),
+                default_meta,
+                crate::typedef::w_type(),
+                crate::baseobjspace::is_w(
+                    pyre_object::gc_roots::shadow_stack_get(winner_slot),
+                    default_meta,
+                ),
+            );
+        }
         if !crate::baseobjspace::is_w(
             pyre_object::gc_roots::shadow_stack_get(winner_slot),
             default_meta,
@@ -7041,6 +7055,15 @@ fn type_create_new_type(
             let type_new = crate::baseobjspace::getattr_str(crate::typedef::w_type(), "__new__")?;
             let type_new_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(type_new);
+            eprintln!(
+                "[type_new] newfunc={:p} type_new={:p} is_w_new={}",
+                pyre_object::gc_roots::shadow_stack_get(newfunc_slot),
+                pyre_object::gc_roots::shadow_stack_get(type_new_slot),
+                crate::baseobjspace::is_w(
+                    pyre_object::gc_roots::shadow_stack_get(newfunc_slot),
+                    pyre_object::gc_roots::shadow_stack_get(type_new_slot),
+                ),
+            );
             if !crate::baseobjspace::is_w(
                 pyre_object::gc_roots::shadow_stack_get(newfunc_slot),
                 pyre_object::gc_roots::shadow_stack_get(type_new_slot),
