@@ -857,15 +857,15 @@ impl PyreMarshalBag {
         // filename / co_name / co_qualname. The first run is the interned
         // objects `pycode.py` `PyCode.__init__` would build again.
         let slots = unsafe { &*self.names };
-        let interned_name_slots: Vec<usize> = if slots.len() >= name_count {
+        let interned_name_slots: &[usize] = if slots.len() >= name_count {
             let start = slots.len() - name_count;
-            slots[start..start + code.names.len()].to_vec()
+            &slots[start..start + code.names.len()]
         } else {
-            Vec::new()
+            &[]
         };
         let code = Rooted::new(crate::pycode::box_code_object_with_interned_name_slots(
             code,
-            &interned_name_slots,
+            interned_name_slots,
         ));
         // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
@@ -1243,7 +1243,7 @@ fn marshal_to_bytes(
 fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let mut pending_error = None;
-    let mut name_slots = Vec::new();
+    let mut name_slots = Vec::with_capacity(64);
     let errors = ErrorSink::park(&roots, &mut pending_error);
     let bag = PyreMarshalBag::new(errors, &mut name_slots);
     let mut reader = BytesReader {
@@ -1466,7 +1466,7 @@ crate::py_module! {
             let (rooted_file, has_readinto) =
                 FileReader::probe(pyre_object::gc_roots::shadow_stack_get(base))?;
             let mut pending_error = None;
-            let mut name_slots = Vec::new();
+            let mut name_slots = Vec::with_capacity(64);
             let errors = ErrorSink::park(&roots, &mut pending_error);
             let bag = PyreMarshalBag::new(errors, &mut name_slots);
             let mut reader = FileReader::from_probed(rooted_file, has_readinto, bag.errors);
