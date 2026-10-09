@@ -7196,7 +7196,23 @@ fn type_create_new_type(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
-                crate::executioncontext::force_virtualizable_if_necessary(frame);
+                // `typeobject.py ensure_module_attr` reads `caller.get_w_globals()`.
+                // `hook_access_field` keeps `force_virtualizable_if_necessary` in
+                // the residual `_create_new_type` graph; native residual has no
+                // rewritten graph, so the token test runs here.
+                //
+                // `force_now` on `TOKEN_TRACING_RESCALL` stores `TOKEN_NONE` as
+                // the escape marker `tracing_after_residual_call` reads. An
+                // Active token belongs to the portal virtualizable. This caller
+                // is `gettopframe_nohidden()` — classify, whose token is idle
+                // once the portal owns the loop — and forcing Active here fails
+                // `GUARD_NOT_FORCED` on every residual (`forced_never_compiled`
+                // ~2N). pypy's residual `get_w_globals` no-ops on that idle
+                // token.
+                let token = unsafe { (*frame).vable_token };
+                if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
+                    unsafe { (*frame).vable_token = 0 };
+                }
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()
                     && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?
