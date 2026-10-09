@@ -47,7 +47,7 @@ pub mod sys {
     // Types (zero-cost to name; cross no boundary).
     pub use ::libc::{
         c_char, c_int, c_long, c_uint, c_void, clockid_t, gid_t, mode_t, off_t, pid_t, rusage,
-        size_t, time_t, timespec, timeval, tm, uid_t,
+        size_t, time_t, timespec, timeval, tm, uid_t, utsname,
     };
     // The struct `sched_setparam`/`sched_setscheduler` fill in before handing it
     // to host_env. Naming it allocates nothing and calls nothing; the calls
@@ -73,10 +73,10 @@ pub mod sys {
     pub use ::libc::winsize;
     // Constants (added as sandbox-reachable modules need them).
     pub use ::libc::{
-        AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES,
-        LC_MONETARY, LC_NUMERIC, LC_TIME, O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC, O_CREAT,
-        O_DIRECTORY, O_DSYNC, O_EXCL, O_FSYNC, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR,
-        O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
+        AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, ENOSYS, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE,
+        LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME, O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC,
+        O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL, O_FSYNC, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY,
+        O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
         RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT,
         S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
         WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
@@ -161,6 +161,29 @@ pub mod sys {
         _SC_XOPEN_REALTIME_THREADS, _SC_XOPEN_SHM, _SC_XOPEN_UNIX, _SC_XOPEN_VERSION,
         _SC_XOPEN_XCU_VERSION,
     };
+    // `time`'s clock ids: numbers only; `clock_gettime` itself is `rtime` /
+    // `host_seam::ops`. The cfgs match `interp_time.rs` usage sites.
+    #[cfg(not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "wasi",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+    )))]
+    pub use ::libc::CLOCK_PROCESS_CPUTIME_ID;
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    pub use ::libc::CLOCK_PROF;
+    #[cfg(not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "redox",
+    )))]
+    pub use ::libc::CLOCK_THREAD_CPUTIME_ID;
+    pub use ::libc::{CLOCK_MONOTONIC, CLOCK_REALTIME};
     // `posix.pathconf_names`' `_PC_*` table. `libc` exports these on the BSD
     // family only, so the table names them there and spells the glibc values
     // out for Linux — this re-export carries the same gate.
@@ -539,7 +562,7 @@ declare_seam! {
 /// Keep this boundary private to the collector hook.  Every ordinary host
 /// operation must continue to use the release-GIL seam generated above.
 #[cfg(feature = "sandbox")]
-pub(crate) fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
+pub fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
     let args = [
         MarshalValue::Int(fd as i64),
         MarshalValue::Str(data.to_vec()),

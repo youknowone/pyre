@@ -1492,7 +1492,7 @@ fn tm_gmtoff_zone(tm: &libc::tm) -> (i64, String) {
     (tm.tm_gmtoff as i64, zone)
 }
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
@@ -1500,11 +1500,6 @@ fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
         return None;
     }
     Some(tm_gmtoff_zone(unsafe { &*p }))
-}
-
-#[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
-fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
-    host_time::localtime_from_timestamp(seconds as host_time::TimeT).map(|tm| tm_gmtoff_zone(&tm))
 }
 
 #[cfg(all(unix, not(feature = "host_env")))]

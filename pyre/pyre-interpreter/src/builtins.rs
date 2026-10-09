@@ -22881,11 +22881,10 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         #[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
         {
-            if unsafe { majit_rlib::rposix::c_ftruncate(fd, size as libc::off_t) } < 0 {
-                return Err(fd_errno_err(majit_rlib::rposix::get_saved_errno()));
-            }
-            pyre_object::with_roots!(index => fileio_clear_stat_atopen(self_obj));
-            return Ok(index);
+            let _ = (fd, size);
+            return Err(crate::PyError::not_implemented(
+                "fd truncate requires host_env feature",
+            ));
         }
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
