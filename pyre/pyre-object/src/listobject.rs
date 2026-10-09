@@ -513,8 +513,7 @@ impl W_ListObject {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let extra = if min_cap < 9 { 3 } else { 6 };
-        let target_cap = min_cap.saturating_add(extra).saturating_add(min_cap >> 3);
+        let target_cap = crate::object_array::rlist_overallocate_cap(min_cap);
         // The GC rewrite emits COND_CALL_GC_WB before SETFIELD_GC. Keep that
         // ordering on the host path too: the grow below allocates in the moving
         // nursery and may collect, so this old list has to be on the remembered
@@ -611,8 +610,7 @@ impl W_ListObject {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let extra = if min_cap < 9 { 3 } else { 6 };
-        let target_cap = min_cap.saturating_add(extra).saturating_add(min_cap >> 3);
+        let target_cap = crate::object_array::rlist_overallocate_cap(min_cap);
         list_write_barrier(obj);
         let new_block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -710,8 +708,7 @@ impl W_ListObject {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let extra = if min_cap < 9 { 3 } else { 6 };
-        let target_cap = min_cap.saturating_add(extra).saturating_add(min_cap >> 3);
+        let target_cap = crate::object_array::rlist_overallocate_cap(min_cap);
         list_write_barrier(obj);
         let new_block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -3138,12 +3135,12 @@ pub fn ll_list_int_items(l: &W_ListObject) -> *mut TypedItemsBlock {
 
 /// `rlist.py _ll_list_resize_hint_really` for Integer storage.
 ///
+/// `@signature(types.any(), types.int(), types.bool(), returns=types.none())`
+/// — `newsize` is Signed so `some = 3|6; some += newsize >> 3` stays one
+/// signedness.
+///
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
-fn ll_list_int_resize_hint_really_iff(
-    obj: PyObjectRef,
-    newsize: usize,
-    _overallocate: bool,
-) -> bool {
+fn ll_list_int_resize_hint_really_iff(obj: PyObjectRef, newsize: i64, _overallocate: bool) -> bool {
     unsafe {
         let cap = ll_list_int_capacity(&*(obj as *const W_ListObject));
         majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
@@ -3151,7 +3148,7 @@ fn ll_list_int_resize_hint_really_iff(
 }
 
 #[majit_macros::look_inside_iff(ll_list_int_resize_hint_really_iff)]
-pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
+pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
     // rlist.py `_ll_list_resize_hint_really`: malloc then `l.items = newitems`.
     // `grow_int_items_block` is a collecting allocation; pin the owner
     // the way `object_grow` does and reload it before the setfield.
@@ -3159,11 +3156,8 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, o
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > list.int_items.heap_capacity() {
-        let extra = if newsize < 9 { 3 } else { 6 };
-        let target_cap = newsize
-            .saturating_add(extra)
-            .saturating_add(newsize >> 3)
+    if overallocate || newsize > list.int_items.heap_capacity() as i64 {
+        let target_cap = (crate::object_array::rlist_overallocate_signed(newsize) as usize)
             .max(crate::int_array::INT_ARRAY_INLINE_CAP);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
@@ -3187,7 +3181,7 @@ pub unsafe fn ll_list_int_resize_ge(obj: PyObjectRef, newsize: usize) {
     let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
-            ll_list_int_resize_hint_really(obj, newsize, true);
+            ll_list_int_resize_hint_really(obj, newsize as i64, true);
         }
     } else {
         // No branch on `cond` after `jit.conditional_call`: rlist.py
@@ -3197,7 +3191,7 @@ pub unsafe fn ll_list_int_resize_ge(obj: PyObjectRef, newsize: usize) {
             cond,
             ll_list_int_resize_hint_really,
             obj,
-            newsize,
+            newsize as i64,
             true,
         );
     }
@@ -3263,7 +3257,7 @@ pub fn ll_list_float_set_items(l: &mut W_ListObject, items: *mut TypedItemsBlock
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
 fn ll_list_float_resize_hint_really_iff(
     obj: PyObjectRef,
-    newsize: usize,
+    newsize: i64,
     _overallocate: bool,
 ) -> bool {
     unsafe {
@@ -3273,20 +3267,13 @@ fn ll_list_float_resize_hint_really_iff(
 }
 
 #[majit_macros::look_inside_iff(ll_list_float_resize_hint_really_iff)]
-pub unsafe fn ll_list_float_resize_hint_really(
-    obj: PyObjectRef,
-    newsize: usize,
-    overallocate: bool,
-) {
+pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > list.float_items.heap_capacity() {
-        let extra = if newsize < 9 { 3 } else { 6 };
-        let target_cap = newsize
-            .saturating_add(extra)
-            .saturating_add(newsize >> 3)
+    if overallocate || newsize > list.float_items.heap_capacity() as i64 {
+        let target_cap = (crate::object_array::rlist_overallocate_signed(newsize) as usize)
             .max(crate::float_array::FLOAT_ARRAY_INLINE_CAP);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
@@ -3308,7 +3295,7 @@ pub unsafe fn ll_list_float_resize_ge(obj: PyObjectRef, newsize: usize) {
     let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
-            ll_list_float_resize_hint_really(obj, newsize, true);
+            ll_list_float_resize_hint_really(obj, newsize as i64, true);
         }
     } else {
         // No branch on `cond` after `jit.conditional_call`: rlist.py
@@ -3318,7 +3305,7 @@ pub unsafe fn ll_list_float_resize_ge(obj: PyObjectRef, newsize: usize) {
             cond,
             ll_list_float_resize_hint_really,
             obj,
-            newsize,
+            newsize as i64,
             true,
         );
     }
@@ -3405,16 +3392,35 @@ pub fn ll_list_ascii_set_len(l: &mut W_ListObject, n: usize) {
 }
 
 /// `ll_setitem_fast` for AsciiListStrategy: store the erased `STR` at a
-/// known-in-bounds index. The host body is `setarrayitem_gc`
-/// (`items_block_set_ref`). The fold replaces this leaf with
-/// `getfield_gc_r(ascii_items.block)` + `setarrayitem_gc_r`.
+/// known-in-bounds index. The host body is `setarrayitem_gc`. The fold
+/// replaces this leaf with `getfield_gc_r(ascii_items.block)` +
+/// `setarrayitem_gc_r`.
+///
+/// `rlist.py ll_setitem_fast` stores `item` into a same-type `GcArray`.
+/// Ascii items are `*const STR`; the store is typed through
+/// [`UnicodeArray`]'s STR slot after the array barrier so the annotator
+/// never sees a STR→PyObject cast.
 #[majit_macros::oopspec("list.ascii_setitem(l, index, item)")]
 pub fn ll_list_ascii_setitem_fast(
     l: &mut W_ListObject,
     index: usize,
     item: *const crate::unicodeobject::UnicodeValueStorage,
 ) {
-    unsafe { items_block_set_ref(l.ascii_items.block, index, item as PyObjectRef) };
+    unsafe {
+        let block = l.ascii_items.block;
+        debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
+        let header = majit_gc::header::header_of(block as usize);
+        if (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
+            && (*header).is_forwarded()
+        {
+            panic!(
+                "stale ascii ItemsBlock {:#x} at index {index}",
+                block as usize
+            );
+        }
+        majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(block as usize), index);
+        l.ascii_items[index] = item;
+    }
 }
 
 /// `rlist.py _ll_list_resize_hint_really` for Ascii storage.
@@ -3422,7 +3428,7 @@ pub fn ll_list_ascii_setitem_fast(
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
 fn ll_list_ascii_resize_hint_really_iff(
     obj: PyObjectRef,
-    newsize: usize,
+    newsize: i64,
     _overallocate: bool,
 ) -> bool {
     unsafe {
@@ -3433,14 +3439,10 @@ fn ll_list_ascii_resize_hint_really_iff(
 
 /// `rlist.py _ll_list_resize_hint_really` — grow the erased `STR` block.
 #[majit_macros::look_inside_iff(ll_list_ascii_resize_hint_really_iff)]
-pub unsafe fn ll_list_ascii_resize_hint_really(
-    obj: PyObjectRef,
-    newsize: usize,
-    overallocate: bool,
-) {
+pub unsafe fn ll_list_ascii_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
     let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > ll_list_ascii_capacity(list) {
-        let _ = W_ListObject::ascii_grow(obj, newsize);
+    if overallocate || newsize > ll_list_ascii_capacity(list) as i64 {
+        let _ = W_ListObject::ascii_grow(obj, newsize as usize);
     }
 }
 
@@ -3457,7 +3459,7 @@ pub unsafe fn ll_list_ascii_resize_ge(obj: PyObjectRef, newsize: usize) {
     let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
-            ll_list_ascii_resize_hint_really(obj, newsize, true);
+            ll_list_ascii_resize_hint_really(obj, newsize as i64, true);
         }
     } else {
         // No branch on `cond` after `jit.conditional_call`: rlist.py
@@ -3467,7 +3469,7 @@ pub unsafe fn ll_list_ascii_resize_ge(obj: PyObjectRef, newsize: usize) {
             cond,
             ll_list_ascii_resize_hint_really,
             obj,
-            newsize,
+            newsize as i64,
             true,
         );
     }
@@ -3498,11 +3500,7 @@ pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObje
 /// `rlist.py _ll_list_resize_hint_really` for Object storage.
 ///
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
-fn ll_list_obj_resize_hint_really_iff(
-    obj: PyObjectRef,
-    newsize: usize,
-    _overallocate: bool,
-) -> bool {
+fn ll_list_obj_resize_hint_really_iff(obj: PyObjectRef, newsize: i64, _overallocate: bool) -> bool {
     unsafe {
         let cap = ll_list_obj_capacity(&*(obj as *const W_ListObject));
         majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
@@ -3513,10 +3511,10 @@ fn ll_list_obj_resize_hint_really_iff(
 /// 0, 4, 8, 16, 25, … over-allocation. `W_ListObject::object_grow`
 /// already applies that formula.
 #[majit_macros::look_inside_iff(ll_list_obj_resize_hint_really_iff)]
-pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
+pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
     let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > ll_list_obj_capacity(list) {
-        let _ = W_ListObject::object_grow(obj, newsize);
+    if overallocate || newsize > ll_list_obj_capacity(list) as i64 {
+        let _ = W_ListObject::object_grow(obj, newsize as usize);
     }
 }
 
@@ -3538,7 +3536,7 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
     let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
-            ll_list_obj_resize_hint_really(obj, newsize, true);
+            ll_list_obj_resize_hint_really(obj, newsize as i64, true);
         }
     } else {
         // No branch on `cond` after `jit.conditional_call`: rlist.py
@@ -3548,7 +3546,7 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
             cond,
             ll_list_obj_resize_hint_really,
             obj,
-            newsize,
+            newsize as i64,
             true,
         );
     }
@@ -7372,6 +7370,22 @@ mod tests {
             let l = &*(list as *const W_ListObject);
             assert_eq!(l.strategy, ListStrategy::Object);
             assert!(ll_list_obj_capacity(l) >= 8);
+        }
+    }
+
+    #[test]
+    fn int_resize_hint_really_overallocates_like_rlist() {
+        // rlist.py `_ll_list_resize_hint_really`: newsize=9, some=6+(9>>3)=7,
+        // new_allocated=16. `types.int()` keeps the addends Signed.
+        let list = w_list_new(vec![w_int_new(0)]);
+        unsafe {
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Integer
+            );
+            ll_list_int_resize_hint_really(list, 9, true);
+            let cap = ll_list_int_capacity(&*(list as *const W_ListObject));
+            assert!(cap >= 16, "rlist overallocate of 9: cap={cap}");
         }
     }
 

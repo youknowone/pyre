@@ -69,6 +69,19 @@ fn assert_vtable_reads(graph: &FunctionGraph, method_name: &str) {
         "w_dict_get_strategy stayed a call, so its vtable word was dropped\n{}",
         graph.dump()
     );
+    let fat_vtable_left = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => {
+                field.name == "imp" && field.vec_part == Some(VecFieldPart::FatVtable)
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        !fat_vtable_left,
+        "imp.vtable GetfieldGcR next to imp.len GetfieldGcI trips make_equal_to Box.type\n{}",
+        graph.dump()
+    );
 }
 
 #[test]

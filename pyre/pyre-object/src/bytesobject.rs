@@ -705,6 +705,7 @@ mod tests {
             assert_eq!(w_bytes_getitem(b, 0), b'h');
             assert_eq!(w_bytes_getitem(b, 4), b'o');
             assert_eq!(w_bytes_data(b), b"hello");
+            assert_eq!(bytes_like_data(b), b"hello");
             assert_eq!(w_bytes_find(b, b'l', 0), 2);
             assert_eq!(w_bytes_find(b, b'x', 0), -1);
             assert_eq!(jit_bytes_contains(b, w_bytes_from_bytes(b"ell")), 1);

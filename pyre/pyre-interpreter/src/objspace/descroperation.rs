@@ -1087,10 +1087,12 @@ pub(crate) fn _int_sub(x: i64, y: i64) -> PyResult {
     let Some(r) = x.checked_sub(y) else {
         return _int_sub_ovf(x, y);
     };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_class = pyre_object::gc_roots::pin_root(get_instantiate(&INT_TYPE));
     Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
+            w_class,
         },
         intval: r,
     }) as PyObjectRef)
@@ -1116,10 +1118,12 @@ pub(crate) fn _int_mul(x: i64, y: i64) -> PyResult {
     let Some(r) = x.checked_mul(y) else {
         return _int_mul_ovf(x, y);
     };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_class = pyre_object::gc_roots::pin_root(get_instantiate(&INT_TYPE));
     Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
+            w_class,
         },
         intval: r,
     }) as PyObjectRef)

@@ -289,6 +289,7 @@ fn field_is_fat_dyn(
     !chosen.is_empty() && chosen.into_iter().all(|index| fat[index])
 }
 
+#[derive(Clone)]
 struct FatField {
     block: BlockId,
     var_id: u64,
@@ -326,19 +327,31 @@ fn index_producers(
             match &op.kind {
                 OpKind::FieldRead {
                     base, field, pure, ..
-                } if field.vec_part.is_none() => {
-                    let Some(owner) = field.owner_root.clone() else {
-                        continue;
-                    };
-                    let name = field.name.clone();
-                    let owner_id = field.owner_id;
-                    let cache_key = (owner_id, owner.clone(), name.clone());
-                    let is_fat = if let Some(known) = fat_cache.get(&cache_key) {
-                        *known
+                } if field.vec_part.is_none()
+                    || field.vec_part == Some(VecFieldPart::FatVtable) =>
+                {
+                    // `DictStrategyRef.imp` is tagged FatVtable at lower
+                    // (`tyref_is_dyn_pointer`) so heapcache can key the
+                    // metadata word. That tag is the same fat field this
+                    // pass used to see only while `vec_part` was still
+                    // None; skip it and `method_*` stays on the `{vtable}`
+                    // cast of the data pointer.
+                    let is_fat = if field.vec_part == Some(VecFieldPart::FatVtable) {
+                        true
                     } else {
-                        let known = field_is_fat_dyn(llbc, owner_id, &owner, &name);
-                        fat_cache.insert(cache_key, known);
-                        known
+                        let Some(owner) = field.owner_root.clone() else {
+                            continue;
+                        };
+                        let name = field.name.clone();
+                        let owner_id = field.owner_id;
+                        let cache_key = (owner_id, owner.clone(), name.clone());
+                        if let Some(known) = fat_cache.get(&cache_key) {
+                            *known
+                        } else {
+                            let known = field_is_fat_dyn(llbc, owner_id, &owner, &name);
+                            fat_cache.insert(cache_key, known);
+                            known
+                        }
                     };
                     if !is_fat {
                         continue;
@@ -433,6 +446,13 @@ fn retarget_vtable_method_bases(graph: &mut FunctionGraph, llbc: &Llbc) -> usize
         // for a pure read (`jtransform.py` `rewrite_op_getfield`).
         *pure = true;
         retargeted += 1;
+    }
+    // A leftover `FatVtable` GetfieldGcR of the same slot as the
+    // `FatLen` GetfieldGcI `make_equal_to`s across Box.type
+    // (`imp.len` Int vs `imp.vtable` Ref).
+    let fats: Vec<FatField> = env.fat_fields.values().cloned().collect();
+    for fat in fats {
+        let _ = emit_fat_len(graph, &mut env, &fat);
     }
     retargeted
 }
@@ -584,7 +604,28 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
             .is_some_and(|result| result.id() == fat.var_id)
     });
     match at {
-        Some(index) => block.operations.insert(index + 1, op),
+        Some(index) => {
+            let result_ty = match &block.operations[index].kind {
+                OpKind::FieldRead { field, ty, .. }
+                    if field.vec_part == Some(VecFieldPart::FatVtable) =>
+                {
+                    Some(ty.clone())
+                }
+                _ => None,
+            };
+            if let Some(result_ty) = result_ty {
+                // Same metadata word: keep the Ref users on a cast of
+                // the Int load instead of a second getfield.
+                block.operations[index].kind = OpKind::UnaryOp {
+                    op: "cast_int_to_ptr".into(),
+                    operand: meta.clone(),
+                    result_ty,
+                };
+                block.operations.insert(index, op);
+            } else {
+                block.operations.insert(index + 1, op);
+            }
+        }
         None => block.operations.push(op),
     }
     env.fat_len.insert(fat.var_id, meta.clone());

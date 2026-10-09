@@ -1014,6 +1014,46 @@ fn const_int_array_items(kind: &OpKind) -> Option<Vec<ConstValue>> {
         .collect()
 }
 
+/// `true` iff `kind` is `front::mir`'s synthetic prebuilt-string-array
+/// define-op (`Call(["__const_str_array", <s0>, <s1>, …])`,
+/// `fold_named_const_str_array_global`). Same Constant(list) contract as
+/// [`is_const_int_array_define`].
+fn is_const_str_array_define(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.is_empty() && segments.len() >= 2 && segments[0] == "__const_str_array"
+    )
+}
+
+fn const_str_array_items(kind: &OpKind) -> Option<Vec<ConstValue>> {
+    let OpKind::Call {
+        target: crate::model::CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    Some(
+        segments
+            .get(1..)?
+            .iter()
+            .map(|s| ConstValue::ByteStr(s.clone().into_bytes()))
+            .collect(),
+    )
+}
+
+fn is_const_prebuilt_array_define(kind: &OpKind) -> bool {
+    is_const_int_array_define(kind) || is_const_str_array_define(kind)
+}
+
+fn const_prebuilt_array_items(kind: &OpKind) -> Option<Vec<ConstValue>> {
+    const_int_array_items(kind).or_else(|| const_str_array_items(kind))
+}
+
 /// The pure, non-raising flowspace opname a `core::<family>::<leaf>`
 /// method-call bridge lowers to in [`translate_op`], or `None` when the
 /// path is not such a bridge.  The single source of truth shared by
@@ -1206,7 +1246,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // A prebuilt-constant-array define-op pre-folds to `Constant(list)`
         // and emits no op — a Constant raises nothing.  Matched before the
         // general `Call` arm, same as the string-literal elision.
-        kind if is_const_int_array_define(kind) => false,
+        kind if is_const_prebuilt_array_define(kind) => false,
         // A `hint(x, **kwds)` op (`OpKind::Hint`) lowers to a non-raising
         // `same_as(value)` (`rtyper.py:478-481` internal renaming) in
         // `translate_op` — it emits no raising op.  Matched before the
@@ -1658,7 +1698,7 @@ pub fn translate_op(
     // Prebuilt-constant-array define-ops pre-fold to `Constant(list)` the
     // same way (see `is_const_int_array_define`); the pre-pass owns the
     // slot's `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
-    if is_const_int_array_define(&op.kind) {
+    if is_const_prebuilt_array_define(&op.kind) {
         return Ok(Vec::new());
     }
     match &op.kind {
@@ -4003,7 +4043,7 @@ fn legacy_const_define_hlvalue(
         // (`fold_named_const_int_array_global`); re-fold that define-op to
         // the upstream Constant shape here, the same way the
         // `__str_const` arm below re-folds a string literal.
-        kind if is_const_int_array_define(kind) => Ok(const_int_array_items(kind)
+        kind if is_const_prebuilt_array_define(kind) => Ok(const_prebuilt_array_items(kind)
             .map(|items| Hlvalue::Constant(Constant::new(ConstValue::List(items))))),
         // String-literal constant.  Upstream flowspace carries a string
         // literal as a bare `Constant('text')` SSA value (annotated
@@ -10552,6 +10592,54 @@ mod tests {
             result_ty: ValueType::Ref(None),
         };
         assert!(!is_const_int_array_define(&str_const));
+    }
+
+    #[test]
+    fn const_str_array_define_folds_to_list_constant() {
+        use crate::model::CallTarget;
+
+        let define = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec![
+                    "__const_str_array".to_string(),
+                    "re.TEMPLATE".to_string(),
+                    "re.IGNORECASE".to_string(),
+                ],
+                fun_decl_id: None,
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        };
+        assert!(is_const_str_array_define(&define));
+        assert!(is_const_prebuilt_array_define(&define));
+        assert!(!is_const_int_array_define(&define));
+        assert_eq!(
+            const_str_array_items(&define),
+            Some(vec![
+                ConstValue::ByteStr(b"re.TEMPLATE".to_vec()),
+                ConstValue::ByteStr(b"re.IGNORECASE".to_vec()),
+            ])
+        );
+
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: define,
+        };
+        assert!(
+            translate_op(&op, &HashMap::new(), &empty_call_registry())
+                .expect("const-str-array define translates")
+                .is_empty()
+        );
+        match legacy_const_define_hlvalue(&op, None).expect("const-str-array define folds") {
+            Some(Hlvalue::Constant(c)) => assert_eq!(
+                c.value,
+                ConstValue::List(vec![
+                    ConstValue::ByteStr(b"re.TEMPLATE".to_vec()),
+                    ConstValue::ByteStr(b"re.IGNORECASE".to_vec()),
+                ])
+            ),
+            other => panic!("expected Constant(List), got {other:?}"),
+        }
     }
 
     #[test]

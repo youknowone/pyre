@@ -13,6 +13,20 @@ pub(crate) fn length_cell(n: usize) -> AtomicUsize {
     AtomicUsize::new(n)
 }
 
+/// rlist.py `_ll_list_resize_hint_really` over-allocation with Signed
+/// `newsize` (`@signature(..., types.int(), ...)`):
+/// `some = 3 if newsize < 9 else 6; some += newsize >> 3; return newsize + some`.
+pub(crate) fn rlist_overallocate_signed(newsize: i64) -> i64 {
+    let some = if newsize < 9 { 3i64 } else { 6i64 };
+    let some = some.wrapping_add(newsize >> 3);
+    newsize.wrapping_add(some)
+}
+
+/// [`rlist_overallocate_signed`] for a `usize` capacity.
+pub(crate) fn rlist_overallocate_cap(min_cap: usize) -> usize {
+    rlist_overallocate_signed(min_cap as i64) as usize
+}
+
 /// `rstr.py` `AbstractStringRepr.ll_strcmp` body. No `stroruni.cmp`
 /// oopspec: that hint belongs on a function whose first argument is
 /// `Ptr(STR)` / `Ptr(UNICODE)`. A byte-slice helper is `Other` and
@@ -2190,6 +2204,14 @@ mod tests {
     /// `std_gc_array_size` accepts exactly the sizes `Layout::from_size_align`
     /// accepts at the header's alignment, so `std_gc_array_layout` never
     /// reaches its `expect` for an accepted size.
+    #[test]
+    fn rlist_overallocate_of_nine_is_sixteen() {
+        // rlist.py: newsize=9, some=6+(9>>3)=7, new_allocated=16.
+        assert_eq!(rlist_overallocate_signed(9), 16);
+        assert_eq!(rlist_overallocate_cap(9), 16);
+        assert_eq!(rlist_overallocate_signed(8), 8 + 3 + 1);
+    }
+
     #[test]
     fn std_gc_array_size_matches_layout_bound() {
         let payload = Layout::from_size_align(24, 8).unwrap();

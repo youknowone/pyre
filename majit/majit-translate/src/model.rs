@@ -722,8 +722,8 @@ pub struct FieldDescriptor {
     pub inline_vec: bool,
     /// Which word of an inline aggregate this read loads. `None` is the
     /// field's own value. `Buf` / `Len` add `vec_layout::probe`'s offset;
-    /// `FatData` / `FatLen` add `fat_ptr_layout::probe`'s offset. The add
-    /// sits on top of the field's own offset.
+    /// `FatData` / `FatLen` / `FatVtable` add `fat_ptr_layout::probe`'s offset.
+    /// The add sits on top of the field's own offset.
     pub vec_part: Option<VecFieldPart>,
     /// Declared `Struct._gckind` of the owning struct or enum, recorded
     /// where the container type is still in hand. `Some(false)` is Raw:
@@ -7755,6 +7755,12 @@ pub struct FunctionGraph {
     /// register kind (`ref`), so a `dont_look_inside` stub reads the string
     /// result from here.
     pub return_is_str: bool,
+    /// Field-layout spelling of a raw pointer onto a Rust container
+    /// (`*mut Vec<T>`, `*mut VecDeque<T>`, `*mut [T]`). A `dont_look_inside`
+    /// stub projects it to the same `SomeList` a field of that type carries.
+    /// `return_type` is only `ref`, and that shell is a classdef-less
+    /// instance, which cannot union with the `GcArray` list.
+    pub return_container_root: Option<String>,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -7886,6 +7892,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_type: graph.return_type.clone(),
         return_class_root: graph.return_class_root.clone(),
         return_is_str: graph.return_is_str,
+        return_container_root: graph.return_container_root.clone(),
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         access_directly_inputs: graph.access_directly_inputs.as_ref().map(|ids| {
@@ -7963,6 +7970,7 @@ impl FunctionGraph {
             return_type: None,
             return_class_root: None,
             return_is_str: false,
+            return_container_root: None,
             owner_root: None,
             source_identity: None,
             fun_decl_id: None,
