@@ -564,6 +564,12 @@ pub struct Cpu {
         *mut pyre_interpreter::PyExecutionContext,
         *mut pyre_interpreter::PyFrame,
     ) -> i64,
+    /// pyopcode.py `dispatch_bytecode` jitted arm residual:
+    /// `ec.bytecode_only_trace(self)`.  Void result (`residual_call_r_v`).
+    pub bytecode_only_trace_fn: extern "C" fn(
+        *mut pyre_interpreter::PyExecutionContext,
+        *mut pyre_interpreter::PyFrame,
+    ) -> i64,
     /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
     /// (a user `__neg__` may run Python → fallible).
     pub unary_negative_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
@@ -941,6 +947,7 @@ impl Cpu {
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             clear_in_flight_exception_fn: crate::call_jit::bh_clear_in_flight_exception,
             bytecode_trace_jitted_slow_fn: crate::call_jit::bh_bytecode_trace_jitted_slow,
+            bytecode_only_trace_fn: crate::call_jit::bh_bytecode_only_trace,
             rtyper,
             lowering_ctx: parking_lot::RwLock::new(None),
         }

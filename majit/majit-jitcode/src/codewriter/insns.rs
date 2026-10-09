@@ -46,8 +46,10 @@ pub const BC_INT_IS_TRUE: u8 = 2;
 /// and `check_result` rejects `num_regs_i + len(constants_i) > 256`.
 /// One constant per Python instruction (`dispatch_bytecode`'s
 /// `last_instr = intmask(next_instr)`) overflows that cap. Payload is
-/// `r` + u16 lo + u16 hi + `d` (the same `VableField` descr as
-/// `setfield_vable_i/rid`); the value is the u32 `lo | (hi << 16)`.
+/// `r` + u16 imm + `d` (the same `VableField` descr as
+/// `setfield_vable_i/rid`). The value is a bytecode offset or
+/// `valuestackdepth`; both already fit in u16 because jump targets
+/// (`assembler.py` `fix_labels`) are u16.
 pub const BC_SETFIELD_VABLE_I_IMM: u8 = 32;
 pub const BC_GETINTERIORFIELD_GC_I: u8 = 3;
 pub const BC_GETINTERIORFIELD_GC_R: u8 = 4;
@@ -183,9 +185,17 @@ pub const BC_RECORD_KNOWN_RESULT_R_IR_V: u8 = 31;
 pub const BC_MOVE_R: u8 = 27;
 // Float-typed bytecodes
 pub const BC_MOVE_F: u8 = 33;
-// slot 34 (formerly BC_CALL_FLOAT) freed — see the BC_CALL_REF
-// (slot 28) note above for the canonical replacement.
-// slot 35 (formerly BC_CALL_PURE_FLOAT) freed — see slot 23 above.
+/// `int_copy/d>i` — u16 immediate source. `int_copy` is in `USE_C_FORM`
+/// (`assembler.py`), so a signed-byte value is already `int_copy/c>i`.
+/// A bytecode offset past 127 would otherwise take a `constants_i` slot
+/// (`emit_const` `assert 0 <= val < 256`). Jump targets (`fix_labels`)
+/// are u16, so a PC green fits this form and stays a `ConstInt` at the
+/// merge without consuming the shared one-byte pool.
+pub const BC_MOVE_I_D: u8 = 35;
+// slot 34 stays the assembler's first dynamic hole
+// (`recursive_call_v/iIRFIRF` tests pin it). slot 35 was
+// BC_CALL_PURE_FLOAT; the call family moved to the
+// BC_RESIDUAL_CALL_* bytes (see the BC_CALL_REF slot 28 note).
 // slots 38..=40 (formerly BC_CALL_MAY_FORCE_{INT,REF,FLOAT}) freed —
 // the may_force policy now rides on
 // `EffectInfo.extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` carried
@@ -1025,6 +1035,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // and must share the fixed byte with the runtime blackhole dispatch
     // (`blackhole.rs` BC_MOVE_I_C wiring) rather than draw a dynamic byte.
     m.insert("int_copy/c>i", BC_MOVE_I_C);
+    m.insert("int_copy/d>i", BC_MOVE_I_D);
     m.insert("ref_copy/r>r", BC_MOVE_R);
     m.insert("float_copy/f>f", BC_MOVE_F);
 
@@ -1421,8 +1432,8 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // materialises it as a value.  See [`BC_ARRAYBASE_VABLE`] for why
     // producing it is by definition an escape.
     m.insert("arraybase_vable/rdd>i", BC_ARRAYBASE_VABLE);
-    // Inline u32 immediate for `setfield_vable_i`. See `BC_SETFIELD_VABLE_I_IMM`.
-    m.insert("setfield_vable_i_imm/rddd", BC_SETFIELD_VABLE_I_IMM);
+    // Inline u16 immediate for `setfield_vable_i`. See `BC_SETFIELD_VABLE_I_IMM`.
+    m.insert("setfield_vable_i_imm/rdd", BC_SETFIELD_VABLE_I_IMM);
     m
 }
 

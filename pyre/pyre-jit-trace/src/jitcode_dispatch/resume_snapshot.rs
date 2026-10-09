@@ -575,14 +575,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
                     ctx.trace_ctx,
                 ));
-                let last_instr_value = py_pc as i64 - 1;
-                let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes(
-                    ctx.trace_ctx,
-                    "last_instr",
-                    last_instr_op,
-                    Value::Int(last_instr_value),
-                );
+                if !scope.preserve_vable_last_instr {
+                    let last_instr_value = py_pc as i64 - 1;
+                    let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
+                    crate::trace_opcode::mirror_vable_static_to_boxes(
+                        ctx.trace_ctx,
+                        "last_instr",
+                        last_instr_op,
+                        Value::Int(last_instr_value),
+                    );
+                }
                 // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
                 // virtualizable section WHILE the residual is running. Its
                 // result belongs to the MIFrame's post-call registers, but
