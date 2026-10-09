@@ -4131,7 +4131,9 @@ fn type_flag_from_str(
             (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)
         }
         // `{cap, ptr, len}` inline. Same arm as `get_type_flag`.
-        s if s.starts_with("Vec<") => (ArrayFlag::Struct, majit_ir::value::Type::Ref, 3 * word),
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => {
+            (ArrayFlag::Struct, majit_ir::value::Type::Ref, 3 * word)
+        }
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
         "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
