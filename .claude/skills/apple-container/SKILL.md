@@ -202,3 +202,8 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
   check compares is computed from the tracked tree and so agrees across
   hosts; `platform=` is the one that does not, and `fail_if_llbc_stale` now
   refuses on it rather than letting the build fail somewhere downstream.
+  Leave `LLBC_DEST` unset inside the container. `scripts/llbc_extract.py`
+  (`llbc_dest_path`) takes it as an output override and resolves a relative
+  value against the repo root, i.e. the bind-mounted host worktree, so a set
+  `LLBC_DEST` bypasses the step-2 mount; the Linux `pyre-jit-trace` build
+  reads the fixed `build/llbc` regardless.
