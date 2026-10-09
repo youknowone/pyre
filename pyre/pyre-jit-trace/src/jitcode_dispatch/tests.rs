@@ -1670,6 +1670,62 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
     assert!(!body_has_returning_handler(&mixed_body));
     assert!(!poison_confined_to_returning_handlers(&mixed_body, &[7]));
     assert!(!poison_confined_to_reraise_handlers(&mixed_body, &[7]));
+
+    // Matching arm returns, mismatch arm reraises. `opimpl_goto_if_exception_mismatch`
+    // (`pyjitpl.py`) jumps to the next exception target; treating the op as
+    // fall-through classifies the handler `Returns`.
+    let mismatch = insns["goto_if_exception_mismatch/iL"];
+    let mismatch_body = [
+        int_copy,
+        0,
+        1,
+        catch_exception,
+        7,
+        0,
+        void_return,
+        mismatch,
+        0,
+        12,
+        0,
+        void_return,
+        reraise,
+    ];
+    assert_eq!(
+        exc_handler_shape(&mismatch_body, 7),
+        ExcHandlerShape::Unproven
+    );
+    assert!(!body_has_returning_handler(&mismatch_body));
+
+    // except-as-return does not install `inline_poison_pcs`, so a Dirty
+    // happy path plus an unrelated returning handler must decline.
+    // `fbw_callee_body_replay_scan` keeps `safety` Clean and reports the
+    // ops in `poison`; `verdict()` is the value this admit must read.
+    let happy_poison = CalleeReplayScan {
+        safety: CalleeReplaySafety::Clean,
+        poison: vec![0],
+        protected: Vec::new(),
+        unscannable: false,
+    };
+    assert_eq!(happy_poison.safety, CalleeReplaySafety::Clean);
+    assert_eq!(happy_poison.verdict(), CalleeReplaySafety::Dirty);
+    assert!(!poison_confined_to_returning_handlers(
+        &returns_body,
+        &happy_poison.poison
+    ));
+    assert!(!handler_except_as_return_scan_admits(
+        &happy_poison,
+        &returns_body
+    ));
+    let confined = CalleeReplayScan {
+        safety: CalleeReplaySafety::Clean,
+        poison: vec![7],
+        protected: Vec::new(),
+        unscannable: false,
+    };
+    assert!(handler_except_as_return_scan_admits(
+        &confined,
+        &returns_body
+    ));
 }
 
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
