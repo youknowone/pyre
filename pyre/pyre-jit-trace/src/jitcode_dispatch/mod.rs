@@ -14516,6 +14516,65 @@ fn handle<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
+        // pyjitpl.py `_opimpl_setarrayitem_raw_any` /
+        // `opimpl_setarrayitem_raw_i`:
+        // `execute_with_descr(rop.SETARRAYITEM_RAW, arraydescr, arraybox,
+        // indexbox, itembox)`. `blackhole.py bhimpl_setarrayitem_raw_i`
+        // (`iiid`); `llmodel.py bh_setarrayitem_raw_i = bh_setarrayitem_gc_i`.
+        // `setarrayitem_raw_i` is not in `USE_C_FORM` (`assembler.py`), so
+        // the encoding is always registers. The walk is the execution,
+        // same as `raw_store_i`: a non-concrete operand declines rather
+        // than continue past a lost write. No heapcache.setarrayitem —
+        // `_record_helper` `invalidate_caches` is a no-op via
+        // `heapcache.py clear_caches_not_necessary` for SETARRAYITEM_RAW.
+        "setarrayitem_raw_i/iiid" => {
+            let array = read_int_reg(code, op, 0, ctx)?;
+            let index = read_int_reg(code, op, 1, ctx)?;
+            let value = read_int_reg(code, op, 2, ctx)?;
+            let descr = read_descr(code, op, 3, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                read_int_reg_concrete(code, op, 2, ctx),
+                descr.as_array_descr(),
+            ) {
+                (
+                    ConcreteValue::Int(array_ptr),
+                    ConcreteValue::Int(idx),
+                    ConcreteValue::Int(v),
+                    Some(ad),
+                ) => {
+                    let item_addr = (array_ptr as usize)
+                        .wrapping_add(ad.base_size())
+                        .wrapping_add((idx as usize).wrapping_mul(ad.item_size()));
+                    // SAFETY: same contract as the raw_store arm — the walk
+                    // executed the residuals that produced `array_ptr`;
+                    // `base_size` / `item_size` are the array descr
+                    // (`bhimpl_setarrayitem_raw_i` /
+                    // `bh_setarrayitem_gc_i`).
+                    unsafe { raw_store_int(item_addr as *mut u8, ad.item_size(), v) };
+                }
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "setarrayitem_raw_i/iiid non-concrete operand",
+                    });
+                }
+            }
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::SetarrayitemRaw, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::SetarrayitemRaw,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            ctx.trace_ctx.record_op_with_descr(
+                OpCode::SetarrayitemRaw,
+                &[array, index, value],
+                descr,
+            );
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // `pyjitpl.py opimpl_getinteriorfield_gc_{i,r,f}` /
         // `execute_setinteriorfield_gc`. Same operand layouts as the
         // array-item arms; the descr is the interior field.

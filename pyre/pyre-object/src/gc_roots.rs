@@ -1200,6 +1200,68 @@ pub fn shadow_stack_copy_range_into_vec(base: usize, dst: &mut Vec<PyObjectRef>)
     shadow_stack_copy_range(base, dst.as_mut_slice());
 }
 
+/// Copy `src[start..start + dst.len()]` into `dst`.
+///
+/// The erased form of [`shadow_stack_copy_range`] when the slots were an
+/// incoming `&[PyObjectRef]` the root-bracket pass took out of the jitcode
+/// (`RootBracketPlan`; `gctransform` / `shadowstack.py push_roots` never
+/// emits a bracket into a jitcode). `W_CData.call` (`cdataobj.py descr_call`)
+/// passes `args_w` through; the wrapper's `args[1:]` copy is that list slice.
+///
+/// `copy_from_slice` is a residual memmove and needs a concrete `src`
+/// pointer. The recording walk of `__majit_wrap_cdata_call` holds the
+/// incoming args array as a virtual `GcArray` (`box_value=None`), so that
+/// residual aborts `ResidualCallArgUnbound`. An `@unroll_safe` item loop
+/// is `rlist.py ll_arraycopy` / `rgc.py ll_arraycopy` for length 1 (`copy_item`):
+/// `getarrayitem` reads the virtual source through heapcache and
+/// `setarrayitem` writes the dest the vec-alloc residual already bound.
+#[inline]
+#[majit_macros::unroll_safe]
+pub fn copy_object_slice_range_into_vec(
+    src: &[PyObjectRef],
+    start: usize,
+    dst: &mut Vec<PyObjectRef>,
+) {
+    let n = dst.len();
+    let mut i = 0usize;
+    while i < n {
+        dst[i] = src[start + i];
+        i += 1;
+    }
+}
+
+/// One-word residual ABI for [`copy_object_slice_range_into_vec`].
+///
+/// `src` is `Ptr(GcArray(Ptr(PyObject)))`. `dst` is the address of a live
+/// `Vec<PyObjectRef>`.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the residual words are a live GcTypedArray and a live Vec header"
+)]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn copy_object_slice_range_into_vec_jit_abi(
+    src: *const crate::object_array::GcTypedArray,
+    start: usize,
+    dst: *mut u8,
+) {
+    if dst.is_null() {
+        return;
+    }
+    let vec = unsafe { &mut *(dst as *mut Vec<PyObjectRef>) };
+    let n = vec.len();
+    if n == 0 {
+        return;
+    }
+    let src_len = crate::object_array::gcarray_len(src);
+    assert!(
+        start <= src_len && n <= src_len - start,
+        "object-slice range out of bounds"
+    );
+    for i in 0..n {
+        vec[i] = crate::object_array::getarrayitem_ref(src, start + i);
+    }
+}
+
 /// Overwrite a single shadow-stack slot by index, panicking if the index
 /// is out of bounds. A slot whose contents change over a bracket's lifetime
 /// is written here rather than re-pinned, mirroring `gc_save_root`'s
@@ -1695,6 +1757,22 @@ mod tests {
         shadow_stack_copy_range_into_vec(base, &mut items);
         assert_eq!(items, vec![dummy(0x11), dummy(0x22)]);
         shadow_stack_copy_range_into_vec(shadow_stack_len(), &mut Vec::new());
+    }
+
+    #[test]
+    fn copy_object_slice_range_into_vec_copies_from_a_gcarray() {
+        let items = vec![dummy(0x10), dummy(0x20), dummy(0x30)];
+        let array =
+            gcarray_from_pyobject_vec_jit_abi(&items as *const Vec<PyObjectRef> as *const u8);
+        let mut dst = vec![dummy(0), dummy(0)];
+        copy_object_slice_range_into_vec_jit_abi(
+            array,
+            1,
+            &mut dst as *mut Vec<PyObjectRef> as *mut u8,
+        );
+        assert_eq!(dst, vec![dummy(0x20), dummy(0x30)]);
+        copy_object_slice_range_into_vec(&items, 0, &mut dst);
+        assert_eq!(dst, vec![dummy(0x10), dummy(0x20)]);
     }
 
     /// `walk_shadow_stack` exposes every pinned slot with mutable

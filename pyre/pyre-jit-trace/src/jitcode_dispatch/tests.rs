@@ -3998,6 +3998,64 @@ fn raw_store_i_records_the_store_and_performs_it() {
     );
 }
 
+#[test]
+fn setarrayitem_raw_i_records_the_store_and_performs_it() {
+    // `setarrayitem_raw_i/iiid` — pyjitpl.py `_opimpl_setarrayitem_raw_any`
+    // / `opimpl_setarrayitem_raw_i` via `execute_with_descr(SETARRAYITEM_RAW)`.
+    // Operand layout `iiid`: 1B array + 1B index + 1B value + 2B descr.
+    let byte = *insns_opname_to_byte()
+        .get("setarrayitem_raw_i/iiid")
+        .expect("`setarrayitem_raw_i/iiid` must be in insns table");
+    let code = [byte, 0x00, 0x01, 0x02, 0x00, 0x00];
+    let descr_pool = vec![crate::descr::raw_carray_descr(majit_ir::Type::Int, 8, true)];
+    let mut cell = [0u8; 16];
+    let addr = cell.as_mut_ptr() as i64;
+    let mut tc = fresh_trace_ctx();
+    let array = tc.const_int(addr);
+    let index = tc.const_int(1);
+    let value = tc.const_int(42);
+    let mut regs_i = [array, index, value];
+    let mut concrete_i = [
+        ConcreteValue::Int(addr),
+        ConcreteValue::Int(1),
+        ConcreteValue::Int(42),
+    ];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &descr_pool,
+    )
+    .expect("`setarrayitem_raw_i/iiid` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iiid` consumes 3 register bytes plus a 2B descr"
+    );
+    // `raw_carray_descr` has `base_size == 0`, so index 1 lands at +8.
+    let stored = unsafe { std::ptr::read_unaligned(cell.as_ptr().add(8).cast::<i64>()) };
+    assert_eq!(stored, 42, "the walk performs the store it records");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::SetarrayitemRaw);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![array, index, value],
+        "SetarrayitemRaw args must be [array, index, value]",
+    );
+    assert_eq!(
+        regs_i,
+        [array, index, value],
+        "a raw array store leaves every register untouched"
+    );
+}
+
 /// Float twin of the above: the value comes from the Float bank and the
 /// descr names a `CArray(Float)`.
 #[test]
@@ -5726,6 +5784,21 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         "a child push must restore the parent's pre-CALL heap-cache knowledge"
     );
     assert_eq!(finish_payload_of(&outcome), Some((expected, Type::Ref)));
+}
+
+#[test]
+fn empty_dict_alloc_jitcode_names_match_build_map_zero_helpers() {
+    // BUILD_MAP 0 residualled as NewEmptyDict; the fully-bound form is
+    // `inline_call_r_r` of these two leaves.  `w_dict_new_kwargs` is a
+    // different helper.
+    assert!(jitcode_is_empty_dict_alloc("w_dict_new"));
+    assert!(jitcode_is_empty_dict_alloc("newdict_empty"));
+    assert!(jitcode_is_empty_dict_alloc(
+        "pyre_object::dictmultiobject::w_dict_new"
+    ));
+    assert!(!jitcode_is_empty_dict_alloc("w_dict_new_kwargs"));
+    assert!(!jitcode_is_empty_dict_alloc("dict_display_setitem"));
+    assert!(!jitcode_is_empty_dict_alloc(""));
 }
 
 #[test]

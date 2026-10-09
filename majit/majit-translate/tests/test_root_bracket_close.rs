@@ -32,7 +32,8 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, OBJECT_LLBC, interpreter_llbc, lower_context_for, module_llbc, object_llbc,
+    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, interpreter_llbc, lower_context_for, module_llbc,
+    object_llbc,
 };
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
@@ -753,4 +754,118 @@ fn slice_unpack_erases_the_len_named_free_pin_bracket() {
             "slice_unpack still calls {leaf} after the len-named free pins were erased"
         );
     }
+}
+
+/// `__majit_wrap_cdata_call` pins the incoming `&[PyObjectRef]` and copies
+/// the tail through `shadow_stack_copy_range`. Production harvests
+/// pyre-object's root-stack effects before lowering pyre-module, the same
+/// order `lib.rs` uses; the incoming-slice plan must erase that bracket so
+/// the walker is not left with a residual `push_roots` at wrap pc=41.
+/// `W_CData.call` (`cdataobj.py descr_call`) passes `args_w` through, so a
+/// callee that opens its own bracket (`W_CTypeFunc._call`) must not keep
+/// wrap's pins in the jitcode.
+#[test]
+fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+        || !std::path::Path::new(MODULE_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
+    let mut crates = Vec::new();
+    let mut touching = Vec::new();
+    for llbc in [&object, &interpreter, &module] {
+        llbc.set_root_stack_effects(crates.clone(), touching.clone());
+        touching.extend(majit_translate::front::mir::harvest_root_stack_touching_paths(llbc));
+        crates.push(llbc.crate_name().to_string());
+    }
+    let context = LowerContext::new(&module);
+    let graph = lower_fun(&module, &context, "__majit_wrap_cdata_call");
+    for leaf in [
+        "push_roots",
+        "pin_roots",
+        "pin_root",
+        "shadow_stack_get",
+        "shadow_stack_copy_range",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "wrap still calls {leaf} after incoming-slice erasure"
+        );
+    }
+    assert!(
+        calls_to(&graph, "copy_object_slice_range_into_vec") > 0,
+        "wrap must rewrite copy_range to copy_object_slice_range_into_vec"
+    );
+    assert!(
+        calls_to(&graph, "call") > 0,
+        "wrap must still reach ctypefunc::call"
+    );
+    assert!(
+        calls_to(&graph, "ll_vec_alloc_and_set_r") > 0,
+        "wrap must allocate the rest-args vec"
+    );
+    assert!(
+        calls_to(&graph, "ll_vec_free_r") > 0,
+        "wrap must free the rest-args vec; drop elaboration keeps the \
+         definitely-init Drop of rest and rewrite_op_free frees that header"
+    );
+}
+
+/// `do_call` `n == 1` pins `args_w[0]` with `base()` + `pin_root` + `get(base)`.
+/// The pin temporary is `StorageDead` before the get, so erasure has to
+/// rewrite the get as `getarrayitem` of the incoming list. `n > 1` still
+/// loops `get(args_slot + i)` with a non-const index, so that bracket stays.
+#[test]
+fn do_call_erases_the_n1_incoming_elem_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+        || !std::path::Path::new(MODULE_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
+    let mut crates = Vec::new();
+    let mut touching = Vec::new();
+    for llbc in [&object, &interpreter, &module] {
+        llbc.set_root_stack_effects(crates.clone(), touching.clone());
+        touching.extend(majit_translate::front::mir::harvest_root_stack_touching_paths(llbc));
+        crates.push(llbc.crate_name().to_string());
+    }
+    let context = LowerContext::new(&module);
+    let graph = lower_fun(&module, &context, "do_call");
+    assert_eq!(
+        calls_to(&graph, "push_roots"),
+        1,
+        "n==1 push_roots must be erased; n>1 loop-index get stays"
+    );
+    assert_eq!(
+        calls_to(&graph, "pin_root"),
+        0,
+        "n==1 pin_root(args_w[0]) must be erased"
+    );
+    assert_eq!(
+        calls_to(&graph, "base"),
+        0,
+        "n==1 base() must be erased with the incoming-elem bracket"
+    );
+    let array_reads = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        .count();
+    assert!(
+        array_reads > 0,
+        "n==1 get(base) must rewrite to getarrayitem of args_w"
+    );
 }

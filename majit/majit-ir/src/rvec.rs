@@ -120,7 +120,24 @@ pub fn vec_item_spelling(ty: &str) -> Option<&str> {
     let rest = ty
         .strip_prefix("alloc::vec::Vec<")
         .or_else(|| ty.strip_prefix("Vec<"))?;
-    rest.strip_suffix('>')
+    let rest = rest.strip_suffix('>')?;
+    // `Vec<T, A = Global>`: the allocator is a second type argument.
+    // The item kind is T; A is not an item.
+    Some(first_generic_arg(rest))
+}
+
+/// The first comma-separated generic argument, respecting nested `<>`.
+fn first_generic_arg(args: &str) -> &str {
+    let mut depth = 0usize;
+    for (i, c) in args.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return args[..i].trim(),
+            _ => {}
+        }
+    }
+    args.trim()
 }
 
 /// Item kind of a `Vec` spelling (see [`vec_item_spelling`]) whose items are
@@ -592,6 +609,18 @@ mod tests {
         assert_eq!(vec_item_spelling("VecDeque<usize>"), None);
         assert_eq!(vec_item_spelling("*mut Vec<f64>"), Some("f64"));
         assert_eq!(vec_item_spelling("& &mut Vec<isize>"), Some("isize"));
+        assert_eq!(
+            vec_item_spelling("Vec<PyObjectRef, Global>"),
+            Some("PyObjectRef")
+        );
+        assert_eq!(
+            vec_item_spelling("alloc::vec::Vec<pyre_object::PyObjectRef,alloc::alloc::Global>"),
+            Some("pyre_object::PyObjectRef")
+        );
+        assert_eq!(
+            rust_vec_item_kind_for_spelling("Vec<PyObjectRef, Global>", 8),
+            Some(VecItemKind::Ref)
+        );
         assert_eq!(
             rust_vec_item_kind_for_spelling("&mut Vec<PyObjectRef>", 8),
             Some(VecItemKind::Ref)

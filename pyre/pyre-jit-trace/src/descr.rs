@@ -8209,6 +8209,175 @@ mod tests {
         );
     }
 
+    /// `W_CType` is a pyre-module `#[pyre_class]` with no `DECLARED_GROUPS`
+    /// row. Publishing the class census must make a `vtable=0` mint of
+    /// its parent SizeDescr `is_object()`, so a speculative `kind` read
+    /// takes `descr.py is_valid_class_for` instead of comparing the
+    /// analyzer tid to the collector tid.
+    #[cfg(feature = "pyre-module")]
+    #[test]
+    fn pyre_class_vtable_publish_makes_w_ctype_parent_an_object() {
+        publish_pyre_class_vtables();
+        let mut found = None;
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr
+                .struct_path
+                .ends_with("::_cffi_backend::ctypeobj::W_CType")
+                || descr.struct_path.ends_with("::ctypeobj::W_CType")
+            {
+                found = Some(descr);
+            }
+        });
+        let descr = found.expect("W_CType pyre_class descriptor");
+        let stripped = match descr.struct_path.split_once("::") {
+            Some((_, rest)) => rest,
+            None => descr.struct_path,
+        };
+        assert_eq!(stripped, "module::_cffi_backend::ctypeobj::W_CType");
+        let key = majit_ir::descr::path_hash(stripped);
+        let mut gc = majit_ir::descr::gc_cache().lock();
+        assert_eq!(
+            gc._cache_gcstruct2vtable.get(&key).map(|(vt, _)| *vt),
+            Some(descr.pytype_ptr as usize),
+        );
+        let parent = gc.get_size_descr(
+            majit_ir::descr::LLType::Struct(key),
+            descr.object_size,
+            0,
+            false,
+        );
+        let sd = parent.as_size_descr().expect("SizeDescr");
+        assert!(
+            sd.is_object(),
+            "W_CType parent must carry the pytype vtable"
+        );
+        assert_eq!(sd.vtable(), descr.pytype_ptr as usize);
+        assert!(
+            !gc._cache_gcstruct2vtable
+                .contains_key(&majit_ir::descr::path_hash("W_CType")),
+            "leaf name is not a STRUCT key"
+        );
+    }
+
+    /// Kind-0 packed parents of unpublished `#[pyre_class]` STRUCTs mint
+    /// through `publish_borrowed_struct_layout` with the serialized
+    /// `vtable=0`. That path must inject `_cache_gcstruct2vtable` the way
+    /// `get_size_descr` does, so a speculative `kind` read takes
+    /// `descr.py is_valid_class_for`.
+    #[cfg(feature = "pyre-module")]
+    #[test]
+    fn pyre_class_vtable_is_injected_into_a_borrowed_kind0_parent() {
+        publish_pyre_class_vtables();
+        let mut found = None;
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr
+                .struct_path
+                .ends_with("::_cffi_backend::ctypeobj::W_CType")
+                || descr.struct_path.ends_with("::ctypeobj::W_CType")
+            {
+                found = Some(descr);
+            }
+        });
+        let descr = found.expect("W_CType pyre_class descriptor");
+        let stripped = match descr.struct_path.split_once("::") {
+            Some((_, rest)) => rest,
+            None => descr.struct_path,
+        };
+        let key = majit_ir::descr::path_hash(stripped);
+        let group = majit_ir::descr::publish_borrowed_struct_layout(
+            u32::MAX,
+            descr.object_size,
+            0,
+            key,
+            0,
+            true,
+            false,
+            &[],
+            vec![majit_ir::descr::BorrowedField {
+                index: 0,
+                name: Cow::Borrowed("W_CType.kind"),
+                field_key: "kind",
+                offset: 64,
+                field_size: 8,
+                field_type: Type::Int,
+                flag: majit_ir::descr::ArrayFlag::Signed,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+        );
+        assert!(
+            group.size_descr.is_object(),
+            "borrowed W_CType parent must carry the pytype vtable"
+        );
+        assert_eq!(group.size_descr.vtable(), descr.pytype_ptr as usize);
+        let parent_descr = group.field_descrs[0]
+            .get_parent_descr()
+            .expect("parent_descr");
+        let parent = parent_descr.as_size_descr().expect("SizeDescr");
+        assert!(parent.is_object());
+        assert_eq!(parent.vtable(), descr.pytype_ptr as usize);
+    }
+
+    /// `_cache_gcstruct2vtable` is keyed by the STRUCT
+    /// (`heaptracker.setup_cache_gcstruct2vtable`), never a short name.
+    /// `W_Compress` is zlib and itertools; a leaf row would inject the
+    /// first writer's vtable into the other class.
+    #[cfg(feature = "pyre-module")]
+    #[test]
+    fn pyre_class_vtable_publish_keys_the_struct_not_the_leaf() {
+        publish_pyre_class_vtables();
+        let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        let mut full_paths: Vec<&str> = Vec::new();
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr.pytype_ptr.is_null() {
+                return;
+            }
+            let stripped = match descr.struct_path.split_once("::") {
+                Some((_, rest)) => rest,
+                None => descr.struct_path,
+            };
+            full_paths.push(stripped);
+            if let Some((_, leaf)) = stripped.rsplit_once("::") {
+                by_leaf.entry(leaf).or_default().push(stripped);
+            }
+        });
+        let gc = majit_ir::descr::gc_cache().lock();
+        for path in &full_paths {
+            let key = majit_ir::descr::path_hash(path);
+            assert!(
+                gc._cache_gcstruct2vtable.contains_key(&key),
+                "missing vtable row for {path}"
+            );
+        }
+        let mut shared_leaves = 0usize;
+        for (leaf, paths) in &by_leaf {
+            if paths.len() > 1 {
+                shared_leaves += 1;
+            }
+            let leaf_is_a_full_path = full_paths.iter().any(|p| *p == *leaf);
+            if leaf_is_a_full_path {
+                continue;
+            }
+            let leaf_key = majit_ir::descr::path_hash(leaf);
+            assert!(
+                !gc._cache_gcstruct2vtable.contains_key(&leaf_key),
+                "leaf {leaf} must not be a vtable key (paths {paths:?})"
+            );
+        }
+        assert!(
+            shared_leaves >= 1,
+            "expected W_Compress (zlib vs itertools) to share a leaf"
+        );
+        let compress = by_leaf.get("W_Compress").expect("W_Compress leaf");
+        assert!(
+            compress.len() > 1,
+            "W_Compress must be shared: {compress:?}"
+        );
+    }
+
     #[test]
     fn native_user_mapdict_fields_replace_prepass_placeholder_indices() {
         assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0000);
@@ -11129,6 +11298,50 @@ static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
             .collect()
     });
 
+/// `heaptracker.py` `setup_cache_gcstruct2vtable`.
+///
+/// Walk every `#[pyre_class]` descriptor and register its `PyType` as
+/// the STRUCT's vtable under the crate-stripped `path_hash`, matching
+/// `heaptracker.py` `_cache_gcstruct2vtable[GCSTRUCT]` (the STRUCT
+/// object, never a short name). Analyzer `get_size_descr(..., vtable=0)`
+/// then mints an `is_object()` SizeDescr. `DECLARED_GROUPS` already does
+/// this for the core types it names; pyre-module classes such as
+/// `W_CType` have no row, and without this census their field descrs
+/// fail `protect_speculative_field`'s non-object typeid equality.
+///
+/// Does not mint a SizeDescr: a fieldless shell would steal
+/// `all_fielddescrs` from the later layout producer.
+pub(crate) fn publish_pyre_class_vtables() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(publish_pyre_class_vtables_inner);
+}
+
+/// Second pass after the collector has stamped `TypeIdCell`s.
+pub(crate) fn refresh_pyre_class_vtable_tids() {
+    publish_pyre_class_vtables_inner();
+}
+
+fn publish_pyre_class_vtables_inner() {
+    let mut gc = majit_ir::descr::gc_cache().lock();
+    pyre_object::lltype::for_each_class_descriptor(|descr| {
+        let vtable = descr.pytype_ptr as usize;
+        if vtable == 0 {
+            return;
+        }
+        let tid = descr.gc_type_id.get();
+        let tid = if tid == pyre_object::lltype::TypeIdCell::UNASSIGNED {
+            0
+        } else {
+            tid
+        };
+        let stripped = match descr.struct_path.split_once("::") {
+            Some((_, rest)) => rest,
+            None => descr.struct_path,
+        };
+        gc.register_gcstruct_vtable(majit_ir::descr::path_hash(stripped), vtable, tid);
+    });
+}
+
 /// Force this module's own group for `cache_key`, if it declares one, so the
 /// declaration takes the STRUCT's `(STRUCT, fieldname)` slots before a
 /// serialized `BhDescr` can.
@@ -11139,6 +11352,7 @@ static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
 /// constructor publishes every `def_path` (`descr.py` `get_size_descr`).
 /// Matching `path_hash` on each miss does not select a row.
 fn force_declared_group(cache_key: u64) {
+    publish_pyre_class_vtables();
     if let Some(force) = DECLARED_GROUP_BY_KEY.get(&cache_key) {
         force();
         return;

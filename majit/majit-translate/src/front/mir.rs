@@ -1960,6 +1960,7 @@ impl<'l> CrateLowering<'l> {
             return Err(DeclBuildError::NoBody);
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
+        elaborate_vec_drops(llbc, &mut body);
         let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
@@ -2049,6 +2050,7 @@ impl<'l> CrateLowering<'l> {
             return None;
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
+        elaborate_vec_drops(llbc, &mut body);
         let signature = crate::front::clause_spec::substituted_signature(
             &fd.signature,
             llbc,
@@ -4701,6 +4703,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         ))
     })?;
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
+    elaborate_vec_drops(llbc, &mut u);
     let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
@@ -5004,6 +5007,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     );
     let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        lo.emit_pending_vec_frees();
         lo.graph.return_class_root = dont_look_inside_return_class_root(
             &fd.signature.output,
             llbc,
@@ -8074,10 +8078,17 @@ struct Lowering<'a> {
     /// minted it from. The target body is lowered before pass 2 writes
     /// those pairs as link args, so a use in the target reads the map.
     input_copied_from: std::collections::HashMap<u64, u64>,
-    /// Header addresses of a `Vec<PyObjectRef>`. `index_mut(RangeFull)`
-    /// aliases `&mut vec[..]` to this word. A block input copied from it
-    /// is recorded too.
+    /// Header addresses of a `Vec<PyObjectRef>`. A whole-list mutable
+    /// view (`deref_mut`, `as_mut_slice`, `index_mut(RangeFull)`) aliases
+    /// `&mut vec` / `&mut vec[..]` to this word. A block input copied from
+    /// it is recorded too.
     object_vec_headers: std::collections::HashSet<u64>,
+    /// Definitely-initialised `Vec` Drops recorded while lowering. The
+    /// `ll_vec_free_*` is emitted after block links are in SSA-final form
+    /// (framestate Pass 2 / monotonic `edge_args`), because
+    /// `rewrite_op_free` follows the header through those links and a
+    /// Pass-1 leftover inputarg position does not match a live-in link.
+    pending_vec_frees: Vec<(BlockId, Variable, majit_ir::rvec::VecItemKind)>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
@@ -8580,37 +8591,9 @@ fn pygraph_initial_block(
             Some("GCREF".to_string())
         } else {
             match &ty {
-                ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
-                    // A `&str` / `str` param strips to the `str` builtin
-                    // (not an ADT), so `tyref_class_root` answers `None`;
-                    // name it `"str"` so `derive_subject_inputcells` seeds
-                    // the byte `SomeString` (`s_str0`) instead of the
-                    // abstract `SomeInstance(None)` a `Ref(None)` projects
-                    // to.  A string param compared against a string literal
-                    // then rtypes as `pair(StringRepr, StringRepr)` rather
-                    // than walling at `pair(InstanceRepr, StringRepr)`.
-                    .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                    // named-ADT leaf — `tyref_class_root` answers `None`
-                    // because `adt_node_class_root` excludes the
-                    // core/std/alloc container family from classdef
-                    // minting.  Carry its full monomorphic spelling so
-                    // `derive_subject_inputcells` projects it through the
-                    // annotator's list model (`project_struct_field_type`)
-                    // instead of the classdef-less `SomeInstance(None)`
-                    // shell, on which a `len()` / iteration would wall at
-                    // `getattr` over a classdef-less instance.
-                    .or_else(|| {
-                        let spelling = tyref_to_ast_string(&local.ty, llbc);
-                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
-                    })
-                    // A tuple param (a closure's `call_once(env, args)`
-                    // args tuple, or `&(A, B)`) is an RPython tuple.
-                    // Carry the same `Tuple<A,B>` shape its `.N` reads
-                    // name as owner, so `derive_subject_inputcells`
-                    // seeds the `SomeTuple` those `getitem`s read.
-                    .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
+                ValueType::Ref(_) => {
+                    tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                }
                 // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                 // so it takes the non-`Ref` arm and would otherwise carry no
                 // `class_root`.  Its variant-name metadata is a side table
@@ -8854,35 +8837,9 @@ impl<'a> Lowering<'a> {
                 Some("GCREF".to_string())
             } else {
                 match &ty {
-                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
-                        // A `&str` / `str` param strips to the `str` builtin
-                        // (not an ADT), so `tyref_class_root` answers `None`;
-                        // name it `"str"` so `derive_subject_inputcells` seeds
-                        // the byte `SomeString` (`s_str0`) instead of the
-                        // abstract `SomeInstance(None)` a `Ref(None)` projects
-                        // to.  A string param compared against a string literal
-                        // then rtypes as `pair(StringRepr, StringRepr)` rather
-                        // than walling at `pair(InstanceRepr, StringRepr)`.
-                        .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                        .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                        // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                        // named-ADT leaf — `tyref_class_root` answers `None`
-                        // because `adt_node_class_root` excludes the
-                        // core/std/alloc container family from classdef
-                        // minting.  Carry its full monomorphic spelling so
-                        // `derive_subject_inputcells` projects it through the
-                        // annotator's list model (`project_struct_field_type`)
-                        // instead of the classdef-less `SomeInstance(None)`
-                        // shell, on which a `len()` / iteration would wall at
-                        // `getattr` over a classdef-less instance.
-                        .or_else(|| {
-                            let spelling = tyref_to_ast_string(&local.ty, llbc);
-                            majit_ir::descr::is_list_container_spelling(&spelling)
-                                .then_some(spelling)
-                        })
-                        // A tuple param is an RPython tuple. Carry the same
-                        // `Tuple<A,B>` shape its `.N` reads name as owner.
-                        .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
+                    ValueType::Ref(_) => {
+                        tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                    }
                     // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                     // so it takes the non-`Ref` arm and would otherwise carry no
                     // `class_root`.  Its variant-name metadata is a side table
@@ -9031,6 +8988,13 @@ impl<'a> Lowering<'a> {
         // `compute_index_write_extra_live` handles for a deferred array write.
         for (bb_idx, value_local) in &root_bracket.get_sites {
             extra_live[*bb_idx].push(*value_local);
+        }
+        for (bb_idx, slice_local, _) in root_bracket
+            .slice_gets
+            .iter()
+            .chain(root_bracket.slice_copies.iter())
+        {
+            extra_live[*bb_idx].push(*slice_local);
         }
         // The STR chars view aliases its slice to `base`, which the
         // `from_raw_parts` block does not spell. Keep `base` live there so
@@ -9244,6 +9208,7 @@ impl<'a> Lowering<'a> {
             root_bracket,
             owner_root: analyze_owner_roots(body, llbc),
             owner_root_reroot: None,
+            pending_vec_frees: Vec::new(),
         })
     }
 
@@ -9505,6 +9470,17 @@ impl<'a> Lowering<'a> {
                 None => return false,
             }
         }
+    }
+
+    /// Whether MIR `local` currently holds a [`Self::note_object_vec_header`]
+    /// address: the dest of a whole-list mut view (`deref_mut`,
+    /// `as_mut_slice`, `index_mut(RangeFull)`).
+    fn local_is_object_vec_header(&self, local: usize) -> bool {
+        self.local_var
+            .get(local)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())
+            .is_some_and(|var| self.var_is_object_vec_header(&var))
     }
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
@@ -10245,7 +10221,10 @@ impl<'a> Lowering<'a> {
             && self.root_bracket.is_erased_scope(scope)
             && matches!(
                 &rvalue,
-                Rvalue::Aggregate(..) | Rvalue::Ref { .. } | Rvalue::UnaryOp(..)
+                Rvalue::Aggregate(..)
+                    | Rvalue::Ref { .. }
+                    | Rvalue::UnaryOp(..)
+                    | Rvalue::Use(_, _)
             )
         {
             return Ok(());
@@ -15350,6 +15329,63 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// `&vec`, `&mut vec`, `&vec[..]`, `&mut vec[..]` of a `Vec<PyObjectRef>`
+    /// are the same `SomeList` value. RPython has no borrow wrapper.
+    ///
+    /// Shared views copy the items into one length-prefixed object array
+    /// (`gcarray_from_pyobject_vec`). Mutable views keep the header address
+    /// so a write, or `shadow_stack_copy_range`, updates that vec.
+    fn try_lower_object_vec_whole_list_view(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+        reg: &RegularCall,
+    ) -> Result<bool, LowerError> {
+        let Some(view) = object_vec_whole_list_view(reg, call.args.len(), self.llbc) else {
+            return Ok(false);
+        };
+        let Some(first_ty) = call.args.first().and_then(operand_tyref) else {
+            return Ok(false);
+        };
+        if !tyref_is_object_pointer_rust_vec(first_ty, self.llbc) {
+            return Ok(false);
+        }
+        let header = self.resolve_operand(mir_bb, call.args[0].clone())?;
+        let inherit = operand_local(call.args.first())
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        self.bind_object_vec_whole_list_view(mir_bb, dest_local, header, target, view, inherit)?;
+        Ok(true)
+    }
+
+    /// The shared object-vec whole-list arm. [`Self::try_lower_object_vec_whole_list_view`]
+    /// is the only caller; Deref and RangeFull both reach it.
+    fn bind_object_vec_whole_list_view(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        header: Variable,
+        target: usize,
+        view: ObjectVecWholeListView,
+        inherit_byte_view: bool,
+    ) -> Result<(), LowerError> {
+        if view == ObjectVecWholeListView::Shared
+            && !rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
+        {
+            return self.emit_object_vec_gcarray(mir_bb, dest_local, header, target);
+        }
+        if view == ObjectVecWholeListView::Mut {
+            self.note_object_vec_header(&header);
+        }
+        self.alias_dest_to_arg0(dest_local, header, inherit_byte_view);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph
+            .set_goto(self.block_id[mir_bb], target_bb, link_args);
+        Ok(())
+    }
+
     /// Emit a call of the helper at `path` and return its result.
     fn emit_path_call(
         &mut self,
@@ -16181,13 +16217,22 @@ impl<'a> Lowering<'a> {
         // The receiver must be a pair in this frame (a length slot), not
         // merely a pair-shaped type. An object-pointer `&mut [T]` parameter
         // keeps the one-word helper ABI; only a body local of that type is
-        // the `{ptr, len}` view.
-        operand_local(call.args.first()).is_some_and(|local| self.len_shadow[local].is_some())
-            && call
-                .args
-                .first()
-                .and_then(operand_tyref)
-                .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
+        // the `{ptr, len}` view. A whole-list `&mut vec` aliases the vec
+        // header ([`Self::try_lower_object_vec_whole_list_view`]) and has
+        // no length slot; slice methods on that view still take this arm,
+        // which splits the header with [`Self::pair_of_vec`].
+        // `<[T]>::reverse` of the header stays `ll_vec_reverse` in the
+        // regular call arm (`rlist.py` `ll_reverse`).
+        operand_local(call.args.first()).is_some_and(|local| {
+            self.len_shadow[local].is_some()
+                || (self.local_is_object_vec_header(local)
+                    && regular_call_name_path(reg, self.llbc).as_deref()
+                        != Some("core::slice::<Impl>::reverse"))
+        }) && call
+            .args
+            .first()
+            .and_then(operand_tyref)
+            .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
             && regular_call_name_path(reg, self.llbc).is_some_and(|path| match path.as_str() {
                 "core::slice::<Impl>::len"
                 | "core::slice::<Impl>::is_empty"
@@ -16223,7 +16268,12 @@ impl<'a> Lowering<'a> {
     ///   `ll_slice_arraycopy` of the destination length. `as_ptr` and
     ///   `as_mut_ptr` are the pointer word.
     /// - `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice` and
-    ///   `Vec::index(RangeFull)` are `(ll_vec_items(v), ll_vec_length(v))`.
+    ///   `Vec::index(RangeFull)` of a one-word item vec are
+    ///   `(ll_vec_items(v), ll_vec_length(v))`. `Vec<PyObjectRef>`
+    ///   whole-list views are one `SomeList` word
+    ///   ([`Self::try_lower_object_vec_whole_list_view`]); a slice method
+    ///   on a mut view splits that header with [`Self::pair_of_vec`] and
+    ///   uses the same `ll_slice_*` helpers.
     /// - `slice::from_raw_parts(p, n)` is `(p, n)`.
     /// - Any other callee returning a pair slice takes the address of a
     ///   one-word length slot as a trailing argument, stores the length
@@ -16260,6 +16310,25 @@ impl<'a> Lowering<'a> {
                 }
                 None => args.push(self.resolve_operand(mir_bb, op.clone())?),
             }
+        }
+        // Whole-list `&mut vec` / `&mut vec[..]` of `Vec<PyObjectRef>` is
+        // the header word, so it has no length slot. Slice methods on that
+        // view (`rotate_left` / `rotate_right`, `copy_from_slice`, ...) and
+        // `iter_mut` still walk the item buffer: split the header the way
+        // `pair_of_vec` splits a `Vec` (`ll_vec_items` / `ll_vec_length`).
+        if !pair_lens.iter().any(|(at, _)| *at == 0)
+            && args
+                .first()
+                .is_some_and(|v| self.var_is_object_vec_header(v))
+        {
+            let kind = arg_tys
+                .first()
+                .and_then(Option::as_ref)
+                .and_then(|ty| self.pair_slice_kind(ty))
+                .unwrap_or(majit_ir::rvec::VecItemKind::Ref);
+            let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
+            args[0] = ptr;
+            pair_lens.insert(0, (0, len));
         }
         let vec_kind = arg_tys
             .first()
@@ -19500,6 +19569,28 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // rustc promotes `(a..=b)` to an `AnonConst` whose init is
+                // `RangeInclusive::new(const, const)` plus a `&` return.
+                // `promoted_init_from_body` requires a 1-BB assign+return,
+                // so the 3-BB Call+Ref+Unwind shape is not spliced, and
+                // the Global read would residualize a 0-arg Call on the
+                // static's path (`…::is_primitive::promoted`). That path
+                // is not a function: `symbolic_fnaddr_for_path` hashes it
+                // to `SYMBOLIC_FNADDR_BASE` and the walker aborts.
+                //
+                // RPython constants are live host values at translation
+                // time (`const_eval_init_body`); un-promote the range back
+                // into the caller as the inline `new(lo, hi)` the
+                // `(a..=b).contains(&x)` fold (`front::range_contains`)
+                // already consumes. PyPy's `isinstance(ct, W_CTypePrimitive)`
+                // on a promoted ctype is a constant-folded class check
+                // (`ctypeprim.W_CTypePrimitive`); a helper with a graph is
+                // `guess_call_kind` → `'regular'` (`call.py`) → `inline_call`.
+                if let Some((lo, hi)) = promoted_int_range_inclusive_bounds(self.llbc, id)
+                    && tyref_is_int_range_inclusive(&place_ty, self.llbc)
+                {
+                    return Ok(self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty));
+                }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
                 // the `None` stored in PyPy's `locals_cells_stack_w` slots
@@ -20600,6 +20691,61 @@ impl<'a> Lowering<'a> {
             })
     }
 
+    /// Emit the inline `RangeInclusive::new(lo, hi)` a promoted
+    /// `(a..=b)` constant becomes once its AnonConst init is folded.
+    /// Records a [`crate::front::range_contains::RangeInclusiveNewSite`]
+    /// so the post-pass can pair it with `contains` and remove `new`.
+    fn emit_promoted_int_range_inclusive(
+        &mut self,
+        mir_bb: usize,
+        lo: i64,
+        hi: i64,
+        place_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let lo_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(lo_v.clone()),
+            kind: OpKind::ConstInt(lo),
+        });
+        let hi_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(hi_v.clone()),
+            kind: OpKind::ConstInt(hi),
+        });
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        // Owner-qualified associated-function spelling
+        // `unspecialized_fun_segments` emits for `RangeInclusive::new`
+        // (`ops::range::RangeInclusive::new`). The fold matches the
+        // `["range", "RangeInclusive", "new"]` tail.
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ops", "range", "RangeInclusive", "new"]),
+                args: crate::model::call_args(vec![lo_v.clone(), hi_v.clone()]),
+                result_ty: tyref_to_value_type_with(
+                    place_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                ),
+            },
+        });
+        self.range_inclusive_new_sites
+            .push(crate::front::range_contains::RangeInclusiveNewSite {
+                result_var: res.clone(),
+                lo: lo_v,
+                hi: hi_v,
+            });
+        res
+    }
+
     /// Fold a `NamedConst` global (Rust `const`) whose initializer is a
     /// single literal assignment to its `ConstInt` / `ConstBool` /
     /// `ConstFloat` value.  `None` for statics (`global_kind` ≠
@@ -21474,6 +21620,27 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc) {
             return Ok(true);
         }
+        if tyref_is_owned_vec(&place.ty, self.llbc) {
+            if let PlaceKind::Local(local) = place.kind {
+                match vec_init_at_drop(self.body, self.llbc, mir_bb, local as usize) {
+                    VecInit::Maybe => {
+                        crate::decline::record_named(
+                            crate::decline::gate::RUST_VEC_DROP,
+                            "maybe-initialised",
+                            &self.graph.name,
+                        );
+                        return Ok(true);
+                    }
+                    VecInit::Uninit => return Ok(true),
+                    VecInit::Init => {
+                        self.lower_rust_vec_drop(self.block_id[mir_bb], place);
+                        return Ok(true);
+                    }
+                }
+            }
+            self.lower_rust_vec_drop(self.block_id[mir_bb], place);
+            return Ok(true);
+        }
         if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
             self.lower_rust_vec_drop(self.block_id[mir_bb], place);
             return Ok(true);
@@ -21491,59 +21658,46 @@ impl<'a> Lowering<'a> {
     /// contents untraced and roots them where it allocates, and the lowered
     /// code keeps that contract, so freeing it releases no GC object.
     ///
-    /// Only a header this graph allocated through `ll_vec_newemptylist` /
-    /// `ll_vec_newlist_hint` / `ll_vec_alloc_and_set` is `raw_malloc_varsize_char`
-    /// memory; any other
-    /// `Vec` value (a phi merge, a call result) is left as before and the
-    /// decline is recorded.
+    /// `rewrite_op_free` (`jtransform.py`) emits `raw_free` wherever the
+    /// graph frees; the pointer is threaded through Links like any other
+    /// variable. Ownership is a header this graph allocated through
+    /// `ll_vec_newemptylist` / `ll_vec_newlist_hint` / `ll_vec_alloc_and_set`,
+    /// following SSA copies through block-input Links and phi merges. A
+    /// call result or function input is not this graph's allocation.
     fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) {
-        use majit_ir::rvec::VecOp;
         let PlaceKind::Local(local) = place.kind else {
             return;
         };
         let Some(kind) = tyref_rust_vec_item_kind(&place.ty, self.llbc) else {
+            if tyref_is_vec_value(&place.ty, self.llbc) {
+                crate::decline::record_named(
+                    crate::decline::gate::RUST_VEC_DROP,
+                    "vec-drop-unknown-item-kind",
+                    &self.graph.name,
+                );
+            }
             return;
         };
         let Some(header) = self.local_var[local as usize]
             .as_ref()
             .and_then(|value| value.one().ok())
         else {
-            return;
-        };
-        let allocated_here =
-            resolve_to_producer_op(&self.graph, &header).is_some_and(|(block, index)| {
-                let producer = &self.graph.block(block).operations[index];
-                let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } = &producer.kind
-                else {
-                    return false;
-                };
-                matches!(
-                    majit_ir::rvec::vec_helper_for_path(&segments.join("::")),
-                    Some((VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet, _))
-                )
-            });
-        if !allocated_here {
-            crate::decline::record(
-                "rust-vec-drop",
-                "header-not-allocated-in-graph",
-                format_args!("{}", self.graph.name),
+            crate::decline::record_named(
+                crate::decline::gate::RUST_VEC_DROP,
+                "header-not-live-at-drop",
+                &self.graph.name,
             );
             return;
+        };
+        // Prove ownership after links match inputargs (framestate Pass 2).
+        self.pending_vec_frees.push((bb_id, header, kind));
+    }
+
+    fn emit_pending_vec_frees(&mut self) {
+        let pending = std::mem::take(&mut self.pending_vec_frees);
+        for (bb_id, header, kind) in pending {
+            emit_rust_vec_drop_if_allocated(&mut self.graph, bb_id, &header, kind);
         }
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: rust_vec_helper_segments(VecOp::Free, kind),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![header]),
-                result_ty: ValueType::Void,
-            },
-        });
     }
 
     /// Drop a one-word guard local by passing its word to the bound release
@@ -21655,6 +21809,45 @@ impl<'a> Lowering<'a> {
                 None
             }
             "base" | "pin_roots" | "shadow_stack_len" if receiver_scope.is_some() => None,
+            "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec"
+                if receiver_scope.is_some() =>
+            {
+                let Some((slice, k)) = self.root_bracket.slice_copy_answer(mir_bb) else {
+                    return Ok(false);
+                };
+                let src = self.local_var[slice]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased copy_range reads unbound slice local {slice}"
+                        ))
+                    })?
+                    .one()?;
+                let dest_op = call.args.get(1).cloned().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased copy_range without a destination operand"
+                    ))
+                })?;
+                let dest = self.resolve_operand(mir_bb, dest_op)?;
+                let start = {
+                    let bb_id = self.block_id[mir_bb];
+                    let var = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(var.clone()),
+                        kind: OpKind::ConstInt(k as i64),
+                    });
+                    var
+                };
+                self.emit_path_call(
+                    mir_bb,
+                    "pyre_object::gc_roots::copy_object_slice_range_into_vec",
+                    vec![src, start, dest],
+                    ValueType::Void,
+                );
+                None
+            }
             "pin_root" if receiver_scope.is_some() => {
                 // Free `gc_roots::pin_root(value)` has one argument. The
                 // method form is `scope.pin_root(value)`.
@@ -21683,16 +21876,55 @@ impl<'a> Lowering<'a> {
                 let Some(scope) = receiver_scope else {
                     return Ok(false);
                 };
-                let value = self.root_bracket.get_answer(mir_bb).ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
-                    ))
-                })?;
-                Some(self.local_var[value].as_ref().ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
-                    ))
-                })?.one()?)
+                if let Some((slice, k)) = self.root_bracket.slice_get_answer(mir_bb) {
+                    let src = self.local_var[slice]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: erased slice get reads unbound local {slice}"
+                            ))
+                        })?
+                        .one()?;
+                    let bb_id = self.block_id[mir_bb];
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(k as i64),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: src,
+                            index,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    Some(loaded)
+                } else {
+                    let value = self.root_bracket.get_answer(mir_bb).ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
+                        ))
+                    })?;
+                    Some(
+                        self.local_var[value]
+                            .as_ref()
+                            .ok_or_else(|| {
+                                LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
+                                ))
+                            })?
+                            .one()?,
+                    )
+                }
             }
             _ => return Ok(false),
         };
@@ -22032,6 +22264,19 @@ impl<'a> Lowering<'a> {
         }
         self.refuse_residual_owner_root_guard(mir_bb, &call)?;
         if self.lower_item_addr_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
+        // Whole-list `Vec<PyObjectRef>` views (`&vec`, `&mut vec`, `&vec[..]`,
+        // `&mut vec[..]`) are one `SomeList` word. Take that arm before
+        // `is_pair_call`: an object-pointer `&mut [T]` dest would otherwise
+        // become a `{ptr, len}` pair, and a later one-word use
+        // (`shadow_stack_copy_range`, a reborrow) declines with
+        // `pair-slice local read as one word`. Slice methods on the mut
+        // view (`rotate_right`) still take `is_pair_call`, which splits
+        // the header.
+        if let CallFunc::Regular(reg) = &call.func
+            && self.try_lower_object_vec_whole_list_view(mir_bb, &call, dest_local, target, reg)?
+        {
             return Ok(());
         }
         if self.is_pair_call(&call, dest_local) {
@@ -22839,31 +23084,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Vec<PyObjectRef>::deref` yields `&[T]`. The vec is the
-                // address of its header; a shared slice is one
-                // length-prefixed object array, so copy the items
-                // (`gcarray_from_pyobject_vec`). `deref_mut` yields
-                // `&mut [T]`, the `{ptr, len}` view that aliases the
-                // vec's item buffer (`pair_of_vec`); a copy would drop
-                // stores (`arguments_w.iter_mut()`). `<[T]>::reverse`
-                // keeps the header alias below.
-                if args.len() == 1
-                    && self.is_container_identity_deref(&reg)
-                    && regular_call_name_path(&reg, self.llbc)
-                        .as_deref()
-                        .is_some_and(|path| path.ends_with("::deref"))
-                    && first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc))
-                    && !rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
-                {
-                    return self.emit_object_vec_gcarray(
-                        mir_bb,
-                        dest_local,
-                        args[0].clone(),
-                        target,
-                    );
-                }
                 // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
                 // identity in the lifted value model (String/&str and
                 // Vec/&[T] share one repr), so alias the destination to
@@ -23264,31 +23484,14 @@ impl<'a> Lowering<'a> {
                 // identity before the scalar element arm; Range/RangeFrom/
                 // RangeTo remain real getslice operations.
                 //
-                // `Vec<PyObjectRef>[..]` shared is the length-prefixed object
-                // array `deref` / `as_slice` build. `index_mut` keeps the
-                // header address: the slice is the vec's own buffer, and
-                // `shadow_stack_copy_range` writes that vec.
+                // `Vec<PyObjectRef>[..]` is [`Self::try_lower_object_vec_whole_list_view`].
                 if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
+                    // A `Vec` of raw pointers is an address (`getkind` int).
+                    // The slice view is `lltype.cast_int_to_ptr`.
+                    // `Vec<PyObjectRef>` already took the whole-list arm above.
                     let object_vec = first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc));
-                    match vec_index_regular_unchecked_leaf(&reg, self.llbc) {
-                        Some("index") if object_vec => {
-                            return self.emit_object_vec_gcarray(
-                                mir_bb,
-                                dest_local,
-                                args[0].clone(),
-                                target,
-                            );
-                        }
-                        Some("index_mut") if object_vec => {
-                            self.note_object_vec_header(&args[0]);
-                        }
-                        _ => {}
-                    }
-                    // A `Vec` of raw pointers is an address (`getkind` int).
-                    // The slice view is `lltype.cast_int_to_ptr`.
-                    // `Vec<PyObjectRef>` already took the GcArray arm above.
                     if !object_vec
                         && borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc, self.gc_struct_ids)
                     {
@@ -25649,22 +25852,8 @@ impl<'a> Lowering<'a> {
                 // annotation.  Same shape as the reflexive identity aliases
                 // below.
                 //
-                // `Vec<PyObjectRef>::as_slice` is the object array the
-                // deref arm builds, not an alias of the header.
+                // `Vec<PyObjectRef>::as_slice` is [`Self::try_lower_object_vec_whole_list_view`].
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    if regular_call_name_path(&reg, self.llbc).as_deref()
-                        == Some("alloc::vec::<Impl>::as_slice")
-                        && first_arg_ty
-                            .as_ref()
-                            .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc))
-                    {
-                        return self.emit_object_vec_gcarray(
-                            mir_bb,
-                            dest_local,
-                            args[0].clone(),
-                            target,
-                        );
-                    }
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -40594,6 +40783,45 @@ fn is_vec_rangefull_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
         .is_some_and(|t| tyref_to_ast_string(&t, llbc) == "RangeFull")
 }
 
+/// Shared vs mutable whole-list view of a `Vec<PyObjectRef>`.
+///
+/// `&vec` / `&vec[..]` / `as_slice` copy the items into one object array.
+/// `&mut vec` / `&mut vec[..]` / `as_mut_slice` keep the header address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectVecWholeListView {
+    Shared,
+    Mut,
+}
+
+/// Deref / DerefMut / `as_slice` / `as_mut_slice` / `Index(RangeFull)` of a
+/// `Vec`. The caller still checks the receiver is a `Vec<PyObjectRef>`.
+fn object_vec_whole_list_view(
+    reg: &RegularCall,
+    nargs: usize,
+    llbc: &Llbc,
+) -> Option<ObjectVecWholeListView> {
+    let path = regular_call_name_path(reg, llbc)?;
+    let leaf = path.rsplit("::").next()?;
+    if nargs == 1 {
+        // `alloc::vec::<Impl>::deref` after monomorphization. A slice
+        // `as_slice` has a slice receiver, not a `Vec`.
+        let vec_method = path.starts_with("alloc::vec::");
+        return match leaf {
+            "deref" | "as_slice" if vec_method => Some(ObjectVecWholeListView::Shared),
+            "deref_mut" | "as_mut_slice" if vec_method => Some(ObjectVecWholeListView::Mut),
+            _ => None,
+        };
+    }
+    if nargs == 2 && is_vec_rangefull_index_regular(reg, llbc) {
+        return match vec_index_regular_unchecked_leaf(reg, llbc)? {
+            "index" => Some(ObjectVecWholeListView::Shared),
+            "index_mut" => Some(ObjectVecWholeListView::Mut),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// Whether `ty` is an index type [`vec_index_regular_leaf`] may lower to a
 /// scalar `ArrayRead` / `ArrayWrite`.
 ///
@@ -41439,6 +41667,7 @@ pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
         || is_list_lock_release_call(kind)
         || is_set_lock_release_call(kind)
         || is_slice_buffer_free_call(kind)
+        || is_rust_vec_free_call(kind)
 }
 
 /// Match the `ll_slice_buffer_free` a raw array's frame exit emits.
@@ -41451,6 +41680,22 @@ pub(crate) fn is_slice_buffer_free_call(kind: &OpKind) -> bool {
         return false;
     };
     segments.join("::") == majit_ir::rvec::SLICE_BUFFER_FREE
+}
+
+/// Match `ll_vec_free_*` of a one-word `Vec` header, the `rewrite_op_free`
+/// residual a Drop of that vec emits. Result/exception rewrites replay it
+/// the same way they replay `ll_slice_buffer_free`.
+pub(crate) fn is_rust_vec_free_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments
+        .last()
+        .is_some_and(|leaf| leaf.starts_with("ll_vec_free_"))
 }
 
 /// `core::mem::drop(move local)`: the local that call drops.
@@ -41672,6 +41917,11 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
             out.insert(bb_idx);
         }
     }
+    // A definitely-initialised `Drop _v` of a `Vec<T>` local is a use:
+    // the destructor reads the header. `elaborate_vec_drops` has already
+    // rewritten a definitely-moved-out Drop to `Goto`, so those never
+    // ask liveness for `_v`. A maybe-initialised Drop is left unmarked.
+    out.union_with(&definitely_init_vec_drop_blocks(body, llbc));
     out
 }
 
@@ -42998,9 +43248,13 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
 /// free `pin_root(x)` inside that scope is the `k`-th pin exactly as
 /// `pin_roots` is, and the scope's close rewinds it, so the close is erased
 /// with the rest.  Then `get(base + k)` / `get(len + k)` is the value of the
-/// `k`-th pin, and nothing else observes the guard.  Every other call inside
-/// the bracket must leave the root stack as it found it
-/// ([`RootStackAnalyzer`]), which is the per-graph balance the upstream
+/// `k`-th pin, and nothing else observes the guard.  `pin_roots` of an
+/// incoming `&[PyObjectRef]` parameter is the same shape with the list itself
+/// as the source: `get(base + k)` is `getarrayitem` of that list, and
+/// `shadow_stack_copy_range(base + k, dest)` copies the live slice
+/// (`W_CData.call` / `cdataobj.py descr_call` passes `args_w` through).
+/// Every other call inside the bracket must leave the root stack as it found
+/// it ([`RootStackAnalyzer`]), which is the per-graph balance the upstream
 /// transformer guarantees.  Spanning a collecting call does not by itself
 /// keep the bracket: the three jitcode consumers already root the
 /// republished refs.  A bracket that pins in a loop, reads a slot this pass
@@ -43028,6 +43282,12 @@ struct RootBracketPlan {
     /// the array, its borrows and the unsizing cast -- mapped to their guard.
     /// They only ever fed the erased pin, so they bind nothing.
     pin_temps: std::collections::HashMap<usize, usize>,
+    /// `get(base + k)` of a `pin_roots` of an incoming `&[PyObjectRef]`.
+    /// `(block, slice local, k)`, answered with `getarrayitem`.
+    slice_gets: Vec<(usize, usize, u64)>,
+    /// `shadow_stack_copy_range(base + k, dest)` of that same pin.
+    /// `(block, slice local, k)`, rewritten as a copy from the live list.
+    slice_copies: Vec<(usize, usize, u64)>,
     /// Temporaries that only build a closure capture of an erased index: the
     /// borrow of the index, the closure aggregate, the receiver borrow and the
     /// argument tuple.  The closure call is answered by the pinned value, so
@@ -43053,6 +43313,23 @@ impl RootBracketPlan {
             .iter()
             .find(|(bb, _)| *bb == mir_bb)
             .map(|(_, value)| *value)
+    }
+
+    /// The incoming list and index an erased `get` in `mir_bb` answers with.
+    fn slice_get_answer(&self, mir_bb: usize) -> Option<(usize, u64)> {
+        self.slice_gets
+            .iter()
+            .find(|(bb, _, _)| *bb == mir_bb)
+            .map(|(_, slice, k)| (*slice, *k))
+    }
+
+    /// The incoming list and start an erased `shadow_stack_copy_range` in
+    /// `mir_bb` copies from.
+    fn slice_copy_answer(&self, mir_bb: usize) -> Option<(usize, u64)> {
+        self.slice_copies
+            .iter()
+            .find(|(bb, _, _)| *bb == mir_bb)
+            .map(|(_, slice, k)| (*slice, *k))
     }
 
     /// The erased guard a free pin or read-back in `mir_bb` acts on.
@@ -43252,6 +43529,7 @@ impl<'a> RootStackAnalyzer<'a> {
                 elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
                     regular_call_name_path(reg, self.llbc)
                 });
+                elaborate_vec_drops(self.llbc, &mut body);
                 self.analyze_body(&body, seen)
             }
             None => self.analyze_external_call(fd),
@@ -44067,6 +44345,13 @@ fn root_pin_value_is_stable_in_bracket(
 /// item the bracket hands out as a value, must be one `touches` proves leaves
 /// the stack as it found it.  Otherwise erasing the close leaks their pins or
 /// changes a later get.
+///
+/// `pins_are_incoming_slice` is the `W_CData.call` / `cdataobj.py descr_call`
+/// shape, and the `W_CTypeFunc._call` `n == 1` shape (`pin_root(args_w[0])`):
+/// the pins are the caller's argument array, already live, and the rewritten
+/// reads are `getarrayitem` of that array. A callee that opens and closes
+/// its own bracket cannot shift those reads, so its `touches` answer does
+/// not keep this bracket in the jitcode.
 fn root_bracket_stack_effects_are_known(
     llbc: &Llbc,
     body: &Unstructured,
@@ -44076,6 +44361,7 @@ fn root_bracket_stack_effects_are_known(
     free_sites: &std::collections::HashMap<usize, usize>,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
     touches: &impl Fn(&RegularCall) -> bool,
+    pins_are_incoming_slice: bool,
 ) -> bool {
     let fn_values_touch = |v: &serde_json::Value| {
         let mut found = false;
@@ -44140,14 +44426,15 @@ fn root_bracket_stack_effects_are_known(
                     if !own_leaf {
                         return false;
                     }
-                } else if touches(reg)
-                    || call.args.iter().any(|op| match op {
-                        Operand::Const(c) => {
-                            fn_def_of_const(llbc, c).is_some_and(|reg| touches(&reg))
-                                || fn_values_touch(c)
-                        }
-                        _ => false,
-                    })
+                } else if !pins_are_incoming_slice
+                    && (touches(reg)
+                        || call.args.iter().any(|op| match op {
+                            Operand::Const(c) => {
+                                fn_def_of_const(llbc, c).is_some_and(|reg| touches(&reg))
+                                    || fn_values_touch(c)
+                            }
+                            _ => false,
+                        }))
                 {
                     return false;
                 }
@@ -44259,6 +44546,248 @@ fn pin_roots_slice_values(
             _ => return None,
         }
     }
+}
+
+/// `scope.pin_roots(args)` when `args` is an incoming `&[PyObjectRef]`
+/// parameter, not a `[move _a, move _b]` aggregate.
+///
+/// The list is already a live argument the jitcode consumers root, so
+/// `get(base + k)` is `getarrayitem` of that list (`W_CData.call` /
+/// `cdataobj.py descr_call` passes `args_w` through).
+fn pin_roots_incoming_slice(
+    body: &Unstructured,
+    slice: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, Vec<usize>)> {
+    let arg_count = body.locals.arg_count as usize;
+    let definition = |local: usize| -> Option<Rvalue> {
+        if assigned.get(&local) != Some(&1) {
+            return None;
+        }
+        body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::Assign(place, value))
+                    if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            }
+        })
+    };
+    let mut temps = Vec::new();
+    let mut local = slice;
+    loop {
+        if temps.len() > 8 {
+            return None;
+        }
+        let assigns = assigned.get(&local).copied().unwrap_or(0);
+        if assigns == 0 {
+            return (1..=arg_count).contains(&local).then_some((local, temps));
+        }
+        if assigns != 1 {
+            return None;
+        }
+        temps.push(local);
+        match definition(local)? {
+            Rvalue::Use(operand, _) => local = operand_local(Some(&operand))?,
+            Rvalue::UnaryOp(kind, operand)
+                if kind
+                    .get("Cast")
+                    .is_some_and(|cast| cast.get("Unsize").is_some()) =>
+            {
+                local = operand_local(Some(&operand))?;
+            }
+            Rvalue::Ref { place, .. } => match place.kind {
+                PlaceKind::Local(src) => local = src as usize,
+                PlaceKind::Projection(base, ProjectionElem::Atom(elem)) if elem == "Deref" => {
+                    match base.kind {
+                        PlaceKind::Local(src) => local = src as usize,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+}
+
+/// The unique `Assign` of `local`, when it has exactly one.
+fn unique_assigned_rvalue(
+    body: &Unstructured,
+    local: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<Rvalue> {
+    if assigned.get(&local) != Some(&1) {
+        return None;
+    }
+    body.body.iter().flat_map(|bb| bb.statements.iter()).find_map(|stmt| {
+        match stmt.stmt_kind() {
+            Ok(StmtKind::Assign(place, value))
+                if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A `usize` constant held in `local`, walking `Use` copies.
+fn local_usize_literal(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<u64> {
+    let mut local = local;
+    for _ in 0..8 {
+        match unique_assigned_rvalue(body, local, assigned)? {
+            Rvalue::Use(operand, _) => {
+                if let Some(k) = operand_usize_literal(llbc, &operand) {
+                    return Some(k);
+                }
+                local = operand_local(Some(&operand))?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `offset` of an `Index` projection: a `usize` literal, or a local that
+/// holds one.
+fn index_offset_usize(
+    llbc: &Llbc,
+    body: &Unstructured,
+    offset: &serde_json::Value,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<u64> {
+    let op: Operand = serde_json::from_value(offset.clone()).ok()?;
+    if let Some(k) = operand_usize_literal(llbc, &op) {
+        return Some(k);
+    }
+    local_usize_literal(llbc, body, operand_local(Some(&op))?, assigned)
+}
+
+/// `(*args_w)[k]` / `args_w[k]` when `args_w` is an incoming parameter and
+/// `k` is a `usize` constant.
+fn place_incoming_slice_elem(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, u64)> {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind else {
+        return None;
+    };
+    let index = v.get("Index")?;
+    if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let k = index_offset_usize(llbc, body, index.get("offset")?, assigned)?;
+    let slice_place = match &inner.kind {
+        PlaceKind::Projection(base, ProjectionElem::Atom(atom)) if atom == "Deref" => base.as_ref(),
+        _ => inner.as_ref(),
+    };
+    let PlaceKind::Local(slice) = slice_place.kind else {
+        return None;
+    };
+    pin_roots_incoming_slice(body, slice as usize, assigned).map(|(slice, _)| (slice, k))
+}
+
+/// `pin_root(args_w[k])` / `pin_root(w_arg)` when `w_arg` was loaded from an
+/// incoming `&[PyObjectRef]` at a constant index. `W_CTypeFunc._call`
+/// (`ctypefunc.py` `_call`) pins one argument that way for `n == 1`; the
+/// value is already live in the caller's list, so `get(base)` is
+/// `getarrayitem` of that list at `k`. The pin's own local is
+/// `StorageDead` before the get (`do_call` discards `pin_root`'s result),
+/// so the answer has to be the list element, not that temporary.
+fn pin_value_incoming_slice_elem(
+    llbc: &Llbc,
+    body: &Unstructured,
+    value: usize,
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, u64)> {
+    let mut local = value;
+    for _ in 0..8 {
+        if let Some(rvalue) = unique_assigned_rvalue(body, local, assigned) {
+            match rvalue {
+                Rvalue::Use(operand, _) => {
+                    if let Some(place) = operand_place(&operand)
+                        && let Some(elem) = place_incoming_slice_elem(llbc, body, place, assigned)
+                    {
+                        return Some(elem);
+                    }
+                    local = operand_local(Some(&operand))?;
+                }
+                Rvalue::Ref { place, .. } => {
+                    if let Some(elem) = place_incoming_slice_elem(llbc, body, &place, assigned) {
+                        return Some(elem);
+                    }
+                    match place.kind {
+                        PlaceKind::Local(src) => local = src as usize,
+                        PlaceKind::Projection(base, ProjectionElem::Atom(elem))
+                            if elem == "Deref" =>
+                        {
+                            match base.kind {
+                                PlaceKind::Local(src) => local = src as usize,
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Pins of one guard that are all constant-index loads of the same
+/// incoming `&[PyObjectRef]`, in slot order. `None` unless every pin is
+/// one such load.
+fn incoming_elem_pins(
+    llbc: &Llbc,
+    body: &Unstructured,
+    scope_pins: &[(usize, usize)],
+    assigned: &std::collections::HashMap<usize, usize>,
+) -> Option<(usize, Vec<u64>)> {
+    if scope_pins.is_empty() {
+        return None;
+    }
+    let mut elems = Vec::with_capacity(scope_pins.len());
+    for &(_, value) in scope_pins {
+        elems.push(pin_value_incoming_slice_elem(llbc, body, value, assigned)?);
+    }
+    let slice = elems[0].0;
+    if elems.iter().any(|&(s, _)| s != slice) {
+        return None;
+    }
+    Some((slice, elems.into_iter().map(|(_, k)| k).collect()))
+}
+
+/// Slot `k` for a `base` or `base + k` index, without `shadow_stack_len`.
+fn root_read_const_slot(
+    index_local: usize,
+    scope: usize,
+    bases: &std::collections::HashMap<usize, usize>,
+    offsets: &std::collections::HashMap<usize, RootSlotSum>,
+) -> Option<usize> {
+    if bases.get(&index_local) == Some(&scope) {
+        return Some(0);
+    }
+    if let Some(slot) = offsets.get(&index_local)
+        && slot.scope == scope
+        && slot.from_len.is_none()
+    {
+        return usize::try_from(slot.k).ok();
+    }
+    None
 }
 
 /// How a closure body reads one shadow-stack slot.
@@ -45329,6 +45858,12 @@ fn analyze_root_brackets_with(
     // run (`zip_two_tuple_next` pins each cursor with its own `pin_roots`).
     let mut run_dests: std::collections::HashMap<usize, (usize, usize)> =
         std::collections::HashMap::new();
+    // Block of each `pin_roots` of an incoming `&[PyObjectRef]` parameter
+    // -> (guard, slice local, argument temporaries).
+    let mut slice_runs: std::collections::HashMap<usize, (usize, usize, Vec<usize>)> =
+        std::collections::HashMap::new();
+    // `shadow_stack_copy_range(base + k, dest)` -> (guard, index local).
+    let mut range_copies: Vec<(usize, usize, usize)> = Vec::new();
     // Free `pin_root(value)` -> (guard, published local). Its result is the
     // object it forwarded, not the slot base `pin_roots` returns.
     let mut single_pins: std::collections::HashMap<usize, (usize, usize)> =
@@ -45363,10 +45898,13 @@ fn analyze_root_brackets_with(
             let Some(scope) = open_scope_at(bb_idx) else {
                 continue;
             };
-            let Some(run) = pin_roots_slice_values(body, slice, &assigned) else {
+            if let Some(run) = pin_roots_slice_values(body, slice, &assigned) {
+                pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else if let Some(run) = pin_roots_incoming_slice(body, slice, &assigned) {
+                slice_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else {
                 continue;
-            };
-            pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            }
             free_sites.insert(bb_idx, scope);
             bases.insert(*dest as usize, scope);
             run_dests.insert(*dest as usize, (scope, bb_idx));
@@ -45434,10 +45972,13 @@ fn analyze_root_brackets_with(
             let Some(slice) = operand_local(call.args.get(1)) else {
                 continue;
             };
-            let Some(run) = pin_roots_slice_values(body, slice, &assigned) else {
+            if let Some(run) = pin_roots_slice_values(body, slice, &assigned) {
+                pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else if let Some(run) = pin_roots_incoming_slice(body, slice, &assigned) {
+                slice_runs.insert(bb_idx, (scope, run.0, run.1));
+            } else {
                 continue;
-            };
-            pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            }
             run_dests.insert(*dest as usize, (scope, bb_idx));
         }
         bases.insert(*dest as usize, scope);
@@ -45813,6 +46354,21 @@ fn analyze_root_brackets_with(
                 {
                     continue;
                 }
+                if call.args.len() == 2
+                    && free_leaf.as_deref() == Some("shadow_stack_copy_range")
+                    && let Some(index) = operand_local(call.args.first())
+                {
+                    if let Some(scope) = bases
+                        .get(&index)
+                        .copied()
+                        .or_else(|| offsets.get(&index).map(|slot| slot.scope))
+                        && candidates.contains(scope)
+                    {
+                        range_copies.push((bb_idx, scope, index));
+                        free_sites.insert(bb_idx, scope);
+                        continue;
+                    }
+                }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
                         Some("pin_roots") => {
@@ -45822,6 +46378,12 @@ fn analyze_root_brackets_with(
                             {
                                 let entry = pins.entry(*scope).or_default();
                                 entry.extend(values.iter().map(|v| (bb_idx, *v)));
+                                continue;
+                            }
+                            if let Some((scope, _, _)) = slice_runs.get(&bb_idx)
+                                && free_sites.get(&bb_idx) == Some(scope)
+                                && candidates.contains(*scope)
+                            {
                                 continue;
                             }
                         }
@@ -45897,7 +46459,15 @@ fn analyze_root_brackets_with(
                                             entry.extend(values.iter().map(|v| (bb_idx, *v)));
                                             true
                                         }
-                                        _ => false,
+                                        _ => match slice_runs.get(&bb_idx) {
+                                            Some((run_scope, _, _))
+                                                if run_scope == scope
+                                                    && bases.get(&dest) == Some(scope) =>
+                                            {
+                                                true
+                                            }
+                                            _ => false,
+                                        },
                                     }
                                 }
                                 ("get", Some(_)) if call.args.len() == 2 => {
@@ -45936,6 +46506,13 @@ fn analyze_root_brackets_with(
     let surviving: Vec<usize> = candidates.iter().collect();
     for scope in surviving {
         let opener = opener_block[&scope];
+        let incoming_elem = pins
+            .get(&scope)
+            .and_then(|scope_pins| incoming_elem_pins(llbc, body, scope_pins, &assigned));
+        let pins_are_incoming_slice = slice_runs
+            .values()
+            .any(|(run_scope, _, _)| *run_scope == scope)
+            || incoming_elem.is_some();
         if !root_bracket_stack_effects_are_known(
             llbc,
             body,
@@ -45945,7 +46522,156 @@ fn analyze_root_brackets_with(
             &free_sites,
             &name_of,
             &touches,
+            pins_are_incoming_slice,
         ) {
+            continue;
+        }
+        if let Some((pin_bb, slice_local, temps)) =
+            slice_runs.iter().find_map(|(bb, (run_scope, loc, temps))| {
+                (*run_scope == scope).then_some((*bb, *loc, temps.clone()))
+            })
+        {
+            if !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb) {
+                continue;
+            }
+            let region = root_bracket_region(llbc, body, opener, scope, &name_of);
+            let own_get_bbs: Vec<usize> = gets
+                .iter()
+                .filter(|(_, get_scope, _, _)| *get_scope == scope)
+                .map(|(get_bb, _, _, _)| *get_bb)
+                .collect();
+            // `scope.pin_roots(args)` reborrows the incoming `&[PyObjectRef]`
+            // (`_t = &*args`). That Ref is the pin's argument, not a write of
+            // the fat pointer; `root_pin_value_is_stable` treats any Ref of a
+            // local as aliasing. A parameter with no Assign is still the same
+            // array `W_CData.call` received.
+            let slice_is_unassigned_param = assigned.get(&slice_local).copied().unwrap_or(0) == 0
+                && (1..=body.locals.arg_count as usize).contains(&slice_local);
+            if (!slice_is_unassigned_param
+                && !root_pin_value_is_stable_in_bracket(
+                    llbc,
+                    body,
+                    slice_local,
+                    &region,
+                    &own_get_bbs,
+                ))
+                || !region.contains(pin_bb)
+            {
+                continue;
+            }
+            let mut ok = true;
+            let mut sites = Vec::new();
+            for (get_bb, _, index_local, addend) in gets
+                .iter()
+                .filter(|(_, get_scope, _, _)| *get_scope == scope)
+            {
+                let slot =
+                    root_read_const_slot(*index_local, scope, &bases, &offsets).and_then(|base| {
+                        usize::try_from(*addend)
+                            .ok()
+                            .and_then(|extra| base.checked_add(extra))
+                    });
+                let Some(k) = slot else {
+                    ok = false;
+                    break;
+                };
+                if !region.contains(*get_bb) {
+                    ok = false;
+                    break;
+                }
+                sites.push((*get_bb, slice_local, k as u64));
+            }
+            let mut copies = Vec::new();
+            for (copy_bb, copy_scope, index_local) in &range_copies {
+                if *copy_scope != scope {
+                    continue;
+                }
+                let Some(k) = root_read_const_slot(*index_local, scope, &bases, &offsets) else {
+                    ok = false;
+                    break;
+                };
+                if !region.contains(*copy_bb) {
+                    ok = false;
+                    break;
+                }
+                copies.push((*copy_bb, slice_local, k as u64));
+            }
+            if !ok {
+                continue;
+            }
+            plan.scopes.insert(scope);
+            plan.slice_gets.extend(sites);
+            plan.slice_copies.extend(copies);
+            for (base_local, base_scope) in &bases {
+                if *base_scope == scope {
+                    base_results.insert(*base_local, scope);
+                }
+            }
+            for (temp, slot) in sums.iter().chain(offsets.iter()) {
+                if slot.scope == scope {
+                    slot_temps.insert(*temp, scope);
+                }
+            }
+            for (temp, (temp_scope, _)) in &len_index {
+                if *temp_scope == scope {
+                    slot_temps.insert(*temp, scope);
+                }
+            }
+            pin_temps.extend(temps.iter().map(|temp| (*temp, scope)));
+            continue;
+        }
+        if let Some((slice_local, elem_ks)) = incoming_elem {
+            let scope_pins: &[(usize, usize)] = pins.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
+            if scope_pins
+                .iter()
+                .any(|&(pin_bb, _)| !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb))
+            {
+                continue;
+            }
+            let region = root_bracket_region(llbc, body, opener, scope, &name_of);
+            if scope_pins
+                .iter()
+                .any(|(pin_bb, _)| !region.contains(*pin_bb))
+            {
+                continue;
+            }
+            let mut ok = true;
+            let mut sites = Vec::new();
+            for (get_bb, _, index_local, addend) in gets
+                .iter()
+                .filter(|(_, get_scope, _, _)| *get_scope == scope)
+            {
+                let slot =
+                    root_read_const_slot(*index_local, scope, &bases, &offsets).and_then(|base| {
+                        usize::try_from(*addend)
+                            .ok()
+                            .and_then(|extra| base.checked_add(extra))
+                    });
+                let Some(k) = slot.and_then(|i| elem_ks.get(i).copied()) else {
+                    ok = false;
+                    break;
+                };
+                if !region.contains(*get_bb) {
+                    ok = false;
+                    break;
+                }
+                sites.push((*get_bb, slice_local, k));
+            }
+            if !ok {
+                continue;
+            }
+            plan.scopes.insert(scope);
+            plan.slice_gets.extend(sites);
+            for (base_local, base_scope) in &bases {
+                if *base_scope == scope {
+                    base_results.insert(*base_local, scope);
+                }
+            }
+            for (temp, slot) in sums.iter().chain(offsets.iter()) {
+                if slot.scope == scope {
+                    slot_temps.insert(*temp, scope);
+                }
+            }
             continue;
         }
         let scope_pins: &[(usize, usize)] = pins.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
@@ -46668,6 +47394,301 @@ fn gc_root_scope_base_path(name: &str) -> bool {
     matches!(segments.last(), Some(&"base")) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
+/// CFG successors the lowering keeps: `Goto` / `Call` / `Assert` / `Drop`
+/// / `Switch` targets, leaving out `on_unwind`.
+///
+/// [`elaborate_explicit_root_closes`] and [`elaborate_vec_drops`] share
+/// this edge set so a drop-elaboration fact is the same one the flow
+/// graph will see.
+fn model_successors(body: &Unstructured, llbc: &Llbc, bb: usize) -> Vec<usize> {
+    let Some(block) = body.body.get(bb) else {
+        return Vec::new();
+    };
+    let targets: Vec<u64> = match block.term_ref(llbc) {
+        Ok(TermKind::Goto { target }) => vec![*target],
+        Ok(
+            TermKind::Call { target, .. }
+            | TermKind::Assert { target, .. }
+            | TermKind::Drop { target, .. },
+        ) => vec![*target],
+        Ok(TermKind::Switch { targets, .. }) => match targets {
+            SwitchTargets::If(a, b) => vec![*a, *b],
+            SwitchTargets::SwitchInt(_, arms, default) => arms
+                .iter()
+                .map(|(_, bb)| *bb)
+                .chain(std::iter::once(*default))
+                .collect(),
+        },
+        _ => Vec::new(),
+    };
+    targets
+        .into_iter()
+        .map(|t| t as usize)
+        .filter(|&t| t < body.body.len())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VecInit {
+    Init,
+    Uninit,
+    Maybe,
+}
+
+const VEC_INIT: u8 = 1;
+const VEC_UNINIT: u8 = 2;
+
+fn vec_init_from_bits(bits: u8) -> VecInit {
+    match bits {
+        VEC_INIT => VecInit::Init,
+        VEC_UNINIT => VecInit::Uninit,
+        _ => VecInit::Maybe,
+    }
+}
+
+/// An owned `alloc::vec::Vec<T>` value, not `&Vec<_>` and not `*mut Vec<_>`.
+fn tyref_is_owned_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if node
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"))
+    {
+        return false;
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+}
+
+fn operand_moves_local(op: &Operand, local: usize) -> bool {
+    matches!(
+        op,
+        Operand::Move(place) if matches!(place.kind, PlaceKind::Local(l) if l as usize == local)
+    )
+}
+
+fn rvalue_moves_local(rvalue: &Rvalue, local: usize) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => operand_moves_local(op, local),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            operand_moves_local(lhs, local) || operand_moves_local(rhs, local)
+        }
+        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_moves_local(op, local)),
+        Rvalue::Ref { .. }
+        | Rvalue::RawPtr { .. }
+        | Rvalue::Len(_)
+        | Rvalue::Discriminant(_)
+        | Rvalue::NullaryOp(_, _)
+        | Rvalue::Unknown => false,
+    }
+}
+
+fn place_is_local(place: &Place, local: usize) -> bool {
+    matches!(place.kind, PlaceKind::Local(l) if l as usize == local)
+}
+
+fn vec_transfer_stmt(s: u8, stmt: &majit_charon_reader::ullbc::Statement, local: usize) -> u8 {
+    match stmt.stmt_kind_ref() {
+        Ok(StmtKind::Assign(place, rvalue)) => {
+            let mut s = s;
+            if rvalue_moves_local(rvalue, local) {
+                s = VEC_UNINIT;
+            }
+            if place_is_local(place, local) {
+                s = VEC_INIT;
+            }
+            s
+        }
+        Ok(StmtKind::Assert(assert)) => {
+            if operand_moves_local(&assert.cond, local) {
+                VEC_UNINIT
+            } else {
+                s
+            }
+        }
+        _ => s,
+    }
+}
+
+fn vec_transfer_term(
+    s: u8,
+    term: &TermKind,
+    local: usize,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> u8 {
+    if term_dropped_local(term, name_of) == Some(local as u64) {
+        return VEC_UNINIT;
+    }
+    match term {
+        TermKind::Call { call, .. } => {
+            let mut s = s;
+            if call.args.iter().any(|op| operand_moves_local(op, local)) {
+                s = VEC_UNINIT;
+            }
+            if let CallFunc::Dynamic(op) = &call.func
+                && operand_moves_local(op, local)
+            {
+                s = VEC_UNINIT;
+            }
+            if place_is_local(&call.dest, local) {
+                s = VEC_INIT;
+            }
+            s
+        }
+        TermKind::Switch { discr, .. } => {
+            if operand_moves_local(discr, local) {
+                VEC_UNINIT
+            } else {
+                s
+            }
+        }
+        TermKind::Assert { assert, .. } => {
+            if operand_moves_local(&assert.cond, local) {
+                VEC_UNINIT
+            } else {
+                s
+            }
+        }
+        _ => s,
+    }
+}
+
+fn vec_local_entry_bits(body: &Unstructured, llbc: &Llbc, local: usize) -> Vec<u8> {
+    let n = body.body.len();
+    let mut state = vec![0u8; n];
+    if n == 0 {
+        return state;
+    }
+    let arg_count = body.locals.arg_count as usize;
+    state[0] = if (1..=arg_count).contains(&local) {
+        VEC_INIT
+    } else {
+        VEC_UNINIT
+    };
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let mut work = vec![0usize];
+    while let Some(bb) = work.pop() {
+        let mut s = state[bb];
+        for stmt in &body.body[bb].statements {
+            s = vec_transfer_stmt(s, stmt, local);
+        }
+        if let Ok(term) = body.body[bb].term_ref(llbc) {
+            s = vec_transfer_term(s, term, local, &name_of);
+        }
+        for succ in model_successors(body, llbc, bb) {
+            if state[succ] | s != state[succ] {
+                state[succ] |= s;
+                work.push(succ);
+            }
+        }
+    }
+    state
+}
+
+fn vec_init_bits_at_term(body: &Unstructured, bb: usize, local: usize, entry: u8) -> u8 {
+    let mut s = entry;
+    for stmt in &body.body[bb].statements {
+        s = vec_transfer_stmt(s, stmt, local);
+    }
+    s
+}
+
+fn vec_init_at_drop(body: &Unstructured, llbc: &Llbc, bb: usize, local: usize) -> VecInit {
+    let entry = vec_local_entry_bits(body, llbc, local);
+    let bits = vec_init_bits_at_term(body, bb, local, entry.get(bb).copied().unwrap_or(0));
+    vec_init_from_bits(bits)
+}
+
+/// Charon keeps the scope-end `Drop _v` that rustc's drop elaboration
+/// (`elaborate_drops`) removes for a local moved out on every path to it.
+/// The same rule [`elaborate_explicit_root_closes`] applies to a root
+/// guard: a `Vec<T>` local definitely moved out at its `Drop` becomes a
+/// `Goto`, a definitely-initialised `Drop` stays (it USES `_v` and
+/// lowers to `ll_vec_free_*`), and a mixed (maybe-initialised) `Drop`
+/// is left for the lowering to decline rather than invent a drop flag.
+fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstructured) {
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let vec_locals: Vec<usize> = body
+        .locals
+        .locals
+        .iter()
+        .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
+        .map(|local| local.index as usize)
+        .collect();
+    if vec_locals.is_empty() {
+        return;
+    }
+    let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();
+    for local in vec_locals {
+        let entry = vec_local_entry_bits(body, llbc, local);
+        for bb_idx in 0..body.body.len() {
+            let (dropped, target) = match body.body[bb_idx].term_ref(llbc) {
+                Ok(term) => (
+                    term_dropped_local(term, &name_of),
+                    match term {
+                        TermKind::Drop { target, .. } | TermKind::Call { target, .. } => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    },
+                ),
+                _ => continue,
+            };
+            if dropped != Some(local as u64) {
+                continue;
+            }
+            let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
+            if vec_init_from_bits(at_term) != VecInit::Uninit {
+                continue;
+            }
+            let Some(target) = target else {
+                continue;
+            };
+            rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
+        }
+    }
+    for (bb_idx, kind) in rewrites {
+        body.body[bb_idx].set_terminator_kind(kind);
+    }
+}
+
+fn definitely_init_vec_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let mut out = bit_set::BitSet::with_capacity(body.body.len());
+    let vec_locals: Vec<usize> = body
+        .locals
+        .locals
+        .iter()
+        .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
+        .map(|local| local.index as usize)
+        .collect();
+    for local in vec_locals {
+        let entry = vec_local_entry_bits(body, llbc, local);
+        for bb_idx in 0..body.body.len() {
+            let dropped = match body.body[bb_idx].term_ref(llbc) {
+                Ok(term) => term_dropped_local(term, &name_of),
+                _ => continue,
+            };
+            if dropped != Some(local as u64) {
+                continue;
+            }
+            let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
+            if vec_init_from_bits(at_term) == VecInit::Init {
+                out.insert(bb_idx);
+            }
+        }
+    }
+    out
+}
+
 /// `drop(guard)`: `_t = move _g; _ = core::mem::drop(move _t)`.
 ///
 /// The guard's destructor runs inside that call, so the call is the close of
@@ -46767,30 +47788,6 @@ fn elaborate_explicit_root_closes(
         }
     }
     let move_counts = local_move_counts(body, llbc);
-    let model_successors = |bb: usize| -> Vec<usize> {
-        let targets: Vec<u64> = match body.body[bb].term(llbc) {
-            Ok(TermKind::Goto { target }) => vec![target],
-            Ok(
-                TermKind::Call { target, .. }
-                | TermKind::Assert { target, .. }
-                | TermKind::Drop { target, .. },
-            ) => vec![target],
-            Ok(TermKind::Switch { targets, .. }) => match targets {
-                SwitchTargets::If(a, b) => vec![a, b],
-                SwitchTargets::SwitchInt(_, arms, default) => arms
-                    .iter()
-                    .map(|(_, bb)| *bb)
-                    .chain(std::iter::once(default))
-                    .collect(),
-            },
-            _ => Vec::new(),
-        };
-        targets
-            .into_iter()
-            .map(|t| t as usize)
-            .filter(|&t| t < body.body.len())
-            .collect()
-    };
     let drop_of = |bb: &majit_charon_reader::ullbc::BasicBlock| -> Option<usize> {
         match bb.term(llbc) {
             Ok(TermKind::Drop { place, .. }) => match place.kind {
@@ -46883,7 +47880,7 @@ fn elaborate_explicit_root_closes(
             } else {
                 state[bb]
             };
-            for succ in model_successors(bb) {
+            for succ in model_successors(body, llbc, bb) {
                 if state[succ] | out != state[succ] {
                     state[succ] |= out;
                     work.push(succ);
@@ -55343,6 +56340,29 @@ fn tyref_input_class_root(
     }
 }
 
+/// `OpKind::Input.class_root` for a `Ref`-typed parameter.
+///
+/// A list-typed param (`Vec<T>`, `&[T]`, Charon builtin `Slice<T>`) is
+/// the annotator's list model. Prefer the monomorphic spelling over an
+/// ADT leaf (`Slice`) so `derive_subject_inputcells` seeds `SomeList`
+/// instead of a classdef-less `SomeInstance` whose `len()` walls at
+/// `getattr("__len__")`.
+fn tyref_ref_param_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    generics: Option<&serde_json::Value>,
+) -> Option<String> {
+    let spelling = tyref_to_ast_string(ty, llbc);
+    if majit_ir::descr::is_list_container_spelling(&spelling) {
+        return Some(spelling);
+    }
+    tyref_input_class_root(ty, llbc, tombstoned)
+        .or_else(|| tyref_strips_to_str(ty, llbc).then(|| "str".to_string()))
+        .or_else(|| tyref_generic_trait_bound_root(ty, llbc, generics))
+        .or_else(|| tyref_shaped_tuple_root(ty, llbc))
+}
+
 /// The inner [`ValueType`] of a `core::sync::atomic::Atomic<T>`
 /// (`Atomic<i64>` → `Int`, `Atomic<usize>` → `Unsigned`, `Atomic<bool>` →
 /// `Bool`, `Atomic<*mut T>` → `Ref(None)`), or `None` when `ty` is not a
@@ -59545,6 +60565,10 @@ fn charon_builtin_adt_to_ast_string(builtin: &serde_json::Value, type_args: &[St
             None => "Box".to_string(),
         },
         "Str" => "str".to_string(),
+        "Slice" => match type_args.first() {
+            Some(inner) => format!("[{inner}]"),
+            None => "[]".to_string(),
+        },
         other => format!("??builtin_{other}"),
     }
 }
@@ -60674,6 +61698,96 @@ fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u64) -> Option<u64> {
         }
     }
     named
+}
+
+/// An `AnonConst` / promoted const whose init is `RangeInclusive::new`
+/// of two integer constants.  rustc lifts `(a..=b)` out of the function;
+/// Charon records the init as a 3-BB Call+Ref-return+Unwind, which
+/// `promoted_init_from_body` will not splice.  The bounds are the live
+/// host values RPython would already have at translation time.
+fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64, i64)> {
+    let g = llbc.global_by_id(def_id)?;
+    if g.rest
+        .get("global_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("AnonConst")
+    {
+        return None;
+    }
+    let leaf = g.item_meta.name_path().rsplit("::").next()?.to_string();
+    if !majit_charon_reader::ullbc::is_const_initializer_leaf(&leaf) {
+        return None;
+    }
+    let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+    let u = llbc.fn_by_id(init_id)?.unstructured()?;
+    let mut bounds = None;
+    for bb in &u.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        if leaf != "new"
+            || !owner
+                .rsplit("::")
+                .next()
+                .is_some_and(|s| s == "RangeInclusive")
+        {
+            continue;
+        }
+        if call.args.len() != 2 {
+            return None;
+        }
+        let lo = operand_as_signed_int(llbc, &call.args[0])?;
+        let hi = operand_as_signed_int(llbc, &call.args[1])?;
+        if bounds.is_some() {
+            return None;
+        }
+        bounds = Some((lo, hi));
+    }
+    bounds
+}
+
+/// Integer constant carried by a `RangeInclusive::new` operand: a
+/// literal, or a `NamedConst` global (`KIND_PRIM_CHAR` / `KIND_PRIM_COMPLEX`).
+fn operand_as_signed_int(llbc: &Llbc, op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Const(value) => match decode_constant(llbc, value).ok()? {
+            DecodedConst::Int(n) => Some(n),
+            DecodedConst::UInt(n) => i64::try_from(n).ok(),
+            DecodedConst::Int128(n) => i64::try_from(n).ok(),
+            DecodedConst::UInt128(n) => i64::try_from(n).ok(),
+            _ => None,
+        },
+        Operand::Copy(place) | Operand::Move(place) => {
+            let PlaceKind::Global { id, .. } = &place.kind else {
+                return None;
+            };
+            global_signed_int(llbc, *id)
+        }
+    }
+}
+
+fn global_signed_int(llbc: &Llbc, def_id: u64) -> Option<i64> {
+    match fold_named_const_on_llbc(llbc, def_id).or_else(|| {
+        let g = llbc.global_by_id(def_id)?;
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
+        const_eval_init_body(llbc, &llbc.fn_by_id(init_id)?.unstructured()?)
+    })? {
+        OpKind::ConstInt(n) => Some(n),
+        OpKind::ConstUInt(n) => i64::try_from(n).ok(),
+        _ => None,
+    }
 }
 
 /// Fold a `NamedConst` whose initializer is the trivial
@@ -62449,6 +63563,150 @@ pub(crate) fn resolve_to_producer_op(
             crate::model::LinkArg::Const(_) => return None,
         }
     }
+}
+
+/// Whether `op` is this graph's `ll_vec_newemptylist` / `ll_vec_newlist_hint`
+/// / `ll_vec_alloc_and_set` — the helpers that produce the
+/// `raw_malloc_varsize_char` header `ll_vec_free` releases.
+fn op_is_in_graph_vec_alloc(op: &SpaceOperation) -> bool {
+    op_vec_alloc_kind(op).is_some()
+}
+
+fn op_vec_alloc_kind(op: &SpaceOperation) -> Option<majit_ir::rvec::VecItemKind> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    match majit_ir::rvec::vec_helper_for_path(&segments.join("::")) {
+        Some((
+            majit_ir::rvec::VecOp::NewEmpty
+            | majit_ir::rvec::VecOp::NewHint
+            | majit_ir::rvec::VecOp::AllocAndSet,
+            kind,
+        )) => Some(kind),
+        _ => None,
+    }
+}
+
+/// Whether `header` is a `Vec` this graph allocated through
+/// `ll_vec_newemptylist` / `ll_vec_newlist_hint` / `ll_vec_alloc_and_set`.
+///
+/// `rewrite_op_free` (`jtransform.py`) emits `raw_free` wherever the graph
+/// frees; the pointer is threaded through Links like any other variable,
+/// so a phi merge is not a different owner. Every incoming SSA path must
+/// reach one of those producers. A call result or function input is not
+/// this graph's allocation.
+pub(crate) fn rust_vec_header_allocated_in_graph(graph: &FunctionGraph, header: &Variable) -> bool {
+    rust_vec_header_allocated_in_graph_rec(graph, header, &mut Vec::new(), &mut Vec::new())
+        == Some(true)
+}
+
+/// `Some(true)` allocated here, `Some(false)` not, `None` a cycle in the
+/// current walk (a loop-carried phi). Other incoming arms decide a cycle.
+fn rust_vec_header_allocated_in_graph_rec(
+    graph: &FunctionGraph,
+    header: &Variable,
+    visiting: &mut Vec<u64>,
+    cache: &mut Vec<(u64, bool)>,
+) -> Option<bool> {
+    let id = header.id();
+    if let Some((_, ok)) = cache.iter().find(|(k, _)| *k == id) {
+        return Some(*ok);
+    }
+    if visiting.contains(&id) {
+        return None;
+    }
+    visiting.push(id);
+
+    let computed = 'compute: {
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref().is_some_and(|r| r.id() == id) {
+                    break 'compute Some(op_is_in_graph_vec_alloc(op));
+                }
+            }
+        }
+        let Some((owner, pos)) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|a| a.id() == id)
+                .map(|pos| (block.id, pos))
+        }) else {
+            break 'compute Some(false);
+        };
+        let incoming: Vec<&Link> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .filter(|link| link.target == owner)
+            .collect();
+        if incoming.is_empty() {
+            break 'compute Some(false);
+        }
+        let mut saw_alloc = false;
+        let mut saw_other = false;
+        for link in incoming {
+            match link.args.get(pos) {
+                Some(LinkArg::Value(v)) => {
+                    match rust_vec_header_allocated_in_graph_rec(graph, v, visiting, cache) {
+                        Some(true) => saw_alloc = true,
+                        Some(false) => saw_other = true,
+                        None => {}
+                    }
+                }
+                _ => saw_other = true,
+            }
+        }
+        if saw_other {
+            Some(false)
+        } else if saw_alloc {
+            Some(true)
+        } else {
+            Some(false)
+        }
+    };
+
+    visiting.pop();
+    if let Some(ok) = computed {
+        cache.push((id, ok));
+    }
+    computed
+}
+
+/// Emit `ll_vec_free_*` of `header` when this graph allocated it.
+///
+/// Returns whether a free was emitted. A call-result or function-input
+/// header records `header-not-allocated-in-graph` and is left alone.
+pub(crate) fn emit_rust_vec_drop_if_allocated(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    header: &Variable,
+    kind: majit_ir::rvec::VecItemKind,
+) -> bool {
+    if !rust_vec_header_allocated_in_graph(graph, header) {
+        crate::decline::record_named(
+            crate::decline::gate::RUST_VEC_DROP,
+            "header-not-allocated-in-graph",
+            &graph.name,
+        );
+        return false;
+    }
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
+                fun_decl_id: None,
+            },
+            args: crate::model::call_args(vec![header.clone()]),
+            result_ty: ValueType::Void,
+        },
+    });
+    true
 }
 
 /// Whether `dom` dominates `target`: every path from the graph entry to
@@ -66017,6 +67275,9 @@ fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
 fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     let n = body.locals.locals.len();
     let mut view = vec![false; n];
+    // Whole-list `&mut vec` / `&mut vec[..]` is the header word, not a
+    // `{ptr, len}` pair. `iter_mut` of that dest still walks the buffer.
+    let mut whole_list_mut_dest = vec![false; n];
     for bb in &body.body {
         let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
             continue;
@@ -66035,7 +67296,15 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
             && slice_ty_item_is_object_pointer(&call.dest.ty, llbc)
             && (ref_kind_is_mut(&call.dest.ty, llbc) || raw_ptr_kind_is_mut(&call.dest.ty, llbc))
         {
-            view[dest] = true;
+            // A Range / RangeFrom / RangeTo subslice stays the aliasing view.
+            let whole_list_mut = matches!(&call.func, CallFunc::Regular(reg)
+                if object_vec_whole_list_view(reg, call.args.len(), llbc)
+                    == Some(ObjectVecWholeListView::Mut));
+            if whole_list_mut {
+                whole_list_mut_dest[dest] = true;
+            } else {
+                view[dest] = true;
+            }
         }
     }
     let mut changed = true;
@@ -66068,7 +67337,9 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
                 },
                 _ => continue,
             };
-            if view.get(recv).copied().unwrap_or(false) {
+            if view.get(recv).copied().unwrap_or(false)
+                || whole_list_mut_dest.get(recv).copied().unwrap_or(false)
+            {
                 view[dest] = true;
                 changed = true;
             }
@@ -72154,6 +73425,724 @@ mod tests {
         assert_eq!(resolve_to_producer_op(&graph, &Variable::new()), None);
     }
 
+    fn vec_alloc_and_set_r(result: Variable) -> SpaceOperation {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+        SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(
+                    vec_helper_path(VecOp::AllocAndSet, VecItemKind::Ref).split("::"),
+                ),
+                args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
+                result_ty: ValueType::Int,
+            },
+        }
+    }
+
+    fn vec_call_result(result: Variable, leaf: &str) -> SpaceOperation {
+        SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["other", leaf]),
+                args: vec![],
+                result_ty: ValueType::Int,
+            },
+        }
+    }
+
+    fn graph_call_leaves(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `rewrite_op_free` frees a header that reached the drop through a
+    /// return/unwind phi: both incoming Links carry the same in-graph
+    /// `ll_vec_alloc_and_set` result, so the drop emits `ll_vec_free`.
+    #[test]
+    fn rust_vec_drop_frees_phi_merged_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("phi_vec_drop");
+        let alloc_bb = graph.create_block();
+        let ok_bb = graph.create_block();
+        let err_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+
+        let ok_h = Variable::new();
+        graph.block_mut(ok_bb).inputargs = vec![ok_h.clone()];
+        let err_h = Variable::new();
+        graph.block_mut(err_bb).inputargs = vec![err_h.clone()];
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], ok_bb, None)
+                .with_prevblock(alloc_bb),
+            Link::from_variables(&graph, vec![allocated.clone()], err_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(ok_bb).exits = vec![
+            Link::from_variables(&graph, vec![ok_h.clone()], drop_bb, None).with_prevblock(ok_bb),
+        ];
+        graph.block_mut(err_bb).exits = vec![
+            Link::from_variables(&graph, vec![err_h.clone()], drop_bb, None).with_prevblock(err_bb),
+        ];
+
+        // The drop header is a two-predecessor phi: `resolve_to_producer_op`
+        // has no single producer, which is the leak the SSA walk closes.
+        assert_eq!(super::resolve_to_producer_op(&graph, &drop_h), None);
+        assert!(rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            leaves.iter().any(|leaf| leaf == "ll_vec_free_r"),
+            "phi-merged in-graph header must be freed: {leaves:?}"
+        );
+    }
+
+    /// A header that is only a call result in this graph is not this
+    /// graph's `raw_malloc` allocation; `rewrite_op_free` of it would
+    /// free a pointer another graph (or a residual) owns.
+    #[test]
+    fn rust_vec_drop_does_not_free_call_result_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("call_result_vec_drop");
+        let call_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let returned = Variable::new();
+        graph
+            .block_mut(call_bb)
+            .operations
+            .push(vec_call_result(returned.clone(), "returns_vec"));
+
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+        graph.block_mut(call_bb).exits = vec![
+            Link::from_variables(&graph, vec![returned.clone()], drop_bb, None)
+                .with_prevblock(call_bb),
+        ];
+
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &returned));
+        assert!(!emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
+            "call-result header must not be freed by this graph: {leaves:?}"
+        );
+    }
+
+    /// A phi that mixes an in-graph alloc with a call result cannot prove
+    /// ownership of the live header.
+    #[test]
+    fn rust_vec_drop_does_not_free_mixed_phi_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("mixed_phi_vec_drop");
+        let alloc_bb = graph.create_block();
+        let call_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+        let returned = Variable::new();
+        graph
+            .block_mut(call_bb)
+            .operations
+            .push(vec_call_result(returned.clone(), "returns_vec"));
+
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], drop_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(call_bb).exits = vec![
+            Link::from_variables(&graph, vec![returned.clone()], drop_bb, None)
+                .with_prevblock(call_bb),
+        ];
+
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(!emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
+            "mixed phi must not free: {leaves:?}"
+        );
+    }
+
+    fn owned_vec_drop_llbc(
+        name: &str,
+        arg_count: u64,
+        locals: Vec<serde_json::Value>,
+        blocks: Vec<serde_json::Value>,
+        extra_types: Vec<serde_json::Value>,
+        extra_funs: Vec<serde_json::Value>,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| {
+                    if *segment == "<Impl>" {
+                        serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                    } else {
+                        serde_json::json!({"Ident": [segment, 0]})
+                    }
+                }).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [i64_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let unit = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let inputs: Vec<serde_json::Value> = locals
+            .iter()
+            .skip(1)
+            .take(arg_count as usize)
+            .filter_map(|local| local.get("ty").cloned())
+            .collect();
+        let subject = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {"arg_count": arg_count, "locals": locals},
+                    "body": blocks
+                }
+            }
+        });
+        let vec_new = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["alloc", "vec", "<Impl>", "new"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": vec_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let sink = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "sink"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [vec_ty],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let vec_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["alloc", "vec", "Vec"], false),
+            "kind": {"Struct": []}
+        });
+        let mut types = vec![vec_decl];
+        types.extend(extra_types);
+        let mut funs = vec![subject, vec_new, sink];
+        funs.extend(extra_funs);
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": funs,
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("owned vec drop fixture parses")
+    }
+
+    fn owned_vec_ty() -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"Scalar": {"Integer": {"Signed": "I64"}}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn owned_vec_unit_ty() -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn owned_vec_span() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    }
+
+    fn owned_vec_local(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "index": index,
+            "name": null,
+            "span": owned_vec_span(),
+            "ty": ty
+        })
+    }
+
+    fn owned_vec_place(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"kind": {"Local": index}, "ty": ty})
+    }
+
+    fn owned_vec_block(
+        statements: Vec<serde_json::Value>,
+        terminator: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "statements": statements,
+            "terminator": {"span": owned_vec_span(), "kind": terminator}
+        })
+    }
+
+    fn owned_vec_new_call(
+        dest: u64,
+        dest_ty: &serde_json::Value,
+        target: u64,
+        unwind: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 1},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": [],
+                "dest": owned_vec_place(dest, dest_ty)
+            },
+            "target": target,
+            "on_unwind": unwind
+        }})
+    }
+
+    fn owned_vec_drop(
+        local: u64,
+        ty: &serde_json::Value,
+        target: u64,
+        unwind: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"Drop": {
+            "place": owned_vec_place(local, ty),
+            "fn_ptr": {"kind": {"Fun": 1}, "generics": {}},
+            "target": target,
+            "on_unwind": unwind
+        }})
+    }
+
+    fn owned_vec_return_unit(unit: &serde_json::Value) -> serde_json::Value {
+        owned_vec_block(
+            vec![serde_json::json!({
+                "span": owned_vec_span(),
+                "kind": {"Assign": [
+                    owned_vec_place(0, unit),
+                    {"Aggregate": ["Tuple", []]}
+                ]}
+            })],
+            serde_json::json!("Return"),
+        )
+    }
+
+    fn owned_vec_leaves(graph: &FunctionGraph) -> Vec<String> {
+        graph_call_leaves(graph)
+    }
+
+    fn owned_vec_has_free(graph: &FunctionGraph) -> bool {
+        owned_vec_leaves(graph)
+            .iter()
+            .any(|leaf| leaf.starts_with("ll_vec_free"))
+    }
+
+    fn owned_vec_has_alloc(graph: &FunctionGraph) -> bool {
+        owned_vec_leaves(graph)
+            .iter()
+            .any(|leaf| leaf.starts_with("ll_vec_newemptylist"))
+    }
+
+    fn drop_term_is_goto(
+        body: &majit_charon_reader::ullbc::Unstructured,
+        llbc: &Llbc,
+        bb: usize,
+    ) -> bool {
+        matches!(
+            body.body[bb].term(llbc),
+            Ok(majit_charon_reader::ullbc::TermKind::Goto { .. })
+        )
+    }
+
+    fn drop_term_is_drop(
+        body: &majit_charon_reader::ullbc::Unstructured,
+        llbc: &Llbc,
+        bb: usize,
+    ) -> bool {
+        matches!(
+            body.body[bb].term(llbc),
+            Ok(majit_charon_reader::ullbc::TermKind::Drop { .. })
+        )
+    }
+
+    /// A definitely-initialised `Vec` Drop stays a Drop and lowers to
+    /// `ll_vec_free_*` at that terminator, the `rewrite_op_free` site.
+    #[test]
+    fn rust_vec_drop_of_definitely_init_vec_frees_at_the_drop() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let name = "drop_init_vec";
+        let llbc = owned_vec_drop_llbc(
+            name,
+            0,
+            vec![owned_vec_local(0, &unit), owned_vec_local(1, &vec_ty)],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(1, &vec_ty, 1, 3)),
+                owned_vec_block(vec![], owned_vec_drop(1, &vec_ty, 2, 3)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_drop(&body, &llbc, 1),
+            "definitely-init Drop stays a Drop"
+        );
+        assert_eq!(
+            super::vec_init_at_drop(&body, &llbc, 1, 1),
+            super::VecInit::Init
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_init_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            owned_vec_has_free(&graph),
+            "definitely-init Drop must free at the Drop: {leaves:?}"
+        );
+    }
+
+    /// A `Vec` moved into a call is uninitialised at the trailing Drop;
+    /// elaboration turns that Drop into a Goto, so this graph does not free.
+    #[test]
+    fn rust_vec_drop_after_move_into_call_does_not_free() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let name = "drop_moved_into_call_vec";
+        let sink = serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 2},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": [{"Move": owned_vec_place(1, &vec_ty)}],
+                "dest": owned_vec_place(2, &unit)
+            },
+            "target": 2,
+            "on_unwind": 4
+        }});
+        let llbc = owned_vec_drop_llbc(
+            name,
+            0,
+            vec![
+                owned_vec_local(0, &unit),
+                owned_vec_local(1, &vec_ty),
+                owned_vec_local(2, &unit),
+            ],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(1, &vec_ty, 1, 4)),
+                owned_vec_block(vec![], sink),
+                owned_vec_block(vec![], owned_vec_drop(1, &vec_ty, 3, 4)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_goto(&body, &llbc, 2),
+            "moved-out Drop becomes Goto"
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_moved_into_call_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            !owned_vec_has_free(&graph),
+            "moved-into-call must not free: {leaves:?}"
+        );
+    }
+
+    /// A `Vec` stored into a struct field is uninitialised at the trailing
+    /// Drop; this graph does not free the moved-out header.
+    #[test]
+    fn rust_vec_drop_after_store_into_struct_does_not_free() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let holder_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let name = "drop_stored_into_struct_vec";
+        let store = serde_json::json!({
+            "span": owned_vec_span(),
+            "kind": {"Assign": [
+                owned_vec_place(2, &holder_ty),
+                {"Aggregate": [
+                    {"Adt": [1, null]},
+                    [{"Move": owned_vec_place(1, &vec_ty)}]
+                ]}
+            ]}
+        });
+        let holder_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["Holder", 0]}
+                ],
+                "span": owned_vec_span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": [{
+                "name": "items",
+                "ty": vec_ty,
+                "attr_info": null
+            }]}
+        });
+        let llbc = owned_vec_drop_llbc(
+            name,
+            0,
+            vec![
+                owned_vec_local(0, &unit),
+                owned_vec_local(1, &vec_ty),
+                owned_vec_local(2, &holder_ty),
+            ],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(1, &vec_ty, 1, 4)),
+                owned_vec_block(vec![store], serde_json::json!({"Goto": {"target": 2}})),
+                owned_vec_block(vec![], owned_vec_drop(1, &vec_ty, 3, 4)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![holder_decl],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_goto(&body, &llbc, 2),
+            "stored-into-struct Drop becomes Goto"
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_stored_into_struct_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            !owned_vec_has_free(&graph),
+            "stored-into-struct must not free: {leaves:?}"
+        );
+    }
+
+    /// Mixed init at a `Vec` Drop is a drop-flag case: leave the Drop,
+    /// decline `maybe-initialised`, emit no free.
+    #[test]
+    fn rust_vec_drop_maybe_initialised_declines_without_free() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let cond_ty = serde_json::json!({"Scalar": "Bool"});
+        let name = "drop_maybe_init_vec";
+        let sink = serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 2},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": [{"Move": owned_vec_place(2, &vec_ty)}],
+                "dest": owned_vec_place(3, &unit)
+            },
+            "target": 4,
+            "on_unwind": 6
+        }});
+        let llbc = owned_vec_drop_llbc(
+            name,
+            1,
+            vec![
+                owned_vec_local(0, &unit),
+                owned_vec_local(1, &cond_ty),
+                owned_vec_local(2, &vec_ty),
+                owned_vec_local(3, &unit),
+            ],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(2, &vec_ty, 1, 6)),
+                owned_vec_block(
+                    vec![],
+                    serde_json::json!({"Switch": {
+                        "discr": {"Copy": owned_vec_place(1, &cond_ty)},
+                        "targets": {"If": [2, 3]}
+                    }}),
+                ),
+                owned_vec_block(vec![], sink),
+                owned_vec_block(vec![], serde_json::json!({"Goto": {"target": 4}})),
+                owned_vec_block(vec![], owned_vec_drop(2, &vec_ty, 5, 6)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_drop(&body, &llbc, 4),
+            "maybe-init Drop is left unlowered"
+        );
+        assert_eq!(
+            super::vec_init_at_drop(&body, &llbc, 4, 2),
+            super::VecInit::Maybe
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_maybe_init_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            !owned_vec_has_free(&graph),
+            "maybe-init must not free: {leaves:?}"
+        );
+    }
+
     /// `&*(*p).f` reads the value the field holds; `&(*p).f` names the
     /// field's address.
     ///
@@ -75762,6 +77751,11 @@ mod tests {
         assert!(!borrow(serde_json::json!({"Slice": [u8_ty.clone(), null]})));
         assert!(!borrow(builtin("Str", serde_json::json!([]))));
         assert!(!borrow(serde_json::json!({"DynTrait": {}})));
+
+        let slice_adt = TyRef::Other(builtin("Slice", serde_json::json!([u8_ty])));
+        let spelling = super::tyref_to_ast_string(&slice_adt, &llbc);
+        assert_eq!(spelling, "[u8]");
+        assert!(majit_ir::descr::is_list_container_spelling(&spelling));
 
         // A fixed-length array IS sized, so a pointer to one stays thin.
         let len = serde_json::json!([
@@ -85381,6 +87375,270 @@ mod tests {
     }
 
     #[test]
+    fn root_bracket_erasure_answers_an_incoming_slice_pin() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `__majit_wrap_cdata_call`: `pin_roots(args)` of the incoming
+        // `&[PyObjectRef]` parameter, `get(base)` of slot 0, and
+        // `shadow_stack_copy_range(base + 1, rest)`.
+        //
+        //   bb0: _3 = push_roots()                            -> bb1
+        //   bb1: _4 = &_3; _5 = pin_roots(_4, copy _1)        -> bb2
+        //   bb2: _6 = &_3; _7 = copy _5; _8 = get(_6, _7)     -> bb3
+        //   bb3: _9 = AddChecked(copy _5, 1); assert          -> bb4
+        //   bb4: _10 = move _9.0; copy_range(_10, _2)         -> bb5
+        //   bb5: drop(_3)                                     -> bb6
+        //   bb6: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let field = |i: u64, f: u64| serde_json::json!({"kind": {"Projection": [place(i), {"Field": [null, f]}]}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_roots",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    8 => "pyre_object::gc_roots::shadow_stack_copy_range",
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(
+                    vec![borrow(4, 3)],
+                    call(3, vec![copy(4), copy(1)], 5, 2),
+                ),
+                block(
+                    vec![borrow(6, 3), assign(7, serde_json::json!({"Use": [copy(5), "No"]}))],
+                    call(4, vec![copy(6), copy(7)], 8, 3),
+                ),
+                block(
+                    vec![assign(
+                        9,
+                        serde_json::json!({"BinaryOp": ["AddChecked", copy(5), usize_lit(1)]}),
+                    )],
+                    serde_json::json!({"Assert": {
+                        "assert": {
+                            "cond": {"Move": field(9, 1)},
+                            "expected": false,
+                            "check_kind": {"Overflow": [{"Add": "Wrap"}, copy(5), usize_lit(1)]}
+                        },
+                        "target": 4,
+                        "on_unwind": 99
+                    }}),
+                ),
+                block(
+                    vec![assign(10, serde_json::json!({"Use": [{"Move": field(9, 0)}, "No"]}))],
+                    call(8, vec![mv(10), copy(2)], 0, 5),
+                ),
+                block(vec![], drop_guard(3, 6)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &body,
+            &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "an incoming-slice pin_roots must be erased"
+        );
+        assert_eq!(plan.slice_gets, vec![(2usize, 1usize, 0u64)]);
+        assert_eq!(plan.slice_copies, vec![(4usize, 1usize, 1u64)]);
+        assert_eq!(
+            plan.free_sites.get(&4),
+            Some(&3),
+            "copy_range is this guard"
+        );
+    }
+
+    #[test]
+    fn root_bracket_erasure_answers_an_incoming_elem_pin() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `W_CTypeFunc._call` `n == 1` (`ctypefunc.py` `_call`): `base()`,
+        // `pin_root(args_w[0])`, `get(base)`. The pin's temporary is
+        // `StorageDead` before the get, so the answer is `getarrayitem` of
+        // the incoming list at 0, not that local.
+        //
+        //   bb0: _3 = push_roots()                                 -> bb1
+        //   bb1: _4 = &_3; _5 = base(_4)                           -> bb2
+        //   bb2: _6 = 0; _7 = (*_1)[copy _6]; _8 = &_3;
+        //        _9 = copy _7; pin_root(_8, move _9)               -> bb3
+        //   bb3: convert()                                         -> bb4
+        //   bb4: _10 = &_3; _11 = copy _5; get(_10, _11)           -> bb5
+        //   bb5: drop(_3)                                          -> bb6
+        //   bb6: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let deref =
+            |i: u64| serde_json::json!({"kind": {"Projection": [place(i), "Deref"]}, "ty": ty()});
+        let index_place = |slice: u64, offset: u64| {
+            serde_json::json!({"kind": {"Projection": [deref(slice), {"Index": {
+                "offset": copy(offset),
+                "from_end": false
+            }}]}, "ty": ty()})
+        };
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    2 => "pyre_object::gc_roots::{impl RootScope}::base",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_root",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    5 => {
+                        "pyre_module::module::_cffi_backend::ctypeobj::convert_argument_from_object"
+                    }
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(vec![borrow(4, 3)], call(2, vec![copy(4)], 5, 2)),
+                block(
+                    vec![
+                        assign(6, serde_json::json!({"Use": [usize_lit(0), "No"]})),
+                        assign(7, serde_json::json!({"Use": [{"Copy": index_place(1, 6)}, "Yes"]})),
+                        borrow(8, 3),
+                        assign(9, serde_json::json!({"Use": [copy(7), "Yes"]})),
+                    ],
+                    call(3, vec![mv(8), mv(9)], 10, 3),
+                ),
+                block(vec![], call(5, vec![], 14, 4)),
+                block(
+                    vec![
+                        borrow(12, 3),
+                        assign(11, serde_json::json!({"Use": [copy(5), "No"]})),
+                    ],
+                    call(4, vec![copy(12), copy(11)], 13, 5),
+                ),
+                block(vec![], drop_guard(3, 6)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let moved = super::MovedOutLocals::with_set(&body, bit_set::BitSet::new());
+        for touches_callees in [false, true] {
+            let touches = |reg: &RegularCall| {
+                touches_callees
+                    && matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if *id == 5)
+            };
+            let plan =
+                super::analyze_root_brackets_with(&fixture_llbc(), &body, &moved, name_of, touches);
+            assert!(
+                plan.scopes.contains(3),
+                "n==1 incoming-elem pin must be erased (touches={touches_callees})"
+            );
+            assert_eq!(
+                plan.slice_gets,
+                vec![(4usize, 1usize, 0u64)],
+                "get(base) answers with args_w[0] (touches={touches_callees})"
+            );
+        }
+    }
+
+    #[test]
     fn root_bracket_erasure_numbers_pins_in_order_and_reads_base_plus_k() {
         use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
         // The `w_list_append_inner` Object-arm shape:
@@ -91477,6 +93735,331 @@ mod tests {
         assert!(
             !leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
             "deref_mut must not copy into a gcarray: {leaves:?}"
+        );
+    }
+
+    fn object_vec_whole_list_fixture(
+        name: &str,
+        callee_path: &[&str],
+        callee_id: u64,
+        vec_mut: bool,
+        dest_is_mut_slice: bool,
+        extra_funs: Vec<serde_json::Value>,
+        extra_blocks: Vec<serde_json::Value>,
+        extra_locals: Vec<serde_json::Value>,
+        extra_args: Vec<serde_json::Value>,
+        extra_inputs: Vec<serde_json::Value>,
+    ) -> (Llbc, crate::model::FunctionGraph) {
+        let span = fixture_span();
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let obj = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let objptr = serde_json::json!({"RawPtr": [obj, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {"types": [objptr.clone()]}}
+        });
+        let vec_ref = if vec_mut {
+            serde_json::json!({"Ref": ["'_", vec_ty, "Mut"]})
+        } else {
+            serde_json::json!({"Ref": ["'_", vec_ty, "Shared"]})
+        };
+        let slice_kind = if dest_is_mut_slice { "Mut" } else { "Shared" };
+        let slice_ty = serde_json::json!({
+            "Ref": ["'_", {"Slice": [objptr.clone(), null]}, slice_kind]
+        });
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+        let mut locals = vec![
+            local(0, Some("ret"), &slice_ty),
+            local(1, Some("vec"), &vec_ref),
+        ];
+        locals.extend(extra_locals);
+        let mut inputs = vec![vec_ref.clone()];
+        inputs.extend(extra_inputs);
+        let arg_count = inputs.len() as u64;
+        let mut args = vec![serde_json::json!({"Copy": place(1, &vec_ref)})];
+        args.extend(extra_args);
+        let mut body_blocks = vec![serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span, "kind": {"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": callee_id}, "generics": generics}},
+                    "args": args,
+                    "dest": place(0, &slice_ty)
+                },
+                "target": 1,
+                "on_unwind": extra_blocks.len() as u64 + 2
+            }}}
+        })];
+        body_blocks.extend(extra_blocks);
+        body_blocks.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span, "kind": "Return"}
+        }));
+        body_blocks.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span, "kind": "UnwindResume"}
+        }));
+        let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
+        let fun = |id: u64,
+                   path: &[&str],
+                   ins: Vec<serde_json::Value>,
+                   output: serde_json::Value,
+                   body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(path),
+                "signature": {"is_unsafe": false, "inputs": ins, "output": output},
+                "body": body
+            })
+        };
+        let view_body = serde_json::json!({"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": arg_count, "locals": locals},
+            "body": body_blocks
+        }});
+        let mut fun_decls = vec![
+            fun(0, &["fixture", name], inputs, slice_ty.clone(), view_body),
+            fun(
+                callee_id,
+                callee_path,
+                vec![vec_ref],
+                slice_ty,
+                serde_json::json!("Opaque"),
+            ),
+        ];
+        fun_decls.extend(extra_funs);
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta(&["PyObject"]), "kind": {"Struct": []}},
+                    {"def_id": 1, "item_meta": meta(&["alloc", "vec", "Vec"]), "kind": {"Struct": []}},
+                ],
+                "fun_decls": fun_decls,
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph =
+            super::lower_function(&llbc, name).unwrap_or_else(|err| panic!("lower {name}: {err}"));
+        (llbc, graph)
+    }
+
+    fn object_vec_call_leaves(graph: &crate::model::FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `Vec<PyObjectRef>::deref` (`&vec`) is the length-prefixed object array.
+    #[test]
+    fn object_vec_deref_builds_the_gcarray() {
+        let (_llbc, graph) = object_vec_whole_list_fixture(
+            "view",
+            &["alloc", "vec", "<Impl>", "deref"],
+            1,
+            false,
+            false,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let leaves = object_vec_call_leaves(&graph);
+        assert!(
+            leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+            "deref must copy into a gcarray: {leaves:?}"
+        );
+        let input = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .expect("vec input");
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .expect("return link");
+        assert!(
+            !matches!(returned, crate::model::LinkArg::Value(value) if value == input),
+            "deref must not alias the header; graph: {graph:#?}"
+        );
+    }
+
+    /// `Vec<PyObjectRef>::deref_mut` (`&mut vec`) is the header address, the
+    /// same `SomeList` as `&mut vec[..]`. A gcarray copy would drop stores.
+    #[test]
+    fn object_vec_deref_mut_aliases_the_header() {
+        let (_llbc, graph) = object_vec_whole_list_fixture(
+            "view_mut",
+            &["alloc", "vec", "<Impl>", "deref_mut"],
+            1,
+            true,
+            true,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let leaves = object_vec_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+            "deref_mut must not copy into a gcarray: {leaves:?}"
+        );
+        assert!(
+            !leaves.iter().any(|l| l == "ll_vec_items_r"),
+            "deref_mut must not split the header into a pair: {leaves:?}"
+        );
+        let input = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .expect("vec input");
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .expect("return link");
+        assert!(
+            matches!(returned, crate::model::LinkArg::Value(value) if value == input),
+            "deref_mut must alias the vec header; graph: {graph:#?}"
+        );
+    }
+
+    /// `&mut vec` passed to `shadow_stack_copy_range` is that vec. The call
+    /// is `shadow_stack_copy_range_into_vec`.
+    #[test]
+    fn object_vec_deref_mut_retargets_shadow_stack_copy_into_vec() {
+        let span = fixture_span();
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let obj = serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let objptr = serde_json::json!({"RawPtr": [obj, "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {"types": [objptr.clone()]}}
+        });
+        let vec_mut = serde_json::json!({"Ref": ["'_", vec_ty, "Mut"]});
+        let slice_ty = serde_json::json!({
+            "Ref": ["'_", {"Slice": [objptr.clone(), null]}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+        let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
+        let fun = |id: u64,
+                   path: &[&str],
+                   inputs: Vec<serde_json::Value>,
+                   output: serde_json::Value,
+                   body: serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": meta(path),
+                "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+                "body": body
+            })
+        };
+        let init_ret = serde_json::json!({"span": span, "kind": {"Assign": [
+            place(0, &unit),
+            {"Aggregate": ["Tuple", []]}
+        ]}});
+        let copy_body = serde_json::json!({"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                local(0, Some("ret"), &unit),
+                local(1, Some("base"), &usize_ty),
+                local(2, Some("vec"), &vec_mut),
+                local(3, Some("slice"), &slice_ty),
+            ]},
+            "body": [
+                {"statements": [init_ret], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                        "args": [{"Copy": place(2, &vec_mut)}],
+                        "dest": place(3, &slice_ty)
+                    },
+                    "target": 1,
+                    "on_unwind": 3
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                        "args": [
+                            {"Copy": place(1, &usize_ty)},
+                            {"Copy": place(3, &slice_ty)}
+                        ],
+                        "dest": place(0, &unit)
+                    },
+                    "target": 2,
+                    "on_unwind": 3
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta(&["PyObject"]), "kind": {"Struct": []}},
+                    {"def_id": 1, "item_meta": meta(&["alloc", "vec", "Vec"]), "kind": {"Struct": []}},
+                ],
+                "fun_decls": [
+                    fun(0, &["fixture", "copy_into"], vec![usize_ty.clone(), vec_mut.clone()], unit.clone(), copy_body),
+                    fun(1, &["alloc", "vec", "<Impl>", "deref_mut"], vec![vec_mut.clone()], slice_ty.clone(), serde_json::json!("Opaque")),
+                    fun(2, &["pyre_object", "gc_roots", "shadow_stack_copy_range"], vec![usize_ty, slice_ty], unit, serde_json::json!("Opaque")),
+                ],
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "copy_into")
+            .unwrap_or_else(|err| panic!("lower copy_into: {err}"));
+        let paths: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.join("::")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("shadow_stack_copy_range_into_vec")),
+            "deref_mut dest must retarget the copy: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.ends_with("gcarray_from_pyobject_vec")),
+            "deref_mut must not copy into a gcarray: {paths:?}"
         );
     }
 

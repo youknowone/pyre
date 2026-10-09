@@ -1697,6 +1697,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gcarray_from_pyobject_vec",
         pyre_object::gc_roots::gcarray_from_pyobject_vec_jit_abi,
     );
+    // Erased `shadow_stack_copy_range(base + k, &mut vec)` of an incoming
+    // `&[PyObjectRef]` pin (`RootBracketPlan`; `cdataobj.py W_CData.call`
+    // passes `args_w` through). The src word is the length-prefixed array.
+    cpa3(
+        &mut entries,
+        "pyre_object::gc_roots::copy_object_slice_range_into_vec",
+        "pyre_object::copy_object_slice_range_into_vec",
+        pyre_object::gc_roots::copy_object_slice_range_into_vec_jit_abi,
+    );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its

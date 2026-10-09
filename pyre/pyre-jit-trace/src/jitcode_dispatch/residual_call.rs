@@ -3242,6 +3242,12 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // the end flush keeps the legacy loop-entry replay,
                         // which runs the traced iteration's add a second time.
                         "pin_root" => arg_index == 1 && nargs == 2,
+                        // `rlist.py ll_alloc_and_set(length, init)` writes
+                        // `init` into every slot and does not dereference it.
+                        // `vec![PY_NULL; n]` lowers to this helper; a NULL
+                        // fill is the empty rest-args vector `W_CData.call`
+                        // copies `args_w[1:]` into.
+                        "ll_vec_alloc_and_set_r" => arg_index == 1 && nargs == 2,
                         _ => false,
                     }
                 })

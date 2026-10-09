@@ -3820,12 +3820,58 @@ macro_rules! replay_unscannable {
     }};
 }
 
+/// Leaf name of the jitcode an `inline_call_*` names, when the descr
+/// resolves.  Operand 0 is the two-byte descr (`dR>r` / `dIR>r` / …).
+///
+/// A Python-function body numbers that operand in its per-fn pool
+/// (`RawDescrPool::PerFn`).  `as_jitcode_descr().jitcode_index()` on those
+/// slots is the pool index, not an `ALL_JITCODES` index — reading it through
+/// `get_jitcode_by_index` names an unrelated canonical helper.  The pool's
+/// `inline_callee_name` is the one lookup that distinguishes the two.
+fn inline_call_jitcode_name(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_pool: super::RawDescrPool<'_>,
+) -> Option<String> {
+    if !d.opname.starts_with("inline_call") {
+        return None;
+    }
+    let descr_index = {
+        let lo = *body_code.get(d.pc + 1)? as usize;
+        let hi = *body_code.get(d.pc + 2)? as usize;
+        lo | (hi << 8)
+    };
+    callee_pool
+        .inline_callee_name(descr_index)
+        .map(str::to_owned)
+}
+
+/// BUILD_MAP 0 `{}` used to residual as `NewEmptyDict` (`flatten.rs`
+/// `build_map_from_empty_array`).  When `w_dict_new` and
+/// `dict_display_setitem` are both fully bound, the same site emits
+/// `inline_call_r_r` of `w_dict_new` (`codewriter.rs` BUILD_MAP
+/// `display_bound`).  `w_dict_new` is `newdict_empty` (`dictmultiobject.rs`):
+/// a fresh empty dict, no user code.  The residual helper-kind admission
+/// (`RuntimeHelperKind::NewEmptyDict`) already treated that as replay-safe;
+/// this is the same fact on the inline_call form.
+///
+/// Leaf names only: `JitCode.name` is the graph leaf (`w_dict_new`,
+/// `newdict_empty`).  `w_dict_new_kwargs` is a different helper.
+pub(crate) fn jitcode_is_empty_dict_alloc(name: &str) -> bool {
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    leaf == "w_dict_new" || leaf == "newdict_empty"
+}
+
 /// The `pc` a `[replay-dirty]` line names is an offset into the scanned
 /// callee's jitcode, and no per-function dump covers a callee — so on its own
 /// the number cannot be matched against any op.  `PYRE_FBW_REPLAY_DIRTY_BODY=1`
 /// lists each body as it is scanned, so the verdict line that follows a listing
 /// names an op within it.
-fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
+fn replay_safety_dump_body(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+) {
     if !fbw_inline_diag_enabled() || std::env::var_os("PYRE_FBW_REPLAY_DIRTY_BODY").is_none() {
         return;
     }
@@ -3836,7 +3882,8 @@ fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
     for d in crate::jitcode_runtime::decoded_ops(body_code) {
         // Every residual verdict below turns on the helper kind, and the opname
         // alone does not separate a deferred `call_fn` from an untagged helper
-        // that declines the whole body — so name it.
+        // that declines the whole body — so name it.  An `inline_call_*` has no
+        // helper kind; its jitcode name is the equivalent fact.
         let helper = if d.opname.starts_with("residual_call") {
             residual_call_descr_index_in_body(body_code, &d)
                 .and_then(|i| callee_descr_refs.get(i))
@@ -3845,6 +3892,11 @@ fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
                     || " helper=<no call descr>".to_string(),
                     |cd| format!(" helper={:?}", cd.get_extra_info().runtime_helper),
                 )
+        } else if d.opname.starts_with("inline_call") {
+            inline_call_jitcode_name(body_code, &d, callee_pool).map_or_else(
+                || " jitcode=<unresolved>".to_string(),
+                |name| format!(" jitcode={name}"),
+            )
         } else {
             String::new()
         };
@@ -3866,7 +3918,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
     callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {
-    replay_safety_dump_body(body_code, callee_descr_refs);
+    replay_safety_dump_body(body_code, callee_descr_refs, callee_pool);
     let mut poison: Vec<usize> = Vec::new();
     let mut protected: Vec<usize> = Vec::new();
     let Some(branch_targets) = body_branch_targets(body_code) else {
@@ -4530,7 +4582,16 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     dst_exact_bool = true;
                 }
                 None => {
-                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    // Same allocation BUILD_MAP 0 residualled as NewEmptyDict:
+                    // a fully-bound `w_dict_new` / `newdict_empty` is that
+                    // constructor, now reached as `inline_call_r_r`.  Leave
+                    // dst provenance unproven — the residual NewEmptyDict
+                    // arm does the same, it is not numeric.
+                    if !inline_call_jitcode_name(body_code, &d, callee_pool)
+                        .is_some_and(|name| jitcode_is_empty_dict_alloc(&name))
+                    {
+                        replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    }
                 }
             }
         } else if d.opname.starts_with("setinteriorfield_gc")

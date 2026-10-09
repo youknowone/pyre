@@ -1493,6 +1493,11 @@ pub fn materialize_gccache_owned_descrs_on_caller_stack() {
 
 fn materialize_gccache_owned_descrs_with(on_caller_stack: bool) {
     static ONCE: Once = Once::new();
+    // `heaptracker.setup_cache_gcstruct2vtable` before `get_size_descr`.
+    // Kind-0 decode mints analyzer field descrs with `vtable=0`; the
+    // table has to be populated first so those SizeDescrs are born
+    // `is_object()`.
+    crate::descr::publish_pyre_class_vtables();
     ONCE.call_once(|| {
         if on_caller_stack {
             decode_kind0_descrs();
@@ -1503,6 +1508,8 @@ fn materialize_gccache_owned_descrs_with(on_caller_stack: bool) {
     // The decode `Once` may have run before a collector existed. Register
     // once the live collector is installed; a second call is a no-op.
     register_synthetic_struct_tids();
+    // Collector tids may have been `UNASSIGNED` on the first walk.
+    crate::descr::refresh_pyre_class_vtable_tids();
 }
 
 /// Kind-0 bincode runs on a fresh 8 MiB stack.
@@ -2580,7 +2587,10 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // already binds each key; without the slot, `setup_insns` never
     // records the byte and a guard-failure resume panics here.
     // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
-    // omits that key.
+    // omits that key. `setarrayitem_raw_i/iiid` is the store twin
+    // (`blackhole.py bhimpl_setarrayitem_raw_i`); looking inside
+    // `copy_object_slice_range_into_vec` emits it when the dest is a
+    // residual `ll_vec_alloc_and_set_r` Int header.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",

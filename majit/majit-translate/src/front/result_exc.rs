@@ -7460,7 +7460,9 @@ fn is_root_bracket_close(kind: &OpKind) -> bool {
 /// root-bracket close or a raw array's `ll_slice_buffer_free`.  Neither reads
 /// the exception, so both commute with the ops around them.
 fn is_frame_exit_cleanup(kind: &OpKind) -> bool {
-    is_root_bracket_close(kind) || super::mir::is_slice_buffer_free_call(kind)
+    is_root_bracket_close(kind)
+        || super::mir::is_slice_buffer_free_call(kind)
+        || super::mir::is_rust_vec_free_call(kind)
 }
 
 /// A bounded rendering of an op kind, for diagnostics that name the

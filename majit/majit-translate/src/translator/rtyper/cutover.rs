@@ -2003,6 +2003,9 @@ pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
     if msg.contains("two-phase: subject rtype-skipped in prepass") {
         return Some("two-phase-rtype-skipped");
     }
+    if msg.contains("two-phase: subject annotate-skipped in prepass") {
+        return Some("two-phase-annotate-skipped");
+    }
     None
 }
 
@@ -4221,23 +4224,28 @@ fn run_two_phase_prepass_inner(
                 );
             }
             ref other @ (Ok(Err(_)) | Err(_)) => {
-                // De-aggregating census (MAJIT_RTYPER_VERBOSE): the dual-gate
-                // otherwise lumps every Phase-A failure under one opaque
-                // "subject not annotated/rtyped" Skip. Surface the per-graph
-                // reason so the onion can be triaged.
+                // The graph was a prepass subject: record the annotate-half
+                // failure so publish classifies it as annotate-skipped, not
+                // never-a-subject. Upstream `translator.graphs` contains every
+                // graph the codewriter later sees (`driver.py` task_annotate
+                // then task_rtype_lltype); a failed annotate is still a
+                // subject. `downcast_ref::<String>` misses `AnnotatorError`
+                // payloads (`panic_payload_text`).
+                let reason = match other {
+                    Ok(Err(e)) => format!("annotate Err: {e:?}"),
+                    Err(p) => {
+                        let msg = crate::annotator::model::panic_payload_text(&**p)
+                            .unwrap_or_else(|| "<non-string panic>".to_string());
+                        format!("annotate PANIC: {msg}")
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                {
+                    let mut tp = call_registry.two_phase();
+                    tp.annotate_skipped
+                        .insert(path.canonical_key(), reason.clone());
+                }
                 if rtyper_verbose_enabled() {
-                    let reason = match other {
-                        Ok(Err(e)) => format!("annotate Err: {e:?}"),
-                        Err(p) => {
-                            let msg = p
-                                .downcast_ref::<String>()
-                                .cloned()
-                                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                                .unwrap_or_else(|| "<non-string panic>".to_string());
-                            format!("annotate PANIC: {msg}")
-                        }
-                        Ok(Ok(_)) => unreachable!(),
-                    };
                     eprintln!("[PREPASS phaseA fail] {:?}: {reason}", path);
                     phase_a_reasons.push(reason);
                     // MAJIT_RTYPER_FRONTIER: the adapter's whole call-wall set
@@ -4248,9 +4256,8 @@ fn run_two_phase_prepass_inner(
                         eprintln!("[PREPASS phaseA wall] {:?}: {wall}", path);
                     }
                 }
-                // Annotate-half failed (or panicked): repair shared-callee state
-                // and leave the graph uncached so publish Skips it to the legacy
-                // walker. unpoison is itself contained — a panic here must not
+                // Annotate-half failed (or panicked): repair shared-callee state.
+                // unpoison is itself contained — a panic here must not
                 // abort the remaining Phase A graphs.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     unpoison_failed_subject_callees(
@@ -4979,15 +4986,22 @@ pub(crate) fn dual_gate_outcome_from_cache(
 ) -> Result<DualGateOutcome, String> {
     // Clone the cached real types out so the cache borrow drops before the
     // legacy baseline runs (the baseline never touches the cache).
-    // Two causes reach the Skip below and they are not the same finding:
-    // the prepass may never have had this graph as a subject at all, or it
-    // may have had it and rtype-skipped it.  The first says the closure
-    // walk did not reach the graph; the second says it did and the real
-    // rtyper refused it.  They shared one message until now, so a census
-    // of Skip reasons could not separate "never attempted" from
-    // "attempted and declined" — the same conflation the decline census
-    // exists to remove.  Neither spelling matches any
-    // `unported_category` arm, so classification is unchanged.
+    // Three causes reach the Skip below and they are not the same finding:
+    // the prepass may never have had this graph as a subject at all, it
+    // may have had it and annotate-skipped it, or it may have annotated
+    // it and rtype-skipped it.  The first says the closure walk did not
+    // reach the graph; the others say it did and the real rtyper refused
+    // it.  Phase-A failures used to share the never-a-subject message, so
+    // a census could not separate "never attempted" from "attempted and
+    // declined" — the same conflation the decline census exists to remove.
+    // Neither spelling matches any `unported_category` arm, so
+    // classification is unchanged.  Lookup is by `diag_key` alone
+    // (`CallPath::canonical_key()` at both prepass insert and publish);
+    // graph names are not unique (`default`, `new`, `call`, and
+    // `<Impl>::copy` shared across Int/Unicode/Bytes/Object dict
+    // strategies) so a name scan can publish another graph's
+    // concretetypes. `FunctionGraph::source_identity` is the unique
+    // funcobj key.
     let cached = {
         let tp = call_registry.two_phase();
         match tp.subjects.get(diag_key) {
@@ -4998,14 +5012,22 @@ pub(crate) fn dual_gate_outcome_from_cache(
                 subj.constant_concretetypes.clone(),
                 subj.constant_hlvalues.clone(),
             )),
-            Some(_) => Err("two-phase: subject rtype-skipped in prepass"),
-            None => Err("two-phase: graph was never a prepass subject"),
+            Some(_) => Err("two-phase: subject rtype-skipped in prepass".to_string()),
+            None => {
+                if let Some(reason) = tp.annotate_skipped.get(diag_key) {
+                    Err(format!(
+                        "two-phase: subject annotate-skipped in prepass: {reason}"
+                    ))
+                } else {
+                    Err("two-phase: graph was never a prepass subject".to_string())
+                }
+            }
         }
     };
     let (graph, mut value_to_var, value_to_var_candidates, mut constants, mut constant_values) =
         match cached {
             Ok(cached) => cached,
-            Err(reason) => return Ok(DualGateOutcome::Skip(reason.to_string())),
+            Err(reason) => return Ok(DualGateOutcome::Skip(reason)),
         };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
@@ -5280,6 +5302,108 @@ mod tests {
     fn an_access_directly_jit_graph_passes_the_sanity_check() {
         let (registry, path) = registry_with_a_flagged_graph();
         check_access_directly_sanity(&registry, &HashSet::from([path]));
+    }
+
+    fn empty_return_graph(name: &str) -> LegacyGraph {
+        let mut graph = LegacyGraph::new(name);
+        graph.set_return(graph.startblock, None);
+        graph
+    }
+
+    fn graph_calling_unregistered(name: &str) -> LegacyGraph {
+        let mut graph = empty_return_graph(name);
+        graph.block_mut(graph.startblock).operations.insert(
+            0,
+            crate::model::SpaceOperation {
+                result: None,
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["no_such".into(), "callee".into()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+            },
+        );
+        graph
+    }
+
+    /// Phase A attempted the graph: a failure is annotate-skipped, not
+    /// never-a-subject. Upstream `translator.graphs` still contains it
+    /// (`driver.py` task_annotate).
+    #[test]
+    fn phase_a_failure_publishes_as_annotate_skipped_not_never_a_subject() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "failing_subject".into()],
+        };
+        let graph = graph_calling_unregistered("failing_subject");
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        let outcome = dual_gate_outcome_from_cache(&graph, &registry, &path.canonical_key())
+            .expect("publish reads the cache");
+        let DualGateOutcome::Skip(reason) = outcome else {
+            panic!("Phase A fail must Skip, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("annotate-skipped"),
+            "Phase A fail must not look like a missed subject, got {reason}"
+        );
+        assert_eq!(
+            non_arm_skip_category(&reason),
+            Some("two-phase-annotate-skipped")
+        );
+    }
+
+    /// A codewriter graph the prepass candidate set did not contain is
+    /// never-a-subject.
+    #[test]
+    fn a_graph_absent_from_the_prepass_set_is_never_a_subject() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "unreached".into()],
+        };
+        let graph = empty_return_graph("unreached");
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        run_two_phase_prepass(&registry, &HashSet::new(), &graphs);
+        let outcome = dual_gate_outcome_from_cache(&graph, &registry, &path.canonical_key())
+            .expect("publish reads the cache");
+        let DualGateOutcome::Skip(reason) = outcome else {
+            panic!("unreached graph must Skip, got {outcome:?}");
+        };
+        assert_eq!(
+            non_arm_skip_category(&reason),
+            Some("two-phase-never-a-subject")
+        );
+    }
+
+    /// A publish `diag_key` that is not the prepass `canonical_key` must
+    /// not steal another graph's cached types through a name scan.
+    #[test]
+    fn dual_gate_cache_lookup_does_not_fall_back_to_graph_name() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "trivial".into()],
+        };
+        let graph = empty_return_graph("trivial");
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        let outcome = dual_gate_outcome_from_cache(&graph, &registry, "not_the_canonical_key")
+            .expect("publish reads the cache");
+        let DualGateOutcome::Skip(reason) = outcome else {
+            panic!("wrong diag_key must not Match, got {outcome:?}");
+        };
+        assert_eq!(
+            non_arm_skip_category(&reason),
+            Some("two-phase-never-a-subject")
+        );
     }
 
     /// `warmspot.py check_access_directly_sanity`: a graph outside the JIT
