@@ -90,6 +90,33 @@ fn make_struct_rusage(r: &majit_rlib::rtime::RUSAGE) -> pyre_object::PyObjectRef
     pyre_interpreter::_structseq::new_instance(struct_rusage_type(), fields.take())
 }
 
+/// `getrlimit` / `setrlimit` resource argument is a C `int`.
+fn resource_id(obj: pyre_object::PyObjectRef) -> Result<i32, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::c_int_w(obj)
+}
+
+/// `lib_pypy/resource.py getrlimit`: `0 <= resource < RLIM_NLIMITS`.
+#[allow(deprecated)]
+fn check_resource(resource: i32) -> Result<(), pyre_interpreter::PyError> {
+    if resource < 0 || resource >= libc::RLIM_NLIMITS as i32 {
+        Err(pyre_interpreter::PyError::value_error(
+            "invalid resource specified",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// `Modules/resource.c py2rlim`: unsigned conversion (`uint_w`), then the
+/// value must fit `rlim_t`. Negative → ValueError; wider than unsigned
+/// long long or `rlim_t` → OverflowError. `RLIM_INFINITY` fits `rlim_t`.
+fn rlim_w(obj: pyre_object::PyObjectRef) -> Result<libc::rlim_t, pyre_interpreter::PyError> {
+    let v = pyre_interpreter::baseobjspace::uint_w(obj)?;
+    libc::rlim_t::try_from(v).map_err(|_| {
+        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C rlim_t")
+    })
+}
+
 /// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level
 /// via `_resource_cffi`).  pyre takes CPython's `Modules/resource.c`
 /// shape since pyre has no app-level stdlib.
@@ -112,19 +139,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "getrusage",
             |args| {
                 let mut w_who = if let Some(&a) = args.first() {
-                    if unsafe { pyre_object::is_int(a) } {
-                        a
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "getrusage(): who should be an integer",
-                        ));
-                    }
+                    a
                 } else {
                     return Err(pyre_interpreter::PyError::type_error(
                         "getrusage() missing argument",
                     ));
                 };
-                let who = unsafe { pyre_object::w_int_get_value(w_who) as i32 };
+                let who = pyre_object::with_roots!(w_who => resource_id(w_who))?;
                 // `rtime.c_getrusage` (`releasegil=False`, no `save_err`).
                 // This is `resource.getrusage`, not `time.clock`.
                 let mut ru = unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
@@ -160,19 +181,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "getrlimit",
             |args| {
                 let mut w_res = if let Some(&a) = args.first() {
-                    if unsafe { pyre_object::is_int(a) } {
-                        a
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "getrlimit(): resource should be an integer",
-                        ));
-                    }
+                    a
                 } else {
                     return Err(pyre_interpreter::PyError::type_error(
                         "getrlimit() missing argument",
                     ));
                 };
-                let res = unsafe { pyre_object::w_int_get_value(w_res) as libc::rlim_t };
+                let res = pyre_object::with_roots!(w_res => resource_id(w_res))?;
+                check_resource(res)?;
                 let mut rl = unsafe { std::mem::zeroed::<libc::rlimit>() };
                 let ret = pyre_object::with_roots!(w_res => unsafe {
                     ll::c_getrlimit(res as majit_rlib::rffi::INT, &mut rl)
@@ -206,48 +222,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     ));
                 }
                 let mut w_res = args[0];
-                let res = unsafe {
-                    if !pyre_object::is_int(w_res) {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "setrlimit(): resource should be an integer",
-                        ));
-                    }
-                    pyre_object::w_int_get_value(w_res) as libc::rlim_t
-                };
-                // `lib_pypy/resource.py setrlimit` — `soft, hard = limits;
-                // soft = int(soft); hard = int(hard)`.  Accept any
-                // 2-item tuple or list and coerce each entry to int
-                // (PyPy unpacks via Python iteration; pyre's surface
-                // covers the two concrete sequence shapes callers
-                // actually use).
-                let (mut w_soft, mut w_hard) = unsafe {
-                    if pyre_object::is_tuple(args[1]) && pyre_object::w_tuple_len(args[1]) == 2 {
-                        (
-                            pyre_object::w_tuple_getitem(args[1], 0).unwrap(),
-                            pyre_object::w_tuple_getitem(args[1], 1).unwrap(),
-                        )
-                    } else if pyre_object::is_list(args[1]) && pyre_object::w_list_len(args[1]) == 2
-                    {
-                        (
-                            pyre_object::w_list_getitem(args[1], 0).unwrap(),
-                            pyre_object::w_list_getitem(args[1], 1).unwrap(),
-                        )
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "expected a tuple of 2 integers",
-                        ));
-                    }
-                };
-                let soft = pyre_object::with_roots!(w_res, w_soft, w_hard => pyre_interpreter::baseobjspace::int_w(w_soft))?
-                    as libc::rlim_t;
-                let hard = pyre_object::with_roots!(w_res, w_soft, w_hard => pyre_interpreter::baseobjspace::int_w(w_hard))?
-                    as libc::rlim_t;
+                let mut w_limits = args[1];
+                let res = pyre_object::with_roots!(w_res, w_limits => resource_id(w_res))?;
+                check_resource(res)?;
+                // `lib_pypy/resource.py setrlimit` — `limits = tuple(limits)`
+                // then `len(limits) != 2` → ValueError.
+                let items = pyre_object::with_roots!(w_res, w_limits => {
+                    pyre_interpreter::baseobjspace::unpackiterable(w_limits, -1)
+                })?;
+                if items.len() != 2 {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "expected a tuple of 2 integers",
+                    ));
+                }
+                let mut w_soft = items[0];
+                let mut w_hard = items[1];
+                let soft =
+                    pyre_object::with_roots!(w_res, w_soft, w_hard => rlim_w(w_soft))?;
+                let hard =
+                    pyre_object::with_roots!(w_res, w_soft, w_hard => rlim_w(w_hard))?;
                 let rl = libc::rlimit {
                     rlim_cur: soft,
                     rlim_max: hard,
                 };
                 let ret = pyre_object::with_roots!(w_res, w_soft, w_hard => unsafe {
-                    ll::c_setrlimit(res as majit_rlib::rffi::INT, &rl)
+                    ll::c_setrlimit(res, &rl)
                 });
                 if ret == -1 {
                     // `lib_pypy/resource.py setrlimit` — EINVAL and
@@ -275,6 +274,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             2,
+        ),
+    );
+    // `lib_pypy/resource.py getpagesize` → `os.sysconf("SC_PAGESIZE")`.
+    pyre_interpreter::module_ns_store(
+        ns,
+        "getpagesize",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "getpagesize",
+            |_| {
+                // `lib_pypy/resource.py getpagesize` → `os.sysconf("SC_PAGESIZE")`
+                // → `rposix.c_sysconf`.
+                let n = unsafe { majit_rlib::rposix::c_sysconf(libc::_SC_PAGESIZE) };
+                Ok(pyre_object::w_int_new(n as i64))
+            },
+            0,
         ),
     );
     // ── Constants (POSIX subset matching CPython) ──

@@ -354,6 +354,13 @@ fn windows_handles_signal(signum: i32) -> bool {
     )
 }
 
+/// interp_signal.py `signal` SIG_IGN arm: `pypysig_ignore` then
+/// `handlers_w[signum] = w_handler`.
+fn signal_ignore(signum: i32, w_handler: PyObjectRef) {
+    signalstate::pypysig_ignore(signum);
+    set_handler(signum, w_handler);
+}
+
 /// interp_signal.py `signal(signum, handler) -> previous`.
 fn signal_signal(
     w_signum: PyObjectRef,
@@ -802,13 +809,32 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         let ticker_addr = ec.actionflag.ticker_addr();
         signalstate::register_ticker(ticker_addr);
 
-        // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
+        // app_main.run_command_line — `signal.signal(SIGINT, default_int_handler)`.
         #[cfg(any(unix, windows))]
         let sigint = libc::SIGINT;
         #[cfg(not(any(unix, windows)))]
         let sigint = wasm_signals::SIGINT;
         if signalstate::pypysig_setflag(sigint) {
             set_handler(sigint, default_int_handler_obj());
+        }
+        // app_main.run_command_line — `signal.signal(SIGPIPE, SIG_IGN)` and
+        // `signal.signal(SIGXFSZ, SIG_IGN)` (`hasattr` each).  Same
+        // interp_signal.signal SIG_IGN arm as the Python-visible call:
+        // `pypysig_ignore` then `handlers_w` store.  Numbers come from the
+        // same `sig` source `register_module` publishes.
+        #[cfg(unix)]
+        {
+            #[cfg(feature = "host_env")]
+            use rustpython_host_env::signal as sig;
+            #[cfg(not(feature = "host_env"))]
+            use libc as sig;
+            let mut ign = pyre_object::w_int_new(1);
+            pyre_object::with_roots!(ign => {
+                signal_ignore(sig::SIGPIPE, ign)
+            });
+            pyre_object::with_roots!(ign => {
+                signal_ignore(sig::SIGXFSZ, ign)
+            });
         }
         action as *mut CheckSignalAction as usize
     });
