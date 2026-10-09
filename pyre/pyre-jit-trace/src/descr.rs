@@ -9768,6 +9768,7 @@ mod tests {
             size: 32,
             type_id: owner_id,
             vtable: 0,
+            owner: String::new(),
             is_gc_managed: true,
             headerless: false,
             all_fielddescrs: Vec::new(),
