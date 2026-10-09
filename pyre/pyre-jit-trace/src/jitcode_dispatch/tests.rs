@@ -2384,6 +2384,74 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
     ));
 }
 
+#[test]
+fn replay_scan_admits_inline_call_of_fresh_alloc_callee() {
+    // A callee that only allocates and returns that allocation is
+    // replay-safe (`perform_call` traces look-inside `ll_newdict`).
+    // The caller's `inline_call` is admitted, and `dst` inherits
+    // freshness so a following init store is not live-heap.
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    let mut callee = majit_metainterp::JitCodeBuilder::new();
+    callee.new_with_vtable(0, 16, 1, 0);
+    callee.ref_return(0);
+    let callee_jc = std::sync::Arc::new(callee.finish());
+
+    let inline_byte = *insns_opname_to_byte().get("inline_call_r_r/dR>r").unwrap();
+    let setfield = *insns_opname_to_byte().get("setfield_gc_i/rid").unwrap();
+    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
+    let code = [inline_byte, 0, 0, 0, 0, setfield, 0, 0, 2, 0, ret, 0];
+    let descrs = vec![
+        make_fail_descr(0),
+        make_fail_descr(1),
+        field_descr_with_index(2),
+    ];
+    let pool = [RuntimeBhDescr::JitCode(callee_jc)];
+    let scan = fbw_callee_body_replay_scan(
+        &code,
+        &[],
+        1,
+        &[0],
+        1,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&pool),
+        false,
+    );
+    assert_eq!(scan.verdict(), CalleeReplaySafety::Clean);
+    assert!(scan.poison.is_empty());
+}
+
+#[test]
+fn replay_scan_poisons_inline_call_of_store_into_nonfresh() {
+    // A callee that stores into a register it did not allocate is
+    // still `UnprovableStoreOrCallForm` on the caller's `inline_call`.
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    let mut callee = majit_metainterp::JitCodeBuilder::new();
+    callee.setfield_gc_i(0, 1, 8, 99, "mut");
+    callee.ref_return(0);
+    let callee_jc = std::sync::Arc::new(callee.finish());
+
+    let inline_byte = *insns_opname_to_byte().get("inline_call_r_r/dR>r").unwrap();
+    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
+    let code = [inline_byte, 0, 0, 0, 0, ret, 0];
+    let pool = [RuntimeBhDescr::JitCode(callee_jc)];
+    let scan = fbw_callee_body_replay_scan(
+        &code,
+        &[],
+        0,
+        &[],
+        1,
+        &[],
+        &[],
+        RawDescrPool::PerFn(&pool),
+        false,
+    );
+    assert_eq!(scan.verdict(), CalleeReplaySafety::Dirty);
+    assert_eq!(scan.poison, vec![0]);
+}
+
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard

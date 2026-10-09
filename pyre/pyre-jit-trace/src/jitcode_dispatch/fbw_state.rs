@@ -4061,10 +4061,10 @@ impl CalleeReplayScan {
 /// residual that did not inline.  Every other unproven residual is `Dirty`.
 ///
 /// A `new_with_vtable/d>r` or `new_array*` result is fresh within this body.
-/// A `setfield_gc` initialization write into one is benign only when the
-/// target field is immutable (`wrapint` is the important instance,
-/// `W_IntObject.intval`); a `setarrayitem_gc` into a fresh array is benign
-/// outright, since replay writes the replay's own array (`BUILD_TUPLE` /
+/// A `setfield_gc` into one is an initialization of the replay's own object
+/// (`wrapint`'s `W_IntObject.intval` is the immutable instance; `ll_newdict`
+/// / `space.newdict()` writes mutable strategy fields the same way).  A
+/// `setarrayitem_gc` into a fresh array is the same shape (`BUILD_TUPLE` /
 /// `BUILD_LIST` fill their backing block this way).  Freshness may pass
 /// through `ref_copy`, but every other Ref-producing instruction clears it,
 /// so a later store cannot accidentally be classified as an initialization of
@@ -4175,7 +4175,10 @@ macro_rules! replay_unscannable {
         if fbw_inline_diag_enabled() {
             eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
         }
-        return CalleeReplayScan::unscannable();
+        return ReplayScanCore {
+            scan: CalleeReplayScan::unscannable(),
+            ret: ReplayReturnFacts::default(),
+        };
     }};
 }
 
@@ -4184,6 +4187,137 @@ macro_rules! replay_unscannable {
 /// the number cannot be matched against any op.  `PYRE_FBW_REPLAY_DIRTY_BODY=1`
 /// lists each body as it is scanned, so the verdict line that follows a listing
 /// names an op within it.
+/// Return-value facts the scan proved about every `ref_return` in the body.
+///
+/// An `inline_call_*` whose callee itself passes this scan copies these onto
+/// its destination register: a callee that returns a `new_with_vtable` result
+/// marks `dst` fresh, the same way `pyjitpl.py` `perform_call`/`inline_call`
+/// traces a look-inside helper (`ll_newdict` / `space.newdict()`) rather than
+/// name-checking it.
+#[derive(Clone, Copy, Default)]
+struct ReplayReturnFacts {
+    fresh: bool,
+    exact_numeric: bool,
+    exact_plain_int: bool,
+    exact_bool: bool,
+}
+
+struct ReplayScanCore {
+    scan: CalleeReplayScan,
+    ret: ReplayReturnFacts,
+}
+
+fn replay_scan_descr_ref(
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    index: usize,
+) -> Option<DescrRef> {
+    if let Some(descr) = callee_descr_refs.get(index) {
+        return Some(descr.clone());
+    }
+    if callee_descr_refs.is_empty() {
+        if let super::RawDescrPool::Global = callee_pool {
+            return crate::jitcode_runtime::descr_ref_at(index);
+        }
+    }
+    None
+}
+
+fn descr_refs_from_runtime_bh(
+    descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
+) -> Vec<DescrRef> {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    descrs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            RuntimeBhDescr::ResolvedDescr { .. } => d
+                .as_optimizer_descr()
+                .cloned()
+                .unwrap_or_else(|| crate::descr::make_jitcode_descr(i)),
+            RuntimeBhDescr::JitCode(_)
+            | RuntimeBhDescr::JitCodeBackEdge(_)
+            | RuntimeBhDescr::Call(_)
+            | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
+        })
+        .collect()
+}
+
+/// Resolve the callee jitcode an `inline_call_*` `d` operand names.
+/// The descr indexes the scanned body's pool (`runtime_jitcode_at`);
+/// else `callee_descr_refs[..].as_jitcode_descr()` /
+/// `get_runtime_jitcode_by_index`.
+fn inline_call_callee_jitcode(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    if !d.argcodes.starts_with('d') {
+        return None;
+    }
+    let descr_index = {
+        let lo = *body_code.get(d.pc + 1)? as usize;
+        let hi = *body_code.get(d.pc + 2)? as usize;
+        lo | (hi << 8)
+    };
+    if let Some(jc) = callee_pool.runtime_jitcode_at(descr_index) {
+        return Some(jc);
+    }
+    let sub_index = callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_jitcode_descr())
+        .map(|jc| jc.jitcode_index())?;
+    match callee_pool {
+        super::RawDescrPool::PerFn(descrs) => {
+            descrs.get(sub_index).and_then(|d| d.as_jitcode_owned())
+        }
+        super::RawDescrPool::Global => {
+            crate::jitcode_runtime::get_runtime_jitcode_by_index(sub_index)
+        }
+    }
+}
+
+fn replay_scan_inline_call_callee(
+    jc: &majit_metainterp::jitcode::JitCode,
+    depth: usize,
+) -> ReplayScanCore {
+    let code = jc.code.as_slice();
+    let constants_i = jc.constants_i.as_slice();
+    let constants_r = jc.constants_r.as_slice();
+    let num_regs_i = jc.num_regs_i();
+    let num_regs_r = jc.num_regs_r();
+    if jc.uses_global_descr_pool() {
+        fbw_callee_body_replay_scan_at_depth(
+            code,
+            &[],
+            num_regs_i,
+            constants_i,
+            num_regs_r,
+            constants_r,
+            &[],
+            super::RawDescrPool::Global,
+            false,
+            depth,
+        )
+    } else {
+        let descr_refs = descr_refs_from_runtime_bh(&jc.exec.descrs);
+        fbw_callee_body_replay_scan_at_depth(
+            code,
+            &[],
+            num_regs_i,
+            constants_i,
+            num_regs_r,
+            constants_r,
+            &descr_refs,
+            super::RawDescrPool::PerFn(&jc.exec.descrs),
+            false,
+            depth,
+        )
+    }
+}
+
 fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
     if !fbw_inline_diag_enabled() || std::env::var_os("PYRE_FBW_REPLAY_DIRTY_BODY").is_none() {
         return;
@@ -4225,6 +4359,38 @@ pub(crate) fn fbw_callee_body_replay_scan(
     callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {
+    fbw_callee_body_replay_scan_at_depth(
+        body_code,
+        arg_facts,
+        num_regs_i,
+        constants_i,
+        num_regs_r,
+        constants_r,
+        callee_descr_refs,
+        callee_pool,
+        method_form_deferred_helpers,
+        0,
+    )
+    .scan
+}
+
+/// Depth is the number of `inline_call_*` callees already entered from the
+/// root body.  Bounded by [`fbw_max_multiframe_depth`] — the same cap
+/// `walker_capture_multi_frame_inline_snapshot` uses for a value-returning
+/// callee chain — so a look-inside helper nest cannot walk past the inline
+/// depth the walker itself unrolls.
+fn fbw_callee_body_replay_scan_at_depth(
+    body_code: &[u8],
+    arg_facts: &[CalleeArgFact],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    num_regs_r: usize,
+    constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    method_form_deferred_helpers: bool,
+    depth: usize,
+) -> ReplayScanCore {
     replay_safety_dump_body(body_code, callee_descr_refs);
     let mut poison: Vec<usize> = Vec::new();
     let mut protected: Vec<usize> = Vec::new();
@@ -4271,19 +4437,26 @@ pub(crate) fn fbw_callee_body_replay_scan(
     // holds the caller's argument.
     let mut seed_numeric_ref_regs = [false; u8::MAX as usize + 1];
     let mut seed_plain_int_ref_regs = [false; u8::MAX as usize + 1];
-    for (index, raw) in constants_r.iter().enumerate() {
-        let Some(reg) = num_regs_r
-            .checked_add(index)
-            .filter(|r| *r < seed_numeric_ref_regs.len())
-        else {
-            break;
-        };
-        let obj = raw.get() as usize as pyre_object::PyObjectRef;
-        if !obj.is_null() {
-            let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
-            seed_plain_int_ref_regs[reg] = exact_int;
-            seed_numeric_ref_regs[reg] =
-                exact_int || unsafe { pyre_object::is_plain_float_strict(obj) };
+    // The Python callee's `constants_r` slots are interned `PyObject`s
+    // (`box_str_constant` / `LoadConst`).  A look-inside helper jitcode's
+    // slots are not — they may be tagged immediates or rpython pointers —
+    // so the exactness seed runs only at the root body.  Nested scans still
+    // see `new_with_vtable` / `box_int` freshness from the ops themselves.
+    if depth == 0 {
+        for (index, raw) in constants_r.iter().enumerate() {
+            let Some(reg) = num_regs_r
+                .checked_add(index)
+                .filter(|r| *r < seed_numeric_ref_regs.len())
+            else {
+                break;
+            };
+            let obj = raw.get() as usize as pyre_object::PyObjectRef;
+            if !obj.is_null() {
+                let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
+                seed_plain_int_ref_regs[reg] = exact_int;
+                seed_numeric_ref_regs[reg] =
+                    exact_int || unsafe { pyre_object::is_plain_float_strict(obj) };
+            }
         }
     }
     let mut numeric_ref_regs = seed_numeric_ref_regs;
@@ -4317,6 +4490,13 @@ pub(crate) fn fbw_callee_body_replay_scan(
     // frames, so it stops claiming anything.
     let mut vable_reg: Option<u8> = None;
     let mut deferred_call = false;
+    let mut seen_ref_return = false;
+    let mut return_facts = ReplayReturnFacts {
+        fresh: true,
+        exact_numeric: true,
+        exact_plain_int: true,
+        exact_bool: true,
+    };
     // `RETURN_VALUE` stores `frame_finished_execution` as
     // `getfield flags; int_or FLAG_FRAME_FINISHED; setfield flags`
     // immediately before `ref_return` (`pyopcode.py`). The bit is sticky.
@@ -4359,6 +4539,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
         let mut dst_exact_numeric = false;
         let mut dst_exact_plain_int = false;
         let mut dst_exact_bool = false;
+        let mut dst_fresh = false;
 
         // The ref-slot accessors name the frame in operand 0 and the slot in
         // operand 1, both one byte wide.  The `_i` / `_f` variants address a
@@ -4409,17 +4590,20 @@ pub(crate) fn fbw_callee_body_replay_scan(
         // descr does not resolve is poisoned here and then matches no arm — it
         // is not a `setfield_gc`, a `setarrayitem_gc`, or any of the store
         // forms below, so the chain runs off the end, which is the intent.
-        let residual_call_descr = if d.opname.starts_with("residual_call") {
+        let residual_call_owned = if d.opname.starts_with("residual_call") {
             match residual_call_descr_index_in_body(body_code, &d) {
                 None => {
                     replay_poison!(poison, "ResidualCallDescrIndexMissing", d.pc, d.opname);
                     None
                 }
                 Some(descr_index) => {
-                    let resolved = callee_descr_refs
-                        .get(descr_index)
-                        .and_then(|descr| descr.as_call_descr());
-                    if resolved.is_none() {
+                    let resolved =
+                        replay_scan_descr_ref(callee_descr_refs, callee_pool, descr_index);
+                    if resolved
+                        .as_ref()
+                        .and_then(|descr| descr.as_call_descr())
+                        .is_none()
+                    {
                         replay_poison!(poison, "ResidualCallDescrNotACall", d.pc, d.opname);
                     }
                     resolved
@@ -4429,7 +4613,10 @@ pub(crate) fn fbw_callee_body_replay_scan(
             None
         };
 
-        if let Some(call_descr) = residual_call_descr {
+        if let Some(call_descr) = residual_call_owned
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+        {
             let ei = call_descr.get_extra_info();
             // `ForIterNext` is deliberately not accepted here: it advances the
             // shared heap iterator irreversibly (no journal undo), so replaying
@@ -4810,11 +4997,6 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if !d.argcodes.starts_with('r') {
                 replay_poison!(poison, "SetfieldGcTargetNotRefReg", d.pc, d.opname);
             } else if let Some(&target_reg) = body_code.get(d.pc + 1) {
-                let descr_index = decode_descr_index(body_code, &d, 2);
-                let immutable_field = callee_descr_refs
-                    .get(descr_index)
-                    .and_then(|descr| descr.as_field_descr())
-                    .is_some_and(|field| field.is_immutable());
                 // PyPy's `MetaInterp._interpret` owns one MIFrame per inlined
                 // call.  Replaying the caller CALL abandons and rebuilds that
                 // callee frame, so lifecycle/bookkeeping stores on the
@@ -4842,10 +5024,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                         && crate::jitcode_runtime::decode_op_at(body_code, d.next_pc)
                             .is_some_and(|next| next.key == "ref_return/r")
                 });
-                if !finished_return
-                    && !callee_owned_frame
-                    && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
-                {
+                if !finished_return && !callee_owned_frame && !fresh_ref_regs[target_reg as usize] {
                     replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
                 }
             } else {
@@ -4889,7 +5068,35 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     dst_exact_bool = true;
                 }
                 None => {
-                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    // `pyjitpl.py` `perform_call`/`inline_call` traces a
+                    // look-inside callee (`ll_newdict` / `space.newdict()`),
+                    // so replay safety is a property of that body.  Recurse
+                    // with the same scan, bounded by
+                    // [`fbw_max_multiframe_depth`].
+                    if depth >= fbw_max_multiframe_depth() {
+                        replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    } else if let Some(jc) = inline_call_callee_jitcode(
+                        body_code,
+                        &d,
+                        callee_descr_refs,
+                        callee_pool,
+                    ) {
+                        let nested = replay_scan_inline_call_callee(&jc, depth + 1);
+                        if nested.scan.unscannable || !nested.scan.poison.is_empty() {
+                            replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                        } else {
+                            if nested.scan.safety == CalleeReplaySafety::DeferredCall {
+                                deferred_call = true;
+                            } else {
+                                dst_fresh = nested.ret.fresh;
+                                dst_exact_numeric = nested.ret.exact_numeric;
+                                dst_exact_plain_int = nested.ret.exact_plain_int;
+                                dst_exact_bool = nested.ret.exact_bool;
+                            }
+                        }
+                    } else {
+                        replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    }
                 }
             }
         } else if d.opname.starts_with("setinteriorfield_gc")
@@ -4920,7 +5127,8 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if vable_reg == Some(dst) {
                 vable_reg = None;
             }
-            fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
+            fresh_ref_regs[dst as usize] = dst_fresh
+                || d.key == "new_with_vtable/d>r"
                 || d.opname.starts_with("new_array")
                 || (d.key == "ref_copy/r>r"
                     && body_code
@@ -5000,19 +5208,42 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 }
             }
         }
+        if d.key == "ref_return/r" {
+            if let Some(&src) = body_code.get(d.pc + 1) {
+                let src = src as usize;
+                if !seen_ref_return {
+                    seen_ref_return = true;
+                    return_facts.fresh = fresh_ref_regs[src];
+                    return_facts.exact_numeric = numeric_ref_regs[src];
+                    return_facts.exact_plain_int = plain_int_ref_regs[src];
+                    return_facts.exact_bool = bool_ref_regs[src];
+                } else {
+                    return_facts.fresh &= fresh_ref_regs[src];
+                    return_facts.exact_numeric &= numeric_ref_regs[src];
+                    return_facts.exact_plain_int &= plain_int_ref_regs[src];
+                    return_facts.exact_bool &= bool_ref_regs[src];
+                }
+            }
+        }
         flags_get = next_get;
         finished_or = next_or;
         pc = d.next_pc;
     }
-    CalleeReplayScan {
-        safety: if deferred_call {
-            CalleeReplaySafety::DeferredCall
-        } else {
-            CalleeReplaySafety::Clean
+    if !seen_ref_return {
+        return_facts = ReplayReturnFacts::default();
+    }
+    ReplayScanCore {
+        scan: CalleeReplayScan {
+            safety: if deferred_call {
+                CalleeReplaySafety::DeferredCall
+            } else {
+                CalleeReplaySafety::Clean
+            },
+            poison,
+            protected,
+            unscannable: false,
         },
-        poison,
-        protected,
-        unscannable: false,
+        ret: return_facts,
     }
 }
 
