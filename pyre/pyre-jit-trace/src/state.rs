@@ -6442,17 +6442,10 @@ pub(crate) fn capture_frame_stack_for_publish(
 /// full-stack override.  The height is checked against the forward analysis for
 /// the same reason that override is: a mirror describing another coordinate
 /// must decline, not publish a shifted stack.
-///
-/// `resume_past` is the ABORT_ESCAPE residual path: the opcode at `py_pc` has
-/// already run (`convert_and_run_from_pyjitpl` at `next_pc`), the slots are
-/// the POST-call prefix, and `last_instr = py_pc` so `next_instr()` continues
-/// after it.  The entry-depth table does not describe that prefix, so the
-/// equality check is skipped.
 pub(crate) fn capture_frame_stack_from_mirror(
     live_frame: usize,
     py_pc: usize,
     stack: &[PyObjectRef],
-    resume_past: bool,
 ) -> Option<CapturedFrameStack> {
     let stack_base = concrete_nlocals(live_frame)?;
     let valuestackdepth = stack_base.checked_add(stack.len())?;
@@ -6463,33 +6456,28 @@ pub(crate) fn capture_frame_stack_from_mirror(
     if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < valuestackdepth {
         return None;
     }
-    let last_instr = if resume_past {
-        py_pc as isize
-    } else {
-        let w_code = unsafe {
-            *((live_frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
-                as *const *const ())
-        };
-        if w_code.is_null() {
-            return None;
-        }
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
-        let depth = crate::liveness::liveness_for(raw_code)
-            .depth_at_py_pc()
-            .get(py_pc)
-            .copied()?;
-        if depth as usize != stack.len() {
-            return None;
-        }
-        py_pc as isize - 1
+    let w_code = unsafe {
+        *((live_frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
+            as *const *const ())
     };
+    if w_code.is_null() {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let depth = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(py_pc)
+        .copied()?;
+    if depth as usize != stack.len() {
+        return None;
+    }
     Some(CapturedFrameStack {
         stack_base,
         scalars: FrameScalars {
-            last_instr,
+            last_instr: py_pc as isize - 1,
             valuestackdepth,
         },
         roots: stack.iter().map(|&value| value as i64).collect(),

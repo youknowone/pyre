@@ -393,17 +393,8 @@ pub(crate) struct MirrorStackImage {
     /// Python pc of the opcode the walk stopped inside.  Pairs with the slots:
     /// the mirror reflects the depth ON ENTRY to this opcode, which is the
     /// `last_instr = py_pc - 1` coordinate the codewriter stores for it.
-    /// A resume-past image (`resume_past`) instead holds the POST-call
-    /// prefix at this same `py_pc`, and capture stores `last_instr = py_pc`
-    /// so `next_instr()` continues after the residual.
     pub(crate) py_pc: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
-    /// True when the residual has already run and the blackhole must resume
-    /// PAST it (`convert_and_run_from_pyjitpl` after `ABORT_ESCAPE`).  The
-    /// walker `vstack_boxes` still hold the ON-ENTRY operand stack; a void
-    /// residual's opcode pops have to be applied here so FOR_ITER does not
-    /// see a STORE_SUBSCR key as TOS.
-    pub(crate) resume_past: bool,
 }
 
 pub(crate) struct LatchedSingleFrameBlackhole {
@@ -476,7 +467,6 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
                 vable_frame,
                 mirror.py_pc,
                 &mirror.slots,
-                mirror.resume_past,
             )
             .is_some()
     })
@@ -589,42 +579,7 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: ctx.vstack_cur_pypc as usize,
         slots,
-        resume_past: false,
     })
-}
-
-/// Resume-past counterpart of [`capture_vstack_mirror_image`].
-///
-/// `pyjitpl.py vable_after_residual_call` raises `SwitchToBlackhole(ABORT_ESCAPE)`
-/// after the residual has run; `blackhole.py convert_and_run_from_pyjitpl`
-/// copies `MIFrame` registers at `next_pc`, where the call's operand suffix
-/// is already consumed.  The walker mirror is still the ON-ENTRY Python
-/// operand stack, so a void residual (STORE_SUBSCR / STORE_NAME) has to
-/// drop that suffix before the adopter publishes it — otherwise FOR_ITER
-/// reads the store key as TOS.  Producing residuals splice their result
-/// through `lastop_result` into the MIFrame banks and keep the entry
-/// mirror; their Python-stack publish is the entry image the existing
-/// adopt already consumed.
-fn capture_resume_past_mirror_image<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    lastop_result: Option<(char, usize, i64)>,
-) -> Option<MirrorStackImage> {
-    let mut image = capture_vstack_mirror_image(ctx, "escape-flush")?;
-    if lastop_result.is_some() {
-        return Some(image);
-    }
-    let Some(code) = walker_active_py_code(ctx) else {
-        return Some(image);
-    };
-    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, image.py_pc) else {
-        return Some(image);
-    };
-    let (post_depth, _) = crate::liveness::stack_effects(&instr, op_arg, image.slots.len());
-    if post_depth <= image.slots.len() {
-        image.slots.truncate(post_depth);
-        image.resume_past = true;
-    }
-    Some(image)
 }
 
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
@@ -724,7 +679,6 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: resume_py_pc,
         slots,
-        resume_past: false,
     })
 }
 
@@ -4254,15 +4208,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // None ref, so it is not a void call yet still mutates) — eager-everything +
     // commit is the single consistent rule, matching `do_residual_call`.
     //
-    // The snapshot (`virtualizable_heap_ptr`) for a MayForce residual —
-    // rooted across the call so a collection can forward the sync target
-    // and the restore below can write it back.  None for non-force opcodes
-    // and when no vable exists.  The TOKEN_TRACING_RESCALL stamp is not
-    // this pointer: at root entry the heap pointer is the
-    // `snapshot_for_tracing` copy, and residual native readers
-    // (`gettopframe_nohidden` / `get_w_globals`) see the live identity.
-    // `tracing_before_residual_call` below arms `live_frame` instead.
-    // The token is armed further below, past every decline gate.
+    // The standard virtualizable box pointer for a MayForce residual — a
+    // force inside the callee could escape the frame.  None for non-forces
+    // opcodes and when no live vable exists (the jitdriver has no standard
+    // virtualizable, or unit-test init disabled the heap pointer) — nothing
+    // the callee could force.  The token is armed further below, past every
+    // decline gate.
     let mut vable_obj_root = if is_may_force {
         ctx.trace_ctx
             .standard_virtualizable_box()
@@ -4794,22 +4745,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         }
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
-            // `pyjitpl.py vable_and_vrefs_before_residual_call` unwraps
-            // `virtualizable_boxes[-1]` — the live identity residual native
-            // code reads. `**obj` is the snapshot sync target, a different
-            // object at root entry
-            // (`trace_ctx.rs merge_point_records_the_vable_identity_not_the_sync_target`).
-            // Arming the snapshot left `force_virtualizable_if_necessary` on
-            // the live frame looking at TOKEN_NONE while
-            // `tracing_after_residual_call` still saw TOKEN_TRACING_RESCALL
-            // on the copy, so `ABORT_ESCAPE` never fired
-            // (`virtualizable.py force_now`).
-            let token_ptr = if live_frame != 0 {
-                live_frame_root.current(live_frame) as *mut u8
-            } else {
-                **obj as usize as *mut u8
-            };
-            info.tracing_before_residual_call(token_ptr);
+            info.tracing_before_residual_call(**obj as usize as *mut u8);
         }
         Some(root_depth)
     } else {
@@ -5088,12 +5024,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // cleared back to TOKEN_NONE.
     if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let token_ptr = if live_frame != 0 {
-            live_frame_root.current(live_frame) as *mut u8
-        } else {
-            **obj as usize as *mut u8
-        };
-        let forced = unsafe { info.tracing_after_residual_call(token_ptr) };
+        let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
@@ -5237,15 +5168,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                // `pyjitpl.py vable_after_residual_call` raises
-                // `SwitchToBlackhole(ABORT_ESCAPE)` for loop traces and
-                // bridges alike; `convert_and_run_from_pyjitpl` then runs
-                // forward past the residual. A bridge walk still goes
-                // through `run_perfn_walk`'s VableEscape adopt, so the
-                // resume-past image is latched here the same way a portal
-                // walk latches it. The Exact rewind commit above stays
-                // off bridges: that path would re-run the opcode.
-                if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
+                // Same non-bridge latch as the escape-flush commit above:
+                // a bridge walk never adopts this image (`run_perfn_walk`
+                // epilogue is skipped).
+                if ctx.session.borrow().at_portal()
+                    && !ctx.fbw_mode.inline_subwalk
+                    && !ctx.trace_ctx.is_bridge_trace
+                {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())
@@ -5259,10 +5188,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         // stops inside the residual call, and the resumed
                         // blackhole can reach a `getarrayitem_vable_r` that
                         // reloads an operand from the virtualizable array, so
-                        // publish the POST-call prefix: the residual has
-                        // already consumed its operand suffix
-                        // (`convert_and_run_from_pyjitpl` at `next_pc`).
-                        let mirror_stack = capture_resume_past_mirror_image(ctx, lastop_result);
+                        // publish the root stack from the walker's mirror.
+                        let mirror_stack = capture_vstack_mirror_image(ctx, "escape-flush");
                         if fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[latch-accept] origin=escape-flush single-frame pc={} \
@@ -5420,8 +5347,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     }
     // Not forced, so nothing above consumed the pre-call image.  The reachable
     // shape is the same `f_locals` write-through as the forced arm, one
-    // recording later: a residual that stores through the array without
-    // forcing still lands on the heap with no escape and no shadow reload.
+    // recording later: with the callee inlined the store IS the residual, and
+    // `framelocalsproxy_setitem`'s own force is gated on the live frame's
+    // `vable_token` -- which the walk arms on its snapshot instead -- so the
+    // store lands on the array with no escape raised and no shadow reload.
     // The walk would otherwise carry the box it held before the call all the
     // way into the jump arguments the loop closes on.
     //

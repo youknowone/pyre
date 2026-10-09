@@ -3288,7 +3288,6 @@ fn try_adopt_single_frame_blackhole(
                     vable_frame,
                     mirror.py_pc,
                     &mirror.slots,
-                    mirror.resume_past,
                 )
             })
         } else {
@@ -3901,12 +3900,7 @@ fn try_adopt_multi_frame_blackhole(
         || commit_leg == WalkEndCommitLeg::TraceTooLong
     {
         latched.mirror_stack.as_ref().and_then(|mirror| {
-            crate::state::capture_frame_stack_from_mirror(
-                root_addr,
-                mirror.py_pc,
-                &mirror.slots,
-                mirror.resume_past,
-            )
+            crate::state::capture_frame_stack_from_mirror(root_addr, mirror.py_pc, &mirror.slots)
         })
     } else {
         crate::state::capture_frame_stack_for_publish(cf_addr, root_addr)
