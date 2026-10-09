@@ -1372,7 +1372,14 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// the storage as an erased `*mut u8` so the trait surface stays
     /// strategy-agnostic.
     fn get_empty_storage(&self) -> *mut u8 {
-        crate::lltype::malloc_raw(ModuleDictStorage::new()) as *mut u8
+        // `celldict.py get_empty_storage`: `self.erase({})` is a nursery
+        // `dicttable`. A `malloc_raw` table has no MiniMark header, so
+        // `ll_dict_grow`'s `d.entries = newitems` write barrier cannot
+        // remember the young `DICTENTRYARRAY`.
+        crate::gc_storage::gc_alloc_young_storage_box(
+            ModuleDictStorage::new(),
+            module_dict_storage_gc_type_id(),
+        ) as *mut u8
     }
 
     /// `celldict.py getitem` — str fast path, else
