@@ -8550,6 +8550,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // The construct fold declined: an exception class whose `__new__` and
+    // `__init__` are both builtin gateways descends `descr_call` like any
+    // other class.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && let Some(inlined) = try_walker_inline_exception_type_call(
+            ctx, op, code, funcptr, 1, &r_args, call_descr, dst_bank, dst,
+        )?
+    {
+        return Ok(inlined);
+    }
     // `BaseException___reduce___impl`: `(cls, args)` when `w_dict` is
     // NULL, `(cls, args, dict)` when the pointer is set. Residual
     // `bh_call_fn(__reduce__)` otherwise forces the virtual exception
