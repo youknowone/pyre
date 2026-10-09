@@ -228,6 +228,10 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
         .map_err(|_| "set_recursion_limit failed".to_string())?;
     pyre_module::register();
     init_jit_hooks();
+    // The previous test's `sys` module and its path list live in the collector
+    // this reset leaks. Drop the registry entry while that collector is still
+    // current, or the next `add_sys_path_0` frees the old list storage.
+    importing::remove_sys_module("sys");
     // Per-worker fresh GC heap: these tests share the process-global GC
     // singleton, so hide any prior test's residue before this one allocates.
     reset_gc_fresh_for_test();
@@ -3342,5 +3346,33 @@ assert b == bytearray(b"abcdef\x01\x02"), b
         "memoryview_derived_export.py",
         "memoryview derived export",
         "derived memoryviews must share the root's export",
+    );
+}
+
+/// `sys.intern` on a miss stores a weak managed string. A later collection
+/// must keep that string while a strong reference lives, and a builtin
+/// `interp2app` reached through the declaration container must still run.
+#[test]
+fn intern_and_declaration_roots_survive_collection() {
+    run_on_worker(
+        r#"
+import gc
+import sys
+
+name = "pyre-intern-survives-collection-9c1e"
+first = sys.intern(name)
+assert sys.intern(name) is first
+gc.collect()
+assert sys.intern(name) is first, "intern miss was not the same object after collect"
+assert first + "!" == name + "!"
+
+add = int.__add__
+gc.collect()
+assert int.__add__ is add
+assert add(1, 2) == 3
+"#,
+        "intern_and_declaration_roots.py",
+        "intern identity and declaration interior",
+        "intern or declaration root did not survive collection",
     );
 }

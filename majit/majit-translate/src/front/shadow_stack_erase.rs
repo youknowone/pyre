@@ -207,12 +207,22 @@ fn const_usize(op: &Operand, llbc: &Llbc) -> Option<usize> {
     lit.as_array()?.get(1)?.as_str()?.parse().ok()
 }
 
-fn binop_is_add(op: &Value) -> Option<bool> {
-    // `"AddChecked"` yields a pair; `"Add"` / `{"Add": "Wrap"}` a value.
+/// A compile-time slot-index `+ k` or `- k`. `"*Checked"` yields a pair;
+/// `"Add"` / `"Sub"` / `{"Add": "Wrap"}` / `{"Sub": "Wrap"}` a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexArith {
+    Add { checked: bool },
+    Sub { checked: bool },
+}
+
+fn binop_is_index_arith(op: &Value) -> Option<IndexArith> {
     match op {
-        Value::String(s) if s == "AddChecked" => Some(true),
-        Value::String(s) if s == "Add" => Some(false),
-        Value::Object(m) if m.contains_key("Add") => Some(false),
+        Value::String(s) if s == "AddChecked" => Some(IndexArith::Add { checked: true }),
+        Value::String(s) if s == "Add" => Some(IndexArith::Add { checked: false }),
+        Value::Object(m) if m.contains_key("Add") => Some(IndexArith::Add { checked: false }),
+        Value::String(s) if s == "SubChecked" => Some(IndexArith::Sub { checked: true }),
+        Value::String(s) if s == "Sub" => Some(IndexArith::Sub { checked: false }),
+        Value::Object(m) if m.contains_key("Sub") => Some(IndexArith::Sub { checked: false }),
         _ => None,
     }
 }
@@ -366,17 +376,20 @@ fn assert_is_erased_index_add_overflow(
     let Some(arr) = assert.check_kind.get("Overflow").and_then(Value::as_array) else {
         return false;
     };
-    let is_add = match arr.first() {
-        Some(Value::String(s)) => s == "Add" || s == "AddChecked",
-        Some(Value::Object(m)) => m.contains_key("Add"),
+    let is_index_arith = match arr.first() {
+        Some(Value::String(s)) => {
+            s == "Add" || s == "AddChecked" || s == "Sub" || s == "SubChecked"
+        }
+        Some(Value::Object(m)) => m.contains_key("Add") || m.contains_key("Sub"),
         _ => false,
     };
-    if !is_add || arr.len() < 3 {
+    if !is_index_arith || arr.len() < 3 {
         return false;
     }
-    // A compile-time slot offset plus a usize length/one cannot
+    // A compile-time slot offset plus or minus a small usize cannot
     // overflow a machine word: the offsets this pass binds are the
-    // published slot count, a small integer.
+    // published slot count, and a `len - k` it accepted already
+    // proved `k` fits.
     json_index_offset(&arr[1], specials).is_some() || json_index_offset(&arr[2], specials).is_some()
 }
 
@@ -590,20 +603,29 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         None
                     }
                 },
-                Rvalue::BinaryOp(op, lhs, rhs) => match binop_is_add(op) {
-                    Some(checked) => {
+                Rvalue::BinaryOp(op, lhs, rhs) => match binop_is_index_arith(op) {
+                    Some(arith) => {
                         let index_of = |o: &Operand| {
                             operand_local(o).and_then(|l| match plan.specials.get(&l) {
                                 Some(Special::Index(k)) => Some(*k),
                                 _ => None,
                             })
                         };
-                        let offset = match (index_of(lhs), index_of(rhs)) {
-                            (Some(k), None) => const_usize(rhs, llbc).map(|c| k + c),
-                            (None, Some(k)) => const_usize(lhs, llbc).map(|c| k + c),
+                        // `len + k` and `len - k` are compile-time offsets
+                        // from the depth at the Len/Base. `zip_two_tuple_next`
+                        // names a just-pinned slot as `shadow_stack_len() - 1`.
+                        let offset = match (arith, index_of(lhs), index_of(rhs)) {
+                            (IndexArith::Add { checked }, Some(k), None) => {
+                                const_usize(rhs, llbc).map(|c| (k + c, checked))
+                            }
+                            (IndexArith::Add { checked }, None, Some(k)) => {
+                                const_usize(lhs, llbc).map(|c| (k + c, checked))
+                            }
+                            (IndexArith::Sub { checked }, Some(k), None) => const_usize(rhs, llbc)
+                                .and_then(|c| k.checked_sub(c).map(|n| (n, checked))),
                             _ => None,
                         };
-                        offset.map(|k| {
+                        offset.map(|(k, checked)| {
                             if checked {
                                 Special::IndexPair(k)
                             } else {
@@ -851,10 +873,26 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 TermKind::UnwindResume
                 | TermKind::UnwindTerminate
                 | TermKind::Abort(_)
+                | TermKind::Panic { .. }
                 | TermKind::UndefinedBehavior,
             ) => {}
             _ => return Err("unknown-terminator"),
         }
+    }
+
+    // Local 0 is the return place. An Index bound there is a helper that
+    // answers a slot (`pin_self`: pin, then `shadow_stack_len() - 1`).
+    // The Sub/Len statements that defined it are stripped as specials, and
+    // `Return` does not mention local 0, so the rewritten body would return
+    // an unbound local. Callers keep that index (`from_slot`) and lower the
+    // call as `getattr(recv, method)` (`CallTarget::Method`); a broken
+    // callee graph blocks that getattr. Refuse: the Pin lives in the
+    // caller's RootScope and is only erasable if the helper is inlined.
+    if matches!(
+        plan.specials.get(&0),
+        Some(Special::Index(_) | Special::IndexPair(_))
+    ) {
+        return Err("returns-slot-index");
     }
 
     // Every surviving mention of a guard, borrow or index has to be one of the
@@ -1182,6 +1220,13 @@ impl Depth {
             Depth::Unknown => Depth::Unknown,
         }
     }
+
+    fn checked_sub(self, n: usize) -> Option<Depth> {
+        match self {
+            Depth::Known(d) => d.checked_sub(n).map(Depth::Known),
+            Depth::Unknown => Some(Depth::Unknown),
+        }
+    }
 }
 
 /// The callee path a call terminator names, for a statically resolved callee.
@@ -1297,15 +1342,21 @@ fn stack_walk(body: &Unstructured, llbc: &Llbc, sensitive: &dyn Fn(&str) -> bool
                     }
                 }
                 Rvalue::BinaryOp(op, lhs, rhs) => {
-                    if let Some(checked) = binop_is_add(op) {
+                    if let Some(arith) = binop_is_index_arith(op) {
                         let base =
                             |o: &Operand| operand_local(o).and_then(|l| indices.get(&l).copied());
-                        let offset = match (base(lhs), base(rhs)) {
-                            (Some(k), None) => const_usize(rhs, llbc).map(|c| k.add(c)),
-                            (None, Some(k)) => const_usize(lhs, llbc).map(|c| k.add(c)),
+                        let offset = match (arith, base(lhs), base(rhs)) {
+                            (IndexArith::Add { checked }, Some(k), None) => {
+                                const_usize(rhs, llbc).map(|c| (k.add(c), checked))
+                            }
+                            (IndexArith::Add { checked }, None, Some(k)) => {
+                                const_usize(lhs, llbc).map(|c| (k.add(c), checked))
+                            }
+                            (IndexArith::Sub { checked }, Some(k), None) => const_usize(rhs, llbc)
+                                .and_then(|c| k.checked_sub(c).map(|n| (n, checked))),
                             _ => None,
                         };
-                        if let Some(k) = offset {
+                        if let Some((k, checked)) = offset {
                             if checked {
                                 pairs.insert(dest, k);
                             } else {
@@ -1985,6 +2036,144 @@ mod tests {
         assert!(
             is_neutral(&body, &llbc),
             "open, pin, close on every path must be depth-neutral"
+        );
+    }
+
+    fn bb_stmts(statements: Vec<Value>, kind: Value) -> Value {
+        json!({
+            "statements": statements,
+            "terminator": {"span": span(), "kind": kind},
+            "is_cleanup": false
+        })
+    }
+
+    fn assign_local(dest: u64, rvalue: Value) -> Value {
+        json!({
+            "kind": {"Assign": [place(dest), rvalue]},
+            "comments_before": [],
+            "span": span()
+        })
+    }
+
+    fn usize_lit(k: u64) -> Value {
+        json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]})
+    }
+
+    /// `zip_two_tuple_next` / `tuple_iter_descr_next`: pin, then name the
+    /// slot as `shadow_stack_len() - 1`, then get it.
+    fn len_minus_one_body(sub_op: Value) -> Unstructured {
+        let copy = |i| json!({"Copy": place(i)});
+        body_of(
+            6,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(call_fun(3, vec![], 3, 3)),
+                bb_stmts(
+                    vec![assign_local(
+                        4,
+                        json!({"BinaryOp": [sub_op, copy(3), usize_lit(1)]}),
+                    )],
+                    call_fun(2, vec![copy(4)], 5, 4),
+                ),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ],
+        )
+    }
+
+    #[test]
+    fn analyze_accepts_len_minus_one_after_pin() {
+        let llbc = stack_ops_llbc();
+        let body = len_minus_one_body(json!("Sub"));
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+        assert!(
+            is_neutral(&body, &llbc),
+            "len-1 of a just-pinned slot must be depth-neutral"
+        );
+    }
+
+    /// `pin_self`: pin, `len - 1`, return that index. The return place is
+    /// the Index special; erase would strip its assignment. Last block is
+    /// `UnwindResume` so the cleanup-drop depth hack does not refuse first.
+    #[test]
+    fn analyze_refuses_returning_the_len_minus_one_slot_index() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            4,
+            vec![
+                bb(call_fun(4, vec![copy(1)], 2, 1)),
+                bb(call_fun(3, vec![], 3, 2)),
+                bb_stmts(
+                    vec![assign_local(
+                        0,
+                        json!({"BinaryOp": [json!("Sub"), copy(3), usize_lit(1)]}),
+                    )],
+                    json!("Return"),
+                ),
+                bb(json!("UnwindResume")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("returns-slot-index") => {}
+            Ok(Some(_)) => panic!("expected returns-slot-index, got accepted"),
+            Ok(None) => panic!("expected returns-slot-index, got no bracket"),
+            Err(reason) => panic!("expected returns-slot-index, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn analyze_accepts_len_minus_one_wrap_after_pin() {
+        let llbc = stack_ops_llbc();
+        let body = len_minus_one_body(json!({"Sub": "Wrap"}));
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn analyze_accepts_len_minus_one_subchecked_after_pin() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let field0 = json!({
+            "kind": {"Projection": [place(4), {"Field": [null, 0]}]},
+            "ty": ty()
+        });
+        let body = body_of(
+            7,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(call_fun(3, vec![], 3, 3)),
+                bb_stmts(
+                    vec![
+                        assign_local(
+                            4,
+                            json!({"BinaryOp": ["SubChecked", copy(3), usize_lit(1)]}),
+                        ),
+                        assign_local(5, json!({"Use": [{"Move": field0}, "No"]})),
+                    ],
+                    call_fun(2, vec![copy(5)], 6, 4),
+                ),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+        assert!(
+            is_neutral(&body, &llbc),
+            "SubChecked len-1 of a just-pinned slot must be depth-neutral"
         );
     }
 

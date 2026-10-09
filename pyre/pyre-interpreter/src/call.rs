@@ -4458,12 +4458,13 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
         Ok(result) => return result,
         Err(e) => e,
     };
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut e = e;
-    let slot = e.pin(&_roots);
-    let message = e.message_text();
-    e.reload(&_roots, slot);
-    log_call_error(&message);
+    if pyre_debug_call_enabled() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = e.pin(&_roots);
+        let message = e.message_text();
+        e.reload(&_roots, slot);
+        log_call_error(&message);
+    }
     set_call_error(e);
     PY_NULL
 }

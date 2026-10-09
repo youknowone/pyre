@@ -11788,6 +11788,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("loop_header/i", handler_loop_header);
     builder.wire_handler("ref_isconstant/r>i", handler_ref_isconstant);
     builder.wire_handler("ref_isvirtual/r>i", handler_ref_isvirtual);
+    // `jtransform.py` emits `{kind}_isvirtual`; pyjitpl only names
+    // `opimpl_ref_isvirtual`. An int-kind leftover uses the same always-
+    // false blackhole body (`bhimpl_ref_isvirtual`) with the `i>i` decoder.
+    builder.wire_handler("int_isvirtual/i>i", handler_int_isconstant);
     builder.wire_handler(
         "goto_if_not_int_is_zero/iL",
         handler_goto_if_not_int_is_zero,

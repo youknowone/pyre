@@ -502,6 +502,16 @@ pub(crate) fn emit_sum_variant_dynamic(
             )
         });
         let value = emit_sum_variant(graph, arm, enum_owner, variant, tag as i64, arm_payload);
+        // Recast each arm onto the dest type's enum ClassDef (`bookkeeper.py`
+        // `getuniqueclassdef(cls)`). Discriminant narrowing then intern's
+        // the declared variant (`classdesc.py` `getuniqueclassdef`) and
+        // `__pos_0` resolves on that variant ClassDef.
+        let recast = graph.alloc_value_var();
+        graph.block_mut(arm).operations.push(SpaceOperation {
+            result: Some(recast.clone()),
+            kind: crate::model::cast_instance_call(enum_owner, value),
+        });
+        let value = recast;
         let args =
             reproduce_exit_args(&saved_exit, &result, &value, &sources, &inputs, &graph.name)
                 .expect("all continuation values threaded into each arm");

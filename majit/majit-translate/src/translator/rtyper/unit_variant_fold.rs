@@ -19,18 +19,16 @@
 //!
 //! This pass operates directly on `model::FunctionGraph` after
 //! `lower_indirect_calls` and before `Transformer::transform`, so it
-//! catches both gate arms.  With a bookkeeper the prebuilt instance is
-//! `intern_enum_variant_host(...).reusable_prebuilt_instance()` —
+//! catches both gate arms.  The prebuilt instance is
+//! `intern_enum_variant_host(...).reusable_prebuilt_instance()` on the
+//! interned class in `struct_root_classes` —
 //! `InstanceRepr.get_reusable_prebuilt_instance` (rclass.py).  Without
-//! one, [`UNIT_VARIANT_PREBUILT_INSTANCES`] caches a standalone host
-//! for assembler tests and the post-rtype jtransform fold.  The
-//! assembler's `emit_const_r` recovers `(qualname, tag)` from the
-//! interned variant class host (`unit_variant_const_from_host`); the
-//! bookkeeper-less Vec remains an identity fallback.
+//! a session bookkeeper this pass does not mint (same as jtransform
+//! `transform_body`).  The assembler's `emit_const_r` recovers
+//! `(qualname, tag)` from the interned variant class host
+//! (`unit_variant_const_from_host`).
 
-use parking_lot::Mutex;
 use std::rc::Rc;
-use std::sync::LazyLock;
 
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::flowspace::model::{ConstValue, HostObject};
@@ -81,26 +79,10 @@ pub(crate) fn unit_variant_const_from_host(obj: &HostObject) -> Option<(String, 
     }
 }
 
-/// Bookkeeper-less cache of unit-variant prebuilt instance singletons,
-/// keyed by qualname.  Used only when no [`Bookkeeper`] is present
-/// (assembler tests, jtransform's post-rtype fold).  With a bookkeeper
-/// the instance lives on the interned class's
-/// `HostObject::reusable_prebuilt_instance` OnceLock — upstream
-/// `InstanceRepr.get_reusable_prebuilt_instance` /
-/// `self._reusable_prebuilt_instance` (rclass.py).
-///
-/// `Vec<(String, HostObject)>` instead of `HashMap` per the
-/// project's no-HashMap policy ([[no-hashmap-ever]]).  The variant
-/// set is closed and small (~11 entries in
-/// [`is_synthetic_unit_variant_path`]), so linear
-/// scan is both cheap and PyPy-orthodox.
-static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, Option<i64>, HostObject)>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
 /// Class host for a unit-variant (or zero-length aggregate) singleton.
 ///
 /// Annotation already interned the variant through
-/// [`Bookkeeper::intern_enum_variant_host`] (`classdef_for_prebuilt_instance`).
+/// [`Bookkeeper::intern_enum_variant_host`].
 /// Minting a fresh `HostObject::new_class` here produced a second ClassDesc
 /// with no bases, so `InstanceRepr.convert_const` (`rclass.py` —
 /// `bk.getuniqueclassdef(value.__class__)`) rejected the prebuilt instance
@@ -120,8 +102,8 @@ fn intern_unit_variant_class(bk: &Rc<Bookkeeper>, qualname: &str) -> HostObject 
 
 /// Find-or-mint the prebuilt singleton instance for an allowlisted
 /// unit-variant ctor (`StepResult::Continue`, `LoopResult::Done`, …).
-/// Returns the same `HostObject` Arc across all calls and all
-/// graphs, mirroring `InstanceRepr.get_reusable_prebuilt_instance`
+/// Returns the same `HostObject` Arc across all calls against the
+/// same bookkeeper, mirroring `InstanceRepr.get_reusable_prebuilt_instance`
 /// caching on the per-rtyper `instance_reprs` map.  Returns `None`
 /// only if `HostObject::Class` cannot produce a prebuilt instance,
 /// which by construction never happens for the allowlisted set
@@ -130,57 +112,21 @@ fn intern_unit_variant_class(bk: &Rc<Bookkeeper>, qualname: &str) -> HostObject 
 /// `OnceLock` instance — see
 /// `majit-translate/src/flowspace/model.rs`).
 ///
-/// When `bookkeeper` is present the instance is
-/// `interned_class.reusable_prebuilt_instance()` and the process-global
-/// Vec is not consulted — one prebuilt per class, as
-/// `InstanceRepr.get_reusable_prebuilt_instance` (rclass.py).
+/// The instance is `interned_class.reusable_prebuilt_instance()` —
+/// one prebuilt per class, as
+/// `InstanceRepr.get_reusable_prebuilt_instance` (rclass.py).  The
+/// declared discriminant is a class-dict constant on that host
+/// (`ClassDesc.classdict` / `initialize_prebuilt_data`).
 pub(crate) fn intern_unit_variant_prebuilt_instance(
+    bookkeeper: &Rc<Bookkeeper>,
     qualname: &str,
     tag: Option<i64>,
-    bookkeeper: Option<&Rc<Bookkeeper>>,
 ) -> Option<HostObject> {
-    if let Some(bk) = bookkeeper {
-        let class_obj = intern_unit_variant_class(bk, qualname);
-        if let Some(tag) = tag {
-            stamp_unit_variant_discriminant(&class_obj, tag);
-        }
-        return class_obj.reusable_prebuilt_instance();
-    }
-    let mut cache = UNIT_VARIANT_PREBUILT_INSTANCES.lock();
-    if let Some((_, stored_tag, instance)) = cache.iter_mut().find(|(q, _, _)| q == qualname) {
-        // Both gate arms derive the tag from the same `CallTarget`, so a
-        // recorded value never conflicts; a `Some` fills in an entry a
-        // tag-less caller interned first.
-        if stored_tag.is_none() {
-            *stored_tag = tag;
-        }
-        if let Some(tag) = tag
-            && let Some(class_obj) = instance.instance_class()
-        {
-            stamp_unit_variant_discriminant(class_obj, tag);
-        }
-        return Some(instance.clone());
-    }
-    let class_obj = HostObject::new_class(qualname, Vec::new());
+    let class_obj = intern_unit_variant_class(bookkeeper, qualname);
     if let Some(tag) = tag {
         stamp_unit_variant_discriminant(&class_obj, tag);
     }
-    let instance = class_obj.reusable_prebuilt_instance()?;
-    cache.push((qualname.to_string(), tag, instance.clone()));
-    Some(instance)
-}
-
-/// Reverse lookup for the assembler: whether `identity` (an interned
-/// instance's `identity_id`) names a unit-variant singleton with a
-/// recorded discriminant.  Returns the interned qualname and tag; a
-/// tag-less entry (a zero-length shaped aggregate, whose value carries
-/// no discriminant) stays on the identity-id constant path.
-pub(crate) fn unit_variant_const_by_identity(identity: usize) -> Option<(String, i64)> {
-    let cache = UNIT_VARIANT_PREBUILT_INSTANCES.lock();
-    cache
-        .iter()
-        .find(|(_, tag, instance)| tag.is_some() && instance.identity_id() == identity)
-        .and_then(|(q, tag, _)| Some((q.clone(), (*tag)?)))
+    class_obj.reusable_prebuilt_instance()
 }
 
 /// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
@@ -245,6 +191,13 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
     // struct never becomes a `ConstRefNull` register.
     erase_zero_sized_ctors(graph);
     strip_void_typed_call_args(graph);
+    // Interning a prebuilt instance needs the session bookkeeper
+    // (`rtyper.annotator.bookkeeper` / `getuniqueclassdef(value.__class__)`).
+    // Without one, skip the ctor-to-constant rewrite rather than minting
+    // a throwaway Bookkeeper or a process-global instance cache.
+    let Some(bk) = bookkeeper else {
+        return;
+    };
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
@@ -295,8 +248,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
             // `UnregisteredNewGcType` after the descent has already run.
             if owner_path.is_empty()
                 && is_zero_length_shaped_aggregate(name)
-                && let Some(instance) =
-                    intern_unit_variant_prebuilt_instance(name, None, bookkeeper)
+                && let Some(instance) = intern_unit_variant_prebuilt_instance(bk, name, None)
             {
                 op.kind = OpKind::ConstRef(instance);
                 continue;
@@ -307,8 +259,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
                 continue;
             }
             let qualname = segments.join(".");
-            let Some(instance) =
-                intern_unit_variant_prebuilt_instance(&qualname, *variant_tag, bookkeeper)
+            let Some(instance) = intern_unit_variant_prebuilt_instance(bk, &qualname, *variant_tag)
             else {
                 continue;
             };
@@ -565,18 +516,13 @@ mod tests {
         assert!(!is_synthetic_unit_variant_path(&q(&["Continue"])));
     }
 
-    /// A bookkeeper-path prebuilt is not in the process-global Vec; the
-    /// assembler recovers `(qualname, tag)` from the interned class host's
-    /// `__discriminant` classdict constant.
+    /// The assembler recovers `(qualname, tag)` from the interned class
+    /// host's `__discriminant` classdict constant.
     #[test]
     fn bookkeeper_prebuilt_carries_discriminant_on_class() {
         let bk = Rc::new(Bookkeeper::new());
         let instance =
-            intern_unit_variant_prebuilt_instance("JitAction.Return", Some(1), Some(&bk)).unwrap();
-        assert!(
-            unit_variant_const_by_identity(instance.identity_id()).is_none(),
-            "bookkeeper-path instance must not enter the global Vec"
-        );
+            intern_unit_variant_prebuilt_instance(&bk, "JitAction.Return", Some(1)).unwrap();
         let (qualname, tag) = unit_variant_const_from_host(&instance)
             .expect("class host carries the declared discriminant");
         assert_eq!(tag, 1);
@@ -593,11 +539,10 @@ mod tests {
     /// `InstanceRepr.get_reusable_prebuilt_instance` caches per classdef.
     #[test]
     fn one_prebuilt_instance_per_shape() {
-        let a =
-            intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>", None, None).unwrap();
-        let b =
-            intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>", None, None).unwrap();
-        let other = intern_unit_variant_prebuilt_instance("Array<u8;0>", None, None).unwrap();
+        let bk = Rc::new(Bookkeeper::new());
+        let a = intern_unit_variant_prebuilt_instance(&bk, "Array<*mut PyObject;0>", None).unwrap();
+        let b = intern_unit_variant_prebuilt_instance(&bk, "Array<*mut PyObject;0>", None).unwrap();
+        let other = intern_unit_variant_prebuilt_instance(&bk, "Array<u8;0>", None).unwrap();
         assert_eq!(a.identity_id(), b.identity_id());
         assert_ne!(a.identity_id(), other.identity_id());
     }
@@ -666,7 +611,6 @@ mod tests {
         graph.set_goto(entry, entry, Vec::new());
 
         fold_unit_variant_ctors(&mut graph, None);
-
         assert_eq!(
             FunctionGraph::concretetype_of(&zst),
             ConcreteType::Void,

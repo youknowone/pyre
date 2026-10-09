@@ -408,6 +408,15 @@ fn retarget_vtable_method_bases(graph: &mut FunctionGraph, llbc: &Llbc) -> usize
         let Some(meta) = ensure_meta(graph, &mut env, block, &base) else {
             continue;
         };
+        // `lookup_operand` requires a block inputarg or op result. The
+        // metadata word is often a FatLen FieldRead in a predecessor, or
+        // a merge phi of two such reads, and `ensure_meta` may reuse that
+        // identity across a passthrough. Thread it the way
+        // `ensure_variable_at_block` threads every other block-crossing
+        // value (`flowspace/model.py` `checkgraph`).
+        if !graph.ensure_variable_at_block(block, &meta) {
+            continue;
+        }
         let Some(op) = graph.blocks[block.0].operations.iter_mut().find(|op| {
             op.result
                 .as_ref()
@@ -528,8 +537,21 @@ fn ensure_meta_inner(
     let first_id = metas[0].2.id();
     let used_phi = metas.iter().any(|(_, _, meta)| meta.id() == phi.id());
     if !used_phi && metas.iter().all(|(_, _, meta)| meta.id() == first_id) {
-        env.memo.insert(key, metas[0].2.clone());
-        return Some(metas[0].2.clone());
+        // All predecessors produced the same metadata word, so a new
+        // phi would be an identity copy. The word still has to appear
+        // as an inputarg of this block: `lookup_operand` does not
+        // accept a dominating use.
+        let meta = metas[0].2.clone();
+        env.memo.insert(key, meta.clone());
+        if !graph.variable_defined_in_block(block, &meta) {
+            graph.push_inputarg_var(block, meta.clone());
+            for (pred, link_index, incoming) in metas {
+                graph.blocks[pred.0].exits[link_index]
+                    .args
+                    .push(LinkArg::Value(incoming));
+            }
+        }
+        return Some(meta);
     }
     graph.push_inputarg_var(block, phi.clone());
     for (pred, link_index, meta) in metas {
@@ -751,9 +773,104 @@ mod tests {
         );
         let meta = ensure_meta(&mut graph, &mut env, later, &carried).expect("dominating metadata");
         assert_eq!(FunctionGraph::concretetype_of(&meta), ConcreteType::Signed);
-        assert!(graph.blocks[later.0].inputargs.is_empty());
-        assert_eq!(graph.blocks[merge.0].inputargs.len(), 1);
-        assert_eq!(graph.blocks[merge.0].exits[0].args.len(), 0);
+        assert_eq!(
+            graph.blocks[later.0].inputargs.as_slice(),
+            std::slice::from_ref(&meta)
+        );
+        assert_eq!(graph.blocks[merge.0].inputargs.len(), 2);
+        assert_eq!(graph.blocks[merge.0].inputargs[1], meta);
+        assert_eq!(
+            graph.blocks[merge.0].exits[0].args.as_slice(),
+            std::slice::from_ref(&LinkArg::Value(meta.clone()))
+        );
+        assert!(graph.variable_defined_in_block(later, &meta));
+    }
+
+    #[test]
+    fn metadata_phi_is_threaded_through_a_passthrough() {
+        let mut graph = FunctionGraph::new("diamond_passthrough");
+        let base = graph.alloc_value_var();
+        let data_l = graph.alloc_value_var();
+        let data_r = graph.alloc_value_var();
+        let carried = graph.alloc_value_var();
+        let left = graph.startblock;
+        let right = graph.create_block();
+        let merge = graph.create_block();
+        let pass = graph.create_block();
+        let later = graph.create_block();
+        let field = FieldDescriptor::new("imp", Some("DictStrategyRef".into()));
+        graph.blocks[left.0].operations.push(SpaceOperation {
+            result: Some(data_l.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        graph.blocks[right.0].operations.push(SpaceOperation {
+            result: Some(data_r.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        graph.push_inputarg_var(merge, carried.clone());
+        graph.set_goto(left, merge, vec![data_l.clone()]);
+        graph.set_goto(right, merge, vec![data_r.clone()]);
+        graph.set_goto(merge, pass, vec![]);
+        graph.set_goto(pass, later, vec![]);
+        let mut env = empty_env(data_l.id(), None);
+        env.fat_fields.insert(
+            data_l.id(),
+            FatField {
+                block: left,
+                var_id: data_l.id(),
+                base: base.clone(),
+                field: field.clone(),
+                pure: false,
+            },
+        );
+        env.fat_fields.insert(
+            data_r.id(),
+            FatField {
+                block: right,
+                var_id: data_r.id(),
+                base,
+                field,
+                pure: false,
+            },
+        );
+        let meta = ensure_meta(&mut graph, &mut env, later, &carried).expect("passthrough phi");
+        assert_eq!(FunctionGraph::concretetype_of(&meta), ConcreteType::Signed);
+        assert!(
+            graph.variable_defined_in_block(later, &meta),
+            "the method_* block must define the vtable word as an inputarg"
+        );
+        assert!(
+            graph.variable_defined_in_block(pass, &meta),
+            "the passthrough must carry the vtable word"
+        );
+        assert!(
+            graph.variable_defined_in_block(merge, &meta),
+            "the diamond merge must phi the two FatLen words"
+        );
+        assert_eq!(
+            graph.blocks[pass.0].exits[0]
+                .args
+                .last()
+                .and_then(LinkArg::as_variable),
+            Some(&meta)
+        );
+        assert_eq!(
+            graph.blocks[merge.0].exits[0]
+                .args
+                .last()
+                .and_then(LinkArg::as_variable),
+            Some(&meta)
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
-# pyre-check: max-pypy-ratio=9.2
-# Run 37176956131, startup-subtracted vs pypy: macos dynasm 2.6x,
-# ubuntu dynasm 3.4x, macos cranelift 3.5x, windows dynasm 3.6x,
-# ubuntu cranelift 4.6x. The ceiling is twice that slowest reading.
-# PERF_GATE_FLOOR_DIVISOR is 4, so the floor is 2.3x, under the fastest 2.6x.
-# The ratio still moves with how far pypy constant-folds the loop, so the
-# ceiling stays twice the slowest native reading rather than a tight fit.
+# pyre-check: max-pypy-ratio=7.2
+# Run 37874517385, startup-subtracted vs pypy: macos dynasm 1.9x
+# (2.1x on its rerun), windows dynasm 2.5x, macos cranelift 2.6x,
+# ubuntu dynasm 3.1x, ubuntu cranelift 4.1x. The readings now span 2.16x,
+# more than the 2x the old "twice the slowest" rule can hold under a
+# floor divisor of 4, so 7.2 keeps the floor 1.8x under the fastest 1.9x
+# and the ceiling 1.76x over the slowest 4.1x.
 # What this fixture gates is the differential OUTPUT — pyre must agree with
 # cpython and pypy that the rebound method wins after the loop compiled.
 # `typeobject.py:177 _immutable_fields_ = ['_version_tag?']` — the LOAD_METHOD

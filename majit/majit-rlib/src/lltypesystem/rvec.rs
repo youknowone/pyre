@@ -48,12 +48,99 @@ const _: () = assert!(VEC_CAP_WORD == majit_ir::rvec::VEC_CAP_WORD);
 const _: () = assert!(VEC_PTR_WORD == majit_ir::rvec::VEC_PTR_WORD);
 const _: () = assert!(VEC_LEN_WORD == majit_ir::rvec::VEC_LEN_WORD);
 
+/// In-place reverse of `items[start..end]`, the swap loop of `rlist.ll_reverse`.
+/// Expanded at each `ll_slice_rotate_*` site.
+macro_rules! ll_slice_reverse_range {
+    ($getitem:ident, $setitem:ident, $items:ident, $start:expr, $end:expr) => {{
+        let mut i = $start as isize;
+        let mut j = $end as isize - 1;
+        while i < j {
+            let tmp = $getitem($items, i as usize);
+            let other = $getitem($items, j as usize);
+            $setitem($items, i as usize, other);
+            $setitem($items, j as usize, tmp);
+            i += 1;
+            j -= 1;
+        }
+    }};
+}
+
+/// In-place reverse of a managed-reference range; items move as address words,
+/// the same as [`ll_slice_reverse_r`].
+macro_rules! ll_slice_reverse_range_r {
+    ($items:ident, $start:expr, $end:expr) => {{
+        let mut i = $start as isize;
+        let mut j = $end as isize - 1;
+        while i < j {
+            let low = slice_item_addr($items, i as usize, ITEM_SIZE_R);
+            let high = slice_item_addr($items, j as usize, ITEM_SIZE_R);
+            let tmp = raw_read_ptr(low);
+            raw_write_ptr(low, raw_read_ptr(high));
+            raw_write_ptr(high, tmp);
+            i += 1;
+            j -= 1;
+        }
+    }};
+}
+
+/// Three-reverse rotate of a pair slice. `$right` is `rotate_right`.
+macro_rules! ll_slice_rotate_body {
+    ($items:ident, $length:ident, $k:ident, $reverse_range:ident, $right:expr) => {{
+        if $length <= 1 {
+            return;
+        }
+        let k = if $k >= $length { $k % $length } else { $k };
+        if k == 0 {
+            return;
+        }
+        if $right {
+            $reverse_range!($items, 0, $length);
+            $reverse_range!($items, 0, k);
+            $reverse_range!($items, k, $length);
+        } else {
+            $reverse_range!($items, 0, k);
+            $reverse_range!($items, k, $length);
+            $reverse_range!($items, 0, $length);
+        }
+    }};
+}
+
+macro_rules! ll_slice_reverse_range_i {
+    ($items:ident, $start:expr, $end:expr) => {
+        ll_slice_reverse_range!(
+            ll_slice_getitem_fast_i,
+            ll_slice_setitem_fast_i,
+            $items,
+            $start,
+            $end
+        )
+    };
+}
+
+macro_rules! ll_slice_reverse_range_f {
+    ($items:ident, $start:expr, $end:expr) => {
+        ll_slice_reverse_range!(
+            ll_slice_getitem_fast_f,
+            ll_slice_setitem_fast_f,
+            $items,
+            $start,
+            $end
+        )
+    };
+}
+
 use super::rffi::{
     raw_free, raw_malloc_varsize_char, raw_ptradd, raw_read_f64, raw_read_ptr, raw_write_f64,
     raw_write_ptr,
 };
 
 const WORD: usize = std::mem::size_of::<usize>();
+
+/// Standard GcArray length word (`majit_gc` `standard_array_length_ofs`).
+const GCARRAY_LEN_OFFSET: usize = 0;
+/// Word-sized items follow the length word (`array_items_base` for a
+/// pointer element: the length word rounded up to the item's alignment).
+const GCARRAY_ITEMS_OFFSET: usize = WORD;
 
 const ITEM_SIZE_I: usize = std::mem::size_of::<usize>();
 const ITEM_ALIGN_I: usize = std::mem::align_of::<usize>();
@@ -78,6 +165,14 @@ fn vec_item_addr(header: usize, index: usize, itemsize: usize) -> usize {
 
 fn vec_header_i(l: &mut Vec<usize>) -> usize {
     l as *mut Vec<usize> as usize
+}
+
+/// Buffer pointer word of any `Vec<T>` header (`rlist.py` `ll_items`:
+/// `return l.items`). Item-kind independent: every `Vec<T>` header stores
+/// that word at `VEC_PTR_WORD`, including items the one-word `ll_vec_items_*`
+/// helpers do not name.
+pub fn ll_vec_as_ptr(header: usize) -> usize {
+    vec_header_word(header, VEC_PTR_WORD)
 }
 
 fn vec_header_r(l: &mut Vec<*mut u8>) -> usize {
@@ -537,6 +632,21 @@ pub fn ll_slice_reverse_i(items: usize, length: usize) {
     }
 }
 
+/// `<[T]>::rotate_right` on a pair slice. Three `ll_reverse` passes, the
+/// same swap loop as [`ll_slice_reverse_i`]. The items are a raw address,
+/// which `jit.isvirtual` does not describe, so the loop stays a residual
+/// call — the same treatment as [`ll_slice_reverse_i`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_right_i(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_i, true);
+}
+
+/// `<[T]>::rotate_left` on a pair slice.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_left_i(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_i, false);
+}
+
 // ── `_r`: managed-reference items ───────────────────────────────────────
 
 /// `ll_newemptylist`.
@@ -753,6 +863,45 @@ pub fn ll_vec_extend_from_slice_r(l: &mut Vec<*mut u8>, items: usize, length: us
     ll_slice_arraycopy_r(items, ll_vec_items_r(l), 0, len1, length);
 }
 
+/// Length of a length-prefixed object GcArray. The array is a movable GC
+/// object; callers re-read this from `l2` rather than caching it across a
+/// collection.
+fn gcarray_length_r(l2: *mut u8) -> usize {
+    raw_read_ptr(raw_ptradd(l2 as usize, GCARRAY_LEN_OFFSET))
+}
+
+/// Item `index` of a length-prefixed object GcArray, read from the array
+/// word so a collection that moves `l2` is visible on the next index.
+fn gcarray_getitem_r(l2: *mut u8, index: usize) -> *mut u8 {
+    raw_read_ptr(raw_ptradd(
+        l2 as usize,
+        GCARRAY_ITEMS_OFFSET + index * ITEM_SIZE_R,
+    )) as *mut u8
+}
+
+/// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
+/// GcArray word, not a `(items, length)` pair. Length is the array's
+/// header; each item is read by index from `l2` after `_ll_resize_ge`,
+/// which may collect.
+///
+/// `ovfcheck(len1 + len2)`: a wrapping sum would undersize the resize.
+/// Overflow is MemoryError, the same `Vec capacity overflow` panic as
+/// [`vec_buf_layout`].
+pub fn ll_vec_extend_r(l: &mut Vec<*mut u8>, l2: *mut u8) {
+    let len1 = ll_vec_length_r(l);
+    let len2 = gcarray_length_r(l2);
+    let newlength = len1
+        .checked_add(len2)
+        .unwrap_or_else(|| panic!("Vec capacity overflow"));
+    ll_vec_resize_ge_r(l, newlength);
+    let mut i = 0;
+    while i < len2 {
+        let item = gcarray_getitem_r(l2, i);
+        ll_vec_setitem_fast_r(l, len1 + i, item);
+        i += 1;
+    }
+}
+
 /// `rgc.ll_arraycopy` over raw items. The items hold no GC pointer, so the
 /// copy is the `raw_memcopy` of `length` items; `ll_arraycopy` is a residual
 /// call (`list.ll_arraycopy`, `OS_ARRAYCOPY`), and so is this.
@@ -872,6 +1021,19 @@ pub fn ll_slice_reverse_r(items: usize, length: usize) {
         i += 1;
         length_1_i -= 1;
     }
+}
+
+/// `<[T]>::rotate_right` on a pair slice. Three `ll_reverse` passes, the
+/// same address-word swap as [`ll_slice_reverse_r`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_right_r(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_r, true);
+}
+
+/// `<[T]>::rotate_left` on a pair slice.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_left_r(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_r, false);
 }
 
 // ── `_f`: `f64` items ───────────────────────────────────────────────────
@@ -1197,6 +1359,19 @@ pub fn ll_slice_reverse_f(items: usize, length: usize) {
     }
 }
 
+/// `<[T]>::rotate_right` on a pair slice. Three `ll_reverse` passes, the
+/// same swap loop as [`ll_slice_reverse_f`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_right_f(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_f, true);
+}
+
+/// `<[T]>::rotate_left` on a pair slice.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_rotate_left_f(items: usize, length: usize, k: usize) {
+    ll_slice_rotate_body!(items, length, k, ll_slice_reverse_range_f, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::rffi::raw_malloc_varsize_char;
@@ -1267,6 +1442,17 @@ mod tests {
     }
 
     #[test]
+    fn as_ptr_reads_the_header_buffer_pointer_word() {
+        let mut bytes: Vec<u8> = vec![1, 2, 3];
+        let header = &mut bytes as *mut Vec<u8> as usize;
+        assert_eq!(ll_vec_as_ptr(header), bytes.as_ptr() as usize);
+        let mut words: Vec<usize> = vec![7, 8];
+        let header = &mut words as *mut Vec<usize> as usize;
+        assert_eq!(ll_vec_as_ptr(header), words.as_ptr() as usize);
+        assert_eq!(ll_vec_as_ptr(header), ll_vec_items_i(&mut words));
+    }
+
+    #[test]
     fn helpers_grow_and_reverse_a_host_vec() {
         let mut v = ll_vec_newemptylist_i();
         for item in 0..40 {
@@ -1296,6 +1482,42 @@ mod tests {
         ll_vec_append_r(&mut r, b);
         ll_vec_reverse_r(&mut r);
         assert_eq!(r, vec![b, a]);
+    }
+
+    #[test]
+    fn helpers_rotate_a_pair_slice() {
+        let mut v: Vec<usize> = (0..5).collect();
+        let items = ll_vec_items_i(&mut v);
+        let n = ll_vec_length_i(&mut v);
+        ll_slice_rotate_right_i(items, n, 2);
+        assert_eq!(v, vec![3, 4, 0, 1, 2]);
+        ll_slice_rotate_left_i(items, n, 2);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+        ll_slice_rotate_right_i(items, n, 0);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+        ll_slice_rotate_right_i(items, n, 5);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+        ll_slice_rotate_left_i(items, n, 7);
+        assert_eq!(v, vec![2, 3, 4, 0, 1]);
+
+        ll_slice_rotate_right_i(0, 0, 3);
+
+        let a = 0x10 as *mut u8;
+        let b = 0x20 as *mut u8;
+        let c = 0x30 as *mut u8;
+        let mut r = vec![a, b, c];
+        let items = ll_vec_items_r(&mut r);
+        ll_slice_rotate_right_r(items, 3, 1);
+        assert_eq!(r, vec![c, a, b]);
+        ll_slice_rotate_left_r(items, 3, 1);
+        assert_eq!(r, vec![a, b, c]);
+
+        let mut f = vec![1.5, 2.5, 3.5, 4.5];
+        let items = ll_vec_items_f(&mut f);
+        ll_slice_rotate_left_f(items, 4, 1);
+        assert_eq!(f, vec![2.5, 3.5, 4.5, 1.5]);
+        ll_slice_rotate_right_f(items, 4, 1);
+        assert_eq!(f, vec![1.5, 2.5, 3.5, 4.5]);
     }
 
     #[test]
@@ -1390,6 +1612,9 @@ mod tests {
             "ll_slice_reverse_i",
             "ll_slice_reverse_r",
             "ll_slice_reverse_f",
+            "ll_slice_rotate_left_i",
+            "ll_slice_rotate_right_r",
+            "ll_slice_rotate_left_f",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
@@ -1397,6 +1622,53 @@ mod tests {
                 "{path} is not published"
             );
         }
+    }
+
+    #[test]
+    fn extend_copies_gcarray_items_after_resize() {
+        #[repr(C)]
+        struct GcArrayWord {
+            length: usize,
+            items: [*mut u8; 2],
+        }
+        let mut src = GcArrayWord {
+            length: 2,
+            items: [0x10 as *mut u8, 0x20 as *mut u8],
+        };
+        let mut l = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut l, 0x01 as *mut u8);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
+        assert_eq!(ll_vec_length_r(&mut l), 3);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 0), 0x01 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 1), 0x10 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 2), 0x20 as *mut u8);
+
+        let mut empty = GcArrayWord {
+            length: 0,
+            items: [std::ptr::null_mut(), std::ptr::null_mut()],
+        };
+        let before = ll_vec_length_r(&mut l);
+        ll_vec_extend_r(&mut l, &mut empty as *mut GcArrayWord as *mut u8);
+        assert_eq!(ll_vec_length_r(&mut l), before);
+    }
+
+    /// `ovfcheck(len1 + len2)` in `ll_extend`: a wrapping sum is MemoryError,
+    /// the same panic [`vec_buf_layout`] uses for a capacity overflow.
+    #[test]
+    #[should_panic(expected = "Vec capacity overflow")]
+    fn extend_overflowing_length_sum_is_memory_error() {
+        #[repr(C)]
+        struct GcArrayWord {
+            length: usize,
+            items: [*mut u8; 1],
+        }
+        let mut src = GcArrayWord {
+            length: usize::MAX,
+            items: [std::ptr::null_mut()],
+        };
+        let mut l = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut l, 0x01 as *mut u8);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
     }
 
     #[test]

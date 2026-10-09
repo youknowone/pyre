@@ -96,6 +96,10 @@ pub(crate) struct ClosureSelectSite {
     /// The built niche is `Option<fn>`. `None` is `null_fn` (int bank),
     /// not `null_mut` (ref bank). Set from `tyref_option_payload_is_fn_ptr`.
     pub result_fn_ptr: bool,
+    /// `fn(inputs) -> output` spelling of the built `Option<fn(...)>` so
+    /// `None` is `nullptr` of that `FuncType`. Empty when the result is
+    /// not a function pointer.
+    pub result_fn_ptr_spelling: Option<String>,
     /// Repr projection of the built result's niche null; see
     /// `FunctionGraph::push_niche_null`. `map`/`and_then` take it from the
     /// destination `Option`; the other combinators reuse the receiver's cast.
@@ -392,7 +396,10 @@ fn rewire_one_closure_select_site(
             // `__discriminant` / `__pos_0`: `None` is null.
             if site.result_niche {
                 let null = if site.result_fn_ptr {
-                    graph.push_null_fn_ptr(else_bb)
+                    graph.push_null_fn_ptr_with_spelling(
+                        else_bb,
+                        site.result_fn_ptr_spelling.as_deref(),
+                    )
                 } else {
                     graph.push_niche_null(else_bb, site.result_niche_null_cast.as_ref())
                 };
@@ -787,6 +794,7 @@ mod tests {
             result_some_owner: RESULT_SOME.into(),
             result_niche,
             result_fn_ptr: false,
+            result_fn_ptr_spelling: None,
             result_niche_null_cast: None,
             result_fieldless_none_tag: None,
             call_once_result_exc: None,

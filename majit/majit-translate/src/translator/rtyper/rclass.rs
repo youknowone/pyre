@@ -6408,9 +6408,9 @@ mod tests {
         // `bk.getuniqueclassdef(value.__class__)` (rclass.py) on that host.
         let linked =
             crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                &bk,
                 "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
                 Some(0),
-                Some(&bk),
             )
             .expect("linked prebuilt");
         assert_eq!(

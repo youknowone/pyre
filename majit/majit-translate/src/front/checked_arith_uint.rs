@@ -49,7 +49,7 @@
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::emit_option_variant_dynamic;
-use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
+use crate::model::{FunctionGraph, OpKind, SpaceOperation, ValueType};
 
 /// A recorded unsigned `checked_{add,sub,mul}` call whose result is an
 /// `Option<T>`, captured during body lowering with the `Option`/`Some` owners
@@ -222,27 +222,45 @@ fn rewire_one_checked_arith_uint_site(
         })
         .ok_or_else(|| format!("{name}: checked_* result var has no producer block"))?;
 
+    // The dest Option is recast onto its instantiation (`Option<usize>`).
+    // Drop that identity recast so the callee is again the last op.
+    crate::front::result_exc::collapse_trailing_recasts_onto(graph, a, opt);
+
     // The call must still be A's last op (a
     // `[..]::checked_add/checked_sub/checked_mul`
     // 2-arg FunctionPath call); a site `checked_arith`'s first pass already
-    // rewrote is now a `*_ovf` BinOp producer — skip it.  The overflow op is
-    // resolved here (before any mutation) so an unsupported leaf declines
-    // without touching the graph.
-    let call_idx = graph.blocks[a].operations.len() - 1;
+    // rewrote is now a `*_ovf` BinOp producer — skip it.  Recognition is
+    // by the callee (`FunDecl` / FunctionPath leaf), not dest-type spelling.
+    // The overflow op is resolved here (before any mutation) so an
+    // unsupported leaf declines without touching the graph.
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| {
+            op.result.as_ref() == Some(opt)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { target, args, .. }
+                        if args.len() == 2
+                            && crate::front::checked_arith::is_checked_arith_target(target)
+                )
+        })
+        .ok_or_else(|| format!("{name}: no 2-arg checked_* callee producing {opt:?}"))?;
+    if call_idx + 1 != graph.blocks[a].operations.len() {
+        return Err(format!(
+            "{name}: block {a} last op is not the 2-arg checked_* call producing {opt:?}"
+        ));
+    }
     let (lhs, rhs, arith) = match &graph.blocks[a].operations[call_idx] {
         SpaceOperation {
             result: Some(r),
-            kind:
-                OpKind::Call {
-                    target: target @ CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                },
+            kind: OpKind::Call { target, args, .. },
         } if r == opt
             && args.len() == 2
             && crate::front::checked_arith::is_checked_arith_target(target) =>
         {
-            let leaf = segments.last().map(String::as_str).unwrap_or_default();
+            let leaf =
+                crate::front::checked_arith::checked_arith_callee_leaf(target).unwrap_or_default();
             let arith = UintArith::from_leaf(leaf).ok_or_else(|| {
                 format!("{name}: unsigned checked lowering does not handle {leaf}")
             })?;
@@ -266,7 +284,8 @@ fn rewire_one_checked_arith_uint_site(
     let a_id = graph.blocks[a].id;
     // Drop the residual call (A's last op) so `opt` is produced solely by the
     // virtualized ctor appended below, then re-emit the native sequence in
-    // place of the removed call.
+    // place of the removed call. The Some payload is written on the
+    // instantiated `Option<T>` ClassDef recorded at the call (`site.some_owner`).
     graph.blocks[a].operations.truncate(call_idx);
 
     // The two operators differ only in the payload value and the overflow
@@ -455,8 +474,8 @@ mod tests {
     fn site_for(opt: &Variable) -> CheckedArithUintSite {
         CheckedArithUintSite {
             opt: opt.clone(),
-            option_owner: "core::option::Option".to_string(),
-            some_owner: "core::option::Option::Some".to_string(),
+            option_owner: "core::option::Option<usize>".to_string(),
+            some_owner: "core::option::Option<usize>::Some".to_string(),
             payload_ty: ValueType::Unsigned,
         }
     }
@@ -501,7 +520,7 @@ mod tests {
                 OpKind::Call {
                     target: checked_target(leaf),
                     args: crate::model::call_args(vec![x, y]),
-                    result_ty: ValueType::Ref(Some("core::option::Option".into())),
+                    result_ty: ValueType::Ref(Some("core::option::Option<usize>".into())),
                 },
                 true,
             )
@@ -561,7 +580,7 @@ mod tests {
             if let Some(field) = payloads.first() {
                 assert_eq!(
                     field.owner_root.as_deref(),
-                    Some("core::option::Option::Some")
+                    Some("core::option::Option<usize>::Some")
                 );
             }
         }
@@ -576,6 +595,56 @@ mod tests {
         assert_eq!(rewritten, 1, "the unsigned checked_add site must rewrite");
         // Carry test: `add` (wrapping sum) + `uint_lt(sum, x)` + `eq`.
         assert_eq!(tail_binops(&g, a), vec!["add", "uint_lt", "eq"]);
+    }
+
+    #[test]
+    fn checked_add_rewrites_through_instantiation_recast() {
+        let mut g = FunctionGraph::new("test_checked_uint_recast");
+        let a = g.startblock;
+        let x = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let y = g.push_op_var(a, OpKind::ConstInt(8), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: checked_target("checked_add"),
+                    args: crate::model::call_args(vec![x, y]),
+                    result_ty: ValueType::Ref(Some("core::option::Option<usize>".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let narrowed = g
+            .push_op_var(
+                a,
+                crate::model::cast_instance_call("Option<usize>", opt.clone()),
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(a, cont, vec![narrowed]);
+        let rewritten = rewire_checked_arith_uint_sites(&mut g, &[site_for(&opt)]);
+        assert_eq!(
+            rewritten, 1,
+            "the unsigned checked_add callee must rewrite through the dest recast"
+        );
+        assert_eq!(tail_binops(&g, a.0), vec!["add", "uint_lt", "eq"]);
+        let some_owners: Vec<_> = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } if field.name == "__pos_0" => {
+                    field.owner_root.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            some_owners.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["core::option::Option<usize>::Some"]
+        );
     }
 
     #[test]

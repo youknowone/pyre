@@ -51,7 +51,7 @@
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::result_exc::{
     assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-    follow_single_exit, split_diamond_exits,
+    collapse_trailing_recasts_onto, follow_single_exit, split_diamond_exits,
 };
 use crate::model::{
     CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
@@ -76,21 +76,32 @@ pub(crate) fn checked_arith_ovf_opname(leaf: &str) -> Option<&'static str> {
 /// `true` iff the residual call target is a
 /// `core::num::<Impl>::checked_{add,sub,mul}` — the `[.., "num",
 /// "<Impl>", "checked_*"]` FunctionPath shape Charon emits for the
-/// inherent `i64` method (core fn bodies are Opaque in the LLBC, so the
-/// call is permanently unliftable).  Combined with an `Option` return
-/// type at the recording site, this records a checked-arith candidate;
-/// the rewrite itself validates the surrounding match shape.
+/// inherent integer method (core fn bodies are Opaque in the LLBC, so the
+/// call is permanently unliftable). Recognition is by the callee path
+/// (`FunDecl` leaf on that FunctionPath), not by the dest `Option`
+/// spelling: after per-instantiation classdef keys the dest is
+/// `Option<i64>` / `Option<usize>`, and a dest-name match would miss.
+/// Combined with an `Option` return type at the recording site, this
+/// records a checked-arith candidate; the rewrite itself validates the
+/// surrounding match shape.
 pub(crate) fn is_checked_arith_target(target: &CallTarget) -> bool {
+    checked_arith_callee_leaf(target).is_some()
+}
+
+/// The `checked_{add,sub,mul}` leaf of a residual callee, if this
+/// FunctionPath is the inherent `core::num::<Impl>` method.
+pub(crate) fn checked_arith_callee_leaf(target: &CallTarget) -> Option<&str> {
     let CallTarget::FunctionPath { segments, .. } = target else {
-        return false;
+        return None;
     };
     let [first, .., module, impl_seg, leaf] = segments.as_slice() else {
-        return false;
+        return None;
     };
-    first == "core"
+    (first == "core"
         && module == "num"
         && impl_seg == "<Impl>"
-        && checked_arith_ovf_opname(leaf).is_some()
+        && checked_arith_ovf_opname(leaf).is_some())
+    .then_some(leaf.as_str())
 }
 
 /// `true` for the signed width atoms (`{"Scalar": {"Integer": {"Signed": _}}}`) whose
@@ -271,11 +282,26 @@ fn rewire_one_checked_arith_site(
         })
         .ok_or_else(|| format!("{name}: checked_* result var has no producer block"))?;
 
-    // The call must be A's last op (lower_call closes the block right
-    // after pushing it) so it becomes the block's `raising_op`.
-    let call_idx = graph.blocks[a].operations.len() - 1;
-    let last_is_call = graph.blocks[a].operations[call_idx].result.as_ref() == Some(opt);
-    if !last_is_call {
+    // The dest Option is recast onto its instantiation (`Option<i64>`).
+    // Drop that identity recast so the callee is again the last op and
+    // becomes the block's `raising_op`.
+    collapse_trailing_recasts_onto(graph, a, opt);
+
+    // Locate the residual by its callee (`core::num::<Impl>::checked_*`),
+    // not by dest-type spelling. The call must then be A's last op.
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| {
+            op.result.as_ref() == Some(opt)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { target, args, .. }
+                        if args.len() == 2 && is_checked_arith_target(target)
+                )
+        })
+        .ok_or_else(|| format!("{name}: no 2-arg checked_* callee producing {opt:?}"))?;
+    if call_idx + 1 != graph.blocks[a].operations.len() {
         return Err(format!(
             "{name}: checked_* call is not the last op of block {a}"
         ));
@@ -283,14 +309,9 @@ fn rewire_one_checked_arith_site(
     // Capture the two operands (the `_ovf` op's args) and resolve the
     // `_ovf` opname from the callee leaf.
     let (lhs, rhs, ovf_opname) = match &graph.blocks[a].operations[call_idx].kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } if args.len() == 2 => {
-            let leaf = segments
-                .last()
-                .ok_or_else(|| format!("{name}: checked_* call path is empty"))?;
+        OpKind::Call { target, args, .. } if args.len() == 2 => {
+            let leaf = checked_arith_callee_leaf(target)
+                .ok_or_else(|| format!("{name}: call is not a checked_* arith callee"))?;
             let ovf = checked_arith_ovf_opname(leaf)
                 .ok_or_else(|| format!("{name}: call leaf {leaf} is not a checked_* arith op"))?;
             (
@@ -966,6 +987,93 @@ mod tests {
         assert!(
             exits[1].last_exception.is_some() && exits[1].last_exc_value.is_some(),
             "overflow link carries the last_exception / last_exc_value pair"
+        );
+    }
+
+    #[test]
+    fn rewrite_finds_checked_add_behind_instantiation_recast() {
+        let mut g = FunctionGraph::new("test_checked_add_recast");
+        let a = g.startblock;
+        let va = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let vb = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: checked_target(),
+                    args: crate::model::call_args(vec![va.clone(), vb.clone()]),
+                    result_ty: ValueType::Ref(Some("Option<i64>".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let narrowed = g
+            .push_op_var(
+                a,
+                crate::model::cast_instance_call("Option<i64>", opt.clone()),
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        g.push_op_var(
+            some_t,
+            OpKind::FieldRead {
+                base: some_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        g.set_return(some_t, None);
+        let none_t = g.create_block();
+        g.set_return(none_t, None);
+        g.set_goto(a, c, vec![narrowed.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c.clone())],
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c.clone())],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[]);
+        assert_eq!(
+            rewritten.total, 1,
+            "the checked_add callee must rewrite through the dest recast"
+        );
+        let last = g.blocks[a.0].operations.last().unwrap();
+        match &last.kind {
+            OpKind::BinOp { op, .. } => assert_eq!(op, "add_ovf"),
+            other => panic!("expected add_ovf BinOp, got {other:?}"),
+        }
+        assert!(
+            crate::model::cast_instance_root(&last.kind).is_none(),
+            "the instantiation recast must be dropped"
         );
     }
 

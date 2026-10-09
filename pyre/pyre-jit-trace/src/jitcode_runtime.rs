@@ -2414,6 +2414,8 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         "recursive_call_f/iIRFIRF>f",
         "recursive_call_v/iIRFIRF",
         "getarrayitem_raw_i/iid>i",
+        "setarrayitem_raw_i/iiid",
+        "int_isvirtual/i>i",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()

@@ -834,15 +834,26 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
 /// [`drop_guarded_gc_write_barriers`] drops when the store it guards
 /// follows. `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
+///
+/// `celldict::object_mutable_cell_write_barrier` is `write_cell`'s
+/// spelling of the barrier on `w_cell.w_value = w_value`. A cell is
+/// outside the collector only when `lltype::malloc_typed_managed` ran
+/// before the GC alloc hook was installed; the product installs every
+/// pyre-object hook at boot (`init_jit_hooks` phase A →
+/// `init_gc_subsystem` → `install_pyre_object_hooks`), before any
+/// interpreter state exists, so every cell compiled code can store into
+/// is collector-owned and the call is the `gc_hook` barrier.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };
-    module == "gc_hook"
-        && matches!(
-            leaf.as_str(),
+    matches!(
+        (module.as_str(), leaf.as_str()),
+        (
+            "gc_hook",
             "try_gc_write_barrier" | "try_gc_write_barrier_managed"
-        )
+        ) | ("celldict", "object_mutable_cell_write_barrier")
+    )
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
@@ -936,13 +947,18 @@ fn canonical_gc_base(
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
 /// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
-/// that barrier as an explicit `try_gc_write_barrier(obj)` right before the
-/// store it guards, so the call is dropped only when a GC `FieldWrite` /
-/// `ArrayWrite` of the same base follows it in the same block: that store
-/// lowers to the op the backend barriers. Any other barrier stays residual.
+/// that barrier as an explicit `try_gc_write_barrier(obj)` (or
+/// `celldict::object_mutable_cell_write_barrier` from `write_cell`) right
+/// before the store it guards, so the call is dropped only when a GC
+/// `FieldWrite` / `ArrayWrite` of the same base follows it in the same
+/// block: that store lowers to the op the backend barriers. Any other
+/// barrier stays residual.
 ///
-/// The result becomes `true`: the hook is installed before any compiled
-/// code runs.
+/// The bool-returning `gc_hook` result becomes `true`: the hook is
+/// installed before any compiled code runs. The unit-returning
+/// `celldict::object_mutable_cell_write_barrier` result becomes
+/// `ConstNone`, the unit-constant binding `front/mir.rs` uses for
+/// `type_write_barrier`.
 fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let aliases = std::collections::HashMap::new();
     let mut drops: Vec<(usize, usize)> = Vec::new();
@@ -980,7 +996,13 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     }
     for (bi, oi) in drops {
         let op = &mut graph.blocks[bi].operations[oi];
-        op.kind = OpKind::ConstBool(true);
+        op.kind = match &op.kind {
+            OpKind::Call {
+                result_ty: ValueType::Void,
+                ..
+            } => OpKind::ConstNone,
+            _ => OpKind::ConstBool(true),
+        };
     }
 }
 
@@ -2642,13 +2664,18 @@ impl<'a> Transformer<'a> {
         // `Constant(prebuilt_instance_ptr)` before jtransform runs.
         // `transform_graph_to_jitcode` runs this fold on `graph_owned`
         // already; running it again here is idempotent (no-op after
-        // the first pass) and ensures `transform_graph` /
-        // `transform_graph_with_callcontrol` entry points (test
-        // fixtures, etc.) are also covered.
-        // After rtype: leftover `Call` ops never reach
-        // `InstanceRepr.convert_const`.  Match-arm graphs interned with
-        // the bookkeeper in `flowspace_adapter` before rtype.
-        crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(&mut rewritten, None);
+        // the first pass) when the session bookkeeper is present.
+        // `InstanceRepr.convert_const` looks up `value.__class__` on
+        // `rtyper.annotator.bookkeeper`; a throwaway Bookkeeper is a
+        // second intern universe, so a CallControl without one
+        // (unit-test fixtures, `transform_graph` with no annotator)
+        // skips the fold rather than minting.
+        if let Some(fold_bk) = self.callcontrol.as_ref().and_then(|cc| cc.bookkeeper()) {
+            crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
+                &mut rewritten,
+                Some(&fold_bk),
+            );
+        }
 
         // RPython rtyper `specialize_call` rewrites a `we_are_jitted()`
         // `direct_call` to the `_we_are_jitted` symbolic constant
@@ -3473,6 +3500,13 @@ impl<'a> Transformer<'a> {
                     );
                 }
                 RewriteResult::Replace(Vec::new())
+            }
+            // High-level `newlist(item0, …, itemN)` (`object_array_unsize_newlist`).
+            // `rtype_newlist` expands this on the flowspace graph; jtransform
+            // walks the model graph, so this arm performs the same
+            // `do_fixed_newlist` + `do_fixed_list_setitem` expansion.
+            OpKind::NewList { args } => {
+                rewrite_fixed_newlist(graph, op, args, self.callcontrol.as_deref())
             }
             // `rewrite_op_malloc`: a `new` whose STRUCT has a vtable is
             // `new_with_vtable`. scalar_replace may have already emitted
@@ -9764,21 +9798,8 @@ impl<'a> Transformer<'a> {
                         item_ty,
                         array_type_id,
                     } => {
-                        let array_type_id = match (&item_ty, array_type_id) {
-                            (_, Some(id)) => Some(id),
-                            (ValueType::Int, None) => Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                            (ValueType::Float, None) => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
-                            // `do_fixed_newlist` (jtransform.py): a GC-pointer
-                            // OF emits `new_array_clear` with
-                            // `cpu.arraydescrof(ARRAY)`. An identity-less
-                            // Ref descr cannot trace the block; name the
-                            // same `GcArray(OBJECTPTR)` identity the
-                            // `newlist_clear` Fallback uses.
-                            (ValueType::Ref(_), None) => {
-                                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
-                            }
-                            (_, None) => None,
-                        };
+                        let (item_ty, array_type_id) =
+                            arraydescr_of_fixed_array(item_ty, array_type_id);
                         if matches!(item_ty, ValueType::Ref(_)) {
                             (
                                 "newlist → new_array_clear(length, arraydescr) \
@@ -12494,6 +12515,90 @@ fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
     Some((id, nolength))
 }
 
+/// High-level `newlist(item0, …, itemN)` (`OpKind::NewList`).
+///
+/// `rtype_newlist` (`rlist.py`) expands this to `LIST.ll_newlist(n)` plus
+/// one `ll_setitem_fast` per item; `do_fixed_newlist` /
+/// `do_fixed_list_setitem` (`jtransform.py`) then turn those oopspecs into
+/// `new_array` / `new_array_clear` + `setarrayitem_gc`.
+///
+/// `do_fixed_newlist` reads `ARRAY = op.result.concretetype.TO` and
+/// builds the array descr from it (`cpu.arraydescrof(ARRAY)`). A
+/// GC-pointer `ARRAY.OF` selects `new_array_clear`; otherwise
+/// `new_array`. The model-graph producer
+/// `object_array_unsize_newlist` plants `Ptr(GcArray(GCREF))` on the
+/// result so this arm sees that ARRAY.
+///
+/// The rtyper rewrite stays on the flowspace graph; jtransform walks the
+/// model graph, so this arm performs that same expansion.
+fn rewrite_fixed_newlist(
+    graph: &mut FunctionGraph,
+    op: &SpaceOperation,
+    items: &[crate::flowspace::model::Variable],
+    callcontrol: Option<&crate::call::CallControl>,
+) -> RewriteResult {
+    let Some((item_ty, array_type_id, clears)) =
+        fixed_newlist_array(op.result.as_ref(), callcontrol)
+    else {
+        return RewriteResult::Keep;
+    };
+    let nolength = crate::front::typestr::nolength_from_array_type_id(Some(array_type_id.as_str()));
+    let n = items.len() as i64;
+    let length =
+        graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+    let mut ops = Vec::with_capacity(2 + items.len() * 2);
+    ops.push(SpaceOperation {
+        result: Some(length.clone()),
+        kind: OpKind::ConstInt(n),
+    });
+    let alloc = if clears {
+        OpKind::NewArrayClear {
+            length,
+            item_ty: item_ty.clone(),
+            array_type_id: Some(array_type_id.clone()),
+        }
+    } else {
+        OpKind::NewArray {
+            length,
+            item_ty: item_ty.clone(),
+            array_type_id: Some(array_type_id.clone()),
+        }
+    };
+    ops.push(SpaceOperation {
+        result: op.result.clone(),
+        kind: alloc,
+    });
+    let Some(array) = op.result.clone() else {
+        return RewriteResult::Replace(ops);
+    };
+    // `do_fixed_newlist` result is `Ptr(GcArray)`; an untyped leftover
+    // would assemble the stores as `setarrayitem_raw_*`.
+    crate::model::FunctionGraph::set_concretetype_of_inline(
+        &array,
+        crate::codewriter::type_state::ConcreteType::GcRef,
+    );
+    for (i, item) in items.iter().enumerate() {
+        let index =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        ops.push(SpaceOperation {
+            result: Some(index.clone()),
+            kind: OpKind::ConstInt(i as i64),
+        });
+        ops.push(SpaceOperation {
+            result: None,
+            kind: OpKind::ArrayWrite {
+                base: array.clone(),
+                index,
+                value: LinkArg::Value(item.clone()),
+                item_ty: item_ty.clone(),
+                array_type_id: Some(array_type_id.clone()),
+                nolength,
+            },
+        });
+    }
+    RewriteResult::Replace(ops)
+}
+
 /// `__pos_N` on a length-prefixed `Array<T;N>` is `getarrayitem_gc` /
 /// `setarrayitem_gc` on the ARRAY `do_fixed_newlist` allocated. A
 /// headerless item keeps the positional field: its `&[T]` reader has no
@@ -13846,6 +13951,50 @@ fn newlist_clear_shape(
             NewlistClearShape::Fallback
         }
         _ => NewlistClearShape::Fallback,
+    }
+}
+
+/// `cpu.arraydescrof(ARRAY)` for a nameless `GcArray(ITEM)`: the descr
+/// cache key follows ITEM. A rust layout already carries its identity
+/// in `array_type_id`.
+fn arraydescr_of_fixed_array(
+    item_ty: ValueType,
+    array_type_id: Option<String>,
+) -> (ValueType, Option<String>) {
+    let array_type_id = match (&item_ty, array_type_id) {
+        (_, Some(id)) => Some(id),
+        (ValueType::Int, None) => Some(LIST_INT_ITEMS_ARRAY.to_string()),
+        (ValueType::Float, None) => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+        // `do_fixed_newlist`: a GC-pointer OF emits `new_array_clear`
+        // with `cpu.arraydescrof(ARRAY)`. An identity-less Ref descr
+        // cannot trace the block; name the same `GcArray(OBJECTPTR)`
+        // identity the `newlist_clear` Fallback uses.
+        (ValueType::Ref(_), None) => {
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+        }
+        (_, None) => None,
+    };
+    (item_ty, array_type_id)
+}
+
+/// `ARRAY = op.result.concretetype.TO` (`do_fixed_newlist`) and
+/// `cpu.arraydescrof(ARRAY)`. `clears` is whether `ARRAY.OF` is a GC
+/// pointer (`new_array_clear` vs `new_array`).
+fn fixed_newlist_array(
+    result: Option<&crate::flowspace::model::Variable>,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> Option<(ValueType, String, bool)> {
+    match newlist_clear_shape(result, callcontrol) {
+        NewlistClearShape::Fixed {
+            item_ty,
+            array_type_id,
+        } => {
+            let (item_ty, array_type_id) = arraydescr_of_fixed_array(item_ty, array_type_id);
+            let array_type_id = array_type_id?;
+            let clears = matches!(item_ty, ValueType::Ref(_));
+            Some((item_ty, array_type_id, clears))
+        }
+        _ => None,
     }
 }
 
@@ -23195,6 +23344,18 @@ mod tests {
         }
     }
 
+    fn cell_wb_call(obj: &crate::flowspace::model::Variable) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path([
+                "pyre_object",
+                "celldict",
+                "object_mutable_cell_write_barrier",
+            ]),
+            args: crate::model::call_args(vec![obj.clone()]),
+            result_ty: ValueType::Void,
+        }
+    }
+
     fn wb_store(
         obj: &crate::flowspace::model::Variable,
         stored: &crate::flowspace::model::Variable,
@@ -23252,7 +23413,8 @@ mod tests {
     }
 
     /// Only the `gc_hook` barrier is this op: a same-named leaf in another
-    /// module is an ordinary call.
+    /// module is an ordinary call. Same for
+    /// `celldict::object_mutable_cell_write_barrier`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -23267,6 +23429,55 @@ mod tests {
             "try_gc_write_barrier"
         ])));
         assert!(!is_gc_write_barrier_path(&path(&["try_gc_write_barrier"])));
+        assert!(is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "celldict",
+            "object_mutable_cell_write_barrier"
+        ])));
+        assert!(!is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "other",
+            "object_mutable_cell_write_barrier"
+        ])));
+    }
+
+    /// `rewrite.py handle_write_barrier_setfield` owns the barrier on
+    /// SETFIELD_GC: `write_cell`'s explicit celldict barrier right
+    /// before the GC store it guards does not survive as a residual
+    /// helper. The call returns `()`; the dropped op is `ConstNone`.
+    #[test]
+    fn celldict_write_barrier_before_its_store_is_dropped() {
+        let mut graph = FunctionGraph::new("cell_wb_drop");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, cell_wb_call(&obj), false);
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let ops = &graph.blocks[entry.0].operations;
+        assert!(matches!(ops[0].kind, OpKind::ConstNone));
+        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
+    }
+
+    /// A celldict barrier whose argument has no GC store after it in
+    /// its block stays a residual call — dropping it would be a GC hole.
+    #[test]
+    fn celldict_write_barrier_without_following_store_stays_residual() {
+        let mut graph = FunctionGraph::new("cell_wb_keep");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        graph.push_op_var(entry, cell_wb_call(&obj), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[1].kind));
+
+        let mut graph = FunctionGraph::new("cell_wb_keep_alone");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, cell_wb_call(&obj), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
     }
 
     #[test]
@@ -23451,6 +23662,159 @@ mod tests {
             !ops.iter()
                 .any(|kind| matches!(kind, OpKind::New { owner } if owner.contains("Array<"))),
             "escaping array must not be a struct new: {ops:?}"
+        );
+    }
+
+    /// `object_array_unsize_newlist` plants `OpKind::NewList` of object
+    /// pointers with `Ptr(GcArray(GCREF))` on the result.
+    /// `rewrite_fixed_newlist` is `do_fixed_newlist` plus one
+    /// `do_fixed_list_setitem` per item: `new_array_clear` of that
+    /// ARRAY and a `setarrayitem_gc` for each element. No `newlist`
+    /// jitcode op remains.
+    #[test]
+    fn object_array_literal_newlist_lowers_to_new_array_clear_and_stores() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let mut graph = FunctionGraph::new("object_array_literal_newlist");
+        let entry = graph.startblock;
+        let a = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let b = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let c = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let list = graph
+            .push_op_var(
+                entry,
+                OpKind::NewList {
+                    args: vec![a.clone(), b.clone(), c.clone()],
+                },
+                true,
+            )
+            .unwrap();
+        list.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+        }))));
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["take_object_slice"]),
+                args: crate::model::call_args(vec![list.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+        let expected = fixed_newlist_array(Some(&list), None)
+            .expect("do_fixed_newlist ARRAY")
+            .1;
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops: Vec<_> = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewList { .. })),
+            "newlist must not survive to jitcode: {ops:?}"
+        );
+        let alloc = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::NewArrayClear {
+                    array_type_id: Some(id),
+                    item_ty: ValueType::Ref(None),
+                    ..
+                } if id == &expected
+            )
+        });
+        let alloc = alloc.expect("object newlist must allocate the object gcarray");
+        assert_eq!(
+            alloc.result.as_ref(),
+            Some(&list),
+            "the slice value is the allocated array: {ops:?}"
+        );
+        let stored: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::ArrayWrite {
+                    base,
+                    value: LinkArg::Value(item),
+                    array_type_id: Some(id),
+                    nolength: false,
+                    ..
+                } if base == &list && id == &expected => Some(item.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            vec![a, b, c],
+            "each newlist item must be stored in order: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("take_object_slice")
+                    && args.iter().any(|arg| arg.as_variable() == Some(&list))
+            )),
+            "the slice parameter must receive the allocated array: {ops:?}"
+        );
+    }
+
+    /// Empty `newlist()` is `ll_newlist(0)` / `do_fixed_newlist` with no
+    /// `setitem`. The ARRAY is the result's `Ptr(GcArray(GCREF))`.
+    #[test]
+    fn empty_object_newlist_lowers_to_new_array_clear() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let mut graph = FunctionGraph::new("empty_object_newlist");
+        let entry = graph.startblock;
+        let list = graph
+            .push_op_var(entry, OpKind::NewList { args: vec![] }, true)
+            .unwrap();
+        list.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+        }))));
+        graph.set_return(entry, Some(list.clone()));
+        let expected = fixed_newlist_array(Some(&list), None)
+            .expect("do_fixed_newlist ARRAY")
+            .1;
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops: Vec<_> = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| &op.kind)
+            .collect();
+        assert!(
+            !ops.iter()
+                .any(|kind| matches!(kind, OpKind::NewList { .. })),
+            "empty newlist must not survive to jitcode: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|kind| matches!(
+                kind,
+                OpKind::NewArrayClear {
+                    array_type_id: Some(id),
+                    item_ty: ValueType::Ref(None),
+                    ..
+                } if id == &expected
+            )),
+            "empty newlist must allocate a zero-length object gcarray: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|kind| matches!(kind, OpKind::ArrayWrite { .. })),
+            "empty newlist has no item stores: {ops:?}"
         );
     }
 

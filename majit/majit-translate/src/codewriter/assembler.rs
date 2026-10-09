@@ -841,6 +841,12 @@ impl AssemblerEncode for Assembler {
                     });
                 }
                 argcodes.push('L');
+                if opname.starts_with("int_") && args.iter().any(|arg| arg.kind != RegKind::Int) {
+                    panic!(
+                        "fused goto_if_not_{opname}/{argcodes} in {} has a non-int register",
+                        self.current_graph_name.as_deref().unwrap_or("?")
+                    );
+                }
                 let opnum = self.get_opnum(&format!("goto_if_not_{opname}/{argcodes}"));
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -3575,20 +3581,11 @@ impl AssemblerEncode for Assembler {
         // The discriminant is a class-level constant on the interned
         // variant host (`ClassDesc.classdict` / `rclass.py`
         // `initialize_prebuilt_data` `classdesc.read_attribute`).  Recover
-        // `(qualname, tag)` from the constant itself so a bookkeeper-path
-        // instance — which never enters `UNIT_VARIANT_PREBUILT_INSTANCES`
-        // — still takes this arm.  The identity-Vec lookup is the
-        // bookkeeper-less fallback.
+        // `(qualname, tag)` from the constant itself so `emit_const_r`
+        // does not need a side table of instance identities.
         if let ConstValue::HostObject(obj) = value {
             if let Some((qualname, tag)) =
                 crate::translator::rtyper::unit_variant_fold::unit_variant_const_from_host(obj)
-            {
-                return self.emit_unit_variant_const_r(qualname, tag, state);
-            }
-            if let Some((qualname, tag)) =
-                crate::translator::rtyper::unit_variant_fold::unit_variant_const_by_identity(
-                    obj.identity_id(),
-                )
             {
                 return self.emit_unit_variant_const_r(qualname, tag, state);
             }
@@ -5841,7 +5838,18 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
-        OpKind::NewList { .. } => "newlist".into(),
+        // High-level `newlist(item0, …, itemN)` does not exist as a jitcode
+        // op. `rtype_newlist` (`rlist.py`) expands it to `ll_newlist` plus
+        // `ll_setitem_fast`, and `do_fixed_newlist` /
+        // `do_fixed_list_setitem` (`jtransform.py`) turn those into
+        // `new_array_clear` + `setarrayitem_gc`. `rewrite_fixed_newlist`
+        // performs that expansion on the model graph. Reaching this arm
+        // would emit `newlist/<r…>r`, which has no blackhole handler.
+        OpKind::NewList { .. } => panic!(
+            "OpKind::NewList reached the JitCode assembler; jtransform must \
+             expand newlist to new_array_clear + setarrayitem_gc \
+             (rewrite_fixed_newlist / do_fixed_newlist)"
+        ),
         // `getslice` never reaches the assembler in a lifted graph — the
         // rtyper's `rtype_getslice` replaces it with a `direct_call` to the
         // `ll_listslice_*` helper, and the gated front recognizer keeps it
@@ -7776,13 +7784,20 @@ mod tests {
         // deferred sentinel path and commits the recorded descriptor into
         // `JitCodeBody.unit_variant_consts` — the build-side half of the
         // loop the runtime `materialize_unit_variant_consts` pass closes.
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use std::rc::Rc;
+        let bk = Rc::new(Bookkeeper::new());
         let instance =
             crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                &bk,
                 "TestUnitVariantEnum.Only",
                 Some(7),
-                None,
             )
             .expect("unit variant instance");
+        let expected_class = instance
+            .instance_class()
+            .expect("prebuilt instance has a class host")
+            .clone();
         let mut flat = SSARepr {
             name: "return_unit_variant".into(),
             insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
@@ -7797,7 +7812,7 @@ mod tests {
         assert_eq!(body.unit_variant_consts.len(), 1);
         let d = &body.unit_variant_consts[0];
         assert_eq!(d.tag, 7);
-        assert_eq!(d.qualname, "TestUnitVariantEnum.Only");
+        assert_eq!(d.qualname, expected_class.qualname());
         assert_eq!(
             body.constants_r[d.constants_r_index].get(),
             UNIT_VARIANT_CONST_SENTINEL_BASE,
@@ -7807,9 +7822,8 @@ mod tests {
     #[test]
     fn assemble_ref_return_with_bookkeeper_unit_variant_constant() {
         // Production order: `fold_unit_variant_ctors(graph, Some(&bk))`
-        // then assemble.  The bookkeeper-path instance is not in
-        // `UNIT_VARIANT_PREBUILT_INSTANCES`; `emit_const_r` recovers
-        // `(qualname, tag)` from the interned variant class host.
+        // then assemble.  `emit_const_r` recovers `(qualname, tag)` from
+        // the interned variant class host.
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
         use std::rc::Rc;
@@ -7846,13 +7860,6 @@ mod tests {
                 })
             })
             .expect("fold rewrote the ctor to ConstRef");
-        assert!(
-            crate::translator::rtyper::unit_variant_fold::unit_variant_const_by_identity(
-                instance.identity_id()
-            )
-            .is_none(),
-            "bookkeeper-path instance must not enter the global Vec"
-        );
         let expected_class = bk.intern_enum_variant_host("JitAction", "Return");
         let mut flat = SSARepr {
             name: "return_bk_unit_variant".into(),

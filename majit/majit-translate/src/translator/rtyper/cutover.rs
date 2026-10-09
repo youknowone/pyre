@@ -2935,8 +2935,9 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
 /// rtyper's lowering of the `valuetype_to_someshell` annotation shell:
 /// `Str` → the string pointer, `Ref`/`State` → the erased object pointer
 /// (`OBJECTPTR`, what a classdef-less `SomeInstance` rtypes to), `Unknown`
-/// declines.  Used to build a callee's declared fn-ptr arg signature.
-fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLevelType> {
+/// declines.  Used to build a callee's declared fn-ptr arg signature
+/// (`getfunctionptr` / `FuncType.RESULT` from the return annotation).
+pub(crate) fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLevelType> {
     use crate::model::ValueType;
     Some(match vt {
         ValueType::Int => LowLevelType::Signed,
@@ -3401,17 +3402,16 @@ pub(crate) fn register_atomic_load_llexternals(
 /// The result shell comes from the per-method faithful `ValueType` the
 /// collector read off the LLBC output signature — a `Ref(None)`
 /// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
-/// `bigint_from`), or a scalar shell for an integer/float/bool return.
-/// Same non-overwriting, annotator-only-carrier contract as
-/// [`register_foreign_stdlib_externals`].
+/// `bigint_from`), a `SomeInstance(classdef)` of the interned enum-base
+/// for a payload-enum return (`GcAllocOutcome::from_hook`), or a scalar
+/// shell for an integer/float/bool return.  Same non-overwriting,
+/// annotator-only-carrier contract as [`register_foreign_stdlib_externals`].
 pub(crate) fn register_foreign_opaque_method_externals(
     registry: &CallRegistry,
     externals: &[(Vec<String>, Signature, crate::model::ValueType)],
 ) {
     for (segments, signature, result_ty) in externals {
-        let Some(return_someval) =
-            crate::codewriter::annotation_state::valuetype_to_someshell(result_ty)
-        else {
+        let Some(return_someval) = foreign_opaque_method_return_shell(registry, result_ty) else {
             continue;
         };
         let key = FunctionPathKey::from_segments(segments.iter().cloned());
@@ -3425,6 +3425,36 @@ pub(crate) fn register_foreign_opaque_method_externals(
         );
         registry.register_callee(key, signature.clone(), stub_pygraph);
     }
+}
+
+/// Annotator shell for a harvested foreign-opaque residual result.
+///
+/// `valuetype_to_someshell(Ref)` always drops the classdef
+/// (`annotation_state.rs`), which is the right shell for an opaque
+/// `BigInt` return.  A payload-carrying enum (`GcAllocOutcome`) needs
+/// the interned enum-base ClassDef so a caller `match` can getattr
+/// `__discriminant` (`rclass.py` `InstanceRepr.rtype_getattr`).
+/// [`declared_return_annotation`] is the wrong intern here: a raw-word
+/// payload enum is a `raw_word_owner`, so that helper prefers
+/// `raw_struct_ptr_annotation` (`SomePtr`) over `SomeInstance`.
+fn foreign_opaque_method_return_shell(
+    registry: &CallRegistry,
+    result_ty: &crate::model::ValueType,
+) -> Option<crate::annotator::model::SomeValue> {
+    if let crate::model::ValueType::Ref(Some(root)) = result_ty {
+        let bk = registry.bookkeeper();
+        let host = bk.intern_class_by_qualname(root);
+        if let Ok(classdef) = bk.getuniqueclassdef(&host) {
+            return Some(crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                ),
+            ));
+        }
+    }
+    crate::codewriter::annotation_state::valuetype_to_someshell(result_ty)
 }
 
 /// Test-only restricted entry: only graphs without `OpKind::Call::FunctionPath`

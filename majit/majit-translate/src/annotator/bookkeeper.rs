@@ -1182,6 +1182,36 @@ impl Bookkeeper {
         self.exception_carrier_handle.borrow().as_deref() == Some(key.as_str())
     }
 
+    /// Whether `spelling` names the registered exception carrier handle or
+    /// object class. `tyref_is_result_of_carrier` compares the error ADT
+    /// to `ErrorCarrierSpec.carrier_path`; this is that compare on a
+    /// Charon type string.
+    fn exception_carrier_type_spelling(&self, spelling: &str) -> bool {
+        let t = peel_ref_and_ptr_prefixes(spelling);
+        if self.exception_carrier_handle_key(t) {
+            return true;
+        }
+        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(t));
+        if self.exception_carrier.borrow().as_deref() == Some(key.as_str()) {
+            return true;
+        }
+        let leaf = t.rsplit("::").next().unwrap_or(t);
+        if self
+            .exception_carrier_handle
+            .borrow()
+            .as_deref()
+            .and_then(|k| k.rsplit("::").next())
+            == Some(leaf)
+        {
+            return true;
+        }
+        self.exception_carrier
+            .borrow()
+            .as_deref()
+            .and_then(|k| k.rsplit("::").next())
+            == Some(leaf)
+    }
+
     /// The `__bases__` a first mint of class `key` receives when nothing
     /// else supplies one: `Exception` for the error carrier, none otherwise.
     fn default_class_bases(&self, key: &str) -> Vec<HostObject> {
@@ -2923,6 +2953,13 @@ impl Bookkeeper {
     /// `canonical_struct_name` resolves the leaf through
     /// `STRUCT_ORIGIN_REGISTRY` — the same normalisation the base itself
     /// went through.
+    ///
+    /// `enum_root` must carry the LLBC instantiation suffix when the ADT
+    /// is generic (`Option<i64>`, not `Option`). `canonical_struct_name`
+    /// reattaches a `<…>` that is already on the spelling and otherwise
+    /// leaves the name ungeneric, so two instantiations interned under
+    /// the bare template share one `ClassDef` and their payloads union
+    /// (`bookkeeper.py` `getuniqueclassdef(cls)` — one class per class).
     pub fn intern_enum_variant_host(
         self: &Rc<Self>,
         enum_root: &str,
@@ -3239,8 +3276,27 @@ impl Bookkeeper {
                         && inst.flags.is_empty()
                         && inst.base.const_box.is_none()
             );
+            // `tyref_to_attr_value_type` puts `Ptr(FuncType)` in the Int
+            // bank (`history.getkind`), so FORCE shells a `fn` /
+            // `Option<fn>` field as the Int-bank shell
+            // (`valuetype_to_someshell(Int)`: no const, signed,
+            // nonneg=false). The layout spelling is still a function
+            // pointer, and `project_struct_field_type` answers
+            // `SomePtr`. Replace ONLY that exact FORCE shell on a
+            // function-pointer spelling: it carries strictly less
+            // information than the registry projection, and leaving it
+            // makes a `fn` field read union `Integer ∪ Ptr(Func)` with
+            // `fn_null_constant`. Any other value was produced by real
+            // annotation flow and stays.
+            let is_fn_integer_force_shell = fn_ptr_somevalue_for_spelling_in(field_ty, Some(self))
+                .is_some()
+                && crate::codewriter::annotation_state::valuetype_to_someshell(
+                    &crate::model::ValueType::Int,
+                )
+                .is_some_and(|shell| shell == attr.s_value);
             if matches!(attr.s_value, SomeValue::Impossible)
                 || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
+                || is_fn_integer_force_shell
             {
                 attr.s_value = s_value;
             }
@@ -3549,6 +3605,28 @@ impl Bookkeeper {
         host
     }
 
+    /// Prebuilt singleton instance of the interned class for `qualname`.
+    ///
+    /// RPython `InstanceRepr.get_reusable_prebuilt_instance` caches one
+    /// instance per classdef on the rtyper; here the instance lives on
+    /// the interned class object (`HostObject::reusable_prebuilt_instance`)
+    /// in [`Self::struct_root_classes`]. A synthetic unit-variant path
+    /// interns through [`Self::intern_enum_variant_host`] so the instance's
+    /// `__class__` is the variant ClassDef (Continue → StepResult<..> →
+    /// StepResult). `getuniqueclassdef(value.__class__)` then returns that
+    /// ClassDef (`classdesc.py getuniqueclassdef`, `rclass.py
+    /// InstanceRepr.convert_const`). The declared discriminant is a
+    /// class-dict constant on that host (`ClassDesc.classdict`).
+    pub fn intern_unit_variant_prebuilt_instance(
+        self: &Rc<Self>,
+        qualname: &str,
+        tag: Option<i64>,
+    ) -> Option<HostObject> {
+        crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+            self, qualname, tag,
+        )
+    }
+
     /// True when `name` is a type-root key in the snapshot
     /// struct-field registry ([`Self::struct_fields`]).  Enums and
     /// structs both register under their qualified path AND bare leaf
@@ -3638,12 +3716,13 @@ impl Bookkeeper {
         // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
         // `_gckind == 'raw'`, so `getkind` is Signed — the dual-gate twin
         // of the legacy walker's address word (`gateway::builtin_code_get`).
-        if is_fn_type_spelling(t) {
+        if let Some(s_fn) = fn_ptr_somevalue_for_spelling_in(t, Some(self)) {
             // `lltype.FuncType` / `SomePtr` (`lltype.py` `SomePtr`). A raw
-            // function pointer is not a GC instance; `Option<fn>`'s null
-            // (`fn_null_constant`) uses this same `ll_ptrtype` so the two
-            // arms union (`llannotation.py` `pairtype(SomePtr, SomePtr).union`).
-            return raw_fn_ptr_somevalue();
+            // function pointer is not a GC instance. `Option<fn(...)>`'s
+            // null (`fn_null_constant`) uses the same signature `FuncType`
+            // so the two arms union (`llannotation.py`
+            // `pairtype(SomePtr, SomePtr).union`).
+            return s_fn;
         }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`.  Projecting the pointee is right for an
@@ -3778,8 +3857,8 @@ impl Bookkeeper {
             // `union(SomePtr, s_None)`. `s_None` is a classdef-less
             // instance, and that union collapses to a GC ref while the
             // value itself is an int-bank address.
-            if is_fn_type_spelling(inner.trim()) {
-                return raw_fn_ptr_somevalue();
+            if let Some(s_fn) = fn_ptr_somevalue_for_spelling_in(inner.trim(), Some(self)) {
+                return s_fn;
             }
             let s_inner = self.project_struct_field_type(inner);
             // The same join is refused for a raw-struct payload
@@ -4543,31 +4622,6 @@ impl Bookkeeper {
         }
     }
 
-    /// Classdef for a prebuilt instance.
-    ///
-    /// Ordinary instances keep `getuniqueclassdef(x.__class__)`. A folded
-    /// unit-variant constant (`StepResult<*mut PyObject>::Continue`) is
-    /// re-interned as the enum variant so it subclasses the discriminant-only
-    /// class field reads already use.
-    fn classdef_for_prebuilt_instance(
-        self: &Rc<Self>,
-        class_obj: &crate::flowspace::model::HostObject,
-    ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
-        let qualname = class_obj.qualname();
-        if let Some((owner, variant)) = qualname.rsplit_once('.') {
-            let mut segments: Vec<String> = owner.split('.').map(str::to_string).collect();
-            segments.push(variant.to_string());
-            if crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(
-                &segments,
-            ) {
-                let enum_root = owner.replace('.', "::");
-                let host = self.intern_enum_variant_host(&enum_root, variant);
-                return self.getuniqueclassdef(&host);
-            }
-        }
-        self.getuniqueclassdef(class_obj)
-    }
-
     /// Input is a flowspace [`ConstValue`] — the Rust-side counterpart
     /// to upstream's Python constant. Primitive branches (bool / int /
     /// float / str / char / unicode / bytearray / tuple / None) are
@@ -4920,10 +4974,10 @@ impl Bookkeeper {
             // A unit-variant singleton is folded to a prebuilt instance whose
             // class host is interned through `intern_enum_variant_host`
             // (`unit_variant_fold::intern_unit_variant_prebuilt_instance`)
-            // so `value.__class__` is the variant ClassDef.  A dotted ctor
-            // host (bookkeeper-less fold) is re-interned as that variant
-            // so field reads of the discriminant-only class still union.
-            let classdef = self.classdef_for_prebuilt_instance(class_obj)?;
+            // so `value.__class__` is the variant ClassDef.
+            // `getuniqueclassdef(x.__class__)` (bookkeeper.py) then returns
+            // that ClassDef (`rclass.py` `InstanceRepr.convert_const`).
+            let classdef = self.getuniqueclassdef(class_obj)?;
             super::classdesc::ClassDef::see_instance(&classdef, obj)?;
             let mut inst = super::model::SomeInstance::new(
                 Some(classdef),
@@ -5084,17 +5138,216 @@ fn is_nullable_sum_spelling(field_ty: &str) -> bool {
 }
 
 /// `SomePtr(Ptr(FuncType([], Void)))` — the annotation of a raw function
-/// pointer whose signature was erased to the field-registry spelling
-/// (`is_fn_type_spelling`). Shared with `fn_null_constant` so a null
-/// `Option<fn>` and a `fn` field read are one `ll_ptrtype`.
+/// pointer whose signature was erased to the coarse field-registry
+/// spelling (`fn` / `Option<fn>`). Shared with an untyped `fn_null_constant`
+/// so a coarse null `Option<fn>` and a coarse `fn` field read are one
+/// `ll_ptrtype`.
 pub(crate) fn raw_fn_ptr_somevalue() -> SomeValue {
-    use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, Ptr, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
     SomeValue::Ptr(super::model::SomePtr::new(Ptr {
-        TO: PtrTarget::Func(FuncType {
-            args: vec![],
-            result: LowLevelType::Void,
-        }),
+        TO: PtrTarget::Func(empty_functype()),
     }))
+}
+
+/// `SomePtr(FuncType)` when `spelling` names a function pointer or a
+/// nullable `Option<fn>`. The `Int` bank (`history.getkind` of
+/// `Ptr(FuncType)`) still shells through `valuetype_to_someshell` as
+/// `SomeInteger`; this recovers the pointer lattice those Int-typed
+/// producers lost. A full `fn(inputs) -> output` spelling yields the
+/// same `FuncType` as `getfunctionptr` / `declared_funcptr_type_from_legacy`
+/// for that signature.
+#[cfg(test)]
+pub(crate) fn fn_ptr_somevalue_for_spelling(spelling: &str) -> Option<SomeValue> {
+    fn_ptr_somevalue_for_spelling_in(spelling, getbookkeeper().as_deref())
+}
+
+pub(crate) fn fn_ptr_somevalue_for_spelling_in(
+    spelling: &str,
+    bk: Option<&Bookkeeper>,
+) -> Option<SomeValue> {
+    use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+    let ft = func_type_from_fn_spelling(spelling, bk)?;
+    Some(SomeValue::Ptr(super::model::SomePtr::new(Ptr {
+        TO: PtrTarget::Func(ft),
+    })))
+}
+
+fn empty_functype() -> crate::translator::rtyper::lltypesystem::lltype::FuncType {
+    use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType};
+    FuncType {
+        args: vec![],
+        result: LowLevelType::Void,
+    }
+}
+
+/// `FuncType` of a Rust fn-pointer spelling. One Rust `fn` type is one
+/// `FuncType` (`lltype.py` `FuncType` / `getfunctionptr`), whether the
+/// producer is a parameter seed, a field read, or a reified fn item.
+pub(crate) fn func_type_from_fn_spelling(
+    spelling: &str,
+    bk: Option<&Bookkeeper>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
+    use crate::translator::rtyper::lltypesystem::lltype::FuncType;
+    let t = spelling.trim();
+    let inner = if let Some(inner) = strip_generic_one(t, "Option<") {
+        inner.trim()
+    } else {
+        t
+    };
+    if !is_fn_type_spelling(inner) {
+        return None;
+    }
+    let rest = inner.strip_prefix("unsafe ").unwrap_or(inner).trim();
+    let after_fn = rest.strip_prefix("fn")?.trim();
+    if after_fn.is_empty() {
+        return Some(empty_functype());
+    }
+    let Some((args_str, after_args)) = split_paren_group(after_fn) else {
+        return Some(empty_functype());
+    };
+    let args = if args_str.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_generic_args(args_str)
+            .into_iter()
+            .map(fn_ptr_arg_lltype)
+            .collect()
+    };
+    let after = after_args.trim();
+    let result = if after.is_empty() {
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
+    } else if let Some(ret) = after.strip_prefix("->") {
+        fn_ptr_result_lltype(ret.trim(), bk)
+    } else {
+        return None;
+    };
+    Some(FuncType { args, result })
+}
+
+/// First parenthesized group of a `fn(...)` spelling, with nested
+/// `()` / `<>` / `[]` depth. `None` when the group is unclosed.
+fn split_paren_group(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => {
+                depth -= 1;
+                if depth == 0 && b == b')' {
+                    return Some((&input[1..i], &input[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn peel_ref_and_ptr_prefixes(spelling: &str) -> &str {
+    let mut t = spelling.trim();
+    loop {
+        let next = t
+            .strip_prefix('&')
+            .or_else(|| t.strip_prefix("*const "))
+            .or_else(|| t.strip_prefix("*mut "))
+            .map(|s| s.trim_start_matches("mut ").trim());
+        match next {
+            Some(n) if n != t => t = n,
+            _ => break,
+        }
+    }
+    t
+}
+
+/// Ok payload of `Result<T, E>` when `E` is the bookkeeper's exception
+/// carrier (`tyref_is_result_of_carrier`). Other `Result` types stay
+/// the ADT; `FuncType.RESULT` is then `valuetype_to_lltype` of that
+/// payload, matching `getcallable` / `getfunctionptr`.
+fn result_ok_of_exception_carrier<'a>(
+    spelling: &'a str,
+    bk: Option<&Bookkeeper>,
+) -> Option<&'a str> {
+    let bk = bk?;
+    let args = spelling.trim().strip_prefix("Result<")?.strip_suffix('>')?;
+    let parts = split_generic_args(args);
+    if parts.len() == 2 && bk.exception_carrier_type_spelling(parts[1].trim()) {
+        Some(parts[0].trim())
+    } else {
+        None
+    }
+}
+
+/// Arg lltype of a fn-pointer spelling. Matches `valuetype_to_lltype` of
+/// the corresponding `ValueType` (`declared_funcptr_type_from_legacy`):
+/// integers / bool / float stay primitive; `str` is `STRPTR`; everything
+/// else — slices, ADTs, `Result`, pointers, `()` — is `OBJECTPTR`.
+fn fn_ptr_arg_lltype(
+    spelling: &str,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    let t = peel_ref_and_ptr_prefixes(spelling);
+    match t {
+        "i8" | "i16" | "i32" | "i64" | "isize" | "char" => LowLevelType::Signed,
+        "i128" => LowLevelType::SignedLongLongLong,
+        "u8" | "u16" | "u32" | "u64" | "usize" => LowLevelType::Unsigned,
+        "u128" => LowLevelType::UnsignedLongLongLong,
+        "bool" => LowLevelType::Bool,
+        "f32" => LowLevelType::SingleFloat,
+        "f64" => LowLevelType::Float,
+        "str" | "String" | "Wtf8" | "Wtf8Buf" => {
+            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
+        }
+        "StringBuilder" => {
+            crate::translator::rtyper::lltypesystem::rbuilder::STRINGBUILDERPTR.clone()
+        }
+        "gcref" | "GCREF" => GCREF.clone(),
+        other if is_fn_type_spelling(other) => LowLevelType::Signed,
+        _ => crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+    }
+}
+
+/// Result lltype of a fn-pointer spelling. `getfunctionptr` / `getcallable`
+/// set `FuncType.RESULT` to the callee return variable's lltype
+/// (`bindingrepr(v).lowleveltype`); `valuetype_to_lltype` is that
+/// projection from the return `ValueType`. A `Result<T, E>` whose `E` is
+/// the exception carrier is the residual-call payload `T`
+/// (`tyref_is_result_of_carrier`).
+fn fn_ptr_result_lltype(
+    spelling: &str,
+    bk: Option<&Bookkeeper>,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::model::ValueType;
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    if let Some(ok) = result_ok_of_exception_carrier(spelling, bk) {
+        return fn_ptr_result_lltype(ok, bk);
+    }
+    let t = spelling.trim();
+    if t == "()" {
+        return LowLevelType::Void;
+    }
+    let peeled = peel_ref_and_ptr_prefixes(t);
+    if peeled == "gcref" || peeled == "GCREF" {
+        return GCREF.clone();
+    }
+    let vt = match peeled {
+        "bool" => ValueType::Bool,
+        "i8" | "i16" | "i32" | "i64" | "isize" | "char" => ValueType::Int,
+        "i128" => ValueType::Int128,
+        "u8" | "u16" | "u32" | "u64" | "usize" => ValueType::Unsigned,
+        "u128" => ValueType::UInt128,
+        "f32" => ValueType::SingleFloat,
+        "f64" => ValueType::Float,
+        "str" | "String" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
+        "StringBuilder" => ValueType::StringBuilder,
+        other if is_fn_type_spelling(other) => ValueType::Int,
+        _ => ValueType::Ref(None),
+    };
+    crate::translator::rtyper::cutover::valuetype_to_lltype(&vt)
+        .unwrap_or_else(|| crate::translator::rtyper::rclass::OBJECTPTR.clone())
 }
 
 /// Charon spelling of a Rust function-pointer type (`fn`, `fn(…)`,
@@ -5860,6 +6113,107 @@ mod tests {
     }
 
     #[test]
+    fn fn_ptr_spellings_of_one_rust_type_share_one_functype() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let with_ref = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
+        let stripped = "fn([PyObjectRef]) -> Result<PyObjectRef, PyError>";
+        let a = fn_ptr_somevalue_for_spelling(with_ref).expect("ref spelling is a fn pointer");
+        let b = fn_ptr_somevalue_for_spelling(stripped).expect("stripped spelling is a fn pointer");
+        let SomeValue::Ptr(pa) = &a else {
+            panic!("ref spelling must seed SomePtr, got {a:?}");
+        };
+        let SomeValue::Ptr(pb) = &b else {
+            panic!("stripped spelling must seed SomePtr, got {b:?}");
+        };
+        assert_eq!(
+            pa.ll_ptrtype, pb.ll_ptrtype,
+            "one Rust fn type is one FuncType (`getfunctionptr`)"
+        );
+        let expected = FuncType {
+            args: vec![OBJECTPTR.clone()],
+            result: OBJECTPTR.clone(),
+        };
+        assert_eq!(
+            pa.ll_ptrtype.TO,
+            PtrTarget::Func(expected),
+            "BuiltinCodeFn args/result rtype as OBJECTPTR (`valuetype_to_lltype` / `return_token_to_lltype`)"
+        );
+        crate::annotator::model::union(&a, &b)
+            .expect("equal FuncTypes union (`llannotation.py` SomePtr.union)");
+        let option_spelling = "Option<fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>>";
+        let c = fn_ptr_somevalue_for_spelling(option_spelling)
+            .expect("Option of that fn type is the same pointer");
+        let SomeValue::Ptr(pc) = &c else {
+            panic!("Option<fn> spelling must seed SomePtr, got {c:?}");
+        };
+        assert_eq!(
+            pa.ll_ptrtype, pc.ll_ptrtype,
+            "Option wrapping does not change FuncType (`getfunctionptr`)"
+        );
+        crate::annotator::model::union(&a, &c)
+            .expect("Option<fn(ARGS)->RET> unions with fn(ARGS)->RET");
+        let empty = raw_fn_ptr_somevalue();
+        assert!(
+            crate::annotator::model::union(&empty, &a).is_err(),
+            "distinct FuncTypes must not union; the seed is the signature, not a merge of pointer types"
+        );
+    }
+
+    #[test]
+    fn fn_ptr_result_lltype_follows_callee_return_valuetype() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let math = fn_ptr_somevalue_for_spelling("fn(f64) -> Result<f64, MathError>")
+            .expect("math Result is a fn pointer");
+        let SomeValue::Ptr(p_math) = &math else {
+            panic!("math spelling must seed SomePtr, got {math:?}");
+        };
+        assert_eq!(
+            p_math.ll_ptrtype.TO,
+            PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Float],
+                result: OBJECTPTR.clone(),
+            }),
+            "a non-carrier Result stays the ADT (`getfunctionptr` of that return annotation)"
+        );
+
+        let bk = bk();
+        bk.set_exception_carrier("error::PyErrorObject");
+        bk.alias_exception_carrier_handle("error::PyError");
+        let unit = fn_ptr_somevalue_for_spelling_in("fn() -> Result<(), PyError>", Some(&bk))
+            .expect("carrier Result is a fn pointer");
+        let SomeValue::Ptr(p_unit) = &unit else {
+            panic!("unit spelling must seed SomePtr, got {unit:?}");
+        };
+        assert_eq!(
+            p_unit.ll_ptrtype.TO,
+            PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+            "carrier Result<(), E> is Void (`getcallable` of the success return)"
+        );
+        let signed =
+            fn_ptr_somevalue_for_spelling_in("fn() -> Result<i64, error::PyError>", Some(&bk))
+                .expect("carrier i64 Result is a fn pointer");
+        let SomeValue::Ptr(p_signed) = &signed else {
+            panic!("signed spelling must seed SomePtr, got {signed:?}");
+        };
+        assert_eq!(
+            p_signed.ll_ptrtype.TO,
+            PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Signed,
+            }),
+            "carrier Result<i64, E> is Signed (`valuetype_to_lltype` of the payload)"
+        );
+    }
+
+    #[test]
     fn bytes_block_projects_to_rpython_string_storage() {
         use crate::annotator::model::SomeValue;
 
@@ -6380,6 +6734,123 @@ mod tests {
     }
 
     #[test]
+    fn generic_enum_instantiations_keep_distinct_payload_classdefs() {
+        // Two Rust instantiations of one generic enum are two classes
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`). Their `Some.__pos_0`
+        // attrs must not share one Attribute: a shared ClassDef unions
+        // `r_uint` with `int`.
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        for (root, payload) in [
+            ("option::Option<usize>", "usize"),
+            ("option::Option<i64>", "i64"),
+        ] {
+            reg.fields.insert(
+                root.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+            reg.fields.insert(
+                format!("{root}::Some"),
+                vec![("__pos_0".to_string(), payload.to_string())],
+            );
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        let some_usize = bk
+            .getuniqueclassdef_for_enum_variant("option::Option<usize>", "Some")
+            .expect("Option<usize>::Some");
+        let some_i64 = bk
+            .getuniqueclassdef_for_enum_variant("option::Option<i64>", "Some")
+            .expect("Option<i64>::Some");
+        assert!(
+            !Rc::ptr_eq(&some_usize, &some_i64),
+            "Option<usize>::Some and Option<i64>::Some must be distinct ClassDefs, got {}",
+            some_usize.borrow().name
+        );
+        assert_ne!(some_usize.borrow().name, some_i64.borrow().name);
+        assert!(
+            some_usize.borrow().name.contains("<usize>"),
+            "usize instantiation must keep its suffix, got {}",
+            some_usize.borrow().name
+        );
+        assert!(
+            some_i64.borrow().name.contains("<i64>"),
+            "i64 instantiation must keep its suffix, got {}",
+            some_i64.borrow().name
+        );
+
+        let unsigned = SomeValue::Integer(SomeInteger::new(true, true));
+        let signed = SomeValue::Integer(SomeInteger::new(true, false));
+        ClassDef::generalize_attr(&some_usize, "__pos_0", Some(unsigned.clone()))
+            .expect("usize Some payload");
+        ClassDef::generalize_attr(&some_i64, "__pos_0", Some(signed.clone()))
+            .expect("i64 Some payload");
+        match &some_usize.borrow().attrs["__pos_0"].s_value {
+            SomeValue::Integer(si) => assert!(si.unsigned, "usize payload must stay r_uint"),
+            other => panic!("expected unsigned Integer, got {other:?}"),
+        }
+        match &some_i64.borrow().attrs["__pos_0"].s_value {
+            SomeValue::Integer(si) => assert!(!si.unsigned, "i64 payload must stay signed"),
+            other => panic!("expected signed Integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intern_enum_variant_host_keeps_suffix_after_template_some() {
+        // A template `Option::Some` interned first must not steal the
+        // `Option<usize>::Some` key (`bookkeeper.py` `getuniqueclassdef(cls)`).
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option::Some".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<usize>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "option::Option<usize>::Some".to_string(),
+            vec![("__pos_0".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let template = bk.intern_enum_variant_host("Option", "Some");
+        let suffixed = bk.intern_enum_variant_host("core::option::Option<usize>", "Some");
+        assert_ne!(
+            template,
+            suffixed,
+            "template Some must not be the usize instantiation, template={} suffixed={}",
+            template.qualname(),
+            suffixed.qualname()
+        );
+        assert!(
+            suffixed.qualname().contains("<usize>"),
+            "ctor intern of Option<usize>::Some must keep the suffix, got {}",
+            suffixed.qualname()
+        );
+        let cd = bk
+            .getuniqueclassdef_for_enum_variant("core::option::Option<usize>", "Some")
+            .expect("Option<usize>::Some classdef");
+        assert!(
+            cd.borrow().name.contains("<usize>"),
+            "ClassDef name must keep the suffix, got {}",
+            cd.borrow().name
+        );
+    }
+
+    #[test]
     fn unit_variant_prebuilt_continue_unions_with_stepresult_field() {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::flowspace::model::ConstValue;
@@ -6398,11 +6869,10 @@ mod tests {
         for root in bk.struct_root_names() {
             let _ = bk.getuniqueclassdef_for_struct_root(&root);
         }
-        let instance =
-            crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+        let instance = bk
+            .intern_unit_variant_prebuilt_instance(
                 "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
                 Some(0),
-                Some(&bk),
             )
             .expect("prebuilt Continue");
         let s = bk
@@ -8817,6 +9287,70 @@ mod tests {
     }
 
     #[test]
+    fn unit_variant_prebuilt_instance_is_of_interned_class() {
+        // The prebuilt instance's `__class__` is the interned class
+        // object (`rclass.py InstanceRepr.convert_const` /
+        // `classdesc.py getuniqueclassdef`). getuniqueclassdef of that
+        // class has the Continue → StepResult<*mut PyObject> →
+        // StepResult chain.
+        use crate::annotator::classdesc::ClassDef;
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyopcode::StepResult".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "pyopcode::StepResult<*mut PyObject>::Continue".to_string(),
+            vec![],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let dotted = "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue";
+        let interned = bk.intern_enum_variant_host(
+            "pyre_interpreter::pyopcode::StepResult<*mut PyObject>",
+            "Continue",
+        );
+        let instance = bk
+            .intern_unit_variant_prebuilt_instance(dotted, Some(0))
+            .expect("unit-variant prebuilt instance");
+        let cls = instance.class_of().expect("instance class");
+        assert_eq!(cls, interned);
+        let cd = bk
+            .getuniqueclassdef(&cls)
+            .expect("getuniqueclassdef of the interned class");
+        let mro: Vec<String> = ClassDef::getmro(&cd)
+            .into_iter()
+            .map(|c| c.borrow().name.clone())
+            .collect();
+        assert!(
+            mro.iter().any(|n| n.contains("Continue")),
+            "MRO must include Continue, got {mro:?}"
+        );
+        assert!(
+            mro.iter().any(|n| n.contains("StepResult<*mut PyObject>")),
+            "MRO must include StepResult<*mut PyObject>, got {mro:?}"
+        );
+        let short = bk
+            .getuniqueclassdef_for_struct_root("pyopcode::StepResult")
+            .expect("field class");
+        assert!(
+            cd.borrow().issubclass(&short),
+            "Continue must subclass StepResult, MRO {mro:?}"
+        );
+        assert!(
+            mro.iter().any(|n| {
+                let leaf = n.rsplit("::").next().unwrap_or(n);
+                leaf == "StepResult"
+            }),
+            "MRO must include StepResult, got {mro:?}"
+        );
+    }
+
+    #[test]
     fn getdesc_for_instance_returns_frozen_entry() {
         let bk = bk();
         let cls = HostObject::new_class("pkg.Foo", vec![]);
@@ -9462,6 +9996,70 @@ mod tests {
             computed[1] - computed[0],
             2 * word,
             "later fields must keep the metadata word"
+        );
+    }
+
+    #[test]
+    fn struct_root_pass2_replaces_integer_force_shell_of_fn_field() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        // `tyref_to_attr_value_type` banks `Ptr(FuncType)` as Int, so FORCE
+        // shells the field `SomeInteger`. Pass-2 must replace that with the
+        // layout spelling's `SomePtr` (`project_struct_field_type("fn")`).
+        crate::annotator::classdesc::register_struct_fields(
+            "CallbackHolder",
+            &[("slot".to_string(), crate::model::ValueType::Int)],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "CallbackHolder".to_string(),
+            vec![("slot".to_string(), "fn".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("CallbackHolder")
+            .expect("CallbackHolder registers");
+        let g = cd.borrow();
+        let slot = g.attrs.get("slot").expect("slot attr present");
+        assert!(
+            matches!(slot.s_value, SomeValue::Ptr(_)),
+            "fn field must project to SomePtr(FuncType), got {:?}",
+            slot.s_value
+        );
+    }
+
+    #[test]
+    fn struct_root_pass2_keeps_integer_force_shell_of_non_fn_int_field() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        // A non-fn Int-bank field (`usize`) is also FORCE-shelled as
+        // `valuetype_to_someshell(Int)`. Pass-2 must leave that shell:
+        // the Integer→Ptr replacement is only the exact FORCE shell of
+        // a function-pointer spelling. Replacing it would install the
+        // `usize` projection (`s_uint`, unsigned) over the FORCE shell.
+        crate::annotator::classdesc::register_struct_fields(
+            "LenHolder",
+            &[("len".to_string(), crate::model::ValueType::Int)],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "LenHolder".to_string(),
+            vec![("len".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("LenHolder")
+            .expect("LenHolder registers");
+        let g = cd.borrow();
+        let len = g.attrs.get("len").expect("len attr present");
+        let force = crate::codewriter::annotation_state::valuetype_to_someshell(
+            &crate::model::ValueType::Int,
+        );
+        assert_eq!(
+            Some(&len.s_value),
+            force.as_ref(),
+            "non-fn Int field must keep the Int FORCE shell, got {:?}",
+            len.s_value
         );
     }
 

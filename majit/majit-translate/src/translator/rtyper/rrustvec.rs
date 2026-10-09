@@ -22,7 +22,7 @@ use crate::flowspace::model::{ConstValue, Hlvalue};
 use crate::model::ConcreteType;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
+    Array, FuncType, GCREF, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
 use crate::translator::rtyper::rlist::ListIteratorRepr;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, inputconst_from_lltype};
@@ -314,6 +314,25 @@ impl Repr for RustVecRepr {
                         LowLevelType::Unsigned,
                         LowLevelType::Unsigned,
                     ],
+                    LowLevelType::Void,
+                )
+            }
+            // `rlist.ll_extend(l1, l2)`: `l2` is the object GcArray word.
+            // Only `_r`: a one-word GcArray source is an object slice.
+            "extend" => {
+                if self.kind != VecItemKind::Ref {
+                    return Err(self.missing_rtype_operation("method_extend"));
+                }
+                let v = hop.inputargs(vec![
+                    ConvertedTo::Repr(self),
+                    ConvertedTo::LowLevelType(&*GCREF),
+                ])?;
+                hop.exception_cannot_occur()?;
+                self.call_helper(
+                    hop,
+                    VecOp::Extend,
+                    v,
+                    vec![self.lltype.clone(), GCREF.clone()],
                     LowLevelType::Void,
                 )
             }

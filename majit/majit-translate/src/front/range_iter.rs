@@ -241,16 +241,22 @@ fn rewire_one_range_iter_site(
         .ok_or_else(|| format!("{name}: range aggregate ctor op vanished"))?;
     let tmp = graph.alloc_value_var();
     let iter_var = res.clone();
-    let iter_phi = iter_arg.clone();
+    let iter_phi = (*iter_arg).clone();
     graph.blocks[cb].operations[ctor_idx] = range_builtin_call(tmp.clone(), start, end);
     graph.blocks[cb]
         .operations
         .insert(ctor_idx + 1, slice_iter_call(res, tmp));
-    // The loop-header phi of this iterator is `iter_var`. The entry edge
-    // can still pass the end bound (`w_tuple_len` in `exception_match`)
-    // into that phi, and the assembler then copies the unsigned word into
-    // the range pointer. When any predecessor of the slot passes the
-    // iterator, pass it on the bound edges too.
+    // The iterator-phi slot must receive the iterator on every predecessor,
+    // including an entry edge that still names the end bound (`w_tuple_len`
+    // in `exception_match`).  `FlowContext.mergeblock` /
+    // `FrameState.getoutputargs` thread each block's live locals as that
+    // block's inputargs, so a `Link.args` slot is a Variable defined in
+    // the source (`flowspace/model.py checkgraph`).  Planting the
+    // preheader `iter()` result on every predecessor breaks loop
+    // back-edges: the latch does not define that result.  Keep a
+    // source-defined alias; otherwise thread the header phi through the
+    // source (`FunctionGraph::ensure_variable_at_block`, the `setstate`
+    // backfill).
     let n = graph.blocks.len();
     let mut incoming: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for (bi, block) in graph.blocks.iter().enumerate() {
@@ -268,27 +274,53 @@ fn rewire_one_range_iter_site(
             if slot_var != Some(&iter_var) && slot_var != Some(&iter_phi) {
                 continue;
             }
-            // Every predecessor of the iterator phi must pass the iterator.
-            // The entry edge otherwise passes the end bound (`w_tuple_len`,
-            // or a local the FieldWrite no longer names) into the range
-            // pointer.
             for &(bi, ei) in preds {
-                let Some(arg) = graph.blocks[bi].exits[ei].args.get(pos) else {
-                    continue;
-                };
-                let already = matches!(arg, LinkArg::Value(v) if v == &iter_var);
-                if !already {
+                if graph.blocks[bi].exits[ei].args.get(pos).is_some() {
                     fix.push((bi, ei, pos));
                 }
             }
         }
     }
     for (bi, ei, pos) in fix {
+        let src = crate::model::BlockId(bi);
+        let keep = match graph.blocks[bi].exits[ei].args.get(pos) {
+            Some(LinkArg::Value(v))
+                if graph.variable_defined_in_block(src, v)
+                    && iterator_alias_of(flow, v, &iter_var, &iter_phi) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if keep {
+            continue;
+        }
+        let replacement = if graph.variable_defined_in_block(src, &iter_var) {
+            iter_var.clone()
+        } else if graph.variable_defined_in_block(src, &iter_phi) {
+            iter_phi.clone()
+        } else if graph.ensure_variable_at_block(src, &iter_phi) {
+            iter_phi.clone()
+        } else {
+            continue;
+        };
         if let Some(slot) = graph.blocks[bi].exits[ei].args.get_mut(pos) {
-            *slot = LinkArg::Value(iter_var.clone());
+            *slot = LinkArg::Value(replacement);
         }
     }
     Ok(())
+}
+
+/// `true` iff `v` is the `iter()` result, the loop-header iterator phi, or
+/// a block-inputarg alias that traces to the range value through
+/// `ValueFlow` (`range_iter_origin_matches`).
+fn iterator_alias_of(
+    flow: &ValueFlow,
+    v: &Variable,
+    iter_var: &Variable,
+    iter_phi: &Variable,
+) -> bool {
+    v == iter_var || v == iter_phi || range_iter_origin_matches(flow, v, iter_var)
 }
 
 /// `true` iff `iter_arg` traces — directly or through loop-carried block
@@ -698,6 +730,345 @@ mod tests {
             count_calls_ending(&g, &["core", "slice", "iter"]),
             1,
             "one iter op emitted"
+        );
+    }
+
+    fn assert_link_args_defined_in_source(graph: &FunctionGraph) {
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for link in &block.exits {
+                for (arg_index, arg) in link.args.iter().enumerate() {
+                    let Some(var) = arg.as_variable() else {
+                        continue;
+                    };
+                    assert!(
+                        graph.variable_defined_in_block(crate::model::BlockId(bi), var),
+                        "undefined operand as Link.args[{arg_index}] entry \
+                         (source block {bi} -> target block {})",
+                        link.target.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// `for _ in a..b { live }` — the range reaches the header, the body
+    /// carries a loop-live local and the iterator alias, and the latch
+    /// jumps back.  The rewrite must not plant the preheader `iter()`
+    /// result on that back-edge (`FlowContext.mergeblock` /
+    /// `FrameState.getoutputargs`).
+    #[test]
+    fn rewrite_loop_back_edge_threads_iterator_defined_in_source() {
+        let mut g = FunctionGraph::new("test_range_iter_loop_back_edge");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let live = g.push_op_var(n, OpKind::ConstInt(1), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: range_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "start", &a),
+        });
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "end", &b),
+        });
+
+        let (h, h_args) = g.create_block_with_arg_vars(2);
+        let it = h_args[0].clone();
+        let live_h = h_args[1].clone();
+        let opt = g
+            .push_op_var(
+                h,
+                OpKind::Call {
+                    target: CallTarget::method("next", Some("Range".to_string())),
+                    args: crate::model::call_args(vec![it.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (body, body_args) = g.create_block_with_arg_vars(2);
+        let it_b = body_args[0].clone();
+        let live_b = body_args[1].clone();
+        let _keep_live = g
+            .push_op_var(
+                body,
+                OpKind::UnaryOp {
+                    op: "int_is_true".to_string(),
+                    operand: live_b.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        g.set_goto(n, h, vec![range.clone(), live.clone()]);
+        g.set_goto(h, body, vec![it.clone(), live_h.clone()]);
+        g.set_goto(body, h, vec![it_b.clone(), live_b.clone()]);
+
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range.clone(),
+            }],
+            &[opt],
+        );
+        assert_eq!(rewritten, 1, "the looping range for-loop must be diverted");
+        assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
+        assert_link_args_defined_in_source(&g);
+        let latch = g
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == h && block.id != n)
+            })
+            .expect("loop latch");
+        let passed = latch.exits[0].args[0]
+            .as_variable()
+            .expect("iterator slot is a value");
+        assert!(
+            g.variable_defined_in_block(latch.id, passed),
+            "back-edge iterator is a source-block inputarg or op result"
+        );
+        assert_ne!(
+            passed, &range,
+            "back-edge must not name the preheader iter() result"
+        );
+    }
+
+    /// Synthetic LLBC for `for _ in 0..n { live += 1 }`: a Range aggregate,
+    /// `next` in the header, and a body latch that does not mention the
+    /// iterator.  `lower_function` must thread the iterator through that
+    /// latch (`FlowContext.mergeblock`).
+    #[test]
+    fn lower_range_for_loop_back_edge_defines_link_args() {
+        use crate::front::mir::lower_function;
+        use majit_charon_reader::Llbc;
+
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let unit_ty = serde_json::json!({
+            "Adt": {"id": 2, "builtin": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let range_generics = serde_json::json!({
+            "regions": [],
+            "types": [usize_ty.clone()],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let range_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": range_generics.clone()}
+        });
+        let option_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": {
+                "regions": [],
+                "types": [usize_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }}
+        });
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+            serde_json::json!({
+                "index": index,
+                "name": name,
+                "span": span,
+                "ty": ty
+            })
+        };
+        let stmt = |kind: serde_json::Value| serde_json::json!({"span": span, "kind": kind, "comments_before": []});
+        let assign = |dest: u64, dest_ty: &serde_json::Value, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
+        };
+        let copy =
+            |index: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(index, ty)});
+        let usize_lit = |k: &str| {
+            serde_json::json!({
+                "Const": [
+                    {"Integer": {"Unsigned": ["Usize", k]}},
+                    usize_ty.clone()
+                ]
+            })
+        };
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let range_td = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["core", "ops", "range", "Range"]),
+            "kind": {"Struct": [
+                {"name": "start", "ty": usize_ty.clone(), "attr_info": field_attr},
+                {"name": "end", "ty": usize_ty.clone(), "attr_info": field_attr}
+            ]}
+        });
+        let option_td = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["core", "option", "Option"]),
+            "kind": {"Enum": [
+                {"name": "None", "fields": [], "discriminant": 0, "attr_info": null},
+                {"name": "Some", "fields": [
+                    {"name": "0", "ty": usize_ty.clone(), "attr_info": null}
+                ], "discriminant": 1, "attr_info": null}
+            ]}
+        });
+        let unit_td = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["core", "tuple", "Tuple"]),
+            "kind": {"Struct": []}
+        });
+        let next_fn = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["core", "iter", "traits", "iterator", "Iterator", "next"]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [range_ty.clone()],
+                "output": option_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "loop_range"]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [usize_ty.clone()],
+                "output": unit_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, None, &unit_ty),
+                    local(1, Some("n"), &usize_ty),
+                    local(2, Some("start"), &usize_ty),
+                    local(3, Some("range"), &range_ty),
+                    local(4, Some("opt"), &option_ty),
+                    local(5, Some("live"), &usize_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            assign(2, &usize_ty, serde_json::json!({
+                                "Use": [usize_lit("0"), "No"]
+                            })),
+                            assign(5, &usize_ty, serde_json::json!({
+                                "Use": [usize_lit("1"), "No"]
+                            })),
+                            assign(3, &range_ty, serde_json::json!({
+                                "Aggregate": [
+                                    {"Adt": [
+                                        {"id": 0, "generics": range_generics.clone()},
+                                        0,
+                                        null
+                                    ]},
+                                    [copy(2, &usize_ty), copy(1, &usize_ty)]
+                                ]
+                            }))
+                        ],
+                        "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 1},
+                                    "generics": {
+                                        "regions": [], "types": [],
+                                        "const_generics": [], "trait_refs": []
+                                    }
+                                }},
+                                "args": [copy(3, &range_ty)],
+                                "dest": place(4, &option_ty)
+                            },
+                            "target": 2,
+                            "on_unwind": 4
+                        }}}
+                    },
+                    {
+                        "statements": [
+                            assign(5, &usize_ty, serde_json::json!({
+                                "BinaryOp": ["Add", copy(5, &usize_ty), usize_lit("1")]
+                            }))
+                        ],
+                        "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [range_td, option_td, unit_td],
+                "fun_decls": [caller, next_fn],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("loop_range Llbc parses");
+        let graph = lower_function(&llbc, "loop_range").expect("lower loop_range");
+        assert_link_args_defined_in_source(&graph);
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &[crate::runtime_names::shims::RANGE.to_string()]
+                        || segments == &["core".to_string(), "slice".to_string(), "iter".to_string()]
+                )),
+            "the exclusive-int Range loop must divert to range()+iter()\n{}",
+            graph.dump()
         );
     }
 

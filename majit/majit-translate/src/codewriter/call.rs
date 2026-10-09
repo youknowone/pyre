@@ -2741,6 +2741,11 @@ pub struct CallControl {
     /// [`crate::front::semantic::SemanticProgram::atomic_load_decls`].
     pub atomic_load_decls:
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
+    /// Dual-gate annotator bookkeeper for this session. Set by
+    /// `CodeWriter::dual_gate_registry` so `emit_const_r` reverse-looks-up
+    /// unit-variant prebuilt constants against the intern store that
+    /// minted them.
+    bookkeeper: std::cell::RefCell<Option<std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>>>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -3285,6 +3290,7 @@ impl CallControl {
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
+            bookkeeper: std::cell::RefCell::new(None),
         };
         cc.stamp_ll_math_llexternal_canraise();
         cc
@@ -3388,6 +3394,22 @@ impl CallControl {
     /// dual-gate bookkeeper alongside [`Self::struct_fields`].
     pub fn enum_variant_by_discriminant(&self) -> &HashMap<String, HashMap<i64, String>> {
         &self.enum_variant_by_discriminant
+    }
+
+    /// Thread the dual-gate bookkeeper so assembler reverse-lookup of
+    /// unit-variant prebuilt constants uses the intern store that minted
+    /// them.
+    pub fn set_bookkeeper(
+        &self,
+        bookkeeper: std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>,
+    ) {
+        *self.bookkeeper.borrow_mut() = Some(bookkeeper);
+    }
+
+    /// Dual-gate bookkeeper for this session, if `CodeWriter` has started
+    /// one.
+    pub fn bookkeeper(&self) -> Option<std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>> {
+        self.bookkeeper.borrow().clone()
     }
 
     /// Register the trait → unique-concrete-impl-owner map (see the

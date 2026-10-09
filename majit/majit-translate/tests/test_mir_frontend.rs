@@ -124,11 +124,12 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
     }
     // `branch_loop_sum` iterates the `(items, length)` pair of its `&[i64]`:
     // `range(0, intmask(length))` and its `iter` op, `Iterator::next` lifted
-    // to the `[__iter_next]` op, and the item read `ll_slice_getitem_fast_i`
-    // at `r_uint(index)`.
+    // to the `[__iter_next]` op, the item read `ll_slice_getitem_fast_i`
+    // at `r_uint(index)`, and `intmask` of that `usize` helper result
+    // (`cast_uint_to_int`) so the signed item stays Signed.
     assert_eq!(
-        call_count, 6,
-        "expected 6 body Call ops (intmask, range, iter, next, r_uint, getitem)"
+        call_count, 7,
+        "expected 7 body Call ops (intmask, range, iter, next, r_uint, getitem, intmask)"
     );
     // The `next`-diamond rewrite (`front::iter_next`) replaces the
     // `Option` step's `__discriminant` switch with the `next` op's
@@ -148,6 +149,103 @@ fn lowers_strategy_len_with_discriminant_switch() {
     // bb0 Discriminant + Switch, bb1/bb2/bb3 arm bodies + Return,
     // bb4 Abort → 5 MIR bbs + returnblock + exceptblock = 7.
     assert_eq!(graph.blocks.len(), 7);
+}
+
+/// Charon `TerminatorKind::Panic` lowers the same implicit
+/// `AssertionError` raise as the older `Abort` terminator.
+#[test]
+fn a_panic_terminator_raises_implicitly_like_abort() {
+    use majit_charon_reader::ullbc::TermKind;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::LinkArg;
+
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+        "generated_from_span": null
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let local = serde_json::json!({
+        "index": 0,
+        "name": null,
+        "span": span,
+        "ty": unit
+    });
+    let panic_name = serde_json::json!([
+        {"Ident": ["core", 0]},
+        {"Ident": ["panicking", 0]},
+        {"Ident": ["panic_fmt", 0]}
+    ]);
+    let fun = |id: u64, leaf: &str, term: serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": {
+                "name": [{"Ident": ["probe", 0]}, {"Ident": [leaf, 0]}],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span, "kind": term},
+                    "is_cleanup": false
+                }]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.281",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [
+                fun(0, "abort_raise", serde_json::json!({"Abort": {"Panic": panic_name.clone()}})),
+                fun(1, "panic_raise", serde_json::json!({
+                    "Panic": {"name": panic_name, "on_unwind": 0}
+                }))
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture parses");
+    let panic_body = llbc
+        .fn_by_id(1)
+        .and_then(|fd| fd.unstructured())
+        .expect("panic body");
+    assert!(
+        matches!(panic_body.body[0].term(&llbc), Ok(TermKind::Panic { .. })),
+        "the Panic JSON shape must decode as TermKind::Panic"
+    );
+
+    let context = LowerContext::new(&llbc);
+    let abort_graph =
+        lower_fun_decl(&context, llbc.fn_by_id(0).expect("abort_raise")).expect("lower abort");
+    let panic_graph =
+        lower_fun_decl(&context, llbc.fn_by_id(1).expect("panic_raise")).expect("lower panic");
+
+    let implicit_raises = |graph: &majit_translate::model::FunctionGraph| {
+        graph
+            .blocks
+            .iter()
+            .filter(|b| {
+                b.exits.iter().any(|l| {
+                    l.target == graph.exceptblock
+                        && l.args.len() == 2
+                        && matches!(l.args[0], LinkArg::Const(_))
+                        && matches!(l.args[1], LinkArg::Const(_))
+                })
+            })
+            .count()
+    };
+    assert_eq!(implicit_raises(&abort_graph), 1);
+    assert_eq!(implicit_raises(&panic_graph), 1);
 }
 
 #[test]
@@ -493,6 +591,53 @@ fn branch_loop_sum_next_yields_an_int_element() {
         element_types,
         vec![ValueType::Int],
         "the `&[i64]` element must keep its own kind, not be typed as a GC reference",
+    );
+}
+
+/// `for &v in slice: &[i64]`: `ll_slice_getitem_fast_i` returns `usize`
+/// (`rvec.rs` `VecItemKind::Int`). The item is Signed, so the front end
+/// must `intmask` (`cast_uint_to_int`) the helper result the way indexed
+/// `items[i]` already does (`assert_exchange_pair_item`). Without that
+/// cast the annotator unions the signed `i64` argument of
+/// `int_or_float_encode_int` with the unsigned helper result.
+#[test]
+fn pair_slice_iter_getitem_intmasks_a_signed_item() {
+    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    let graph = lower_function(load_corpus(), "branch_loop_sum").expect("lowering");
+    let leaf = |op: &majit_translate::model::SpaceOperation| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty,
+            ..
+        } => segments
+            .last()
+            .map(|leaf| (leaf.clone(), args.clone(), result_ty.clone())),
+        _ => None,
+    };
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    let getitem_at = ops
+        .iter()
+        .position(|op| leaf(op).is_some_and(|(l, _, _)| l == "ll_slice_getitem_fast_i"))
+        .expect("branch_loop_sum reads the slice item");
+    let getitem_result = ops[getitem_at]
+        .result
+        .as_ref()
+        .expect("getitem has a result");
+    assert!(
+        leaf(ops[getitem_at]).is_some_and(|(_, _, ty)| ty == ValueType::Unsigned),
+        "ll_slice_getitem_fast_i returns usize"
+    );
+    let intmasked = ops.iter().any(|op| {
+        leaf(op).is_some_and(|(l, args, result_ty)| {
+            l == "intmask"
+                && args.first().and_then(|a| a.as_variable()) == Some(getitem_result)
+                && result_ty == ValueType::Int
+        })
+    });
+    assert!(
+        intmasked,
+        "signed pair-slice iter item must intmask the usize helper result"
     );
 }
 

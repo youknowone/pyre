@@ -22550,14 +22550,17 @@ impl WritableBuffer {
 
 impl Drop for WritableBuffer {
     fn drop(&mut self) {
-        let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+        // `self._roots` still holds the acquire pin. `BufferView.releasebuffer`
+        // has no keep-alive of its own; reload the owner from that slot.
         if self.held {
+            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
             unsafe { buffer_export_decref(owner) };
         }
         if self.made_view {
             // The count above is what a release refuses over, so it goes
             // first.  A failure has nowhere to be reported and nothing to
             // report: the view is this one's own and no caller named it.
+            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
             let _ = memoryview_release(&[owner]);
         }
     }

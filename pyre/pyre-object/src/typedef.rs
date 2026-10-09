@@ -223,6 +223,18 @@ pub fn walk_typedef_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
+pub fn test_declaration_roots_len() -> usize {
+    TYPEDEF_VALUE_ROOTS.lock().len()
+}
+
+pub fn test_last_declaration_slot() -> *mut PyObjectRef {
+    *TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut PyObjectRef
+}
+
+pub fn test_truncate_declaration_roots(len: usize) {
+    TYPEDEF_VALUE_ROOTS.lock().truncate(len);
+}
+
 /// Existing process-lifetime allocation for module-level `W_X.typedef`
 /// metadata. Keep the allocation identity while its bootstrap owner migrates
 /// to TypeDef.__init__ / TypeCache.build.
