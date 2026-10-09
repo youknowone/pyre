@@ -18117,6 +18117,20 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             });
         }
     };
+    // `execute_varargs`: `if pure and not last_exc_value and op:
+    // op = record_result_of_call_pure(...)`, then
+    // `exc = exc and not isinstance(op, Const)`.
+    let recorded = super::residual_call::record_result_of_executed_pure_call(
+        ctx,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        descr.clone(),
+        patch_pos,
+        recorded,
+        resid,
+    );
+    let can_raise = can_raise && recorded.inline_const_to_value().is_none();
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
     // `do_residual_call` writes dest before `GUARD_NOT_FORCED` so the
