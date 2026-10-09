@@ -2399,9 +2399,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     os.environ["CARGO_TARGET_DIR"] = str(charon_target)
     print(f"charon cargo target: {charon_target}")
 
-    crate_attr = "-Zcrate-attr=feature(cfg_select)"
-    env["RUSTC_BOOTSTRAP"] = "1"
-    env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " " + crate_attr).strip()
     # Charon reads MIR straight from rustc; the compiled binary is discarded
     # and only the `.ullbc` is kept, so debuginfo is dead weight here. Drop it
     # to skip DWARF generation across the whole extraction graph. The nightly

@@ -6703,6 +6703,7 @@ impl<M: Clone> MetaInterp<M> {
     /// snapshot and call [`Self::start_back_edge_trace`]; it has not marked the
     /// cell as tracing yet, so a later descriptor/live-value refusal remains a
     /// clean refusal rather than stranding a `JC_TRACING` cell.
+    #[cfg(test)]
     pub(crate) fn on_back_edge_typed_decision(
         &mut self,
         green_key: u64,
@@ -6749,7 +6750,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Commit a `StartTracing` answer from
-    /// [`Self::on_back_edge_typed_decision`] and consume the expensive tracing
+    /// [`Self::on_back_edge_typed_decision_on_driver`] and consume the expensive tracing
     /// arguments.  `bound_reached` re-runs the cell policy without ticking the
     /// counter, then marks the cell and sets up the trace.
     pub(crate) fn start_back_edge_trace(
@@ -13279,6 +13280,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Merge-point greens recorded for `green_key` on the compiling driver.
     /// `warmstate.py JitCell` is per `jitdriver_sd.warmstate`; two drivers
     /// may share a numeric cell key.
+    #[cfg(test)]
     pub(crate) fn loop_header_greens_for(
         &self,
         green_key: u64,
@@ -13290,6 +13292,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Runtime FINISH / `ContinueRunningNormally` banks for that driver's
     /// cell. `warmspot.py handle_jitexception` reads the entering
     /// `jitdriver_sd.warmstate`, not leftover `active_jitdriver_sd`.
+    #[cfg(test)]
     pub(crate) fn loop_header_greens_for_driver(
         &self,
         jd_no: usize,
@@ -13303,6 +13306,7 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get_mut(&key)
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_compiled_loop(
         &mut self,
         green_key: u64,
@@ -27966,7 +27970,7 @@ mod metainterp_static_data_tests {
         );
         assert!(
             !matches!(
-                meta.on_back_edge_typed_decision_on_driver(0, key, (0, 0)),
+                meta.on_back_edge_typed_decision(key, (0, 0)),
                 crate::warmstate::HotResult::RunCompiled
             ),
             "portal slot 0 does not take jd1's compiled cell as RunCompiled"

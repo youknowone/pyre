@@ -1327,9 +1327,6 @@ struct HelperBodyFact {
     has_push_roots: bool,
     /// MIR parameters are locals `1..=arg_count`. Local 0 is the return place.
     arg_count: u64,
-    /// Locals that received an assignment, so they are no longer the incoming
-    /// parameter value even when their number is still in `1..=arg_count`.
-    assigned: HashSet<u64>,
     defs: HashMap<u64, PinSrc>,
     calls: Vec<HelperCallFact>,
     /// Bare locals whose single assignment is a pin call or a slot read.
@@ -1344,9 +1341,6 @@ struct HelperBodyFact {
 
 struct PinAssignIndex {
     defs: HashMap<u64, PinSrc>,
-    /// Locals written at least once. A parameter local in this set is the
-    /// replacement, not the incoming argument.
-    assigned: HashSet<u64>,
     /// Bare locals whose single assignment is a call, and that were not
     /// overwritten later. A pin result is one of these.
     call_dests: HashSet<u64>,
@@ -1412,7 +1406,6 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
     }
     PinAssignIndex {
         defs,
-        assigned: defined,
         call_dests,
         mut_borrow_of,
     }
@@ -1967,7 +1960,6 @@ fn helper_body_fact(
     Some(HelperBodyFact {
         has_push_roots,
         arg_count: body.locals.arg_count,
-        assigned: index.assigned,
         defs: index.defs,
         calls,
         pin_result_locals,
@@ -3621,7 +3613,6 @@ mod tests {
         HelperBodyFact {
             has_push_roots,
             arg_count,
-            assigned: HashSet::new(),
             defs: HashMap::new(),
             pin_result_locals: HashSet::new(),
             calls: calls
@@ -4031,7 +4022,6 @@ mod tests {
             false,
             vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![1]])],
         );
-        body.assigned.insert(1);
         body.calls[0].assigned_before.clear();
         let bodies = HashMap::from([(1, body)]);
         let sums = summarize_pin_helpers(&bodies, &HashSet::new());

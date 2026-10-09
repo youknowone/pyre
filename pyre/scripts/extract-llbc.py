@@ -174,20 +174,9 @@ SPECS: dict[str, CrateSpec] = {
         # that build script and so brings the host copy of the interpreter
         # back.
         cargo_args=["--no-default-features", "--features", "{features}"],
-        # No layout sidecar. A cross-target pass has to pass cargo
-        # `--target`, and cargo then stops applying `RUSTFLAGS` to host
-        # units — including `pyre-jit-trace`'s build script, which
-        # build-depends on `pyre-interpreter` and so drags in
-        # `rustpython-host_env`. That crate uses `cfg_select!`, still
-        # unstable on Charon's pinned nightly, and the
-        # `-Zcrate-attr=feature(cfg_select)` that enables it can only reach
-        # host units through `-Zhost-config`, which cargo panics on when
-        # `--target` is set. The stock build never hits this: its toolchain
-        # has `cfg_select` stable.
-        #
-        # The gap this leaves is the 588 layout-carrying types declared
+        # No layout sidecar. The 588 layout-carrying types declared
         # only here — `jit::{flow,codewriter,flatten,regalloc}`,
-        # `majit_*`, and closure environments, i.e. the compiler's own
+        # `majit_*`, and closure environments — are the compiler's own
         # data structures rather than the object model traced bytecode
         # reads. Every runtime type reached through a descr comes from
         # pyre-object or pyre-interpreter, both of which do get sidecars.

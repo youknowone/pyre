@@ -3,7 +3,6 @@ version = "0.0.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/youknowone/pyre"
-homepage = "https://github.com/youknowone/pyre"
 
 [workspace]
 resolver = "2"
@@ -72,8 +71,6 @@ pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit", default-features = false
 # Defaults off so `pyre-jit` forwards `dynasm` / `cranelift` / `prepass` one by
 # one and its LLBC extraction pass can leave `prepass` out (see that manifest).
 pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace", default-features = false }
-pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
-pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
 # Pinned to upstream main after the pyre compatibility fixes from #8390 and
 # #8506, the memoryview fixes from #8553, the runtime marshal code-byte hook
@@ -142,7 +139,6 @@ rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev
 sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
 
 # majit JIT framework
-majit = { version = "0.0.2", path = "majit/majit" }
 # Defaults off although that manifest declares none: backend selection there is
 # mandatory, so a `default` added to it later would otherwise arrive through
 # every inheriting edge at once instead of being named per consumer.
@@ -152,7 +148,6 @@ majit-trace = { version = "0.0.2", path = "majit/majit-trace" }
 majit-backend = { version = "0.0.2", path = "majit/majit-backend" }
 majit-backend-cranelift = { version = "0.0.2", path = "majit/majit-backend-cranelift" }
 majit-backend-dynasm = { version = "0.0.2", path = "majit/majit-backend-dynasm" }
-majit-backend-wasm = { version = "0.0.2", path = "majit/majit-backend-wasm" }
 majit-backend-wasm-host = { version = "0.0.2", path = "majit/majit-backend-wasm-host" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
