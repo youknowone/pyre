@@ -801,7 +801,7 @@ fn dict_lookup_rdict_owner(cc: &crate::call::CallControl) -> Option<String> {
                     .struct_fields()
                     .fields
                     .get(*key)
-                    .is_some_and(|rows| rows.iter().any(|(name, _)| name == "entries"))
+                    .is_some_and(|rows| rows.iter().any(|row| row.name == "entries"))
         })
         .cloned()
         .collect();
@@ -13898,14 +13898,14 @@ fn newlist_clear_shape(
         if fields.len() != 2 {
             return None;
         }
-        let (_, first_ty) = fields.first()?;
+        let first_ty = &fields.first()?.ty;
         if !matches!(
             crate::front::mir::tuple_field_value_type(first_ty),
             ValueType::Int | ValueType::Unsigned
         ) {
             return None;
         }
-        let (_, ty) = fields.last()?;
+        let ty = &fields.last()?.ty;
         let Some((item, 0)) = crate::front::mir::shaped_array_parts(ty) else {
             return None;
         };
@@ -13962,14 +13962,14 @@ fn newlist_clear_shape(
         if fields.len() != 2 {
             return None;
         }
-        let (_, first_ty) = fields.first()?;
+        let first_ty = &fields.first()?.ty;
         if !matches!(
             crate::front::mir::tuple_field_value_type(first_ty),
             ValueType::Int | ValueType::Unsigned
         ) {
             return None;
         }
-        let (_, ty) = fields.last()?;
+        let ty = &fields.last()?.ty;
         let (item, 0) = crate::front::mir::shaped_array_parts(ty)? else {
             return None;
         };
