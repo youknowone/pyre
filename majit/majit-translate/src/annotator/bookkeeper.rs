@@ -703,6 +703,48 @@ fn generic_owner_lookup(name: &str) -> &str {
     name.split_once('<').map(|(bare, _)| bare).unwrap_or(name)
 }
 
+/// Pointer-sized host layout whose tag is `TagEncoding::Niche`.
+/// Extracted from [`Bookkeeper::field_ty_is_nullable_ptr`].
+///
+/// Size and tag are the Charon `HostLayout` facts (`host.size`,
+/// `host.tag.encoding`). The translator's explicit sum shell may store a
+/// larger `layout.size` than rustc's niche word; that shell size is not
+/// this fact.
+fn layout_is_niche_ptr_word(layout: &crate::codewriter::call::StructLayout) -> bool {
+    layout.host.as_ref().is_some_and(|host| {
+        host.size == crate::layout::target_word_size() as u64
+            && matches!(
+                host.tag.as_ref(),
+                Some(tag) if matches!(
+                    tag.encoding,
+                    majit_charon_reader::ullbc::TagEncoding::Niche { .. }
+                )
+            )
+    })
+}
+
+/// True when Charon recorded a tag on this layout. Absent `host.tag` is
+/// not a `TagEncoding` fact: the Option arm must not guess niche vs
+/// tagged from the inner annotation or the shell size.
+fn layout_host_has_tag(layout: &crate::codewriter::call::StructLayout) -> bool {
+    layout.host.as_ref().is_some_and(|host| host.tag.is_some())
+}
+
+/// `SomePtr` of a Raw `Struct` — gckind Raw, no GC field-0 ancestor.
+/// `Option<That>` is a tagged raw value; `Option` of any other Ptr is the
+/// nullable `lltype.Ptr`.
+fn some_ptr_is_raw_struct(s: &super::model::SomeValue) -> bool {
+    match s {
+        super::model::SomeValue::Ptr(p) => matches!(
+            &p.ll_ptrtype.TO,
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st)
+                if st._gckind
+                    == crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        ),
+        _ => false,
+    }
+}
+
 /// A template row spells a parameter as `??TypeVar#N` (declaration index)
 /// or, for one argument, as a bare name such as `T`.
 fn instantiate_field_spelling(
@@ -1340,6 +1382,19 @@ impl Bookkeeper {
         layout_for_owner(layouts, generic_owner_lookup(name)).map(|(_, layout)| layout)
     }
 
+    /// Layout of `name` itself (`StructId::instantiate` keeps monomorphs
+    /// distinct), then the template owner `layout_of_named` uses.
+    fn layout_of_type(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<crate::codewriter::call::StructLayout>> {
+        let layouts = self.struct_layouts.borrow();
+        let layouts = layouts.as_ref()?;
+        layout_for_owner(layouts, name)
+            .or_else(|| layout_for_owner(layouts, generic_owner_lookup(name)))
+            .map(|(_, layout)| layout)
+    }
+
     /// Promote a positional payload SomePtr to SomeInstance only for a
     /// classed scalar ADT written by `robjmodel_instantiate` (Fmt /
     /// Utf16Or32Form / RootScope as an enum payload). A closure capture
@@ -1384,16 +1439,7 @@ impl Bookkeeper {
             .trim();
         let named = majit_ir::descr::strip_generic_args(stripped);
         if let Some(layout) = self.layout_of_named(named.as_ref())
-            && layout.size == crate::layout::target_word_size()
-            && layout.host.as_ref().is_some_and(|host| {
-                matches!(
-                    host.tag.as_ref(),
-                    Some(tag) if matches!(
-                        tag.encoding,
-                        majit_charon_reader::ullbc::TagEncoding::Niche { .. }
-                    )
-                )
-            })
+            && layout_is_niche_ptr_word(layout.as_ref())
         {
             return true;
         }
@@ -3858,11 +3904,33 @@ impl Bookkeeper {
                 return s_fn;
             }
             let s_inner = self.project_struct_field_type(inner);
-            // The same join is refused for a raw-struct payload
-            // (`llannotation.py` `pairtype(SomePtr, SomeObject).union`).
-            // None is the null word of that Ptr.
+            // A niche pointer-word Option is the nullable `lltype.Ptr`
+            // (`None` is the null niche). A tagged Option keeps its
+            // discriminant: it is itself a raw struct
+            // (`raw_struct_ptr_annotation`, gckind Raw). Returning
+            // `s_inner` would drop that tag. `llannotation.py`
+            // `pairtype(SomePtr, SomeObject).union` refuses
+            // `union(SomePtr, s_None)`.
             if matches!(s_inner, SomeValue::Ptr(_)) {
-                return s_inner;
+                if some_ptr_is_raw_struct(&s_inner) {
+                    if let Some(layout) = self.layout_of_type(stripped) {
+                        if layout_is_niche_ptr_word(layout.as_ref()) {
+                            return s_inner;
+                        }
+                        if layout_host_has_tag(layout.as_ref()) {
+                            if let Some(s_opt) = self.raw_struct_ptr_annotation(stripped) {
+                                return s_opt;
+                            }
+                        }
+                    }
+                    // No TagEncoding for this Option of a raw struct: the
+                    // Option value itself is Ptr(Struct(raw)).
+                    if let Some(s_opt) = self.raw_struct_ptr_annotation(stripped) {
+                        return s_opt;
+                    }
+                } else {
+                    return s_inner;
+                }
             }
             let s_none = super::model::s_none();
             return super::model::unionof([&s_inner, &s_none]).unwrap_or(SomeValue::Impossible);
@@ -8323,6 +8391,204 @@ mod tests {
         assert!(
             matches!(payload, SomeValue::Ptr(_)),
             "Option::Some.__pos_0 of Option<Raw> stays the nullable Ptr, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_option_of_raw_struct_projects_option_ptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::host_layout::HostLayout;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use majit_charon_reader::ullbc::{TagEncoding, TagLayout};
+
+        let inner = "rawproj::PosixMap";
+        let option_root = "Option";
+        let option_ty = "Option<rawproj::PosixMap>";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let option_id = majit_ir::descr::StructId::from_canonical(option_root);
+        let option_inst = option_id.instantiate("<rawproj::PosixMap>");
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (option_root.to_string(), Some(option_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            option_root.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            format!("{option_root}::Some"),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        reg.raw_word_owners.insert(option_root.to_string());
+        reg.raw_word_owners.insert(option_ty.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "len".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let tagged = crate::call::StructLayout {
+            size: 24,
+            align: 8,
+            gckind: GcKind::Raw,
+            fields: vec![],
+            host: Some(HostLayout {
+                size: 24,
+                align: 8,
+                variant_field_offsets: vec![vec![], vec![8]],
+                tag: Some(TagLayout {
+                    offset: 0,
+                    signed: false,
+                    bits: 8,
+                    encoding: TagEncoding::Direct { tags: vec![0, 1] },
+                }),
+            }),
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        cc.set_struct_layout(option_id, tagged.clone());
+        cc.set_struct_layout(option_inst, tagged);
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let projected = bk.project_struct_field_type(option_ty);
+        let SomeValue::Ptr(ptr) = projected else {
+            panic!("tagged Option<RawStruct> must project to SomePtr of Option, got {projected:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("SomePtr target must be a Struct");
+        };
+        assert_eq!(st._gckind, GcKind::Raw);
+        assert_eq!(
+            st._name.as_str(),
+            option_ty,
+            "tagged Option keeps its own discriminant; the annotation is Ptr of Option, not s_inner"
+        );
+    }
+
+    #[test]
+    fn option_shell_without_host_tag_does_not_guess_nullable_ptr() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "rawproj::PosixMap";
+        let option_root = "Option";
+        let option_ty = "Option<rawproj::PosixMap>";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let option_id = majit_ir::descr::StructId::from_canonical(option_root);
+        let option_inst = option_id.instantiate("<rawproj::PosixMap>");
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+                (option_root.to_string(), Some(option_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            inner.to_string(),
+            vec![
+                ("ptr".into(), "*mut u8".into()),
+                ("len".into(), "usize".into()),
+            ],
+        );
+        reg.fields.insert(
+            option_root.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            format!("{option_root}::Some"),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", inner,
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        reg.raw_word_owners.insert(option_root.to_string());
+        reg.raw_word_owners.insert(option_ty.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let shell = crate::call::StructLayout {
+            size: 16,
+            align: 8,
+            gckind: GcKind::Raw,
+            fields: vec![],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        cc.set_struct_layout(option_id, shell.clone());
+        cc.set_struct_layout(option_inst, shell);
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let projected = bk.project_struct_field_type(option_ty);
+        assert!(
+            matches!(bk.project_struct_field_type(inner), SomeValue::Ptr(_)),
+            "inner raw struct still projects to SomePtr"
+        );
+        let returned_inner = match &projected {
+            SomeValue::Ptr(ptr) => match &ptr.ll_ptrtype.TO {
+                crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st) => {
+                    st._name.as_str() == inner
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(
+            !returned_inner,
+            "absent host.tag must not return s_inner; got {projected:?}"
         );
     }
 
