@@ -3723,6 +3723,7 @@ mod tests {
 
     #[test]
     fn registered_force_frame_hook_is_invoked_with_the_frame_pointer() {
+        let _lock = crate::stack_check::test_support::stack_and_jit_test_guard();
         force_frame_before_locals_read(std::ptr::null_mut());
 
         SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -3738,6 +3739,7 @@ mod tests {
 
     #[test]
     fn force_vref_identity_dispatch_and_unset_panic() {
+        let _lock = crate::stack_check::test_support::stack_and_jit_test_guard();
         use super::{FORCE_VREF_HOOK, force_vref, register_force_vref_hook};
         use majit_metainterp::virtualref::{ObjectHeader, VirtualRefInfo};
 
