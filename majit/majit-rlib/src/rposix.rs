@@ -40,6 +40,63 @@ pub fn set_saved_alterrno(errno: i32) {
     rthread::tlfield_setraw_int(rthread::TLFIELD_ALT_ERRNO_OFS, errno);
 }
 
+/// Stdio fds that were EBADF before rustc `sanitize_standard_fds` reopened
+/// `/dev/null` onto them.  Occupied in a process ctor so the sanitizer
+/// leaves them, then closed again by [`restore_closed_standard_fds`] so a
+/// `posix_spawn` `POSIX_SPAWN_CLOSE` of 0/1/2 stays EBADF in the child.
+#[cfg(unix)]
+static CLOSED_STDIO_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Occupy EBADF 0/1/2 before rustc `sys::pal::unix::init` /
+/// `sanitize_standard_fds` opens `/dev/null` onto them.
+#[cfg(unix)]
+extern "C" fn preserve_closed_stdio() {
+    let mut mask = 0u8;
+    for fd in 0i32..3 {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            let n = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR, 0) };
+            if n < 0 {
+                continue;
+            }
+            if n != fd {
+                let _ = unsafe { libc::dup2(n, fd) };
+                let _ = unsafe { libc::close(n) };
+            }
+            mask |= 1 << fd;
+        }
+    }
+    CLOSED_STDIO_MASK.store(mask, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+#[used]
+#[cfg_attr(
+    any(target_os = "macos", target_os = "ios"),
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(
+    all(unix, not(any(target_os = "macos", target_os = "ios"))),
+    unsafe(link_section = ".init_array")
+)]
+static PRESERVE_CLOSED_STDIO: extern "C" fn() = preserve_closed_stdio;
+
+/// Close the stdio slots [`preserve_closed_stdio`] occupied, restoring the
+/// EBADF `posix_spawn` `POSIX_SPAWN_CLOSE` left.  Called from
+/// `create_stdio` / `make_std_stream` setup, before those streams wrap 0/1/2.
+#[cfg(unix)]
+pub fn restore_closed_standard_fds() {
+    let _ = PRESERVE_CLOSED_STDIO as usize;
+    let mask = CLOSED_STDIO_MASK.swap(0, std::sync::atomic::Ordering::SeqCst);
+    for fd in 0i32..3 {
+        if mask & (1 << fd) != 0 {
+            let _ = unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn restore_closed_standard_fds() {}
+
 /// `rposix._errno_before`.
 pub fn _errno_before(save_err: i64) {
     if save_err & RFFI_READSAVED_ERRNO != 0 {

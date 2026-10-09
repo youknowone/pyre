@@ -1914,6 +1914,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // pyre exposes objects of the same type with the minimum surface so
     // anything that writes status (unittest, traceback, warnings) keeps
     // working.  `sys.__stdout__ is sys.stdout` (a single object each).
+    //
+    // rustc `sanitize_standard_fds` reopens `/dev/null` onto EBADF 0/1/2
+    // before `main`; `rposix::restore_closed_standard_fds` undoes the
+    // occupy that kept the sanitizer from claiming a `posix_spawn`
+    // `POSIX_SPAWN_CLOSE` slot, so `create_stdio` still sees EBADF.
+    majit_rlib::rposix::restore_closed_standard_fds();
     let stdout = make_std_stream("<stdout>", 1);
     let stdout_slot = roots.pin_roots(&[stdout]);
     let stderr = make_std_stream("<stderr>", 2);
