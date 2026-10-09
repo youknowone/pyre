@@ -1389,6 +1389,25 @@ pub struct GcCache {
     /// fuller-layout upgrade. Kept out of `_cache_size`.
     _size_keepalive: Vec<DescrRef>,
 
+    /// `heaptracker.py` `setup_cache_gcstruct2vtable` —
+    /// `gccache._cache_gcstruct2vtable[GCSTRUCT] = vtable`.
+    ///
+    /// Upstream fills this from `rtyper.instance_reprs` so
+    /// `get_field_descr` can pass `heaptracker.get_vtable_for_gcstruct`
+    /// into `get_size_descr` (`descr.py`). Pyre's analyzer mints with
+    /// `vtable=0` because the `PyType` address does not exist at
+    /// translation; the runtime census (`publish_pyre_class_vtables`)
+    /// registers each `#[pyre_class]` vtable under the STRUCT
+    /// `path_hash` before the first mint, and `get_size_descr` /
+    /// `make_simple_descr_group_keyed` / `publish_borrowed_struct_layout`
+    /// inject it the way `get_vtable_for_gcstruct` would have supplied it.
+    ///
+    /// The extra collector tid is the same object's `TypeIdCell`:
+    /// upstream `init_size_descr` stamps the collector id in the same
+    /// process that mints the descr. Value `0` means the collector has
+    /// not assigned one yet; a later register upgrades only that half.
+    pub _cache_gcstruct2vtable: IndexMap<u64, (usize, u32)>,
+
     /// `gctypelayout.py TypeLayoutBuilder.get_type_id` analog for
     /// SizeDescr. ArrayDescr tids come from the collector via
     /// `register_unresolved_array_tids` (`gc.py` `init_array_descr`).
@@ -1417,6 +1436,7 @@ impl GcCache {
             _external_arraylen_order: Vec::new(),
             _external_interiorfield_order: Vec::new(),
             _size_keepalive: Vec::new(),
+            _cache_gcstruct2vtable: IndexMap::new(),
             // tid 0 is reserved as "no class" / sentinel —
             // `gctypelayout.py make_type_info_group` adds a
             // DUMMY member at index 0.
@@ -1753,6 +1773,50 @@ impl GcCache {
 // in Rust they are &mut self methods on GcCache.
 
 impl GcCache {
+    /// `heaptracker.py` `setup_cache_gcstruct2vtable` one-entry insert.
+    ///
+    /// `vtable == 0` is ignored: that is the analyzer's "no typeptr"
+    /// sentinel, not an object. A later call with a collector tid
+    /// upgrades only the tid half of an existing row
+    /// (`init_size_descr` running after the vtable was already known).
+    pub fn register_gcstruct_vtable(&mut self, cache_key: u64, vtable: usize, type_id: u32) {
+        if cache_key == 0 || vtable == 0 {
+            return;
+        }
+        match self._cache_gcstruct2vtable.get(&cache_key) {
+            Some(&(_, old_tid)) if old_tid == 0 && type_id != 0 => {
+                self._cache_gcstruct2vtable
+                    .insert(cache_key, (vtable, type_id));
+            }
+            Some(_) => {}
+            None => {
+                self._cache_gcstruct2vtable
+                    .insert(cache_key, (vtable, type_id));
+            }
+        }
+    }
+
+    /// `heaptracker.py` `get_vtable_for_gcstruct` plus the collector tid
+    /// `init_size_descr` would stamp. Caller's non-zero vtable / resolved
+    /// tid win; a zero vtable or an unresolved truncated cache-key tid
+    /// take the registered values.
+    fn object_shape_for_struct(&self, cache_key: u64, vtable: usize, type_id: u32) -> (usize, u32) {
+        if cache_key == 0 {
+            return (vtable, type_id);
+        }
+        let Some(&(reg_vt, reg_tid)) = self._cache_gcstruct2vtable.get(&cache_key) else {
+            return (vtable, type_id);
+        };
+        let vtable = if vtable != 0 { vtable } else { reg_vt };
+        let type_id =
+            if reg_tid != 0 && (type_id == 0 || struct_tid_is_unresolved(cache_key, type_id)) {
+                reg_tid
+            } else {
+                type_id
+            };
+        (vtable, type_id)
+    }
+
     /// descr.py get_size_descr(gccache, STRUCT, vtable).
     ///
     /// `key`: LLType::Struct — STRUCT identity (no vtable in key).
@@ -1765,6 +1829,9 @@ impl GcCache {
     /// `gctypelayout.py`).  Caller does not supply it.  This
     /// guarantees dense, collision-free tids per distinct key regardless
     /// of how the caller derived the `LLType::Struct(u64)` identity.
+    /// A registered collector tid from `_cache_gcstruct2vtable` is the
+    /// exception: that is the value `init_size_descr` would have stamped
+    /// had the collector been in the same process as the mint.
     pub fn get_size_descr(
         &mut self,
         key: LLType,
@@ -1776,9 +1843,18 @@ impl GcCache {
         if let Some(descr) = self._cache_size.get(&key) {
             return descr.clone();
         }
+        let cache_key = match &key {
+            LLType::Struct(k) => *k,
+            _ => 0,
+        };
+        // descr.py get_field_descr: vtable = get_vtable_for_gcstruct(gccache, STRUCT)
+        // then get_size_descr(gccache, STRUCT, vtable). Analyzer callers pass 0.
+        let (vtable, registered_tid) = self.object_shape_for_struct(cache_key, vtable, 0);
         // descr.py: SizeDescr(size, vtable=vtable, immutable_flag=immutable_flag)
         // `type_id` placeholder 0 — overwritten by `init_size_descr`
-        // below per `gc.py:536-542` structure.
+        // (`gc.py` `GcLLDescr_framework.init_size_descr` sets `descr.tid`)
+        // or by the registered collector tid when `_cache_gcstruct2vtable`
+        // already has one.
         let mut sd = if vtable != 0 {
             SimpleSizeDescr::with_vtable(u32::MAX, size, 0, vtable)
         } else {
@@ -1792,8 +1868,8 @@ impl GcCache {
         // `bh_size_spec_from_descr` returned `type_id` widened to u64,
         // landing on a different `_cache_size` slot when round-tripped
         // through `simple_descr_group_from_bh_size`.
-        if let LLType::Struct(k) = &key {
-            sd.set_cache_key(*k);
+        if cache_key != 0 {
+            sd.set_cache_key(cache_key);
         }
         sd.mark_fieldless_shell_mint();
         FIELD_MINT
@@ -1801,7 +1877,11 @@ impl GcCache {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // descr.py: gccache.init_size_descr(STRUCT, sizedescr)
         // gc.py:536-542: sets descr.tid — must happen BEFORE Arc wrap.
-        self.init_size_descr(&key, &mut sd);
+        if registered_tid != 0 {
+            sd.set_type_id(registered_tid);
+        } else {
+            self.init_size_descr(&key, &mut sd);
+        }
         let descr: DescrRef = Arc::new(sd);
         // descr.py:120: cache[STRUCT] = sizedescr
         self._cache_size.insert(key, descr.clone());
@@ -6962,6 +7042,11 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     // `index_in_parent` against the position it hands the field in.
     census_spec_positions(field_specs);
     let mut gc = gc_cache().lock();
+    // `descr.py get_field_descr` asks `get_vtable_for_gcstruct` before
+    // `get_size_descr`. Analyzer / BhDescr reconstruction pass vtable=0
+    // and a truncated cache-key tid; inject the registered object shape
+    // so the SizeDescr is born `is_object()` with the collector tid.
+    let (vtable, type_id) = gc.object_shape_for_struct(cache_key, vtable, type_id);
     // `heaptracker.py all_fielddescrs` recurses into an inlined
     // `lltype.Struct` and extends the outer list with
     // `get_field_descr(gccache, INNER, name)`. The class word is that
@@ -7160,6 +7245,13 @@ fn publish_borrowed_struct_layout_inner(
 ) -> Option<SimpleDescrGroup> {
     let struct_key = LLType::struct_key(cache_key);
     let mut gc = gc_cache().lock();
+    // `descr.py get_field_descr` asks `get_vtable_for_gcstruct` before
+    // `get_size_descr`. Kind-0 packed parents of unpublished STRUCTs
+    // (`publish_borrowed_parent_layout`) arrive with the serialized
+    // vtable (0 for a `#[pyre_class]` without a DECLARED_GROUPS row)
+    // and a truncated cache-key tid; inject the registered object shape
+    // so the SizeDescr is born `is_object()` with the collector tid.
+    let (vtable, type_id) = gc.object_shape_for_struct(cache_key, vtable, type_id);
     if only_if_absent {
         let present = gc._cache_size.contains_key(&struct_key)
             || gc
@@ -9243,6 +9335,141 @@ mod register_keyed_size_authority_tests {
         let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
         assert_eq!(cached.type_id(), 9);
         assert_eq!(cached.all_fielddescrs().len(), 3);
+    }
+
+    /// `heaptracker.get_vtable_for_gcstruct` supplies the vtable
+    /// `get_size_descr` stores. A registered row must make a `vtable=0`
+    /// mint `is_object()`, so `protect_speculative_field` takes the
+    /// subclass-range arm (`descr.py is_valid_class_for`) instead of
+    /// comparing the analyzer tid to the collector tid.
+    #[test]
+    fn registered_vtable_makes_get_size_descr_an_object() {
+        let mut gc = GcCache::new();
+        let cache_key = 0x1_0000_0c11_u64;
+        let key = LLType::Struct(cache_key);
+        gc.register_gcstruct_vtable(cache_key, 0xabc0, 263);
+        let descr = gc.get_size_descr(key, 64, 0, false);
+        let sd = descr.as_size_descr().expect("SizeDescr");
+        assert!(sd.is_object());
+        assert_eq!(sd.vtable(), 0xabc0);
+        assert_eq!(sd.type_id(), 263);
+    }
+
+    /// `make_simple_descr_group_keyed` is the BhDescr reconstruction
+    /// factory. Analyzer specs carry `vtable=0` and the truncated cache
+    /// key as `type_id`; the registered row must win both halves.
+    #[test]
+    fn registered_vtable_is_injected_into_a_keyed_group() {
+        let cache_key = 0x1_0000_0c12_u64;
+        {
+            let mut gc = gc_cache().lock();
+            gc.register_gcstruct_vtable(cache_key, 0xdef0, 264);
+        }
+        let spec = SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "kind".to_string(),
+            name: "W_CType.kind".to_string(),
+            offset: 64,
+            field_size: 8,
+            field_type: Type::Int,
+            is_immutable: true,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+        };
+        let group = make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            80,
+            cache_key as u32,
+            cache_key,
+            0,
+            true,
+            false,
+            &[spec],
+            &[],
+        );
+        assert!(group.size_descr.is_object());
+        assert_eq!(group.size_descr.vtable(), 0xdef0);
+        assert_eq!(group.size_descr.type_id(), 264);
+        let parent_descr = group.field_descrs[0]
+            .get_parent_descr()
+            .expect("parent_descr");
+        let parent = parent_descr.as_size_descr().expect("SizeDescr");
+        assert!(parent.is_object());
+        assert_eq!(parent.vtable(), 0xdef0);
+    }
+
+    /// Kind-0 packed parents of unpublished STRUCTs mint through
+    /// `publish_borrowed_struct_layout` with the serialized vtable (0
+    /// for a `#[pyre_class]` without a DECLARED_GROUPS row). Inject the
+    /// registered row the way `get_size_descr` /
+    /// `make_simple_descr_group_keyed` do, so the field's parent is born
+    /// `is_object()`.
+    #[test]
+    fn registered_vtable_is_injected_into_a_borrowed_layout() {
+        let cache_key = 0x1_0000_0c13_u64;
+        {
+            let mut gc = gc_cache().lock();
+            gc.register_gcstruct_vtable(cache_key, 0xabc0, 265);
+        }
+        let group = publish_borrowed_struct_layout(
+            u32::MAX,
+            80,
+            cache_key as u32,
+            cache_key,
+            0,
+            true,
+            false,
+            &[],
+            vec![BorrowedField {
+                index: 0,
+                name: Cow::Borrowed("W_CType.kind"),
+                field_key: "kind",
+                offset: 64,
+                field_size: 8,
+                field_type: Type::Int,
+                flag: ArrayFlag::Signed,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+        );
+        assert!(
+            group.size_descr.is_object(),
+            "borrowed layout must carry the registered vtable"
+        );
+        assert_eq!(group.size_descr.vtable(), 0xabc0);
+        assert_eq!(group.size_descr.type_id(), 265);
+        let parent_descr = group.field_descrs[0]
+            .get_parent_descr()
+            .expect("parent_descr");
+        let parent = parent_descr.as_size_descr().expect("SizeDescr");
+        assert!(parent.is_object());
+        assert_eq!(parent.vtable(), 0xabc0);
+        assert_eq!(parent.type_id(), 265);
+    }
+
+    /// `vtable == 0` is not an object and must not occupy the table.
+    #[test]
+    fn register_gcstruct_vtable_ignores_a_zero_vtable() {
+        let mut gc = GcCache::new();
+        gc.register_gcstruct_vtable(0x11, 0, 1);
+        assert!(gc._cache_gcstruct2vtable.is_empty());
+        gc.register_gcstruct_vtable(0x11, 0x100, 0);
+        gc.register_gcstruct_vtable(0x11, 0x100, 7);
+        assert_eq!(
+            gc._cache_gcstruct2vtable.get(&0x11).copied(),
+            Some((0x100, 7))
+        );
+        gc.register_gcstruct_vtable(0x11, 0x200, 8);
+        assert_eq!(
+            gc._cache_gcstruct2vtable.get(&0x11).copied(),
+            Some((0x100, 7)),
+            "first vtable and a nonzero tid stay",
+        );
     }
 }
 
