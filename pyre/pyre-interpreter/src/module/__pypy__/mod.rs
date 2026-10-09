@@ -343,7 +343,7 @@ crate::py_module! {
         "write_unraisable" / 3 = write_unraisable,
         "hidden_applevel" / 1 = hidden_applevel,
         "strategy" / 1 = strategy,
-        "newmemoryview" / * = interp_buffer::newmemoryview,
+        "newmemoryview" / * = interp_buffer::newmemoryview; crate::Signature::new(vec!["buf", "itemsize", "format", "shape", "strides"], None, None, 0, 0),
     },
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`

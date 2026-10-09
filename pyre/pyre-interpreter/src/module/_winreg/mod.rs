@@ -482,24 +482,18 @@ mod imp {
         name: &str,
         params: [&str; 4],
     ) -> Result<[Option<PyObjectRef>; 4], pyre_interpreter::PyError> {
-        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pos.len() > params.len() {
+        // Bound scope: four named slots (`PY_NULL` omitted). The first two
+        // are required; the last two default per boundary.
+        let given = args.iter().filter(|o| !o.is_null()).count();
+        if given > params.len() {
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "{name}() takes at most {} arguments ({} given)",
-                params.len(),
-                pos.len()
+                "{name}() takes at most {} arguments ({given} given)",
+                params.len()
             )));
         }
         let mut bound = [None; 4];
         for (index, key) in params.iter().enumerate() {
-            let value = pyre_interpreter::builtins::bind_pos_or_kw(
-                pos,
-                kwargs,
-                index,
-                key,
-                name,
-                index + 1,
-            )?;
+            let value = args.get(index).copied().filter(|o| !o.is_null());
             if value.is_none() && index < 2 {
                 return Err(pyre_interpreter::PyError::type_error(format!(
                     "{name}() missing required argument '{key}' (pos {})",
@@ -508,7 +502,6 @@ mod imp {
             }
             bound[index] = value;
         }
-        pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &params, name)?;
         Ok(bound)
     }
 
@@ -1533,7 +1526,47 @@ mod imp {
                 "Returns the reflection state for the specified key as a bool.\n\n  key\n    An already open key, or any one of the predefined HKEY_* constants.\n\nWill generally raise NotImplementedError if executed on a 32bit OS.",
             ),
         ] {
-            let function = pyre_interpreter::make_builtin_function_with_doc(name, func, doc);
+            let function = match name {
+                "OpenKey" | "OpenKeyEx" | "CreateKeyEx" => {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        name,
+                        func,
+                        Some(doc),
+                        pyre_interpreter::Signature::new(
+                            vec!["key", "sub_key", "reserved", "access"],
+                            None,
+                            None,
+                            0,
+                            0,
+                        ),
+                    );
+                    pyre_interpreter::function_new_with_fixed_code(
+                        code as *const (),
+                        name.to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                }
+                "DeleteKeyEx" => {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        name,
+                        func,
+                        Some(doc),
+                        pyre_interpreter::Signature::new(
+                            vec!["key", "sub_key", "access", "reserved"],
+                            None,
+                            None,
+                            0,
+                            0,
+                        ),
+                    );
+                    pyre_interpreter::function_new_with_fixed_code(
+                        code as *const (),
+                        name.to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                }
+                _ => pyre_interpreter::make_builtin_function_with_doc(name, func, doc),
+            };
             unsafe {
                 pyre_interpreter::function::fset_func_text_signature(
                     function,

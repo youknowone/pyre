@@ -3956,55 +3956,28 @@ fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// `__name__` / `__doc__` / `__package__` / `__loader__` / `__spec__`
 /// in the module dict.
 fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.is_empty() {
-        return Err(crate::PyError::type_error(
-            "descriptor '__init__' of 'module' object needs an argument",
-        ));
-    }
-    let self_ = module_require(positional[0], "__init__", false)?;
-    let given = positional.len().saturating_sub(1);
+    // Bound scope: `self`, required `name`, optional `doc` (`PY_NULL` omitted).
+    let self_slot = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("descriptor '__init__' of 'module' object needs an argument")
+        })?;
+    let self_ = module_require(self_slot, "__init__", false)?;
+    let given = args.iter().skip(1).filter(|o| !o.is_null()).count();
     if given > 2 {
         return Err(crate::PyError::type_error(format!(
             "module() takes at most 2 arguments ({given} given)"
         )));
     }
-    let mut w_name = positional.get(1).copied();
-    let mut w_doc = positional.get(2).copied();
-    if let Some(kwargs) = kwargs {
-        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(kwargs) } {
-            let Ok(key) = key.as_str() else {
-                continue;
-            };
-            if key == "__pyre_kw__" {
-                continue;
-            }
-            match key {
-                "name" if w_name.is_none() => w_name = Some(value),
-                "name" => {
-                    return Err(crate::PyError::type_error(
-                        "argument for module() given by name ('name') and position (1)",
-                    ));
-                }
-                "doc" if w_doc.is_none() => w_doc = Some(value),
-                "doc" => {
-                    return Err(crate::PyError::type_error(
-                        "argument for module() given by name ('doc') and position (2)",
-                    ));
-                }
-                other => {
-                    return Err(crate::PyError::type_error(format!(
-                        "module() got an unexpected keyword argument '{other}'"
-                    )));
-                }
-            }
-        }
-    }
-    let Some(w_name) = w_name else {
-        return Err(crate::PyError::type_error(
-            "module() missing required argument 'name' (pos 1)",
-        ));
-    };
+    let w_name = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("module() missing required argument 'name' (pos 1)")
+        })?;
     if !unsafe { pyre_object::is_str(w_name) } {
         let received = if unsafe { pyre_object::is_none(w_name) } {
             "None".to_string()
@@ -4017,7 +3990,11 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "module() argument 'name' must be str, not {received}"
         )));
     }
-    let w_doc = w_doc.unwrap_or_else(pyre_object::w_none);
+    let w_doc = args
+        .get(2)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or_else(pyre_object::w_none);
     // module.py:69 `self.w_name = w_name`: retain the wrapped string itself.
     // Module names can contain lone surrogates (the import traceback suite
     // exercises one), so projecting through `w_str_get_value` would both lose
@@ -4417,15 +4394,19 @@ fn init_module_type(ns: PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__init__",
-            crate::gateway::make_builtin_function_with_doc(
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__init__", {
+            let code = crate::gateway::builtin_code_new_with_signature(
                 "__init__",
                 module_descr_init,
-                "Initialize self.  See help(type(self)) for accurate signature.",
-            ),
-        )
+                Some("Initialize self.  See help(type(self)) for accurate signature."),
+                crate::gateway::Signature::new(vec!["self", "name", "doc"], None, None, 0, 1),
+            );
+            crate::function_new_with_fixed_code(
+                code as *const (),
+                "__init__".to_string(),
+                pyre_object::PY_NULL,
+            )
+        })
     };
     for (name, function, arity, doc) in [
         (
@@ -23838,33 +23819,17 @@ fn bytearray_descr_init_value(
     // every parameter is positional-or-keyword (bytearrayobject.py
     // descr_init shares bytesobject.newbytesdata_w); `encoding`/`errors`
     // are only valid with a str source.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    // pos[0] is the class; `bytearray(source, encoding, errors)` accepts at
-    // most three further positional arguments.
-    if pos.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "bytearray() takes at most 3 arguments ({} given)",
-            pos.len() - 1
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytearray")?;
-    let source =
-        crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytearray", 1)?;
+    // Bound scope: `self`, `source`, `encoding`, `errors` (`PY_NULL` omitted).
+    let source = args.get(1).copied().filter(|o| !o.is_null());
     let w_encoding = bytes_codec_arg_w(
         "bytearray",
         "encoding",
-        crate::builtins::resolve_pos_or_kw(
-            pos.get(2).copied(),
-            kwargs,
-            "encoding",
-            "bytearray",
-            2,
-        )?,
+        args.get(2).copied().filter(|o| !o.is_null()),
     )?;
     let w_errors = bytes_codec_arg_w(
         "bytearray",
         "errors",
-        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytearray", 3)?,
+        args.get(3).copied().filter(|o| !o.is_null()),
     )?;
     let Some(mut arg) = source else {
         if w_encoding.is_some() || w_errors.is_some() {
@@ -24033,7 +23998,16 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(bytes_descr_new),
+            make_new_descr_with_signature(
+                bytes_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "source", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     unsafe {
@@ -24234,7 +24208,11 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "translate",
-            make_builtin_function("translate", bytes_method_translate),
+            crate::make_builtin_function_with_signature(
+                "translate",
+                bytes_method_translate,
+                crate::gateway::Signature::new(vec!["self", "table", "delete"], None, None, 0, 2),
+            ),
         )
     };
     unsafe {
@@ -26114,36 +26092,30 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// second positional slot or the `delete=` keyword, and an explicit
 /// `delete` must be bytes-like — `None` is not "no deletion".
 fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Bound scope: pos-only `self`/`table`, optional `delete` (`PY_NULL` omitted).
     // Table / delete lookups can snapshot a memoryview, so publish every
-    // incoming argument first and copy the receiver payload off the object.
+    // bound slot first and copy the receiver payload off the object.
     let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
     let recv_slot = pyre_object::gc_roots::pin_roots(args);
     let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
-    let reloaded: Vec<_> = (0..args.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
-        .collect();
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&reloaded[1..]);
-    crate::builtins::clinic_arity(
-        "translate",
-        positional.len(),
-        crate::builtins::real_kwarg_count(kwargs),
-        1,
-        2,
-        0,
-    )?;
-    // The missing-positional report wins over the unknown-keyword one:
-    // `b''.translate(bogus=1)` names the absent `table`, not `bogus`.
-    let Some(&table_obj) = positional.first() else {
+    let table_obj = if n > 1 {
+        pyre_object::gc_roots::shadow_stack_get(recv_slot + 1)
+    } else {
+        pyre_object::PY_NULL
+    };
+    if table_obj.is_null() {
         return Err(crate::PyError::type_error(
             "translate() takes at least 1 positional argument (0 given)",
         ));
+    }
+    let delete_obj = if n > 2 {
+        let w = pyre_object::gc_roots::shadow_stack_get(recv_slot + 2);
+        if w.is_null() { None } else { Some(w) }
+    } else {
+        None
     };
-    crate::builtins::kwarg_reject_unknown(kwargs, &["delete"], "translate")?;
-    let delete_obj = positional
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "delete"));
     let table_none = unsafe { pyre_object::is_none(table_obj) };
     let extras_base = match (table_none, delete_obj) {
         (true, None) => None,
@@ -27535,29 +27507,28 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `args` is the gateway's native copy; cls is re-read from its slot after
     // the conversions below collect.
     let _cls_root = pyre_object::gc_roots::push_roots();
-    let cls_slot = _cls_root.pin_roots(&args[..1]);
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    // pos[0] is the class; `bytes(source, encoding, errors)` accepts at most
-    // three further positional arguments.
-    if pos.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "bytes() takes at most 3 arguments ({} given)",
-            pos.len() - 1
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytes")?;
-    let source =
-        crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytes", 1)?;
-    let w_encoding = bytes_codec_arg_w(
-        "bytes",
-        "encoding",
-        crate::builtins::resolve_pos_or_kw(pos.get(2).copied(), kwargs, "encoding", "bytes", 2)?,
-    )?;
-    let w_errors = bytes_codec_arg_w(
-        "bytes",
-        "errors",
-        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytes", 3)?,
-    )?;
+    let n = args.len();
+    let cls_slot = _cls_root.pin_roots(args);
+    let bound = |i: usize| {
+        if i < n {
+            _cls_root.get(cls_slot + i)
+        } else {
+            pyre_object::PY_NULL
+        }
+    };
+    // Bound scope: `cls`, `source`, `encoding`, `errors` (`PY_NULL` omitted).
+    let source = {
+        let w = bound(1);
+        if w.is_null() { None } else { Some(w) }
+    };
+    let w_encoding = bytes_codec_arg_w("bytes", "encoding", {
+        let w = bound(2);
+        if w.is_null() { None } else { Some(w) }
+    })?;
+    let w_errors = bytes_codec_arg_w("bytes", "errors", {
+        let w = bound(3);
+        if w.is_null() { None } else { Some(w) }
+    })?;
     let Some(mut arg) = source else {
         // No source → `bytes()` is empty; a stray encoding/errors with no
         // source is the "encoding or errors without sequence argument" error.
@@ -28197,15 +28168,25 @@ fn init_bytearray_type(ns: PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__init__",
-            crate::gateway::make_builtin_function_with_doc(
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__init__", {
+            let code = crate::gateway::builtin_code_new_with_signature(
                 "__init__",
                 bytearray_descr_init,
-                "Initialize self.  See help(type(self)) for accurate signature.",
-            ),
-        )
+                Some("Initialize self.  See help(type(self)) for accurate signature."),
+                crate::gateway::Signature::new(
+                    vec!["self", "source", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            );
+            crate::function_new_with_fixed_code(
+                code as *const (),
+                "__init__".to_string(),
+                pyre_object::PY_NULL,
+            )
+        })
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -28517,7 +28498,11 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "translate",
-            make_builtin_function("translate", bytes_method_translate),
+            crate::make_builtin_function_with_signature(
+                "translate",
+                bytes_method_translate,
+                crate::gateway::Signature::new(vec!["self", "table", "delete"], None, None, 0, 2),
+            ),
         )
     };
     unsafe {

@@ -1628,7 +1628,17 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         let _ = pyre_object::gc_roots::pin_root(type_ns);
         crate::builtins::init_file_wrapper_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         crate::builtins::init_fileio_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
-        let init_fn = crate::make_builtin_function("__init__", crate::builtins::fileio_init);
+        let init_fn = crate::make_builtin_function_with_signature(
+            "__init__",
+            crate::builtins::fileio_init,
+            crate::gateway::Signature::new(
+                vec!["self", "file", "mode", "closefd", "opener"],
+                None,
+                None,
+                0,
+                1,
+            ),
+        );
         let init_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(init_fn);
         type_method(

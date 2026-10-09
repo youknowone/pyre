@@ -3646,7 +3646,27 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "open", || {
-        make_module_builtin_function("open", builtin_open)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "open",
+            builtin_open,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(
+                vec![
+                    "file",
+                    "mode",
+                    "buffering",
+                    "encoding",
+                    "errors",
+                    "newline",
+                    "closefd",
+                    "opener",
+                ],
+                None,
+                None,
+                0,
+                0,
+            ),
+        )
     });
     // Exception hierarchy — exceptions are real types so they can be
     // subclassed (`class FrozenInstanceError(AttributeError): pass`).
@@ -22152,39 +22172,37 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// The existing file helpers keep their state in reserved instance slots; a
 /// FileIO instance uses the same slots but always exposes a binary raw stream.
 pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["file", "mode", "closefd", "opener"], "FileIO")?;
-    let n_pos = pos.len();
-    let has_kwargs = kwargs.is_some();
-    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
-    let mut self_obj = pos
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("FileIO.__init__() missing self"))?;
+    // Bound scope: `self`, required `file`, optional `mode`/`closefd`/`opener`
+    // (`PY_NULL` omitted).
     let _arg_roots = pyre_object::gc_roots::push_roots();
-    let pos_base = pyre_object::gc_roots::publish_roots(pos);
-    let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
-    let self_slot = pyre_object::gc_roots::publish_roots(&[self_obj]);
-    pyre_object::gc_roots::normalize_roots(pos_base, n_pos + 2);
-    self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
-    let mut pos_buf = vec![pyre_object::PY_NULL; n_pos];
-    let kwargs = || has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+    let n = args.len();
+    let pos_base = pyre_object::gc_roots::pin_roots(args);
+    let bound = |i: usize| {
+        if i < n {
+            let w = pyre_object::gc_roots::shadow_stack_get(pos_base + i);
+            if w.is_null() { None } else { Some(w) }
+        } else {
+            None
+        }
+    };
+    let mut self_obj =
+        bound(0).ok_or_else(|| crate::PyError::type_error("FileIO.__init__() missing self"))?;
     // `_pyio.FileIO.__init__` invalidates the previous open-time snapshot
     // before doing anything that can reject the new arguments.  The fresh
     // snapshot is published only after the complete initialization succeeds.
     pyre_object::with_roots!(self_obj => fileio_clear_stat_atopen(self_obj));
+    self_obj = pyre_object::gc_roots::shadow_stack_get(pos_base);
     if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
         fileio.set_seekable_flag(-1);
     } else {
         pyre_object::with_roots!(self_obj =>
             crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none())
         );
+        self_obj = pyre_object::gc_roots::shadow_stack_get(pos_base);
     }
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut file = bind_pos_or_kw(&pos_buf, kwargs(), 1, "file", "FileIO", 1)?
+    let mut file = bound(1)
         .ok_or_else(|| crate::PyError::type_error("FileIO() missing required argument 'file'"))?;
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mode_obj = match bind_pos_or_kw(&pos_buf, kwargs(), 2, "mode", "FileIO", 2)? {
+    let mode_obj = match bound(2) {
         Some(mode) => mode,
         None => {
             let _mode_roots = pyre_object::gc_roots::push_roots();
@@ -22244,9 +22262,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         _ => unreachable!(),
     };
 
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut closefd_obj = bind_pos_or_kw(&pos_buf, kwargs(), 3, "closefd", "FileIO", 3)?
-        .unwrap_or_else(|| w_bool_from(true));
+    let mut closefd_obj = bound(3).unwrap_or_else(|| w_bool_from(true));
     let closefd = pyre_object::with_roots!(closefd_obj, file, self_obj =>
         crate::baseobjspace::is_true(closefd_obj)
     )?;
@@ -22260,9 +22276,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "Cannot use closefd=False with file name",
         ));
     }
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let opener =
-        bind_pos_or_kw(&pos_buf, kwargs(), 4, "opener", "FileIO", 4)?.unwrap_or_else(w_none);
+    let opener = bound(4).unwrap_or_else(w_none);
     let _open_roots = pyre_object::gc_roots::push_roots();
     let file_slot = pyre_object::gc_roots::publish_roots(&[file, closefd_obj, opener]);
     let closefd_slot = file_slot + 1;
@@ -24111,45 +24125,26 @@ fn builtin_open_impl(
     args: &[PyObjectRef],
     allow_windows_console: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    // Every declared slot binds before the unrecognized keywords are
-    // reported, so a call missing `file` names `file`.
-    let file = bind_pos_or_kw(positional, kwargs, 0, "file", "open", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("open() missing required argument 'file' (pos 1)")
-    })?;
-    kwarg_reject_unknown(
-        kwargs,
-        &[
-            "file",
-            "mode",
-            "buffering",
-            "encoding",
-            "errors",
-            "newline",
-            "closefd",
-            "opener",
-        ],
-        "open",
-    )?;
-    // Bind every argument before unwrap-style conversions start.  A conversion
-    // can call Python and move objects, so the complete live argument set must
-    // already be on the shadow stack before the first such callback.
-    let npos = positional.len();
-    let has_kwargs = kwargs.is_some();
+    // Bound scope: `file`, `mode`, `buffering`, `encoding`, `errors`,
+    // `newline`, `closefd`, `opener` (`PY_NULL` omitted).
     let argument_roots = pyre_object::gc_roots::push_roots();
-    let file = pyre_object::gc_roots::pin_root(file);
-    let mut file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    // `str_utf8_w` can collect; the arguments still to bind are read back
-    // from their slots after it.
-    let positional_base = pyre_object::gc_roots::pin_roots(positional);
-    let kwargs_slot = pyre_object::gc_roots::pin_roots(&[kwargs.unwrap_or(PY_NULL)]);
-    let positional: Vec<PyObjectRef> = (0..npos)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
-        .collect();
-    let positional = positional.as_slice();
-    let kwargs = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
-    let w_mode =
-        bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
+    let n = args.len();
+    let base = argument_roots.pin_roots(args);
+    let bound = |i: usize| {
+        if i < n {
+            let w = pyre_object::gc_roots::shadow_stack_get(base + i);
+            if w.is_null() { None } else { Some(w) }
+        } else {
+            None
+        }
+    };
+    if bound(0).is_none() {
+        return Err(crate::PyError::type_error(
+            "open() missing required argument 'file' (pos 1)",
+        ));
+    }
+    let mut file_slot = base;
+    let w_mode = bound(1).unwrap_or_else(|| w_str_new("r"));
     if unsafe { !pyre_object::is_str(w_mode) } {
         return Err(crate::PyError::type_error(format!(
             "open() argument 'mode' must be str, not {}",
@@ -24157,23 +24152,12 @@ fn builtin_open_impl(
         )));
     }
     let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();
-    let positional: Vec<PyObjectRef> = (0..npos)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
-        .collect();
-    let positional = positional.as_slice();
-    let kwargs = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
-    let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
-        .unwrap_or_else(|| w_int_new(-1));
-    let w_encoding =
-        bind_pos_or_kw(positional, kwargs, 3, "encoding", "open", 4)?.unwrap_or_else(w_none);
-    let w_errors =
-        bind_pos_or_kw(positional, kwargs, 4, "errors", "open", 5)?.unwrap_or_else(w_none);
-    let w_newline =
-        bind_pos_or_kw(positional, kwargs, 5, "newline", "open", 6)?.unwrap_or_else(w_none);
-    let w_closefd = bind_pos_or_kw(positional, kwargs, 6, "closefd", "open", 7)?
-        .unwrap_or_else(|| w_bool_from(true));
-    let w_opener =
-        bind_pos_or_kw(positional, kwargs, 7, "opener", "open", 8)?.unwrap_or_else(w_none);
+    let w_buffering = bound(2).unwrap_or_else(|| w_int_new(-1));
+    let w_encoding = bound(3).unwrap_or_else(w_none);
+    let w_errors = bound(4).unwrap_or_else(w_none);
+    let w_newline = bound(5).unwrap_or_else(w_none);
+    let w_closefd = bound(6).unwrap_or_else(|| w_bool_from(true));
+    let w_opener = bound(7).unwrap_or_else(w_none);
 
     for value in [
         w_buffering,
@@ -24524,38 +24508,18 @@ fn file_wrapper_store(slot: usize, name: &str, value: PyObjectRef) {
 /// assemble buffered or text layers; public `open()` below does that after it
 /// has constructed the real `_io.FileIO` object.
 fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.is_empty() {
-        return Err(crate::PyError::type_error(
-            "open() missing required argument 'file' (pos 1)",
-        ));
-    }
-    let (open_pos, open_kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(
-        open_kwargs,
-        &[
-            "file",
-            "mode",
-            "buffering",
-            "encoding",
-            "errors",
-            "newline",
-            "closefd",
-            "opener",
-        ],
-        "open",
-    )?;
-    let mut path_obj =
-        resolve_pos_or_kw(open_pos.first().copied(), open_kwargs, "file", "open", 1)?.ok_or_else(
-            || crate::PyError::type_error("open() missing required argument 'file' (pos 1)"),
-        )?;
-    let mode_obj = resolve_pos_or_kw(open_pos.get(1).copied(), open_kwargs, "mode", "open", 2)?;
-    let encoding_obj =
-        resolve_pos_or_kw(open_pos.get(3).copied(), open_kwargs, "encoding", "open", 4)?;
-    let errors_obj = resolve_pos_or_kw(open_pos.get(4).copied(), open_kwargs, "errors", "open", 5)?;
-    let mut closefd_obj =
-        resolve_pos_or_kw(open_pos.get(6).copied(), open_kwargs, "closefd", "open", 7)?;
-    let mut opener_obj =
-        resolve_pos_or_kw(open_pos.get(7).copied(), open_kwargs, "opener", "open", 8)?;
+    // Internal positional helper used by `FileIO.__init__`. The public
+    // `open()` binds through Signature; this leaf reads the already-ordered
+    // slots (`file`, `mode`, fd, encoding, errors, newline, `closefd`, `opener`).
+    let slot = |i: usize| args.get(i).copied().filter(|o| !o.is_null());
+    let mut path_obj = slot(0).ok_or_else(|| {
+        crate::PyError::type_error("open() missing required argument 'file' (pos 1)")
+    })?;
+    let mode_obj = slot(1);
+    let encoding_obj = slot(3);
+    let errors_obj = slot(4);
+    let mut closefd_obj = slot(6);
+    let mut opener_obj = slot(7);
     let str_or_none =
         |obj: Option<PyObjectRef>, name: &str| -> Result<Option<String>, crate::PyError> {
             match obj {
