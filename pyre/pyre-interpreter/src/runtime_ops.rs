@@ -940,9 +940,9 @@ pub fn store_slice_values(
 /// `getitem`. A `None` start/stop defaults to `0` / `len`.
 ///
 /// Residual wrapper around [`binary_slice_values_inner`]. The inner owns
-/// the operand-root bracket. This extra scope is empty once the inner
-/// returns; a residual that still calls the wrapper does not start the
-/// inner with no live RootScope on the native path.
+/// the operand-root bracket. This extra scope pins the three operands
+/// across the inner call so they are not live unbracketed `PyObjectRef`s
+/// at that collecting hop.
 #[inline(never)]
 pub fn binary_slice_values(
     obj: PyObjectRef,
@@ -950,7 +950,14 @@ pub fn binary_slice_values(
     stop: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    binary_slice_values_inner(obj, start, stop)
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::publish_roots(&[obj, start, stop]);
+    pyre_object::gc_roots::normalize_roots(obj_slot, 3);
+    binary_slice_values_inner(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
+        pyre_object::gc_roots::shadow_stack_get(obj_slot + 2),
+    )
 }
 
 /// Body of [`binary_slice_values`]. The public function stays

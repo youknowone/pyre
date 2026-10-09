@@ -63,4 +63,20 @@ for step in range(5):
     assert wide[Bound(2):] == (step + 2, step + 3, step + 4)
     assert wide[:Bound(2)] == (step, step + 1)
 
+# Integer-strategy list slices of many lengths, including above the nursery
+# large-object threshold, while allocating garbage so a minor collection can
+# walk the adopted int-items block.  Every slice's contents must match.
+sizes = list(range(0, 64)) + [100, 200, 500, 1000, 2000, 4000, 5000]
+for n in sizes:
+    src = list(range(n))
+    for _ in range(8):
+        churn()
+        whole = src[:]
+        assert whole == src
+        if n >= 2:
+            inner = src[1 : n - 1]
+            assert inner == list(range(1, n - 1))
+        empty = src[n:n]
+        assert empty == []
+
 print("OK")
