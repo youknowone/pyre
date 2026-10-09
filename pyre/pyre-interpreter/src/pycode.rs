@@ -795,6 +795,12 @@ pub struct PyCode {
     /// this address. The collector runs no `Drop`, so [`pycode_destructor`]
     /// reclaims the instance.
     pub w_globals_watchers: pyre_object::quasiimmut::QuasiImmutField,
+    /// Per-code result of the runtime frame-shape gate.
+    ///
+    /// 0 is uncomputed; a later fill stores `1 +` the shape discriminant.
+    /// `pycode.py` keeps per-code JIT state on `PyCode` (`jit_cells`); this
+    /// is the same owner for the pyre-only shape latch.
+    pub jit_shape: std::sync::atomic::AtomicU8,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -821,6 +827,11 @@ pub const ADDR2LINE_MEMO_EMPTY: i64 = i64::MIN;
 pub const CODE_CO_FIRSTLINENO_RAW_OFFSET: usize = std::mem::offset_of!(PyCode, co_firstlineno_raw);
 /// Field offset of `hidden_applevel` within `PyCode`.
 pub const CODE_HIDDEN_APPLEVEL_OFFSET: usize = std::mem::offset_of!(PyCode, hidden_applevel);
+
+/// `PyCode.jit_shape` before the first classification.
+pub const JIT_SHAPE_UNCOMPUTED: u8 = 0;
+/// Stored `jit_shape` for assembler overflow: `1 + ConstEncodingOverflow`.
+pub const JIT_SHAPE_STORED_CONST_ENCODING_OVERFLOW: u8 = 4;
 
 /// The `co_firstlineno` slot, exactly as [`code_get_field`] reads it.
 ///
@@ -1333,6 +1344,7 @@ fn w_code_new_owned(
         }),
         loop_header_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         w_globals_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+        jit_shape: std::sync::atomic::AtomicU8::new(JIT_SHAPE_UNCOMPUTED),
     };
     // The raw-address JIT compatibility seam described above requires a
     // stable wrapper address. `malloc_typed_stable` is still a managed
@@ -4265,6 +4277,21 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
         None => {
             wrappers.insert(code_ptr as usize, wrapper);
         }
+    }
+}
+
+/// Latch assembler overflow onto the live wrapper so the per-frame shape
+/// gate agrees with `CallControl.graph_jit_shapes` without a map probe.
+pub fn store_wrapper_jit_shape_overflow(code_ptr: *const ()) {
+    let w = live_code_wrapper(code_ptr);
+    if w.is_null() {
+        return;
+    }
+    unsafe {
+        (*(w as *const PyCode)).jit_shape.store(
+            JIT_SHAPE_STORED_CONST_ENCODING_OVERFLOW,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
