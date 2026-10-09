@@ -3223,12 +3223,87 @@ pub fn parse_builtin_signature(
     } else {
         w_kw_defs
     };
+    let npos = pos_args.len();
+    let nkw = keyword_names_w.len();
+    // [3.14-spec] clinic counts nargs+nkwargs against the declared
+    // parameter total when the signature accepts keywords.  parse_obj
+    // reports UnknownKwds / TooMany instead (`argument.py`).  Measured
+    // against 3.14.6: `sum([1], **{K:0, "start":3})` is
+    // `takes at most 2 arguments (3 given)`.
+    if signature_accepts_keywords(sig) && !sig.has_vararg() && npos + nkw > sig.argnames.len() {
+        let n = sig.argnames.len();
+        let m = npos + nkw;
+        let argword = if n == 1 { "argument" } else { "arguments" };
+        return Err(crate::PyError::type_error(format!(
+            "{fname}() takes at most {n} {argword} ({m} given)"
+        )));
+    }
     let mut scope_w =
-        arguments.parse_obj(pyre_object::PY_NULL, fname, sig, defaults, w_kw_defs, 0)?;
+        match arguments.parse_obj(pyre_object::PY_NULL, fname, sig, defaults, w_kw_defs, 0) {
+            Ok(scope) => scope,
+            Err(err) => {
+                return Err(rewrite_builtin_keyword_error(
+                    sig,
+                    fname,
+                    keyword_names_w,
+                    err,
+                ));
+            }
+        };
     if synthesized {
         rewrite_omitted_kwonly_none_to_null(sig, &mut scope_w, keyword_names_w);
     }
     Ok(scope_w)
+}
+
+/// True when a caller may pass a keyword that names a parameter
+/// (`start=` on `sum`, kw-only tails, `**kwargs`).  All-posonly
+/// signatures stay on parse_obj's `takes no keyword arguments`.
+fn signature_accepts_keywords(sig: &crate::Signature) -> bool {
+    sig.has_kwarg() || sig.num_kwonlyargnames() > 0 || sig.num_argnames() > sig.posonlyargcount
+}
+
+/// [3.14-spec] `parse_obj` says `takes no keyword arguments` when there
+/// is no `**` and no kw-only (`argument.py`).  3.14.6 names the extra
+/// key once the signature already accepts some keywords
+/// (`round(1.5, **{K:0})`, `sum([1,2], **{K:0})`).
+fn rewrite_builtin_keyword_error(
+    sig: &crate::Signature,
+    fname: &str,
+    keyword_names_w: &[PyObjectRef],
+    err: crate::PyError,
+) -> crate::PyError {
+    if err.kind != crate::PyErrorKind::TypeError {
+        return err;
+    }
+    if !err.message_text().ends_with("takes no keyword arguments") {
+        return err;
+    }
+    if !signature_accepts_keywords(sig) {
+        return err;
+    }
+    let Some(name) = first_unknown_keyword_name(sig, keyword_names_w) else {
+        return err;
+    };
+    crate::PyError::type_error(crate::display::wtf8_format!(
+        format!("{fname}() got an unexpected keyword argument '"),
+        name,
+        "'",
+    ))
+}
+
+fn first_unknown_keyword_name(
+    sig: &crate::Signature,
+    keyword_names_w: &[PyObjectRef],
+) -> Option<Wtf8Buf> {
+    for &w_name in keyword_names_w {
+        let text = keyword_name_text(w_name);
+        match keyword_name_utf8(&text) {
+            Some(name) if sig.find_argname(name) >= 0 => continue,
+            _ => return Some(text),
+        }
+    }
+    None
 }
 
 /// `interp2app._getdefaults` stand-in: every kw-only name maps to `None` so

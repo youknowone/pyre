@@ -63,7 +63,6 @@ def sum_rejects_the_marker_key():
             "TypeError",
             "sum() got an unexpected keyword argument '%s'" % K,
         ),
-        xfail=("ok", 3),
     )
 
 
@@ -132,7 +131,6 @@ def sum_two_extras_are_too_many_arguments():
         'sum([1], **{K:0, "start":3})',
         lambda: sum([1], **{K: 0, "start": 3}),
         ("TypeError", "sum() takes at most 2 arguments (3 given)"),
-        xfail=("ok", 4),
     )
 
 

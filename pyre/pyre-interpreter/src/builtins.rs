@@ -4174,7 +4174,13 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function_with_arity("all", builtin_all, 1)
     });
     crate::module_ns_get_or_insert_with(ns, "sum", || {
-        make_module_builtin_function("sum", builtin_sum)
+        // `sum(iterable, /, start=0)` — interp body, Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "sum",
+            builtin_sum,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["iterable", "start"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "round", || {
         make_module_builtin_function("round", builtin_round)
@@ -25160,22 +25166,24 @@ fn compensated_sum_to_double(total: CompensatedSum) -> f64 {
 }
 
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `sum(iterable, /, start=0)`: iterable is positional-only, start is
-    // positional-or-keyword; at most two arguments total.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let total = pos.len() + real_kwarg_count(kwargs);
-    if total > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "sum() takes at most 2 arguments ({total} given)"
-        )));
-    }
-    if pos.is_empty() {
+    // Bound scope from `parse_obj`: `iterable`, `start` (`PY_NULL` omitted).
+    // `sum(iterable, /, start=0)`.
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
             "sum() takes at least 1 positional argument (0 given)",
         ));
     }
-    kwarg_reject_unknown(kwargs, &["start"], "sum")?;
-    let start_opt = bind_pos_or_kw(pos, kwargs, 1, "start", "sum", 2)?;
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "sum() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
+    }
+    let start_opt = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
     // `_regular_sum`: `for x in sequence: last = last + x` over the generic
     // iterator protocol (so generators, ranges, sets, dict views, ... all
     // work).  Very intentionally `last + x`, not `+=` — preserving a mutable
@@ -25198,7 +25206,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // local a foreign collection has left stale. Pin the iterable before the
     // default `start=0` mint so that nursery object cannot move first.
     let last_slot = roots.base();
-    let _ = roots.pin_root(pos[0]);
+    let _ = roots.pin_root(args[0]);
     let start = start_opt.unwrap_or_else(|| w_int_new(0));
     if unsafe { pyre_object::is_str(start) } {
         return Err(crate::PyError::type_error(
