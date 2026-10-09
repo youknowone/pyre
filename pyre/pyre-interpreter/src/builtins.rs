@@ -4183,7 +4183,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "round", || {
-        make_module_builtin_function("round", builtin_round)
+        // `operation.round(space, w_number, w_ndigits=None)` — both
+        // positional-or-keyword; Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "round",
+            builtin_round,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["number", "ndigits"], None, None, 0, 0),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "divmod", || {
         // operation.py `divmod(space, w_x, w_y)` — two positional-only
@@ -4197,7 +4204,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "pow", || {
-        make_module_builtin_function("pow", __majit_wrap_builtin_pow)
+        // `operation.pow(space, w_base, w_exp, w_mod)` with omitted
+        // modulus as `WrappedDefault(None)`; Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "pow",
+            __majit_wrap_builtin_pow,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["base", "exp", "mod"], None, None, 0, 0),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "hex", || {
         make_module_builtin_function("hex", builtin_hex)
@@ -25605,19 +25619,26 @@ pub(crate) fn builtin_round_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 }
 
 fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate::PyError> {
-    // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let total = pos.len() + real_kwarg_count(kwargs);
-    if total > 2 {
+    // Bound scope from `parse_obj`: `number`, `ndigits` (`PY_NULL` omitted).
+    // `round(number, ndigits=None)`. Method `__round__` arrives as
+    // `[self, ndigits?]` after `reject_kwargs`.
+    if args.is_empty() || args[0].is_null() {
+        return Err(crate::PyError::type_error(
+            "round() missing required argument 'number' (pos 1)",
+        ));
+    }
+    if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
-            "round() takes at most 2 arguments ({total} given)"
+            "round() takes at most 2 arguments ({} given)",
+            args.len()
         )));
     }
-    let obj = bind_pos_or_kw(pos, kwargs, 0, "number", "round", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("round() missing required argument 'number' (pos 1)")
-    })?;
-    kwarg_reject_unknown(kwargs, &["number", "ndigits"], "round")?;
-    let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
+    let obj = args[0];
+    let ndigits_arg = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
     let ndigits = ndigits_arg.as_ref();
     unsafe {
         // `operation.py`'s `round` reaches `__round__` through the type, so a
@@ -25813,24 +25834,33 @@ static __majit_wrap_builtin_pow_target: crate::gateway::BuiltinWrapperDescriptor
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `pow(base, exp, mod=None)`: all positional-or-keyword; at most three.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let total = pos.len() + real_kwarg_count(kwargs);
-    if total > 3 {
+    // Bound scope from `parse_obj`: `base`, `exp`, `mod` (`PY_NULL` omitted).
+    // `pow(base, exp, mod=None)`.
+    if args.is_empty() || args[0].is_null() {
+        return Err(crate::PyError::type_error(
+            "pow() missing required argument 'base' (pos 1)",
+        ));
+    }
+    if args.len() < 2 || args[1].is_null() {
+        return Err(crate::PyError::type_error(
+            "pow() missing required argument 'exp' (pos 2)",
+        ));
+    }
+    if args.len() > 3 {
         return Err(crate::PyError::type_error(format!(
-            "pow() takes at most 3 arguments ({total} given)"
+            "pow() takes at most 3 arguments ({} given)",
+            args.len()
         )));
     }
-    let base = bind_pos_or_kw(pos, kwargs, 0, "base", "pow", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("pow() missing required argument 'base' (pos 1)")
-    })?;
-    let exp = bind_pos_or_kw(pos, kwargs, 1, "exp", "pow", 2)?.ok_or_else(|| {
-        crate::PyError::type_error("pow() missing required argument 'exp' (pos 2)")
-    })?;
-    kwarg_reject_unknown(kwargs, &["base", "exp", "mod"], "pow")?;
+    let base = args[0];
+    let exp = args[1];
     // `WrappedDefault(None)`: an omitted modulus arrives as `w_None`, and
     // `descroperation.py pow` turns that into the two-argument form.
-    let modulus = bind_pos_or_kw(pos, kwargs, 2, "mod", "pow", 3)?.unwrap_or_else(w_none);
+    let modulus = if args.len() > 2 && !args[2].is_null() {
+        args[2]
+    } else {
+        w_none()
+    };
     crate::objspace::descroperation::pow3(base, exp, modulus)
 }
 

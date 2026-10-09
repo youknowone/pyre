@@ -74,7 +74,6 @@ def round_rejects_the_marker_key():
             "TypeError",
             "round() got an unexpected keyword argument '%s'" % K,
         ),
-        xfail=("ok", 2),
     )
 
 
@@ -86,7 +85,6 @@ def pow_rejects_the_marker_key():
             "TypeError",
             "pow() got an unexpected keyword argument '%s'" % K,
         ),
-        xfail=("ok", 8),
     )
 
 
