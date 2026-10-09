@@ -296,3 +296,72 @@ fn scalar_pointer_params_match_int_callers() {
             .join("; ")
     );
 }
+
+fn call_segments(target: &CallTarget) -> Option<&[String]> {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => Some(segments.as_slice()),
+        _ => None,
+    }
+}
+
+fn residual_named(graph: &FunctionGraph, owner: &str, leaf: &str) -> bool {
+    ops(graph).any(|op| match &op.kind {
+        OpKind::Call { target, .. } => call_segments(target).is_some_and(|segments| {
+            segments.last().map(String::as_str) == Some(leaf)
+                && segments
+                    .get(segments.len().wrapping_sub(2))
+                    .map(String::as_str)
+                    == Some(owner)
+        }),
+        _ => false,
+    })
+}
+
+/// `Layout::new::<T>()` in the grow `unwrap_or_else` abort closure used
+/// to residualise as `["alloc", "layout", "Layout", "new"]`.
+#[test]
+fn grow_int_items_block_call_once_has_no_layout_new_residual() {
+    let llbc = load_object();
+    let graph = lower_function(&llbc, "object_array::grow_int_items_block")
+        .expect("lower grow_int_items_block");
+    assert!(
+        !residual_named(&graph, "Layout", "new"),
+        "Layout::new must fold to the virtualized {{size, align}} aggregate"
+    );
+}
+
+/// `ll_list_int_length` is `l.int_items.len()` — `rlist.py` LIST
+/// `("length", Signed)`, `jtransform.py` `_handle_list_call` `list.int_len`
+/// → `getfield_gc_i(l, int_items.len)`. A residual `__len` was
+/// `getattr(__len__)` on the nested `IntArray`.
+#[test]
+fn ll_list_int_length_reads_int_array_len_field() {
+    let llbc = load_object();
+    let graph =
+        lower_function(&llbc, "listobject::ll_list_int_length").expect("lower ll_list_int_length");
+    assert!(
+        ops(&graph).any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                field,
+                ty: ValueType::Int,
+                ..
+            } if field.name == "len"
+                && field.owner_root.as_deref() == Some("IntArray")
+        )),
+        "ll_list_int_length must getfield IntArray.len, ops {:?}",
+        ops(&graph)
+            .map(|op| {
+                let rendered = format!("{:?}", op.kind);
+                rendered.chars().take(90).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ops(&graph).all(|op| !matches!(
+            &op.kind,
+            OpKind::Call { target, .. } if call_leaf(target) == Some("__len")
+        )),
+        "IntArray::len must not residualise as __len"
+    );
+}

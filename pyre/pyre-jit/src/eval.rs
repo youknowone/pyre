@@ -9785,7 +9785,7 @@ fn eval_with_jit_inner(
     // collect, and hold the same bracket through the portal (or the decline
     // into `execute_frame_plain`).
     let pins = match resume.as_mut() {
-        Some(resume) => pyre_interpreter::eval::ResumeArgPins::try_pin(resume),
+        Some(resume) => pyre_interpreter::pin_resume_args!(resume),
         None => None,
     };
     // The JIT-side frame-activation seam: a frame that runs entirely as
@@ -9802,7 +9802,7 @@ fn eval_with_jit_inner(
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| env_var("PYRE_JIT").as_deref() == Some("0")) {
-        pyre_interpreter::eval::ResumeArgPins::reload_opt(pins.as_ref(), &mut resume);
+        pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
         return frame.execute_frame_plain(resume);
     }
     // This door tests only `frame_tracing_active`, which is true when the
@@ -9819,7 +9819,7 @@ fn eval_with_jit_inner(
     // code, so its `line` events still come from `eval_loop_jit`'s
     // `bytecode_trace`.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
-        pyre_interpreter::eval::ResumeArgPins::reload_opt(pins.as_ref(), &mut resume);
+        pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
         return frame.execute_frame_plain(resume);
     }
     let mut frame_root = FrameRoot::new(frame);
@@ -9862,7 +9862,7 @@ fn eval_with_jit_inner(
                 code as *const _ as usize,
                 unsupported_jit_shape(code).1,
             );
-            pyre_interpreter::eval::ResumeArgPins::reload_opt(pins.as_ref(), &mut resume);
+            pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
@@ -9880,7 +9880,7 @@ fn eval_with_jit_inner(
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            pyre_interpreter::eval::ResumeArgPins::reload_opt(pins.as_ref(), &mut resume);
+            pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
@@ -9898,7 +9898,7 @@ fn eval_with_jit_inner(
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    pyre_interpreter::eval::ResumeArgPins::reload_opt(pins.as_ref(), &mut resume);
+    pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
     portal_activation_bracketed(
         &mut frame_root,
         resume,
@@ -9967,7 +9967,7 @@ fn portal_activation_bracketed(
     let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
     if ec.is_null() {
         // No execution context is no hook to owe, and no `leave` either.
-        pyre_interpreter::eval::ResumeArgPins::reload_opt(resume_pins, &mut resume);
+        pyre_interpreter::reload_resume_args_opt!(resume_pins, &mut resume);
         if let Some(resume) = resume
             && let Some(delegated) = pyre_interpreter::eval::prepare_frame_resume_for_dispatch(
                 frame_root.frame(),
@@ -9993,7 +9993,7 @@ fn portal_activation_bracketed(
     let mut resume = resume;
     let local_pins = if resume_pins.is_none() {
         match resume.as_mut() {
-            Some(resume) => pyre_interpreter::eval::ResumeArgPins::try_pin(resume),
+            Some(resume) => pyre_interpreter::pin_resume_args!(resume),
             None => None,
         }
     } else {
@@ -10003,7 +10003,7 @@ fn portal_activation_bracketed(
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
-            pyre_interpreter::eval::ResumeArgPins::reload_opt(pins, &mut resume);
+            pyre_interpreter::reload_resume_args_opt!(pins, &mut resume);
             // `self.resume_execute_frame(w_arg_or_err)` and its
             // `except pyopcode.Yield` arm, in `execute_frame`'s inner `try`: a
             // resumed frame is positioned mid-body and the sent value belongs

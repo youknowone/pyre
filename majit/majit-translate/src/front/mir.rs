@@ -22815,6 +22815,17 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `Layout::new::<T>()` is `size_of::<T>()` plus `align_of::<T>()`
+                // (`Layout::from_size_align` with those constants, which a sized
+                // `T` always satisfies).  The grow `unwrap_or_else` abort
+                // closure (`object_array::grow_*_items_block` `call_once`)
+                // residualised it as `["alloc", "layout", "Layout", "new"]`,
+                // which `CallRegistry` cannot type.  Fold to the same
+                // virtualized `{size, align}` aggregate
+                // `from_size_align` already emits (`build_layout_aggregate`).
+                if self.try_lower_layout_new(mir_bb, &reg, dest_local, &call.dest.ty, target)? {
+                    return Ok(());
+                }
                 // Rust exposes RPython's generated shadow-stack publication as
                 // a normal `pin_root(PyObjectRef)` call.  Its pointer argument
                 // is actually `llmemory.GCREF`, irrespective of the source
@@ -25702,9 +25713,12 @@ impl<'a> Lowering<'a> {
                 // gives `set_ref` an `ArrayWrite`, and the workspace `Index`
                 // interception gives `index` / `index_mut` an
                 // `ArrayRead` / `ArrayWrite`.  The length-prefixed siblings
-                // `IntArray` / `FloatArray` are deliberately left on `__len`:
-                // neither is virtualizable, so neither has a reason to move,
-                // and the retarget is unmeasured for them.
+                // `IntArray` / `FloatArray` are the nested
+                // `W_ListObject.int_items` / `float_items` structs
+                // (`rlist.py` LIST `("length", Signed)`); `is_container_len`
+                // reads that word as a `FieldRead`, matching
+                // `jtransform.py` `_handle_list_call` `list.int_len` →
+                // `getfield_gc_i(l, int_items.len)`.
                 if args.len() == 1 && self.is_object_array_len(&reg) {
                     let res = self
                         .graph
@@ -25785,6 +25799,20 @@ impl<'a> Lowering<'a> {
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
+                        }
+                    } else if let Some(owner) = self.typed_array_len_owner(&reg) {
+                        // Nested `IntArray` / `FloatArray` is the LIST
+                        // GcStruct's `length` word (`rlist.py`), not a
+                        // `SomeList`.  `__len` on that struct is
+                        // `getattr(__len__)` on a classdef with no such
+                        // method (`ll_list_int_length`); the word is
+                        // `getfield_gc_i` of `len`.  Signed, matching
+                        // `("length", Signed)` and `getfield_gc_i`.
+                        OpKind::FieldRead {
+                            base: args[0].clone(),
+                            field: FieldDescriptor::new("len", Some(owner.to_string())),
+                            ty: ValueType::Int,
+                            pure: true,
                         }
                     } else {
                         OpKind::Call {
@@ -32240,13 +32268,10 @@ impl<'a> Lowering<'a> {
     ///
     /// The length-prefixed containers `IntArray` / `FloatArray`
     /// (`pyre-object/src/int_array.rs` / `float_array.rs`) expose the same
-    /// inherent `len()` whose body reads the header prefix.  The receiver
-    /// annotates to a `SomeList` (GcArray model), so entering the body
-    /// drives a `getattr(SomeList, "len")` on the header field, which
-    /// dead-ends at `Cannot find attribute "len"` — the header prefix is
-    /// the array's length, read through the `len` op (`arraylen_gc`), not a
-    /// user attribute.  Recognising the call retargets it to `__len` so the
-    /// body is never entered.
+    /// inherent `len()` whose body reads the nested LIST `length` word
+    /// (`rlist.py` `("length", Signed)`).  Entering the body dead-ends at
+    /// `AtomicUsize::load`; recognising the call emits a `FieldRead` of
+    /// `len` (`jtransform.py` `_handle_list_call` `list.int_len`).
     ///
     /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
     /// via [`Self::is_object_array_len`], because its receiver is the
@@ -32366,6 +32391,20 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::len")
+    }
+
+    /// Owner leaf of `IntArray::len` / `FloatArray::len` — the nested
+    /// LIST `length` field (`rlist.py` `GcStruct("list", ("length", Signed),
+    /// …)`).  `None` for `Vec::len`, which stays on `__len`.
+    fn typed_array_len_owner(&self, reg: &RegularCall) -> Option<&'static str> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+            "pyre_object::int_array::<Impl>::len" => Some("IntArray"),
+            "pyre_object::float_array::<Impl>::len" => Some("FloatArray"),
+            _ => None,
+        }
     }
 
     /// `as_bytes()` aliases the dest to the `W_UnicodeObject` and marks
@@ -37623,6 +37662,89 @@ impl<'a> Lowering<'a> {
             dest_local,
             target,
         )?;
+        Ok(true)
+    }
+
+    /// `Layout::new::<T>()` → the virtualized `{size, align}` aggregate
+    /// [`crate::front::from_size_align::build_layout_aggregate`] already
+    /// emits for `from_size_align`.  `new` is `size_of::<T>()` plus
+    /// `align_of::<T>()`; both constants fold through
+    /// [`Self::size_align_const_from_tyexpr`], the same helper the inline
+    /// `size_of`/`align_of` call fold uses.  Fail-closed: a missing type
+    /// argument or unresolved layout leaves the residual call.
+    fn try_lower_layout_new(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let segments: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(String::from)
+            .collect();
+        if !crate::front::from_size_align::is_layout_new(&segments) {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let layout_owner = td.item_meta.name_path();
+        if !crate::front::from_size_align::is_layout_adt_owner(&layout_owner) {
+            return Ok(false);
+        }
+        let Some(ty) = reg
+            .generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+        else {
+            return Ok(false);
+        };
+        let Some(size) = self.size_align_const_from_tyexpr(false, ty) else {
+            return Ok(false);
+        };
+        let Some(align) = self.size_align_const_from_tyexpr(true, ty) else {
+            return Ok(false);
+        };
+        let bb_id = self.block_id[mir_bb];
+        let push_const = |graph: &mut FunctionGraph, value: i64| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::ConstInt(value),
+            });
+            res
+        };
+        let size_var = push_const(&mut self.graph, size);
+        let align_var = push_const(&mut self.graph, align);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        crate::front::from_size_align::build_layout_aggregate(
+            &mut self.graph,
+            bb_id,
+            &layout_owner,
+            res.clone(),
+            size_var,
+            align_var,
+        );
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
     }
 

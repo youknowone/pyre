@@ -5120,11 +5120,11 @@ impl PyFrame {
         // `stack_check`'s overflow arm allocates `RecursionError` while a
         // thrown `OperationError` (`error.py`) and the sent value are still
         // the argument. One shadow-stack bracket covers the whole span.
-        let pins = crate::eval::ResumeArgPins::try_pin(&mut resume);
+        let pins = crate::pin_resume_args!(&mut resume);
         crate::stack_check::drain_jit_pending_exception()?;
-        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), &mut resume);
+        crate::reload_resume_args!(pins.as_ref(), &mut resume);
         crate::stack_check::stack_check()?;
-        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), &mut resume);
+        crate::reload_resume_args!(pins.as_ref(), &mut resume);
         crate::eval::eval_frame_plain_with_resume(self, &mut resume, pins.as_ref())
     }
 
@@ -5184,11 +5184,11 @@ impl PyFrame {
         // Same `w_arg_or_err` bracket as `execute_frame`: the overflow arm
         // allocates before `call_trace` / `resume_execute_frame` consume the
         // sent value and the thrown `OperationError`.
-        let pins = crate::eval::ResumeArgPins::try_pin(resume);
+        let pins = crate::pin_resume_args!(resume);
         crate::stack_check::drain_jit_pending_exception()?;
-        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), resume);
+        crate::reload_resume_args!(pins.as_ref(), resume);
         crate::stack_check::stack_check()?;
-        crate::eval::ResumeArgPins::reload_into(pins.as_ref(), resume);
+        crate::reload_resume_args!(pins.as_ref(), resume);
         crate::eval::eval_frame_plain_with_resume(self, resume, pins.as_ref())
     }
 
