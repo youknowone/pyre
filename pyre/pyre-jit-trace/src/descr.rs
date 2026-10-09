@@ -12274,6 +12274,18 @@ fn lookup_field_by_either_spelling<'m>(
     hit
 }
 
+/// Whether `struct_id` names `GilReadyState` under one of the owner spellings
+/// `make_descr_from_bh` bridges.
+fn is_gil_ready_struct(struct_id: u64) -> bool {
+    [
+        "GilReadyState",
+        "gil_ready::GilReadyState",
+        "pyre_object::gil_ready::GilReadyState",
+    ]
+    .into_iter()
+    .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
+}
+
 fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
@@ -12283,6 +12295,13 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             field_name,
             ..
         } => {
+            // `GilReadyState.gil_ready` lives in a non-GC static, so no
+            // `gc_cache` slot names its struct.  A residual call that reads
+            // the word publishes it in its read set; resolve it to the one
+            // quasi descr, as `make_descr_from_bh` does for the opcode.
+            if field_name.as_str() == "gil_ready" && is_gil_ready_struct(*struct_id) {
+                return SetMemberLookup::Resolved(gil_ready_descr());
+            }
             let struct_key = LLType::Struct(*struct_id);
             let gc = gc_cache().lock();
             match gc._cache_field.get(&struct_key) {

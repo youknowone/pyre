@@ -78,18 +78,19 @@ impl Drop for ListGuard {
     }
 }
 
-/// PyPy runs every list operation under the GIL, so no trace of a list
-/// operation carries a lock.  Compiled code keeps that shape: under
-/// `we_are_jitted()` the guard holds the zero word and its release does
-/// nothing, so a traced body records no lock call and a list the trace
-/// allocated stays virtual across it.  The blackhole resumes such a body
-/// with the zero word too, and runs a call it reaches through the call's
-/// host address, which acquires and releases as the interpreter does.
+/// PyPy runs every list operation under the GIL and has no per-list lock.
+/// `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ =
+/// ['gil_ready?']`) stays 0 until `setup_threads`, so while the process has
+/// no other thread the guard holds the zero word and its release does
+/// nothing: a traced body records no lock call and a list the trace
+/// allocated stays virtual across it.  Publication fails the guard on the
+/// folded zero, and the retrace acquires the stripe.
 pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
-    let lock = if majit_rlib::jit::we_are_jitted() {
-        0
-    } else {
+    let ready = crate::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
         w_list_lock_acquire(obj)
+    } else {
+        0
     };
     ListGuard {
         lock,
@@ -166,8 +167,8 @@ fn acquire_list_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> u
 /// # Safety
 /// `lock` must be an unreleased handle from w_list_lock_acquire on this thread.
 ///
-/// The zero word is the guard [`w_list_lock`] hands compiled code; it
-/// releases nothing.
+/// The zero word is the guard [`w_list_lock`] holds while `gil_ready` is
+/// unpublished; it releases nothing.
 pub unsafe fn w_list_lock_release(lock: usize) {
     if lock != 0 {
         unsafe { w_list_lock_release_held(lock) };
