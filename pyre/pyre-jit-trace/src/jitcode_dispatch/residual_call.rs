@@ -393,8 +393,17 @@ pub(crate) struct MirrorStackImage {
     /// Python pc of the opcode the walk stopped inside.  Pairs with the slots:
     /// the mirror reflects the depth ON ENTRY to this opcode, which is the
     /// `last_instr = py_pc - 1` coordinate the codewriter stores for it.
+    /// A resume-past image (`resume_past`) instead holds the POST-call
+    /// prefix at this same `py_pc`, and capture stores `last_instr = py_pc`
+    /// so `next_instr()` continues after the residual.
     pub(crate) py_pc: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+    /// True when the residual has already run and the blackhole must resume
+    /// PAST it (`convert_and_run_from_pyjitpl` after `ABORT_ESCAPE`).  The
+    /// walker `vstack_boxes` still hold the ON-ENTRY operand stack; a void
+    /// residual's opcode pops have to be applied here so FOR_ITER does not
+    /// see a STORE_SUBSCR key as TOS.
+    pub(crate) resume_past: bool,
 }
 
 pub(crate) struct LatchedSingleFrameBlackhole {
@@ -467,6 +476,7 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
                 vable_frame,
                 mirror.py_pc,
                 &mirror.slots,
+                mirror.resume_past,
             )
             .is_some()
     })
@@ -579,7 +589,42 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: ctx.vstack_cur_pypc as usize,
         slots,
+        resume_past: false,
     })
+}
+
+/// Resume-past counterpart of [`capture_vstack_mirror_image`].
+///
+/// `pyjitpl.py vable_after_residual_call` raises `SwitchToBlackhole(ABORT_ESCAPE)`
+/// after the residual has run; `blackhole.py convert_and_run_from_pyjitpl`
+/// copies `MIFrame` registers at `next_pc`, where the call's operand suffix
+/// is already consumed.  The walker mirror is still the ON-ENTRY Python
+/// operand stack, so a void residual (STORE_SUBSCR / STORE_NAME) has to
+/// drop that suffix before the adopter publishes it — otherwise FOR_ITER
+/// reads the store key as TOS.  Producing residuals splice their result
+/// through `lastop_result` into the MIFrame banks and keep the entry
+/// mirror; their Python-stack publish is the entry image the existing
+/// adopt already consumed.
+fn capture_resume_past_mirror_image<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    lastop_result: Option<(char, usize, i64)>,
+) -> Option<MirrorStackImage> {
+    let mut image = capture_vstack_mirror_image(ctx, "escape-flush")?;
+    if lastop_result.is_some() {
+        return Some(image);
+    }
+    let Some(code) = walker_active_py_code(ctx) else {
+        return Some(image);
+    };
+    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, image.py_pc) else {
+        return Some(image);
+    };
+    let (post_depth, _) = crate::liveness::stack_effects(&instr, op_arg, image.slots.len());
+    if post_depth <= image.slots.len() {
+        image.slots.truncate(post_depth);
+        image.resume_past = true;
+    }
+    Some(image)
 }
 
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
@@ -679,6 +724,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: resume_py_pc,
         slots,
+        resume_past: false,
     })
 }
 
@@ -5213,8 +5259,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         // stops inside the residual call, and the resumed
                         // blackhole can reach a `getarrayitem_vable_r` that
                         // reloads an operand from the virtualizable array, so
-                        // publish the root stack from the walker's mirror.
-                        let mirror_stack = capture_vstack_mirror_image(ctx, "escape-flush");
+                        // publish the POST-call prefix: the residual has
+                        // already consumed its operand suffix
+                        // (`convert_and_run_from_pyjitpl` at `next_pc`).
+                        let mirror_stack = capture_resume_past_mirror_image(ctx, lastop_result);
                         if fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[latch-accept] origin=escape-flush single-frame pc={} \

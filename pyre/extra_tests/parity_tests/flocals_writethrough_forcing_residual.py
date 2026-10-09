@@ -6,14 +6,16 @@
 # against the frame the tracer is stepping a copy of, so it is the tracer's
 # handling of that call -- not the proxy -- that decides whether the write
 # survives.
-# pyre-check: regresses-under: PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS=1 -- without the adopt the walk keeps the box the local held before the call, and both traced iterations lose the write
 
 """A callee's write through the caller's ``f_locals`` survives tracing.
 
-``setter`` forces the caller and writes its fast-local array while the tracer
-holds a boxed copy. ``adopt_residual_locals_writes`` must read the slot back for
-both the concretely called and later inlined recordings. The bound reaches both;
-the ``regresses-under`` arm proves the shape remains live.
+``setter`` forces the caller (``virtualizable.py force_now`` stores
+``TOKEN_NONE`` on ``TOKEN_TRACING_RESCALL``) and writes its fast-local array
+while the tracer holds a boxed copy. ``pyjitpl.py vable_after_residual_call``
+raises ``SwitchToBlackhole(ABORT_ESCAPE)``; ``blackhole.py
+convert_and_run_from_pyjitpl`` resumes past the residual and the interpreter
+carries the write. The write is visible without ``adopt_residual_locals_writes``
+because the walk is abandoned.
 """
 
 import sys

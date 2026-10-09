@@ -439,17 +439,15 @@ pub mod frame_locals_proxy {
             if token == 0 {
                 return;
             }
-            // `virtualizable.py force_now` values are already correct during
-            // tracing. Do not store TOKEN_NONE: that marker is
-            // `tracing_after_residual_call`'s escape, and a proxy write is a
-            // residual `space.setitem` under looked-inside STORE_SUBSCR
-            // (`pyopcode.py`). Clearing here aborts the loop and the
-            // single-frame blackhole adopt then leaves a name/int/str where
-            // FOR_ITER expects its iterator. `vable_and_vrefs_before_residual_call`
-            // already stored the boxes; `adopt_residual_locals_writes` owns
-            // the tracing write. An Active token still forces — compiled
-            // code owns the frame, which is when the write has a shadow.
+            // `virtualizable.py force_now`: TOKEN_TRACING_RESCALL values are
+            // already correct during tracing; reset to TOKEN_NONE as the
+            // escape marker `tracing_after_residual_call` reads. A proxy
+            // write under a traced residual (`bh_store_subscr_fn` /
+            // `space.setitem`) is an escape the same way any other residual
+            // redirected-field write is: pypy aborts `ABORT_ESCAPE` and the
+            // blackhole runs forward (`convert_and_run_from_pyjitpl`).
             if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
+                unsafe { (*frame).vable_token = 0 };
                 return;
             }
             // The force materializes through a backend hook this crate cannot
