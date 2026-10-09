@@ -6916,12 +6916,11 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
 /// `#[inline(never)]` keeps the helper a separate graph so rustc does not
 /// fold it into `type_descr_new`.
 ///
-/// `ensure_module_attr` reads `caller.get_w_globals()`. Residual copies
-/// of that graph keep `force_virtualizable_if_necessary`
-/// (`TOKEN_TRACING_RESCALL` → `TOKEN_NONE`, then
-/// `tracing_after_residual_call` aborts `ABORT_ESCAPE`). Native residual
-/// execution has no rewritten graph, so the arm below calls the helper
-/// before the field read.
+/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
+/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
+/// out) so the heap slot is already current.  A hand-placed
+/// `jit_force_virtualizable` here aborted compiles that create a type
+/// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
 #[inline(never)]
 fn type_create_new_type(
     args: &[PyObjectRef],
@@ -7181,12 +7180,13 @@ fn type_create_new_type(
         //
         // `ensure_module_attr` reaches the caller through
         // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
-        // rather than through the `CURRENT_FRAME` thread-local.  The walk
-        // itself only dereferences the vref and follows `f_backref`. Residual
-        // copies keep `force_virtualizable_if_necessary` on this
-        // `get_w_globals` (`hook_access_field` on `debugdata` / `pycode`);
-        // native residual execution has no rewritten graph, so the helper
-        // runs here.
+        // rather than through the `CURRENT_FRAME` thread-local.  No force is
+        // owed here: the walk only dereferences the vref and follows
+        // `f_backref`, and `force_frame` belongs to the consumers that hand a
+        // frame to application code.  `w_globals` is a declared virtualizable
+        // field, but no walk writes it on the live frame —
+        // `restore_resume_state_from` leaves it and `pycode` out of the resume
+        // restore as frame-invariant — so its heap slot is already current.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -7196,23 +7196,6 @@ fn type_create_new_type(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
-                // `typeobject.py ensure_module_attr` reads `caller.get_w_globals()`.
-                // `hook_access_field` keeps `force_virtualizable_if_necessary` in
-                // the residual `_create_new_type` graph; native residual has no
-                // rewritten graph, so the token test runs here.
-                //
-                // `force_now` on `TOKEN_TRACING_RESCALL` stores `TOKEN_NONE` as
-                // the escape marker `tracing_after_residual_call` reads. An
-                // Active token belongs to the portal virtualizable. This caller
-                // is `gettopframe_nohidden()` — classify, whose token is idle
-                // once the portal owns the loop — and forcing Active here fails
-                // `GUARD_NOT_FORCED` on every residual (`forced_never_compiled`
-                // ~2N). pypy's residual `get_w_globals` no-ops on that idle
-                // token.
-                let token = unsafe { (*frame).vable_token };
-                if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
-                    unsafe { (*frame).vable_token = 0 };
-                }
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()
                     && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?
