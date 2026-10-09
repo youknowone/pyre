@@ -1024,6 +1024,10 @@ pub struct MiniMarkGC {
     /// stale bit is not merely inherited, it is the same header the next major
     /// reads. See [`Self::note_nonmoving_young_mark`].
     oldgen_nonmoving_active: bool,
+    /// Set while `do_collect_full` drives a cycle it seeded itself. No
+    /// mutator runs between that seed and the end of MARKING, so every
+    /// extra-root slot still holds the value the seed already marked.
+    full_collect_owns_cycle: bool,
     /// The cycle now in sweep had its mark seam run with
     /// [`Self::oldgen_nonmoving_active`] set. Only that cycle may release
     /// unvisited young rawmallocs: a non-moving entry that first finishes a
@@ -1309,6 +1313,7 @@ impl MiniMarkGC {
             finalizer_lock: false,
             enabled: true,
             oldgen_nonmoving_active: false,
+            full_collect_owns_cycle: false,
             oldgen_nonmoving_marked: false,
             oldgen_nonmoving_young_marks: Vec::new(),
             rrc: rawrefcount::RawRefCount::default(),
@@ -6755,9 +6760,16 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
             i += 1;
         }
-        crate::shadow_stack::walk_extra_roots(|gcref| {
-            self.seed_major_extra_root(*gcref, "rescan_extra_root");
-        });
+        // `collect_nonstack_roots` repeats the static roots because the
+        // mutator may have written them since `collect_roots`. A cycle that
+        // `do_collect_full` seeded and is finishing in the same call has had
+        // no mutator step, so the extra-root tables are the ones the seed
+        // walked and every value in them is already `GCFLAG_VISITED`.
+        if !self.full_collect_owns_cycle {
+            crate::shadow_stack::walk_extra_roots(|gcref| {
+                self.seed_major_extra_root(*gcref, "rescan_extra_root");
+            });
+        }
         // TLS exception cells live on the per-mutator frame area for the
         // first pass. Upstream's second `collect_nonstack_roots` still
         // repeats the non-stack carriers that can be written after the
@@ -8940,8 +8952,10 @@ impl MiniMarkGC {
         // the cycle with the finishing cycle's counters still in place.
         if self.gc_state == GcState::Scanning {
             self.major_collection_step();
+            self.full_collect_owns_cycle = self.gc_state == GcState::Marking;
         }
         self.gc_step_until_scanning_with_minors();
+        self.full_collect_owns_cycle = false;
 
         // incminimark.py:808.
         self.rrc_invoke_callback();
