@@ -364,9 +364,10 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
 /// store aborts, exactly as without materialization.
 ///
 /// A real heap array store — whose `array` operand is a `GetfieldGcR`
-/// load of a live container's items block, not a recorded NewArray —
-/// is left untouched, so the interpreter's own SETARRAYITEM is never
-/// duplicated eagerly here.
+/// load of a pre-existing container's items block — is left untouched,
+/// so the interpreter's own SETARRAYITEM is never duplicated eagerly
+/// here. The reload of a block from a container this walk allocated is
+/// the walk's own object and is filled like a recorded NewArray.
 pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     array: OpRef,
@@ -385,6 +386,23 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     }
     match ctx.trace_ctx.opcode_of(array) {
         Some(OpCode::NewArray | OpCode::NewArrayClear) => {}
+        // The block a container this walk allocated points at now. A
+        // `conditional_call` the walk executed (`_ll_list_resize_ge` ->
+        // `_ll_list_resize_hint_really`) replaces the recorded NewArray
+        // with a block the callee allocated, and the reload of `l.items`
+        // is the only box naming it. `_opimpl_setfield_gc_any` already
+        // executes `l.length = newsize` on that container; without the
+        // `ll_setitem_fast` store the list holds a null slot.
+        Some(OpCode::GetfieldGcR) => {
+            let owned = ctx.is_authoritative_executor
+                && ctx
+                    .trace_ctx
+                    .ref_getfield_gc_r(array)
+                    .is_some_and(|(_, obj)| ctx.trace_ctx.heap_cache().saw_allocation(obj));
+            if !owned {
+                return;
+            }
+        }
         _ => return,
     }
     let block = match ctx.trace_ctx.box_value(array) {
