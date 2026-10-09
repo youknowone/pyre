@@ -1573,21 +1573,32 @@ pub unsafe fn module_dict_strategy_force_version_qmut(
 /// `EmptyDictStrategy.get_empty_storage` is `erase(None)`.  The first
 /// mutating call promotes via `switch_to_correct_strategy` and installs
 /// real storage, the same `w_dict_new_kwargs` path.
-#[majit_macros::dont_look_inside]
-pub fn w_dict_new() -> PyObjectRef {
-    alloc_dict_object(
-        W_DictObject {
-            ob_header: PyObject {
-                ob_type: &DICT_TYPE as *const PyType,
-                w_class: get_instantiate(&DICT_TYPE),
-            },
-            dstorage: std::ptr::null_mut(),
-            dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
-            keys_version: 0,
-            clear_gen: 0,
+/// A traced call is [`newdict_empty`]: null `dstorage`, `EmptyDictStrategy`,
+/// same shape as `ll_newdict`. `malloc_typed_managed` is the boxing primitive
+/// `w_str_from_storage_and_length` / specialised-tuple constructors expose so
+/// `fuse_boxing_alloc` emits `new_with_vtable`; `malloc_typed` leaks off-heap
+/// (`alloc_with_gc_header`) and that pass treats it as non-movable.
+#[inline(never)]
+pub fn newdict_empty() -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &DICT_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_TYPE),
         },
-        false,
-    )
+        dstorage: std::ptr::null_mut(),
+        dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
+        keys_version: 0,
+        clear_gen: 0,
+    }) as PyObjectRef
+}
+
+/// Allocate a new empty dict per `dictmultiobject.py allocate_and_init_instance`.
+///
+/// One body: [`newdict_empty`] (`malloc_typed_managed` / `ll_newdict`).
+/// `fuse_boxing_alloc` rewrites that cluster to `new_with_vtable`.
+#[inline(never)]
+pub fn w_dict_new() -> PyObjectRef {
+    newdict_empty()
 }
 
 pub type MakeInstanceDictHookFn = fn() -> PyObjectRef;
@@ -1718,6 +1729,7 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
     }
     let slot = entries.entries_slot() as *mut PyObjectRef;
     visitor(unsafe { &mut *slot });
+    entries.visit_indexes(&mut |slot| visitor(unsafe { &mut *(slot as *mut PyObjectRef) }));
 }
 
 /// Visit every GC-reference slot in a dict's strategy-owned storage.
@@ -2581,6 +2593,8 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             crate::celldict::walk_module_value_slot(value, visitor);
         }
         visitor(unsafe { &mut *(object_storage.entries_slot() as *mut PyObjectRef) });
+        object_storage
+            .visit_indexes(&mut |slot| visitor(unsafe { &mut *(slot as *mut PyObjectRef) }));
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
         for (key, value) in storage.entries.iter_mut_for_trace() {
@@ -2591,6 +2605,9 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             crate::celldict::walk_module_value_slot(value, visitor);
         }
         visitor(unsafe { &mut *(storage.entries.entries_slot() as *mut PyObjectRef) });
+        storage.entries.visit_indexes(&mut |slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef) });
+        });
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
     }
 }
@@ -4572,7 +4589,11 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 /// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
 /// `RDict<K, PyObjectRef, S>`.
 unsafe fn typed_move_to_end<
-    K: std::hash::Hash + Eq + Copy + crate::rordereddict::EntryDummy,
+    K: std::hash::Hash
+        + Eq
+        + Copy
+        + crate::rordereddict::EntryDummy
+        + crate::rordereddict::GcRefOffsets,
     S: std::hash::BuildHasher,
 >(
     dict: *mut W_DictObject,
@@ -4939,10 +4960,6 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// — `return self.get_strategy().length(self)`.  Dispatches through
 /// the polymorphic strategy slot.
 ///
-/// Residualise the length leaf (`@dont_look_inside`,
-/// `rlib/jit.py`): the strategy dispatch it wraps reads
-/// runtime-mutable dict storage the tracer cannot model.
-#[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -5102,26 +5119,14 @@ pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
     w_dict_get_strategy(obj).copy(obj)
 }
 
-/// Internal helper: `IntDictStrategy::setitem` body — direct
-/// linear-scan write on the native `Vec<(i64, PyObjectRef)>` storage,
-/// matching `dictmultiobject.py` (`self.unerase
-/// (w_dict.dstorage)[self.unwrap(w_key)] = w_value`).  Caller must
-/// have already verified `is_correct_type(w_key)`.
+/// Internal helper: `IntDictStrategy::setitem` body.
 ///
-/// Residualise the int-storage setitem leaf (`@dont_look_inside`,
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).
+/// look_inside_iff lives on `ll_dict_setitem_lookup_done`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::INT_DICT_STRATEGY`]; `key` must be a
 /// plain `W_IntObject` (not bool).
-fn w_dict_store_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef, _value: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_store_int_strategy_iff)]
 pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj, key, value);
     dict_write_barrier(obj);
@@ -5137,17 +5142,10 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
 /// `dictmultiobject.py self.unerase(w_dict.dstorage).get(self.unwrap(w_key), None)`.
 /// Caller must have already verified `is_correct_type(w_key)`.
 ///
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `ll_dict_lookup` (`rordereddict.py`).
+/// look_inside_iff lives on `ll_dict_lookup`.
 ///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
-fn w_dict_lookup_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_lookup_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_int_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -5160,16 +5158,8 @@ pub unsafe fn w_dict_lookup_int_strategy(
 
 /// Return the insertion-order index selected by an int-strategy lookup.
 ///
-/// Same predicate as [`w_dict_lookup_int_strategy`].
-///
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
-fn w_dict_index_of_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_index_of_int_strategy_iff)]
 pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
     lock_dict_refs!(_dict_guard, obj, key);
     w_dict_index_of_int_locked(obj, key)
@@ -5191,16 +5181,8 @@ unsafe fn w_dict_index_of_int_locked(obj: PyObjectRef, key: PyObjectRef) -> Opti
 
 /// Return the live value selected by an int-strategy lookup.
 ///
-/// Same predicate as [`w_dict_lookup_int_strategy`].
-///
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
-fn w_dict_lookup_or_null_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_lookup_or_null_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_or_null_int_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -5222,12 +5204,6 @@ pub unsafe fn w_dict_lookup_or_null_int_strategy(
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::UNICODE_DICT_STRATEGY`].
-fn w_dict_index_of_unicode_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_object_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_index_of_unicode_strategy_iff)]
 pub unsafe fn w_dict_index_of_unicode_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -5292,12 +5268,6 @@ unsafe fn w_str_memoized_hash(key: PyObjectRef, key_str: &str) -> Option<i64> {
 ///
 /// # Safety
 /// Same as [`w_dict_index_of_unicode_strategy`].
-fn w_dict_lookup_or_null_unicode_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_object_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_lookup_or_null_unicode_strategy_iff)]
 pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -5315,25 +5285,15 @@ pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
 /// `dictmultiobject.py del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
 /// Returns `true` if a key was removed.
 ///
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))` on
-/// `_ll_dict_del` (`rordereddict.py`).
+/// look_inside_iff lives on `_ll_dict_del`.
 ///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
-fn w_dict_delitem_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_delitem_int_strategy_iff)]
 pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     lock_dict_refs!(_dict_guard, obj, key);
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut IntDictStorage);
     let k = crate::listobject::plain_int_w(key);
-    // shift_remove preserves insertion order, matching CPython 3.7+ /
-    // PyPy3 dict semantics where deleting an entry leaves the
-    // remaining entries in their original relative order.
     if entries.remove(&k).is_some() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
         true
@@ -5503,23 +5463,12 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
 /// `dictmultiobject.py` direct typed-storage write.  Caller
 /// must have already verified `is_correct_type(w_key)`.
 ///
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).
+/// look_inside_iff lives on `ll_dict_setitem_lookup_done`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::BYTES_DICT_STRATEGY`]; `key` must be a
 /// `W_BytesObject`.
-fn w_dict_store_bytes_strategy_iff(
-    obj: PyObjectRef,
-    key: PyObjectRef,
-    _value: PyObjectRef,
-) -> bool {
-    let entries = unsafe { w_dict_bytes_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_store_bytes_strategy_iff)]
 pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj, key, value);
     dict_write_barrier(obj);
@@ -5535,17 +5484,10 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
 /// `dictmultiobject.py`.  Caller must have already verified
 /// `is_correct_type(w_key)`.
 ///
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `ll_dict_lookup` (`rordereddict.py`).
+/// look_inside_iff lives on `ll_dict_lookup`.
 ///
 /// # Safety
 /// Same as [`w_dict_store_bytes_strategy`].
-fn w_dict_lookup_bytes_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_bytes_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
-}
-
-#[majit_macros::look_inside_iff(w_dict_lookup_bytes_strategy_iff)]
 pub unsafe fn w_dict_lookup_bytes_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -6943,6 +6885,7 @@ pub trait DictStrategy {
         }
         let slot = entries.entries_slot() as *mut PyObjectRef;
         visitor(slot);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 }
 
@@ -7936,6 +7879,7 @@ impl DictStrategy for BytesDictStrategy {
             visitor(value as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
@@ -8415,6 +8359,7 @@ impl DictStrategy for IntDictStrategy {
             visitor(value as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
@@ -8453,6 +8398,25 @@ mod tests {
     fn install_test_hash_hook() {
         crate::dict_eq_hook::register_hash_w_hook(builtin_structural_hash);
         crate::dict_eq_hook::register_hash_str_hook(builtin_structural_str_hash);
+    }
+
+    #[test]
+    fn empty_dict_walk_gc_refs_skips_null_dstorage() {
+        unsafe {
+            let dict = w_dict_new();
+            assert_eq!(w_dict_strategy_name(dict), "EmptyDictStrategy");
+            assert!((*(dict as *const W_DictObject)).dstorage.is_null());
+            w_dict_walk_gc_refs(dict, &mut |_| {
+                panic!("EmptyDictStrategy has no storage slots")
+            });
+
+            let kwargs = w_dict_new_kwargs();
+            assert_eq!(w_dict_strategy_name(kwargs), "EmptyKwargsDictStrategy");
+            assert!((*(kwargs as *const W_DictObject)).dstorage.is_null());
+            w_dict_walk_gc_refs(kwargs, &mut |_| {
+                panic!("EmptyKwargsDictStrategy has no storage slots")
+            });
+        }
     }
 
     #[test]

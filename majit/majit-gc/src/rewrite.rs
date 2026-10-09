@@ -1945,7 +1945,9 @@ impl GcRewriterImpl {
                 self.malloc_array_fn
             });
             let itemsize_ref = st.const_int(ad.item_size() as i64);
-            let typeid_ref = st.const_int(ad.type_id() as i64);
+            let tid = ad.type_id();
+            majit_ir::descr::assert_array_tid_for_malloc(tid, "gen_malloc_array");
+            let typeid_ref = st.const_int(tid as i64);
             self.gen_call_malloc_gc(
                 &[fn_ref, itemsize_ref, typeid_ref, v_num_elem],
                 result_pos,
@@ -1961,7 +1963,9 @@ impl GcRewriterImpl {
             let basesize_ref = st.const_int(ad.base_size() as i64);
             let itemsize_ref = st.const_int(ad.item_size() as i64);
             let lengthofs_ref = st.const_int(length_ofs as i64);
-            let typeid_ref = st.const_int(ad.type_id() as i64);
+            let tid = ad.type_id();
+            majit_ir::descr::assert_array_tid_for_malloc(tid, "gen_malloc_array");
+            let typeid_ref = st.const_int(tid as i64);
             self.gen_call_malloc_gc(
                 &[
                     fn_ref,

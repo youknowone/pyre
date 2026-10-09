@@ -1501,12 +1501,55 @@ fn register_synthetic_struct_tids() {
             cache.register_unresolved_struct_tids(|size, offsets| {
                 gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
             });
+            cache.register_unresolved_array_tids(|base, item, len, offs, is_ptr| {
+                register_array_layout(gc, base, item, len, offs, is_ptr)
+            });
             return;
         }
         cache.replay_synthetic_struct_tids(|size, offsets| {
             gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
         });
+        cache.replay_synthetic_array_tids(|base, item, len, offs, is_ptr| {
+            register_array_layout(gc, base, item, len, offs, is_ptr)
+        });
     });
+}
+
+/// `TypeLayoutBuilder.get_type_id(A)` then `encode_type_shape`. Host
+/// `register_dict_entries` / int/float item arrays already occupy a
+/// `TypeInfo` with the same `ofstovar` / `varitemsize` / `ofstolength` /
+/// `varofstoinnergcptrs`. Two distinct `LLType` keys that denote that
+/// same lltype therefore reuse the existing tid via
+/// `TypeRegistry::find_varsize_type` instead of appending a second one.
+fn register_array_layout(
+    gc: &mut majit_gc::collector::MiniMarkGC,
+    base_size: usize,
+    item_size: usize,
+    len_offset: usize,
+    item_gc_offsets: Vec<usize>,
+    is_ptr: bool,
+) -> u32 {
+    use majit_gc::GcAllocator;
+    let var_offsets = if !item_gc_offsets.is_empty() {
+        item_gc_offsets
+    } else if is_ptr {
+        vec![0]
+    } else {
+        Vec::new()
+    };
+    if let Some(tid) = gc
+        .types
+        .find_varsize_type(base_size, item_size, len_offset, &var_offsets)
+    {
+        return tid;
+    }
+    gc.register_type(majit_gc::trace::TypeInfo::varsize_with_gc_ptr_offsets(
+        base_size,
+        item_size,
+        len_offset,
+        var_offsets,
+        Vec::new(),
+    ))
 }
 
 /// Rehydrate build-time EffectInfo raw descr sets before

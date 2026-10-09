@@ -3633,9 +3633,10 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     descr
 }
 
-/// The runtime's own descr for a list backing block named by its ARRAY
-/// identity.  The build-time descr pool consults this before minting, so
-/// the GC tid stamped here reaches the shared `_cache_array` slot first.
+/// The runtime's own descr for a list backing block or a `DICTENTRYARRAY`
+/// named by its ARRAY identity.  The build-time descr pool consults this
+/// before minting, so the GC tid stamped here reaches the shared
+/// `_cache_array` slot first.
 pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
     use majit_jitcode::codewriter::jtransform as jt;
     let canonical = jt::canonical_array_type_id(array_type_id);
@@ -3643,8 +3644,100 @@ pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
         jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
         jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
         jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),
-        _ => None,
+        other => entries_gcarray_descr_for_type_id(other),
     }
+}
+
+fn entries_array_leaf(array_type_id: &str) -> &str {
+    let inner = array_type_id
+        .strip_prefix("GcArray<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(array_type_id);
+    inner.rsplit("::").next().unwrap_or(inner)
+}
+
+fn is_entry_kv(array_type_id: &str, key: &str, value_is_pyobject: bool) -> bool {
+    let leaf = entries_array_leaf(array_type_id);
+    if !leaf.starts_with("Entry<") {
+        return false;
+    }
+    let has_key = leaf.contains(key);
+    let has_pyobject = leaf.contains("PyObject") || leaf.contains("pyobject");
+    has_key && has_pyobject == value_is_pyobject
+}
+
+/// `cpu.arraydescrof(ENTRIES)` for every `entries_gc_type_id!` pair.
+fn entries_gcarray_descr_for_type_id(array_type_id: &str) -> Option<DescrRef> {
+    type V = pyre_object::PyObjectRef;
+    if is_entry_kv(array_type_id, "i64", true) {
+        return Some(entries_gcarray_descr::<i64, V>(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "ObjectKey", true) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::dictmultiobject::ObjectKey,
+            V,
+        >(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "BytesKey", true) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::dictmultiobject::BytesKey,
+            V,
+        >(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "IdentityKey", true) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::identitydict::IdentityKey,
+            V,
+        >(array_type_id));
+    }
+    if is_entry_kv(array_type_id, "StrKey", true) {
+        return Some(entries_gcarray_descr::<pyre_object::celldict::StrKey, V>(
+            array_type_id,
+        ));
+    }
+    if is_entry_kv(array_type_id, "ObjectKey", false) {
+        return Some(entries_gcarray_descr::<
+            pyre_object::dictmultiobject::ObjectKey,
+            (),
+        >(array_type_id));
+    }
+    None
+}
+
+/// `cpu.arraydescrof(ENTRIES)` for one `GcEntries<K, V>` ARRAY identity.
+fn entries_gcarray_descr<K, V>(array_type_id: &str) -> DescrRef
+where
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
+    use majit_ir::descr::{ArrayFlag, LLType};
+    use majit_ir::{ArrayDescr, Descr};
+    let base_size = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, items);
+    let item_size = std::mem::size_of::<pyre_object::rordereddict::Entry<K, V>>();
+    let len_offset = std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, length);
+    let tid = <(K, V) as pyre_object::rordereddict::GcEntriesType>::entries_gc_type_id();
+    let key = LLType::Array(majit_ir::descr::path_hash(array_type_id));
+    let descr = {
+        let mut cache = majit_ir::descr::gc_cache().lock();
+        cache.get_array_descr(
+            key,
+            base_size,
+            item_size,
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            len_offset,
+            false,
+            '\x00',
+        )
+    };
+    if !majit_ir::descr::array_tid_is_unresolved(tid) {
+        if let Some(ad) = descr.as_array_descr() {
+            if majit_ir::descr::array_tid_is_unresolved(ad.type_id()) || ad.type_id() != tid {
+                ad.set_type_id(tid);
+            }
+        }
+    }
+    descr
 }
 
 /// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block

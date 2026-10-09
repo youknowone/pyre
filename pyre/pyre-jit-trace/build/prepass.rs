@@ -1187,6 +1187,15 @@ fn real_main() {
                     "listobject",
                     "w_list_getitem_inner",
                 ]),
+                // BUILD_MAP's `inline_call` target (`flatten.rs
+                // inline_call_targets`). `build_map_from_refs` stores through
+                // `w_dict_store_checked`, so the portal closure never names
+                // this wrapper.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "dict_display_setitem",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

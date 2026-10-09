@@ -20,12 +20,13 @@ use std::alloc::{Layout, alloc, alloc_zeroed};
 
 /// No host has declared this array's GC type id yet.
 ///
-/// Not `0`: `TypeRegistry::register` hands out `entries.len()`, so `0` is a
+/// Same value as [`majit_ir::descr::UNSET_GC_TYPE_ID`]. Not `0`:
+/// `TypeRegistry::register` hands out `entries.len()`, so `0` is a
 /// legitimate slot — whatever the host registers first. A zero sentinel would
 /// read "unset" and "the first registered type" the same way, which is the
 /// very confusion these ids exist to prevent. `TypeRegistry::register`
 /// reserves this value by rejecting an index that cannot fit below it.
-pub const UNSET_GC_TYPE_ID: u32 = u32::MAX;
+pub const UNSET_GC_TYPE_ID: u32 = majit_ir::descr::UNSET_GC_TYPE_ID;
 
 /// GC type id for `Ptr(GcArray(Signed))`. This is a distinct ARRAY identity
 /// from `GcArray(Float)` even though the collector trace shape is the same —

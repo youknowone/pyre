@@ -2556,8 +2556,24 @@ impl BhDescr {
                 None => return raw as u32,
             }
         }
-        self.resolved_gc_tid_checked()
-            .unwrap_or_else(|| self.get_type_id() as u32)
+        if let Some(tid) = self.resolved_gc_tid_checked() {
+            return tid;
+        }
+        // `resolved_gc_tid_checked` declines `UNSET_GC_TYPE_ID` because
+        // it is not a header value (`GUARD_GC_TYPE`). `opimpl_new_array`
+        // still needs the published descr's tid: the mint sentinel, not
+        // a truncated `path_hash`. Compiled malloc asserts the sentinel
+        // (`gc.py` `init_array_descr` / `TypeLayoutBuilder.get_type_id`).
+        if let BhDescr::Array { .. } = self {
+            let raw = self.get_type_id();
+            if raw != 0
+                && let Some(tid) = majit_ir::descr::gc_cache().lock().resolve_array_tid(raw)
+            {
+                return tid;
+            }
+            return majit_ir::descr::UNSET_GC_TYPE_ID;
+        }
+        self.get_type_id() as u32
     }
 
     /// Resolve the GC type id without truncating an unresolved serialized
@@ -2567,6 +2583,7 @@ impl BhDescr {
     pub fn resolved_gc_tid_checked(&self) -> Option<u32> {
         if let BhDescr::Array { gc_type_id, .. } = self
             && *gc_type_id != 0
+            && !majit_ir::descr::array_tid_is_unresolved(*gc_type_id)
         {
             return Some(*gc_type_id);
         }
@@ -2600,7 +2617,14 @@ impl BhDescr {
         {
             return None;
         }
-        resolved.or_else(|| u32::try_from(raw).ok())
+        if matches!(self, BhDescr::Array { .. })
+            && resolved.is_some_and(majit_ir::descr::array_tid_is_unresolved)
+        {
+            return None;
+        }
+        resolved.or_else(|| u32::try_from(raw).ok()).filter(|&tid| {
+            !matches!(self, BhDescr::Array { .. }) || !majit_ir::descr::array_tid_is_unresolved(tid)
+        })
     }
 
     pub fn as_itemsize(&self) -> usize {

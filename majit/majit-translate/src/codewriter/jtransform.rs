@@ -779,6 +779,72 @@ pub use majit_jitcode::codewriter::jtransform::{
     LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
 };
 
+/// Leaf of a type path, ignoring a generic argument list and a turbofish `::`.
+fn type_leaf_base(name: &str) -> &str {
+    let base = name.split('<').next().unwrap_or(name);
+    let base = base.trim_end_matches("::");
+    base.rsplit("::").next().unwrap_or(base)
+}
+
+/// The `RDict` owner `fielddescrof(d, 'entries')` names. Prefer the
+/// qualified `i64`/`PyObject` monomorph `get_ll_dict` would have built.
+fn dict_lookup_rdict_owner(cc: &crate::call::CallControl) -> Option<String> {
+    let matches: Vec<String> = cc
+        .struct_fields()
+        .fields
+        .keys()
+        .filter(|key| {
+            type_leaf_base(key) == "RDict"
+                && key.contains("i64")
+                && (key.contains("PyObject") || key.contains("pyobject"))
+                && cc
+                    .struct_fields()
+                    .fields
+                    .get(*key)
+                    .is_some_and(|rows| rows.iter().any(|(name, _)| name == "entries"))
+        })
+        .cloned()
+        .collect();
+    matches
+        .iter()
+        .find(|key| key.starts_with("pyre_object::"))
+        .cloned()
+        .or_else(|| {
+            if matches.len() == 1 {
+                Some(matches[0].clone())
+            } else {
+                None
+            }
+        })
+}
+
+/// `arraydescrof(DICTENTRYARRAY)` identity for `Entry<i64, *mut PyObject>`.
+fn dict_lookup_entry_array_id(cc: &crate::call::CallControl) -> Option<String> {
+    let matches: Vec<String> = cc
+        .struct_fields()
+        .fields
+        .keys()
+        .filter(|key| {
+            type_leaf_base(key) == "Entry"
+                && key.contains("i64")
+                && (key.contains("PyObject") || key.contains("pyobject"))
+        })
+        .cloned()
+        .collect();
+    let name = matches
+        .iter()
+        .find(|key| key.starts_with("pyre_object::"))
+        .cloned()
+        .or_else(|| {
+            if matches.len() == 1 {
+                Some(matches[0].clone())
+            } else {
+                None
+            }
+        })?;
+    Some(format!("GcArray<{name}>"))
+}
+
 /// pyre's own driver receiver types, and the
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its
 /// own portal via `portal_jd_index`. Another embedding pipeline names its
@@ -8261,6 +8327,13 @@ impl<'a> Transformer<'a> {
             {
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
+            // jtransform.py handle_builtin_call: oopspec_name.endswith('dict.lookup')
+            // (also `ordereddict.lookup`) → `_handle_dict_lookup_call`.
+            if base.ends_with("dict.lookup") {
+                let result =
+                    self._handle_dict_lookup_call(graph, op, target, args, result_ty, graph_name);
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
             // jtransform.py — int.* oopspecs → _handle_int_special.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path.
@@ -10363,6 +10436,54 @@ impl<'a> Transformer<'a> {
             detail: detail.to_string(),
         });
         Some(RewriteResult::Replace(ops))
+    }
+
+    /// `Transformer._handle_dict_lookup_call` (`jtransform.py`): residual
+    /// `OS_DICT_LOOKUP` with extra descrs `fielddescrof(d, 'entries')` and
+    /// `arraydescrof(DICTENTRYARRAY)`.
+    fn _handle_dict_lookup_call(
+        &mut self,
+        graph: &mut FunctionGraph,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let extradescrs = self
+            .callcontrol
+            .as_deref()
+            .and_then(Self::dict_lookup_extra_descrs);
+        self._handle_oopspec_call(
+            graph,
+            op,
+            target,
+            args,
+            result_ty,
+            graph_name,
+            OopSpecIndex::DictLookup,
+            None,
+            extradescrs,
+        )
+    }
+
+    /// `cpu.fielddescrof(STRUCT, 'entries')` and `cpu.arraydescrof(STRUCT.entries.TO)`.
+    /// The harvest `register_ordereddict_i64_entry_rows` publishes the one
+    /// `Entry<i64, *mut PyObject>` `get_ll_dict` would have built.
+    fn dict_lookup_extra_descrs(cc: &crate::call::CallControl) -> Option<Vec<majit_ir::DescrRef>> {
+        let owner = dict_lookup_rdict_owner(cc)?;
+        let entry_array = dict_lookup_entry_array_id(cc)?;
+        let field_idx = cc
+            .descr_indices
+            .field_index(&Some(owner.clone()), "entries");
+        let field = cc.fielddescrof(field_idx, &owner, None, "entries")?;
+        let array = cc.arraydescrof_for_type(
+            &ValueType::Ref(None),
+            &Some(entry_array),
+            majit_ir::value::Type::Ref,
+            Some(0),
+        );
+        Some(vec![field, array])
     }
 
     /// `rewrite_op_direct_call(op1)` on a call the rewrite itself built
@@ -29635,5 +29756,54 @@ mod tests {
             !super::optimize_goto_if_not(&mut graph, start),
             "an unstamped operand pair has no `iiL` opcode to fuse into",
         );
+    }
+
+    /// `dict_lookup_extra_descrs` names the qualified `Entry<i64, *mut PyObject>`
+    /// harvest and the RDict owner that carries `entries`.
+    #[test]
+    fn dict_lookup_extra_descrs_use_the_qualified_monomorph() {
+        use crate::call::CallControl;
+        use crate::front::StructFieldRegistry;
+
+        let entry = "pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>";
+        let owner = "pyre_object::rordereddict::RDict<i64,*mut PyObject,IntKeyHash>";
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            entry.to_string(),
+            vec![
+                ("key".to_string(), "i64".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "Entry".to_string(),
+            vec![
+                ("key".to_string(), "??TypeVar".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "??TypeVar".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("indexes".to_string(), "*mut TypedItemsBlock".to_string()),
+                ("entries".to_string(), "*mut GcEntries".to_string()),
+            ],
+        );
+        let mut names = std::collections::HashSet::new();
+        names.insert(entry.to_string());
+        names.insert("Entry".to_string());
+        names.insert(owner.to_string());
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        cc.set_struct_fields(fields);
+        assert_eq!(
+            super::dict_lookup_entry_array_id(&cc).as_deref(),
+            Some("GcArray<pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>>")
+        );
+        assert_eq!(super::dict_lookup_rdict_owner(&cc).as_deref(), Some(owner));
     }
 }

@@ -544,7 +544,15 @@ impl OptVirtualize {
         let field_descr = setfield_descr_arc
             .as_field_descr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
-        let field_idx = parent_list_slot(field_descr);
+        let owner = struct_box
+            .as_ref()
+            .and_then(Operand::ptr_info)
+            .and_then(|info| match &*info {
+                PtrInfo::Virtual(v) => Some(v.descr.clone()),
+                PtrInfo::VirtualStruct(v) => Some(v.descr.clone()),
+                _ => None,
+            });
+        let field_idx = parent_list_slot_in(owner.as_ref(), field_descr);
         let is_typeptr = field_descr.is_typeptr();
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
@@ -639,23 +647,21 @@ impl OptVirtualize {
                                 OptimizationResult::PassOn
                             });
                         }
-                        set_field(&mut vinfo.fields, field_idx, value_op.clone());
-                        if let Some(err) =
-                            field_slot_disagreement(&vinfo.descr, field_idx, field_descr)
-                        {
-                            panic!("Virtual setfield: {err}");
-                        }
-                        Some(OptimizationResult::Remove)
+                        Some(store_virtual_field_or_emit(
+                            &vinfo.descr,
+                            &mut vinfo.fields,
+                            field_idx,
+                            field_descr,
+                            value_op.clone(),
+                        ))
                     }
-                    PtrInfo::VirtualStruct(vinfo) => {
-                        set_field(&mut vinfo.fields, field_idx, value_op.clone());
-                        if let Some(err) =
-                            field_slot_disagreement(&vinfo.descr, field_idx, field_descr)
-                        {
-                            panic!("VirtualStruct setfield: {err}");
-                        }
-                        Some(OptimizationResult::Remove)
-                    }
+                    PtrInfo::VirtualStruct(vinfo) => Some(store_virtual_field_or_emit(
+                        &vinfo.descr,
+                        &mut vinfo.fields,
+                        field_idx,
+                        field_descr,
+                        value_op.clone(),
+                    )),
                     _ => None,
                 }
             }))
@@ -688,7 +694,15 @@ impl OptVirtualize {
         let field_descr = field_descr_arc
             .as_field_descr()
             .expect("optimize_getfield_gc: descr is not a FieldDescr");
-        let field_idx = parent_list_slot(field_descr);
+        let owner = struct_box
+            .as_ref()
+            .and_then(Operand::ptr_info)
+            .and_then(|info| match &*info {
+                PtrInfo::Virtual(v) => Some(v.descr.clone()),
+                PtrInfo::VirtualStruct(v) => Some(v.descr.clone()),
+                _ => None,
+            });
+        let field_idx = parent_list_slot_in(owner.as_ref(), field_descr);
         let is_typeptr = field_descr.is_typeptr();
         let is_raw_op = matches!(
             op.opcode,
@@ -2345,6 +2359,113 @@ fn field_slot_disagreement(
     None
 }
 
+/// `AbstractResumeDataReader.setfield` split: FLAG_POINTER / float / else.
+/// `stable_field_index` hashes `field_type`, not this flag, so a
+/// FLAG_POINTER Int and a true Int at one offset share `descr.index()`.
+fn setfield_kind_matches(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
+    slot.is_pointer_field() == field.is_pointer_field()
+        && slot.is_float_field() == field.is_float_field()
+}
+
+/// Named overlay aliases at one offset (`W_DictObject.dstorage` /
+/// `dstorage_as_gcref`) share `stable_field_index` — it hashes
+/// offset+size+type+signed, not fieldname — and therefore
+/// `descr.index()`. `descr.py` `cache[STRUCT][fieldname]` still treats
+/// them as distinct rows; identity probes that omit the key must not
+/// alias two named fields. Empty-name flattened aggregates (`ob_header`,
+/// `__pos_0`) keep the offset+kind fallback.
+fn named_field_keys_agree(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
+    let slot_key = slot.field_key();
+    let field_key = field.field_key();
+    slot_key.is_empty() || field_key.is_empty() || slot_key == field_key
+}
+
+/// Position of `field` in `fields`, or `None` when that list does not
+/// hold it. Identity (`descr.index()` + offset + setfield kind) first;
+/// `index_in_parent` only when that slot still `slot_holds_field`s.
+/// Never returns a listed sibling of a different
+/// `AbstractResumeDataReader.setfield` kind. Named fields with distinct
+/// `field_key()`s are not the same row even when they share
+/// `descr.index()` (`descr.py` `cache[STRUCT][fieldname]`).
+fn slot_in_field_list(fields: &[Arc<dyn FieldDescr>], field: &dyn FieldDescr) -> Option<u32> {
+    if let Some(i) = fields.iter().position(|slot| {
+        slot.index() == field.index()
+            && slot.offset() == field.offset()
+            && setfield_kind_matches(slot.as_ref(), field)
+            && named_field_keys_agree(slot.as_ref(), field)
+    }) {
+        return Some(i as u32);
+    }
+    let minted = field.index_in_parent();
+    if fields
+        .get(minted)
+        .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
+    {
+        return Some(minted as u32);
+    }
+    if let Some(i) = fields
+        .iter()
+        .position(|slot| slot_holds_field(slot.as_ref(), field))
+    {
+        return Some(i as u32);
+    }
+    fields
+        .iter()
+        .position(|slot| {
+            slot.offset() == field.offset()
+                && setfield_kind_matches(slot.as_ref(), field)
+                && named_field_keys_agree(slot.as_ref(), field)
+        })
+        .map(|i| i as u32)
+}
+
+/// Slot in `owner`'s `all_fielddescrs` when that is a SizeDescr that
+/// holds `field`, otherwise the field's own parent list.
+///
+/// Virtual `_fields` follow the allocation SizeDescr (`info.py`
+/// `descr.get_all_fielddescrs()`). A flattened inlined leaf can still
+/// name the nested STRUCT as `get_parent_descr()` (`heaptracker.py`
+/// `all_fielddescrs` recurses); looking that nested list up first
+/// aliases payload slot 0 onto a listed Ref sibling and
+/// `AbstractVirtualStructInfo.setfields` `decode_int`s a TAGCONST Ref.
+pub(crate) fn parent_list_slot_in(owner: Option<&DescrRef>, field: &dyn FieldDescr) -> u32 {
+    if let Some(size) = owner.and_then(|d| d.as_size_descr()) {
+        let fields = size.all_fielddescrs();
+        if let Some(i) = slot_in_field_list(fields, field) {
+            return i;
+        }
+        // Owner `_fields` is the allocation list. A nested STRUCT slot
+        // is not a key into that bank (`AbstractVirtualStructInfo.setfields`).
+        // `store_virtual_field_or_emit` still sees this mint, then refuses
+        // the store when `field_slot_identifies` is false so a Ref write
+        // cannot occupy an Int visitor slot.
+        let minted = field.index_in_parent();
+        if fields
+            .get(minted)
+            .is_none_or(|slot| slot_holds_field(slot.as_ref(), field))
+        {
+            return minted as u32;
+        }
+        // `owner.all_fielddescrs()[index_in_parent]` failed
+        // `slot_holds_field`. Nested STRUCT leaves absent from the
+        // allocation list still use the mint; a named overlay sibling
+        // occupying that slot must not (`descr.py` `cache[STRUCT][fieldname]`).
+        if field.field_key().is_empty() {
+            return minted as u32;
+        }
+    }
+    if let Some(parent) = field.get_parent_descr()
+        && let Some(size) = parent.as_size_descr()
+        && let Some(i) = slot_in_field_list(size.all_fielddescrs(), field)
+    {
+        return i;
+    }
+    if field.is_typeptr() || field.is_w_class() {
+        return field.index_in_parent() as u32;
+    }
+    field.index_in_parent() as u32
+}
+
 /// Slot in the parent SizeDescr's current field list.
 ///
 /// `FieldDescr.index_in_parent` can be minted before `kind` is listed,
@@ -2352,28 +2473,7 @@ fn field_slot_disagreement(
 /// virtual object's `_fields` array follows that list; look the field
 /// up by identity, not by the stale mint.
 pub(crate) fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
-    if field.is_typeptr() || field.is_w_class() {
-        return field.index_in_parent() as u32;
-    }
-    if let Some(parent) = field.get_parent_descr()
-        && let Some(size) = parent.as_size_descr()
-    {
-        let fields = size.all_fielddescrs();
-        let minted = field.index_in_parent();
-        if fields
-            .get(minted)
-            .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
-        {
-            return minted as u32;
-        }
-        if let Some(i) = fields
-            .iter()
-            .position(|slot| slot_holds_field(slot.as_ref(), field))
-        {
-            return i as u32;
-        }
-    }
-    field.index_in_parent() as u32
+    parent_list_slot_in(None, field)
 }
 
 /// Whether `slot` and `field` name the same field.
@@ -2618,7 +2718,15 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     let named_apart = !field.field_key().is_empty()
         && !slot.field_key().is_empty()
         && slot.field_key() != field.field_key();
-    same_owner && !named_apart && slot.offset() == field.offset()
+    // Resume `AbstractResumeDataReader.setfield` classifies by
+    // `is_pointer_field` / `is_float_field` / else. Empty-name flattened
+    // leaves at one offset must not alias across that split.
+    same_owner
+        && !named_apart
+        && slot.offset() == field.offset()
+        && slot.is_pointer_field() == field.is_pointer_field()
+        && slot.is_float_field() == field.is_float_field()
+        && slot.field_type() == field.field_type()
 }
 
 /// Whether `field_idx` addresses `field` in the struct `descr` describes.
@@ -2641,6 +2749,37 @@ fn field_slot_identifies(descr: &DescrRef, field_idx: u32, field: &dyn FieldDesc
         .all_fielddescrs()
         .get(field_idx as usize)
         .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
+}
+
+/// Absorb a virtual SETFIELD into `_fields`, or `PassOn` so the store
+/// is emitted on a forced object.
+///
+/// `parent_list_slot_in` falls back to `index_in_parent` when the
+/// allocation SizeDescr list does not hold `field`. That mint aliases a
+/// listed sibling; `AbstractVirtualStructInfo.setfields` then
+/// `decode_int`s a TAGCONST Ref. `field_slot_disagreement` only panics
+/// under `jit_strict_mode` (debug / `MAJIT_STRICT`), so release product
+/// used to keep the aliased write. GETFIELD already refuses that slot
+/// via `field_slot_identifies`; SETFIELD must too.
+fn store_virtual_field_or_emit(
+    descr: &DescrRef,
+    fields: &mut majit_ir::ptr_info::VirtualFieldList,
+    field_idx: u32,
+    field: &dyn FieldDescr,
+    value: Operand,
+) -> OptimizationResult {
+    // Uninterned SizeDescr field rows are not assembler-pool keys
+    // (`field_slot_disagreement` fail-open). Absorb the write.
+    if descr.index() == u32::MAX || field_slot_identifies(descr, field_idx, field) {
+        set_field(fields, field_idx, value);
+        return OptimizationResult::Remove;
+    }
+    if crate::majit_log_enabled() {
+        if let Some(err) = field_slot_disagreement(descr, field_idx, field) {
+            eprintln!("[jit][setfield-slot-unlisted] {err}; emitting on a forced object");
+        }
+    }
+    OptimizationResult::PassOn
 }
 
 fn set_field(fields: &mut majit_ir::ptr_info::VirtualFieldList, field_idx: u32, value: Operand) {
@@ -3729,6 +3868,255 @@ mod tests {
             "a user type registered under option::Option::Some must not inherit the std shell"
         );
         majit_ir::descr::register_struct_ids(std::collections::HashMap::new());
+    }
+
+    #[test]
+    fn parent_list_slot_does_not_alias_same_offset_empty_name_int_onto_ref() {
+        // Flattened inline leaves (`heaptracker.py` `all_fielddescrs`) can
+        // share an address with empty names. `slot_holds_field` keeps
+        // `AbstractResumeDataReader.setfield`'s pointer/float/int split so
+        // a reconstructed Int leaf does not bind the Ref sibling.
+        let listed_ref = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_1002, 16, 8, Type::Ref, false)
+                .with_index_in_parent(0),
+        );
+        let listed_int = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_1001, 16, 8, Type::Int, false)
+                .with_index_in_parent(1),
+        );
+        let parent: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0200, 32, 1).with_all_fielddescrs(vec![
+                listed_ref.clone() as Arc<dyn FieldDescr>,
+                listed_int.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        listed_ref.set_parent_descr(&parent);
+        listed_int.set_parent_descr(&parent);
+        let visitor_int = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_10aa, 16, 8, Type::Int, false)
+                .with_parent_descr(parent.clone(), 0),
+        );
+        assert!(!slot_holds_field(listed_ref.as_ref(), visitor_int.as_ref()));
+        assert!(slot_holds_field(listed_int.as_ref(), visitor_int.as_ref()));
+        assert_eq!(parent_list_slot(visitor_int.as_ref()), 1);
+        assert_eq!(parent_list_slot(listed_ref.as_ref()), 0);
+        assert_eq!(parent_list_slot_in(Some(&parent), visitor_int.as_ref()), 1);
+        assert_eq!(parent_list_slot_in(Some(&parent), listed_ref.as_ref()), 0);
+    }
+
+    #[test]
+    fn parent_list_slot_in_uses_allocation_list_not_nested_parent() {
+        // Inlined leaf still names the nested STRUCT as parent. Virtual
+        // `_fields` follow the allocation SizeDescr list; slot 0 there is
+        // a Ref sibling.
+        let nested_int = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_5001, 16, 8, Type::Int, false)
+                .with_index_in_parent(0),
+        );
+        let nested: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0501, 24, 2)
+                .with_all_fielddescrs(vec![nested_int.clone() as Arc<dyn FieldDescr>]),
+        );
+        nested_int.set_parent_descr(&nested);
+        let outer_ref = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_5002, 8, 8, Type::Ref, false)
+                .with_index_in_parent(0),
+        );
+        let outer_int = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_5001, 16, 8, Type::Int, false)
+                .with_index_in_parent(1),
+        );
+        let outer: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0500, 32, 1).with_all_fielddescrs(vec![
+                outer_ref.clone() as Arc<dyn FieldDescr>,
+                outer_int.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        outer_ref.set_parent_descr(&outer);
+        outer_int.set_parent_descr(&outer);
+        assert_eq!(parent_list_slot(nested_int.as_ref()), 0);
+        assert_eq!(parent_list_slot_in(Some(&outer), nested_int.as_ref()), 1);
+    }
+
+    #[test]
+    fn parent_list_slot_in_owner_miss_ref_does_not_identify_int_slot() {
+        // Unlisted Ref leaf, `index_in_parent` 0. Allocation slot 0 is
+        // Int. `parent_list_slot_in` still returns that mint; SETFIELD
+        // must not store (`field_slot_identifies` is false) or
+        // `AbstractVirtualStructInfo.setfields` `decode_int`s the
+        // TAGCONST Ref.
+        let listed_int = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_6001, 8, 8, Type::Int, false)
+                .with_index_in_parent(0),
+        );
+        let outer: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0600, 24, 1)
+                .with_all_fielddescrs(vec![listed_int.clone() as Arc<dyn FieldDescr>]),
+        );
+        listed_int.set_parent_descr(&outer);
+        let nested_ref = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_6002, 24, 8, Type::Ref, false)
+                .with_index_in_parent(0),
+        );
+        let nested: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0601, 32, 2)
+                .with_all_fielddescrs(vec![nested_ref.clone() as Arc<dyn FieldDescr>]),
+        );
+        nested_ref.set_parent_descr(&nested);
+        let slot = parent_list_slot_in(Some(&outer), nested_ref.as_ref());
+        assert_eq!(slot, 0);
+        assert!(!field_slot_identifies(&outer, slot, nested_ref.as_ref()));
+        assert!(!slot_holds_field(listed_int.as_ref(), nested_ref.as_ref()));
+    }
+
+    #[test]
+    fn parent_list_slot_distinguishes_flag_pointer_int_from_true_int_same_index() {
+        // `stable_field_index` hashes `field_type`, not FLAG_POINTER, so
+        // a pointer-as-Int leaf and a true Int at one offset share
+        // `descr.index()`. Identity without the setfield kind aliases
+        // both onto slot 0 and `AbstractVirtualStructInfo.setfields`
+        // `decode_int`s the Ref TAGCONST.
+        let collide = 0x1000_00cc;
+        let ptr_fd = Arc::new(
+            majit_ir::SimpleFieldDescr::new(collide, 16, 8, Type::Int, false)
+                .with_flag(majit_ir::ArrayFlag::Pointer)
+                .with_index_in_parent(0),
+        );
+        let int_fd = Arc::new(
+            majit_ir::SimpleFieldDescr::new(collide, 16, 8, Type::Int, false)
+                .with_index_in_parent(1),
+        );
+        let parent: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_00cc, 32, 1).with_all_fielddescrs(vec![
+                ptr_fd.clone() as Arc<dyn FieldDescr>,
+                int_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        int_fd.set_parent_descr(&parent);
+        assert!(ptr_fd.is_pointer_field());
+        assert!(!int_fd.is_pointer_field());
+        assert_eq!(ptr_fd.index(), int_fd.index());
+        assert_eq!(parent_list_slot_in(Some(&parent), ptr_fd.as_ref()), 0);
+        assert_eq!(parent_list_slot_in(Some(&parent), int_fd.as_ref()), 1);
+        assert_eq!(parent_list_slot(ptr_fd.as_ref()), 0);
+        assert_eq!(parent_list_slot(int_fd.as_ref()), 1);
+    }
+
+    #[test]
+    fn parent_list_slot_in_distinguishes_named_overlay_aliases_same_index() {
+        // Named overlay aliases at one offset (`W_DictObject.dstorage` /
+        // `dstorage_as_gcref`) share `stable_field_index` because it hashes
+        // offset+size+type+signed, not fieldname. `descr.py`
+        // `cache[STRUCT][fieldname]` still treats them as distinct fields;
+        // virtual `_fields` (`AbstractVirtualStructInfo.setfields`) must
+        // too. Windows MAJIT_STRICT shape: dstorage claims slot 3, slot 3
+        // holds dstorage_as_gcref.
+        let collide = 0x1000_00dd;
+        let dstorage_as_gcref = Arc::new(
+            majit_ir::SimpleFieldDescr::new_with_name(
+                collide,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_DictObject.dstorage_as_gcref".to_string(),
+                "dstorage_as_gcref".to_string(),
+            )
+            .with_index_in_parent(3),
+        );
+        let dstorage = Arc::new(
+            majit_ir::SimpleFieldDescr::new_with_name(
+                collide,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_DictObject.dstorage".to_string(),
+                "dstorage".to_string(),
+            )
+            .with_index_in_parent(3),
+        );
+        let filler0 = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_00d0, 0, 8, Type::Int, false)
+                .with_index_in_parent(0),
+        );
+        let filler1 = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_00d1, 8, 8, Type::Int, false)
+                .with_index_in_parent(1),
+        );
+        let filler2 = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_00d2, 24, 8, Type::Int, false)
+                .with_index_in_parent(2),
+        );
+        let parent: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_00dd, 40, 1).with_all_fielddescrs(vec![
+                filler0.clone() as Arc<dyn FieldDescr>,
+                filler1.clone() as Arc<dyn FieldDescr>,
+                filler2.clone() as Arc<dyn FieldDescr>,
+                dstorage_as_gcref.clone() as Arc<dyn FieldDescr>,
+                dstorage.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        filler0.set_parent_descr(&parent);
+        filler1.set_parent_descr(&parent);
+        filler2.set_parent_descr(&parent);
+        dstorage_as_gcref.set_parent_descr(&parent);
+        dstorage.set_parent_descr(&parent);
+        assert_eq!(dstorage.index(), dstorage_as_gcref.index());
+        assert_eq!(dstorage.offset(), 16);
+        assert_eq!(dstorage_as_gcref.offset(), 16);
+        assert_eq!(dstorage.index_in_parent(), 3);
+        let fields = parent.as_size_descr().unwrap().all_fielddescrs();
+        assert_eq!(parent_list_slot_in(Some(&parent), dstorage.as_ref()), 4);
+        assert_eq!(slot_in_field_list(fields, dstorage.as_ref()), Some(4));
+        assert_ne!(slot_in_field_list(fields, dstorage.as_ref()), Some(3));
+        assert_eq!(
+            slot_in_field_list(fields, dstorage_as_gcref.as_ref()),
+            Some(3)
+        );
+        assert_ne!(
+            slot_in_field_list(fields, dstorage_as_gcref.as_ref()),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn parent_list_slot_finds_shared_w_class_behind_payload() {
+        // Shared header descr mints `index_in_parent` 0; a listed layout
+        // puts it at `all_fielddescrs[1]`. Identity in the parent list
+        // wins over that mint so SETFIELD w_class does not overwrite
+        // payload slot 0.
+        let payload = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_4001, 16, 8, Type::Int, false)
+                .with_index_in_parent(0),
+        );
+        let w_class = Arc::new(
+            majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class".to_string(),
+            )
+            .with_class_word(true)
+            .with_index_in_parent(0),
+        );
+        let parent: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0400, 32, 1).with_all_fielddescrs(vec![
+                payload.clone() as Arc<dyn FieldDescr>,
+                w_class.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        payload.set_parent_descr(&parent);
+        w_class.set_parent_descr(&parent);
+        assert_eq!(parent_list_slot(w_class.as_ref()), 1);
+        assert_eq!(parent_list_slot(payload.as_ref()), 0);
     }
 
     /// The `super` edge is not `Result`/`Option`-only: every payload enum
@@ -4979,6 +5367,110 @@ mod tests {
              field_slot_identifies runs; without it the descr carries no field \
              list, the slot check fails open, and the populated slot 3 is \
              forwarded instead of folded"
+        );
+    }
+
+    #[test]
+    fn test_unlisted_setfield_does_not_alias_int_slot_with_ref() {
+        // Allocation list is one Int at slot 0. An unlisted Ref leaf
+        // still mints `index_in_parent` 0. Storing it would put a Ref
+        // opref in the Int visitor slot and
+        // `AbstractVirtualStructInfo.setfields` would `decode_int` the
+        // TAGCONST. `store_virtual_field_or_emit` PassOn-s instead.
+        let group = majit_ir::descr::make_simple_descr_group(
+            1,
+            16,
+            1,
+            0,
+            &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: Some(false),
+                index: 11,
+                field_key: "Node.value".to_string(),
+                name: "Node.value".to_string(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: majit_ir::ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let sd = group.size_descr.clone() as DescrRef;
+        let int_fd = group.field_descrs[0].clone() as DescrRef;
+        let nested_ref = Arc::new(
+            majit_ir::SimpleFieldDescr::new(0x1000_7002, 24, 8, Type::Ref, false)
+                .with_index_in_parent(0),
+        );
+        let nested: DescrRef = Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0x3000_0701, 32, 2)
+                .with_all_fielddescrs(vec![nested_ref.clone() as Arc<dyn FieldDescr>]),
+        );
+        nested_ref.set_parent_descr(&nested);
+        let unlisted_fd = nested_ref.clone() as DescrRef;
+
+        let mut ctx = OptContext::new(3);
+        let mut pass = OptVirtualize::new();
+        pass.setup();
+
+        let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
+        new_op.pos().set(OpRef::ref_op(0));
+        let new_op_rc = OpRc::new(new_op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
+        assert!(matches!(
+            pass.propagate_forward(&new_op, &new_op_rc, &mut ctx),
+            OptimizationResult::Remove
+        ));
+
+        let int_value = crate::history::test_support::rooted_resop_operand(Type::Int, 100);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&int_value));
+        let mut set_int = Op::with_descr(
+            OpCode::SetfieldGc,
+            &[Operand::from_bound_op(&new_op_rc), int_value],
+            int_fd,
+        );
+        set_int.pos().set(OpRef::int_op(1));
+        resolve_op_args(&mut set_int, &mut ctx);
+        assert!(matches!(
+            pass.propagate_forward(&set_int, &OpRc::new(set_int.clone()), &mut ctx),
+            OptimizationResult::Remove
+        ));
+
+        let ref_value = crate::history::test_support::rooted_resop_operand(Type::Ref, 51);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&ref_value));
+        let mut set_ref = Op::with_descr(
+            OpCode::SetfieldGc,
+            &[Operand::from_bound_op(&new_op_rc), ref_value],
+            unlisted_fd,
+        );
+        set_ref.pos().set(OpRef::ref_op(2));
+        resolve_op_args(&mut set_ref, &mut ctx);
+        assert!(
+            matches!(
+                pass.propagate_forward(&set_ref, &OpRc::new(set_ref.clone()), &mut ctx),
+                OptimizationResult::PassOn
+            ),
+            "unlisted Ref SETFIELD must not occupy the Int allocation slot"
+        );
+
+        let inputarg_box = ctx
+            .get_box_replacement_operand_opt(OpRef::ref_op(0))
+            .expect("inputarg operand populated");
+        let info = ctx
+            .peek_ptr_info(&inputarg_box)
+            .expect("virtual info missing");
+        let PtrInfo::Virtual(vinfo) = info else {
+            panic!("expected Virtual ptr info, got {info:?}");
+        };
+        assert_eq!(
+            vinfo
+                .fields
+                .iter()
+                .map(|(i, b)| (*i, b.to_opref()))
+                .collect::<Vec<_>>(),
+            vec![(0, OpRef::int_op(100))],
+            "Int slot 0 must keep the listed Int write"
         );
     }
 

@@ -703,13 +703,19 @@ pub fn materialize_bridge_virtual(
                 continue;
             }
             // resume.py self.setfields → decoder.setfield(struct,
-            // fieldnum, fielddescr): reuse the parent SizeDescr's live
-            // FieldDescr (canonical immutable / quasi-immutable / ei_index)
-            // rather than reconstructing a partial copy. The descr is keyed
-            // by index_in_parent (small sequential), not the 268M-hash
-            // stable_field_index.
+            // fieldnum, self.fielddescrs[i]): reuse the parent SizeDescr's
+            // live FieldDescr (canonical immutable / quasi-immutable /
+            // ei_index) rather than reconstructing a partial copy. The row
+            // is `fielddescrs[i]`; an offset alone does not name it when two
+            // fields overlay one word.
             let field_descr =
-                majit_ir::descr::field_descr_from_parent_by_offset(&parent_descr, fd_info.offset);
+                crate::resume::live_field_descr_for_resume(Some(&parent_descr), i, fd_info)
+                    .unwrap_or_else(|| {
+                        majit_ir::descr::field_descr_from_parent_by_offset(
+                            &parent_descr,
+                            fd_info.offset,
+                        )
+                    });
             // resume.py allocate_with_vtable materializer operations use
             // `execute_and_record`.
             ctx.profiler()
@@ -1848,6 +1854,120 @@ mod tests {
             int_add_concrete(OpRef::const_int(5), OpRef::const_ptr(majit_ir::GcRef(8))),
             None
         );
+    }
+
+    /// resume.py decode_box asserts `box.type == kind`. kind comes from
+    /// decoder.setfield (`is_pointer_field` → REF). The stored box is the
+    /// SETFIELD value optimize_SETFIELD_GC kept as-is, already REF for a
+    /// FLAG_POINTER field. apply_setfield therefore sees
+    /// `(Type::Ref, Value::Ref)` and writes through bh_setfield_gc_r.
+    #[test]
+    fn materialize_pointer_field_ref_operand_matches_snapshot_kind() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::{
+            ArrayFlag, Const, Descr, FieldDescr, FieldDescrInfo, GcRef, SimpleFieldDescr,
+        };
+        use std::cell::RefCell;
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct RecAllocator {
+            refs: RefCell<Vec<i64>>,
+            ints: RefCell<Vec<i64>>,
+        }
+        impl crate::resume::BlackholeAllocator for RecAllocator {
+            fn allocate_with_vtable(&self, _descr: &majit_ir::DescrRef, _vtable: usize) -> i64 {
+                0xBEEF
+            }
+            fn bh_setfield_gc_r(&self, _struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+                self.refs.borrow_mut().push(value);
+            }
+            fn bh_setfield_gc_i(&self, _struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+                self.ints.borrow_mut().push(value);
+            }
+        }
+
+        let ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abc, 16, 8, Type::Ref, false)
+                .with_flag(ArrayFlag::Pointer)
+                .with_index_in_parent(0),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0001, 32, 1)
+                .with_all_fielddescrs(vec![ptr_fd.clone() as Arc<dyn FieldDescr>]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        assert!(ptr_fd.is_pointer_field());
+
+        let tagged = ((majit_ir::resumedata::TAG_CONST_OFFSET << 2)
+            | majit_ir::resumedata::TAGCONST as i32) as i16;
+        let storage = crate::resume::ResumeStorage::new(
+            Vec::new(),
+            vec![Const::Ref(GcRef(0x1111))],
+            Vec::new(),
+            Vec::new(),
+        );
+        let resume_data = crate::jit_state::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_boxes: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: Vec::new(),
+        };
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(parent),
+            type_id: 1,
+            known_class: None,
+            fielddescrs: vec![FieldDescrInfo {
+                index: ptr_fd.index(),
+                offset: ptr_fd.offset(),
+                field_type: Type::Ref,
+                field_size: ptr_fd.field_size(),
+            }],
+            fieldnums: vec![tagged],
+            descr_size: 32,
+        })];
+        let alloc = RecAllocator::default();
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        let mut cache =
+            BridgeVirtualCache::executing(1, default_bridge_array_descr, &alloc, &[], &[]);
+        let result =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        assert!(!result.is_none(), "pointer-field virtual must materialize");
+        assert_eq!(*alloc.refs.borrow(), vec![0x1111]);
+        assert!(alloc.ints.borrow().is_empty());
+
+        // setfields passes `self.fielddescrs[i]`. An Int row overlaying the
+        // pointer's word sits earlier in the list; the row is the one at the
+        // snapshot's position, not the first at that offset.
+        let word_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abd, 16, 8, Type::Int, false).with_index_in_parent(0),
+        );
+        let overlay_ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abc, 16, 8, Type::Ref, false)
+                .with_flag(ArrayFlag::Pointer)
+                .with_index_in_parent(1),
+        );
+        let overlay_parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0002, 32, 1).with_all_fielddescrs(vec![
+                word_fd.clone() as Arc<dyn FieldDescr>,
+                overlay_ptr_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        let live = crate::resume::live_field_descr_for_resume(
+            Some(&overlay_parent),
+            1,
+            &FieldDescrInfo {
+                index: overlay_ptr_fd.index(),
+                offset: 16,
+                field_type: Type::Ref,
+                field_size: 8,
+            },
+        )
+        .expect("the snapshot row is listed");
+        assert!(live.as_field_descr().unwrap().is_pointer_field());
+        assert_eq!(live.index(), overlay_ptr_fd.index());
     }
 
     /// pyjitpl.py `MetaInterp.rebuild_state_after_failure` /

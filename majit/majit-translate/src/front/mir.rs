@@ -1012,6 +1012,193 @@ fn register_ref_enum_instantiation_rows(
     }
 }
 
+/// One concrete `rordereddict_entries::Entry` / `GcEntries` use found in a
+/// signature or a local. `found` holds the rendered type arguments.
+struct EntryInstantiationScan<'a> {
+    llbc: &'a Llbc,
+    entry_id: u64,
+    gc_entries_id: Option<u64>,
+    seen_dedup: std::collections::HashSet<u64>,
+    seen_suffix: std::collections::HashSet<String>,
+    found: Vec<Vec<String>>,
+}
+
+impl EntryInstantiationScan<'_> {
+    fn consider(&mut self, root: Option<&serde_json::Value>) {
+        let Some(root) = root else {
+            return;
+        };
+        let mut stack = vec![(root, 0usize)];
+        while let Some((node, depth)) = stack.pop() {
+            if depth > 24 {
+                continue;
+            }
+            let Some(obj) = node.as_object() else {
+                continue;
+            };
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                if !self.seen_dedup.insert(id) {
+                    continue;
+                }
+                if let Some(body) = self.llbc.dedup_body(id) {
+                    stack.push((body, depth + 1));
+                }
+                continue;
+            }
+            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+                && arr.len() == 2
+            {
+                stack.push((&arr[1], depth + 1));
+                continue;
+            }
+            if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
+                if let Some(id) = type_decl_ref_adt_id(adt)
+                    && (id == self.entry_id || self.gc_entries_id == Some(id))
+                {
+                    let args = render_adt_type_args(adt, self.llbc, depth);
+                    if !args.is_empty()
+                        && args
+                            .iter()
+                            .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                    {
+                        let suffix = args.join(",");
+                        if self.seen_suffix.insert(suffix) {
+                            self.found.push(args);
+                        }
+                    }
+                }
+                if let Some(types) = type_decl_ref_generics(adt, self.llbc)
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|generics| generics.get("types"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for ty in types {
+                        stack.push((ty, depth + 1));
+                    }
+                }
+                continue;
+            }
+            if let Some(inner) = obj
+                .get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())
+                .or_else(|| {
+                    obj.get("Ref")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|arr| arr.get(1))
+                })
+                .or_else(|| {
+                    obj.get("Array")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|arr| arr.first())
+                })
+                .or_else(|| {
+                    obj.get("Slice")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|arr| arr.first())
+                })
+            {
+                stack.push((inner, depth + 1));
+            }
+        }
+    }
+}
+
+/// Publish concrete `Entry<i64, *mut PyObject>` field rows.
+///
+/// Charon leaves `rordereddict_entries::Entry` generic, so
+/// `derive_program_metadata` records `key` as a type variable.
+/// `_handle_dict_lookup_call` extra descrs need that concrete `i64` key
+/// (`arraydescrof(DICTENTRYARRAY)`). A fully concrete use of `Entry`, or
+/// the same arguments on `GcEntries`, supplies the rows. Only the
+/// qualified spelling is inserted. `#[repr(C)]` places `key`, `f_valid`,
+/// `value`, and `f_hash` in declaration order.
+fn register_ordereddict_i64_entry_rows(
+    llbc: &Llbc,
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) {
+    let mut entry: Option<(u64, String)> = None;
+    let mut gc_entries_id = None;
+    for td in llbc.iter_type_decls() {
+        let path = td.item_meta.name_path();
+        if entry.is_none()
+            && path.ends_with("rordereddict_entries::Entry")
+            && matches!(td.kind, TypeDeclKind::Struct(_))
+        {
+            entry = Some((td.def_id, path));
+        } else if gc_entries_id.is_none() && path.ends_with("rordereddict_entries::GcEntries") {
+            gc_entries_id = Some(td.def_id);
+        }
+    }
+    let Some((entry_id, entry_path)) = entry else {
+        return;
+    };
+    let mut scan = EntryInstantiationScan {
+        llbc,
+        entry_id,
+        gc_entries_id,
+        seen_dedup: std::collections::HashSet::new(),
+        seen_suffix: std::collections::HashSet::new(),
+        found: Vec::new(),
+    };
+    for fd in llbc.iter_local_fns() {
+        for ty in fd
+            .signature
+            .inputs
+            .iter()
+            .chain(std::iter::once(&fd.signature.output))
+        {
+            scan.consider(tyref_node(ty, llbc));
+        }
+        if let Some(locals) = fd.unstructured_locals() {
+            for local in &locals.locals {
+                scan.consider(tyref_node(&local.ty, llbc));
+            }
+        }
+    }
+    let Some(td) = llbc.type_by_id(entry_id) else {
+        return;
+    };
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return;
+    };
+    for args in scan.found {
+        let mut rows = Vec::with_capacity(fields.len());
+        let mut key_is_i64 = false;
+        let mut valid = false;
+        let mut value = false;
+        let mut hash = false;
+        let mut concrete = true;
+        for (index, field) in fields.iter().enumerate() {
+            let fname = field
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("__pos_{index}"));
+            let concrete_ty = substitute_field_type(&field.ty, &args, llbc, gc_struct_ids);
+            if concrete_ty.contains("??") {
+                concrete = false;
+                break;
+            }
+            match fname.as_str() {
+                "key" => key_is_i64 = concrete_ty == "i64",
+                "f_valid" => valid = true,
+                "value" => value = true,
+                "f_hash" => hash = true,
+                _ => {}
+            }
+            rows.push((fname, concrete_ty));
+        }
+        if !concrete || !key_is_i64 || !valid || !value || !hash {
+            continue;
+        }
+        let name = format!("{entry_path}<{}>", args.join(","));
+        struct_fields.fields.entry(name.clone()).or_insert(rows);
+        known_struct_names.insert(name);
+    }
+}
+
 pub fn build_semantic_program_from_llbc(
     llbc: &Llbc,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -1359,6 +1546,15 @@ impl CrateLoweringState {
             &mut struct_fields,
             gc_struct_ids,
         );
+        // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
+        // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
+        // need the monomorph `get_ll_dict` would have built.
+        register_ordereddict_i64_entry_rows(
+            llbc,
+            &mut known_struct_names,
+            &mut struct_fields,
+            gc_struct_ids,
+        );
 
         // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
         // (`eval::Code` beside `module::struct::Code`) is not a class: the
@@ -1427,6 +1623,17 @@ impl CrateLoweringState {
             .filter(|(_, hints)| hints.iter().any(|h| h == "not_rpython"))
             .map(|(path, _)| path.clone())
             .collect();
+        // The eager builder passes an empty map: it has no cross-crate
+        // union. Leaving that empty drops every `_jit_*_` token, so a
+        // loopy spec copy never receives `unroll_safe` and
+        // `look_inside_graph` declines it. The local harvest is that
+        // crate's whole bag. A caller that already unioned every crate
+        // passes a non-empty map and keeps it.
+        let func_hints = if func_hints.is_empty() {
+            harvested
+        } else {
+            func_hints
+        };
         Self {
             known_trait_names,
             struct_field_attrs,
@@ -2262,7 +2469,10 @@ impl SemanticFunctionHeader {
             || fun_decl_is_builtin_code_fn(fd, llbc);
         // A spec copy's own path is not in the harvested sets. Copy the
         // declaration's residual markers onto this graph so registration and
-        // `look_inside_graph` keep the same status.
+        // `look_inside_graph` keep the same status. `_jit_unroll_safe_` and
+        // the other `_jit_*_` tokens are keyed by `policy_fn_path`, not by
+        // the `__spec_` leaf. A loopy copy without `unroll_safe` is declined
+        // and the call residualizes at a symbolic fnaddr.
         let mut hints = Vec::new();
         if policy_fn_path != fn_path {
             if dont_look_inside.contains(policy_fn_path) {
@@ -2295,13 +2505,17 @@ impl SemanticFunctionHeader {
         };
         // The funcobj's own `_jit_*_` attributes: `graph.func` carries them
         // to `look_inside_graph` and the BFS, so the first registration
-        // already sees `unroll_safe`.
+        // already sees `unroll_safe`. A spec copy misses `fn_path` in the
+        // harvested map; the declaration's tokens are under `policy_fn_path`.
         if dont_look_inside.contains(policy_fn_path)
             && !hints.iter().any(|hint| hint == "dont_look_inside")
         {
             hints.push("dont_look_inside".to_string());
         }
-        if let Some(own) = func_hints.get(&fn_path) {
+        let own_hints = func_hints
+            .get(&fn_path)
+            .or_else(|| func_hints.get(policy_fn_path));
+        if let Some(own) = own_hints {
             for hint in own {
                 if !hints.contains(hint) {
                     hints.push(hint.clone());
@@ -27535,9 +27749,23 @@ impl<'a> Lowering<'a> {
         // Capture scoped `Result<T, PyError>` call results for the
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
-        if let OpKind::Call { .. } = &op_kind
+        //
+        // A dyn vtable slot is `OpKind::IndirectCall` with `family_key`
+        // set. Trait methods stamp FUNC.RESULT as the Ok payload
+        // (`dont_look_inside_return_token`). A scalar payload lives in
+        // a different bank from the Result shell, so the same capture
+        // unwraps that call. A reference payload already shares the
+        // shell's Ref bank.
+        let indirect_family_call = matches!(
+            &op_kind,
+            OpKind::IndirectCall {
+                family_key: Some(_),
+                ..
+            }
+        );
+        if (matches!(&op_kind, OpKind::Call { .. }) && callee_name_path.is_some()
+            || indirect_family_call)
             && !captured_option_ok_or_else_try
-            && callee_name_path.is_some()
             && crate::front::result_exc::tyref_is_result_of_carrier(
                 &call.dest.ty,
                 self.llbc,
@@ -27570,8 +27798,14 @@ impl<'a> Lowering<'a> {
                         })
                         .unwrap_or(ValueType::Ref(None))
                 };
-            self.result_exc_call_results
-                .push((result_var.clone(), suffix, payload_ty));
+            let payload_shares_shell_bank = matches!(
+                payload_ty,
+                ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+            );
+            if !indirect_family_call || !payload_shares_shell_bank {
+                self.result_exc_call_results
+                    .push((result_var.clone(), suffix, payload_ty));
+            }
         }
         // Capture `Iterator::next()` results (`Option<T>`-typed) for the
         // `next`-diamond rewiring pass (`front::iter_next`).  Recognition
@@ -96113,6 +96347,167 @@ mod tests {
         );
     }
 
+    /// `od_malloc_i64_entries` returns `*mut GcEntries<i64, *mut PyObject>`
+    /// and a generic `Entry` local must not publish a type-variable row.
+    /// The bare `Entry` leaf keeps its type-variable `key`.
+    #[test]
+    fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
+        let obj_ty = 0u64;
+        let entry = 1u64;
+        let gc_entries = 2u64;
+        let i64_ty = interior_i64();
+        let bool_ty = interior_bool();
+        let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+        let typevar = |index: u64| serde_json::json!({"TypeVar": {"Bound": [0, index]}});
+        let adt = |id: u64, types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Adt": {
+                    "id": id,
+                    "generics": {
+                        "regions": [],
+                        "types": types,
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            })
+        };
+        let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+        let struct_decl = |def_id: u64, path: &[&str], fields: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": interior_meta(path, true),
+                "kind": {"Struct": fields}
+            })
+        };
+        let obj_ptr = interior_raw_mut(adt(obj_ty, vec![]));
+        let concrete_gc = interior_raw_mut(adt(gc_entries, vec![i64_ty.clone(), obj_ptr.clone()]));
+        let typevar_entry = interior_raw_mut(adt(entry, vec![typevar(0), typevar(1)]));
+        let malloc = interior_opaque(
+            10,
+            &["pyre_object", "rordereddict", "od_malloc_i64_entries"],
+            vec![interior_usize()],
+            concrete_gc.clone(),
+        );
+        let generic = interior_caller(
+            "generic_entry",
+            0,
+            vec![],
+            bool_ty.clone(),
+            vec![
+                interior_local(0, None, &bool_ty),
+                interior_local(1, Some("e"), &typevar_entry),
+            ],
+            vec![interior_bb(vec![], interior_return())],
+        );
+        let llbc = llbc_with_types(
+            "pyre_object",
+            vec![
+                struct_decl(obj_ty, &["pyre_object", "pyobject", "PyObject"], vec![]),
+                struct_decl(
+                    entry,
+                    &["pyre_object", "rordereddict_entries", "Entry"],
+                    vec![
+                        field("key", typevar(0)),
+                        field("f_valid", bool_ty.clone()),
+                        field("value", typevar(1)),
+                        field("f_hash", u64_ty),
+                    ],
+                ),
+                struct_decl(
+                    gc_entries,
+                    &["pyre_object", "rordereddict_entries", "GcEntries"],
+                    vec![
+                        field("length", interior_usize()),
+                        field(
+                            "items",
+                            serde_json::json!({
+                                "Array": [
+                                    adt(entry, vec![i64_ty.clone(), obj_ptr.clone()]),
+                                    {"Value": {"Scalar": {"Unsigned": ["Usize", "0"]}}},
+                                    null
+                                ]
+                            }),
+                        ),
+                    ],
+                ),
+            ],
+            vec![malloc, generic],
+        );
+        use crate::model::ValueType;
+        let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let gc_ptr = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "Value": [9100, concrete_gc.clone()]
+        }))
+        .expect("GcEntries ptr TyRef");
+        assert!(
+            !super::ty_is_raw_address(&gc_ptr, &llbc, &gc),
+            "*mut GcEntries is a GC ref"
+        );
+        assert!(
+            matches!(
+                super::tyref_to_value_type_with(
+                    &gc_ptr,
+                    &llbc,
+                    &std::collections::HashSet::new(),
+                    &gc
+                ),
+                ValueType::Ref(_)
+            ),
+            "*mut GcEntries lowers as Ref"
+        );
+        let state = super::CrateLoweringState::new(
+            &llbc,
+            &std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+            Default::default(),
+            &gc,
+            None,
+            None,
+        );
+        let program = state.finish(Vec::new());
+        let qualified = "pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>";
+        assert_eq!(
+            program.struct_fields.fields.get(qualified),
+            Some(&vec![
+                ("key".to_string(), "i64".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ])
+        );
+        assert!(program.known_struct_names.contains(qualified));
+        let bare_key = program
+            .struct_fields
+            .fields
+            .get("Entry")
+            .and_then(|rows| rows.iter().find(|(name, _)| name == "key"))
+            .map(|(_, ty)| ty.as_str());
+        assert_eq!(bare_key, Some("??TypeVar#0"));
+        let published: Vec<_> = program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|key| {
+                key.split('<')
+                    .next()
+                    .and_then(|base| base.rsplit("::").next())
+                    == Some("Entry")
+                    && key.contains("i64")
+                    && key.contains("PyObject")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(published, vec![qualified.to_string()]);
+        assert!(
+            program
+                .struct_fields
+                .fields
+                .keys()
+                .all(|key| !key.contains("??"))
+        );
+    }
+
     fn interior_span() -> serde_json::Value {
         serde_json::json!({
             "data": {
@@ -96142,6 +96537,10 @@ mod tests {
             },
             "is_local": is_local
         })
+    }
+
+    fn interior_bool() -> serde_json::Value {
+        serde_json::json!({"Scalar": "Bool"})
     }
 
     fn interior_i64() -> serde_json::Value {

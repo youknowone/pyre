@@ -14516,6 +14516,21 @@ fn handle<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
+        // `pyjitpl.py opimpl_getinteriorfield_gc_{i,r,f}` /
+        // `execute_setinteriorfield_gc`. Same operand layouts as the
+        // array-item arms; the descr is the interior field.
+        "getinteriorfield_gc_i/rid>i" => {
+            getinteriorfield_gc_via_heapcache(code, op, ctx, OpCode::GetinteriorfieldGcI, 'i')
+        }
+        "getinteriorfield_gc_r/rid>r" => {
+            getinteriorfield_gc_via_heapcache(code, op, ctx, OpCode::GetinteriorfieldGcR, 'r')
+        }
+        "getinteriorfield_gc_f/rid>f" => {
+            getinteriorfield_gc_via_heapcache(code, op, ctx, OpCode::GetinteriorfieldGcF, 'f')
+        }
+        "setinteriorfield_gc_i/riid" => setinteriorfield_gc_via_heapcache(code, op, ctx, 'i'),
+        "setinteriorfield_gc_r/rird" => setinteriorfield_gc_via_heapcache(code, op, ctx, 'r'),
+        "setinteriorfield_gc_f/rifd" => setinteriorfield_gc_via_heapcache(code, op, ctx, 'f'),
         // `arraylen_gc` — `blackhole.py bhimpl_arraylen_gc`
         // (@arguments("cpu","r","d", returns="i")).  Operand layout `rd>i`:
         // 1B r-reg(array) + 2B descr + 1B i-reg(dst).  Delegates to
@@ -14739,10 +14754,28 @@ fn handle<Sym: WalkSym>(
             let descr = read_descr(code, op, 1, ctx)?;
             let is_ref_array = descr
                 .as_array_descr()
-                .map_or(false, |a| a.is_array_of_pointers());
+                .is_some_and(|a| a.is_array_of_pointers() && !a.is_array_of_structs());
             let is_float_array = descr
                 .as_array_descr()
                 .is_some_and(|a| a.is_array_of_floats());
+            // `ordereddict.malloc_i64_entries` → `new_array_clear` of
+            // `GcArray(Entry)`. `_overallocate_entries_len(0)` is a
+            // computed register (`baselen + (baselen >> 3) + 8`), so the
+            // length is known from `Box.value` without being a jitcode
+            // const. `heapcache.new_array` below still virtualizes only
+            // when `length.is_constant()`. `tid` is `ArrayDescr.tid`
+            // (`gc.py` `init_array_descr` / `cpu.arraydescrof`).
+            let cleared_struct_array = if clear {
+                descr.as_array_descr().and_then(|array| {
+                    let item_size = array.item_size();
+                    let items_base = array.base_size();
+                    let tid = array.type_id();
+                    let matches_header = array.is_array_of_structs() && array.len_descr().is_some();
+                    matches_header.then_some((tid, item_size, items_base))
+                })
+            } else {
+                None
+            };
             // pyjitpl.py `_opimpl_new_array`.
             ctx.trace_ctx
                 .profiler()
@@ -14782,9 +14815,28 @@ fn handle<Sym: WalkSym>(
             // non-concrete it reverts the array to the no-concrete sentinel
             // so the residual declines (abort, as before).
             // An unknown length keeps the Null posture. Signed/Float
-            // arrays stamp a typed items block so `OS_ARRAYCOPY` can run.
+            // arrays stamp a typed items block so `OS_ARRAYCOPY` can run;
+            // `NEW_ARRAY_CLEAR` zeroes it (`bh_new_array_clear`) so
+            // `getarrayitem_gc_i` reads `FREE` (0).
             let mut concrete = ConcreteValue::Null;
-            if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
+            if let Some((tid, item_size, items_base)) = cleared_struct_array {
+                // `cd>r` encodes the length in the opcode byte. Reading
+                // that byte as a register index aliases another slot.
+                let from_register = op.key != "new_array_clear/cd>r";
+                if let Some(n) =
+                    heapcache_ops::known_int_operand(code, op, 0, length, ctx, from_register)
+                        .filter(|&n| majit_ir::ptr_info::reasonable_array_index(n))
+                    && let Some(block) = heapcache_ops::materialize_cleared_struct_gcarray(
+                        n as usize, tid, item_size, items_base,
+                    )
+                    && ctx.trace_ctx.try_set_opref_concrete(
+                        resbox,
+                        majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+                    )
+                {
+                    concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
+                }
+            } else if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
                 if let Ok(cap) = usize::try_from(n) {
                     // Ref arrays: BUILD_LIST / tuple slice. Signed/Float
                     // arrays: IntegerListStrategy `newlist` (`int_ll_newlist`
@@ -14807,15 +14859,22 @@ fn handle<Sym: WalkSym>(
                         {
                             None
                         } else {
-                            let tid = ad.type_id();
-                            let tid = if tid != 0 {
-                                tid
+                            // Analyzer `get_array_descr` leaves
+                            // `UNSET_GC_TYPE_ID` until
+                            // `register_unresolved_array_tids` (`gc.py`
+                            // `init_array_descr`). Fall back to the host
+                            // `GcArray(Signed)` / `GcArray(Float)` tid,
+                            // the same way mint `0` does.
+                            let raw = ad.type_id();
+                            let tid = if raw != 0 && !majit_ir::descr::array_tid_is_unresolved(raw)
+                            {
+                                raw
                             } else if is_float_array {
                                 pyre_object::object_array::gc_float_array_gc_type_id()
                             } else {
                                 pyre_object::object_array::gc_int_array_gc_type_id()
                             };
-                            if tid == 0 {
+                            if tid == 0 || majit_ir::descr::array_tid_is_unresolved(tid) {
                                 None
                             } else {
                                 let p = unsafe {
@@ -14826,6 +14885,11 @@ fn handle<Sym: WalkSym>(
                                 if p.is_null() {
                                     None
                                 } else {
+                                    if clear {
+                                        unsafe {
+                                            pyre_object::object_array::typed_items_block_clear(p)
+                                        };
+                                    }
                                     Some(p as *mut u8)
                                 }
                             }

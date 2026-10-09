@@ -45,17 +45,19 @@ pub(crate) fn resolve_gc_tid(
     cache_key: u64,
     resolve: impl FnOnce(&majit_ir::descr::GcCache, u64) -> Option<u32>,
 ) -> Option<u32> {
-    if stamped_tid != 0 {
+    if stamped_tid != 0 && !majit_ir::descr::array_tid_is_unresolved(stamped_tid) {
         return Some(stamped_tid);
     }
     // Zero is the no-STRUCT-identity sentinel, not a key: resolving it would
     // certify this descr against whichever group was published under the
     // sentinel, and the guard would then pin a layout nothing here has.
+    // `UNSET_GC_TYPE_ID` is the array mint placeholder until
+    // `register_unresolved_array_tids` (`gc.py` `init_array_descr`).
     if cache_key == 0 {
         return None;
     }
     let cache = majit_ir::descr::gc_cache().lock();
-    resolve(&cache, cache_key).filter(|&tid| tid != 0)
+    resolve(&cache, cache_key).filter(|&tid| !majit_ir::descr::array_tid_is_unresolved(tid))
 }
 
 /// Whether allocation lowering already writes exactly the `w_class` value

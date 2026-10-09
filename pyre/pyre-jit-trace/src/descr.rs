@@ -323,14 +323,16 @@ fn get_or_create_array_descr_with_full_id(
             .cloned()
         {
             // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
-            // Runtime `init_array_descr` / `pyobject_gcarray_descr`
-            // carry the collector tid; stamp it onto the shared Arc
-            // so `gen_initialize_tid` does not fall back to
-            // `OBJECT_GC_TYPE_ID` (frame-locals walk as a 16-byte
-            // PyObject — `fib_recursive` SIGSEGV).
-            if type_id != 0
+            // `init_array_descr` leaves `UNSET_GC_TYPE_ID` until
+            // `register_unresolved_array_tids`. Runtime
+            // `pyobject_gcarray_descr` carries the collector tid; stamp
+            // it onto the shared Arc so `gen_initialize_tid` does not
+            // fall back to `OBJECT_GC_TYPE_ID` (frame-locals walk as a
+            // 16-byte PyObject — `fib_recursive` SIGSEGV).
+            if !majit_ir::descr::array_tid_is_unresolved(type_id)
+                && type_id != 0
                 && let Some(ad) = existing.as_array_descr()
-                && ad.type_id() == 0
+                && (majit_ir::descr::array_tid_is_unresolved(ad.type_id()) || ad.type_id() == 0)
             {
                 ad.set_type_id(type_id);
             }
@@ -2222,15 +2224,21 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 /// Dict storage descriptors, read after a trace has pinned the live strategy.
 ///
-/// The `dstrategy_word`, `dstorage_lookup_ns` and `dstorage_as_gcref` keys
-/// deliberately do NOT match the Rust field names they cover.
-/// `gc_cache().get_field_descr` is keyed by `(struct_key, field_name)` and a
-/// cache HIT returns the cached descriptor with the caller's declared type
-/// ignored, while the LLBC analyzer resolves a real struct field access by name
-/// — so a key spelled `dstrategy` would share one descriptor with the
-/// analyzer's own mint and whichever side initialised first would decide the
-/// field's type for both.  A distinct key is a distinct cache slot, which is
-/// what keeps these raw-word views honest.
+/// `dstrategy_word`, `dstorage_lookup_ns` and `dstorage_as_gcref` are the
+/// raw-word views. `gc_cache().get_field_descr` is keyed by
+/// `(struct_key, field_name)` and a cache hit returns that descriptor with
+/// the caller's declared type ignored, so each view keeps its own key and
+/// its own type.
+///
+/// `newdict_empty` stores the struct's own fields (`dstorage`, `dstrategy`,
+/// `keys_version`, `clear_gen`). `force_box` writes a virtual field back
+/// through `all_fielddescrs[index]`, and that index is the slot
+/// `derive_index_in_parent` finds for the field's name. Those four names
+/// therefore occupy slots in this list, after the three views, so
+/// `dict_strategy_word_descr`, `dict_lookup_namespace_descr` and
+/// `dict_dstorage_descr` keep census indices 0, 1 and 2. `dstorage` and
+/// `dstrategy` are `Ref`, matching `newdict_empty`'s `setfield_gc_r`;
+/// `keys_version` and `clear_gen` are unsigned `Int`.
 static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE,
@@ -2255,16 +2263,50 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // A second view of `dstorage`, typed `Ref`: the analyzer lowers the
-            // strategy dispatch and so types `dstorage` as the raw `*mut u8` it
-            // is declared as, while a fold that walks to the storage box needs
-            // to read it as a reference.  Two views of one word need two keys
-            // for the same reason the keys above avoid the Rust field names.
+            // Fold read of the storage word as a `Ref`. The key stays off the
+            // Rust field name: that name is the constructor entry below, and
+            // one `(struct_key, field_name)` slot holds one type.
             (
                 "dstorage_as_gcref",
                 std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
                 std::mem::size_of::<usize>(),
                 Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "dstorage",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "dstrategy",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstrategy),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "keys_version",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, keys_version),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "clear_gen",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, clear_gen),
+                std::mem::size_of::<usize>(),
+                Type::Int,
                 false,
                 false,
                 false,
@@ -9512,6 +9554,176 @@ mod tests {
         );
     }
 
+    /// A traced integer-dict `NEW_ARRAY_CLEAR` must keep the collector
+    /// tid `register_dict_entries` published, not the sequential id
+    /// `init_array_descr` mints for an unknown ARRAY.
+    ///
+    /// `BhDescr.gc_type_id` is 0 (legacy serialized rows). The runtime
+    /// ARRAY slot is consulted first, so the bridged descr is that Arc
+    /// and carries whatever tid `i64_pyobject_entries_gc_type_id` has
+    /// already published. Do not overwrite the process-global atomic:
+    /// `runtime_gcarray_descr` stamps `_cache_array` in place.
+    #[test]
+    fn make_descr_from_bh_i64_entries_uses_registered_gc_tid() {
+        use majit_jitcode::jitcode::BhDescr;
+        type K = i64;
+        type V = pyre_object::PyObjectRef;
+        let atid = "GcArray<pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>>";
+        let runtime = crate::state::runtime_gcarray_descr(atid).expect("DICTENTRYARRAY descr");
+        let bridged = make_descr_from_bh(&BhDescr::Array {
+            base_size: std::mem::offset_of!(pyre_object::rordereddict::GcEntries<K, V>, items),
+            itemsize: std::mem::size_of::<pyre_object::rordereddict::Entry<K, V>>(),
+            len_offset: Some(std::mem::offset_of!(
+                pyre_object::rordereddict::GcEntries<K, V>,
+                length
+            )),
+            type_id: majit_ir::descr::path_hash(atid),
+            gc_type_id: 0,
+            item_type: Type::Ref,
+            is_array_of_pointers: false,
+            is_array_of_structs: true,
+            is_item_signed: false,
+            is_gc_managed: true,
+            ei_index: u32::MAX,
+            array_type_id: Some(atid.to_string()),
+            interior_fields: Vec::new(),
+        });
+        assert!(std::sync::Arc::ptr_eq(&bridged, &runtime));
+        let array = bridged.as_array_descr().expect("ArrayDescr");
+        let published = pyre_object::rordereddict::i64_pyobject_entries_gc_type_id();
+        if published != 0 {
+            assert_eq!(array.type_id(), published);
+        }
+        assert!(array.is_array_of_structs());
+    }
+
+    /// An entry-struct array whose parent `SizeDescr` was minted before its
+    /// fields existed still has to publish every interior slot
+    /// `opcode_published_descr_members` will stamp.
+    #[test]
+    fn empty_owner_interior_fields_publish_the_effectinfo_slot() {
+        use majit_ir::descr::{LLType, gc_cache};
+        use majit_ir::effectinfo::DescrSetMember;
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
+
+        let owner_id =
+            majit_ir::descr::path_hash("pyre_jit_trace::descr::tests::empty_owner_interior::Entry");
+        let array_id = majit_ir::descr::path_hash(
+            "pyre_jit_trace::descr::tests::empty_owner_interior::GcArray",
+        );
+        assert_ne!(owner_id, 0);
+        assert_ne!(array_id, 0);
+        let owner = BhSizeSpec {
+            size: 32,
+            type_id: owner_id,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: Vec::new(),
+        };
+        let spec =
+            |index_in_parent: usize, field_key: &str, offset: usize, field_type, field_flag| {
+                BhFieldSpec {
+                    index: index_in_parent as u32,
+                    field_key: field_key.into(),
+                    name: format!("T{owner_id}.{field_key}"),
+                    offset,
+                    field_size: 8,
+                    field_type,
+                    field_flag,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent,
+                    is_class_word: None,
+                }
+            };
+        let key = spec(0, "key", 0, Type::Ref, majit_ir::descr::ArrayFlag::Pointer);
+        let hash = spec(
+            3,
+            "f_hash",
+            24,
+            Type::Int,
+            majit_ir::descr::ArrayFlag::Unsigned,
+        );
+        let interior = |index, field: BhFieldSpec| BhInteriorFieldSpec {
+            index,
+            field,
+            owner: owner.clone(),
+        };
+        let _restored = make_descr_from_bh(&BhDescr::InteriorField {
+            array: Box::new(BhDescr::Array {
+                base_size: 8,
+                itemsize: 32,
+                len_offset: Some(0),
+                type_id: array_id,
+                gc_type_id: 0,
+                item_type: Type::Ref,
+                is_array_of_pointers: false,
+                is_array_of_structs: true,
+                is_item_signed: false,
+                is_gc_managed: true,
+                ei_index: u32::MAX,
+                array_type_id: None,
+                interior_fields: vec![interior(0, key), interior(3, hash)],
+            }),
+            field: Box::new(BhDescr::Field {
+                offset: 8,
+                field_size: 1,
+                field_type: Type::Int,
+                field_flag: majit_ir::descr::ArrayFlag::Unsigned,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: Some(1),
+                parent: None,
+                name: "f_valid".into(),
+                owner: String::new(),
+            }),
+        });
+
+        let stamp = |name: &str, ei_index: u32| {
+            super::stamp_effect_info_descr(
+                &DescrSetMember::InteriorField {
+                    array_id,
+                    name: name.to_string(),
+                },
+                ei_index,
+            );
+        };
+        stamp("f_hash", 11);
+        stamp("key", 12);
+
+        let gc = gc_cache().lock();
+        assert!(
+            !gc._cache_size.contains_key(&LLType::Struct(owner_id)),
+            "an empty owner list must not register a field-less size",
+        );
+        let stored = |name: &str| {
+            gc._cache_interiorfield
+                .get(&(LLType::Array(array_id), name.to_string(), String::new()))
+                .unwrap_or_else(|| panic!("{name} interior slot missing"))
+                .clone()
+        };
+        let hash_descr = stored("f_hash");
+        let key_descr = stored("key");
+        drop(gc);
+        assert_eq!(hash_descr.get_ei_index(), 11);
+        assert_eq!(key_descr.get_ei_index(), 12);
+        let hash_field = hash_descr
+            .as_interior_field_descr()
+            .expect("f_hash InteriorFieldDescr")
+            .field_descr();
+        assert_eq!(hash_field.offset(), 24);
+        assert_eq!(hash_field.index_in_parent(), 3);
+        let key_field = key_descr
+            .as_interior_field_descr()
+            .expect("key InteriorFieldDescr")
+            .field_descr();
+        assert_eq!(key_field.offset(), 0);
+        assert_eq!(key_field.index_in_parent(), 0);
+    }
+
     #[test]
     fn make_descr_from_bh_items_block_capacity_with_parent_is_canonical() {
         use majit_ir::descr::ArrayFlag;
@@ -10126,16 +10338,10 @@ mod tests {
         let array = descr.as_array_descr().expect("Array BhDescr -> ArrayDescr");
 
         assert!(array.is_array_of_structs());
-        // `type_id` is the dense sequential GC tid allocated by
-        // `GcCache::init_array_descr` (analog of `gc.py
-        // GcLLDescr_framework.init_array_descr` + `gctypelayout.py TypeLayoutBuilder
-        // TypeLayoutBuilder.get_type_id`).  Exact value depends on the
-        // global allocator state — test-suite ordering is non-deterministic
-        // so we only assert it is non-zero (tid 0 reserved per
-        // `gctypelayout.py`).  The structural identity that
-        // round-trips through `BhDescr::Array.type_id` (path_hash payload)
-        // lives in `cache_key` (`ArrayDescr::cache_key`), independent of the
-        // GC tid.
+        // Before the freeze-close hook, `init_array_descr` leaves
+        // `UNSET_GC_TYPE_ID`. After it, the tid is the collector id
+        // (`gc.py` `init_array_descr` / `TypeLayoutBuilder.get_type_id`).
+        // Tid 0 is reserved (`gctypelayout.py`). Identity is `cache_key`.
         assert_ne!(array.type_id(), 0);
         assert_eq!(array.cache_key(), 42);
         assert_eq!(array.item_type(), Type::Ref);
@@ -10896,6 +11102,37 @@ fn bh_field_cache_key(owner: &str, name: &str) -> String {
     name.strip_prefix(&prefix).unwrap_or(name).to_string()
 }
 
+/// Field half of an interior descr whose owner list has no row for it.
+///
+/// `get_size_descr` mints the parent before any field is attached, and
+/// `bh_interior_field_specs_from_array_descr` copies that empty
+/// `all_fielddescrs`. Running `simple_descr_group_from_bh_size` on the
+/// empty list registers the empty size and leaves
+/// `_cache_interiorfield` without the member
+/// `opcode_published_descr_members` names by `BhFieldSpec::field_key`.
+/// The spec already carries the offset, so the caller publishes that
+/// field through `get_interiorfield_descr` under `field_key`.
+fn field_descr_from_unlisted_interior_spec(
+    field: &majit_jitcode::jitcode::BhFieldSpec,
+) -> Arc<dyn majit_ir::descr::FieldDescr> {
+    let mut descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
+        field.index,
+        field.offset,
+        field.field_size,
+        field.field_type,
+        field.is_immutable,
+        field.field_flag,
+        field.name.clone(),
+        field.field_key().to_string(),
+    )
+    .with_quasi_immutable(field.is_quasi_immutable)
+    .with_index_in_parent(field.index_in_parent);
+    if let Some(is_class_word) = field.is_class_word {
+        descr = descr.with_class_word(is_class_word);
+    }
+    Arc::new(descr)
+}
+
 /// Keyed sibling: accepts the u64 `cache_key` (= `path_hash(array_type_id)`)
 /// so the freshly-minted `SimpleArrayDescr` lands in
 /// `gc_cache._cache_array[LLType::Array(cache_key)]` in addition to
@@ -10985,58 +11222,73 @@ pub fn make_struct_array_descr_full_keyed(
 
     let mut descrs: Vec<DescrRef> = Vec::new();
     for interior in interior_fields {
-        let owner_group = simple_descr_group_from_bh_size(&interior.owner);
-        let field_pos = interior
-            .owner
-            .all_fielddescrs
-            .iter()
-            .position(|field| {
-                field.index_in_parent == interior.field.index_in_parent
-                    && field.name == interior.field.name
-            })
-            .unwrap_or(interior.field.index_in_parent);
-        if let Some(field_descr) = owner_group.field_descrs.get(field_pos) {
-            // `descr.py get_interiorfield_descr` cache-or-mint
-            // is keyed on the outer ARRAY's lltype identity.  When the
-            // outer array carries `cache_key != 0`, route through the
-            // keyed `_cache_interiorfield[(LLType::Array(cache_key),
-            // name, "")]` so both analyzer and runtime share one Arc
-            // per `(ARRAY, name)` tuple.  With `cache_key == 0`
-            // (no-identity outer array) PyPy has NO "merge several
-            // ARRAYs' interiors into one slot" behavior — local mint
-            // a fresh `SimpleInteriorFieldDescr` per call so distinct
-            // no-identity arrays do not alias on their interior field
-            // descrs.
-            //
-            // Bare interior field name (`spec.name`) is the cache key per
-            // `descr.py cache[STRUCT][fieldname]` shape.
-            let bare_name = interior
-                .field
-                .name
-                .rsplit_once('.')
-                .map(|(_, n)| n.to_string())
-                .unwrap_or_else(|| interior.field.name.clone());
-            let field_dyn: Arc<dyn majit_ir::descr::FieldDescr> = field_descr.clone();
-            let ifd: DescrRef = if cache_key != 0 {
-                gc_cache().lock().get_interiorfield_descr(
-                    LLType::Array(cache_key),
-                    bare_name,
-                    String::new(),
-                    array_descr_for_interior.clone(),
-                    field_dyn,
+        let field = &interior.field;
+        // A parent list that already holds this row keeps that group's
+        // Arc. An empty list (or a list with no matching row) is minted
+        // from the spec: `simple_descr_group_from_bh_size` on an empty
+        // owner would register a field-less size and skip the slot.
+        let (field_dyn, cache_name): (Arc<dyn majit_ir::descr::FieldDescr>, String) =
+            if interior.owner.all_fielddescrs.is_empty() {
+                (
+                    field_descr_from_unlisted_interior_spec(field),
+                    field.field_key().to_string(),
                 )
             } else {
-                Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
-                    u32::MAX,
-                    array_descr_for_interior.clone(),
-                    field_dyn,
-                )) as DescrRef
+                let owner_group = simple_descr_group_from_bh_size(&interior.owner);
+                let field_pos = interior
+                    .owner
+                    .all_fielddescrs
+                    .iter()
+                    .position(|candidate| {
+                        candidate.index_in_parent == field.index_in_parent
+                            && candidate.name == field.name
+                    })
+                    .unwrap_or(field.index_in_parent);
+                if let Some(field_descr) = owner_group.field_descrs.get(field_pos) {
+                    // Bare interior field name (`spec.name`) is the cache
+                    // key per `descr.py cache[STRUCT][fieldname]` shape.
+                    let bare_name = field
+                        .name
+                        .rsplit_once('.')
+                        .map(|(_, name)| name.to_string())
+                        .unwrap_or_else(|| field.name.clone());
+                    (field_descr.clone(), bare_name)
+                } else {
+                    (
+                        field_descr_from_unlisted_interior_spec(field),
+                        field.field_key().to_string(),
+                    )
+                }
             };
-            // Per-trace `interior.index` stamp matches the analyzer's
-            // `cc.interiorfielddescrof` codewriter idx convention.
-            ifd.set_index(interior.index);
-            descrs.push(ifd);
-        }
+        // `descr.py get_interiorfield_descr` cache-or-mint is keyed on
+        // the outer ARRAY's lltype identity.  When the outer array
+        // carries `cache_key != 0`, route through
+        // `_cache_interiorfield[(LLType::Array(cache_key), name, "")]`
+        // so both analyzer and runtime share one Arc per `(ARRAY, name)`
+        // tuple.  With `cache_key == 0` (no-identity outer array) PyPy
+        // has no "merge several ARRAYs' interiors into one slot"
+        // behavior — local mint a fresh `SimpleInteriorFieldDescr` per
+        // call so distinct no-identity arrays do not alias on their
+        // interior field descrs.
+        let ifd: DescrRef = if cache_key != 0 {
+            gc_cache().lock().get_interiorfield_descr(
+                LLType::Array(cache_key),
+                cache_name,
+                String::new(),
+                array_descr_for_interior.clone(),
+                field_dyn,
+            )
+        } else {
+            Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                u32::MAX,
+                array_descr_for_interior.clone(),
+                field_dyn,
+            )) as DescrRef
+        };
+        // Per-trace `interior.index` stamp matches the analyzer's
+        // `cc.interiorfielddescrof` codewriter idx convention.
+        ifd.set_index(interior.index);
+        descrs.push(ifd);
     }
 
     // `descr.py arraydescr.all_interiorfielddescrs = descrs`
@@ -11555,6 +11807,15 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // blackhole/materialization paths do.
             let resolved_gc_type_id = bh.resolve_gc_tid();
             let descr = if *is_array_of_structs {
+                // Stamp the runtime collector tid into `_cache_array`
+                // before the keyed factory cache-hits, so a
+                // `DICTENTRYARRAY` `NEW_ARRAY_CLEAR` keeps
+                // `i64_pyobject_entries_gc_type_id` rather than the
+                // analyzer mint `init_array_descr` assigned.
+                // `descr.py get_array_descr` / `cpu.arraydescrof(ARRAY)`.
+                if let Some(atid) = array_type_id.as_deref() {
+                    let _ = crate::state::runtime_gcarray_descr(atid);
+                }
                 // `descr.py get_array_descr(gccache, ARRAY)`:
                 // the u64 `*type_id` from `BhDescr::Array` is the cache
                 // key (`path_hash` of the producer-side `array_type_id`,

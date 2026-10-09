@@ -1781,10 +1781,16 @@ pub fn virtual_info_from_rd(rd: &majit_ir::RdVirtualInfo) -> VirtualInfo {
             fieldnums,
             descr_size,
         } => {
+            // AbstractVirtualStructInfo.setfields is 1:1 fielddescrs[i] /
+            // fieldnums[i]. Two flattened leaves can share
+            // FieldDescrInfo.index (stable_field_index of the same
+            // offset/size/field_type); keying the vec by that hash makes
+            // a later find return the first fieldnum for every duplicate.
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| (fd.index, rd_virtual_field_source(tagged)))
+                .enumerate()
+                .map(|(i, (_, &tagged))| (i as u32, rd_virtual_field_source(tagged)))
                 .collect();
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
@@ -1805,7 +1811,8 @@ pub fn virtual_info_from_rd(rd: &majit_ir::RdVirtualInfo) -> VirtualInfo {
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| (fd.index, rd_virtual_field_source(tagged)))
+                .enumerate()
+                .map(|(i, (_, &tagged))| (i as u32, rd_virtual_field_source(tagged)))
                 .collect();
             VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
@@ -7150,23 +7157,121 @@ fn vstr_plain_info_allocate(
     string
 }
 
+/// Recover the live `FieldDescr` `AbstractResumeDataReader.setfield`
+/// would receive. Snapshot `FieldDescrInfo` is the spec form; the parent
+/// SizeDescr still owns the canonical descr (`is_pointer_field` /
+/// `is_float_field`).
+///
+/// `index`+offset is unique for a FLAG_POINTER Int whose snapshot
+/// `field_type` was stored as Int. Two flattened leaves can share that
+/// pair (`stable_field_index`); then keep the snapshot bank
+/// (`snapshot_field_descr_info`).
+pub(crate) fn live_field_descr_for_resume(
+    parent: Option<&majit_ir::DescrRef>,
+    i: usize,
+    info: &majit_ir::FieldDescrInfo,
+) -> Option<majit_ir::DescrRef> {
+    let sd = parent?.as_size_descr()?;
+    let fields = sd.all_fielddescrs();
+    // `AbstractVirtualStructInfo.setfields` reads `self.fielddescrs[i]`,
+    // and the snapshot was written from `descr.get_all_fielddescrs()` in
+    // order. Two fields that overlay one word share the offset, so only
+    // the position names the row.
+    if let Some(fd) = fields
+        .get(i)
+        .filter(|fd| fd.index() == info.index && fd.offset() == info.offset)
+    {
+        return Some(std::sync::Arc::clone(fd) as majit_ir::DescrRef);
+    }
+    let want_ptr = info.field_type == majit_ir::Type::Ref;
+    let want_float = info.field_type == majit_ir::Type::Float;
+    let same_index_offset: Vec<&std::sync::Arc<dyn majit_ir::FieldDescr>> = fields
+        .iter()
+        .filter(|fd| fd.index() == info.index && fd.offset() == info.offset)
+        .collect();
+    if same_index_offset.len() == 1 {
+        return Some(std::sync::Arc::clone(same_index_offset[0]) as majit_ir::DescrRef);
+    }
+    if let Some(fd) = same_index_offset
+        .iter()
+        .find(|fd| fd.is_pointer_field() == want_ptr && fd.is_float_field() == want_float)
+    {
+        return Some(std::sync::Arc::clone(*fd) as majit_ir::DescrRef);
+    }
+    fields
+        .iter()
+        .find(|fd| {
+            fd.offset() == info.offset
+                && fd.is_pointer_field() == want_ptr
+                && fd.is_float_field() == want_float
+        })
+        .map(|fd| std::sync::Arc::clone(fd) as majit_ir::DescrRef)
+}
+
+/// `resume.py AbstractResumeDataReader.setfield` kind:
+/// `is_pointer_field` → REF, `is_float_field` → FLOAT, else INT.
+/// Snapshot (`snapshot_field_descr_info`) writes the same split, so a
+/// Ref/Float snapshot is the bank `fieldnums[i]` was tagged with — do
+/// not decode_int it because a colliding live Int sibling won the
+/// parent-list lookup. Live flags only *upgrade* an Int snapshot
+/// (FLAG_POINTER, or `field_type` Ref without FLAG_POINTER).
+fn resume_setfield_kind(
+    live: Option<&majit_ir::DescrRef>,
+    info: &majit_ir::FieldDescrInfo,
+) -> majit_ir::Type {
+    if info.field_type == majit_ir::Type::Ref || info.field_type == majit_ir::Type::Float {
+        return info.field_type;
+    }
+    if let Some(fd) = live.and_then(|d| d.as_field_descr()) {
+        if fd.is_pointer_field() {
+            majit_ir::Type::Ref
+        } else if fd.is_float_field() {
+            majit_ir::Type::Float
+        } else {
+            fd.field_type()
+        }
+    } else {
+        info.field_type
+    }
+}
+
+/// `AbstractVirtualStructInfo.setfields` is
+/// `self.fieldnums[i]` with `self.fielddescrs[i]`. Encode
+/// (`get_virtual_fields` / `parent_list_slot_in`) already lined those
+/// two snapshot lists up; rematching by `FieldDescrInfo.index` or the
+/// live parent list would re-cross a 1:1 zip when two leaves share a
+/// hash. `VArrayStructInfo.allocate` already walks `fielddescrs[j]`
+/// with `element_fields[j]` the same way.
+fn virtual_struct_field_source(
+    fields: &[(u32, VirtualFieldSource)],
+    enumerate_i: usize,
+) -> Option<&VirtualFieldSource> {
+    fields.get(enumerate_i).map(|(_, src)| src)
+}
+
 /// `resume.py AbstractVirtualStructInfo.setfields(decoder, struct)`
 /// — iterate fielddescrs/fieldnums and call decoder.setfield per
 /// non-UNINITIALIZED entry.  pyre threads the spec-form `FieldDescrInfo`
-/// through `bh_setfield_gc_{i,r,f}` directly because the descr Arc
-/// is not interned alongside the spec on `VirtualInfo::{VirtualObj,
-/// VStruct}.fielddescrs` (a future slice can replace `Vec<FieldDescrInfo>`
-/// with `Vec<Arc<dyn FieldDescr>>` so this helper can call
-/// `decoder.setfield(struct, num, descr)` byte-for-byte with RPython).
+/// through `bh_setfield_gc_{i,r,f}` because the descr Arc is not interned
+/// alongside the spec on `VirtualInfo::{VirtualObj, VStruct}.fielddescrs`.
+/// Decode kind follows `AbstractResumeDataReader.setfield` on the live
+/// FieldDescr recovered from the parent SizeDescr, not the snapshot
+/// `field_type` alone (a FLAG_POINTER Int field, or a snapshot fallback
+/// that stored `Type::Int`, still decodes as Ref).
 fn abstract_virtual_struct_info_setfields(
     decoder: &mut ResumeDataDirectReader,
     allocator: &dyn BlackholeAllocator,
     index: usize,
+    parent: Option<&majit_ir::DescrRef>,
     fielddescrs: &[majit_ir::FieldDescrInfo],
     fields: &[(u32, VirtualFieldSource)],
 ) {
-    for (i, (_field_descr, source)) in fields.iter().enumerate() {
-        let Some(descr_info) = fielddescrs.get(i) else {
+    // resume.py AbstractVirtualStructInfo.setfields:
+    // for i in range(len(self.fielddescrs)):
+    //     decoder.setfield(struct, self.fieldnums[i], self.fielddescrs[i])
+    for (i, descr_info) in fielddescrs.iter().enumerate() {
+        let live = live_field_descr_for_resume(parent, i, descr_info);
+        let Some(source) = virtual_struct_field_source(fields, i) else {
             continue;
         };
         // resume.py if not tagged_eq(num, UNINITIALIZED)
@@ -7174,9 +7279,7 @@ fn abstract_virtual_struct_info_setfields(
             continue;
         }
         // resume.py decoder.setfield(struct, num, descr)
-        // — pyre dispatches by descr_info.field_type because pyre's
-        //   fielddescrs collection holds the spec form, not the live
-        //   FieldDescr Arc that RPython passes to decoder.setfield.
+        // AbstractResumeDataReader.setfield: is_pointer_field / is_float_field / else.
         //
         // decode_field_source* may materialize a nested virtual, whose
         // allocation can trigger a minor collection that relocates this
@@ -7184,7 +7287,7 @@ fn abstract_virtual_struct_info_setfields(
         // place; pyre's is a raw i64, so re-read the forwarded pointer from
         // the rooted virtuals_ptr_cache[index] slot after each decode and
         // before the write (see getvirtual_ptr at the `bad cache` comment).
-        match descr_info.field_type {
+        match resume_setfield_kind(live.as_ref(), descr_info) {
             majit_ir::Type::Ref => {
                 let value = decoder.decode_field_source(source);
                 let struct_ptr = decoder.virtuals_cache.get_ptr(index);
@@ -7249,6 +7352,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     decoder,
                     allocator,
                     index,
+                    descr.as_ref(),
                     fielddescrs,
                     fields,
                 );
@@ -7273,6 +7377,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     decoder,
                     allocator,
                     index,
+                    typedescr.as_ref(),
                     fielddescrs,
                     fields,
                 );
@@ -8630,6 +8735,418 @@ impl Drop for ResumeDataDirectReader<'_> {
         if let Some(depth) = self.virtualizable_root_base_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
+    }
+}
+
+#[cfg(test)]
+mod setfields_tests {
+    use super::*;
+    use majit_backend::FailArgSource;
+    use majit_ir::descr::SimpleSizeDescr;
+    use majit_ir::{
+        ArrayFlag, Const, Descr, FieldDescr, FieldDescrInfo, GcRef, SimpleFieldDescr, Type,
+    };
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct RecAllocator {
+        refs: RefCell<Vec<i64>>,
+        ints: RefCell<Vec<i64>>,
+    }
+
+    impl BlackholeAllocator for RecAllocator {
+        fn allocate_with_vtable(&self, _descr: &majit_ir::DescrRef, _vtable: usize) -> i64 {
+            0xBEEF
+        }
+        fn bh_new(&self, _typedescr: &majit_ir::DescrRef) -> i64 {
+            0xBEEF
+        }
+        fn bh_setfield_gc_r(&self, _struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+            self.refs.borrow_mut().push(value);
+        }
+        fn bh_setfield_gc_i(&self, _struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+            self.ints.borrow_mut().push(value);
+        }
+    }
+
+    fn pointer_as_int_parent() -> (
+        majit_ir::DescrRef,
+        Arc<SimpleFieldDescr>,
+        Arc<SimpleFieldDescr>,
+    ) {
+        let ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abc, 16, 8, Type::Int, false)
+                .with_flag(ArrayFlag::Pointer)
+                .with_index_in_parent(0),
+        );
+        let int_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0def, 24, 8, Type::Int, false).with_index_in_parent(1),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0001, 32, 1).with_all_fielddescrs(vec![
+                ptr_fd.clone() as Arc<dyn FieldDescr>,
+                int_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        int_fd.set_parent_descr(&parent);
+        (parent, ptr_fd, int_fd)
+    }
+
+    fn info_for(fd: &SimpleFieldDescr, field_type: Type) -> FieldDescrInfo {
+        FieldDescrInfo {
+            index: fd.index(),
+            offset: fd.offset(),
+            field_type,
+            field_size: fd.field_size(),
+        }
+    }
+
+    fn allocate_virtual_obj(
+        parent: majit_ir::DescrRef,
+        fielddescrs: Vec<FieldDescrInfo>,
+        fields: Vec<(u32, VirtualFieldSource)>,
+        consts: &[Const],
+        alloc: &RecAllocator,
+    ) {
+        let vinfo = VirtualInfo::VirtualObj {
+            descr: Some(parent),
+            type_id: 1,
+            known_class: None,
+            fields,
+            fielddescrs,
+            descr_size: 32,
+        };
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            consts,
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            alloc,
+        );
+        reader.virtuals_cache = VirtualCache::from_caches(vec![0], vec![0]);
+        vinfo.allocate(&mut reader, 0, alloc);
+    }
+
+    #[test]
+    fn setfields_decodes_pointer_field_by_is_pointer_field_not_field_type() {
+        // AbstractResumeDataReader.setfield uses is_pointer_field, not
+        // field_type(). A FLAG_POINTER field whose snapshot FieldDescrInfo
+        // still says Int must decode_ref.
+        let (parent, ptr_fd, _int_fd) = pointer_as_int_parent();
+        assert!(ptr_fd.is_pointer_field());
+        assert_eq!(ptr_fd.field_type(), Type::Int);
+        let tagged = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let consts = [Const::Ref(GcRef(0x1111))];
+        let alloc = RecAllocator::default();
+        allocate_virtual_obj(
+            parent,
+            vec![info_for(&ptr_fd, Type::Int)],
+            vec![(ptr_fd.index(), ResumeValueSource::Tagged(tagged))],
+            &consts,
+            &alloc,
+        );
+        assert_eq!(*alloc.refs.borrow(), vec![0x1111]);
+        assert!(alloc.ints.borrow().is_empty());
+    }
+
+    #[test]
+    fn setfields_pairs_fieldnums_by_parent_list_slot_not_enumerate() {
+        // Parent list [ref, int]; visitor/snapshot fielddescrs [int, ref].
+        // get_virtual_fields already lined fieldnums up with that visitor
+        // list (parent_list_slot_in). AbstractVirtualStructInfo.setfields
+        // is fielddescrs[i] / fieldnums[i] — rematching through the live
+        // parent list would feed the Ref TAGCONST to the Int descr.
+        let (parent, ptr_fd, int_fd) = pointer_as_int_parent();
+        let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let tagged_int = tag(7, TAGINT).unwrap();
+        let consts = [Const::Ref(GcRef(0x2222))];
+        let alloc = RecAllocator::default();
+        allocate_virtual_obj(
+            parent,
+            vec![info_for(&int_fd, Type::Int), info_for(&ptr_fd, Type::Int)],
+            vec![
+                (0, ResumeValueSource::Tagged(tagged_int)),
+                (1, ResumeValueSource::Tagged(tagged_ref)),
+            ],
+            &consts,
+            &alloc,
+        );
+        assert_eq!(*alloc.refs.borrow(), vec![0x2222]);
+        assert_eq!(*alloc.ints.borrow(), vec![7]);
+    }
+
+    #[test]
+    fn setfields_decodes_ref_field_type_without_pointer_flag() {
+        // field_type=Ref, is_pointer_field=false. Snapshot stores else
+        // field_type(); setfields must still decode_ref.
+        let fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0eee, 8, 8, Type::Ref, false)
+                .with_flag(ArrayFlag::Signed)
+                .with_index_in_parent(0),
+        );
+        assert!(!fd.is_pointer_field());
+        assert_eq!(fd.field_type(), Type::Ref);
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0002, 16, 2)
+                .with_all_fielddescrs(vec![fd.clone() as Arc<dyn FieldDescr>]),
+        );
+        fd.set_parent_descr(&parent);
+        let tagged = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let consts = [Const::Ref(GcRef(0x3333))];
+        let alloc = RecAllocator::default();
+        allocate_virtual_obj(
+            parent,
+            vec![info_for(&fd, Type::Int)],
+            vec![(fd.index(), ResumeValueSource::Tagged(tagged))],
+            &consts,
+            &alloc,
+        );
+        assert_eq!(*alloc.refs.borrow(), vec![0x3333]);
+        assert!(alloc.ints.borrow().is_empty());
+    }
+
+    #[test]
+    fn virtual_info_from_rd_setfields_uses_live_pointer_flag() {
+        let (parent, ptr_fd, _int_fd) = pointer_as_int_parent();
+        let tagged = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let rd = majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(parent),
+            type_id: 1,
+            known_class: None,
+            fielddescrs: vec![info_for(&ptr_fd, Type::Int)],
+            fieldnums: vec![tagged],
+            descr_size: 32,
+        };
+        let vinfo = virtual_info_from_rd(&rd);
+        let consts = [Const::Ref(GcRef(0x4444))];
+        let alloc = RecAllocator::default();
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &consts,
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &alloc,
+        );
+        reader.virtuals_cache = VirtualCache::from_caches(vec![0], vec![0]);
+        vinfo.allocate(&mut reader, 0, &alloc);
+        assert_eq!(*alloc.refs.borrow(), vec![0x4444]);
+        assert!(alloc.ints.borrow().is_empty());
+    }
+
+    #[test]
+    fn setfields_same_offset_uses_snapshot_kind_not_first_sibling() {
+        // Flattened leaves share offset 16. Snapshot Int must pair with
+        // slot 1 (AbstractResumeDataReader.setfield kind), not the first
+        // same-offset Ref sibling at slot 0.
+        let ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_3002, 16, 8, Type::Ref, false).with_index_in_parent(0),
+        );
+        let int_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_3001, 16, 8, Type::Int, false).with_index_in_parent(1),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0003, 32, 1).with_all_fielddescrs(vec![
+                ptr_fd.clone() as Arc<dyn FieldDescr>,
+                int_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        int_fd.set_parent_descr(&parent);
+        let int_info = FieldDescrInfo {
+            index: 0xDEAD_0001,
+            offset: 16,
+            field_type: Type::Int,
+            field_size: 8,
+        };
+        let ref_info = FieldDescrInfo {
+            index: 0xDEAD_0002,
+            offset: 16,
+            field_type: Type::Ref,
+            field_size: 8,
+        };
+        let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let tagged_int = tag(9, TAGINT).unwrap();
+        let consts = [Const::Ref(GcRef(0x5555))];
+        let alloc = RecAllocator::default();
+        allocate_virtual_obj(
+            parent,
+            vec![int_info, ref_info],
+            vec![
+                (0, ResumeValueSource::Tagged(tagged_int)),
+                (1, ResumeValueSource::Tagged(tagged_ref)),
+            ],
+            &consts,
+            &alloc,
+        );
+        assert_eq!(*alloc.refs.borrow(), vec![0x5555]);
+        assert_eq!(*alloc.ints.borrow(), vec![9]);
+    }
+
+    #[test]
+    fn setfields_snapshot_ref_does_not_decode_int_colliding_live_int() {
+        // stable_field_index can make the live Int sibling share
+        // index+offset with the snapshot Ref leaf. Live-first
+        // AbstractResumeDataReader.setfield dispatch would then
+        // decode_int the TAGCONST. Snapshot field_type is the bank
+        // snapshot_field_descr_info wrote.
+        let collide = 0x1000_00aa;
+        let int_fd = Arc::new(
+            SimpleFieldDescr::new(collide, 16, 8, Type::Int, false).with_index_in_parent(0),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0006, 24, 1)
+                .with_all_fielddescrs(vec![int_fd.clone() as Arc<dyn FieldDescr>]),
+        );
+        int_fd.set_parent_descr(&parent);
+        let ref_info = FieldDescrInfo {
+            index: collide,
+            offset: 16,
+            field_type: Type::Ref,
+            field_size: 8,
+        };
+        let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let consts = [Const::Ref(GcRef(0x8888))];
+        let alloc = RecAllocator::default();
+        allocate_virtual_obj(
+            parent,
+            vec![ref_info],
+            vec![(0, ResumeValueSource::Tagged(tagged_ref))],
+            &consts,
+            &alloc,
+        );
+        assert_eq!(*alloc.refs.borrow(), vec![0x8888]);
+        assert!(alloc.ints.borrow().is_empty());
+    }
+
+    #[test]
+    fn setfields_duplicate_index_uses_positional_fieldnums() {
+        // stable_field_index can give two snapshot leaves the same
+        // FieldDescrInfo.index. virtual_info_from_rd used to key fields
+        // by that hash, so find fed the Ref TAGCONST to the Int descr
+        // (Const::getint). AbstractVirtualStructInfo.setfields is
+        // positional.
+        let ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_4002, 8, 8, Type::Ref, false).with_index_in_parent(0),
+        );
+        let int_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_4001, 16, 8, Type::Int, false).with_index_in_parent(1),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0004, 24, 1).with_all_fielddescrs(vec![
+                ptr_fd.clone() as Arc<dyn FieldDescr>,
+                int_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        int_fd.set_parent_descr(&parent);
+        let collide = 0x1000_00ff;
+        let ref_info = FieldDescrInfo {
+            index: collide,
+            offset: 8,
+            field_type: Type::Ref,
+            field_size: 8,
+        };
+        let int_info = FieldDescrInfo {
+            index: collide,
+            offset: 16,
+            field_type: Type::Int,
+            field_size: 8,
+        };
+        let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let tagged_int = tag(11, TAGINT).unwrap();
+        let rd = majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: Some(parent),
+            type_id: 1,
+            known_class: None,
+            fielddescrs: vec![ref_info, int_info],
+            fieldnums: vec![tagged_ref, tagged_int],
+            descr_size: 24,
+        };
+        let vinfo = virtual_info_from_rd(&rd);
+        match &vinfo {
+            VirtualInfo::VirtualObj { fields, .. } => {
+                assert_eq!(fields[0].0, 0);
+                assert_eq!(fields[1].0, 1);
+            }
+            other => panic!("expected VirtualObj, got {other:?}"),
+        }
+        let consts = [Const::Ref(GcRef(0x6666))];
+        let alloc = RecAllocator::default();
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &consts,
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &alloc,
+        );
+        reader.virtuals_cache = VirtualCache::from_caches(vec![0], vec![0]);
+        vinfo.allocate(&mut reader, 0, &alloc);
+        assert_eq!(*alloc.refs.borrow(), vec![0x6666]);
+        assert_eq!(*alloc.ints.borrow(), vec![11]);
+    }
+
+    #[test]
+    fn setfields_duplicate_index_vstruct_uses_positional_fieldnums() {
+        let ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_4102, 8, 8, Type::Ref, false).with_index_in_parent(0),
+        );
+        let int_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_4101, 16, 8, Type::Int, false).with_index_in_parent(1),
+        );
+        let parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0005, 24, 2).with_all_fielddescrs(vec![
+                ptr_fd.clone() as Arc<dyn FieldDescr>,
+                int_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        ptr_fd.set_parent_descr(&parent);
+        int_fd.set_parent_descr(&parent);
+        let collide = 0x1000_00fe;
+        let ref_info = FieldDescrInfo {
+            index: collide,
+            offset: 8,
+            field_type: Type::Ref,
+            field_size: 8,
+        };
+        let int_info = FieldDescrInfo {
+            index: collide,
+            offset: 16,
+            field_type: Type::Int,
+            field_size: 8,
+        };
+        let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let tagged_int = tag(13, TAGINT).unwrap();
+        let rd = majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr: Some(parent),
+            type_id: 2,
+            fielddescrs: vec![ref_info, int_info],
+            fieldnums: vec![tagged_ref, tagged_int],
+            descr_size: 24,
+        };
+        let vinfo = virtual_info_from_rd(&rd);
+        let consts = [Const::Ref(GcRef(0x7777))];
+        let alloc = RecAllocator::default();
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &consts,
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &alloc,
+        );
+        reader.virtuals_cache = VirtualCache::from_caches(vec![0], vec![0]);
+        vinfo.allocate(&mut reader, 0, &alloc);
+        assert_eq!(*alloc.refs.borrow(), vec![0x7777]);
+        assert_eq!(*alloc.ints.borrow(), vec![13]);
     }
 }
 

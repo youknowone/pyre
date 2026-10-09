@@ -299,6 +299,29 @@ mod tests {
     }
 
     #[test]
+    fn allocate_array_struct_at_typed_uses_the_published_entries_tid() {
+        type K = i64;
+        type V = crate::pyobject::PyObjectRef;
+        let items_base = std::mem::offset_of!(GcEntries<K, V>, items);
+        let item_size = std::mem::size_of::<Entry<K, V>>();
+        let published = i64_pyobject_entries_gc_type_id();
+        if majit_gc::gc_allocator_installed() {
+            assert!(!majit_ir::descr::array_tid_is_unresolved(published));
+            let arr = crate::object_array::allocate_array_struct_at_typed(
+                2, item_size, items_base, published,
+            );
+            assert!(!arr.is_null());
+            assert_eq!(crate::object_array::gcarray_len(arr), 2);
+        } else {
+            let arr = crate::object_array::allocate_array_struct_at_typed(
+                2, item_size, items_base, published,
+            );
+            assert!(!arr.is_null());
+            assert_eq!(crate::object_array::gcarray_len(arr), 2);
+        }
+    }
+
+    #[test]
     fn object_key_entry_offsets_match_the_field_layout() {
         type Key = crate::dictmultiobject::ObjectKey;
         type Value = crate::pyobject::PyObjectRef;

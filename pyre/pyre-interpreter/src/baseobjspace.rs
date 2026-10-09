@@ -18322,6 +18322,66 @@ fn fixedview_impl<const UNROLL: bool>(
     unpackiterable(w_obj, expected_length)
 }
 
+/// `pypy/objspace/std/objspace.py` `StdObjSpace.listview_no_unpack`.
+///
+/// Cheap storage snapshot: exact list `getitems()`, a tuple still using the
+/// builtin iterator `getitems_copy()`, a list subclass still using the
+/// builtin iterator `getitems()`. Anything else, including a generator, is
+/// `None` so the caller can skip `unpackiterable`.
+pub fn listview_no_unpack(w_obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let current = || pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe {
+        if is_exact_type(current(), &pyre_object::LIST_TYPE) {
+            return Some(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+                current(),
+                majit_metainterp::jit::we_are_jitted(),
+            ));
+        } else if is_tuple(current())
+            && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
+        {
+            return Some(pyre_object::tupleobject::w_tuple_items_copy_as_vec(
+                current(),
+            ));
+        } else if is_list(current())
+            && builtin_iter_replacement(current(), &pyre_object::LIST_TYPE).is_none()
+        {
+            return Some(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+                current(),
+                majit_metainterp::jit::we_are_jitted(),
+            ));
+        }
+    }
+    None
+}
+
+/// `pypy/objspace/std/objspace.py` `StdObjSpace.listview`.
+///
+/// `listview_no_unpack` when cheap, else `ObjSpace.unpackiterable`.
+pub fn listview(
+    w_obj: PyObjectRef,
+    expected_length: isize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    match listview_no_unpack(pyre_object::gc_roots::shadow_stack_get(slot)) {
+        Some(t) => {
+            if expected_length != -1 && t.len() as isize != expected_length {
+                Err(fixedview_length_error(expected_length, t.len() as isize))
+            } else {
+                Ok(t)
+            }
+        }
+        None => unpackiterable(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            expected_length,
+        ),
+    }
+}
+
 /// descroperation.py — `iter()` requires the object returned by a
 /// dispatched `__iter__` to itself be an iterator (`space.lookup(w_iterator,
 /// '__next__') is not None`), raising TypeError otherwise.  `space.lookup` is
@@ -25042,6 +25102,24 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
     }
 }
 
+/// `BUILD_MAP` insert. Plain int keys take `w_dict_store_checked`'s traced
+/// arm; an unhashable key surfaces the latched hash error.
+#[inline(never)]
+pub fn dict_display_setitem(
+    mut obj: PyObjectRef,
+    mut key: PyObjectRef,
+    mut value: PyObjectRef,
+) -> Result<(), PyError> {
+    unsafe {
+        match pyre_object::with_roots!(obj, key, value => {
+            pyre_object::dictmultiobject::w_dict_store_checked(obj, key, value)
+        }) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(take_pending_dict_key_error(key)),
+        }
+    }
+}
+
 /// PyPy `W_DictMultiObject.nondescr_delitem_if_value_is`: bypass subclass
 /// hooks and preserve the single-probe identity-checked deletion primitive.
 pub fn dict_delitem_if_value_is(
@@ -25840,6 +25918,43 @@ mod tests {
             std::ptr::eq(items[0], items[1]),
             "exact-list arm must reuse the storage wrapper"
         );
+    }
+
+    /// `StdObjSpace.listview_no_unpack` copies a 2-int tuple via
+    /// `getitems_copy` instead of going through `iter`/`next`.
+    #[test]
+    fn listview_no_unpack_copies_two_int_tuple() {
+        crate::typedef::init_typeobjects();
+        let tup = w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
+        let items = listview_no_unpack(tup).expect("tuple listview_no_unpack");
+        assert_eq!(items.len(), 2);
+        unsafe {
+            assert_eq!(w_int_get_value(items[0]), 1);
+            assert_eq!(w_int_get_value(items[1]), 2);
+        }
+    }
+
+    /// Exact list `getitems()` is the cheap `listview_no_unpack` arm.
+    #[test]
+    fn listview_no_unpack_copies_exact_list() {
+        crate::typedef::init_typeobjects();
+        let lst = w_list_new(vec![w_int_new(7), w_int_new(8)]);
+        let items = listview_no_unpack(lst).expect("list listview_no_unpack");
+        assert_eq!(items.len(), 2);
+        unsafe {
+            assert_eq!(w_int_get_value(items[0]), 7);
+            assert_eq!(w_int_get_value(items[1]), 8);
+        }
+    }
+
+    /// A non-list/tuple iterable is not cheap; `listview` unpacks it.
+    #[test]
+    fn listview_no_unpack_skips_int_and_listview_unpacks_str() {
+        crate::typedef::init_typeobjects();
+        assert!(listview_no_unpack(w_int_new(3)).is_none());
+        let s = pyre_object::unicodeobject::w_str_new_managed("ab");
+        let items = listview(s, -1).expect("str listview via unpackiterable");
+        assert_eq!(items.len(), 2);
     }
 
     /// `descr_setargs` stores `fixedview`. `W_TupleObject.tolist` is
