@@ -4495,6 +4495,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         majit_ir::RuntimeHelperKind::NewtupleFromArray
             | majit_ir::RuntimeHelperKind::NewlistFromArray
             | majit_ir::RuntimeHelperKind::BuildStringFromArray
+            | majit_ir::RuntimeHelperKind::NewEmptyDict
     );
     // A journaled cursor is replay-safe: `fbw_bridge_iter_journal_rollback`
     // puts it back.  A generator, `map`, dict/set iterator, itertools
@@ -8261,6 +8262,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // BUILD_MAP 0 (`{}`) is `space.newdict()` (`pyopcode.py BUILD_MAP`).
+    // Descend `newdict_empty` (`allocate_and_init_instance` empty-dict arm)
+    // so the trace records `new_with_vtable` + dstorage/dstrategy, matching
+    // PyPy.  Not a spec-fold row — HelperDescent, the `newfloat` twin.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewEmptyDict
+    {
+        if let Some(outcome) = try_walker_orthodox_newdict(ctx, op, dst, dst_bank)? {
+            return Ok((outcome, op.next_pc));
+        }
     }
 
     // #171: specialize `lst.append(x)` so its array ops reach the trace,

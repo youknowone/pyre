@@ -1058,9 +1058,18 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     // skipped at the `SubRaise` catch site instead, matching
     // `pyopcode.py handle_bytecode` routing that exception around
     // `record_context`.
+    //
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
-    // the value the compiled iterations will store.
+    // the value the compiled iterations will store. A recording-time skip
+    // when `sys_exc_info` is None would bake that into the trace; compiled
+    // iterations that later run under a live handler would leave
+    // `__context__` unset. PyPy traces `executioncontext.py sys_exc_info`
+    // as jitcode (`guard_isnull` on `sys_exc_operror` and
+    // `current_gen_or_coroutine`) and compiles a bridge when a guard fails.
+    // Those guards synthesized here resume at the inlined CALL whose
+    // valuestack was already consumed. Residual-call the hook instead
+    // (`resolve_exception_context` reads `get_sys_exception` at run time).
     majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {
@@ -5528,16 +5537,33 @@ pub(crate) fn poison_confined_to_returning_handlers(code: &[u8], poison: &[usize
 /// [`fbw_callee_body_replay_scan`] stores unsafe ops in `poison` and
 /// leaves `safety` as `Clean`/`DeferredCall`; [`CalleeReplayScan::verdict`]
 /// folds a non-empty poison set into `Dirty`. This admit does not install
-/// `inline_poison_pcs` (the walk must enter a taken `except E: return`
-/// arm), so it has to read `verdict()` — `safety != Dirty` is true for
-/// every enforceable scan and would admit a Dirty happy path as long as
-/// some returning handler exists. The reraise and branchy-poison siblings
-/// keep reading `safety` because they refuse the walk at `scan.poison`.
+/// `inline_poison_pcs`: the walk must enter a taken `except E: return`
+/// arm, including a try-body residual that raises into it.
+///
+/// `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` and
+/// `JC_DONT_TRACE_HERE`. `perform_call` (`pyjitpl.py`) traces the taken
+/// path — classify's `_check_surrogate` reject is `except UnicodeEncodeError
+/// as e: return` with `type(name, (), {})` a `CallFn` residual in the try
+/// body (`inline_call_r_r` / `UnprovableStoreOrCallForm`). Residualizing
+/// that callee because the try-body residual poisons `verdict()` lets it
+/// compile as its own function-entry: `record_context` /
+/// `PUSH_EXC_INFO`'s `guard_isnull` on `sys_exc_value` then fails every
+/// compiled iteration (PUSH/POP are not in the caller's loop, so DSE
+/// cannot keep the slot null).
+///
+/// A Dirty happy-path poison may already have written live heap
+/// (`ResidualCallWritesLiveHeap` on `log.append` in
+/// `except_as_return_mutate_once`). Abort-during-tracing does not
+/// re-execute the outer CALL on top of that write: `fbw_bump_executed_effect`
+/// moves the odometer, [`fbw_decline_inline_callee`] sets
+/// `blackhole_required` when the delta is nonzero, and
+/// `blackhole_if_trace_too_long` (`pyjitpl.py`) continues forward
+/// (`fbw_blackhole_adopted_single_frame`). The Entry carrier rewind to the
+/// CALL is the zero-delta gate (`entry_executed_effects`). Seeded deopt
+/// resumes at the callee's own guard. The reraise and branchy-poison
+/// siblings still refuse the walk at `scan.poison`.
 pub(crate) fn handler_except_as_return_scan_admits(scan: &CalleeReplayScan, code: &[u8]) -> bool {
-    scan.enforceable()
-        && body_has_returning_handler(code)
-        && (scan.verdict() != CalleeReplaySafety::Dirty
-            || poison_confined_to_returning_handlers(code, &scan.poison))
+    scan.enforceable() && body_has_returning_handler(code)
 }
 
 /// Whether any `catch_exception` target is a returning handler.
