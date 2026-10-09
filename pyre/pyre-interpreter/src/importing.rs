@@ -1820,7 +1820,17 @@ fn save_module_content_for_future_reload(w_mod: PyObjectRef) -> Result<(), crate
         "copy",
         &[],
     )?;
-    unsafe { pyre_object::w_module_set_initialdict(shadow_stack_get(mod_slot), w_initialdict) };
+    // `call_method_result` returns an unrooted local. `copy` allocates the
+    // new dict in the nursery (`AbstractTypedStrategy.copy`); pin it before
+    // the store so `w_module_set_initialdict` writes the forwarded GCREF.
+    let dict_slot = shadow_stack_len();
+    let _ = pin_root(w_initialdict);
+    unsafe {
+        pyre_object::w_module_set_initialdict(
+            shadow_stack_get(mod_slot),
+            shadow_stack_get(dict_slot),
+        )
+    };
     Ok(())
 }
 
@@ -3695,12 +3705,14 @@ pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     unsafe { walk_bound_module_dicts(visitor) };
 }
 
-/// The shared body of the two module-dict root walks.
+/// Forward the immortal `Module` field GCREFs (`w_name`, `w_dict`,
+/// `w_initialdict`). `malloc_typed` modules are outside the nursery, so a
+/// minor does not trace them; the dicts they hold are young
+/// (`mixedmodule.py MixedModule.w_initialdict`, `module.py self.w_dict`).
 ///
 /// # Safety
-/// `visitor` must tolerate being called on every movable module-dict value
-/// slot reachable here.
-unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+/// `visitor` must tolerate a non-nursery or already-forwarded pointer.
+unsafe fn walk_bound_module_fields(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     for &module in MODULE_DICT_ROOTS.lock().iter() {
         let module = module as PyObjectRef;
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
@@ -3708,10 +3720,33 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
         }
         unsafe {
             let module = &mut *(module as *mut pyre_object::module::Module);
-            visitor(&mut module.w_name);
-            visitor(&mut module.w_dict);
-            visitor(&mut module.w_initialdict);
-            let w_dict = module.w_dict;
+            if !module.w_name.is_null() {
+                visitor(&mut module.w_name);
+            }
+            if !module.w_dict.is_null() {
+                visitor(&mut module.w_dict);
+            }
+            if !module.w_initialdict.is_null() {
+                visitor(&mut module.w_initialdict);
+            }
+        }
+    }
+}
+
+/// The shared body of the two module-dict root walks.
+///
+/// # Safety
+/// `visitor` must tolerate being called on every movable module-dict value
+/// slot reachable here.
+unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    unsafe { walk_bound_module_fields(visitor) };
+    for &module in MODULE_DICT_ROOTS.lock().iter() {
+        let module = module as PyObjectRef;
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        unsafe {
+            let w_dict = (*(module as *mut pyre_object::module::Module)).w_dict;
             pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
         }
     }
@@ -3791,15 +3826,28 @@ pub(crate) unsafe fn walk_import_roots_area(
     }
 }
 
-/// The process-owned object pointers in the import state.
+/// The Module field GCREFs and the process-owned import cells, without
+/// walking module-dict *contents*. Immortal modules are not nursery-traced,
+/// so these slots have to be extra-rooted on every minor — the same shape
+/// as `space.fromcache(CodecState)`'s young dicts. Dict cells stay on
+/// [`walk_process_import_roots`]: those are the object's own edges once
+/// `w_dict` has been forwarded.
 ///
-/// These slots are prebuilt (`space.sys` / `SysModuleState`). A mutator store
-/// of a young pointer into them takes `mark_prebuilt_roots_dirty`
-/// (`incminimark.py remember_young_pointer_from_prebuilt`); this walk is the
-/// corresponding `prebuilt_root_objects` visit, reached only through the gated
-/// [`walk_process_import_roots`]. Stores here rewrite forwarded addresses and
-/// are not mutator stores.
-unsafe fn walk_process_import_object_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+/// The SYS_MODULES / default-importer / builtin-module slots are prebuilt
+/// (`space.sys` / `SysModuleState`). A mutator store of a young pointer
+/// into them takes `mark_prebuilt_roots_dirty` (`incminimark.py
+/// remember_young_pointer_from_prebuilt`); this walk is the corresponding
+/// `prebuilt_root_objects` visit. Stores here rewrite forwarded addresses
+/// and are not mutator stores.
+///
+/// # Safety
+/// `visitor` must tolerate a non-nursery or already-forwarded pointer.
+pub(crate) unsafe fn walk_process_import_object_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    unsafe { walk_bound_module_fields(visitor) };
+    unsafe { walk_process_import_object_roots_tail(visitor) };
+}
+
+unsafe fn walk_process_import_object_roots_tail(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         visitor(&mut dict);
@@ -3832,7 +3880,7 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
     // mutator, so the process-global cache cannot be semantically mutated
     // while this walk holds its native lock.
     unsafe { walk_bound_module_dicts(visitor) };
-    walk_process_import_object_roots(visitor);
+    unsafe { walk_process_import_object_roots_tail(visitor) };
 }
 
 /// Set the Python-visible sys.modules dict reference. Called during sys
