@@ -5191,13 +5191,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                // Same non-bridge latch as the escape-flush commit above:
-                // a bridge walk never adopts this image (`run_perfn_walk`
-                // epilogue is skipped).
-                if ctx.session.borrow().at_portal()
-                    && !ctx.fbw_mode.inline_subwalk
-                    && !ctx.trace_ctx.is_bridge_trace
-                {
+                // `pyjitpl.py vable_after_residual_call` raises
+                // `SwitchToBlackhole(ABORT_ESCAPE)` for loop traces and
+                // bridges alike; `convert_and_run_from_pyjitpl` then runs
+                // forward past the residual. A bridge walk still goes
+                // through `run_perfn_walk`'s VableEscape adopt, so the
+                // resume-past image is latched here the same way a portal
+                // walk latches it. The Exact rewind commit above stays
+                // off bridges: that path would re-run the opcode.
+                if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())
