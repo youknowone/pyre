@@ -724,16 +724,13 @@ pub unsafe fn grow_instance_items_block(
 ) -> *mut ItemsBlock {
     unsafe {
         let _roots = crate::gc_roots::push_roots();
+        // A null `old` is pinned too: the slot holds the null word, which no
+        // collection rewrites, and every path then leaves the bracket at one
+        // depth.
         let old_slot = crate::gc_roots::shadow_stack_len();
-        if !old.is_null() {
-            let _ = crate::gc_roots::pin_root(old as PyObjectRef);
-        }
+        let _ = crate::gc_roots::pin_root(old as PyObjectRef);
         let fresh = alloc_mapdict_storage_block(new_cap);
-        let old = if old.is_null() {
-            old
-        } else {
-            crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock
-        };
+        let old = crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock;
         let new_base = items_block_items_base(fresh);
         let copy = live_len.min(new_cap);
         if !old.is_null() && copy > 0 {
@@ -944,9 +941,7 @@ pub unsafe fn try_grow_list_items_block_gc(
         return unsafe { try_grow_items_block(old, new_cap, live_len) };
     }
     let _roots = crate::gc_roots::push_roots();
-    let old_slot = if old.is_null() {
-        None
-    } else {
+    let old_slot = {
         // Publish the old block before *any* GC hook.  In particular,
         // `try_gc_owns_object` is not a harmless predicate: its cross-thread
         // path can wait behind a collection.  Asking whether `old` was
@@ -956,10 +951,11 @@ pub unsafe fn try_grow_list_items_block_gc(
         //
         // The shadow-stack walker ignores non-GC addresses, so rooting the
         // std::alloc fallback unconditionally is both safe and removes the
-        // ownership-query safepoint entirely.
+        // ownership-query safepoint entirely.  A null `old` is pinned the
+        // same way, so every path publishes the same slots.
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
-        Some(slot)
+        slot
     };
     let new_block_slot = crate::gc_roots::shadow_stack_len();
     let (new_block, owns_new) = unsafe { try_alloc_items_block_gc(new_cap)? };
@@ -977,9 +973,7 @@ pub unsafe fn try_grow_list_items_block_gc(
     // `l.items = newitems`. The copy's `copy_item` head is what writeanalyze
     // records as this ARRAY's read and write, so `force_from_effectinfo`
     // flushes lazy SETARRAYITEM_GC before the residual COND_CALL.
-    if let Some(old_slot) = old_slot
-        && live_len > 0
-    {
+    if !old.is_null() && live_len > 0 {
         unsafe {
             ll_arraycopy_items_block(
                 crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock,
@@ -1443,16 +1437,11 @@ macro_rules! typed_items_block_grow {
                 // what writeanalyze records as this ARRAY's read and write, so
                 // `force_from_effectinfo` flushes lazy SETARRAYITEM_GC before
                 // the residual COND_CALL.
-                let old_root = if !old.is_null() {
-                    let slot = crate::gc_roots::shadow_stack_len();
-                    let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
-                    Some(slot)
-                } else {
-                    None
-                };
-                if let Some(old_root) = old_root
-                    && live_len > 0
-                {
+                // A null `old` is pinned too, so every path publishes the
+                // same slots.
+                let old_root = crate::gc_roots::shadow_stack_len();
+                let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
+                if !old.is_null() && live_len > 0 {
                     $arraycopy(
                         crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock,
                         crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock,
@@ -1461,7 +1450,7 @@ macro_rules! typed_items_block_grow {
                         live_len as i64,
                     );
                 }
-                if let Some(old_root) = old_root {
+                if !old.is_null() {
                     dealloc_typed_items_block(
                         crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
                     );
