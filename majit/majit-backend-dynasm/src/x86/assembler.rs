@@ -1504,13 +1504,15 @@ struct GuardToken {
     const_stores: Vec<(usize, i64)>,
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
-    /// `assembler.py genop_guard_guard_not_invalidated`'s
-    /// `guard_token.pos_jump_offset` — the offset of the eight-byte `NOP` this
-    /// guard's branch is written over.
-    /// `Some` only for `GUARD_NOT_INVALIDATED`, the one guard whose branch is
-    /// written after the buffer is materialised; every other guard reaches its
-    /// recovery stub through a `fail_label` dynasm resolves at finalize.
+    /// `assembler.py implement_guard`'s `guard_token.pos_jump_offset` — the
+    /// offset of the 4-byte target field of the guard's `Jcc`/`JMP`, which
+    /// `patch_jump_for_descr` later redirects into a bridge. For
+    /// `GUARD_NOT_INVALIDATED` it is the byte after the opcode of the
+    /// not-yet-written `JMP` (`genop_guard_guard_not_invalidated`).
+    /// `None` only for a guard that emits no branch at all.
     pos_jump_offset: Option<usize>,
+    /// `GuardToken.guard_not_invalidated()`.
+    guard_not_invalidated: bool,
     /// llsupport/assembler.py must_save_exception: true for
     /// GUARD_EXCEPTION / GUARD_NO_EXCEPTION / GUARD_NOT_FORCED.  Selects the
     /// exc=True failure-recovery variant that stages pos_exc_value into
@@ -1527,8 +1529,10 @@ struct RecoveryStub {
     fail_descr: majit_ir::DescrRef,
     /// `tok.pos_recovery_stub`.
     pos_recovery_stub: usize,
-    /// `tok.pos_jump_offset`, present only for `GUARD_NOT_INVALIDATED`.
+    /// `tok.pos_jump_offset`.
     pos_jump_offset: Option<usize>,
+    /// `tok.guard_not_invalidated()`.
+    guard_not_invalidated: bool,
 }
 
 fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
@@ -3286,8 +3290,8 @@ impl<'a> Assembler386<'a> {
     /// llsupport/assembler.py rebuild_faillocs_from_descr — reconstruct
     /// the locations of bridge inputargs from the guard's recovery layout.
     ///
-    /// patch_jump_for_descr overwrites the recovery stub with a direct
-    /// jump to the bridge, so the register-save subroutine never runs.
+    /// patch_jump_for_descr redirects the guard's jump into the bridge,
+    /// so the register-save subroutine never runs.
     /// The bridge sees live registers exactly as they were at guard time.
     /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
@@ -5935,15 +5939,26 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::GuardNonnullClass => {
                 if arglocs.len() >= 2 {
-                    self.emit_test_loc(&arglocs[0]);
-                    let fail_label = self.emit_guard_jcc(CC_E);
+                    // `genop_guard_guard_nonnull_class`: a null object
+                    // leaves `CMP obj, 1` with B (and NE), so the forward
+                    // `JB` lands on the one guard `Jcc` that
+                    // `patch_jump_for_descr` redirects.
+                    let Loc::Reg(obj) = &arglocs[0] else {
+                        panic!(
+                            "GuardNonnullClass: obj_loc must be Loc::Reg, got {:?}",
+                            arglocs[0]
+                        );
+                    };
+                    let jb_location = self.mc.new_dynamic_label();
+                    dynasm!(self.mc ; .arch x64 ; cmp Rq(obj.value), 1 ; jb =>jb_location);
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
-                    self.emit_jcc_to_label(CC_NE, fail_label);
-                    self.append_guard_token_with_faillocs(
+                    self.forget_scratch_register();
+                    dynasm!(self.mc ; .arch x64 ; =>jb_location);
+                    self.guard_success_cc = Some(CC_E);
+                    self.implement_guard_with_faillocs(
                         op,
                         op_index,
                         fail_index,
-                        fail_label,
                         guard_argloc,
                         faillocs,
                     );
@@ -6552,6 +6567,7 @@ impl<'a> Assembler386<'a> {
             .expect("implement_guard_with_faillocs: guard_success_cc not set");
         let fail_cc = invert_cc(cc);
         let fail_label = self.emit_guard_jcc(fail_cc);
+        let pos = self.mc.offset().0;
         self.append_guard_token_with_faillocs(
             op,
             op_index,
@@ -6560,6 +6576,17 @@ impl<'a> Assembler386<'a> {
             guard_argloc,
             faillocs,
         );
+        self.set_last_guard_jump_offset(pos);
+    }
+
+    /// `implement_guard`: `guard_token.pos_jump_offset = pos - 4`, the
+    /// target field of the `Jcc`/`JMP` ending at `pos`. dynasm encodes a
+    /// branch to a dynamic label with a 32-bit displacement.
+    fn set_last_guard_jump_offset(&mut self, pos: usize) {
+        self.pending_guard_tokens
+            .last_mut()
+            .expect("guard token appended")
+            .pos_jump_offset = Some(pos - 4);
     }
 
     /// Guard no-jump with faillocs.
@@ -6601,15 +6628,15 @@ impl<'a> Assembler386<'a> {
         faillocs: &[Option<Loc>],
     ) {
         // `genop_guard_guard_not_invalidated`: `pos` is the opcode byte of
-        // the not-yet-written `JMP`. Upstream stores `pos + 1` and
-        // `invalidate_loop` writes at `addr - 1`; recording the opcode
-        // address is the same site.
+        // the not-yet-written `JMP`; `pos + 1` is "after potential jmp".
         let pos = self.mc.offset().0;
         self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, guard_argloc, faillocs);
-        self.pending_guard_tokens
+        let token = self
+            .pending_guard_tokens
             .last_mut()
-            .expect("guard token appended")
-            .pos_jump_offset = Some(pos);
+            .expect("guard token appended");
+        token.pos_jump_offset = Some(pos + 1);
+        token.guard_not_invalidated = true;
         self.ensure_next_label_is_at_least_at_position(pos + 5);
     }
 
@@ -6648,6 +6675,7 @@ impl<'a> Assembler386<'a> {
     ) {
         let fail_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; jmp =>fail_label);
+        let pos = self.mc.offset().0;
         self.forget_after_call_or_jmp();
         self.append_guard_token_with_faillocs(
             op,
@@ -6657,6 +6685,7 @@ impl<'a> Assembler386<'a> {
             guard_argloc,
             faillocs,
         );
+        self.set_last_guard_jump_offset(pos);
     }
 
     /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
@@ -6813,6 +6842,7 @@ impl<'a> Assembler386<'a> {
             const_stores,
             gcmap,
             pos_jump_offset: None,
+            guard_not_invalidated: false,
             must_save_exception: matches!(
                 op.opcode,
                 OpCode::GuardException | OpCode::GuardNoException | OpCode::GuardNotForced
@@ -6926,6 +6956,7 @@ impl<'a> Assembler386<'a> {
             fail_descr: guard_token.fail_descr,
             pos_recovery_stub: stub_start.0,
             pos_jump_offset: guard_token.pos_jump_offset,
+            guard_not_invalidated: guard_token.guard_not_invalidated,
         }
     }
 
@@ -6973,13 +7004,25 @@ impl<'a> Assembler386<'a> {
         stub_offsets
     }
 
-    /// assembler.py:849 patch_pending_failure_recoveries — convert
-    /// buffer-relative offsets to absolute addresses after finalize.
+    /// assembler.py:849 patch_pending_failure_recoveries — set
+    /// `tok.faildescr.adr_jump_offset` to the raw address of the 4-byte
+    /// target field in the guard's `JMP`/`Jcond`. dynasm already resolved
+    /// that field to the recovery stub when it bound `fail_label`.
     fn patch_pending_failure_recoveries(rawstart: usize, stubs: &[RecoveryStub]) {
         for stub in stubs {
-            let abs_addr = rawstart + stub.pos_recovery_stub;
+            let Some(pos_jump_offset) = stub.pos_jump_offset else {
+                continue;
+            };
+            let addr = rawstart + pos_jump_offset;
+            if !stub.guard_not_invalidated {
+                debug_assert_eq!(
+                    addr as i64 + 4 + unsafe { (addr as *const i32).read_unaligned() } as i64,
+                    (rawstart + stub.pos_recovery_stub) as i64,
+                    "guard branch target field does not reach its recovery stub"
+                );
+            }
             if let Some(fd) = stub.fail_descr.as_fail_descr() {
-                fd.set_adr_jump_offset(abs_addr);
+                fd.set_adr_jump_offset(addr);
             }
         }
     }
@@ -6995,20 +7038,20 @@ impl<'a> Assembler386<'a> {
     ) -> Vec<majit_backend::InvalidatePosition> {
         stubs
             .iter()
-            .filter_map(|stub| {
-                let pos_jump_offset = stub.pos_jump_offset?;
-                // `relative_target = tok.pos_recovery_stub - (tok.pos_jump_offset + 4)`
-                // with upstream's `pos_jump_offset = pos + 1`. Here
-                // `pos_jump_offset` is the `JMP` opcode byte, so the
-                // displacement is relative to `pos + 5`.
-                let relative_target = stub.pos_recovery_stub as i64 - (pos_jump_offset as i64 + 5);
+            .filter(|stub| stub.guard_not_invalidated)
+            .map(|stub| {
+                let pos_jump_offset = stub
+                    .pos_jump_offset
+                    .expect("GUARD_NOT_INVALIDATED records its jump position");
+                let relative_target = stub.pos_recovery_stub as i64 - (pos_jump_offset as i64 + 4);
                 let relative_target = i32::try_from(relative_target)
                     .expect("guard recovery stub within JMP rel32 reach of its guard");
-                // `JMP_l`: `E9 rel32`, five bytes, written at the guard site.
-                Some(majit_backend::InvalidatePosition {
-                    addr: rawstart + pos_jump_offset,
+                // `JMP_l`: `E9 rel32`, five bytes; `invalidate_loop` writes the
+                // opcode at `addr - 1`.
+                majit_backend::InvalidatePosition {
+                    addr: rawstart + pos_jump_offset - 1,
                     word: 0xE9 | u64::from(relative_target as u32) << 8,
-                })
+                }
             })
             .collect()
     }
@@ -7044,44 +7087,34 @@ impl<'a> Assembler386<'a> {
     // assembler.py:965-987 patch_jump_for_descr
 
     /// assembler.py:965 patch_jump_for_descr: redirect a guard to a
-    /// bridge by overwriting the recovery stub with a JMP to bridge.
+    /// bridge.
     ///
-    /// `adr_jump_offset` is the absolute address of the recovery stub
-    /// (set by patch_pending_failure_recoveries). We overwrite the
-    /// stub with "MOV r11, bridge_addr; JMP r11" (x64) or "BL imm26"
-    /// (aarch64), matching rpython/jit/backend/aarch64/assembler.py
-    /// patch_trace().
+    /// `adr_jump_offset` is the raw address of the 4-byte target field of
+    /// the guard's `JMP`/`Jcond` (set by `patch_pending_failure_recoveries`).
+    /// If the bridge is within rel32 reach of the jump, patch that field.
+    /// Otherwise leave the field pointing at the recovery stub and clobber
+    /// the stub with "MOV r11, bridge_addr; JMP r11"; the stub is at least
+    /// that long.
     pub fn patch_jump_for_descr(descr: &dyn majit_ir::FailDescr, adr_new_target: usize) {
-        let stub_addr = descr.adr_jump_offset();
-        assert!(stub_addr != 0, "guard already patched");
-
-        codebuf::with_writable(stub_addr as *mut u8, 16, || {
-            let stub_ptr = stub_addr as *mut u8;
-            let offset = adr_new_target as isize - (stub_addr as isize + 5);
-            if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
-                unsafe {
-                    *stub_ptr = 0xE9;
-                    (stub_ptr.add(1) as *mut i32).write(offset as i32);
-                }
-            } else {
-                unsafe {
-                    *stub_ptr = 0x49;
-                    *stub_ptr.add(1) = 0xBB;
-                    (stub_ptr.add(2) as *mut u64).write(adr_new_target as u64);
-                    *stub_ptr.add(10) = 0x41;
-                    *stub_ptr.add(11) = 0xFF;
-                    *stub_ptr.add(12) = 0xE3;
-                }
-            }
-        });
-
-        // Verify patch was applied correctly
-        if crate::majit_log_enabled() {
-            let word = unsafe { (stub_addr as *const u32).read() };
-            eprintln!(
-                "[patch-verify] stub_addr={:#x} first_word={:#010x} target={:#x}",
-                stub_addr, word, adr_new_target
-            );
+        let adr_jump_offset = descr.adr_jump_offset();
+        assert!(adr_jump_offset != 0, "guard already patched");
+        let offset = adr_new_target as i64 - (adr_jump_offset as i64 + 4);
+        if let Ok(offset) = i32::try_from(offset) {
+            codebuf::with_writable(adr_jump_offset as *mut u8, 4, || unsafe {
+                (adr_jump_offset as *mut i32).write_unaligned(offset);
+            });
+        } else {
+            let rel = unsafe { (adr_jump_offset as *const i32).read_unaligned() };
+            let adr_target = (adr_jump_offset as i64 + 4 + rel as i64) as usize;
+            codebuf::with_writable(adr_target as *mut u8, 13, || unsafe {
+                let stub_ptr = adr_target as *mut u8;
+                *stub_ptr = 0x49;
+                *stub_ptr.add(1) = 0xBB;
+                (stub_ptr.add(2) as *mut u64).write_unaligned(adr_new_target as u64);
+                *stub_ptr.add(10) = 0x41;
+                *stub_ptr.add(11) = 0xFF;
+                *stub_ptr.add(12) = 0xE3;
+            });
         }
 
         // assembler.py:987
@@ -8046,28 +8079,49 @@ impl<'a> Assembler386<'a> {
             }
             return;
         }
-        // 64-bit immediate that doesn't fit sign-extended imm32. The
-        // regalloc materialises an out-of-range offset into
-        // LARGE_IMM_SCRATCH (R11), so staging val through R11 too would
-        // clobber the offset register. Split the QWORD write into two
-        // DWORD writes instead — `mov DWORD [mem], imm32` accepts a
-        // bare immediate and leaves the offset register intact.
+        // regloc.py `insn_with_64_bit_immediate`: a QWORD immediate that
+        // does not fit sign-extended imm32 is loaded into a register and
+        // written with one QWORD store. Two DWORD halves would defeat
+        // store-to-load forwarding for the QWORD load that usually follows
+        // (`GUARD_CLASS` reading the vtable just written by `NEW_WITH_VTABLE`).
         debug_assert_eq!(
             size, 8,
-            "split-store path only reachable for QWORD stores; smaller sizes go through val_fits_at_size",
+            "64-bit immediate path only reachable for QWORD stores; smaller sizes go through val_fits_at_size",
         );
-        let lo = val as i32;
-        let hi = (val >> 32) as i32;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         match ofs_loc {
             Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                let o = i.value as i32;
-                rx86::mov32_mi(&mut self.mc, (base.value, o), lo);
-                rx86::mov32_mi(&mut self.mc, (base.value, o.wrapping_add(4)), hi);
+                // `_load_scratch(val2)` then `INSN(loc1, X86_64_SCRATCH_REG)`.
+                self.forget_if_scratch_written(scratch);
+                rx86::mov_ri(&mut self.mc, scratch, val);
+                rx86::mov_mr(&mut self.mc, (base.value, i.value as i32), scratch);
+            }
+            Loc::Reg(ofs_r) if ofs_r.value != scratch => {
+                self.forget_if_scratch_written(scratch);
+                rx86::mov_ri(&mut self.mc, scratch, val);
+                rx86::mov_ar(
+                    &mut self.mc,
+                    (i16::from(base.value), ofs_r.value, 0, 0),
+                    scratch,
+                );
             }
             Loc::Reg(ofs_r) => {
-                let addr = (i16::from(base.value), ofs_r.value, 0, 0);
-                rx86::mov32_ai(&mut self.mc, addr, lo);
-                rx86::mov32_ai(&mut self.mc, (i16::from(base.value), ofs_r.value, 0, 4), hi);
+                // The regalloc staged an out-of-range offset into the
+                // scratch register (`gc_offset_loc`), so it cannot carry the
+                // value: `find_unused_reg` + `PUSH_r` / `MOV_ri` / `INSN` /
+                // `POP_r`.
+                let freereg = [rx86::EAX, rx86::ECX, rx86::EDX]
+                    .into_iter()
+                    .find(|&r| r != base.value && r != ofs_r.value)
+                    .expect("three candidates against two address registers");
+                dynasm!(self.mc ; .arch x64 ; push Rq(freereg));
+                rx86::mov_ri(&mut self.mc, freereg, val);
+                rx86::mov_ar(
+                    &mut self.mc,
+                    (i16::from(base.value), ofs_r.value, 0, 0),
+                    freereg,
+                );
+                dynasm!(self.mc ; .arch x64 ; pop Rq(freereg));
             }
             other => panic!("GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",),
         }
@@ -10456,7 +10510,13 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             (Loc::ConstFloat(from), ebp_loc_pat!(e)) => {
                 self.regalloc_immedmem2mem(*from, e.value);
             }
+            (Loc::Immed(i), ebp_loc_pat!(e)) if rx86::fits_in_32bits(i.value) => {
+                // regloc.py `MOV` with location codes 'b','i': `MOV_bi`.
+                rx86::mov_bi(&mut self.mc, e.value, i.value as i32);
+            }
             (Loc::Immed(i), ebp_loc_pat!(e)) => {
+                // regloc.py `insn_with_64_bit_immediate`: `_load_scratch`
+                // then `MOV_br`.
                 self.forget_scratch_register();
                 let ofs = e.value;
                 self.forget_if_scratch_written(scratch_reg);

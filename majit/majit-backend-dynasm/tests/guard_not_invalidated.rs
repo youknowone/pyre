@@ -198,13 +198,23 @@ fn the_x86_site_emits_nothing_until_invalidated() {
         &after[site + 5..],
         "only the five bytes at the site change"
     );
-    let rel = i32::from_le_bytes(after[site + 1..site + 5].try_into().unwrap());
-    let target = (entry + site + 5) as i64 + rel as i64;
-    let stub = guard_descr
+    // `patch_pending_failure_recoveries`: `adr_jump_offset` is the raw
+    // address of the JMP's 4-byte target field, `pos + 1`.
+    let adr_jump_offset = guard_descr
         .as_fail_descr()
         .expect("guard descr")
         .adr_jump_offset();
-    assert_eq!(target as usize, stub, "JMP rel32 targets the recovery stub");
+    assert_eq!(
+        adr_jump_offset,
+        entry + site + 1,
+        "adr_jump_offset names the JMP rel32 field"
+    );
+    let rel = i32::from_le_bytes(after[site + 1..site + 5].try_into().unwrap());
+    let target = (entry + site + 5) as i64 + rel as i64;
+    assert!(
+        target as usize > entry + site + 5,
+        "JMP rel32 targets the recovery stub after the body"
+    );
 }
 
 /// `consider_guard_not_invalidated` /

@@ -5618,6 +5618,103 @@ mod tests {
         assert_eq!(backend.get_ref_value(&frame, 0), payload);
     }
 
+    /// `genop_guard_guard_nonnull_class` funnels the null test into the one
+    /// guard `Jcc`, and `patch_jump_for_descr` rewrites that `Jcc`'s target
+    /// field: once a bridge is attached, a null object and an object of the
+    /// wrong class both reach it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_guard_nonnull_class_null_and_wrong_class_reach_the_bridge() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let wrong_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+        let wrong = gc.alloc_with_type(wrong_tid, 16);
+
+        let payload_vtable: usize = 0x4444_6600;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, payload_vtable, payload_tid);
+
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        install_call_assembler_test_layout(jitframe_tid);
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
+        constants.insert(100, payload_vtable as i64);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1605);
+        let guard = mk_op(
+            OpCode::GuardNonnullClass,
+            &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let passed = backend.execute_token(&token, &[Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&passed).is_finish());
+        assert_eq!(backend.get_ref_value(&passed, 0), payload);
+
+        let null_failed = backend.execute_token(&token, &[Value::Ref(GcRef::NULL)]);
+        assert!(!backend.get_latest_descr(&null_failed).is_finish());
+        let wrong_failed = backend.execute_token(&token, &[Value::Ref(wrong)]);
+        assert!(!backend.get_latest_descr(&wrong_failed).is_finish());
+        let guard_descr = backend.get_latest_descr_arc(&wrong_failed);
+        assert_ne!(guard_descr.as_fail_descr().unwrap().adr_jump_offset(), 0);
+
+        backend.set_constants(indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher));
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        backend
+            .compile_bridge(
+                guard_descr.as_fail_descr().unwrap(),
+                &inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(guard_descr.as_fail_descr().unwrap().adr_jump_offset(), 0);
+
+        for (arg, expected) in [
+            (GcRef::NULL, GcRef::NULL),
+            (wrong, wrong),
+            (payload, payload),
+        ] {
+            let frame = backend.execute_token(&token, &[Value::Ref(arg)]);
+            assert!(backend.get_latest_descr(&frame).is_finish());
+            assert_eq!(backend.get_ref_value(&frame, 0), expected);
+        }
+    }
+
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_bridge_materializes_register_ref_inputs_for_resolve_opref_ops() {
