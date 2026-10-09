@@ -8852,6 +8852,23 @@ enum FbwCellStore {
         cell: pyre_object::PyObjectRef,
         before: pyre_object::PyObjectRef,
     },
+    /// A walked `setfield_gc` / `setarrayitem_gc` into an object the walk did
+    /// not allocate, executed as it was recorded (`pyjitpl.py
+    /// execute_and_record`).  `offset` / `size` locate the stored word inside
+    /// `obj` — a field offset, or `base_size + index * item_size` — and
+    /// `before` is what it held.  `managed` is whether the collector owns
+    /// `obj`: only then is it forwarded as a root and re-barriered on undo.
+    Gc {
+        obj: pyre_object::PyObjectRef,
+        offset: usize,
+        size: usize,
+        before: Value,
+        managed: bool,
+        /// `TracePosition::_count` once the store's op was recorded.  A cut
+        /// back past it discards the op, and with it this store
+        /// ([`fbw_gc_store_journal_cut`]).
+        op_count: u32,
+    },
 }
 
 /// One [`FBW_NAMESPACE_STORE_JOURNAL`] entry: the namespace dict a `*_NAME` /
@@ -9246,6 +9263,21 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
                 if !before.is_null() {
                     visitor(unsafe { &mut *(before as *mut pyre_object::PyObjectRef).cast() });
+                }
+            }
+            FbwCellStore::Gc {
+                obj,
+                before,
+                managed,
+                ..
+            } => {
+                if *managed {
+                    visitor(unsafe { &mut *(obj as *mut pyre_object::PyObjectRef).cast() });
+                }
+                if let Value::Ref(before) = before
+                    && before.0 != 0
+                {
+                    visitor(before);
                 }
             }
         }
@@ -14508,11 +14540,11 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx.record_op_with_descr(
                 OpCode::SetarrayitemGc,
                 &[array, index, value],
-                descr,
+                descr.clone(),
             );
             ctx.trace_ctx
                 .heapcache_setarrayitem(array, index, descr_index, value);
-            walker_fill_materialized_array(ctx, array, index, value);
+            walker_execute_setarrayitem_gc(code, op, ctx, 'r', array, index, value, &descr)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),

@@ -700,6 +700,15 @@ pub struct TraceCtx {
     /// which deref's the pointer to invoke `executor::do_getfield_gc_*`.
     /// The fat pointer is `*const dyn Backend` (16 bytes on 64-bit).
     pub(crate) cpu: Option<*const dyn majit_backend::Backend>,
+    /// Called by [`Self::cut_trace`] / [`Self::cut_trace_with_snapshots`]
+    /// with the position the recorder was restored to.  `Trace.cut_at`
+    /// (`opencoder.py`) discards operations `execute_and_record` already
+    /// executed; upstream only cuts where the executed prefix stands
+    /// (`MetaInterp.cancel_count` paths re-enter from a fresh frame), while a
+    /// tracer that cuts to hand the same region to another executor has to
+    /// undo what the discarded operations wrote.  `None` for a tracer with no
+    /// such undo log.
+    pub(crate) cut_observer: Option<fn(&crate::recorder::TracePosition)>,
     // `opref_concrete: HashMap<u32, Value>` retired — the concrete
     // value now lives intrinsically on each frontend object's
     // `value: Cell<Option<Value>>` field (`Op` / `InputArg`), matching
@@ -1033,6 +1042,18 @@ impl TraceCtx {
         if let Some(ref push) = self.portal_trace_push_fn {
             push(jd_no, green_key, pos);
         }
+    }
+
+    /// Install the observer both trace cuts report to (see
+    /// [`Self::cut_observer`]).
+    pub fn set_cut_observer(&mut self, observer: fn(&crate::recorder::TracePosition)) {
+        self.cut_observer = Some(observer);
+    }
+
+    /// Whether a backend is wired, i.e. whether `executor.execute` has
+    /// anything to run against.
+    pub fn has_cpu(&self) -> bool {
+        self.cpu.is_some()
     }
 
     /// Install the `self.metainterp.cpu` analog for the cache-hit
@@ -2216,6 +2237,7 @@ impl TraceCtx {
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
             cpu: None,
+            cut_observer: None,
             bridge_exception_resume_prepared: false,
             bridge_exception_source_pc: None,
             bridge_exception_source_jitcode: None,
@@ -2308,6 +2330,7 @@ impl TraceCtx {
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
             cpu: None,
+            cut_observer: None,
             bridge_exception_resume_prepared: false,
             bridge_exception_source_pc: None,
             bridge_exception_source_jitcode: None,

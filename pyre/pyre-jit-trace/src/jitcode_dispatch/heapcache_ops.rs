@@ -46,6 +46,125 @@ fn concrete_ref_operand_ptr<Sym: WalkSym>(
         .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64)
 }
 
+/// The live value of a store's value operand, or `None` where the walk holds
+/// no executable one.  Same carrier order as [`concrete_ref_operand_ptr`]: the
+/// box's own value, then the typed register shadow.
+fn concrete_store_value_operand<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    value_bank: char,
+    valuebox: OpRef,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<majit_ir::Value> {
+    let known = |value: &majit_ir::Value| match value {
+        majit_ir::Value::Ref(r) => *r != majit_ir::GcRef::NO_CONCRETE && r.0 != usize::MAX,
+        majit_ir::Value::Void => false,
+        _ => true,
+    };
+    valuebox
+        .inline_const_to_value()
+        .or_else(|| ctx.trace_ctx.box_value(valuebox))
+        .filter(known)
+        .or_else(|| {
+            let shadow = match value_bank {
+                'i' => read_int_reg_concrete(code, op, operand_offset, ctx),
+                'r' => read_ref_reg_concrete(code, op, operand_offset, ctx),
+                'f' => read_float_reg_concrete(code, op, operand_offset, ctx),
+                _ => ConcreteValue::Null,
+            };
+            match shadow {
+                ConcreteValue::Int(v) => Some(majit_ir::Value::Int(v)),
+                ConcreteValue::Bool(v) => Some(majit_ir::Value::Int(i64::from(v))),
+                ConcreteValue::Ref(r) => Some(majit_ir::Value::Ref(majit_ir::GcRef(r as usize))),
+                ConcreteValue::Float(v) => Some(majit_ir::Value::Float(v)),
+                ConcreteValue::Null => None,
+            }
+            .filter(known)
+        })
+}
+
+/// The executing half of `execute_and_record` (`pyjitpl.py`) for a
+/// `SETFIELD_GC` / `SETARRAYITEM_GC` into an object this walk did not
+/// allocate: `executor.execute` -> `cpu.bh_setfield_gc_*` /
+/// `bh_setarrayitem_gc_*` performs the store while the op is recorded, so
+/// the heap the rest of the walk executes against — the residual calls it
+/// runs, the fields it reads back — is the one the trace describes.
+///
+/// `obj_ptr + offset` is the `size`-byte word, `ty` its bank, `before` what
+/// it holds.  The displaced word is journaled ([`fbw_gc_store_journal_push`])
+/// because a walk that does not commit hands its region to a replay that
+/// re-executes it against the pre-walk heap.  A store the walk cannot execute
+/// — no live receiver or value, or a word the value's bank cannot fill — is
+/// one only that replay applies, which is what
+/// [`fbw_mark_unjournaled_effect`] records.
+#[allow(clippy::too_many_arguments)]
+fn walker_execute_gc_store<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    obj_ptr: Option<i64>,
+    offset: usize,
+    size: usize,
+    ty: majit_ir::Type,
+    before: Option<majit_ir::Value>,
+    value: Option<majit_ir::Value>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if !ctx.trace_ctx.has_cpu() {
+        return Ok(());
+    }
+    // One word holds either bank: a pointer the jitcode carries in an `i`
+    // register is stored into a ref field as the same bits, and back.
+    let value = value.and_then(|value| match (ty, value) {
+        (majit_ir::Type::Int, majit_ir::Value::Ref(r)) => Some(majit_ir::Value::Int(r.0 as i64)),
+        (majit_ir::Type::Ref, majit_ir::Value::Int(v)) => {
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(v as usize)))
+        }
+        (majit_ir::Type::Int, majit_ir::Value::Int(_))
+        | (majit_ir::Type::Ref, majit_ir::Value::Ref(_))
+        | (majit_ir::Type::Float, majit_ir::Value::Float(_)) => Some(value),
+        _ => None,
+    });
+    let (Some(obj_ptr), Some(before), Some(value)) = (obj_ptr, before, value) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-gc-store] not executed pc={pc} obj={obj_ptr:?} offset={offset} before={before:?} value={value:?}"
+            );
+        }
+        return walker_gc_store_not_executed(ctx, pc);
+    };
+    let obj = obj_ptr as usize as pyre_object::PyObjectRef;
+    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8);
+    // SAFETY: `obj_ptr` is the live receiver the walk is executing over and
+    // `offset` / `size` come from the op's own descr.
+    if unsafe { fbw_gc_store_word(obj, offset, size, value, managed) } {
+        ctx.trace_ctx.set_cut_observer(fbw_gc_store_journal_cut);
+        let op_count = ctx.trace_ctx.get_trace_position()._count;
+        fbw_gc_store_journal_push(obj, offset, size, before, op_count);
+        Ok(())
+    } else {
+        walker_gc_store_not_executed(ctx, pc)
+    }
+}
+
+/// A recorded store the walk could not execute.
+///
+/// Inside a helper descent the body goes on to read what it wrote, so the
+/// walk does not continue past the lost write (the `setfield_raw_i` rule):
+/// the descent declines, the cut undoes the stores it did execute
+/// ([`fbw_gc_store_journal_cut`]) and the call runs as a residual.  The
+/// top-level walk has no call to hand the region to; there the store is one
+/// only the replay applies.
+fn walker_gc_store_not_executed<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if ctx.fbw_mode.inline_subwalk {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+    }
+    fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
+    Ok(())
+}
+
 /// Live `0 <= index < len`.  A Ref bit-pattern in an Int register is
 /// almost never a valid index; on wasm32 it still fits `i32`, so a
 /// magnitude check is not enough.
@@ -340,16 +459,119 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
         OpCode::SetarrayitemGc,
         majit_metainterp::counters::RECORDED_OPS,
     );
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetarrayitemGc,
+        &[array, index, value],
+        descr.clone(),
+    );
     // `upd.setarrayitem(valuebox)` (heapcache.py) parity — the
     // cache stores the Box identity (`value` OpRef); cache-hit
     // readers fetch the intrinsic value via `box_value(cached)` at
     // hit time.
     ctx.trace_ctx
         .heapcache_setarrayitem(array, index, descr_index, value);
-    walker_fill_materialized_array(ctx, array, index, value);
+    walker_execute_setarrayitem_gc(code, op, ctx, value_bank, array, index, value, &descr)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `execute_setarrayitem_gc`'s store (`pyjitpl.py`) into an array this walk
+/// did not allocate; [`walker_fill_materialized_array`] is the same store for
+/// one it did.  Operand layout as [`setarrayitem_gc_via_heapcache`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    value_bank: char,
+    array: OpRef,
+    index: OpRef,
+    value: OpRef,
+    descr: &DescrRef,
+) -> Result<(), DispatchError> {
+    let Some(ad) = descr.as_array_descr() else {
+        return Ok(());
+    };
+    // A block the walk allocated is held by nothing outside it, so its
+    // stores need no undo entry.  The ref-items fill has its own path;
+    // a `Signed` / `Float` block takes the typed store below.
+    let fresh = ctx.trace_ctx.heap_cache().saw_allocation(array)
+        || matches!(
+            ctx.trace_ctx.opcode_of(array),
+            Some(OpCode::NewArray | OpCode::NewArrayClear)
+        );
+    if fresh && ad.is_array_of_pointers() && !ad.is_array_of_structs() {
+        walker_fill_materialized_array(ctx, array, index, value);
+        return Ok(());
+    }
+    if array.is_constant() {
+        return Ok(());
+    }
+    let (base_size, item_size, ty) = (ad.base_size(), ad.item_size(), ad.item_type());
+    let array_ptr = concrete_ref_operand_ptr(code, op, 0, array, ctx);
+    let index_value = index
+        .inline_const_to_value()
+        .or_else(|| ctx.trace_ctx.box_value(index))
+        .and_then(|v| match v {
+            majit_ir::Value::Int(i) => Some(i),
+            _ => None,
+        })
+        .or_else(|| {
+            if index.is_constant() {
+                return None;
+            }
+            match read_int_reg_concrete(code, op, 1, ctx) {
+                ConcreteValue::Int(i) => Some(i),
+                _ => None,
+            }
+        });
+    // The bounds proof `getarrayitem_gc_via_heapcache` asks before its load:
+    // a Ref bit-pattern in the index register must not become a store.
+    // An array with no length word has no bound to read; what is left to
+    // refuse there is the bit-pattern itself, which is no index.
+    let headerless_index = |i: i64| {
+        ad.len_descr().is_none()
+            && if cfg!(target_pointer_width = "64") {
+                (0..=i64::from(u32::MAX)).contains(&i)
+            } else {
+                majit_ir::ptr_info::reasonable_array_index(i)
+            }
+    };
+    let slot = array_ptr.zip(index_value).filter(|&(ptr, i)| {
+        index_in_array_bounds(ctx, ptr, i, descr)
+            || headerless_const_index(index, i, descr)
+            || headerless_index(i)
+    });
+    let before = slot.and_then(|(ptr, i)| ctx.trace_ctx.array_sanity_load(ptr, i, descr, ty));
+    let offset = slot.map_or(0, |(_, i)| base_size + i as usize * item_size);
+    let value = concrete_store_value_operand(code, op, 2, value_bank, value, ctx);
+    if fresh {
+        // `walker_fill_materialized_array`'s rule for a store it cannot
+        // execute: the block is incomplete, so stop naming it as the
+        // array's value.
+        let stored = match (slot, value) {
+            (Some((ptr, _)), Some(value)) if ctx.trace_ctx.has_cpu() => {
+                let block = ptr as usize as pyre_object::PyObjectRef;
+                // SAFETY: `slot` passed the bounds proof against the live block.
+                unsafe { fbw_gc_store_word(block, offset, item_size, value, false) }
+            }
+            _ => false,
+        };
+        if !stored {
+            ctx.trace_ctx
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+        }
+        return Ok(());
+    }
+    walker_execute_gc_store(
+        ctx,
+        slot.map(|(ptr, _)| ptr),
+        offset,
+        item_size,
+        ty,
+        before,
+        value,
+        op.pc,
+    )
 }
 
 /// Walker virtual-force fill — companion to the `NEW_ARRAY_CLEAR`
@@ -959,22 +1181,34 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         // same field hits the cache and trips its `executor.execute`
         // sanity check (`pyjitpl.py`) on the divergence.
         //
-        // Restricted to boxes this walk allocated (`heapcache.new`'s
-        // HF_SEEN_ALLOCATION, set by `new/d>r` and `new_with_vtable/d>r`
-        // right after `execute_new_allocation` hands back a real, zeroed
-        // object).  Nothing outside the walk holds such an object, so the
-        // write needs no journal entry to survive a non-commit rollback —
-        // the abandoned allocation goes with it.  A store into a
-        // pre-existing object stays record-only: that write *is* observable
-        // and would double-apply against the walk's own concrete execution.
-        if ctx.trace_ctx.heap_cache().saw_allocation(obj)
-            && let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
-            && let Some(value) = ctx.trace_ctx.box_value(valuebox)
-        {
-            let struct_ptr = struct_ref.0 as i64;
-            if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                ctx.trace_ctx.field_store(struct_ptr, &descr, value);
+        // A box this walk allocated (`heapcache.new`'s HF_SEEN_ALLOCATION,
+        // set by `new/d>r` and `new_with_vtable/d>r` right after
+        // `execute_new_allocation` hands back a real, zeroed object) is held
+        // by nothing outside the walk, so the write needs no journal entry
+        // to survive a non-commit rollback — the abandoned allocation goes
+        // with it.  A store into a pre-existing object is observable, so
+        // [`walker_execute_gc_store`] journals what it displaces.
+        if ctx.trace_ctx.heap_cache().saw_allocation(obj) {
+            if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
+                && let Some(value) = ctx.trace_ctx.box_value(valuebox)
+            {
+                let struct_ptr = struct_ref.0 as i64;
+                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                    ctx.trace_ctx.field_store(struct_ptr, &descr, value);
+                }
             }
+        } else if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)
+            && let Some(fd) = descr.as_field_descr()
+        {
+            // The standard virtualizable's box carries the trace-stepping
+            // heap copy rather than the live frame
+            // ([`fbw_publish_exit_last_instr`]), so its stores keep their
+            // own concrete counterparts.
+            let (offset, size, ty) = (fd.offset(), fd.field_size(), fd.field_type());
+            let obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
+            let value = concrete_store_value_operand(code, op, 1, value_bank, valuebox, ctx);
+            let before = obj_ptr.and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
+            walker_execute_gc_store(ctx, obj_ptr, offset, size, ty, before, value, op.pc)?;
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
