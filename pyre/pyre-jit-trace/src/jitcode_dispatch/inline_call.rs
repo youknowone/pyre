@@ -802,13 +802,8 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 /// callee it resolved itself (rather than off a CALL) carries a differently
 /// shaped operand list, so it declines such a body up front.
 ///
-/// The CALL-entered `foriter_deferred_admit` route reaches no CALL_ASSEMBLER at
-/// all, so that reason does not apply to it — but a second, independent one
-/// does: a loop header is where a deferred `load_method_self`'s two
-/// operand-stack entries can be crossed by a failing guard.  See the admission
-/// itself, which pairs this predicate with
-/// [`fbw_callee_body_has_two_entry_method_push`] rather than declining
-/// every loop-bearing body.
+/// A loop header is also where a deferred `load_method_self`'s two
+/// operand-stack entries can be crossed by a failing guard.
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
 }
@@ -4443,10 +4438,12 @@ unsafe fn fbw_bind_star_kwargs(
 /// discarded body rewinds cleanly.  Admission is what has to carry that
 /// decision.
 ///
-/// `DeferredCall` is not enough here.  Its promise is that a residual the lever
-/// cannot inline aborts and rewinds to the enclosing CALL, and the FOR_ITER
-/// gate already records why that rewind does not reach a `BINARY_OP` /
-/// `COMPARE_OP` entry: the flush resumes one operand short.
+/// `DeferredCall` is not enough here.  A residual the lever cannot inline
+/// is executed and recorded, or converts in place through
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) when the callee already
+/// has a seeded `PyFrame`.  A `BINARY_OP` / `COMPARE_OP` entry is a
+/// separate rewind region: [`BinopRewindInlineGuard`] refuses the first
+/// commit so a discarded `NotImplemented` descent does not keep its prefix.
 /// Whether a dunder body at a `BINARY_OP` / `COMPARE_OP` entry is a shape
 /// worth attempting on the strength of the entry's rewind.
 ///
@@ -7920,295 +7917,40 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_frame_reg,
         );
     let instance_next_seeded_route = instance_next_foriter_green_key.is_some();
-    // The keyed route bypasses the legacy caller-replay classification, but it
-    // does not inherit that route's DeferredCall admission.
-    let mut foriter_deferred_admit = false;
-    let mut foriter_dirty_seeded_resume_admit = false;
-    // A handler-bearing `DeferredCall` body that `foriter_deferred_admit`
-    // refuses, but that a seeded frame can carry. See the assignment below.
-    let mut seeded_foriter_deferred = false;
-    // The pcs handed to this callee's sub-walk, set by whichever admission
-    // below admitted a body the scan could not prove clean everywhere.
+    // The pcs handed to this callee's sub-walk, set by the branchy-handler
+    // poison reading below. The FOR_ITER-in-flight gate no longer installs
+    // a poison set of its own.
     let mut inline_poison_pcs: Option<std::sync::Arc<[usize]>> = None;
+    // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
+    // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
+    // A seeded frame already exists here, and a walk abort converts through
+    // `convert_and_run_from_pyjitpl` (`blackhole.py`). The remaining terms
+    // are unported OTHER: `code_has_for_iter`, `code_is_self_recursive`,
+    // and the constant-callable screen. That screen pins `Function.code`
+    // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
+    // unwraps — not function identity, so a fresh lambda with one code
+    // object is admitted the same way a closure is.
+    let mut foriter_seeded_admit = false;
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
-        let scan = fbw_callee_body_replay_scan(
-            body.code,
-            &arg_facts,
-            body.num_regs_i,
-            body.constants_i,
-            body.num_regs_r,
-            body.constants_r,
-            callee_descr_refs,
-            RawDescrPool::PerFn(callee_perfn_descrs),
-            method_form,
-        );
-        let safety = scan.verdict();
-        let legacy_admit = match safety {
-            CalleeReplaySafety::Clean => true,
-            CalleeReplaySafety::DeferredCall => {
-                // The deferred promise rests on the abort REWINDING to the
-                // enclosing CALL and re-executing it from scratch, so the
-                // entry has to be a boundary the rewind can name.  What
-                // decides that is the entry opcode's stack effect rather than
-                // whether it is spelled CALL: one that merely peeks its
-                // operands re-executes from the stack it already had.  A
-                // `BINARY_OP` or `COMPARE_OP` entry is not: the flush resumes
-                // one operand short and the whole iteration's contribution is
-                // dropped, silently — the subscript inline observed its index
-                // operand replaced by an unrelated live Ref.  Each caller
-                // states this directly in `entry_is_call_boundary`; the older
-                // `arg_class_guard.is_none()` proxy stood for the same
-                // property and rotted, because the `obj[key]` inline enters
-                // from `BINARY_OP` while passing no `arg_class_guard`.  A
-                // `Clean` body is still admitted from there — it has nothing
-                // that can abort.
-                //
-                // The widened method-form surface — an unbound callee whose
-                // body reads `self.attr` — was admitted here only once the
-                // receiver was proven not to be a type object, because a type
-                // receiver's read went through `type.__getattribute__` and
-                // reached the deferred abort path.  `cls.__name__` on a class
-                // whose metaclass is `type` is traced through the metatype
-                // data descriptor, so that receiver leaves no residual to
-                // abort on.  Any other metaclass still aborts once and is
-                // denied.
-                //
-                // A callee with its own exception handler has protected-region
-                // state that must be restored at the callee's precise resume
-                // point.  If a deferred residual later aborts after a folded
-                // effect, caller-boundary replay can repeat the protected
-                // entry or skip the handler cleanup.  Keep handler-bearing
-                // bodies on the residual path unless this scan proves them
-                // clean.
-                //
-                // A body that owns a loop header puts failing guards between a
-                // deferred `load_method_self` and the `CALL` that consumes the
-                // two operand-stack entries it pushed, and a deopt landing in
-                // that window resumes a frame whose callable slot was never
-                // written — `names(traceback)` in
-                // `synth/exception_reentry_guard_finally_residual` SIGSEGVs in
-                // `classify_callable` on a null callable.  The test is a
-                // superset of the failing shape: `names` also needs an in-window
-                // guard that actually fails, which a plain `self.attr` read
-                // folds away.
-                //
-                // ⚠️This pair is what disqualifies a CALLEE, and that is the
-                // whole of its licence — it is NOT that a method-load is the
-                // only deferred result outliving the next op, which this clause
-                // used to claim.  Measured counterexample: in
-                // `parity_tests/exception_handler_method_load_resume.py` the
-                // CALLER's `out.append(...)` leaves its `LOAD_ATTR name +
-                // NULL|self` pair on the stack across four opcodes, and the
-                // deopt did resume over the unwritten slot — the same SIGSEGV,
-                // through a caller this gate never examines.  What prevents it
-                // is the producer of the flush's operand image refusing to
-                // publish an unresolved null (`collect_call_stack_overrides`),
-                // not any admission test here.
-                let loop_header_admitted = !body_facts.owns_loop_header
-                    || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
-                foriter_deferred_admit = entry_is_call_boundary
-                    && loop_header_admitted
-                    && !pyre_interpreter::code_has_for_iter(callee_code)
-                    && !body_facts.has_exception_table;
-                // `perform_call` (`pyjitpl.py`) inlines this callee into the
-                // loop being traced and does not also publish it as its own
-                // portal. `foriter_deferred_admit` still refuses
-                // `has_exception_table`. A seeded frame (`try_multiframe` /
-                // `strict_seed`) is the resume coordinate `seeded_deferred`
-                // accepts below, so the same body must reach that admit:
-                // declining here residualizes the call, the callee crosses
-                // `increment_function_threshold` (`warmstate.py`), and
-                // `finish_and_compile` (`compile.py`) attaches a second entry
-                // bridge.
-                seeded_foriter_deferred = (try_multiframe || strict_seed)
-                    && entry_is_call_boundary
-                    && loop_header_admitted
-                    && !pyre_interpreter::code_has_for_iter(callee_code);
-                if !foriter_deferred_admit && fbw_inline_diag_enabled() {
-                    eprintln!(
-                        "[inline-foriter-deferred] pc={} boundary={entry_is_call_boundary} \
-                         header={loop_header_admitted} for_iter={} exc_table={}",
-                        op.pc,
-                        pyre_interpreter::code_has_for_iter(callee_code),
-                        body_facts.has_exception_table,
-                    );
-                }
-                foriter_deferred_admit
-            }
-            CalleeReplaySafety::Dirty => {
-                // The generated resume chain is sound once `try_multiframe` or
-                // `strict_seed` gives the callee a seeded frame.  That frame
-                // makes each in-callee guard carry the callee's own resume
-                // coordinate, so deopt does not replay the whole body from the
-                // caller's CALL boundary.  A stored bound method reaches the
-                // path on `bound_method` alone; one that also meets these terms
-                // takes the same screen exemption below.
-                //
-                // `callable_guard_op.is_constant()` is not part of that
-                // argument.  The operand is pinned by a `GuardValue` either
-                // way, so a varying callable is inlined soundly; what the term
-                // screens is whether that guard holds.  Dropping it admits
-                // `self.cb(...)` and a `__getitem__` reached through a closure
-                // cell (1088 ns to 191 on an attr-callee loop) and buys a guard
-                // failure per iteration wherever the operand really varies:
-                // 9 `bench/synth` fixtures per backend moved together,
-                // `guard_failures` 210 -> 1007, `bridges_compiled` 1 -> 5,
-                // `loops_aborted` 1 -> 2.  Narrowing it to `!contains_raise`
-                // reproduces those numbers unchanged -- the regressing callees
-                // do not raise -- so the term is not standing in for the
-                // raising-chain resume shape either.  Widening it wants a
-                // predicate for "this non-constant operand is monomorphic
-                // across the loop", which nothing here computes.
-                //
-                // The callee's own exception table is NOT a term here.  It was
-                // one because the route was written for handler-bearing bodies,
-                // not because the resume coordinate needs a handler: what the
-                // seeded frame answers is where a deopt lands, which is the same
-                // question for a body with no `try` at all.  Requiring it
-                // refused 17 sites in 14 `bench/synth` fixtures that met every
-                // other term — `entry_is_call_boundary`, a constant callable,
-                // depth 0, and `try_multiframe` — for having no handler, while
-                // the same body carrying one was admitted.  `pyjitpl.py`
-                // `perform_call` pushes a real `MIFrame` for every callee
-                // `can_inline_callable` admits and tests no exception table
-                // anywhere.  The screen exemption below is unaffected: it is
-                // reached only when `branchy_handler_scan` is `Some`, which
-                // itself requires `has_exception_table`.
-                // `try_multiframe` is `!strict_inlinable`, so asking for it
-                // alone refuses the SIMPLEST callee by construction: a
-                // straight-line leaf passes `callee_fast_path_inlinable`, is
-                // therefore strict, and is therefore never multiframe-eligible,
-                // while a branchier body with the same effects is admitted.
-                // What the term is standing in for is the warrant below — the
-                // callee owns a seeded frame, so an in-callee guard carries the
-                // callee's OWN resume coordinate rather than collapsing to the
-                // caller's CALL boundary — and `strict_seed` seeds one too.
-                // The two routes are an either/or, not a ladder.
-                //
-                // Neither carries a depth term of its own here, because each
-                // already declares the depth its resume machinery is proven to:
-                // `strict_seed` stops at `fbw_max_multiframe_depth`, and
-                // `try_multiframe` at `fbw_effective_multiframe_depth`, which
-                // reads the raising-chain and recursion cases separately.  The
-                // `inline_depth < 2` that stood here was `framestack.len() < 2`
-                // from the bare-reraise predicate this grew out of, where "one
-                // paused caller" bounded the re-raise chain specifically; it
-                // outlived that predicate the way `has_exception_table` did.
-                // Two is far under what both routes admit, so it was the whole
-                // bound in practice: a third Python frame residualized however
-                // straight-line it was, which is a two-deep helper called from
-                // any dunder at all.
-                // A closure's green key is `Function.code` (`function.py`
-                // `getcode`), not the function object.  `guards_the_callee_function`
-                // reads that field and threads the cells as red getfields, so a
-                // `def` inside the caller — a fresh function on every call, one
-                // code object — can inline.  The predicate is that flag, not
-                // `has_closure` alone: a guard operand that is not the callee
-                // still pins identity (`GuardValue`), and a fresh function
-                // fails that guard on every call.  A non-closure operand keeps
-                // the constant screen: dropping it inlined `self.cb(...)`
-                // wherever the callable really varied.
-                // A class-pinned `__call__` receiver selects one function for
-                // every instance the same way, with no identity guard on the
-                // operand.
-                let seeded_callee_resume = (try_multiframe || strict_seed)
-                    && (callable_guard_op.is_constant()
-                        || receiver_pinned_by_class
-                        || (has_closure && guards_the_callee_function));
-                // The handler exemption below was measured on a CALL entry
-                // (`blackhole_inlined_callee_local_after_escape_declined`).
-                // A seeded frame does not widen that exemption.
-                foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
-                // A seeded callee frame resumes inside the callee, so the
-                // caller's opcode is not re-executed and does not have to be
-                // a boundary the flush can name.  `perform_call`
-                // (`pyjitpl.py`) pushes that MIFrame for every callee
-                // `can_inline_callable` admits.  This is what lets a mutating
-                // `__format__` inline at FORMAT_WITH_SPEC: the opcode pops
-                // both operands, `entry_is_call_boundary` stays false so a
-                // non-str result still declines to the residual, and the
-                // `self.calls += 1` store is `Dirty`.  An unseeded bound
-                // method still needs the boundary, because its flush replays
-                // the entry opcode.
-                let foriter_dirty_bound = (seeded_callee_resume
-                    || (entry_is_call_boundary && bound_method.is_some()))
-                    && !pyre_interpreter::code_has_for_iter(callee_code)
-                    && !pyre_interpreter::code_is_self_recursive(callee_code);
-                if !foriter_dirty_bound && fbw_inline_diag_enabled() {
-                    eprintln!(
-                        "[inline-foriter-dirty] pc={} boundary={entry_is_call_boundary} \
-                         bound={} exc_table={} const_callable={} depth={inline_depth} \
-                         mf={try_multiframe} strict={strict_inlinable} for_iter={} selfrec={}",
-                        op.pc,
-                        bound_method.is_some(),
-                        body_facts.has_exception_table,
-                        callable_guard_op.is_constant(),
-                        pyre_interpreter::code_has_for_iter(callee_code),
-                        pyre_interpreter::code_is_self_recursive(callee_code),
-                    );
-                }
-                foriter_dirty_bound
-            }
-        };
-        if fbw_inline_diag_enabled() {
+        let seeded_callee_resume = (try_multiframe || strict_seed)
+            && (callable_guard_op.is_constant()
+                || receiver_pinned_by_class
+                || guards_the_callee_function);
+        foriter_seeded_admit = seeded_callee_resume
+            && !pyre_interpreter::code_has_for_iter(callee_code)
+            && !pyre_interpreter::code_is_self_recursive(callee_code);
+        if !foriter_seeded_admit && fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} numeric_args={} \
-                 rewind_built_arg={rewind_built_arg:?} \
-                 safety={safety:?} deferred_admit={foriter_deferred_admit}",
+                "[inline-foriter-gate] pc={} seeded_admit={foriter_seeded_admit} \
+                 const_callable={} mf={try_multiframe} strict={strict_inlinable} \
+                 for_iter={} selfrec={} guards_fn={guards_the_callee_function}",
                 op.pc,
-                arg_facts.iter().filter(|arg| arg.numeric).count(),
+                callable_guard_op.is_constant(),
+                pyre_interpreter::code_has_for_iter(callee_code),
+                pyre_interpreter::code_is_self_recursive(callee_code),
             );
         }
-        // A body the verdict declined gets a second reading against the pcs the
-        // scan poisoned rather than the collapsed verdict.  Purely additive:
-        // `legacy_admit` above is unchanged, so nothing that inlined before
-        // stops, and only a body that would have residualized is reconsidered.
-        //
-        // `code_has_for_iter` is gone from this reading because the poison set
-        // subsumes it.  A `FOR_ITER` compiles to a `ForIterNext` residual and
-        // its mandatory `GET_ITER` to a `MayForce` one, neither of which the
-        // scan accepts, so both are poisoned pcs — and refusing AT them is the
-        // stronger test.  The `CodeObject` predicate asks whether a `for`
-        // appears anywhere in the callee; this asks whether the walk reached
-        // it.  `operator.itemgetter.__call__` is the difference: its
-        // multi-index arm builds a tuple with a comprehension that a
-        // single-index call never enters.
-        //
-        // `has_exception_table` goes the same way, and for the same reason.  It
-        // is not an op the walk arrives at but a REGION a guard can deopt
-        // inside, so what replaces it is not the poison set but
-        // `scan.protected` — the pcs the callee's own handlers cover.  Refusing
-        // on ENTERING one means no handler is ever in play on the walked path,
-        // which is the whole of what the `CodeObject` predicate was standing in
-        // for.
-        let poisoned = scan.poison_with_protected();
-        let poison_admit = fbw_inline_poison_enabled()
-            && !legacy_admit
-            && scan.enforceable()
-            && !poisoned.is_empty()
-            && match scan.safety {
-                CalleeReplaySafety::Clean => true,
-                CalleeReplaySafety::DeferredCall => {
-                    let loop_header_admitted = !body_facts.owns_loop_header
-                        || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
-                    entry_is_call_boundary && loop_header_admitted
-                }
-                // The scan reports this only when it could not model the body,
-                // which `enforceable` already excluded.
-                CalleeReplaySafety::Dirty => false,
-            };
-        if fbw_inline_diag_enabled() && !poisoned.is_empty() {
-            eprintln!(
-                "[inline-poison] pc={} admit={poison_admit} safety={:?} poison={:?} protected={:?}",
-                op.pc, scan.safety, scan.poison, scan.protected,
-            );
-        }
-        if poison_admit {
-            inline_poison_pcs = Some(poisoned.into());
-        }
-        // A Dirty body is admitted only when the CALL boundary can seed its
-        // own MIFrame. Non-call specializer entries remain residual.
-        if !legacy_admit && !poison_admit && !seeded_foriter_deferred {
+        if !foriter_seeded_admit {
             return resolved_inline_decline(op.pc, line!());
         }
     }
@@ -8378,7 +8120,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     }
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
-        && !foriter_dirty_seeded_resume_admit
+        && !foriter_seeded_admit
         && !branchy_poison_admit
         && !seeded_deferred
         && !handler_reraise_admit
@@ -10627,6 +10369,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // and it keeps a legal program from killing the enclosing
                     // loop's trace, which `callee_inline_unsupported` would.
                     return resolved_inline_decline(op.pc, line!());
+                }
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::Format) {
+                    // `descroperation.py format` checks `isinstance_w(w_res,
+                    // w_unicode)` after `__format__` returns. Pin the observed
+                    // str class before the destination write so a later
+                    // non-str deopts with the FORMAT_WITH_SPEC result slot
+                    // still pending; `OperatorTail::Format` is the resume
+                    // level that runs the same check when a guard inside the
+                    // inlined body fails (`crate::operator_continuation`).
+                    let concrete = match concrete_for_shadow {
+                        ConcreteValue::Ref(obj) if !obj.is_null() => obj,
+                        _ => return resolved_inline_decline(op.pc, line!()),
+                    };
+                    let result_type = unsafe { (*concrete).ob_type } as i64;
+                    let result_type_const = ctx.trace_ctx.const_int(result_type);
+                    walker_emit_guard_with_snapshot(
+                        ctx,
+                        op.pc,
+                        OpCode::GuardClass,
+                        &[value, result_type_const],
+                    )?;
+                    ctx.trace_ctx.heap_cache_mut().class_now_known(value);
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
                     // `len` runs `space.index` on what `__len__` returned,
@@ -13515,8 +13279,6 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         Some((arg, concrete_arg, w_type, version_tag, cell_guard)),
         None,
         // The entry is the `range(...)` CALL this `__index__` is nested in.
-        // `foriter_deferred_admit` rewinds a `DeferredCall` body to that CALL,
-        // which is what admits the body inside a `for`.
         // `index_inline_sample_safe` is what makes the re-run free.
         true,
         false,
@@ -13647,14 +13409,11 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag, cell_guard)),
         None,
-        // `entry_is_call_boundary`, for the reason the forward-dunder route
-        // gives: what decides it is whether the abort can name this entry as
-        // a resume coordinate, not whether the entry is spelled CALL.
-        // Saying `false` here cost the whole route inside a `for`, where
-        // `foriter_dirty_bound` has it as a term and refused every subscript
-        // the loop walked.  There is no rewind arm to guard: `__getitem__`
-        // has no reflected half, so no body reached here can answer
-        // `NotImplemented` and demand its descent be taken back.
+        // `entry_is_call_boundary`. What decides it is whether the abort
+        // can name this entry as a resume coordinate, not whether the entry
+        // is spelled CALL. `__getitem__` has no reflected half, so no body
+        // reached here can answer `NotImplemented` and demand its descent
+        // be taken back.
         binop_rewind_enabled(),
         false,
         None,
@@ -16725,11 +16484,9 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
     }
 
     // If this straight-line body is safe to sample, refuse a bad result
-    // before the sub-walk emits anything.  The shared `require_str_result`
-    // fallback latches a Python CALL boundary; FORMAT_WITH_SPEC is not one,
-    // so replaying it from that latch skips the interpreter's TypeError check.
-    // This is the format sibling of the sample in
-    // `try_walker_inline_exception_string_override`.
+    // before the sub-walk emits anything.  `require_str_result` still
+    // declines a record-time non-str; this sample is the format sibling of
+    // the one in `try_walker_inline_exception_string_override`.
     if let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) {
         if body_facts.exc_override_sample_safe {
             let sampled = {
@@ -16754,7 +16511,8 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_value),
         ConcreteValue::Ref(concrete_spec),
     ];
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -16781,46 +16539,32 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             inline_attr_cell_guard(w_class, "__format__", method)
         })),
         None,
-        // FORMAT_WITH_SPEC pops both operands, so this stays false: a
-        // non-str result has no CALL boundary to latch and declines to the
-        // residual, which raises `descroperation.py` `format`'s TypeError.
-        // A mutating body still inlines.  `foriter_dirty_bound` admits it
-        // once `strict_seed` gives the callee its own frame, and
-        // `perform_call` (`pyjitpl.py`) resumes inside that frame rather
-        // than re-executing this opcode.
+        // FORMAT_WITH_SPEC is not a Python CALL. A record-time non-str
+        // declines to the residual (`require_str_result`); a guard inside
+        // the inlined body resumes through `OperatorTail::Format`, which
+        // runs `DescrOperation.format`'s post-call str check.
         false,
-        // `__format__` returning a non-string is a TypeError the interpreter
-        // raises; the plumbing guards the inlined result is a string so that
-        // check keeps its meaning on the compiled path.
+        // `__format__` returning a non-string is a TypeError
+        // `call_format_dispatch_w` raises; `require_str_result` keeps that
+        // at record time, and `OperatorTail::Format` keeps it on deopt.
         true,
         None,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    if matches!(inlined.0, DispatchOutcome::Continue) {
-        // `space.format` checks `isinstance_w(result, str)` after the app-level
-        // call.  Pin the concrete string class observed by this trace: an
-        // exact str and each accepted str subclass get their own guarded
-        // version, while a later non-string result deopts to the residual that
-        // raises the faithful TypeError.
-        let result = ctx.registers_r.get(dst).expect("ref register in range");
-        let concrete_result = match concrete_from_recorded_opref(ctx, result) {
-            ConcreteValue::Ref(obj) => obj,
-            other => unreachable!("accepted __format__ result is not a Ref: {other:?}"),
-        };
-        debug_assert!(
-            !concrete_result.is_null() && unsafe { pyre_object::is_str(concrete_result) }
-        );
-        let result_type = unsafe { (*concrete_result).ob_type } as i64;
-        let result_type_const = ctx.trace_ctx.const_int(result_type);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[result, result_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().class_now_known(result);
+        None,
+        false,
+        None,
+        None,
+        Some(crate::operator_continuation::OperatorTail::Format),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    // A refused result — `__format__` answering a non-str — declines from
+    // inside the call above after the body has been walked. Cut that
+    // emission back so the caller's residual runs the operator itself.
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
-    Ok(Some(inlined))
+    Ok(inlined)
 }
 
 /// State taken before a protocol-dunder inline so a non-bool result can be

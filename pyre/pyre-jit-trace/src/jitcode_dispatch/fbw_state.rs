@@ -3554,18 +3554,12 @@ pub(crate) enum CalleeReplaySafety {
     /// Clean apart from Python-level CALL residuals, whose callee is resolved
     /// only at walk time.
     ///
-    /// This variant and the deferred arm of the nested-residual abort are ONE
-    /// contract, not two independent gates: the admission is sound only
-    /// because a residual the lever could not inline aborts BEFORE executing
-    /// and rewinds to the enclosing CALL (see the enforcer above, which states
-    /// the same promise from the other side).  Retiring the abort on its own
-    /// leaves the admission standing on a promise nothing enforces.
-    ///
-    /// The axis is the EXECUTED-EFFECT delta, not raising — the rewind leg is
-    /// gated on `fbw_executed_effect_count() == entry_executed_effects`.  A
-    /// narrowing keyed on "can this body raise" would admit a `list.append`
-    /// residual, which raises nothing and is exactly what the arm must catch,
-    /// so `EffectInfo::check_can_raise` is not the predicate for this decision.
+    /// A residual the lever cannot inline is executed and recorded as
+    /// `do_residual_call` (`pyjitpl.py`) does, or converts through
+    /// `convert_and_run_from_pyjitpl` (`blackhole.py`) when the inlined
+    /// callee already has a seeded `PyFrame`.  The BINARY_OP / COMPARE_OP
+    /// `NotImplemented` cut is a separate rewind region
+    /// (`BinopRewindInlineGuard`).
     ///
     /// There is no upstream counterpart to defer against: `look_inside_graph`
     /// (`codewriter/policy.py`) and `can_inline_callable`
@@ -3697,11 +3691,9 @@ impl CalleeReplayScan {
 ///
 /// A Python-level CALL residual is the one shape this static scan cannot
 /// settle: its callee is a runtime value, so whether the sub-walk inlines it
-/// (leaving nothing to replay) or executes it (which may write) is known only
-/// at the call.  Those bodies report [`CalleeReplaySafety::DeferredCall`] and
-/// the lever decides at the call — see
-/// [`fbw_abort_nested_unjournaled_residual`], which aborts before executing a
-/// residual that did not inline.  Every other unproven residual is `Dirty`.
+/// or executes it (which may write) is known only at the call.  Those bodies
+/// report [`CalleeReplaySafety::DeferredCall`].  Every other unproven residual
+/// is `Dirty`.
 ///
 /// A `new_with_vtable/d>r` or `new_array*` result is fresh within this body.
 /// A `setfield_gc` initialization write into one is benign only when the
@@ -4424,17 +4416,13 @@ fn fbw_callee_body_replay_scan_rec(
             // body rather than what the verdict says.  The helper is emitted
             // only by the `push_exc_info` lowering, so a body carrying it owns
             // an exception table; `verdict()` collapses to `Dirty` on any
-            // poison, `Dirty` reaches `foriter_dirty_bound`, and a
-            // `foriter_dirty_bound` inline that survives has a seeded frame
-            // (`inline_call.rs` declines it without one) -- the
-            // `MetaInterp.perform_call` shape, which in `pyjitpl.py` is the
-            // ONLY way a callee body is inlined at all.  Dropping the poison
-            // promotes the body to `DeferredCall`, whose admission forbids an
-            // exception table outright because ITS abort rewinds to the
-            // caller's CALL: seven `bench/synth` fixtures lose the inline, and
-            // widening that admission does not give it back, because the two
-            // routes do not produce the same inline.  Make the deferred route
-            // frame a handler-bearing callee before making this scan accurate.
+            // poison.  A Dirty handler-bearing body that inlines does so
+            // through a seeded frame (`inline_call.rs` declines it without
+            // one) -- the `MetaInterp.perform_call` shape, which in
+            // `pyjitpl.py` is the ONLY way a callee body is inlined at all.
+            // Dropping the poison promotes the body to `DeferredCall`.  Make
+            // the deferred route frame a handler-bearing callee before making
+            // this scan accurate.
             let provably_side_effect_free = replay_safe_read
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
@@ -4567,11 +4555,8 @@ fn fbw_callee_body_replay_scan_rec(
                 // other helper on this list its result is TWO operand-stack
                 // entries that stay live from the `LOAD_ATTR` all the way to
                 // the matching `CALL`.  A guard failing inside that window
-                // resumes a frame whose callable slot was never written, so
-                // widening it past a method-form body needs
-                // `foriter_deferred_admit`'s loop-header check to account for
-                // it (`fbw_callee_body_has_two_entry_method_push`).  Keep
-                // the surface where it was.
+                // resumes a frame whose callable slot was never written.
+                // Keep the surface where it was.
                 let defer_truth_or_method_self = match ei.runtime_helper {
                     majit_ir::RuntimeHelperKind::LoadMethodSelf => method_form_deferred_helpers,
                     majit_ir::RuntimeHelperKind::Truth => true,
@@ -4910,47 +4895,6 @@ fn fbw_callee_body_replay_scan_rec(
         },
         returned_fresh_ref == Some(true),
     )
-}
-
-/// True iff the body carries a residual that pushes a two-entry method form.
-///
-/// `LOAD_ATTR name + NULL|self` pushes TWO operand-stack entries that stay live
-/// from that opcode until the matching `CALL` consumes them, which is as far
-/// apart as the argument expressions make it.  Every other deferred helper's
-/// result is consumed by the very next op.  A body that owns a loop header puts
-/// guards inside that window, so it is the one shape where a deopt can land
-/// between the push and the call.
-///
-/// `LOAD_SUPER_ATTR`'s method form pushes the same two entries through its own
-/// pair of `super_attr_unwrap` residuals, so it belongs to the same shape.  It
-/// could not reach this window while those residuals poisoned the body out of
-/// its inline; once they carry replay-safe standing it can.
-pub(crate) fn fbw_callee_body_has_two_entry_method_push(
-    body_code: &[u8],
-    callee_descr_refs: &[DescrRef],
-) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(op) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
-        };
-        if op.opname.starts_with("residual_call")
-            && residual_call_descr_index_in_body(body_code, &op)
-                .and_then(|index| callee_descr_refs.get(index))
-                .and_then(|descr| descr.as_call_descr())
-                .is_some_and(|descr| {
-                    matches!(
-                        descr.get_extra_info().runtime_helper,
-                        majit_ir::RuntimeHelperKind::LoadMethodSelf
-                            | majit_ir::RuntimeHelperKind::SuperAttrUnwrap
-                    )
-                })
-        {
-            return true;
-        }
-        pc = op.next_pc;
-    }
-    false
 }
 
 pub(crate) fn fbw_callee_body_has_binary_op_residual(
