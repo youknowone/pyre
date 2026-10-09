@@ -900,26 +900,15 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
 /// [`drop_guarded_gc_write_barriers`] drops when the store it guards
 /// follows. `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
-///
-/// `celldict::object_mutable_cell_write_barrier` is `write_cell`'s
-/// spelling of the barrier on `w_cell.w_value = w_value`. A cell is
-/// outside the collector only when `lltype::malloc_typed_managed` ran
-/// before the GC alloc hook was installed; the product installs every
-/// pyre-object hook at boot (`init_jit_hooks` phase A →
-/// `init_gc_subsystem` → `install_pyre_object_hooks`), before any
-/// interpreter state exists, so every cell compiled code can store into
-/// is collector-owned and the call is the `gc_hook` barrier.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };
-    matches!(
-        (module.as_str(), leaf.as_str()),
-        (
-            "gc_hook",
+    module == "gc_hook"
+        && matches!(
+            leaf.as_str(),
             "try_gc_write_barrier" | "try_gc_write_barrier_managed"
-        ) | ("celldict", "object_mutable_cell_write_barrier")
-    )
+        )
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
@@ -1013,18 +1002,13 @@ fn canonical_gc_base(
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
 /// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
-/// that barrier as an explicit `try_gc_write_barrier(obj)` (or
-/// `celldict::object_mutable_cell_write_barrier` from `write_cell`) right
-/// before the store it guards, so the call is dropped only when a GC
-/// `FieldWrite` / `ArrayWrite` of the same base follows it in the same
-/// block: that store lowers to the op the backend barriers. Any other
-/// barrier stays residual.
+/// that barrier as an explicit `try_gc_write_barrier(obj)` right before the
+/// store it guards, so the call is dropped only when a GC `FieldWrite` /
+/// `ArrayWrite` of the same base follows it in the same block: that store
+/// lowers to the op the backend barriers. Any other barrier stays residual.
 ///
-/// The bool-returning `gc_hook` result becomes `true`: the hook is
-/// installed before any compiled code runs. The unit-returning
-/// `celldict::object_mutable_cell_write_barrier` result becomes
-/// `ConstNone`, the unit-constant binding `front/mir.rs` uses for
-/// `type_write_barrier`.
+/// The result becomes `true`: the hook is installed before any compiled
+/// code runs.
 fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let aliases = std::collections::HashMap::new();
     let mut drops: Vec<(usize, usize)> = Vec::new();
@@ -1062,13 +1046,7 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     }
     for (bi, oi) in drops {
         let op = &mut graph.blocks[bi].operations[oi];
-        op.kind = match &op.kind {
-            OpKind::Call {
-                result_ty: ValueType::Void,
-                ..
-            } => OpKind::ConstNone,
-            _ => OpKind::ConstBool(true),
-        };
+        op.kind = OpKind::ConstBool(true);
     }
 }
 
@@ -23676,18 +23654,6 @@ mod tests {
         }
     }
 
-    fn cell_wb_call(obj: &crate::flowspace::model::Variable) -> OpKind {
-        OpKind::Call {
-            target: CallTarget::function_path([
-                "pyre_object",
-                "celldict",
-                "object_mutable_cell_write_barrier",
-            ]),
-            args: crate::model::call_args(vec![obj.clone()]),
-            result_ty: ValueType::Void,
-        }
-    }
-
     fn wb_store(
         obj: &crate::flowspace::model::Variable,
         stored: &crate::flowspace::model::Variable,
@@ -23745,8 +23711,7 @@ mod tests {
     }
 
     /// Only the `gc_hook` barrier is this op: a same-named leaf in another
-    /// module is an ordinary call. Same for
-    /// `celldict::object_mutable_cell_write_barrier`.
+    /// module is an ordinary call. `write_cell` spells `try_gc_write_barrier`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -23761,55 +23726,6 @@ mod tests {
             "try_gc_write_barrier"
         ])));
         assert!(!is_gc_write_barrier_path(&path(&["try_gc_write_barrier"])));
-        assert!(is_gc_write_barrier_path(&path(&[
-            "pyre_object",
-            "celldict",
-            "object_mutable_cell_write_barrier"
-        ])));
-        assert!(!is_gc_write_barrier_path(&path(&[
-            "pyre_object",
-            "other",
-            "object_mutable_cell_write_barrier"
-        ])));
-    }
-
-    /// `rewrite.py handle_write_barrier_setfield` owns the barrier on
-    /// SETFIELD_GC: `write_cell`'s explicit celldict barrier right
-    /// before the GC store it guards does not survive as a residual
-    /// helper. The call returns `()`; the dropped op is `ConstNone`.
-    #[test]
-    fn celldict_write_barrier_before_its_store_is_dropped() {
-        let mut graph = FunctionGraph::new("cell_wb_drop");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(entry, cell_wb_call(&obj), false);
-        graph.push_op_var(entry, wb_store(&obj, &stored), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        let ops = &graph.blocks[entry.0].operations;
-        assert!(matches!(ops[0].kind, OpKind::ConstNone));
-        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
-    }
-
-    /// A celldict barrier whose argument has no GC store after it in
-    /// its block stays a residual call — dropping it would be a GC hole.
-    #[test]
-    fn celldict_write_barrier_without_following_store_stays_residual() {
-        let mut graph = FunctionGraph::new("cell_wb_keep");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(entry, wb_store(&obj, &stored), false);
-        graph.push_op_var(entry, cell_wb_call(&obj), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        assert!(is_wb_call(&graph.blocks[entry.0].operations[1].kind));
-
-        let mut graph = FunctionGraph::new("cell_wb_keep_alone");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(entry, cell_wb_call(&obj), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
     }
 
     #[test]
