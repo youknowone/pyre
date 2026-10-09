@@ -37,9 +37,10 @@ fn struct_passwd_type() -> pyre_object::PyObjectRef {
 /// inputs raise TypeError via `int_w`.
 #[cfg(unix)]
 fn pwd_uid_converter(
-    w_uid: pyre_object::PyObjectRef,
+    mut w_uid: pyre_object::PyObjectRef,
 ) -> Result<libc::uid_t, pyre_interpreter::PyError> {
-    let val = match pyre_interpreter::baseobjspace::int_w(w_uid) {
+    let val = match pyre_object::with_roots!(w_uid => pyre_interpreter::baseobjspace::int_w(w_uid))
+    {
         Ok(v) => v,
         Err(e) if matches!(e.kind, pyre_interpreter::PyErrorKind::OverflowError) => {
             return Err(pyre_interpreter::PyError::overflow_error(
@@ -65,6 +66,91 @@ fn pwd_uid_converter(
     Ok(uid)
 }
 
+/// `interp_pwd.py` `eci` and `external()`: `includes=['pwd.h']`,
+/// `releasegil=False`, no `save_err`.
+mod ll {
+    use majit_rlib::rffi::CCHARP;
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["pwd.h"],
+        };
+    }
+
+    macro_rules! external {
+        ($($t:tt)*) => {
+            majit_rlib::rffi::llexternal!($($t)*, compilation_info = ECI, releasegil = false);
+        };
+    }
+
+    external!(
+        pub(super) c_getpwuid = "getpwuid",
+        [libc::uid_t],
+        *mut libc::passwd
+    );
+    external!(
+        pub(super) c_getpwnam = "getpwnam",
+        [CCHARP],
+        *mut libc::passwd
+    );
+    external!(
+        pub(super) c_setpwent = "setpwent",
+        [],
+        ()
+    );
+    external!(
+        pub(super) c_getpwent = "getpwent",
+        [],
+        *mut libc::passwd
+    );
+    external!(
+        pub(super) c_endpwent = "endpwent",
+        [],
+        ()
+    );
+}
+
+/// `interp_pwd.py make_struct_passwd`. String fields are copied with
+/// `charp2str` immediately: `getpwent` (and `getpwuid` / `getpwnam`) may
+/// return a pointer into a static buffer.
+fn make_struct_passwd(pw: *mut libc::passwd) -> pyre_object::PyObjectRef {
+    let name = unsafe { majit_rlib::rffi::charp2str((*pw).pw_name.cast()) };
+    let passwd = unsafe { majit_rlib::rffi::charp2str((*pw).pw_passwd.cast()) };
+    let gecos = unsafe { majit_rlib::rffi::charp2str((*pw).pw_gecos.cast()) };
+    let dir = unsafe { majit_rlib::rffi::charp2str((*pw).pw_dir.cast()) };
+    let shell = unsafe { majit_rlib::rffi::charp2str((*pw).pw_shell.cast()) };
+    let uid = unsafe { (*pw).pw_uid } as i64;
+    let gid = unsafe { (*pw).pw_gid } as i64;
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &name,
+    )));
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &passwd,
+    )));
+    fields.push(pyre_object::w_int_new(uid));
+    fields.push(pyre_object::w_int_new(gid));
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &gecos,
+    )));
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &dir,
+    )));
+    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+        &shell,
+    )));
+    pyre_interpreter::_structseq::new_instance(struct_passwd_type(), fields.take())
+}
+
+/// `getpwall`'s `try`/`finally`: `c_endpwent` runs on every exit.
+struct EndpwentOnDrop;
+
+impl Drop for EndpwentOnDrop {
+    fn drop(&mut self) {
+        unsafe { ll::c_endpwent() };
+    }
+}
+
 /// pwd module — `pypy/module/pwd/interp_pwd.py`.
 ///
 /// getpwuid / getpwnam / getpwall return 7-tuples with the
@@ -76,22 +162,10 @@ fn pwd_uid_converter(
 /// (so `pw_entry.pw_name` returns a string) is a framework prereq
 /// tracked separately.
 ///
-/// Backed by `rustpython_host_env::pwd` (a thin `nix` wrapper).
+/// Calls `c_getpwuid` / `c_getpwnam` / `c_setpwent` / `c_getpwent` /
+/// `c_endpwent`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    #[cfg(feature = "host_env")]
-    fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_str_new_managed(&pw.name));
-        fields.push(pyre_object::w_str_new_managed(&pw.passwd));
-        fields.push(pyre_object::w_int_new(pw.uid as i64));
-        fields.push(pyre_object::w_int_new(pw.gid as i64));
-        fields.push(pyre_object::w_str_new_managed(&pw.gecos));
-        fields.push(pyre_object::w_str_new_managed(&pw.dir));
-        fields.push(pyre_object::w_str_new_managed(&pw.shell));
-        pyre_interpreter::_structseq::new_instance(struct_passwd_type(), fields.take())
-    }
-
     // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
     pyre_interpreter::module_ns_store(ns, "struct_passwd", struct_passwd_type());
     pyre_interpreter::module_ns_store(ns, "struct_pwent", struct_passwd_type());
@@ -112,7 +186,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // than maximum".  `interp_pwd.py getpwuid` catches
                 // OverflowError and converts it to KeyError "uid not
                 // found".
-                let uid = match pwd_uid_converter(args[0]) {
+                let mut w_uid = args[0];
+                let uid = match pyre_object::with_roots!(w_uid => pwd_uid_converter(w_uid)) {
                     Ok(u) => u,
                     Err(e) if matches!(e.kind, pyre_interpreter::PyErrorKind::OverflowError) => {
                         return Err(pyre_interpreter::PyError::key_error(
@@ -121,16 +196,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     Err(e) => return Err(e),
                 };
-                match rustpython_host_env::pwd::getpwuid(uid) {
-                    Ok(Some(pw)) => Ok(make_struct_passwd(&pw)),
-                    Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
+                let pw = pyre_object::with_roots!(w_uid => unsafe { ll::c_getpwuid(uid) });
+                if pw.is_null() {
+                    Err(pyre_interpreter::PyError::key_error(format!(
                         "getpwuid(): uid not found: {}",
                         uid as i64
-                    ))),
-                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("getpwuid: {e}"),
-                    )),
+                    )))
+                } else {
+                    Ok(make_struct_passwd(pw))
                 }
             },
             1,
@@ -147,25 +220,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getpwnam() missing argument",
                     ));
                 }
-                if !unsafe { pyre_object::is_str(args[0]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getpwnam(): name should be a string",
-                    ));
-                }
-                let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
-                // `interp_pwd.py @unwrap_spec(name='text0')` rejects
-                // embedded NULs.
-                if name.as_bytes().contains(&0) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "getpwnam: name must not contain NUL bytes",
-                    ));
-                }
-                match rustpython_host_env::pwd::getpwnam(name) {
-                    Some(pw) => Ok(make_struct_passwd(&pw)),
-                    None => Err(pyre_interpreter::PyError::key_error(format!(
+                // `interp_pwd.py @unwrap_spec(name='text0')` → `text0_w`.
+                let mut w_name = args[0];
+                let name = pyre_object::with_roots!(w_name => {
+                    pyre_interpreter::baseobjspace::text0_w(w_name)
+                })?;
+                let pw = pyre_object::with_roots!(w_name => {
+                    let ll_name =
+                        majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
+                    unsafe { ll::c_getpwnam(ll_name.buf) }
+                });
+                if pw.is_null() {
+                    Err(pyre_interpreter::PyError::key_error(format!(
                         "getpwnam(): name not found: {}",
                         name
-                    ))),
+                    )))
+                } else {
+                    Ok(make_struct_passwd(pw))
                 }
             },
             1,
@@ -179,8 +250,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             |_| {
                 // Every entry is freshly allocated and the next one allocates
                 // again, so they are pinned as they arrive (`build_list_storage`).
+                unsafe { ll::c_setpwent() };
+                let _endpwent = EndpwentOnDrop;
                 let mut items = pyre_object::gc_roots::RootedItems::new();
-                for pw in rustpython_host_env::pwd::getpwall().iter() {
+                loop {
+                    let pw = unsafe { ll::c_getpwent() };
+                    if pw.is_null() {
+                        break;
+                    }
                     items.push(make_struct_passwd(pw));
                 }
                 Ok(pyre_object::w_list_new(items.take()))

@@ -9,11 +9,7 @@ use pyre_object::*;
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
 
-#[cfg(all(
-    feature = "host_env",
-    not(target_arch = "wasm32"),
-    any(not(unix), feature = "sandbox")
-))]
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32"), not(unix)))]
 use rustpython_host_env::time as host_time;
 use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
@@ -263,59 +259,64 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // multiplies by 10**9 under the same overflow guard; anything else is a
     // TypeError.
     const SECS_TO_NS: i64 = 1_000_000_000;
+    let mut w_secs = args[0];
     let timeout_ns: i64 = unsafe {
-        let overflow = || {
+        let overflow = |w_secs: PyObjectRef| {
             crate::PyError::overflow_error(crate::display::wtf8_format!(
                 "timestamp ",
-                crate::display::py_repr_wtf8(args[0]).unwrap_or_else(|_| {
+                crate::display::py_repr_wtf8(w_secs).unwrap_or_else(|_| {
                     rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string())
                 }),
                 " too large to convert to C _PyTime_t"
             ))
         };
-        if is_float(args[0]) {
-            let secs = floatobject::w_float_get_value(args[0]);
+        if is_float(w_secs) {
+            let secs = floatobject::w_float_get_value(w_secs);
             if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
             // `rarithmetic.ovfcheck_float_to_longlong` bounds.
             let result_float = (secs * SECS_TO_NS as f64).ceil();
             if !(-9223372036854776832.0..9223372036854775296.0).contains(&result_float) {
-                return Err(overflow());
+                return Err(overflow(w_secs));
             }
             result_float as i64
         } else {
-            let sec = if is_bool(args[0]) {
+            let sec = if is_bool(w_secs) {
                 // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
-                boolobject::w_bool_get_value(args[0]) as i64
-            } else if is_int(args[0]) {
-                w_int_get_value(args[0])
-            } else if pyre_object::pyobject::is_long(args[0]) {
-                let big = pyre_object::longobject::w_long_get_value(args[0]);
-                i64::try_from(big).map_err(|_| overflow())?
+                boolobject::w_bool_get_value(w_secs) as i64
+            } else if is_int(w_secs) {
+                w_int_get_value(w_secs)
+            } else if pyre_object::pyobject::is_long(w_secs) {
+                let big = pyre_object::longobject::w_long_get_value(w_secs);
+                i64::try_from(big).map_err(|_| overflow(w_secs))?
             } else {
                 // `timeutils.py` — `space.bigint_w(w_secs)` applies
                 // `space.int`, so an object with `__int__` / `__index__` is
                 // accepted and reduced to a longlong.
-                let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
-                    || crate::baseobjspace::lookup(args[0], "__index__").is_some();
+                let has_int = pyre_object::with_roots!(w_secs => {
+                    crate::baseobjspace::lookup(w_secs, "__int__").is_some()
+                        || crate::baseobjspace::lookup(w_secs, "__index__").is_some()
+                });
                 if !has_int {
                     // `_PyTime_FromSecondsObject` accepts either domain, so
                     // an argument that is neither names both.
                     return Err(crate::PyError::type_error(format!(
                         "'{}' object cannot be interpreted as an integer or float",
-                        crate::type_methods::arg_type_name(args[0])
+                        crate::type_methods::arg_type_name(w_secs)
                     )));
                 }
-                let w_int = crate::baseobjspace::space_int(args[0])?;
+                let w_int =
+                    pyre_object::with_roots!(w_secs => crate::baseobjspace::space_int(w_secs))?;
                 if is_int(w_int) {
                     w_int_get_value(w_int)
                 } else {
                     i64::try_from(pyre_object::longobject::w_long_get_value(w_int))
-                        .map_err(|_| overflow())?
+                        .map_err(|_| overflow(w_secs))?
                 }
             };
-            sec.checked_mul(SECS_TO_NS).ok_or_else(overflow)?
+            sec.checked_mul(SECS_TO_NS)
+                .ok_or_else(|| overflow(w_secs))?
         }
     };
     // `interp_time.py` — `if not (timeout >= 0)`.
@@ -354,7 +355,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let deadline = now + dur;
         let mut remaining = dur;
         loop {
-            let slept = {
+            let slept = pyre_object::with_roots!(w_secs => {
                 let _blocking = crate::module::thread::before_external_block();
                 let mut ts = libc::timespec {
                     tv_sec: remaining.as_secs() as libc::time_t,
@@ -363,13 +364,15 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // `interp_time.nanosleep` — GIL already left by
                 // `before_external_block`; `rtime.c_nanosleep` saves errno.
                 unsafe { majit_rlib::rtime::c_nanosleep(&mut ts, std::ptr::null_mut()) }
-            };
+            });
             if slept == 0 {
                 return Ok(w_none());
             }
             let errno = majit_rlib::rposix::get_saved_errno();
             if errno == libc::EINTR {
-                crate::module::signal::interp_signal::checksignals_now()?;
+                pyre_object::with_roots!(w_secs => {
+                    crate::module::signal::interp_signal::checksignals_now()
+                })?;
                 let now =
                     clock_monotonic_duration().unwrap_or_else(|| monotonic_baseline().elapsed());
                 if now >= deadline {
@@ -831,8 +834,9 @@ pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let ts = clock_gettime_timespec(id).map_err(|errno| {
+    let mut w_clk_id = args[0];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
+    let ts = pyre_object::with_roots!(w_clk_id => clock_gettime_timespec(id)).map_err(|errno| {
         crate::PyError::os_error_with_errno(
             errno,
             format!(
@@ -855,8 +859,9 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let ts = clock_gettime_timespec(id).map_err(|errno| {
+    let mut w_clk_id = args[0];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
+    let ts = pyre_object::with_roots!(w_clk_id => clock_gettime_timespec(id)).map_err(|errno| {
         crate::PyError::os_error_with_errno(
             errno,
             format!(
@@ -884,12 +889,14 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let mut w_clk_id = args[0];
+    let mut w_when = args[1];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
     let secs = unsafe {
-        if is_int(args[1]) {
-            w_int_get_value(args[1]) as f64
-        } else if is_float(args[1]) {
-            floatobject::w_float_get_value(args[1])
+        if is_int(w_when) {
+            w_int_get_value(w_when) as f64
+        } else if is_float(w_when) {
+            floatobject::w_float_get_value(w_when)
         } else {
             return Err(crate::PyError::type_error(
                 "clock_settime: time must be a real number",
@@ -904,7 +911,9 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         tv_sec: integer_secs as libc::time_t,
         tv_nsec: (frac * 1e9) as libc::c_long,
     };
-    let ret = unsafe { majit_rlib::rtime::c_clock_settime(id as _, &mut ts) };
+    let ret = pyre_object::with_roots!(w_clk_id, w_when => unsafe {
+        majit_rlib::rtime::c_clock_settime(id as _, &mut ts)
+    });
     if ret != 0 {
         let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
@@ -936,15 +945,19 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             "clock_settime_ns: clock id and time must be integers",
         ));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
-    let ns = unsafe { w_int_get_value(args[1]) };
+    let mut w_clk_id = args[0];
+    let mut w_when = args[1];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
+    let ns = unsafe { w_int_get_value(w_when) };
     // `tv_sec = ns // 10**9`, `tv_nsec = ns % 10**9` (Python floor div/mod,
     // so a negative `ns` normalises to a non-negative `tv_nsec`).
     let mut ts = libc::timespec {
         tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
         tv_nsec: ns.rem_euclid(1_000_000_000) as libc::c_long,
     };
-    let ret = unsafe { majit_rlib::rtime::c_clock_settime(id as _, &mut ts) };
+    let ret = pyre_object::with_roots!(w_clk_id, w_when => unsafe {
+        majit_rlib::rtime::c_clock_settime(id as _, &mut ts)
+    });
     if ret != 0 {
         let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
@@ -969,9 +982,12 @@ pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     if !unsafe { is_int(args[0]) } {
         return Err(crate::PyError::type_error("clock id must be an integer"));
     }
-    let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
+    let mut w_clk_id = args[0];
+    let id = unsafe { w_int_get_value(w_clk_id) } as libc::clockid_t;
     let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
-    let ret = unsafe { majit_rlib::rtime::c_clock_getres(id as _, &mut ts) };
+    let ret = pyre_object::with_roots!(w_clk_id => unsafe {
+        majit_rlib::rtime::c_clock_getres(id as _, &mut ts)
+    });
     if ret != 0 {
         let errno = majit_rlib::rposix::get_saved_errno();
         return Err(crate::PyError::os_error_with_errno(
@@ -1011,7 +1027,7 @@ struct c_tm {
 #[allow(non_camel_case_types)]
 type time_t = i64;
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_gmtime(&mut t) };
@@ -1022,11 +1038,7 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(libc_tm_to_c_tm(unsafe { &*p }))
 }
 
-#[cfg(all(
-    feature = "host_env",
-    not(target_arch = "wasm32"),
-    any(windows, feature = "sandbox")
-))]
+#[cfg(all(windows, feature = "host_env"))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
@@ -1371,7 +1383,7 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(msvc_tm_to_c_tm(&tm))
 }
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
@@ -1382,11 +1394,7 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(libc_tm_to_c_tm(unsafe { &*p }))
 }
 
-#[cfg(all(
-    feature = "host_env",
-    not(target_arch = "wasm32"),
-    any(windows, feature = "sandbox")
-))]
+#[cfg(all(windows, feature = "host_env"))]
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
@@ -1488,7 +1496,7 @@ fn tm_gmtoff_zone(tm: &libc::tm) -> (i64, String) {
     (tm.tm_gmtoff as i64, zone)
 }
 
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env"))]
 fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
@@ -1496,11 +1504,6 @@ fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
         return None;
     }
     Some(tm_gmtoff_zone(unsafe { &*p }))
-}
-
-#[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
-fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
-    host_time::localtime_from_timestamp(seconds as host_time::TimeT).map(|tm| tm_gmtoff_zone(&tm))
 }
 
 #[cfg(all(unix, not(feature = "host_env")))]
@@ -1949,7 +1952,7 @@ fn decode_strftime_output(
     }
 }
 
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 #[allow(dead_code)]
 fn strftime_one(
     format: &[u8],
@@ -1960,15 +1963,15 @@ fn strftime_one(
         return Ok(rustpython_wtf8::Wtf8Buf::new());
     }
     let c_fmt = std::ffi::CString::new(format).expect("NUL-free strftime segment");
-    let libc_tm = c_tm_to_libc_tm(tm);
+    let mut libc_tm = c_tm_to_libc_tm(tm);
     let mut buf = vec![0u8; 1024];
     unsafe {
         loop {
-            let n = libc::strftime(
-                buf.as_mut_ptr() as *mut libc::c_char,
+            let n = majit_rlib::rtime::c_strftime(
+                buf.as_mut_ptr() as majit_rlib::rffi::CCHARP,
                 buf.len(),
-                c_fmt.as_ptr(),
-                &libc_tm,
+                c_fmt.as_ptr() as majit_rlib::rffi::CCHARP,
+                &mut libc_tm,
             );
             // A buffer 256 times the format length is not failing for
             // lack of room: the format simply yields an empty result,
@@ -2092,16 +2095,16 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // strftime consults $TZ/tzname (%Z/%z) and the LC_TIME locale DB; under
     // sandbox the registration is stubbed, so the real body is compiled out.
-    #[cfg(all(unix, feature = "sandbox"))]
+    #[cfg(all(unix, feature = "host_env", feature = "sandbox"))]
     {
         let _ = format_len;
         Err(crate::host_seam::stub("time.strftime"))
     }
     // strftime is available on both Unix and Windows CRT.
-    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        let libc_tm = c_tm_to_libc_tm(&tm);
-        let render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
+        let mut libc_tm = c_tm_to_libc_tm(&tm);
+        let mut render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
             if segment.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2110,11 +2113,11 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let mut buf = vec![0u8; 256];
             loop {
                 let n = unsafe {
-                    libc::strftime(
-                        buf.as_mut_ptr() as *mut libc::c_char,
+                    majit_rlib::rtime::c_strftime(
+                        buf.as_mut_ptr() as majit_rlib::rffi::CCHARP,
                         buf.len(),
-                        c_fmt.as_ptr(),
-                        &libc_tm,
+                        c_fmt.as_ptr() as majit_rlib::rffi::CCHARP,
+                        &mut libc_tm,
                     )
                 };
                 if n != 0 {
@@ -2151,6 +2154,13 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Err(_) => crate::typedef::charp2uni(&rendered),
         };
         Ok(result)
+    }
+    #[cfg(all(unix, not(feature = "host_env")))]
+    {
+        let _ = format_len;
+        Err(crate::PyError::not_implemented(
+            "time.strftime requires host_env feature",
+        ))
     }
     // The wide runtime call, which is what `format_time` resolves to here.
     // The narrow one goes through the active code page, so it can neither be
@@ -2255,14 +2265,14 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let mut tm = _gettmarg(args, false)?;
         tm.tm_wday = -1;
 
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env"))]
         let tt = {
             let mut libc_tm = c_tm_to_libc_tm(&tm);
             let result = unsafe { majit_rlib::rtime::c_mktime(&mut libc_tm) };
             tm.tm_wday = libc_tm.tm_wday;
             result as i64
         };
-        #[cfg(all(feature = "host_env", any(windows, feature = "sandbox")))]
+        #[cfg(all(windows, feature = "host_env"))]
         let tt = {
             let mut libc_tm = c_tm_to_libc_tm(&tm);
             let result = host_time::mktime(&mut libc_tm);

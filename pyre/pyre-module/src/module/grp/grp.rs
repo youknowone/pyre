@@ -19,37 +19,108 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
     })
 }
 
+/// `_pwdgrp_build.py` includes and `lib_pypy/grp.py` libc calls:
+/// `includes=['sys/types.h', 'grp.h']`, `releasegil=False`, no `save_err`.
+mod ll {
+    use majit_rlib::rffi::CCHARP;
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/types.h", "grp.h"],
+        };
+    }
+
+    macro_rules! external {
+        ($($t:tt)*) => {
+            majit_rlib::rffi::llexternal!($($t)*, compilation_info = ECI, releasegil = false);
+        };
+    }
+
+    external!(
+        pub(super) c_getgrgid = "getgrgid",
+        [libc::gid_t],
+        *mut libc::group
+    );
+    external!(
+        pub(super) c_getgrnam = "getgrnam",
+        [CCHARP],
+        *mut libc::group
+    );
+    external!(
+        pub(super) c_setgrent = "setgrent",
+        [],
+        ()
+    );
+    external!(
+        pub(super) c_getgrent = "getgrent",
+        [],
+        *mut libc::group
+    );
+    external!(
+        pub(super) c_endgrent = "endgrent",
+        [],
+        ()
+    );
+}
+
+/// `lib_pypy/grp.py _group_from_gstruct`. String fields are copied with
+/// `charp2str` immediately: `getgrent` (and `getgrgid` / `getgrnam`) may
+/// return a pointer into a static buffer. `gr_mem` is a NULL-terminated
+/// `char**` walked into a list of strings. Each C string is `os.fsdecode`
+/// (`_group_from_gstruct`), via `fsdecode_filename_bytes`.
+fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
+    let name = unsafe { majit_rlib::rffi::charp2str((*g).gr_name.cast()) };
+    let passwd = unsafe { majit_rlib::rffi::charp2str((*g).gr_passwd.cast()) };
+    let gid = unsafe { (*g).gr_gid } as i64;
+    let mut member_bytes = Vec::new();
+    unsafe {
+        let mut p = (*g).gr_mem;
+        loop {
+            let member = *p;
+            if member.is_null() {
+                break;
+            }
+            member_bytes.push(majit_rlib::rffi::charp2str(member.cast()));
+            p = p.add(1);
+        }
+    }
+    let holder = pyre_object::gc_roots::push_roots();
+    let mem_list = {
+        let mut mem = pyre_object::gc_roots::RootedItems::new();
+        for s in &member_bytes {
+            mem.push(pyre_interpreter::gateway::fsdecode_filename_bytes(s));
+        }
+        pyre_object::w_list_new(mem.take())
+    };
+    let mem_slot = holder.pin_roots(&[mem_list]);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_interpreter::gateway::fsdecode_filename_bytes(&name));
+    fields.push(pyre_interpreter::gateway::fsdecode_filename_bytes(&passwd));
+    fields.push(pyre_object::w_int_new(gid));
+    fields.push(holder.get(mem_slot));
+    pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
+}
+
+/// `getgrall`'s `try`/`finally`: `c_endgrent` runs on every exit.
+struct EndgrentOnDrop;
+
+impl Drop for EndgrentOnDrop {
+    fn drop(&mut self) {
+        unsafe { ll::c_endgrent() };
+    }
+}
+
 /// grp module — `lib_pypy/grp.py` (PyPy keeps it app-level via
-/// `_pwdgrp_cffi`).  pyre takes CPython's `Modules/grpmodule.c`
-/// shape since pyre has no app-level stdlib.
+/// `_pwdgrp_cffi`).
 ///
 /// getgrgid / getgrnam / getgrall return a `grp.struct_group`
 /// structseq (subclass of tuple) with named fields `gr_name`,
 /// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py`.
+///
+/// Calls `c_getgrgid` / `c_getgrnam` / `c_setgrent` / `c_getgrent` /
+/// `c_endgrent`.
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    #[cfg(feature = "host_env")]
-    fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
-        // Each `w_str_new_managed` is collectable.  A plain Vec is not a
-        // root, so later member/name allocations can sweep earlier strings
-        // before `new_instance` pins its argument vector.  Pin each mint
-        // as it is produced; close the member bracket before the field
-        // bracket (`RootedItems` cannot grow under another open set).
-        let mem_list = {
-            let mut mem = pyre_object::gc_roots::RootedItems::new();
-            for s in &g.mem {
-                mem.push(pyre_object::w_str_new_managed(s));
-            }
-            pyre_object::w_list_new(mem.take())
-        };
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_str_new_managed(&g.name));
-        fields.push(pyre_object::w_str_new_managed(&g.passwd));
-        fields.push(pyre_object::w_int_new(g.gid as i64));
-        fields.push(mem_list);
-        pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
-    }
-
     // `lib_pypy/grp.py class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
     pyre_interpreter::module_ns_store(ns, "struct_group", struct_group_type());
@@ -69,7 +140,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // and rejects other out-of-range values rather than
                 // silently truncating.  Mirror that here so a Python
                 // bigint that doesn't fit in `gid_t` raises OverflowError.
-                let val = pyre_interpreter::baseobjspace::int_w(args[0])?;
+                let mut w_gid = args[0];
+                let val = pyre_object::with_roots!(w_gid => pyre_interpreter::baseobjspace::int_w(w_gid))?;
                 let gid_min = libc::gid_t::MIN as i64;
                 let gid_max = libc::gid_t::MAX as i64;
                 let gid = if val == -1 {
@@ -81,16 +153,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getgrgid: gid is out of range",
                     ));
                 };
-                match rustpython_host_env::grp::getgrgid(gid) {
-                    Ok(Some(g)) => Ok(make_struct_group(&g)),
-                    Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
+                let g = pyre_object::with_roots!(w_gid => unsafe { ll::c_getgrgid(gid) });
+                if g.is_null() {
+                    Err(pyre_interpreter::PyError::key_error(format!(
                         "getgrgid(): gid not found: {}",
                         gid
-                    ))),
-                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("getgrgid: {e}"),
-                    )),
+                    )))
+                } else {
+                    Ok(make_struct_group(g))
                 }
             },
             1,
@@ -107,29 +177,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getgrnam() missing argument",
                     ));
                 }
+                // `lib_pypy/grp.py getgrnam`: `isinstance(name, str)`, then
+                // `os.fsencode(name)`, then `if b'\0' in name_b`.
                 if !unsafe { pyre_object::is_str(args[0]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "getgrnam(): name should be a string",
                     ));
                 }
-                let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
-                // Reject embedded NULs (parity with PyPy's @unwrap_spec
-                // text0 used for similar lookup APIs).
-                if name.as_bytes().contains(&0) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "getgrnam: name must not contain NUL bytes",
-                    ));
+                let mut w_name = args[0];
+                let name_b = pyre_object::with_roots!(w_name => {
+                    pyre_interpreter::gateway::fsencode(w_name)
+                })?;
+                if name_b.contains(&0) {
+                    return Err(pyre_interpreter::PyError::value_error("embedded null byte"));
                 }
-                match rustpython_host_env::grp::getgrnam(name) {
-                    Ok(Some(g)) => Ok(make_struct_group(&g)),
-                    Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
+                let g = pyre_object::with_roots!(w_name => {
+                    let ll_name =
+                        majit_rlib::rffi::scoped_str2charp::new(Some(&name_b));
+                    unsafe { ll::c_getgrnam(ll_name.buf) }
+                });
+                if g.is_null() {
+                    Err(pyre_interpreter::PyError::key_error(format!(
                         "getgrnam(): name not found: {}",
-                        name
-                    ))),
-                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("getgrnam: {e}"),
-                    )),
+                        String::from_utf8_lossy(&name_b)
+                    )))
+                } else {
+                    Ok(make_struct_group(g))
                 }
             },
             1,
@@ -144,9 +217,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // Each struct_group is freshly allocated and building the
                 // next one allocates again, so they are pinned as they
                 // arrive.
-                let groups = rustpython_host_env::grp::getgrall();
+                unsafe { ll::c_setgrent() };
+                let _endgrent = EndgrentOnDrop;
                 let mut items = pyre_object::gc_roots::RootedItems::new();
-                for g in groups.iter() {
+                loop {
+                    let g = unsafe { ll::c_getgrent() };
+                    if g.is_null() {
+                        break;
+                    }
                     items.push(make_struct_group(g));
                 }
                 Ok(pyre_object::w_list_new(items.take()))

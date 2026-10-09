@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-use crate::rffi::{INT, SIGNED, VOIDP};
+use crate::rffi::{CCHARP, INT, SIGNED, SIZE_T, VOIDP};
 use majit_jitcode::rffi::RFFI_SAVE_ERRNO;
 
 /// `rtime.TIMEVAL`.
@@ -142,6 +142,15 @@ crate::rffi::llexternal!(
     compilation_info = TIME_ECI
 );
 
+// `interp_time.c_strftime` (Unix `strftime`, no `save_err`).
+crate::rffi::llexternal!(
+    pub c_strftime = "strftime",
+    [CCHARP, SIZE_T, CCHARP, TM_P],
+    SIZE_T,
+    compilation_info = TIME_ECI,
+    releasegil = false
+);
+
 // `interp_time.nanosleep` / `py_nanosleep`. Product `time.sleep` already
 // wraps `before_external_block`; C name is `nanosleep` with
 // `save_err=RFFI_SAVE_ERRNO`. `releasegil=False` so the product's
@@ -249,5 +258,28 @@ mod tests {
         let mut tm = unsafe { *p };
         let tt = unsafe { c_mktime(&mut tm) };
         assert!(tt > 0 || tm.tm_wday != -1);
+    }
+
+    #[test]
+    fn c_strftime() {
+        let mut t: TIME_T = 0;
+        let p = unsafe { c_gmtime(&mut t) };
+        assert!(
+            !p.is_null(),
+            "c_gmtime errno {}",
+            crate::rposix::get_saved_errno()
+        );
+        let mut buf = [0u8; 64];
+        let fmt = b"%Y\0";
+        let n = unsafe {
+            super::c_strftime(
+                buf.as_mut_ptr() as CCHARP,
+                buf.len(),
+                fmt.as_ptr() as CCHARP,
+                p,
+            )
+        };
+        assert!(n > 0);
+        assert_eq!(&buf[..n], b"1970");
     }
 }

@@ -34,89 +34,158 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
     })
 }
 
+/// `sys/resource.h` `getrlimit` / `setrlimit`. C names `getrlimit` /
+/// `setrlimit`, `releasegil=False`, no `save_err`. Args match libc:
+/// `(int, *mut rlimit) -> int` and `(int, *const rlimit) -> int`.
+mod ll {
+    use majit_rlib::rffi::INT;
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["sys/resource.h"],
+        };
+    }
+
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_getrlimit = "getrlimit",
+        [INT, *mut libc::rlimit],
+        INT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_setrlimit = "setrlimit",
+        [INT, *const libc::rlimit],
+        INT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+}
+
+/// `resource.getrusage` `struct_rusage` from `rtime.RUSAGE` / `libc::rusage`.
+/// `ru_utime` / `ru_stime` are timeval floats, then the 14 integer fields.
+/// This is `resource.getrusage`, not `time.clock`.
+fn make_struct_rusage(r: &majit_rlib::rtime::RUSAGE) -> pyre_object::PyObjectRef {
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::floatobject::w_float_new(
+        majit_rlib::rtime::decode_timeval(&r.ru_utime),
+    ));
+    fields.push(pyre_object::floatobject::w_float_new(
+        majit_rlib::rtime::decode_timeval(&r.ru_stime),
+    ));
+    fields.push(pyre_object::w_int_new(r.ru_maxrss as i64));
+    fields.push(pyre_object::w_int_new(r.ru_ixrss as i64));
+    fields.push(pyre_object::w_int_new(r.ru_idrss as i64));
+    fields.push(pyre_object::w_int_new(r.ru_isrss as i64));
+    fields.push(pyre_object::w_int_new(r.ru_minflt as i64));
+    fields.push(pyre_object::w_int_new(r.ru_majflt as i64));
+    fields.push(pyre_object::w_int_new(r.ru_nswap as i64));
+    fields.push(pyre_object::w_int_new(r.ru_inblock as i64));
+    fields.push(pyre_object::w_int_new(r.ru_oublock as i64));
+    fields.push(pyre_object::w_int_new(r.ru_msgsnd as i64));
+    fields.push(pyre_object::w_int_new(r.ru_msgrcv as i64));
+    fields.push(pyre_object::w_int_new(r.ru_nsignals as i64));
+    fields.push(pyre_object::w_int_new(r.ru_nvcsw as i64));
+    fields.push(pyre_object::w_int_new(r.ru_nivcsw as i64));
+    pyre_interpreter::_structseq::new_instance(struct_rusage_type(), fields.take())
+}
+
+/// `getrlimit` / `setrlimit` resource argument is a C `int`.
+fn resource_id(obj: pyre_object::PyObjectRef) -> Result<i32, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::c_int_w(obj)
+}
+
+/// `lib_pypy/resource.py getrlimit`: `0 <= resource < RLIM_NLIMITS`.
+#[allow(deprecated)]
+fn check_resource(resource: i32) -> Result<(), pyre_interpreter::PyError> {
+    if resource < 0 || resource >= libc::RLIM_NLIMITS as i32 {
+        Err(pyre_interpreter::PyError::value_error(
+            "invalid resource specified",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// `rlim_t` as a Python int, unsigned. `lib_pypy/_resource_build.py`
+/// `my_getrlimit` writes `rlim_cur` into a C `long long`; on hosts where
+/// `rlim_t` is unsigned, that signed widen turns `RLIM_INFINITY` into `-1`
+/// (Linux `~0ULL`) or `-2**63` (Darwin `1<<63`). `rlim_w` then rejects the
+/// value `getrlimit` just produced, so `setrlimit(r, getrlimit(r))` fails.
+/// `test_resource.ResourceTest.test_fsize_ismax` requires that round trip,
+/// and `test_fsize_negative` requires `RLIM_INFINITY != -2**63`.
+fn rlim_as_w(v: libc::rlim_t) -> pyre_object::PyObjectRef {
+    if v <= i64::MAX as libc::rlim_t {
+        pyre_object::w_int_new(v as i64)
+    } else {
+        pyre_object::w_long_new(majit_rlib::rbigint::RBigInt::from_u128(v as u128))
+    }
+}
+
+/// Convert each limit with `uint_w` so a negative is ValueError
+/// (`test_resource.ResourceTest.test_fsize_negative`) and a value wider
+/// than `rlim_t` is OverflowError. `RLIM_INFINITY` fits `rlim_t`.
+fn rlim_w(obj: pyre_object::PyObjectRef) -> Result<libc::rlim_t, pyre_interpreter::PyError> {
+    let v = pyre_interpreter::baseobjspace::uint_w(obj)?;
+    libc::rlim_t::try_from(v).map_err(|_| {
+        pyre_interpreter::PyError::overflow_error("Python int too large to convert to C rlim_t")
+    })
+}
+
 /// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level
 /// via `_resource_cffi`).  pyre takes CPython's `Modules/resource.c`
 /// shape since pyre has no app-level stdlib.
 ///
 /// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
-/// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+/// `error = OSError` alias. Calls `rtime.c_getrusage` and `c_getrlimit`
+/// / `c_setrlimit`.
+pub fn register_module(
+    mut ns: pyre_object::PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
     // `lib_pypy/resource.py error = OSError` and
     // `:15-37 class struct_rusage`.
     let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before init_resource");
     pyre_interpreter::module_ns_store(ns, "error", w_os_error);
     pyre_interpreter::module_ns_store(ns, "struct_rusage", struct_rusage_type());
-    // ── struct_rusage tuple (16-field layout matches CPython) ──
-    #[cfg(all(unix, feature = "host_env"))]
-    fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
-        let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)));
-        fields.push(pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)));
-        fields.push(pyre_object::w_int_new(r.ru_maxrss));
-        fields.push(pyre_object::w_int_new(r.ru_ixrss));
-        fields.push(pyre_object::w_int_new(r.ru_idrss));
-        fields.push(pyre_object::w_int_new(r.ru_isrss));
-        fields.push(pyre_object::w_int_new(r.ru_minflt));
-        fields.push(pyre_object::w_int_new(r.ru_majflt));
-        fields.push(pyre_object::w_int_new(r.ru_nswap));
-        fields.push(pyre_object::w_int_new(r.ru_inblock));
-        fields.push(pyre_object::w_int_new(r.ru_oublock));
-        fields.push(pyre_object::w_int_new(r.ru_msgsnd));
-        fields.push(pyre_object::w_int_new(r.ru_msgrcv));
-        fields.push(pyre_object::w_int_new(r.ru_nsignals));
-        fields.push(pyre_object::w_int_new(r.ru_nvcsw));
-        fields.push(pyre_object::w_int_new(r.ru_nivcsw));
-        pyre_interpreter::_structseq::new_instance(struct_rusage_type(), fields.take())
-    }
     pyre_interpreter::module_ns_store(
         ns,
         "getrusage",
         pyre_interpreter::make_builtin_function_with_arity(
             "getrusage",
             |args| {
-                #[cfg(all(unix, feature = "host_env"))]
-                {
-                    let who = if let Some(&a) = args.first() {
-                        if unsafe { pyre_object::is_int(a) } {
-                            unsafe { pyre_object::w_int_get_value(a) as i32 }
-                        } else {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "getrusage(): who should be an integer",
-                            ));
-                        }
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "getrusage() missing argument",
+                let mut w_who = if let Some(&a) = args.first() {
+                    a
+                } else {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "getrusage() missing argument",
+                    ));
+                };
+                let who = pyre_object::with_roots!(w_who => resource_id(w_who))?;
+                // `rtime.c_getrusage` (`releasegil=False`, no `save_err`).
+                // This is `resource.getrusage`, not `time.clock`.
+                let mut ru = unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
+                let ret = pyre_object::with_roots!(w_who => unsafe {
+                    majit_rlib::rtime::c_getrusage(who, &mut ru)
+                });
+                if ret == -1 {
+                    let errno = majit_rlib::rposix::_get_errno();
+                    // `lib_pypy/resource.py getrusage` raises ValueError for
+                    // an invalid `who`; only other errno values are
+                    // surfaced as OSError.
+                    if errno == libc::EINVAL {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "invalid who parameter",
                         ));
-                    };
-                    match rustpython_host_env::resource::getrusage(who) {
-                        Ok(r) => Ok(make_struct_rusage(&r)),
-                        Err(e) => {
-                            let errno = e.raw_os_error().unwrap_or(0);
-                            // `lib_pypy/resource.py:106` raises ValueError for
-                            // an invalid `who`; only other errno values are
-                            // surfaced as OSError.
-                            if errno == libc::EINVAL {
-                                return Err(pyre_interpreter::PyError::value_error(
-                                    "invalid who parameter",
-                                ));
-                            }
-                            Err(pyre_interpreter::PyError::os_error_with_errno(
-                                errno,
-                                format!("getrusage: {e}"),
-                            ))
-                        }
                     }
-                }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = args;
-                    Err(pyre_interpreter::PyError::not_implemented(
-                        "resource.getrusage requires host_env feature",
+                    let e = std::io::Error::from_raw_os_error(errno);
+                    Err(pyre_interpreter::PyError::os_error_with_errno(
+                        errno,
+                        format!("getrusage: {e}"),
                     ))
+                } else {
+                    Ok(make_struct_rusage(&ru))
                 }
             },
             1,
@@ -128,40 +197,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "getrlimit",
             |args| {
-                #[cfg(all(unix, feature = "host_env"))]
-                {
-                    let res = if let Some(&a) = args.first() {
-                        if unsafe { pyre_object::is_int(a) } {
-                            unsafe { pyre_object::w_int_get_value(a) as libc::rlim_t }
-                        } else {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "getrlimit(): resource should be an integer",
-                            ));
-                        }
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "getrlimit() missing argument",
-                        ));
-                    };
-                    match rustpython_host_env::resource::getrlimit(res) {
-                        Ok(rl) => {
-                            let mut fields = pyre_object::gc_roots::RootedItems::new();
-                            fields.push(pyre_object::w_int_new(rl.rlim_cur as i64));
-                            fields.push(pyre_object::w_int_new(rl.rlim_max as i64));
-                            Ok(pyre_object::w_tuple_new(fields.take()))
-                        }
-                        Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getrlimit: {e}"),
-                        )),
-                    }
-                }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = args;
-                    Err(pyre_interpreter::PyError::not_implemented(
-                        "resource.getrlimit requires host_env feature",
+                let mut w_res = if let Some(&a) = args.first() {
+                    a
+                } else {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "getrlimit() missing argument",
+                    ));
+                };
+                let res = pyre_object::with_roots!(w_res => resource_id(w_res))?;
+                check_resource(res)?;
+                let mut rl = unsafe { std::mem::zeroed::<libc::rlimit>() };
+                let ret = pyre_object::with_roots!(w_res => unsafe {
+                    ll::c_getrlimit(res as majit_rlib::rffi::INT, &mut rl)
+                });
+                if ret == -1 {
+                    let errno = majit_rlib::rposix::_get_errno();
+                    let e = std::io::Error::from_raw_os_error(errno);
+                    Err(pyre_interpreter::PyError::os_error_with_errno(
+                        errno,
+                        format!("getrlimit: {e}"),
                     ))
+                } else {
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(rlim_as_w(rl.rlim_cur));
+                    fields.push(rlim_as_w(rl.rlim_max));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 }
             },
             1,
@@ -173,96 +233,84 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "setrlimit",
             |args| {
-                #[cfg(all(unix, feature = "host_env"))]
-                {
-                    if args.len() < 2 {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "setrlimit() requires 2 arguments",
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "setrlimit() requires 2 arguments",
+                    ));
+                }
+                let mut w_res = args[0];
+                let mut w_limits = args[1];
+                let res = pyre_object::with_roots!(w_res, w_limits => resource_id(w_res))?;
+                check_resource(res)?;
+                // `lib_pypy/resource.py setrlimit` — `limits = tuple(limits)`
+                // then `len(limits) != 2` → ValueError.
+                let items = pyre_object::with_roots!(w_res, w_limits => {
+                    pyre_interpreter::baseobjspace::unpackiterable(w_limits, -1)
+                })?;
+                if items.len() != 2 {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "expected a tuple of 2 integers",
+                    ));
+                }
+                let mut w_soft = items[0];
+                let mut w_hard = items[1];
+                let soft =
+                    pyre_object::with_roots!(w_res, w_soft, w_hard => rlim_w(w_soft))?;
+                let hard =
+                    pyre_object::with_roots!(w_res, w_soft, w_hard => rlim_w(w_hard))?;
+                let rl = libc::rlimit {
+                    rlim_cur: soft,
+                    rlim_max: hard,
+                };
+                let ret = pyre_object::with_roots!(w_res, w_soft, w_hard => unsafe {
+                    ll::c_setrlimit(res, &rl)
+                });
+                if ret == -1 {
+                    // `lib_pypy/resource.py setrlimit` — EINVAL and
+                    // EPERM both surface as ValueError with
+                    // distinct messages; all other errnos stay
+                    // as OSError.
+                    let errno = majit_rlib::rposix::_get_errno();
+                    if errno == libc::EINVAL {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "current limit exceeds maximum limit",
                         ));
                     }
-                    let res = unsafe {
-                        if !pyre_object::is_int(args[0]) {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "setrlimit(): resource should be an integer",
-                            ));
-                        }
-                        pyre_object::w_int_get_value(args[0]) as libc::rlim_t
-                    };
-                    // `lib_pypy/resource.py:81-86` — `soft, hard = limits;
-                    // soft = int(soft); hard = int(hard)`.  Accept any
-                    // 2-item tuple or list and coerce each entry to int
-                    // (PyPy unpacks via Python iteration; pyre's surface
-                    // covers the two concrete sequence shapes callers
-                    // actually use).
-                    let (w_soft, mut w_hard) = unsafe {
-                        if pyre_object::is_tuple(args[1]) && pyre_object::w_tuple_len(args[1]) == 2
-                        {
-                            (
-                                pyre_object::w_tuple_getitem(args[1], 0).unwrap(),
-                                pyre_object::w_tuple_getitem(args[1], 1).unwrap(),
-                            )
-                        } else if pyre_object::is_list(args[1])
-                            && pyre_object::w_list_len(args[1]) == 2
-                        {
-                            (
-                                pyre_object::w_list_getitem(args[1], 0).unwrap(),
-                                pyre_object::w_list_getitem(args[1], 1).unwrap(),
-                            )
-                        } else {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "expected a tuple of 2 integers",
-                            ));
-                        }
-                    };
-                    let soft = pyre_object::with_roots!(w_hard => pyre_interpreter::baseobjspace::int_w(w_soft))? as libc::rlim_t;
-                    let hard = pyre_interpreter::baseobjspace::int_w(w_hard)? as libc::rlim_t;
-                    let rl = libc::rlimit {
-                        rlim_cur: soft,
-                        rlim_max: hard,
-                    };
-                    match rustpython_host_env::resource::setrlimit(res, rl) {
-                        Ok(()) => Ok(pyre_object::w_none()),
-                        Err(e) => {
-                            // `lib_pypy/resource.py:89-95` — EINVAL and
-                            // EPERM both surface as ValueError with
-                            // distinct messages; all other errnos stay
-                            // as OSError.
-                            let errno = e.raw_os_error().unwrap_or(0);
-                            if errno == libc::EINVAL {
-                                return Err(pyre_interpreter::PyError::value_error(
-                                    "current limit exceeds maximum limit",
-                                ));
-                            }
-                            if errno == libc::EPERM {
-                                return Err(pyre_interpreter::PyError::value_error(
-                                    "not allowed to raise maximum limit",
-                                ));
-                            }
-                            Err(pyre_interpreter::PyError::os_error_with_errno(
-                                errno,
-                                format!("setrlimit: {e}"),
-                            ))
-                        }
+                    if errno == libc::EPERM {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "not allowed to raise maximum limit",
+                        ));
                     }
-                }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = args;
-                    Err(pyre_interpreter::PyError::not_implemented(
-                        "resource.setrlimit requires host_env feature",
+                    let e = std::io::Error::from_raw_os_error(errno);
+                    Err(pyre_interpreter::PyError::os_error_with_errno(
+                        errno,
+                        format!("setrlimit: {e}"),
                     ))
+                } else {
+                    Ok(pyre_object::w_none())
                 }
             },
             2,
         ),
     );
+    // `lib_pypy/resource.py getpagesize` → `os.sysconf("SC_PAGESIZE")`.
+    pyre_interpreter::module_ns_store(
+        ns,
+        "getpagesize",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "getpagesize",
+            |_| {
+                // `lib_pypy/resource.py getpagesize` → `os.sysconf("SC_PAGESIZE")`
+                // → `rposix.c_sysconf`.
+                let n = unsafe { majit_rlib::rposix::c_sysconf(libc::_SC_PAGESIZE) };
+                Ok(pyre_object::w_int_new(n as i64))
+            },
+            0,
+        ),
+    );
     // ── Constants (POSIX subset matching CPython) ──
-    #[cfg(unix)]
     {
-        #[cfg(not(feature = "host_env"))]
         use libc as host_resource;
-        #[cfg(feature = "host_env")]
-        use rustpython_host_env::resource as host_resource;
         pyre_interpreter::module_ns_store(
             ns,
             "RUSAGE_SELF",
@@ -323,12 +371,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "RLIMIT_MEMLOCK",
             pyre_object::w_int_new(host_resource::RLIMIT_MEMLOCK as i64),
         );
-        // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIM_INFINITY",
-            pyre_object::w_int_new(host_resource::RLIM_INFINITY as i64),
-        );
+        let w_inf = pyre_object::with_roots!(ns => rlim_as_w(host_resource::RLIM_INFINITY));
+        pyre_interpreter::module_ns_store(ns, "RLIM_INFINITY", w_inf);
     }
     Ok(())
 }

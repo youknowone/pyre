@@ -33,6 +33,8 @@ pub mod rpoll;
 pub mod rposix;
 #[cfg(unix)]
 pub mod rposix_environ;
+#[cfg(unix)]
+pub mod rsignal;
 #[cfg(any(unix, windows))]
 pub mod rsocket;
 #[cfg(unix)]
