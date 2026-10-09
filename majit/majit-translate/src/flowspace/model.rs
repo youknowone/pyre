@@ -2089,11 +2089,10 @@ impl HostEnv {
         // `["std", "ptr", "null_mut"]` by joining `segments[..-1]` with
         // `.` (→ `"std.ptr"`) and calling
         // `HOST_ENV.import_module("std.ptr").module_get("null_mut")`,
-        // so the module key matches the join shape.  No analyzer hook
-        // attached — the callable surface is sufficient to close the
-        // registry-Skip path; downstream type lowering for these
-        // intrinsics still routes through the M2.5g extern-Rust-helper
-        // walker when it lands.
+        // so the module key matches the join shape.  Analyzers that
+        // exist for these callables are registered in
+        // `annotator/builtin.rs` (`std_ptr_eq`, `ptr_null_constant`,
+        // `std_ptr_copy_nonoverlapping`).
         let std_ptr = HostObject::new_module("std.ptr");
         std_ptr.module_set(
             "null_mut",
@@ -2339,6 +2338,16 @@ impl HostEnv {
         core_ptr.module_set(
             "eq",
             std_ptr.module_get("eq").expect("std.ptr.eq bound above"),
+        );
+        // `std::ptr::copy_nonoverlapping` re-exports
+        // `core::ptr::copy_nonoverlapping`. Bind the canonical spelling
+        // to the same callable so `std_ptr_copy_nonoverlapping` and the
+        // `BUILTIN_TYPER` row see one `HostObject`.
+        core_ptr.module_set(
+            "copy_nonoverlapping",
+            std_ptr
+                .module_get("copy_nonoverlapping")
+                .expect("std.ptr.copy_nonoverlapping bound above"),
         );
         // `std.ptr` was already created above with `null_mut` / `eq` /
         // `copy_nonoverlapping`; extend that same module with `null`

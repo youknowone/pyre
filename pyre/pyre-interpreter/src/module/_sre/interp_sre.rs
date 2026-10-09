@@ -2663,7 +2663,8 @@ pub(crate) fn sre_match_repr_str(
 }
 
 /// The first `limit` code points of `text`, for the repr truncations that
-/// `str[:limit]` performs on a subject that may hold a lone surrogate.
+/// `str[:limit]` performs on a subject that may hold a lone surrogate
+/// (`interp_sre.py W_SRE_Pattern.repr_w` `space.getslice(..., 0, 200)`).
 fn truncate_code_points(text: rustpython_wtf8::Wtf8Buf, limit: usize) -> rustpython_wtf8::Wtf8Buf {
     let src: &rustpython_wtf8::Wtf8 = &text;
     let nbytes = src.as_bytes().len();
@@ -2711,10 +2712,23 @@ const SRE_FLAG_LOCALE: i64 = 4;
 const SRE_FLAG_UNICODE: i64 = 32;
 const SRE_FLAG_ASCII: i64 = 256;
 
+/// interp_sre.py `FLAG_NAMES`.
+const SRE_FLAG_NAMES: [&str; 9] = [
+    "re.TEMPLATE",
+    "re.IGNORECASE",
+    "re.LOCALE",
+    "re.MULTILINE",
+    "re.DOTALL",
+    "re.UNICODE",
+    "re.VERBOSE",
+    "re.DEBUG",
+    "re.ASCII",
+];
+
 /// `repr_w` (interp_sre.py) — `re.compile(<pattern repr>, <flags>)`
 /// with the pattern repr truncated to 200 characters and the flag bits
 /// decoded into their `re.*` names (the implicit `re.UNICODE` on a known
-/// unicode pattern is suppressed, :160-165).
+/// unicode pattern is suppressed).
 pub(crate) fn sre_pattern_repr_str(
     mut pat: PyObjectRef,
 ) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
@@ -2724,149 +2738,36 @@ pub(crate) fn sre_pattern_repr_str(
         200,
     );
 
-    let mut flags = unsafe { (*(pat as *const W_SRE_Pattern)).flags };
+    let flags = unsafe { (*(pat as *const W_SRE_Pattern)).flags };
     let is_known_unicode = unsafe { is_str(w_pattern) };
+    let tail = sre_pattern_flag_tail(flags, is_known_unicode);
+    Ok(crate::display::wtf8_format!("re.compile(", u, tail))
+}
+
+/// interp_sre.py `W_SRE_Pattern.repr_w` flag-name join.
+fn sre_pattern_flag_tail(mut flags: i64, is_known_unicode: bool) -> String {
     if is_known_unicode
         && (flags & (SRE_FLAG_LOCALE | SRE_FLAG_UNICODE | SRE_FLAG_ASCII)) == SRE_FLAG_UNICODE
     {
         flags &= !SRE_FLAG_UNICODE;
     }
-    let mut tail = String::new();
-    let mut any = false;
-    if flags & 1 != 0 {
-        flags -= 1;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
+    let mut flag_items: Vec<String> = Vec::new();
+    // interp_sre.py `W_SRE_Pattern.repr_w`: `for i, name in enumerate(FLAG_NAMES)`.
+    for i in 0..SRE_FLAG_NAMES.len() {
+        let name = SRE_FLAG_NAMES[i];
+        if flags & (1 << i) != 0 {
+            flags -= 1 << i;
+            flag_items.push(name.to_string());
         }
-        any = true;
-        tail.push_str("re.TEMPLATE");
-    }
-    if flags & 2 != 0 {
-        flags -= 2;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.IGNORECASE");
-    }
-    if flags & 4 != 0 {
-        flags -= 4;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.LOCALE");
-    }
-    if flags & 8 != 0 {
-        flags -= 8;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.MULTILINE");
-    }
-    if flags & 16 != 0 {
-        flags -= 16;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.DOTALL");
-    }
-    if flags & 32 != 0 {
-        flags -= 32;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.UNICODE");
-    }
-    if flags & 64 != 0 {
-        flags -= 64;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.VERBOSE");
-    }
-    if flags & 128 != 0 {
-        flags -= 128;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.DEBUG");
-    }
-    if flags & 256 != 0 {
-        flags -= 256;
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push_str("re.ASCII");
     }
     if flags != 0 {
-        if any {
-            tail.push('|');
-        } else {
-            tail.push_str(", ");
-        }
-        any = true;
-        tail.push('0');
-        tail.push('x');
-        let bits = flags as u64;
-        let mut shift = 60u32;
-        let mut started = false;
-        loop {
-            let d = ((bits >> shift) & 0xf) as u8;
-            if started || d != 0 || shift == 0 {
-                started = true;
-                match d {
-                    0 => tail.push('0'),
-                    1 => tail.push('1'),
-                    2 => tail.push('2'),
-                    3 => tail.push('3'),
-                    4 => tail.push('4'),
-                    5 => tail.push('5'),
-                    6 => tail.push('6'),
-                    7 => tail.push('7'),
-                    8 => tail.push('8'),
-                    9 => tail.push('9'),
-                    10 => tail.push('a'),
-                    11 => tail.push('b'),
-                    12 => tail.push('c'),
-                    13 => tail.push('d'),
-                    14 => tail.push('e'),
-                    _ => tail.push('f'),
-                }
-            }
-            if shift == 0 {
-                break;
-            }
-            shift -= 4;
-        }
+        flag_items.push(format!("0x{flags:x}"));
     }
-    let _ = any;
-    tail.push(')');
-    Ok(crate::display::wtf8_format!("re.compile(", u, tail))
+    if flag_items.is_empty() {
+        ")".to_owned()
+    } else {
+        format!(", {})", flag_items.join("|"))
+    }
 }
 
 fn sre_pattern_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

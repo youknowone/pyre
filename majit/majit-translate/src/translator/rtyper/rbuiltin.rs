@@ -517,6 +517,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),
+        ("std.ptr", "copy_nonoverlapping", rtype_copy_nonoverlapping),
         // `pyre_object::lltype::malloc_raw` — raw (non-GC) typed alloc.
         // The GC sibling `malloc_typed` is fused into `NewWithVtable` by
         // the front-end and never reaches `findbltintyper`; the raw path
@@ -3547,6 +3548,113 @@ fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeRes
     crate::translator::rtyper::pairtype::pair_rtype_is_(r0.as_ref(), r1.as_ref(), hop)
 }
 
+/// `std::ptr::copy_nonoverlapping(src, dst, count) -> ()`.
+///
+/// `count` is an element count. `llmemory.raw_memcopy` takes a byte
+/// count (`llmemory.py` `raw_memcopy`). `rgc.ll_arraycopy` multiplies
+/// `sizeof(TP.OF) * length` before that call. Scale by `sizeof` of
+/// `src`'s pointee, then `cast_ptr_to_adr` so the llop sees `Address`
+/// operands (`rtype_raw_memcopy`).
+///
+/// `BuiltinFunctionRepr.rtype_simple_call` has already popped the
+/// callable, so the hop is `(src, dst, count)`.
+///
+/// `std_ptr_copy_nonoverlapping` returns `s_None`. `consider_op` binds
+/// `s_ImpossibleValue` only when the analyzer returns nothing, and
+/// `translate_no_return_value` accepts only that. Hand back the Void
+/// constant after `raw_memcopy`, as `rtype_keepalive` does for
+/// `immutablevalue(None)`.
+fn rtype_copy_nonoverlapping(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    if hop.nb_args() != 3 {
+        return Err(TyperError::message(format!(
+            "copy_nonoverlapping: expected 3 arguments, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r0 = arg_repr(hop, 0)?;
+    let r1 = arg_repr(hop, 1)?;
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(r0.as_ref()),
+        ConvertedTo::Repr(r1.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_cannot_occur()?;
+    let v_src = ptr_as_address(hop, vlist[0].clone(), r0.lowleveltype())?;
+    let v_dst = ptr_as_address(hop, vlist[1].clone(), r1.lowleveltype())?;
+    let v_nbytes = scale_copy_count(hop, r0.lowleveltype(), vlist[2].clone())?;
+    let _ = hop.genop(
+        "raw_memcopy",
+        vec![v_src, v_dst, v_nbytes],
+        GenopResult::Void,
+    );
+    let void_const = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(void_const)))
+}
+
+/// `cast_ptr_to_adr` when the operand is a `Ptr` (`raddress.py`
+/// `pairtype(PtrRepr, AddressRepr).convert_from_to`). An `Address` is
+/// already the llop's operand type (`rtype_raw_memcopy`).
+fn ptr_as_address(
+    hop: &HighLevelOp,
+    v: crate::flowspace::model::Hlvalue,
+    ll: &LowLevelType,
+) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    match ll {
+        LowLevelType::Address => Ok(v),
+        LowLevelType::Ptr(_) => hop
+            .genop(
+                "cast_ptr_to_adr",
+                vec![v],
+                GenopResult::LLType(LowLevelType::Address),
+            )
+            .ok_or_else(|| {
+                TyperError::message("copy_nonoverlapping: cast_ptr_to_adr returned void")
+            }),
+        other => Err(TyperError::message(format!(
+            "copy_nonoverlapping: src/dst must be Ptr or Address, got {other:?}"
+        ))),
+    }
+}
+
+/// `rgc.ll_arraycopy`: `raw_memcopy(..., sizeof(TP.OF) * length)`.
+fn scale_copy_count(
+    hop: &HighLevelOp,
+    src_ll: &LowLevelType,
+    v_count: crate::flowspace::model::Hlvalue,
+) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
+    use crate::flowspace::model::Hlvalue;
+    use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let pointee = match src_ll {
+        LowLevelType::Ptr(ptr) => LowLevelType::from(ptr.TO.clone()),
+        LowLevelType::Address => LowLevelType::Char,
+        other => {
+            return Err(TyperError::message(format!(
+                "copy_nonoverlapping: src must be a pointer, got {other:?}"
+            )));
+        }
+    };
+    if pointee._is_varsize() {
+        return Err(TyperError::message(format!(
+            "copy_nonoverlapping: cannot size varsize pointee {pointee:?}"
+        )));
+    }
+    let size = sizeof(&pointee, None).map_err(TyperError::message)?;
+    let c_size = HighLevelOp::inputconst(&LowLevelType::Signed, &size)?;
+    hop.genop(
+        "int_mul",
+        vec![v_count, Hlvalue::Constant(c_size)],
+        GenopResult::LLType(LowLevelType::Signed),
+    )
+    .ok_or_else(|| TyperError::message("copy_nonoverlapping: int_mul returned void"))
+}
+
 /// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`
 /// analog (rbuiltin.py:412-418) for the `{core,std}.ptr.{null_mut,null}`
 /// host builtins.  Upstream routes nullptr through `rtype_const_result`
@@ -4756,6 +4864,119 @@ mod tests {
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `lltype.runtime_type_info`"
         );
+    }
+
+    #[test]
+    fn copy_nonoverlapping_typer_is_shared_by_core_and_std_ptr() {
+        let std_host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("copy_nonoverlapping"))
+            .expect("HOST_ENV missing std.ptr.copy_nonoverlapping");
+        let core_host = HOST_ENV
+            .import_module("core.ptr")
+            .and_then(|m| m.module_get("copy_nonoverlapping"))
+            .expect("HOST_ENV missing core.ptr.copy_nonoverlapping");
+        assert_eq!(
+            std_host, core_host,
+            "core.ptr.copy_nonoverlapping must be the std.ptr HostObject"
+        );
+        assert_eq!(std_host.qualname(), "std.ptr.copy_nonoverlapping");
+        assert!(
+            lookup_typer(&std_host).is_some(),
+            "BUILTIN_TYPER missing std.ptr.copy_nonoverlapping"
+        );
+        assert!(
+            lookup_typer(&core_host).is_some(),
+            "the shared HostObject must carry the typer"
+        );
+    }
+
+    #[test]
+    fn copy_nonoverlapping_s_none_simple_call_emits_raw_memcopy() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInstance, SomeInteger, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("copy_nonoverlapping"))
+            .expect("HOST_ENV missing std.ptr.copy_nonoverlapping");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // Instance / OBJECT is a fixed-size GcStruct. SomeString's STR
+        // is varsize (`chars` array), so sizeof of that pointee errors.
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )))));
+        let count = Variable::named("count");
+        count
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("copied");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(src.clone()),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("copy_nonoverlapping hop setup");
+        // `setup_block_entry` stamps each input's concretetype before
+        // `translate_hl_to_ll`. These operands are not block inputs.
+        for var in [&src, &dst, &count] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("s_None simple_call must agree with the void copy");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_memcopy"),
+            "raw_memcopy missing from {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "int_mul"),
+            "element count must scale by sizeof, missing int_mul in {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "cast_ptr_to_adr"),
+            "Ptr operands must convert to Address, missing cast_ptr_to_adr in {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
     }
 
     #[test]

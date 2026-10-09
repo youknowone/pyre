@@ -1463,3 +1463,56 @@ fn eval_loop_converts_bytecode_corruption_before_raising() {
         "{path}: BytecodeCorruption from_residual must raise From::from"
     );
 }
+
+/// `encode_ascii` is `Result<Vec<u8>, PyError>`. The residual stub must
+/// project the Ok payload as a byte list, not a classdef-less `ref`
+/// that `List ∪ Instance` cannot merge at `encode_object`'s return.
+#[test]
+fn encode_ascii_residual_returns_a_byte_list() {
+    let g = lower_function(interp(), "pyre_interpreter::codec_engine::encode_ascii")
+        .expect("encode_ascii lowers");
+    let root = g.return_container_root.as_deref().unwrap_or("");
+    assert!(
+        root.contains("Vec<u8>") || root.contains("[u8]"),
+        "encode_ascii Result<Vec<u8>> stub must be a byte list, got {root:?}"
+    );
+}
+
+/// `interp_sre.py FLAG_NAMES` is a prebuilt list. The NamedConst
+/// `SRE_FLAG_NAMES: [&str; 9]` must fold to `__const_str_array`, not a
+/// residual accessor Call the registry cannot bind.
+#[test]
+fn sre_flag_names_folds_to_a_str_list() {
+    let g = lower_function(
+        interp(),
+        "pyre_interpreter::module::_sre::interp_sre::sre_pattern_flag_tail",
+    )
+    .expect("sre_pattern_flag_tail lowers");
+    let mut residual = 0usize;
+    let mut tables = Vec::new();
+    for op in g.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) == Some("SRE_FLAG_NAMES") {
+            residual += 1;
+        }
+        if segments.first().map(String::as_str) == Some("__const_str_array") {
+            tables.push(segments.clone());
+        }
+    }
+    assert_eq!(
+        residual, 0,
+        "sre_pattern_flag_tail left an SRE_FLAG_NAMES accessor"
+    );
+    assert!(
+        tables.iter().any(|segments| {
+            segments.len() == 10 && segments[1] == "re.TEMPLATE" && segments[9] == "re.ASCII"
+        }),
+        "sre_pattern_flag_tail must bake FLAG_NAMES, got {tables:?}"
+    );
+}

@@ -4797,6 +4797,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         );
         lo.graph.return_is_str =
             dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
+        lo.graph.return_container_root = dont_look_inside_return_container_root(
+            &fd.signature.output,
+            llbc,
+            static_addrs.error_carrier,
+            gc_struct_ids,
+        );
         let expand_inline_struct = |owner: &str, field: &str| {
             inline_struct_field_leaves(llbc, tombstoned_leaves, gc_struct_ids, owner, field)
         };
@@ -18651,14 +18657,17 @@ impl<'a> Lowering<'a> {
                     // The length is still the fat metadata word.
                     let constants_box = (field_name == "__pos_0" || field_name == "0")
                         && (owner_root == "Constants" || owner_root.ends_with("::Constants"));
-                    // `SetStrategyRef::deref` is `self.imp` (`&dyn SetStrategy`).
+                    // `SetStrategyRef::deref` / `DictStrategyRef::deref` is
+                    // `self.imp` (`&dyn SetStrategy` / `&dyn DictStrategy`).
                     // The caller reads `method_*` off that returned word as
                     // the vtable. Trait-impl paths render as `<Impl>::deref`,
                     // so the field's owner is what identifies the read. The
                     // data word is the unit strategy; the vtable is next.
                     let dyn_vtable = field_name == "imp"
                         && (owner_root == "SetStrategyRef"
-                            || owner_root.ends_with("::SetStrategyRef"))
+                            || owner_root.ends_with("::SetStrategyRef")
+                            || owner_root == "DictStrategyRef"
+                            || owner_root.ends_with("::DictStrategyRef"))
                         && (tyref_is_dyn_pointer(&field_ty, self.llbc)
                             || tyref_is_dyn_pointer(&place_ty, self.llbc));
                     let mut field = FieldDescriptor::new(field_name, Some(owner_root))
@@ -19070,11 +19079,10 @@ impl<'a> Lowering<'a> {
                 // `getarrayitem`, the same op [`Self::typed_items_elem_ptr_add`]
                 // emits for `.add(idx)`. That arm binds the element on
                 // `index_elem_alias`, so the following `*p` is the element
-                // already read. `raw_load` is the post-rtyper spelling
-                // (`rewrite_op_raw_load`); emitting it here makes
-                // `flowspace_adapter::translate_op` reject the subject.
-                // A deref with no `.add` (`sizehint_state_value`) is that
-                // array at index 0.
+                // already read. A primitive deref is `rewrite_op_raw_load`;
+                // `translate_op` carries that op as `raw_load` and `flowin`
+                // binds `item_ty`. A deref with no `.add`
+                // (`sizehint_state_value`) is that array at index 0.
                 //
                 // The object-ref twin: `*items_block_items_base(block)` is
                 // `l.items[0]` (`rlist.py ll_getitem_fast`). A length-2
@@ -19422,6 +19430,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_transparent_int_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
+                    .or_else(|| self.fold_named_const_str_array_global(id))
                     .or_else(|| self.fold_const_fn_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
@@ -20537,6 +20546,81 @@ impl<'a> Lowering<'a> {
         for n in items {
             segments.push(n.to_string());
         }
+        Some(OpKind::Call {
+            target: CallTarget::function_path(segments),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        })
+    }
+
+    /// Fold a `NamedConst` global whose initializer is a fixed-size array
+    /// of string literals (`SRE_FLAG_NAMES: [&str; 9] = ["re.TEMPLATE", …]`)
+    /// into `__const_str_array`. `interp_sre.py FLAG_NAMES` is a prebuilt
+    /// list; `repr_w` enumerates it. The residual accessor call has no
+    /// registry entry (`SRE_FLAG_NAMES` is a const, not a function).
+    ///
+    /// Same `_0 = [c0, c1, …]; return` shape as
+    /// [`Self::fold_named_const_int_array_global`]. Mixes of non-string
+    /// elements, a `::` in a literal (FunctionPath cannot carry it), or a
+    /// richer init body stay on the residual accessor.
+    fn fold_named_const_str_array_global(&self, def_id: u64) -> Option<OpKind> {
+        let gd = self.llbc.global_by_id(def_id)?;
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return None;
+        }
+        let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        let mut array: Option<(u64, Vec<String>)> = None;
+        for block in &body.body {
+            for stmt in &block.statements {
+                match stmt.stmt_kind_ref() {
+                    Ok(StmtKind::StorageLive(_))
+                    | Ok(StmtKind::StorageDead(_))
+                    | Ok(StmtKind::PlaceMention(_))
+                    | Ok(StmtKind::Borrowck(_)) => {}
+                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands))) => {
+                        let PlaceKind::Local(dst) = place.kind else {
+                            return None;
+                        };
+                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
+                            return None;
+                        }
+                        let mut vals = Vec::with_capacity(operands.len());
+                        for op in operands {
+                            let Operand::Const(value) = op else {
+                                return None;
+                            };
+                            let DecodedConst::Str(s) = decode_constant(self.llbc, value).ok()?
+                            else {
+                                return None;
+                            };
+                            if s.contains("::") {
+                                return None;
+                            }
+                            vals.push(s);
+                        }
+                        array = Some((dst, vals));
+                    }
+                    _ => return None,
+                }
+            }
+            match block.term_ref(self.llbc) {
+                Ok(TermKind::Return) | Ok(TermKind::Goto { .. }) => {}
+                _ => return None,
+            }
+        }
+        let (array_local, items) = array?;
+        if array_local != 0 || items.is_empty() {
+            return None;
+        }
+        let mut segments = Vec::with_capacity(items.len() + 1);
+        segments.push("__const_str_array".to_string());
+        segments.extend(items);
         Some(OpKind::Call {
             target: CallTarget::function_path(segments),
             args: Vec::new(),
@@ -36103,11 +36187,20 @@ impl<'a> Lowering<'a> {
         };
         let lhs = first_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
         let rhs = second_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
-        let scalar_ok = crate::codewriter::minmax::scalar_cmp_banks_compatible(
-            lhs.as_ref(),
-            rhs.as_ref(),
-            leaf,
-        );
+        // A missing bank is a const only when that operand has no type.
+        // A typed str (or any non-scalar) is not an int const. Trait
+        // `PartialEq` on floats stays residual (`float` IEEE vs `int_eq`).
+        let typed_nonscalar =
+            (first_arg_ty.is_some() && lhs.is_none()) || (second_arg_ty.is_some() && rhs.is_none());
+        let trait_eq_float = trait_eq
+            && (matches!(lhs, Some(ValueType::Float)) || matches!(rhs, Some(ValueType::Float)));
+        let scalar_ok = !typed_nonscalar
+            && !trait_eq_float
+            && crate::codewriter::minmax::scalar_cmp_banks_compatible(
+                lhs.as_ref(),
+                rhs.as_ref(),
+                leaf,
+            );
         // `[u8]` / `str` equality is `BinOp("eq")` (`ll_streq`). The generic
         // `PartialEq::eq` path is what a monomorphized `Equivalent` body
         // still emits for those operands.
@@ -42500,6 +42593,11 @@ fn trace_struct_ptr_add_header(
 /// non-transparent struct pointee, and a destination used only as
 /// `(*dest).field`. The array identity is taken from the add's pointer
 /// type, which is `*mut Entry` even when the header is a `GcEntries`.
+///
+/// A reassignment of the index or the header that reaches a `(*dest).field`
+/// use is a miss. [`Lowering::realias_operand`] reads the local's binding
+/// at that use, which is the new value, while `ptr::add` captured the old
+/// one.
 #[allow(clippy::too_many_arguments)]
 fn struct_field_ptr_add_trace(
     reg: &RegularCall,
@@ -54329,6 +54427,82 @@ fn dont_look_inside_return_class_root(
     }
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     Some(format!("{}{suffix}", td.item_meta.name_path()))
+}
+
+/// Field-layout spelling of a `*mut Vec<T>` / `*mut VecDeque<T>` / `*mut [T]`
+/// result, or `None`.
+///
+/// A field of that type projects to `SomeList` (`raw_ptr_pointee_container_root`);
+/// the `ref` token alone shells the call as a classdef-less instance, and
+/// `List ∪ Instance` is a phi `pairtype` never builds. The spelling is the
+/// same string `published_struct_field_layout` stores, so the stub and the
+/// field project one list.
+fn dont_look_inside_return_container_root(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    // Same Result<T, PyError> payload [`dont_look_inside_return_token`]
+    // reads. `encode_ascii` returns `Result<Vec<u8>, PyError>`; looking
+    // at the Result ADT yields no Vec/slice spelling, so the stub was a
+    // classdef-less `ref` that `List ∪ Instance` cannot merge.
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let ty = payload.as_ref().unwrap_or(output);
+    let spelling = tyref_to_field_layout_string(ty, llbc, gc_struct_ids);
+    slice_or_vec_container_root_spelling(&spelling).map(str::to_string)
+}
+
+/// Spellings whose residual stub must be `SomeList`, not a classdef-less
+/// `ref`. `*mut Vec<T>` / `*mut [T]` already qualify; `&[T]` is the same
+/// GcArray view (`bytes_like_data` returns `&[u8]`), and `getanyitem` on
+/// the classdef-less shell panics.
+fn slice_or_vec_container_root_spelling(spelling: &str) -> Option<&str> {
+    let pointee = spelling
+        .strip_prefix("*const ")
+        .or_else(|| spelling.strip_prefix("*mut "))
+        .map(str::trim)
+        .unwrap_or_else(|| peel_ref_prefix(spelling));
+    // `[T]` is a GcArray / SomeList. `[T; N]` is a fixed Array: the
+    // outermost brackets carry `; N` (`slice_element_spelling`).
+    let is_unsized_slice = slice_element_spelling(pointee).is_some();
+    (pointee.starts_with("Vec<") || pointee.starts_with("VecDeque<") || is_unsized_slice)
+        .then_some(spelling)
+}
+
+#[cfg(test)]
+mod slice_or_vec_container_root_spelling_tests {
+    use super::slice_or_vec_container_root_spelling;
+
+    #[test]
+    fn slice_and_vec_spellings_are_list_residuals() {
+        assert_eq!(slice_or_vec_container_root_spelling("&[u8]"), Some("&[u8]"));
+        assert_eq!(
+            slice_or_vec_container_root_spelling("&mut [u8]"),
+            Some("&mut [u8]")
+        );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("*mut [u8]"),
+            Some("*mut [u8]")
+        );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("*mut Vec<Utf8LocElem>"),
+            Some("*mut Vec<Utf8LocElem>")
+        );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("Vec<u8>"),
+            Some("Vec<u8>")
+        );
+        assert_eq!(slice_or_vec_container_root_spelling("&Engine"), None);
+        assert_eq!(slice_or_vec_container_root_spelling("*mut PyObject"), None);
+        assert_eq!(slice_or_vec_container_root_spelling("[u8; 4]"), None);
+        assert_eq!(slice_or_vec_container_root_spelling("*mut [u8; 4]"), None);
+        assert_eq!(slice_or_vec_container_root_spelling("&[u8; 4]"), None);
+    }
 }
 
 /// Whether a callee's result is a pointer to the low-level `STR` storage
@@ -75364,6 +75538,28 @@ mod tests {
     }
 
     #[test]
+    fn dyn_pointer_metadata_is_one_pointer_level() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let dyn_trait = serde_json::json!({"DynTrait": {}});
+        let shared = |pointee: serde_json::Value| {
+            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}))
+        };
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        assert!(super::tyref_is_dyn_pointer(
+            &shared(dyn_trait.clone()),
+            &llbc
+        ));
+        assert!(!super::tyref_is_dyn_pointer(
+            &shared(serde_json::json!({"Slice": [u8_ty, null]})),
+            &llbc
+        ));
+        assert!(!super::tyref_is_dyn_pointer(
+            &shared(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
+            &llbc
+        ));
+    }
+
+    #[test]
     fn fixed_array_suffix_separates_item_type_and_length() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
         let array = |item: serde_json::Value, len: &str| {
@@ -79530,6 +79726,8 @@ mod tests {
         assert_handle_class(&llbc, &ty, Some("Word"));
     }
 
+    /// A transparent wrapper of `*mut PyObject` stays the wrapper.
+    /// `StrKey`'s `*mut Utf8Str` and a scalar newtype still erase to the word.
     #[test]
     fn borrowed_one_scalar_struct_uses_the_field_bank() {
         let type_decl = serde_json::json!({
@@ -90512,6 +90710,166 @@ mod tests {
         );
     }
 
+    /// One `__cast_instance_intrinsic` whose root is a `{vtable}` struct.
+    /// The slot read's base is that cast when the metadata word is a raw
+    /// pointer; the operand is the word itself.
+    fn peel_vtable_instance_cast(graph: &FunctionGraph, kind: &OpKind) -> OpKind {
+        let Some(root) = crate::model::cast_instance_root(kind) else {
+            return kind.clone();
+        };
+        if !root.ends_with("::{vtable}") {
+            return kind.clone();
+        }
+        let OpKind::Call { args, .. } = kind else {
+            return kind.clone();
+        };
+        let Some(inner) = args.first().and_then(crate::model::LinkArg::as_variable) else {
+            return kind.clone();
+        };
+        let inner_ops = producers_of(graph, inner);
+        if inner_ops.len() == 1 {
+            inner_ops[0].kind.clone()
+        } else {
+            kind.clone()
+        }
+    }
+
+    fn producers_of<'a>(graph: &'a FunctionGraph, var: &Variable) -> Vec<&'a SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| op.result.as_ref() == Some(var))
+            .collect()
+    }
+
+    /// `method_<name>` must be loaded from the vtable word of the same
+    /// field the call passes as `self`. The data word is the strategy
+    /// static; indexing it reads the bytes that follow that static.
+    fn assert_strategy_slot_indexes_vtable(
+        graph: &FunctionGraph,
+        function: &str,
+        method: &str,
+        funcptr: &Variable,
+        args: &[Variable],
+    ) {
+        let producers = producers_of(graph, funcptr);
+        assert_eq!(
+            producers.len(),
+            1,
+            "{function}::{method} funcptr producers: {producers:?}"
+        );
+        let OpKind::FieldRead {
+            base: vtable,
+            field,
+            ty: ValueType::Int,
+            ..
+        } = &producers[0].kind
+        else {
+            panic!(
+                "{function}::{method} slot must be an int FieldRead: {:?}",
+                producers[0].kind
+            );
+        };
+        assert_eq!(field.name, format!("method_{method}"));
+        assert!(field.vec_part.is_none());
+        let meta_ops = producers_of(graph, vtable);
+        assert_eq!(
+            meta_ops.len(),
+            1,
+            "{function}::{method} vtable-word producers: {meta_ops:?}"
+        );
+        // A raw-pointer deref of the metadata word narrows through
+        // `__cast_instance_intrinsic[<Trait>::{vtable}]` before the slot
+        // read. The cast is a classdef paint; the word it retypes is the
+        // metadata field read.
+        let meta_kind = peel_vtable_instance_cast(graph, &meta_ops[0].kind);
+        let OpKind::FieldRead {
+            base: struct_base,
+            field: meta,
+            ty: ValueType::Ref(None),
+            ..
+        } = &meta_kind
+        else {
+            panic!("{function}::{method} vtable word must be a ref FieldRead: {meta_kind:?}");
+        };
+        assert_eq!(
+            meta.vec_part,
+            Some(crate::model::VecFieldPart::FatVtable),
+            "{function}::{method} metadata field: {meta:?}"
+        );
+        let data_words: Vec<&Variable> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead {
+                    base, field: data, ..
+                } if base == struct_base
+                    && data.name == meta.name
+                    && data.owner_root == meta.owner_root
+                    && data.vec_part.is_none() =>
+                {
+                    op.result.as_ref()
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            args.first()
+                .is_some_and(|recv| forwards_to_any(graph, recv, &data_words)),
+            "{function}::{method} receiver must stay the data word of {}.{}: args={args:?} data={data_words:?}",
+            meta.owner_root.as_deref().unwrap_or("?"),
+            meta.name
+        );
+    }
+
+    /// `start` is one of `targets`, or a chain of one-predecessor block
+    /// arguments that ends at one of them. A live field read is re-bound
+    /// at each join; the call still receives that read.
+    fn forwards_to_any(graph: &FunctionGraph, start: &Variable, targets: &[&Variable]) -> bool {
+        let mut current = start.clone();
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            if targets.iter().any(|target| *target == &current) {
+                return true;
+            }
+            if seen.iter().any(|seen| seen == &current) {
+                return false;
+            }
+            seen.push(current.clone());
+            if !producers_of(graph, &current).is_empty() {
+                return false;
+            }
+            let Some(phi) = graph
+                .blocks
+                .iter()
+                .find(|block| block.inputargs.iter().any(|arg| arg == &current))
+            else {
+                return false;
+            };
+            let Some(index) = phi.inputargs.iter().position(|arg| arg == &current) else {
+                return false;
+            };
+            let preds = graph.predecessors(phi.id);
+            if preds.len() != 1 {
+                return false;
+            }
+            let Some(next) = graph
+                .block(preds[0])
+                .exits
+                .iter()
+                .find(|link| link.target == phi.id)
+                .and_then(|link| link.args.get(index))
+                .and_then(crate::model::LinkArg::as_variable)
+            else {
+                return false;
+            };
+            current = next.clone();
+        }
+        false
+    }
+
     /// The Rust trait-object spelling of PyPy's
     /// `W_DictMultiObject.getitem` / `getitem_str` strategy dispatch must
     /// retain both halves RPython's PBC call carries: the concrete vtable
@@ -90576,6 +90934,39 @@ mod tests {
                 "{function}'s vtable method pointer must be a raw-pointer/int FieldRead: {:?}",
                 producers[0].kind
             );
+        }
+
+        // `w_dict_lookup_checked` reads `DictStrategyRef.imp` (`&dyn
+        // DictStrategy`) and calls through `ptr_metadata` of that field.
+        // The slot load has to index the vtable word. The call receiver
+        // stays the data word: a strategy static, not the vtable.
+        {
+            let function = "w_dict_lookup_checked";
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|error| panic!("lower {function}: {error}"));
+            let calls: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        family_key: Some(family_key),
+                        ..
+                    } if family_key.0 == "DictStrategy" => {
+                        Some((funcptr.clone(), args.clone(), family_key.1.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                calls.iter().any(|(_, _, method)| method == "getitem"),
+                "{function} must dispatch DictStrategy::getitem: {calls:?}"
+            );
+            for (funcptr, args, method) in &calls {
+                assert_strategy_slot_indexes_vtable(&graph, function, method, funcptr, args);
+            }
         }
 
         let program = super::build_semantic_program_from_llbc(&llbc)

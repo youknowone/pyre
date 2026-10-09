@@ -339,6 +339,14 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // checks in
     // `baseobjspace::is_w` / `baseobjspace::is_`.
     analyzer_for(&mut reg, "std.ptr.eq", std_ptr_eq);
+    // `core.ptr.copy_nonoverlapping` is the same `HostObject` as
+    // `std.ptr.copy_nonoverlapping` (`flowspace/model.rs`), so this
+    // qualname covers both spellings.
+    analyzer_for(
+        &mut reg,
+        "std.ptr.copy_nonoverlapping",
+        std_ptr_copy_nonoverlapping,
+    );
     // Rust `std::ptr::null_mut::<T>()` / `null::<T>()` — the null
     // pointer constant (also the value of
     // `pyre_object::pyobject::PY_NULL`, whose HOST_ENV attr binds to
@@ -1450,6 +1458,26 @@ fn std_ptr_eq(
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
 }
 
+/// `std::ptr::copy_nonoverlapping(src, dst, count) -> ()`.
+///
+/// The foreign decl is opaque. A user graph for it has one input slot
+/// per argument, and `mergeinputargs` unions every caller's pointee
+/// into that slot. `llmemory.raw_memcopy` returns
+/// nothing and does not read the pointee, so this analyzer does not
+/// either: `()` is `s_None`.
+fn std_ptr_copy_nonoverlapping(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 3 {
+        return Err(AnnotatorError::new(
+            "std.ptr.copy_nonoverlapping expects (src, dst, count)",
+        ));
+    }
+    Ok(s_none())
+}
+
 /// Analyzer for `std::ptr::null_mut::<T>()` / `std::ptr::null::<T>()`
 /// — the null pointer constant (`lltype.nullptr(T)` analogue;
 /// `rbuiltin.py` typer folds it to a null `Ptr` constant).  Pyre's
@@ -1764,7 +1792,24 @@ fn cast_instance_intrinsic(
     // `SomeList` carries no `can_be_None` — upstream's does not either — so
     // the nullability computed above has nowhere to land on this arm; a null
     // operand is still admitted rather than hard-errored.
-    if matches!(&projected, SomeValue::List(_)) {
+    // A list root is one `ListDef` for this operation
+    // (`Bookkeeper.newlist` / `getlistdef`). `project_struct_field_type`
+    // mints a fresh list, and the next reflow's `setbinding` refuses it:
+    // the new list does not contain the one already bound.
+    if let SomeValue::List(list) = &projected {
+        let projected = if bk.position_entered.get() {
+            let item = list.listdef.s_value();
+            match bk.newlist(&[item], None) {
+                Ok(stable) => SomeValue::List(stable),
+                Err(err) => {
+                    return Err(AnnotatorError::new(format!(
+                        "__cast_instance_intrinsic: {err}"
+                    )));
+                }
+            }
+        } else {
+            projected.clone()
+        };
         return match operand {
             SomeValue::List(_) => Ok(operand.clone()),
             SomeValue::Instance(_)
@@ -3542,6 +3587,40 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("no analyser registered")
+        );
+    }
+
+    #[test]
+    fn copy_nonoverlapping_returns_none_for_an_instance_and_a_string() {
+        let bk = bk();
+        let inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let text = SomeValue::String(SomeString::new(false, false));
+        let count = SomeValue::Integer(SomeInteger::new(true, true));
+        for (src, dst) in [(&inst, &inst), (&text, &text), (&inst, &text)] {
+            let result = call_builtin(
+                &bk,
+                "std.ptr.copy_nonoverlapping",
+                &[Some(src.clone()), Some(dst.clone()), Some(count.clone())],
+                &no_kwds(),
+            )
+            .expect("copy_nonoverlapping annotates");
+            assert!(
+                matches!(result, SomeValue::None_(_)),
+                "copy returns (), got {result:?}"
+            );
+        }
+        let err = call_builtin(
+            &bk,
+            "std.ptr.copy_nonoverlapping",
+            &[Some(inst), Some(count.clone())],
+            &no_kwds(),
+        )
+        .expect_err("two arguments are not the signature");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("expects (src, dst, count)")
         );
     }
 

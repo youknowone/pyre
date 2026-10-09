@@ -2093,8 +2093,24 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     if canonical_strip == ["nonconst", "non_constant"] {
         return Some("skip-nonconst-extregistry-entry");
     }
+    // `core::ptr::copy_nonoverlapping` is an opaque foreign decl. Layer-1
+    // `call_registry.lookup` beats `host_env_callable`, so a registered
+    // user graph is the callee: its empty body still `mergeinputargs`s
+    // every pointee into one slot. Declining the registry entry lets the
+    // callsite reach the `std.ptr.copy_nonoverlapping` host builtin
+    // (`std_ptr_copy_nonoverlapping`). The leaf key is the alias
+    // `free_function_alias_paths` registers from `SemanticFunction.name`.
+    if canonical_strip == ["core", "ptr", "copy_nonoverlapping"]
+        || canonical_strip == ["std", "ptr", "copy_nonoverlapping"]
+        || canonical_strip == ["copy_nonoverlapping"]
+    {
+        return Some(SKIP_PTR_COPY_NONOVERLAPPING);
+    }
     None
 }
+
+/// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
+const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
 
 /// Publish what the source callable of `graph` declares about its result
 /// on its registry entry.
@@ -2843,7 +2859,9 @@ fn residual_stub_result_shell(
 
 /// The result a `_signature_` declares for a residual callee whose `ref`
 /// token alone would shell it as a classdef-less instance: `SomeString` for
-/// a low-level `STR` pointer (`FunctionGraph::return_is_str`), else
+/// a low-level `STR` pointer (`FunctionGraph::return_is_str`), `SomeList`
+/// for a pointer onto a Rust container (`FunctionGraph::return_container_root`,
+/// the `GcArray` a field of that type already projects), else
 /// `SomeInstance(classdef)` of a by-value ADT result
 /// (`FunctionGraph::return_class_root`), whose payload reads
 /// (`__discriminant`, `__pos_0`) the classdef-less shell cannot annotate.
@@ -2859,6 +2877,12 @@ fn declared_return_annotation(
         return crate::codewriter::annotation_state::valuetype_to_someshell(
             &crate::model::ValueType::Str,
         );
+    }
+    if let Some(spelling) = graph.return_container_root.as_deref() {
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        if !matches!(projected, crate::annotator::model::SomeValue::Impossible) {
+            return Some(projected);
+        }
     }
     let root = graph.return_class_root.as_deref()?;
     let bk = registry.bookkeeper();
@@ -3047,7 +3071,26 @@ pub(crate) fn register_unsafe_fn_stubs(
     registry: &CallRegistry,
     specs: &[(Vec<String>, Signature, Option<String>)],
 ) {
+    use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     for (segments, signature, return_token) in specs {
+        // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
+        // (`core::ptr::copy_nonoverlapping`) here, before they ever become
+        // a `SemanticFunction`. Declining that path lets Layer-1
+        // `call_registry.lookup` miss, so the callsite reaches
+        // `host_env_callable`. The same carrier also holds the residual
+        // `allocate` / `allocate_stable` stubs from
+        // `collect_marked_class_ctor_stubs_from_llbc`.
+        // `registration_decline` drops those as user graphs so this stub
+        // can occupy the key; declining them here leaves the key empty.
+        let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
+        if registration_decline(&canonical_dedup_key(&path)) == Some(SKIP_PTR_COPY_NONOVERLAPPING) {
+            crate::decline::record(
+                REGISTRY_GATE,
+                SKIP_PTR_COPY_NONOVERLAPPING,
+                format_args!("{path}"),
+            );
+            continue;
+        }
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
             .or_else(|| residual_return_shell(return_token.as_deref()))
         else {
@@ -5091,6 +5134,115 @@ mod tests {
     use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
     use crate::translator::rtyper::legacy_annotator::setbinding;
+
+    #[test]
+    fn copy_nonoverlapping_is_declined_and_unregistered() {
+        for segments in [
+            vec![
+                "core".to_string(),
+                "ptr".into(),
+                "copy_nonoverlapping".into(),
+            ],
+            vec!["std".into(), "ptr".into(), "copy_nonoverlapping".into()],
+            vec!["copy_nonoverlapping".into()],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_PTR_COPY_NONOVERLAPPING),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["core".into(), "ptr".into(), "copy".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [
+            vec!["core", "ptr", "copy_nonoverlapping"],
+            vec!["std", "ptr", "copy_nonoverlapping"],
+            vec!["copy_nonoverlapping"],
+        ] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+            };
+            let mut graph = LegacyGraph::new("copy_nonoverlapping");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["core", "ptr", "copy_nonoverlapping"][..],
+            &["std", "ptr", "copy_nonoverlapping"][..],
+            &["copy_nonoverlapping"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        let host = crate::flowspace::model::host_env_callable(
+            &["core", "ptr", "copy_nonoverlapping"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.ptr.copy_nonoverlapping resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+
+        let stub_registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let mut specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+        )];
+        for segments in [
+            vec!["core", "ptr", "copy_nonoverlapping"],
+            vec!["std", "ptr", "copy_nonoverlapping"],
+            vec!["copy_nonoverlapping"],
+        ] {
+            specs.push((
+                segments.iter().map(|s| (*s).to_string()).collect(),
+                Signature::new(
+                    vec!["dst".to_string(), "src".to_string(), "count".to_string()],
+                    None,
+                    None,
+                ),
+                None,
+            ));
+        }
+        register_unsafe_fn_stubs(&stub_registry, &specs);
+        assert_eq!(
+            stub_registry.len(),
+            1,
+            "declined copy_nonoverlapping specs must not be registered"
+        );
+        assert!(
+            stub_registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyobject".to_string(),
+                    "is_none".to_string()
+                ]))
+                .is_some()
+        );
+        for segments in [
+            &["core", "ptr", "copy_nonoverlapping"][..],
+            &["std", "ptr", "copy_nonoverlapping"][..],
+            &["copy_nonoverlapping"][..],
+        ] {
+            assert!(
+                stub_registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_none(),
+                "unsafe stub still registered for {segments:?}"
+            );
+        }
+    }
 
     /// A registry whose one funcobj, `owner::flagged`, has an annotator
     /// graph flagged `access_directly`.
@@ -8786,6 +8938,71 @@ mod tests {
     }
 
     #[test]
+    fn container_residuals_declare_a_list_result() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert("Utf8LocElem".to_string(), Vec::new());
+        registry
+            .bookkeeper()
+            .set_struct_fields(std::rc::Rc::new(reg));
+        let mut graph = LegacyGraph::new("w_str_compute_index_storage");
+        graph.return_type = Some("ref".into());
+        assert_eq!(declared_return_annotation(&registry, &graph), None);
+        graph.return_container_root = Some("*mut Vec<Utf8LocElem>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a Vec pointer result declares its annotation");
+        let SomeValue::List(list) = declared else {
+            panic!("a Vec pointer result is SomeList, got {declared:?}")
+        };
+        let SomeValue::Instance(item) = list.listdef.s_value() else {
+            panic!(
+                "Vec item must be the element instance, got {:?}",
+                list.listdef.s_value()
+            )
+        };
+        let classdef = item
+            .classdef
+            .expect("Utf8LocElem is a named struct, not a classdef-less shell");
+        assert!(
+            classdef.borrow().name.contains("Utf8LocElem"),
+            "list item class is {}",
+            classdef.borrow().name
+        );
+
+        let mut graph = LegacyGraph::new("bytes_like_data");
+        graph.return_type = Some("ref".into());
+        assert_eq!(declared_return_annotation(&registry, &graph), None);
+        graph.return_container_root = Some("&[u8]".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a &[u8] residual declares a list");
+        let SomeValue::List(list) = declared else {
+            panic!("&[u8] residual is SomeList, got {declared:?}")
+        };
+        assert!(
+            matches!(list.listdef.s_value(), SomeValue::Integer(_)),
+            "u8 items are integers, got {:?}",
+            list.listdef.s_value()
+        );
+
+        let mut graph = LegacyGraph::new("encode_ascii");
+        graph.return_type = Some("ref".into());
+        graph.return_container_root = Some("Vec<u8>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a Vec<u8> residual declares a list");
+        let SomeValue::List(list) = declared else {
+            panic!("Vec<u8> residual is SomeList, got {declared:?}")
+        };
+        assert!(
+            matches!(list.listdef.s_value(), SomeValue::Integer(_)),
+            "u8 items are integers, got {:?}",
+            list.listdef.s_value()
+        );
+    }
+
+    #[test]
     fn build_stub_pygraph_carries_signature_and_links_to_returnblock() {
         use crate::annotator::model::SomeValue;
         let sig = Signature::new(vec!["obj".to_string()], None, None);
@@ -8892,6 +9109,84 @@ mod tests {
                 ]))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn register_unsafe_fn_stubs_keeps_allocate_ctors() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        let mut specs = vec![
+            (
+                vec!["pyobject".to_string(), "is_none".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                Some("bool".to_string()),
+            ),
+            (
+                vec![
+                    "functional".to_string(),
+                    "W_Range".to_string(),
+                    "allocate_stable".to_string(),
+                ],
+                Signature::new(vec!["payload".to_string()], None, None),
+                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            ),
+            (
+                vec![
+                    "nestedscope".to_string(),
+                    "Cell".to_string(),
+                    "allocate".to_string(),
+                ],
+                Signature::new(vec!["payload".to_string()], None, None),
+                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            ),
+        ];
+        for segments in [
+            vec!["core", "ptr", "copy_nonoverlapping"],
+            vec!["std", "ptr", "copy_nonoverlapping"],
+            vec!["copy_nonoverlapping"],
+        ] {
+            specs.push((
+                segments.iter().map(|s| (*s).to_string()).collect(),
+                Signature::new(
+                    vec!["dst".to_string(), "src".to_string(), "count".to_string()],
+                    None,
+                    None,
+                ),
+                None,
+            ));
+        }
+        register_unsafe_fn_stubs(&registry, &specs);
+        assert_eq!(
+            registry.len(),
+            3,
+            "allocate ctor stubs stay registered; copy_nonoverlapping stays out"
+        );
+        for segments in [
+            &["pyobject", "is_none"][..],
+            &["functional", "W_Range", "allocate_stable"][..],
+            &["nestedscope", "Cell", "allocate"][..],
+        ] {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .unwrap_or_else(|| panic!("{segments:?} must be registered"));
+            assert!(
+                !entry.function_desc.borrow().cache.borrow().is_empty(),
+                "{segments:?}: annotator stub graph required"
+            );
+        }
+        for segments in [
+            &["core", "ptr", "copy_nonoverlapping"][..],
+            &["std", "ptr", "copy_nonoverlapping"][..],
+            &["copy_nonoverlapping"][..],
+        ] {
+            assert!(
+                registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_none(),
+                "unsafe stub still registered for {segments:?}"
+            );
+        }
     }
 
     #[test]

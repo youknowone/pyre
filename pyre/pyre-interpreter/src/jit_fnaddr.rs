@@ -6068,7 +6068,7 @@ mod tests {
             bindings["pyre_object::ll_list_obj_resize_hint_really"],
             obj_hint
         );
-        let raw_hint: unsafe fn(pyre_object::PyObjectRef, usize, bool) =
+        let raw_hint: unsafe fn(pyre_object::PyObjectRef, i64, bool) =
             pyre_object::listobject::ll_list_obj_resize_hint_really;
         assert_ne!(
             obj_hint, raw_hint as *const () as usize as i64,
@@ -6086,7 +6086,7 @@ mod tests {
             bindings["pyre_object::ll_list_ascii_resize_hint_really"],
             ascii_hint
         );
-        let raw_ascii: unsafe fn(pyre_object::PyObjectRef, usize, bool) =
+        let raw_ascii: unsafe fn(pyre_object::PyObjectRef, i64, bool) =
             pyre_object::listobject::ll_list_ascii_resize_hint_really;
         assert_ne!(
             ascii_hint, raw_ascii as *const () as usize as i64,
