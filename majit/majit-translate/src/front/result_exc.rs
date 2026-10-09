@@ -5135,6 +5135,12 @@ fn apply_remove_identical_inputargs(
     }
 }
 
+/// Arm inputargs bound from the match link's shell argument.
+///
+/// Empty is `Ok(_)` / `Err(_)`: rustc drops the unused phi and the
+/// arm does not receive the shell. [`split_result_ok_err_arms`] already
+/// treats a missing forward as an empty walk
+/// (`flowcontext.py` `FlowContext.guessexception`).
 fn arm_shell_vars_from_args(
     graph: &FunctionGraph,
     args: &[LinkArg],
@@ -5152,14 +5158,13 @@ fn arm_shell_vars_from_args(
             vars.push(var);
         }
     }
-    if vars.is_empty() {
-        return Err("match arm does not receive the shell".to_string());
-    }
     Ok(vars)
 }
 
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
+/// An arm that does not receive the shell is a discarded payload
+/// (`Ok(_)`); there is no `__pos_0` to collapse on that edge.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -12318,6 +12323,67 @@ mod drain_fuse_guarded_err_tests {
         let a = graph.startblock.0;
         try_fuse_drain_match(&mut graph, a, &r, "<(),PyError>", &ValueType::Void, spec())
             .expect("guarded Err drain fuses");
+        assert!(
+            matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
+            "the call site is the exception link"
+        );
+        assert_eq!(shell_ctors(&graph), 0, "the rebuilt Result shells collapse");
+        assert!(
+            graph.blocks[reraise]
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the guarded re-raise reaches exceptblock"
+        );
+        assert!(
+            graph.blocks[new_raise]
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the fallback raise reaches exceptblock"
+        );
+    }
+
+    /// `Ok(_)` drops the unused payload phi: the Ok edge carries no shell.
+    /// Restore hops still sit between the call and the discriminant
+    /// (`with_roots!`). `split_result_ok_err_arms` already allows that
+    /// empty arm; collapse must too (`flowcontext.py`
+    /// `FlowContext.guessexception`).
+    fn discarded_ok_guarded_err_fixture() -> (FunctionGraph, Variable, usize, usize) {
+        let (mut graph, r, reraise, new_raise) = guarded_err_fixture();
+        let a = graph.startblock;
+        let m = graph.blocks[a.0].exits[0].target;
+        let (ok_arm, _) = graph.create_block_with_arg_vars(0);
+        graph.set_return(ok_arm, None);
+        graph.blocks[m.0].exits[0].args.clear();
+        graph.blocks[m.0].exits[0].target = ok_arm;
+        let (hop, hop_args) = graph.create_block_with_arg_vars(2);
+        graph.set_goto(hop, m, vec![hop_args[0].clone(), hop_args[1].clone()]);
+        let call_args: Vec<Variable> = graph.blocks[a.0].exits[0]
+            .args
+            .iter()
+            .filter_map(|arg| match arg {
+                LinkArg::Value(v) => Some(v.clone()),
+                LinkArg::Const(_) => None,
+            })
+            .collect();
+        graph.set_goto(a, hop, call_args);
+        (graph, r, reraise, new_raise)
+    }
+
+    #[test]
+    fn a_discarded_ok_payload_with_guarded_err_fuses_to_last_exception() {
+        let (mut graph, r, reraise, new_raise) = discarded_ok_guarded_err_fixture();
+        let a = graph.startblock.0;
+        try_fuse_drain_match(
+            &mut graph,
+            a,
+            &r,
+            "<*mut PyObject,PyError>",
+            &ValueType::Ref(None),
+            spec(),
+        )
+        .expect("discarded Ok(_) with guarded Err fuses");
         assert!(
             matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
             "the call site is the exception link"
