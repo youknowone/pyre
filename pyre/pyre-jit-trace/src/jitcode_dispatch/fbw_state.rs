@@ -3183,6 +3183,34 @@ pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
     Ok(())
 }
 
+/// `pyopcode.py handle_operation_error`'s `frame_finished_execution = True`
+/// on the portal frame, recorded as `getfield flags; int_or
+/// FLAG_FRAME_FINISHED; setfield flags` the way `RETURN_VALUE`'s lowered
+/// store and `walker_ec_leave`'s exception sibling record it for an
+/// inlined callee.  The trace carries the bit itself, so a compiled
+/// `exit_frame_with_exception` run leaves the frame clearable even when no
+/// interpreter re-delivery follows (a `CALL_ASSEMBLER` entry).  No-op
+/// without a standard virtualizable, like [`fbw_publish_exit_last_instr`].
+pub(crate) fn fbw_record_top_level_frame_finished<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) {
+    let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return;
+    };
+    let flags_descr = crate::descr::pyframe_flags_descr();
+    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, vbox, flags_descr.clone());
+    let finished_bit = ctx
+        .trace_ctx
+        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
+    let new_flags = ctx
+        .trace_ctx
+        .record_op(OpCode::IntOr, &[live_flags, finished_bit]);
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[vbox, new_flags], flags_descr.clone());
+    ctx.trace_ctx
+        .heapcache_setfield_cached(vbox, flags_descr.index(), new_flags);
+}
+
 /// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
 /// `Type::Ref`, publishes the return coordinate into `last_instr`, stores the

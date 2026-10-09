@@ -4957,6 +4957,12 @@ node,
                     // recorder and the emitted one, which falls back to that
                     // field.  Compiled code never wrote it, so publish it here.
                     fbw_publish_exit_last_instr(ctx, recording_opcode_position);
+                    // `pyopcode.py handle_operation_error`: the no-handler
+                    // path stores `frame_finished_execution = True` before
+                    // `raise operr` leaves the portal, so the store precedes
+                    // the exit's token protocol; the inlined-callee sibling is
+                    // `walker_ec_leave`.
+                    fbw_record_top_level_frame_finished(ctx);
                     // `pyjitpl.py compile_exit_frame_with_exception` opens
                     // with `store_token_in_vable()`, exactly as
                     // `compile_done_with_this_frame` does. Keep this exit lazy
@@ -5015,6 +5021,11 @@ node,
 node,
                         );
                     }
+                    // The concrete bit lands only once `fbw_store_token_in_vable`
+                    // above has accepted the exit (see
+                    // `finish_current_frame_execution`); the recorded store is
+                    // already in the trace.
+                    commit_top_level_frame_finished(ctx);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
