@@ -1669,7 +1669,7 @@ unsafe fn untraced_mixed_module_function(value: PyObjectRef) -> bool {
 /// `Ok(None)` is "no builtin by that name", which upstream raises as a
 /// `SystemError`: pyre's importers screen the name against the registry
 /// first, and `_imp.create_builtin` reports it as `None`.
-pub(crate) fn getbuiltinmodule(
+pub fn getbuiltinmodule(
     name: &str,
     force_init: bool,
     reuse: bool,
@@ -2181,7 +2181,7 @@ fn set_extension_module_spec(
 fn fix_up_source_module_spec(
     mut ns: PyObjectRef,
     pathname: &rustpython_wtf8::Wtf8,
-    cpathname: Option<&str>,
+    cpathname: Option<&rustpython_wtf8::Wtf8>,
 ) -> Result<bool, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
@@ -2199,11 +2199,12 @@ fn fix_up_source_module_spec(
     let _ = pin_root(w_name);
     let ext_slot = shadow_stack_len();
     let _ = pin_root(ext);
-    let w_path = pyre_object::w_str_from_wtf8_managed(pathname.to_wtf8_buf());
+    // `newutf8` copies the path once into the STR payload.
+    let w_path = pyre_object::w_str_from_wtf8_managed_borrowed(pathname);
     let path_slot = shadow_stack_len();
     let _ = pin_root(w_path);
     let w_cpath = match cpathname {
-        Some(c) => pyre_object::w_str_new_managed(c),
+        Some(c) => pyre_object::w_str_from_wtf8_managed_borrowed(c),
         None => pyre_object::w_none(),
     };
     let cpath_slot = shadow_stack_len();
@@ -2239,7 +2240,7 @@ fn fix_up_source_module_spec(
 fn fix_up_source_module_spec(
     _ns: PyObjectRef,
     _pathname: &rustpython_wtf8::Wtf8,
-    _cpathname: Option<&str>,
+    _cpathname: Option<&rustpython_wtf8::Wtf8>,
 ) -> Result<bool, crate::PyError> {
     Ok(false)
 }
@@ -4517,7 +4518,8 @@ fn exec_code_module(
     mut w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
     pathname: Option<&rustpython_wtf8::Wtf8>,
-    cpathname: Option<&str>,
+    cpathname: Option<&rustpython_wtf8::Wtf8>,
+    plain_dispatch: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     // importing.py:272-274 — setdefault('__builtins__', space.builtin).
     // `fresh_module_globals` already seeds `__builtins__` for module-shape
@@ -4539,7 +4541,10 @@ fn exec_code_module(
     // `write_paths=False` shape (REPL, builtin bootstrap).
     if let Some(p) = pathname {
         // importing.py:284 setitem('__file__', w_pathname).
-        let w_pathname = pyre_object::w_str_from_wtf8_managed(p.to_wtf8_buf());
+        // `importing.py` `space.newfilename` / `newutf8` copies the path once.
+        let w_pathname = pyre_object::with_roots!(w_code, w_globals => {
+            pyre_object::w_str_from_wtf8_managed_borrowed(p)
+        });
         unsafe {
             pyre_object::w_dict_setitem_str(w_globals, "__file__", w_pathname);
         }
@@ -4548,7 +4553,7 @@ fn exec_code_module(
         // import was not satisfied from a `.pyc`.  Pyre has no .pyc
         // path today so reachable callers still hit the None arm.
         let w_cpathname = match cpathname {
-            Some(c) => pyre_object::w_str_new_managed(c),
+            Some(c) => pyre_object::w_str_from_wtf8_managed_borrowed(c),
             None => pyre_object::w_none(),
         };
         unsafe {
@@ -4583,9 +4588,18 @@ fn exec_code_module(
     // GENERATOR / COROUTINE / ASYNC_GENERATOR dispatch in
     // pyframe.py holds for the import path too, and so an imported
     // module's top-level hot loop reaches the JIT portal.
+    // `moduledef.py` `_compile_bootstrap_module` is NOT_RPYTHON and
+    // `startup_at_translation_time_only` does not re-exec those frames.
+    // `zipimport` `Module.install` only inserts `zipimporter`. Those three
+    // bodies run once, on `execute_frame`, the same plain dispatch
+    // `appleveldef_install_seeded` uses for `@not_rpython` app files.
     let mut frame =
         crate::pyframe::createframe_obj(w_code as *const (), w_globals, execution_context, None)?;
-    frame.run_with_jit()
+    if plain_dispatch {
+        frame.execute_frame(None, None)
+    } else {
+        frame.run_with_jit()
+    }
 }
 
 // ── appleveldef_install ──────────────────────────────────────────────
@@ -4677,14 +4691,33 @@ pub fn appleveldef_install_seeded(
     names: &[&str],
     seed: &[(&str, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    let code = compile_source_with_filename(source, Mode::Exec, filename)
-        .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
     let ctx = crate::call::getexecutioncontext();
     if ctx.is_null() {
         panic!("appleveldef `{filename}`: no execution context at module init");
     }
-    let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
+    // `gateway.py ApplevelClass` / `mixedmodule.py MixedModule._cleanup_`
+    // compile the app file at translation. The source is linked into this
+    // binary; the marshalled image is keyed by the full source bytes
+    // (`interp_imp.applevel_cache_load`), not a hash in the pyc mtime word.
+    let cache_key = format!("applevel.{modname}.{filename}");
+    let loaded = crate::module::imp::interp_imp::applevel_cache_load(&cache_key, source);
     let _root = pyre_object::gc_roots::push_roots();
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    if let Some(w_code) = loaded {
+        unsafe { crate::pycode::set_hidden_applevel_unit(w_code) };
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+    } else {
+        let code = compile_source_with_filename(source, Mode::Exec, filename)
+            .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
+        let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+        crate::module::imp::interp_imp::applevel_cache_store(
+            &cache_key,
+            source,
+            pyre_object::gc_roots::shadow_stack_get(code_slot),
+        );
+    }
+    let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
     // `gateway.py build_applevel_dict` binds the owning module's name into the
@@ -4713,25 +4746,24 @@ pub fn appleveldef_install_seeded(
             )
         };
     }
-    // `gateway.py ApplevelClass.hidden_applevel = True`, which
-    // `build_applevel_dict` passes to `space.exec_` and the compiler carries as
-    // `CompileInfo`; every code object of the unit is then built with it
-    // (`assemble.py make_code`), so the flag set here reaches the nested
-    // functions this source defines.
-    //
-    // Every source installed here is a native module's body — the module is
-    // built in, and what it holds is an extension module on CPython — so none
-    // of these frames are the running program's.
-    let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
+    // `gateway.py ApplevelClass.hidden_applevel = True` is already on `w_code`
+    // (compile path via `box_code_object_with_hidden_applevel`, cache path via
+    // `set_hidden_applevel_unit`). Every source installed here is a native
+    // module's body, so none of these frames are the running program's.
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
-    // The source is a module body, so what it raises is the program's to see:
-    // a `from _operator import eq` in it resolves through the running
-    // `sys.modules`, which the program can have blocked.  Only the failures
-    // that no program can cause -- a bundled file that does not compile, a
-    // name the file never binds -- stay panics.
-    frame.run_with_jit()?;
+    // `mixedmodule.py` `buildloaders` is `@not_rpython` and `_cleanup_`
+    // freezes the module, so these bodies are not traced. `gateway.py`
+    // `ApplevelClass.hidden_applevel` marks the same frames. Run the
+    // non-jitted `dispatch_bytecode` arm (`execute_frame`) instead of the
+    // portal: the body runs once and has no back-edge for `can_enter_jit`.
+    // What it raises is the program's to see: a `from _operator import eq`
+    // resolves through `sys.modules`, which the program can have blocked.
+    // Only a bundled file that does not compile, or a name it never binds,
+    // stays a panic.
+    frame.execute_frame(None, None)?;
     for &name in names {
         match unsafe {
             pyre_object::w_dict_getitem_str(
@@ -4768,14 +4800,13 @@ fn load_source_module(
     let path_text = crate::gateway::fsdecode_filename_wtf8(&path_bytes);
     let (_pathname_str, filename_bytes) =
         crate::pycode::split_code_filename_bytes(path_bytes, None);
-
-    let roots = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources and `zipimport` are imported by the
     // native importer before `SourceFileLoader` exists, so they never reach the
     // `.pyc` cache and otherwise recompile on every startup.
     // `_frozen_importlib._cached_compile` (which `zipimport`'s moduledef also
-    // goes through): reload a marshalled, source-validated code object when the
-    // cache holds one for this binary, recompiling only on a miss.
+    // goes through): reload a marshalled code object when this binary and the
+    // source file's mtime and size match, recompiling only on a miss. A hit
+    // does not read the source. PyPy's frozen image does not either.
     // Startup loads the bootstrap sources under their frozen names; a source
     // copy still loads the public submodule names. Both share one cache entry.
     // `zipimport` stays keyed by its own name.  A hit stats mtime/size and
@@ -4794,39 +4825,62 @@ fn load_source_module(
     } else {
         None
     };
-    let (w_code, store) = match cache_key
-        .filter(|_| cache_ok)
-        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname))
-    {
-        Some(w_code) => (w_code, false),
-        None => {
-            let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
-                let mut message =
-                    rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
-                message.push_wtf8(&path_text);
-                message.push_str(&format!("': {e}"));
-                crate::PyError::new(crate::PyErrorKind::ImportError, message)
-            })?;
-            // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
-            // bad declaration is the tokenizer's SyntaxError, not an ImportError.
-            // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
-            // embedded NUL here with `source_as_string`'s unlocated "source code
-            // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
-            // observable while its command-line file path retains PyPy's located
-            // tokenizer boundary through `decode_file_source_bytes`.
-            let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
-            let code = parse_source_module(&path_text, &source).map_err(|error| match error {
-                crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                    crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
-                }
-                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
-            })?;
-            (
-                crate::box_code_object(code),
-                cache_key.is_some() && cache_ok,
-            )
+    // `_bootstrap_external._validate_timestamp_pyc` / `check_compiled_module`:
+    // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path
+    // and `__cached__` is the `.pyc` (`importing.py` `exec_code_module`).
+    #[cfg(not(feature = "sandbox"))]
+    let mut timestamp_cpathname: Option<rustpython_wtf8::Wtf8Buf> = None;
+    #[cfg(not(feature = "sandbox"))]
+    let cached = if cache_ok {
+        let frozen = cache_key
+            .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname));
+        match frozen {
+            Some(code) => Some(code),
+            None => crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?.map(
+                |(code, cpathname)| {
+                    // `space.newfilename(cpathname)`: filesystem-decoded like
+                    // `pathname`, so undecodable bytes round-trip.
+                    timestamp_cpathname = Some(crate::gateway::fsdecode_filename_wtf8(
+                        &crate::gateway::fsencode_os_str(cpathname.as_os_str()),
+                    ));
+                    code
+                },
+            ),
         }
+    } else {
+        None
     };
+    #[cfg(feature = "sandbox")]
+    let cached: Option<PyObjectRef> = None;
+    let (w_code, store) = if let Some(w_code) = cached {
+        (w_code, false)
+    } else {
+        let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
+            let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
+            message.push_wtf8(&path_text);
+            message.push_str(&format!("': {e}"));
+            crate::PyError::new(crate::PyErrorKind::ImportError, message)
+        })?;
+        // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
+        // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+        // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
+        // embedded NUL here with `source_as_string`'s unlocated "source code
+        // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
+        // observable while its command-line file path retains PyPy's located
+        // tokenizer boundary through `decode_file_source_bytes`.
+        let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
+        let code = parse_source_module(&path_text, &source).map_err(|error| match error {
+            crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
+            }
+            crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+        })?;
+        (
+            crate::box_code_object(code),
+            cache_key.is_some() && cache_ok,
+        )
+    };
+    let roots = pyre_object::gc_roots::push_roots();
     // Root before `update_code_filenames` / later allocations can collect.
     // `set_compilation_unit_filename_bytes` walks nested codes and may
     // allocate; the pin is the shadow-stack livevar `gctransform` keeps
@@ -4932,19 +4986,23 @@ fn load_source_module(
     }
 
     // PyPy `importing.py:300` passes `pathname`/`cpathname` to
-    // `exec_code_module`; pyre has no .pyc cache today so cpathname is
-    // always None, matching the PyPy `cpathname is None` arm at line
-    // 282-283.
+    // `exec_code_module`. A timestamp `.pyc` hit supplies that path so
+    // `__cached__` is set; a source parse leaves it None.
     //
     // On exec failure drop the pre-registered module from sys.modules
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
+    #[cfg(not(feature = "sandbox"))]
+    let cpathname = timestamp_cpathname.as_deref();
+    #[cfg(feature = "sandbox")]
+    let cpathname: Option<&rustpython_wtf8::Wtf8> = None;
     if let Err(e) = exec_code_module(
         roots.get(code_slot),
         roots.get(globals_slot),
         execution_context,
         Some(&path_text),
-        None,
+        cpathname,
+        cache_key.is_some(),
     ) {
         remove_sys_module(modulename);
         return Err(e);
@@ -5036,11 +5094,19 @@ fn install_importlib_bootstrap(
     let module_slot = shadow_stack_len();
     let _ = pin_root(module);
 
-    let w_sys = absolute_import(Wtf8::new("sys"), pyre_object::PY_NULL, execution_context)?;
+    // `moduledef.py` `startup_at_translation_time_only` calls
+    // `_install(space.getbuiltinmodule('sys'), space.getbuiltinmodule('_imp'))`.
+    // The seed already registered both; `absolute_import` would walk the
+    // pre-bootstrap finder for the same objects.
+    let w_sys = getbuiltinmodule("sys", false, true, execution_context)?.ok_or_else(|| {
+        crate::PyError::module_not_found_with_name("No module named sys".to_string(), "sys")
+    })?;
     let sys_slot = shadow_stack_len();
     let _ = pin_root(w_sys);
 
-    let w_imp = absolute_import(Wtf8::new("_imp"), pyre_object::PY_NULL, execution_context)?;
+    let w_imp = getbuiltinmodule("_imp", false, true, execution_context)?.ok_or_else(|| {
+        crate::PyError::module_not_found_with_name("No module named _imp".to_string(), "_imp")
+    })?;
     let imp_slot = shadow_stack_len();
     let _ = pin_root(w_imp);
 
@@ -5188,14 +5254,38 @@ pub fn init_importlib_bootstrap(
 /// seed `sys.modules`; a name already present skips `_builtin_from_name` and
 /// keeps the natively-registered module object authoritative.
 #[cfg(feature = "host_env")]
+fn seed_importlib_bootstrap_builtins(
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    // `moduledef.py` `startup_at_translation_time_only` passes
+    // `space.getbuiltinmodule('sys')` and `getbuiltinmodule('_imp')`.
+    // `_setup` reads `_thread` / `_warnings` / `_weakref` from `sys.modules`
+    // and calls `_builtin_from_name` only on a miss. That lookup is
+    // `getbuiltinmodule`, not `importhook`: `BuiltinImporter.find_spec` is
+    // what `_setup` runs later, once, when it stamps the spec.
+    for name in ["sys", "_imp", "_thread", "_warnings", "_weakref"] {
+        if getbuiltinmodule(name, false, true, execution_context)?.is_none() {
+            return Err(crate::PyError::module_not_found_with_name(
+                format!("No module named {name}"),
+                name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host_env")]
 fn bootstrap_importlib_modules(
     canonical: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let canon_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(canonical);
     let import = |name: &str| {
         importhook(
             Wtf8::new(name),
-            canonical,
+            roots.get(canon_slot),
             pyre_object::PY_NULL,
             0,
             execution_context,
@@ -5208,13 +5298,11 @@ fn bootstrap_importlib_modules(
     import("sys")?;
     import("_imp")?;
     // Importing `_frozen_importlib` fires `install_importlib_bootstrap`
-    // (the native load hook) as its body finishes: `_install(sys, _imp)`,
-    // `_install_external_importers()` — which imports and links
-    // `_frozen_importlib_external` — and the frozen-module metadata.
-    // `moduledef.py Module.install` loads that module directly so
-    // `importlib/__init__.py` does not run. A cached module skips the hook,
-    // so running this again (`-i` reaches the REPL after `run_source`) does
-    // not re-append the importers.
+    // as its body finishes: `_install(sys, _imp)` and
+    // `_install_external_importers()`, which links
+    // `_frozen_importlib_external` and defines `ModuleSpec`.
+    // A cached module skips the hook, so a second startup does not
+    // append the importers again.
     import("_frozen_importlib")?;
     Ok(())
 }
@@ -5233,6 +5321,23 @@ fn set_frozen_alias_metadata(
     let bootstrap_slot = shadow_stack_len();
     let _ = pin_root(bootstrap);
 
+    // `_bootstrap._setup` already stored a FrozenImporter spec, and
+    // `_fix_up_module` popped `__origname__`. `moduledef.py`
+    // `startup_at_translation_time_only` calls `_install` and does not call
+    // `FrozenImporter.find_spec` again.
+    let origname = match name {
+        "_frozen_importlib" => "importlib._bootstrap",
+        "_frozen_importlib_external" => "importlib._bootstrap_external",
+        _ => name,
+    };
+    if spec_loader_is_frozen_importer(shadow_stack_get(module_slot)) {
+        crate::baseobjspace::setattr_str(
+            shadow_stack_get(module_slot),
+            "__origname__",
+            pyre_object::w_str_new_managed(origname),
+        )?;
+        return Ok(());
+    }
     let loader =
         crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "FrozenImporter")?;
     let loader_slot = shadow_stack_len();
@@ -5261,17 +5366,32 @@ fn set_frozen_alias_metadata(
     )?;
     // `FrozenImporter._fix_up_module` consumes this when a fresh source copy
     // of importlib repairs the already-loaded essential frozen aliases.
-    let origname = match name {
-        "_frozen_importlib" => "importlib._bootstrap",
-        "_frozen_importlib_external" => "importlib._bootstrap_external",
-        _ => name,
-    };
     crate::baseobjspace::setattr_str(
         shadow_stack_get(module_slot),
         "__origname__",
         pyre_object::w_str_new_managed(origname),
     )?;
     Ok(())
+}
+
+/// `_setup` stamps `FrozenImporter` as `__spec__.loader` before this runs.
+fn spec_loader_is_frozen_importer(module: PyObjectRef) -> bool {
+    let Ok(Some(spec)) = crate::baseobjspace::findattr_result(module, "__spec__") else {
+        return false;
+    };
+    if unsafe { pyre_object::is_none(spec) } {
+        return false;
+    }
+    let Ok(loader) = crate::baseobjspace::getattr_str(spec, "loader") else {
+        return false;
+    };
+    let Ok(loader_name) = crate::baseobjspace::getattr_str(loader, "__name__") else {
+        return false;
+    };
+    unsafe {
+        pyre_object::is_str(loader_name)
+            && pyre_object::w_str_get_wtf8(loader_name) == "FrozenImporter"
+    }
 }
 
 // ── load_package ─────────────────────────────────────────────────────
@@ -6622,6 +6742,7 @@ fn dunder_import_inner(
     // bootstrap into the look-inside body.
     dunder_import_slow(
         name,
+        reload_import(0),
         reload_import(1),
         reload_import(2),
         reload_import(3),
@@ -6983,6 +7104,7 @@ pub(crate) fn dunder_import_package_fromlist(
     // reports rather than answering from the native handler.
     dunder_import_slow(
         name,
+        pyre_object::PY_NULL,
         shadow_stack_get(globals_slot),
         shadow_stack_get(locals_slot),
         if fromlist_is_null {
@@ -7005,6 +7127,7 @@ pub(crate) fn dunder_import_package_fromlist(
 #[majit_macros::dont_look_inside]
 pub(crate) fn dunder_import_slow(
     name: &str,
+    w_name: PyObjectRef,
     w_globals: PyObjectRef,
     w_locals: PyObjectRef,
     w_fromlist: PyObjectRef,
@@ -7017,6 +7140,8 @@ pub(crate) fn dunder_import_slow(
     let globals_is_null = w_globals.is_null();
     let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(w_name);
     let globals_slot = shadow_stack_len();
     let _ = pin_root(if globals_is_null {
         pyre_object::w_none()
@@ -7086,7 +7211,15 @@ pub(crate) fn dunder_import_slow(
                     level,
                 );
             }
-            let w_name = pyre_object::w_str_new_managed(name);
+            // `interp_import.py` `interp___import__` passes the caller's
+            // `w_modulename` into the frozen import. Allocate only when
+            // this entry has no string object (a `&str` head name).
+            let pinned_name = shadow_stack_get(name_slot);
+            let w_name = if !pinned_name.is_null() && unsafe { pyre_object::is_str(pinned_name) } {
+                pinned_name
+            } else {
+                pyre_object::w_str_new_managed(name)
+            };
             return call_bootstrap_import(
                 shadow_stack_get(import_slot),
                 w_name,
@@ -8520,6 +8653,136 @@ pub fn import_all_from_w(
 mod tests {
     use super::*;
 
+    #[test]
+    fn frozen_startup_body_and_alias_spec() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        {
+            // source_exec_stores_file_from_the_path_buffer
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let code = crate::compile::compile_source("x = 1\n", crate::compile::Mode::Exec)
+                .expect("compile");
+            let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+            let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
+            let path = rustpython_wtf8::Wtf8Buf::from("/tmp/m.py");
+            exec_code_module(
+                w_code,
+                w_globals,
+                std::rc::Rc::as_ptr(&ec),
+                Some(&path),
+                None,
+                false,
+            )
+            .expect("exec");
+            let file = unsafe { pyre_object::w_dict_getitem_str(w_globals, "__file__") }
+                .expect("__file__");
+            unsafe {
+                assert_eq!(pyre_object::w_str_len(file), 9);
+                assert_eq!(pyre_object::w_str_get_wtf8(file), "/tmp/m.py");
+            }
+            let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "x") }.expect("x");
+            assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 1);
+        }
+        {
+            // frozen_startup_body_runs_on_the_plain_dispatch
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let code = crate::compile::compile_source("y = 2\n", crate::compile::Mode::Exec)
+                .expect("compile");
+            let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+            let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
+            let path = rustpython_wtf8::Wtf8Buf::from("<frozen importlib._bootstrap>");
+            exec_code_module(
+                w_code,
+                w_globals,
+                std::rc::Rc::as_ptr(&ec),
+                Some(&path),
+                None,
+                true,
+            )
+            .expect("plain exec");
+            let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "y") }.expect("y");
+            assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 2);
+        }
+        {
+            // frozen_alias_keeps_an_installed_frozen_spec
+            let loader = pyre_object::w_module_new("FrozenImporter");
+            let spec = pyre_object::w_module_new("spec");
+            let module = pyre_object::w_module_new("_frozen_importlib");
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    pyre_object::w_module_get_w_dict(spec),
+                    "loader",
+                    loader,
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    pyre_object::w_module_get_w_dict(module),
+                    "__spec__",
+                    spec,
+                );
+            }
+            set_frozen_alias_metadata(module, "_frozen_importlib", module).expect("origname");
+            let kept = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::w_module_get_w_dict(module),
+                    "__spec__",
+                )
+            }
+            .expect("spec");
+            assert!(std::ptr::eq(kept, spec));
+            let origname = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::w_module_get_w_dict(module),
+                    "__origname__",
+                )
+            }
+            .expect("origname");
+            unsafe {
+                assert_eq!(
+                    pyre_object::w_str_get_wtf8(origname),
+                    "importlib._bootstrap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_seed_and_appleveldef_install() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        {
+            // appleveldef_install_binds_through_the_plain_dispatch
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let ns = pyre_object::dictmultiobject::w_dict_new();
+            appleveldef_install(
+                ns,
+                "answer = 1\n",
+                "app_answer.py",
+                "app_answer",
+                &["answer"],
+            )
+            .expect("applevel body binds answer");
+            let bound = unsafe { pyre_object::w_dict_getitem_str(ns, "answer") };
+            assert!(bound.is_some(), "answer is copied into the module dict");
+        }
+        #[cfg(feature = "host_env")]
+        {
+            // bootstrap_seed_registers_builtins_via_getbuiltinmodule
+            install_builtin_modules();
+            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            seed_importlib_bootstrap_builtins(std::rc::Rc::as_ptr(&ec)).expect("seed");
+            for name in ["sys", "_imp", "_thread", "_warnings", "_weakref"] {
+                assert!(
+                    check_sys_modules(name).is_some(),
+                    "{name} is in sys.modules"
+                );
+            }
+        }
+    }
+
     #[cfg(all(
         feature = "host_env",
         not(feature = "sandbox"),
@@ -8803,11 +9066,14 @@ mod tests {
 
     #[test]
     fn test_sys_modules_cache() {
-        let sentinel = w_none();
-        set_sys_module("test_cached", sentinel);
-        let cached = check_sys_modules("test_cached");
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap(), sentinel);
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        // `check_sys_modules` is `finditem` plus PyPy's `if w_mod`: a stored
+        // None is an import miss, whether or not a previous test installed
+        // the Python-visible dict. A real module is the cache hit.
+        let module = pyre_object::module::w_module_new("test_cached");
+        set_sys_module("test_cached", module);
+        assert_eq!(check_sys_modules("test_cached"), Some(module));
     }
 
     #[test]

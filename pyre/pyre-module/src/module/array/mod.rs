@@ -2472,6 +2472,9 @@ pub fn init_array_type(ns: PyObjectRef) {
 
 /// `array` module init — `moduledef.py interpleveldefs`.
 pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    // `W_Array.typedef` (`interp_array.py`) is a module TypeDef.  Empty
+    // startup does not import array.
+    pyre_interpreter::typedef::ensure_array_typeobjects();
     let type_obj = pyre_interpreter::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     module_ns_store(ns, "array", type_obj);
     module_ns_store(ns, "ArrayType", type_obj);

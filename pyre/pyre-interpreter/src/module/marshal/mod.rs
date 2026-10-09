@@ -853,7 +853,20 @@ impl PyreMarshalBag {
         // `str_from_value` ran once per co_names entry, once per localsplus
         // name, then filename / co_name / co_qualname.
         let name_count = code.names.len() + code.localspluskinds.len() + 3;
-        let code = Rooted::new(crate::pycode::box_code_object(code));
+        // `str_from_value` pushed `co_names`, then localsplus names, then
+        // filename / co_name / co_qualname. The first run is the interned
+        // objects `pycode.py` `PyCode.__init__` would build again.
+        let slots = unsafe { &*self.names };
+        let interned_name_slots: Vec<usize> = if slots.len() >= name_count {
+            let start = slots.len() - name_count;
+            slots[start..start + code.names.len()].to_vec()
+        } else {
+            Vec::new()
+        };
+        let code = Rooted::new(crate::pycode::box_code_object_with_interned_name_slots(
+            code,
+            &interned_name_slots,
+        ));
         // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
         // list to `PyCode.__init__`; replace the compiler-boundary eager values
@@ -906,7 +919,9 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_str(&self, value: &Wtf8) -> Rooted {
-        Rooted::new(w_str_from_wtf8_managed(value.to_owned()))
+        // `objspace.py` `newutf8` copies these marshal bytes once into the
+        // STR payload.  An owned `Wtf8Buf` here would be a second buffer.
+        Rooted::new(w_str_from_wtf8_managed_borrowed(value))
     }
 
     fn make_interned_str(&self, value: &Wtf8) -> Rooted {
@@ -1471,6 +1486,26 @@ crate::py_module! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn make_str_reads_the_marshal_buffer_without_an_owned_copy() {
+        let roots = pyre_object::gc_roots::push_roots();
+        let mut pending_error = None;
+        let mut name_slots = Vec::new();
+        let bag = PyreMarshalBag::new(ErrorSink::park(&roots, &mut pending_error), &mut name_slots);
+        let text = rustpython_wtf8::Wtf8Buf::from("stat_result");
+        let rooted = wire::MarshalBag::make_str(&bag, &text);
+        unsafe {
+            assert_eq!(pyre_object::w_str_len(rooted.get()), 11);
+            assert_eq!(pyre_object::w_str_get_wtf8(rooted.get()), "stat_result");
+        }
+        let wide = rustpython_wtf8::Wtf8Buf::from("é");
+        let rooted = wire::MarshalBag::make_str(&bag, &wide);
+        unsafe {
+            assert_eq!(pyre_object::w_str_len(rooted.get()), 1);
+            assert_eq!(pyre_object::w_str_get_wtf8(rooted.get()), "é");
+        }
+    }
 
     #[test]
     fn exact_bytes_are_borrowed_for_unmarshal() {

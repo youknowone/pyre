@@ -2149,15 +2149,11 @@ fn run_source(
     let (canonical, main_module) =
         pyre_interpreter::app_main::prepare_main_module(&execution_context);
 
-    // Import `sys` up front so its creation flushes the native search-path seed
-    // into `sys.path` before `site` and user code read it.
-    let _ = importing::importhook(
-        rustpython_wtf8::Wtf8::new("sys"),
-        canonical,
-        pyre_object::PY_NULL,
-        0,
-        ec_ptr,
-    );
+    // `moduledef.py` `startup_at_translation_time_only` reads `sys` with
+    // `space.getbuiltinmodule('sys')`. The module is already registered by
+    // `install_builtin_modules`; `importhook` walks the pre-bootstrap finder
+    // for that same object and flushes `sys.path` no earlier.
+    let _ = importing::getbuiltinmodule("sys", false, true, ec_ptr);
 
     // pylifecycle.c init_importlib before site: install the importlib
     // bootstrap so `builtins.__import__` routes imports through

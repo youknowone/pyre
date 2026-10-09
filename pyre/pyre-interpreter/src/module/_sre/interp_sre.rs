@@ -20,6 +20,10 @@ use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::{StrDrive, StringCursor};
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    // `W_SRE_Pattern.typedef` and the sibling classes are module TypeDefs.
+    // Empty startup does not import `_sre`, so `init_typeobjects` does not
+    // build them.
+    crate::typedef::ensure_sre_typeobjects();
     // Must equal `re/_constants.py:MAGIC` (the bundled stdlib) — `_compiler.py`
     // asserts `_sre.MAGIC == MAGIC` at import time.
     module_ns_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
@@ -133,9 +137,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             2,
         ),
     );
-    // The 're.Pattern' / 're.Match' W_TypeObjects are created with the
-    // other builtin typedefs in `typedef.rs` (W_SRE_Pattern.typedef /
-    // W_SRE_Match.typedef, interp_sre.py/:869); instances carry
+    // `W_SRE_Pattern.typedef` / `W_SRE_Match.typedef` (`interp_sre.py`)
+    // are published by `ensure_sre_typeobjects` above.  Instances carry
     // `pyre_object::interp_sre` typed payloads.
     Ok(())
 }

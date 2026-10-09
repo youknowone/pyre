@@ -3274,6 +3274,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
                     size: size.size(),
                     type_id: size.cache_key(),
                     vtable: size.vtable() as u64,
+                    owner: String::new(),
                     is_gc_managed: size.is_gc_managed(),
                     headerless: size.headerless(),
                     all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size),

@@ -366,6 +366,49 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
     }
 }
 
+/// One walk of [`decode_instruction_forward`] for `eval_loop_jit`.
+///
+/// `pyopcode.py` `dispatch_bytecode` reads `co_code[next_instr]` once per
+/// opcode. The PC projection and the opcode/oparg projection each repeat
+/// that walk; this returns both from the single pass. `usize::MAX` /
+/// `u64::MAX` are the corruption sentinels of the two projections.
+#[inline]
+pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usize, u64) {
+    let mut start = pc;
+    while start > 0
+        && start - 1 < code_instructions_len(code)
+        && matches!(
+            instruction_from_code_unit_word(code_unit_at(code, start - 1)),
+            Instruction::ExtendedArg
+        )
+    {
+        start -= 1;
+    }
+
+    let mut opcode_pc = start;
+    let mut op_arg = 0u32;
+    loop {
+        if opcode_pc >= code_instructions_len(code) {
+            return (usize::MAX, u64::MAX);
+        }
+        let word = code_unit_at(code, opcode_pc);
+        let instruction = instruction_from_code_unit_word(word);
+        op_arg = (op_arg << 8) | u32::from(word >> 8);
+        if matches!(instruction, Instruction::ExtendedArg) {
+            opcode_pc += 1;
+            continue;
+        }
+        if opcode_pc != start
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
+            return (usize::MAX, u64::MAX);
+        }
+        let packed = u64::from(word & 0xff) | (u64::from(op_arg) << 8);
+        return (opcode_pc, packed);
+    }
+}
+
 pub trait LocalOpcodeHandler: SharedOpcodeHandler {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError>;
     fn load_local_checked_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
@@ -3946,7 +3989,8 @@ pub fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
 mod tests {
     use super::{
         decode_instruction_at, decode_instruction_for_dispatch, decode_instruction_forward,
-        decode_instruction_forward_packed, decode_instruction_forward_pc,
+        decode_instruction_forward_dispatch, decode_instruction_forward_packed,
+        decode_instruction_forward_pc,
     };
     use crate::bytecode::{CodeUnit, CodeUnits, Instruction, OpArgByte};
     use crate::{OpArgState, compile_exec};
@@ -4183,6 +4227,8 @@ mod tests {
         let expected = u64::from(u8::from(Instruction::Reserved)) | (0x01_02_03u64 << 8);
         assert_eq!(decode_instruction_forward_packed(&code, 0), expected);
         assert_eq!(decode_instruction_forward_packed(&code, 2), expected);
+        assert_eq!(decode_instruction_forward_dispatch(&code, 0), (2, expected));
+        assert_eq!(decode_instruction_forward_dispatch(&code, 2), (2, expected));
     }
 
     // A JIT jump/loop-header/resume coordinate points at the real opcode past

@@ -5810,6 +5810,11 @@ pub unsafe fn w_dict_unicode_value_at_checked(
     }
 }
 
+/// Overwrite the value already stored at `index` when that slot still holds
+/// `w_key`.
+///
+/// `typedef.py` `TypeCache.build` assigns the copied `GetSetProperty` back
+/// onto the key the raw dict already contains. The hit arm of
 /// Internal helper: `ModuleDictStrategy::items` body for pyre's
 /// W_ModuleDictObject — branches on `is_object_strategy` and emits
 /// from whichever storage half is live.  Called only from the

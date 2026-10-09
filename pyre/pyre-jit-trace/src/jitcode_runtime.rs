@@ -955,12 +955,16 @@ struct DescrIndex {
     /// PyPy's `FieldDescr.parent_descr` reference to the one SizeDescr owned
     /// by `GcCache`; it is not a runtime semantic side table.
     parent_layouts: Box<[u32]>,
+    /// `BhDescr::Size.type_id` for a parentless size slot, else 0.
+    /// `descr.py` `get_size_descr` returns the cached row, so a size whose
+    /// STRUCT the parent-layout walk already numbered is not parsed again.
+    size_type_ids: Box<[u64]>,
 }
 
 fn load_descr_index() -> DescrIndex {
     const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs_index.bin"));
     const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    let (offsets, kinds, parent_layouts): (Vec<u32>, Vec<u8>, Vec<u32>) =
+    let (offsets, kinds, parent_layouts, size_type_ids): (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u64>) =
         bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
             panic!(
                 "pyre-jit-trace: failed to deserialize descrs_index.bin \
@@ -974,11 +978,13 @@ fn load_descr_index() -> DescrIndex {
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(kinds.len() + 1, offsets.len());
     assert_eq!(parent_layouts.len(), kinds.len());
+    assert_eq!(size_type_ids.len(), kinds.len());
     assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1 | 2)));
     DescrIndex {
         offsets: offsets.into_boxed_slice(),
         kinds: kinds.into_boxed_slice(),
         parent_layouts: parent_layouts.into_boxed_slice(),
+        size_type_ids: size_type_ids.into_boxed_slice(),
     }
 }
 
@@ -1030,19 +1036,129 @@ fn descr_layout_at(index: usize) -> std::sync::Arc<majit_jitcode::jitcode::BhSiz
     // what the canonical-owner rule above is for, and against the startup-RSS
     // work that motivated it.  Share the canonical object through
     // `_cache_size`, not through this decoder.
-    std::sync::Arc::new(
-        bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
-            panic!(
-                "pyre-jit-trace: failed to deserialize descr_layouts.bin entry \
-             {index} ({start}..{end} of {} bytes): {e}",
-                BYTES.len(),
-            )
-        }),
-    )
+    let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(&BYTES[start..end]);
+    assert_eq!(
+        consumed,
+        end - start,
+        "descr_layouts.bin entry {index} did not fill {start}..{end}"
+    );
+    std::sync::Arc::new(spec)
+}
+
+/// Parent layouts translation already stored, in table order.
+///
+/// `warmspot.py` `WarmRunnerDesc.finish` calls `pyjitpl.py`
+/// `finish_setup_descrs` on the rows it built. Walking this table publishes
+/// those rows. [`descr_layout_at`] stays for a later Field slot that still
+/// needs one parent; kind-0 startup does not call it.
+fn for_each_packed_parent_layout(mut visit: impl FnMut(majit_jitcode::jitcode::BhSizeSpec)) {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let mut rest = BYTES;
+    while !rest.is_empty() {
+        let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(rest);
+        rest = &rest[consumed..];
+        visit(spec);
+    }
+}
+
+/// Publish each packed parent once.
+///
+/// `descr.py` `get_field_descr` already filled a declared STRUCT. When that
+/// size lists the same fields, skip the name bytes (`pyjitpl.py`
+/// `finish_setup_descrs` numbers stored rows; it does not rebuild them).
+fn publish_packed_parent_layouts() {
+    const BYTES: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    // `descr.py` `get_size_descr` sees groups translation already built.
+    crate::descr::force_all_declared_groups();
+    // Rows `get_size_descr` already returned. Later records of the same
+    // layout compare this table instead of locking `GcCache` again.
+    let mut known = crate::descr::kind0_vtable_field_counts();
+    // Same answer as `kind0_struct_absent`, without a lock per record.
+    // A publish below inserts the id so a later record of that STRUCT
+    // takes `publish_kind0_parent_layout`, matching the cache after the mint.
+    let mut present = crate::descr::kind0_present_struct_ids();
+    let mut rest: &'static [u8] = BYTES;
+    while !rest.is_empty() {
+        let (type_id, nfields) = majit_jitcode::jitcode::BhSizeSpec::peek_header(rest);
+        // `kind0_vtable_field_counts` is the one `get_size_descr` pass.
+        // `finish_setup_descrs` does not lock again to rediscover a vtable
+        // row. A packed record whose cached size has no vtable is not a hit:
+        // `kind0_layout_already_published` returns false for `vtable == 0`.
+        let known_hit = known
+            .binary_search_by_key(&type_id, |row| row.0)
+            .is_ok_and(|index| known[index].1 == nfields);
+        if type_id == 0 || known_hit {
+            let consumed = majit_jitcode::jitcode::BhSizeSpec::skip_record(rest);
+            rest = &rest[consumed..];
+            continue;
+        }
+        let gained_vtable = if present.binary_search(&type_id).is_err() {
+            let (layout, consumed) = majit_jitcode::jitcode::BhSizeSpec::read_static(rest);
+            rest = &rest[consumed..];
+            let gained_vtable = layout.vtable != 0;
+            crate::descr::publish_borrowed_parent_layout(layout);
+            gained_vtable
+        } else {
+            let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(rest);
+            rest = &rest[consumed..];
+            let gained_vtable = spec.vtable != 0;
+            crate::descr::publish_kind0_parent_layout(spec);
+            gained_vtable
+        };
+        if let Err(index) = present.binary_search(&type_id) {
+            present.insert(index, type_id);
+        }
+        // A vtable-less publish cannot enter the skip table. Locking
+        // `get_size_descr` to confirm that is the per-row cost this pass
+        // already refused.
+        if gained_vtable && crate::descr::kind0_layout_already_published(type_id, nfields) {
+            match known.binary_search_by_key(&type_id, |row| row.0) {
+                Ok(index) => known[index].1 = nfields,
+                Err(index) => known.insert(index, (type_id, nfields)),
+            }
+        }
+    }
 }
 
 fn load_descr_uncached(index: usize) -> BhDescr {
     load_descr_with_parent(index, descr_layout_at)
+}
+
+/// Decode one `descrs.bin` slot.
+///
+/// A parentless `BhDescr::Size` whose `type_id` is nonzero is the STRUCT row
+/// `descr.py` `get_size_descr` returns. `finish_setup_descrs` already numbered
+/// that row, so the bytes are a `BhSizeSpec` record (`pack_into`), not a
+/// bincode enum. Every other slot stays a bincode `BhDescr`.
+fn descr_from_indexed_bytes(bytes: &[u8], size_type_id: u64) -> BhDescr {
+    if size_type_id != 0 {
+        let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(bytes);
+        assert_eq!(
+            consumed,
+            bytes.len(),
+            "packed size record did not fill its descrs.bin slot"
+        );
+        assert_eq!(spec.type_id, size_type_id);
+        let owner = if spec.headerless && spec.owner.is_empty() {
+            majit_jitcode::jitcode::HEADERLESS_SIZE_OWNER_MARKER.to_string()
+        } else {
+            spec.owner
+        };
+        return BhDescr::Size {
+            size: spec.size,
+            type_id: spec.type_id,
+            vtable: spec.vtable,
+            owner,
+            all_fielddescrs: spec.all_fielddescrs,
+            is_gc_managed: spec.is_gc_managed,
+        };
+    }
+    bincode::deserialize(bytes).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize descrs.bin entry ({} bytes): {e}",
+            bytes.len(),
+        )
+    })
 }
 
 /// Decode descriptor slot `index`, taking a Field's parent layout from
@@ -1055,13 +1171,8 @@ fn load_descr_with_parent(
     let offsets = &descrs_index().offsets;
     let start = offsets[index] as usize;
     let end = offsets[index + 1] as usize;
-    let mut descr: BhDescr = bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
-        panic!(
-            "pyre-jit-trace: failed to deserialize descrs.bin entry {index} \
-             ({start}..{end} of {} bytes): {e}",
-            BYTES.len(),
-        )
-    });
+    let mut descr =
+        descr_from_indexed_bytes(&BYTES[start..end], descrs_index().size_type_ids[index]);
     let parent_layout = descrs_index().parent_layouts[index];
     if parent_layout != u32::MAX {
         let BhDescr::Field { parent, .. } = &mut descr else {
@@ -1417,51 +1528,34 @@ fn decode_kind0_descrs_off_caller_stack() {
 
 fn decode_kind0_descrs() {
     let index = descrs_index();
-    // Every Field of a struct names the same parent layout, which carries the
-    // struct's whole `all_fielddescrs`, and most kind-0 slots name one.
-    // `descrs_index().parent_layouts` says which before anything is decoded, so
-    // hold each layout for exactly the span of slots that still name it and
-    // decode it once — `GcCache._cache_size` keyed by STRUCT, which
-    // `get_field_descr` hits for every field of the same struct. Reusing only
-    // the immediately preceding slot's layout decoded 1,084 layouts for 758
-    // distinct ones, 354 KB of repeat bincode, because a struct's fields are
-    // not all adjacent. The span bound is what keeps the transient small: 39
-    // layouts and 44 KB of wire bytes are live at the peak, and the last slot
-    // naming a layout drops it (see `descr_layout_at` for why none is kept
-    // past this pass).
-    //
-    // Both tables are indexed by layout, not keyed: the layout space is the
-    // dense `descr_layouts.bin` index, so a slot per layout is smaller than a
-    // map entry and needs no hashing.
-    let n_layouts = descr_layout_offsets().len() - 1;
-    let mut pending = vec![0u32; n_layouts];
-    for (&kind, &layout) in index.kinds.iter().zip(index.parent_layouts.iter()) {
-        if kind == 0 && layout != u32::MAX {
-            pending[layout as usize] += 1;
-        }
-    }
-    let mut layouts: Vec<Option<std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>>> =
-        vec![None; n_layouts];
+    // `descr.py` `GcCache.setup_descrs` numbers rows already stored by
+    // `get_field_descr`. `pyjitpl.py` `finish_setup_descrs` does that at
+    // translation (`warmspot.py` `WarmRunnerDesc.finish`). The packed parent
+    // table is those rows: publish each once, without `descr_layout_at`.
+    // Size, Array, and InteriorField slots have no parent layout and still
+    // decode.
+    publish_packed_parent_layouts();
+    // `descr.py` `get_size_descr` / `pyjitpl.py` `finish_setup_descrs`.
+    // One snapshot, then a parentless size whose row is already numbered
+    // is not locked or decoded again.
+    let mut published = crate::descr::kind0_published_size_ids();
     for (i, kind) in index.kinds.iter().copied().enumerate() {
-        if kind != 0 {
+        if kind != 0 || index.parent_layouts[i] != u32::MAX {
             continue;
         }
-        let bh = load_descr_with_parent(i, |layout| {
-            layouts[layout]
-                .get_or_insert_with(|| descr_layout_at(layout))
-                .clone()
-        });
+        let type_id = index.size_type_ids[i];
+        if type_id != 0 && published.binary_search(&type_id).is_ok() {
+            continue;
+        }
+        let bh = load_descr_with_parent(i, descr_layout_at);
         debug_assert!(!matches!(
             bh,
             BhDescr::Call { .. } | BhDescr::JitCode { .. }
         ));
         crate::descr::make_descr_from_bh(&bh);
-        let layout = index.parent_layouts[i];
-        if layout != u32::MAX {
-            let remaining = &mut pending[layout as usize];
-            *remaining -= 1;
-            if *remaining == 0 {
-                layouts[layout as usize] = None;
+        if type_id != 0 && crate::descr::kind0_size_already_published(type_id) {
+            if let Err(pos) = published.binary_search(&type_id) {
+                published.insert(pos, type_id);
             }
         }
     }
@@ -1604,6 +1698,39 @@ fn register_array_layout(
 /// Deferring pass 2 or pass 3 therefore buys an unmeasured amount of memory
 /// against a silent optimizer downgrade that surfaces only as
 /// `descr_set_absent` rising off zero.
+/// Type id of the packed parent at `index` in `descr_layouts.bin`.
+fn descr_layout_type_id(index: usize) -> u64 {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let start = descr_layout_offsets()[index] as usize;
+    majit_jitcode::jitcode::BhSizeSpec::peek_header(&BYTES[start..]).0
+}
+
+/// `descr.py` `get_field_descr`: mint the opcode Field into
+/// `_cache_field[STRUCT][fieldname]` with `parent_descr = get_size_descr`.
+/// Packed parent `all_fielddescrs` already holds `heaptracker.all_fielddescrs`.
+fn publish_kind0_field(struct_id: u64, field_name: &str) {
+    let index = descrs_index();
+    for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
+        if index.kinds[slot] != 0 || layout_index == u32::MAX {
+            continue;
+        }
+        if descr_layout_type_id(layout_index as usize) != struct_id {
+            continue;
+        }
+        let bh = load_descr_with_parent(slot, descr_layout_at);
+        let field_key = match &bh {
+            majit_jitcode::jitcode::BhDescr::Field { owner, name, .. } => {
+                crate::descr::bh_field_cache_key(owner, name)
+            }
+            _ => continue,
+        };
+        if field_key != field_name {
+            continue;
+        }
+        let _ = crate::descr::make_descr_from_bh(&bh);
+    }
+}
+
 pub fn rehydrate_build_descr_raw_sets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1625,6 +1752,9 @@ pub fn rehydrate_build_descr_raw_sets() {
         // re-run a cache-miss recipe against a slot that is already full.
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
+            if let Some((struct_id, field_name)) = crate::descr::ambiguous_field_struct(&member) {
+                publish_kind0_field(struct_id, field_name);
+            }
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         // Last, and only into what is still empty: the slots no opcode names,
@@ -3045,6 +3175,165 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 mod tests {
     use super::*;
 
+    /// `descr.py` `get_size_descr` returns a STRUCT that already lists fields.
+    /// The parentless size slot must not bincode that list again, even when
+    /// the published vtable word is 0. An empty shell still decodes. A declared
+    /// STRUCT's field stays the group's descr when kind-0 does not re-decode
+    /// the slot.
+    #[test]
+    fn kind0_size_and_materialize() {
+        {
+            // kind0_size_with_fields_skips_the_parentless_slot
+            let published = 0xF1E1_E201;
+            assert!(!crate::descr::kind0_size_already_published(published));
+            majit_ir::descr::publish_borrowed_struct_layout(
+                u32::MAX,
+                24,
+                1,
+                published,
+                0,
+                true,
+                false,
+                &[],
+                vec![majit_ir::descr::BorrowedField {
+                    index: 0,
+                    name: std::borrow::Cow::Borrowed("Parentless.slot"),
+                    field_key: "slot",
+                    offset: 16,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            );
+            assert!(crate::descr::kind0_size_already_published(published));
+            assert!(
+                crate::descr::kind0_published_size_ids()
+                    .binary_search(&published)
+                    .is_ok()
+            );
+            let shell = 0xF1E1_E202;
+            majit_ir::descr::publish_borrowed_struct_layout(
+                u32::MAX,
+                16,
+                1,
+                shell,
+                0,
+                true,
+                false,
+                &[],
+                Vec::new(),
+            );
+            assert!(!crate::descr::kind0_size_already_published(shell));
+            assert!(
+                crate::descr::kind0_published_size_ids()
+                    .binary_search(&shell)
+                    .is_err()
+            );
+            assert!(!crate::descr::kind0_size_already_published(0));
+        }
+        {
+            // kind0_materialize_publishes_declared_int_field
+            materialize_gccache_owned_descrs();
+            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(
+                "intobject::W_IntObject",
+            ));
+            let cached = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_field
+                .get(&key)
+                .and_then(|fields| fields.get("intval"))
+                .cloned()
+                .expect("W_IntObject.intval published before user code");
+            let cached = cached as majit_ir::DescrRef;
+            assert!(std::sync::Arc::ptr_eq(
+                &cached,
+                &crate::descr::int_intval_descr()
+            ));
+        }
+    }
+
+    /// `descr.py` `get_size_descr` reads the STRUCT row. A nonzero `type_id`
+    /// slot is that packed row, not a bincode `BhDescr` enum.
+    #[test]
+    fn packed_size_slot_and_parent_layouts() {
+        {
+            // packed_size_slot_decodes_without_bincode
+            use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec};
+            let mut spec = BhSizeSpec {
+                size: 24,
+                type_id: 0xA11C_E501,
+                vtable: 0,
+                owner: String::new(),
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: vec![BhFieldSpec {
+                    index: 0,
+                    field_key: "slot".to_string(),
+                    name: "Packed.slot".to_string(),
+                    offset: 16,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    field_flag: majit_ir::descr::ArrayFlag::Signed,
+                    is_field_signed: true,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            };
+            let mut bytes = Vec::new();
+            spec.pack_into(&mut bytes);
+            let BhDescr::Size {
+                type_id,
+                all_fielddescrs,
+                owner,
+                ..
+            } = descr_from_indexed_bytes(&bytes, spec.type_id)
+            else {
+                panic!("packed size slot must be a Size");
+            };
+            assert_eq!(type_id, spec.type_id);
+            assert!(owner.is_empty());
+            assert_eq!(all_fielddescrs.len(), 1);
+            assert_eq!(all_fielddescrs[0].field_key(), "slot");
+
+            spec.owner = "INT_TYPE".into();
+            spec.vtable = 0x7fff_ff00;
+            let mut named = Vec::new();
+            spec.pack_into(&mut named);
+            let BhDescr::Size {
+                owner: named_owner,
+                vtable: named_vtable,
+                ..
+            } = descr_from_indexed_bytes(&named, spec.type_id)
+            else {
+                panic!("packed size slot must keep owner");
+            };
+            assert_eq!(named_owner, "INT_TYPE");
+            assert_eq!(named_vtable, 0x7fff_ff00);
+
+            let raw = bincode::serialize(&BhDescr::VableField { index: 3 }).unwrap();
+            assert!(matches!(
+                descr_from_indexed_bytes(&raw, 0),
+                BhDescr::VableField { index: 3 }
+            ));
+        }
+        {
+            // packed_parent_layouts_match_descr_layout_at
+            let mut count = 0usize;
+            for_each_packed_parent_layout(|spec| {
+                assert_eq!(*descr_layout_at(count), spec);
+                count += 1;
+            });
+            assert_eq!(count, descr_layout_offsets().len() - 1);
+            assert!(count > 0, "translation stored no parent layout");
+        }
+    }
+
     #[test]
     fn descr_index_kind_matches_each_serialized_entry() {
         let index = descrs_index();
@@ -3428,6 +3717,9 @@ mod tests {
 
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
+            if let Some((struct_id, field_name)) = crate::descr::ambiguous_field_struct(&member) {
+                publish_kind0_field(struct_id, field_name);
+            }
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         let after_stamps = rss_kb();

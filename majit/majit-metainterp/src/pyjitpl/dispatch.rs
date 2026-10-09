@@ -6246,6 +6246,7 @@ mod tests {
                 size,
                 type_id,
                 vtable,
+                owner: String::new(),
                 is_gc_managed: true,
                 headerless: false,
                 all_fielddescrs: vec![spec],
