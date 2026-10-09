@@ -932,6 +932,45 @@ fn formatted_message_raise_sites_keep_the_two_call_form() {
     );
 }
 
+/// `list_extend_value` is `Ok(_) / Err(e) if pred(x) / Err(_)`. Drain fuse
+/// treats the Err edge as the exception link and leaves the guard as
+/// ordinary flow (`flowcontext.py` `FlowContext.guessexception`).
+#[test]
+fn list_extend_value_guarded_err_lowers() {
+    let graph = lower_function(interp(), "pyre_interpreter::opcode_ops::list_extend_value")
+        .unwrap_or_else(|e| panic!("lower list_extend_value: {e}"));
+    assert_eq!(count_result_ctors(&graph), 0, "Result shells must be gone");
+    let discs = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant"
+                        && field.owner_root.as_deref().is_some_and(|o| o.contains("Result"))
+            )
+        })
+        .count();
+    assert_eq!(discs, 0, "the Result match is fused away");
+    let lastexc = graph
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.exitswitch, Some(ExitSwitch::LastException)))
+        .count();
+    assert!(lastexc >= 1, "the call site is a LastException diamond");
+    let raises = graph
+        .blocks
+        .iter()
+        .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
+        .count();
+    assert!(
+        raises >= 2,
+        "guarded re-raise and the new raise both reach exceptblock, got {raises}"
+    );
+}
+
 #[test]
 fn list_append_underflow_keeps_its_unfused_materialisation() {
     // `opcode_list_append` raises through
