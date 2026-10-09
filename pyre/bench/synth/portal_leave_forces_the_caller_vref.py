@@ -8,6 +8,16 @@
 # frame with no vref at all, and every assertion below would pass without
 # testing anything.
 #
+# `leaf` is made a portal the way `_opimpl_recursive_call` does: a warmup
+# recurses past `max_unroll_recursion` (7), which stamps `dont_trace_here`
+# on its greenkey.  `can_inline_callable` then refuses it, so `driver`
+# residual-calls `leaf` and the function-threshold compiles the
+# `entry-bridge:leaf` this header declares.  Without that stamp
+# `perform_call` inlines `leaf` into `driver` (pypy3 compiles one loop
+# for the file) and `leave_compiled_frame_chain` never sees this frame.
+# The escape stays on the depth-0 body `mid_pass` calls, so `f_back` is
+# still `mid_pass`.
+#
 # `executioncontext.py ExecutionContext.leave` reaches the caller WITH the
 # force:
 #
@@ -51,9 +61,13 @@ import sys
 
 WARM = 120000
 ESCAPE_AT = WARM - 5
+# One past `memory_manager.max_unroll_recursion` (default 7).
+UNROLL_PAST_BOUND = 8
 
 
-def leaf(i, n):
+def leaf(i, n, depth=0):
+    if depth > 0:
+        return leaf(i, n, depth - 1)
     if i == ESCAPE_AT:
         try:
             raise ValueError('escape')
@@ -78,8 +92,20 @@ def driver(n):
 HELD = []
 
 
+def warm_leaf_portal():
+    # Recurse past the bound so `_opimpl_recursive_call` stamps
+    # `dont_trace_here` on `leaf`, then residual-call it until the
+    # function threshold compiles the entry bridge.
+    leaf(-1, 0, UNROLL_PAST_BOUND)
+    k = 0
+    while k < 2000:
+        leaf(-1, 0)
+        k += 1
+
+
 def main():
     failures = []
+    warm_leaf_portal()
     driver(WARM)
     if len(HELD) != 1:
         print('FAIL the escape never fired: held %d frames' % len(HELD))

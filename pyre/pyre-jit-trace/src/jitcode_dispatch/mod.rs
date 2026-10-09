@@ -2111,17 +2111,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// reads that alias the caller's frame. `None` when this is not an
     /// inlined-callee sub-walk.
     pub inline_callee_consts: Option<InlineCalleeConsts>,
-    /// Ascending jitcode offsets in THIS sub-walk's body that
-    /// [`fbw_state::fbw_callee_body_replay_scan`] could not prove replay-safe.
-    /// [`walk`] refuses the inline on reaching one.
-    ///
-    /// The admission that hands this over is what turns a whole-body verdict
-    /// into a path-sensitive one, so the set is per-sub-walk and never
-    /// inherited: it names offsets into one callee's jitcode and means nothing
-    /// in another's.  `None` for a top-level walk and for an admission that
-    /// found nothing to poison, which is the common case and the reason the
-    /// per-op test is one `Option` check.
-    pub inline_poison_pcs: Option<std::sync::Arc<[usize]>>,
     /// FBW walk modes inherited by nested sub-walk contexts.
     pub fbw_mode: FbwWalkMode<Sym>,
     /// Caller-owned state shared by every frame in this walk attempt.
@@ -3567,10 +3556,10 @@ impl DispatchError {
     /// registers, descrs and concretes lazily against the live trace context,
     /// so a second family exists here that upstream has no analog for: the
     /// abort IS the report that a value is unavailable
-    /// (`RegisterReadUnbound`, `*NotConcrete`, `*ArgUnbound`, a malformed
-    /// descr).  Converting one of those to a blackhole resumes execution on
-    /// exactly the hole the walker refused to read, so those keep the legacy
-    /// entry replay.
+    /// (`RegisterReadUnbound`, `SwitchValueNotConcrete`, `*ArgUnbound`, a
+    /// malformed descr).  Converting one of those to a blackhole resumes
+    /// execution on exactly the hole the walker refused to read, so those
+    /// keep the legacy entry replay.
     ///
     /// An allow-list, not a deny-list: a class left out only forgoes the
     /// handoff, while a class wrongly let in resumes on missing data.
@@ -3628,11 +3617,10 @@ impl DispatchError {
                 | Self::BranchGuardKeptSlotUnsourced { .. }
                 | Self::BranchGuardUnrestorableKeptStackPermanent { .. }
                 | Self::ExcEdgeNoInFrameCatch { .. }
-                // In-walk refuse of a loop-bearing callee (`fbw_decline_inline_callee`,
-                // poisoned-pc).  With a seeded inline the frames are already an
-                // MIFrame stack, so the refuse converts in place
-                // (`run_blackhole_interp_to_cancel_tracing`) instead.
-                // Unseeded remains residual-not-abort: `carrier_owned` when
+                // In-walk refuse of a loop-bearing callee (`fbw_decline_inline_callee`).
+                // With a seeded inline the frames are already an MIFrame stack, so
+                // the refuse converts in place (`run_blackhole_interp_to_cancel_tracing`)
+                // instead. Unseeded remains residual-not-abort: `carrier_owned` when
                 // `!frames_materialized`.
                 | Self::LoopBearingCalleeInlineUnsupported {
                     blackhole_required: false,
@@ -4652,29 +4640,6 @@ pub fn walk<Sym: WalkSym>(
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
-        // The path-sensitive half of the inline admission.  The scan that
-        // admitted this callee left behind the pcs it could not prove
-        // replay-safe instead of declining the whole body for them, so the
-        // refusal happens HERE, where the walk has arrived at one, rather than
-        // at the CALL for an arm the walk may never take.
-        //
-        // Before `step`, so nothing of the offending op is recorded or
-        // executed: the op is the effect, and the decline promises the
-        // enclosing CALL can be re-entered from scratch.  Everything walked up
-        // to this point passed the scan, so it committed no live-heap effect
-        // for the rewind to have to undo.
-        if ctx
-            .inline_poison_pcs
-            .as_ref()
-            .is_some_and(|pcs| pcs.binary_search(&pc).is_ok())
-        {
-            if fbw_inline_diag_enabled() {
-                eprintln!("[inline-poison-refuse] pc={pc}");
-            }
-            census_record("InlineCallee::PoisonedPcReached");
-            let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
-            return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
-        }
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
@@ -5547,153 +5512,6 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
     } else {
         ExcHandlerShape::Unproven
     }
-}
-
-/// Whether every pc in `poison` sits on a `Reraise` handler and off both the
-/// happy path and every other handler.
-///
-/// `perform_call` (`pyjitpl.py`) traces the path the interpreter takes.
-/// `can_inline_callable` (`warmstate.py`) does not residualize a callee
-/// because an `except: raise` arm exists: that arm is the guard's side exit.
-/// The replay scan names the arm's ops in `poison`. This answers whether
-/// refusing the walk at exactly those pcs leaves the traced `try` body free
-/// of them. An empty set, a poison pc on the happy path, a poison pc a
-/// non-`Reraise` handler can reach, or a body this scan cannot decode all
-/// decline.
-pub(crate) fn poison_confined_to_reraise_handlers(code: &[u8], poison: &[usize]) -> bool {
-    poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Reraise)
-}
-
-/// Whether every pc in `poison` sits on a `Returns` handler and off both the
-/// happy path and every other handler.
-///
-/// `can_inline_callable` (`warmstate.py`) does not residualize a callee
-/// because an `except E as e: return` arm exists. `perform_call`
-/// (`pyjitpl.py`) traces that arm when it is the taken path — classify's
-/// `_check_surrogate` reject is that shape. Unlike a reraise arm, the walk
-/// must enter these pcs, so the matching admit does not put them in
-/// `inline_poison_pcs`.
-pub(crate) fn poison_confined_to_returning_handlers(code: &[u8], poison: &[usize]) -> bool {
-    poison_confined_to_handler_shape(code, poison, ExcHandlerShape::Returns)
-}
-
-/// Whether a seeded except-as-return admit may keep this scan.
-///
-/// [`fbw_callee_body_replay_scan`] stores unsafe ops in `poison` and
-/// leaves `safety` as `Clean`/`DeferredCall`; [`CalleeReplayScan::verdict`]
-/// folds a non-empty poison set into `Dirty`. This admit does not install
-/// `inline_poison_pcs` (the walk must enter a taken `except E: return`
-/// arm), so it has to read `verdict()` — `safety != Dirty` is true for
-/// every enforceable scan and would admit a Dirty happy path as long as
-/// some returning handler exists. The reraise and branchy-poison siblings
-/// keep reading `safety` because they refuse the walk at `scan.poison`.
-pub(crate) fn handler_except_as_return_scan_admits(scan: &CalleeReplayScan, code: &[u8]) -> bool {
-    scan.enforceable()
-        && body_has_returning_handler(code)
-        && (scan.verdict() != CalleeReplaySafety::Dirty
-            || poison_confined_to_returning_handlers(code, &scan.poison))
-}
-
-/// Whether any `catch_exception` target is a returning handler.
-///
-/// `except E as e: return` compiles to `ExcHandlerShape::Returns` or
-/// `ExceptAsReturn` (CHECK_EXC_MATCH miss reraises). The try body may
-/// still carry happy-path poison (`BUILD_MAP` for `type(name, (), {})`),
-/// so the except-as admit asks this instead of
-/// [`poison_confined_to_returning_handlers`].
-pub(crate) fn body_has_returning_handler(code: &[u8]) -> bool {
-    let mut pc = 0usize;
-    while pc < code.len() {
-        let Some(op) = decode_op_at(code, pc) else {
-            return false;
-        };
-        if op.key == "catch_exception/L" {
-            let target = read_label(code, &op, 0);
-            if matches!(
-                exc_handler_shape(code, target),
-                ExcHandlerShape::Returns | ExcHandlerShape::ExceptAsReturn
-            ) {
-                return true;
-            }
-        }
-        pc = op.next_pc;
-    }
-    false
-}
-
-fn poison_confined_to_handler_shape(
-    code: &[u8],
-    poison: &[usize],
-    wanted: ExcHandlerShape,
-) -> bool {
-    if poison.is_empty() {
-        return false;
-    }
-    let Some(happy) = reachable_op_pcs(code, 0) else {
-        return false;
-    };
-    if poison.iter().any(|pc| happy.contains(pc)) {
-        return false;
-    }
-    let mut wanted_reach = std::collections::HashSet::new();
-    let mut other_reach = std::collections::HashSet::new();
-    let mut saw_wanted = false;
-    let mut pc = 0usize;
-    while pc < code.len() {
-        let Some(op) = decode_op_at(code, pc) else {
-            return false;
-        };
-        if op.key == "catch_exception/L" {
-            let target = read_label(code, &op, 0);
-            match exc_handler_shape(code, target) {
-                ExcHandlerShape::Unproven => return false,
-                shape if shape == wanted => {
-                    saw_wanted = true;
-                    let Some(reach) = reachable_op_pcs(code, target) else {
-                        return false;
-                    };
-                    wanted_reach.extend(reach);
-                }
-                _ => {
-                    let Some(reach) = reachable_op_pcs(code, target) else {
-                        return false;
-                    };
-                    other_reach.extend(reach);
-                }
-            }
-        }
-        pc = op.next_pc;
-    }
-    saw_wanted
-        && poison
-            .iter()
-            .all(|pc| wanted_reach.contains(pc) && !other_reach.contains(pc))
-}
-
-/// Ops reachable from `start` by ordinary control edges.
-///
-/// `None` when the region cannot be decoded: a `switch`, a label whose
-/// width this scan does not model, a budget overrun, or a byte that is not
-/// an opcode. Callers treat that as "do not admit". `catch_exception/L`
-/// contributes its fall-through only — the label is the handler, and
-/// blackhole jumps there. `goto/L` contributes its label only. Every other
-/// labeled op contributes both edges.
-fn reachable_op_pcs(code: &[u8], start: usize) -> Option<std::collections::HashSet<usize>> {
-    let mut visited = std::collections::HashSet::new();
-    let mut work = vec![start];
-    let mut budget = 4096usize;
-    while let Some(pc) = work.pop() {
-        if budget == 0 {
-            return None;
-        }
-        budget -= 1;
-        if !visited.insert(pc) {
-            continue;
-        }
-        let op = decode_op_at(code, pc)?;
-        work.extend(control_successors(code, &op)?);
-    }
-    Some(visited)
 }
 
 fn control_successors(code: &[u8], op: &DecodedOp) -> Option<Vec<usize>> {

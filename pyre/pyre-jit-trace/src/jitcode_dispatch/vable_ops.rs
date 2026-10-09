@@ -268,7 +268,6 @@ mod frame_replacement_tests {
             let mut ctx = WalkContext {
                 frame_state: state,
                 inline_callee_consts: None,
-                inline_poison_pcs: None,
                 fbw_mode: FbwWalkMode::<crate::state::PyreSym>::default(),
                 session: &session,
                 registers_r: &regs,
