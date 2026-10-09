@@ -132,3 +132,64 @@ print("body done", flush=True)
     assert_eq!(stdout.trim(), "body done");
     assert!(stderr.is_empty(), "{stderr}");
 }
+
+#[test]
+fn command_startup_sees_sys_path_and_reuses_import_name() {
+    let program = r#"
+import sys
+assert sys.path
+by_name = {f.__name__: f for f in sys.meta_path}
+assert 'BuiltinImporter' in by_name and 'FrozenImporter' in by_name and 'PathFinder' in by_name, list(by_name)
+assert by_name['BuiltinImporter'].find_spec('sys') is not None
+assert by_name['FrozenImporter'].find_spec('token') is None
+assert by_name['PathFinder'].find_spec('token') is not None
+assert by_name['PathFinder'].find_spec('not_a_real_module_zz') is None
+assert list.append.__qualname__ == 'list.append'
+boot = sys.modules['_frozen_importlib']
+seen = []
+real = boot.__import__
+def wrap(name, globals=None, locals=None, fromlist=(), level=0):
+    seen.append(name)
+    return real(name, globals, locals, fromlist, level)
+boot.__import__ = wrap
+def f():
+    import token
+name = f.__code__.co_names[f.__code__.co_names.index('token')]
+f()
+assert seen and seen[0] is name, (seen, name)
+"#;
+    let output = pyre_command()
+        .args(["-S", "-c", program])
+        .output()
+        .expect("run command startup sys.path / import-name script");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+}
+
+#[test]
+fn user_del_on_garbage_runs_at_shutdown() {
+    let path = std::env::temp_dir().join(format!(
+        "pyre-shutdown-del-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let source = format!(
+        "class A:\n    def __del__(self):\n        open({:?}, 'wb').write(b'ran')\nA()\n",
+        path
+    );
+    let output = pyre_command()
+        .args(["-c", &source])
+        .output()
+        .expect("run user __del__ shutdown script");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(text, "ran");
+}

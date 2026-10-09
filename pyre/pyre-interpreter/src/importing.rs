@@ -2328,17 +2328,6 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // go in it.
     #[cfg(feature = "host_env")]
     {
-        // Cloned before the lock: `startup_path_config` must not run while
-        // `SYS_PATH` is held, and `add_sys_path` locks that same mutex.
-        #[cfg(not(target_arch = "wasm32"))]
-        let stdlib_reseed = {
-            let config = startup_path_config();
-            #[cfg(not(feature = "sandbox"))]
-            let verbatim = config.pth.is_some();
-            #[cfg(feature = "sandbox")]
-            let verbatim = false;
-            (config.stdlib_paths.clone(), verbatim)
-        };
         let mut path = SYS_PATH.lock();
         path.clear();
         // PYTHONPATH entries head the seed and precede the stdlib
@@ -2360,125 +2349,7 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
         }
         // The stdlib entry is appended when the `sys` module is created —
         // `create_sys_path_list` forces `ensure_stdlib_path` before flushing
-        // this seed into `sys.path`. A later `init_sys_path` has already
-        // cleared that seed, and `ensure_stdlib_path` does not run twice, so
-        // put the same entries back before anything reads the seed again.
-        // First startup leaves this to `ensure_stdlib_path` so a `._pth` list
-        // is not copied here and then extended again.
-        #[cfg(not(target_arch = "wasm32"))]
-        if STDLIB_PATH_SEEDED.load(Ordering::Acquire) {
-            let (stdlib_paths, verbatim) = &stdlib_reseed;
-            for stdlib in stdlib_paths {
-                if *verbatim || !path.contains(stdlib) {
-                    path.push(stdlib.clone());
-                }
-            }
-        }
-    }
-    // `find_in_sys_path` reads this dict entry, not `getattr`. An empty list
-    // is authoritative, so a second startup must put the reseeded entries
-    // back on that same object. `finalize_delete_special` binds `None`.
-    #[cfg(feature = "host_env")]
-    if let Some(sys) = get_interpreter_sys_module() {
-        let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
-        let roots = pyre_object::gc_roots::push_roots();
-        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(w_dict);
-        if sys_path_needs_reseed(roots.get(dict_slot)) {
-            let rebuilt_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = roots.pin_root(create_sys_path_list());
-            unsafe {
-                pyre_object::w_dict_setitem_str(
-                    roots.get(dict_slot),
-                    "path",
-                    roots.get(rebuilt_slot),
-                );
-            }
-        }
-        restore_cleared_meta_path(roots.get(dict_slot));
-    }
-}
-
-/// `sys.path` is missing, not a list (`None` after shutdown), or empty.
-#[cfg(feature = "host_env")]
-fn sys_path_needs_reseed(w_dict: PyObjectRef) -> bool {
-    if w_dict.is_null() {
-        return false;
-    }
-    let Some(live) = (unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }) else {
-        return true;
-    };
-    if unsafe { !pyre_object::is_list(live) } {
-        return true;
-    }
-    let n = unsafe { pyre_object::listobject::w_list_len(live) };
-    n == 0
-}
-
-/// `finalize_delete_special` binds `None` over `sys.meta_path` and leaves the
-/// install flag set, so a later startup would skip `_install`. Put an empty
-/// list back, clear the flag, and drop the cached bootstrap modules so the
-/// next `importhook` runs the bodies and appends the finders again.
-#[cfg(feature = "host_env")]
-fn restore_cleared_meta_path(w_dict: PyObjectRef) {
-    if w_dict.is_null() {
-        return;
-    }
-    let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_dict);
-    let still_a_list =
-        match unsafe { pyre_object::w_dict_getitem_str(roots.get(dict_slot), "meta_path") } {
-            Some(live) if unsafe { pyre_object::is_list(live) } => true,
-            _ => false,
-        };
-    if still_a_list {
-        return;
-    }
-    let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_list_new_empty());
-    let flag_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_bool_from(false));
-    let hooks_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_list_new_empty());
-    let cache_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_dict_new());
-    unsafe {
-        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "meta_path", roots.get(list_slot));
-        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "path_hooks", roots.get(hooks_slot));
-        pyre_object::w_dict_setitem_str(
-            roots.get(dict_slot),
-            "path_importer_cache",
-            roots.get(cache_slot),
-        );
-        pyre_object::w_dict_setitem_str(
-            roots.get(dict_slot),
-            "_pyre_importlib_bootstrap_installed",
-            roots.get(flag_slot),
-        );
-    }
-    remove_sys_module("_frozen_importlib");
-    remove_sys_module("_frozen_importlib_external");
-    refresh_cleared_builtin_modules();
-    crate::module::_codecs::reset_codec_search_for_restart();
-}
-
-/// `MixedModule.init` reload: `_PyModule_ClearDict` filled builtin
-/// dictionaries with `None`, and the immortal module objects still sit in
-/// `space.builtin_modules`. Refresh each from `w_initialdict` so the next
-/// `_install_external_importers` does not call `posix.getcwd` as `None`.
-fn refresh_cleared_builtin_modules() {
-    let entries: Vec<(&'static str, PyObjectRef)> = {
-        let table = BUILTIN_MODULES.lock();
-        table
-            .iter()
-            .filter(|(name, def)| def.w_mod != 0 && **name != "sys" && **name != "builtins")
-            .map(|(name, def)| (*name, def.w_mod as PyObjectRef))
-            .collect()
-    };
-    let ec = crate::call::getexecutioncontext();
-    for (name, w_mod) in entries {
-        let _ = mixedmodule_init(name, w_mod, ec);
+        // this seed into `sys.path`.
     }
 }
 
@@ -3735,19 +3606,6 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     }
 }
 
-/// Whether `module` is the immortal MixedModule `install()` stored in
-/// `space.builtin_modules`. `ObjSpace.finish` walks those values and does
-/// not clear their dictionaries.
-pub fn is_immortal_builtin_module_object(module: PyObjectRef) -> bool {
-    if module.is_null() {
-        return false;
-    }
-    BUILTIN_MODULES
-        .lock()
-        .values()
-        .any(|def| def.w_mod != 0 && def.w_mod as PyObjectRef == module)
-}
-
 /// Remove a (partially initialised) module from `sys.modules`.
 ///
 /// `importlib._bootstrap._load` deletes the module it pre-registered when
@@ -3804,13 +3662,6 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
             }
         }
     }
-    // `finalize_remove_modules` empties the interned module table too.
-    // Leaving `SYS_MODULES` populated keeps encodings/os objects whose
-    // dictionaries `_PyModule_ClearDict` filled with `None`, and a later
-    // in-process `run_source` reuses them.
-    SYS_MODULES
-        .lock()
-        .retain(|name, _| name == "sys" || name == "builtins");
     ReleasedSysModules { modules }
 }
 
@@ -4366,13 +4217,11 @@ fn find_module(
     Ok(None)
 }
 
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-static STDLIB_PATH_SEEDED: AtomicBool = AtomicBool::new(false);
-
 /// Install the PyPy-shaped bootstrap path exactly once for the process.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn ensure_stdlib_path() {
-    if STDLIB_PATH_SEEDED.swap(true, Ordering::AcqRel) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
         return;
     }
     let config = startup_path_config();
@@ -5384,21 +5233,10 @@ pub fn init_importlib_bootstrap(
         let mut err = err;
         let slot = err.pin(&_roots);
         let _stream_codecs = crate::module::sys::vm::init_stream_codecs();
-        let _encodings = crate::module::_codecs::reimport_encodings_if_needed();
         err.reload(&_roots, slot);
         return Err(err);
     }
-    // Both inits run; a stream error is pinned across encodings and wins.
-    match crate::module::sys::vm::init_stream_codecs() {
-        Ok(()) => crate::module::_codecs::reimport_encodings_if_needed(),
-        Err(mut err) => {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin(&_roots);
-            let _encodings = crate::module::_codecs::reimport_encodings_if_needed();
-            err.reload(&_roots, slot);
-            Err(err)
-        }
-    }
+    crate::module::sys::vm::init_stream_codecs()
 }
 
 /// Off-`host_env` builds reach no bootstrap sources, so the native importer is

@@ -9153,9 +9153,6 @@ fn install_build_time_liveness_before_trace(
 /// before its first JIT-traced bytecode still routes through to the
 /// real `WarmState::set_param("trace_limit", 10000)`.
 pub fn init_jit_hooks() {
-    // A previous `finalize_runtime` in this process left `park_if_finalizing`
-    // armed. Boot is a new run: clear that before `ensure_runtime_thread`.
-    pyre_interpreter::module::thread::clear_finalizing();
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).

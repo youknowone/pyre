@@ -257,15 +257,6 @@ pub fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
     (result, errno)
 }
 
-/// A later in-process startup (a second `run_source` after `finalize_runtime`)
-/// is not teardown. `park_if_finalizing` would otherwise stop every thread
-/// except the one that finalized.
-pub fn clear_finalizing() {
-    FINALIZING.store(false, Ordering::Release);
-    FINALIZING_THREAD.store(0, Ordering::Release);
-    majit_ir::eval_breaker_word::clear_finalizing();
-}
-
 pub fn set_finalizing() {
     let ident = current_ident();
     // Free-threaded counterpart of PyPy/CPython's final GIL ownership: publish

@@ -290,15 +290,6 @@ fn clear_shutdown_modules(
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
         }
-        // Immortal MixedModules are `malloc_typed` / Box-owned. Clearing
-        // their dictionaries leaves `posix.getcwd` as `None`, and a later
-        // in-process `run_source` cannot refill it. PyPy `ObjSpace.finish`
-        // walks `space.builtin_modules` values and does not clear them.
-        if !majit_gc::gc_owns_object(module as usize)
-            || crate::importing::is_immortal_builtin_module_object(module)
-        {
-            continue;
-        }
         // _PyWeakref_GET_REF owns the surviving module through _PyModule_Clear.
         // The weak carrier alone must not be its root while a store allocates.
         let module_root = pyre_object::gc_roots::push_roots();
@@ -441,11 +432,8 @@ pub fn finalize_runtime(
     // teardown, so the clearing has to precede the whole walk rather than sit
     // beside `clear_shutdown_modules`.
     finalize_delete_special();
-    // `baseobjspace.py` `ObjSpace.finish` does not collect. A full mark here,
-    // before any name is released, only rewalks objects that are still rooted.
-    // The collection that runs finalizers while module globals are still
-    // readable is the one in `clear_shutdown_modules`.
-    let mut swept_something_finalizable = false;
+    let mut swept_something_finalizable =
+        pyre_object::with_roots!(canonical => collect_and_run_finalizers(ec_ptr));
     let (mut released, mut swept) = (0usize, 0usize);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
     entries.reverse();

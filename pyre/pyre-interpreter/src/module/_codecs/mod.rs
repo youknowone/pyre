@@ -114,40 +114,6 @@ pub(crate) fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
-/// Drop search-path and cache entries left by a previous `finalize_runtime`
-/// in this process. `encodings.search_function` lives on a module dict that
-/// `_PyModule_ClearDict` filled with `None`, and `codec_search_cache` still
-/// holds that module's `encode`. The next `open()` would call it. `CodecState`
-/// is `space.fromcache` state; `_lookup_codec_loop` re-imports encodings
-/// once `codec_need_encodings` is true.
-pub(crate) fn reset_codec_search_for_restart() {
-    let ptr = CODEC_STATE.load(Ordering::Acquire);
-    if ptr.is_null() {
-        return;
-    }
-    with_codec_state(|state| {
-        unsafe {
-            pyre_object::w_list_clear(state.codec_search_path);
-            pyre_object::dictmultiobject::w_dict_clear(state.codec_search_cache);
-        }
-        state.codec_need_encodings = true;
-    });
-}
-
-/// Re-run `_lookup_codec_loop`'s encodings import after
-/// [`reset_codec_search_for_restart`]. Stdio wrappers already hold an encoder,
-/// so `attach_stdio_codec` skips and would otherwise leave the cache empty
-/// until a `__del__` `open()` tries to import with `sys.meta_path` already
-/// `None`.
-pub(crate) fn reimport_encodings_if_needed() -> Result<(), crate::PyError> {
-    with_codec_state(ensure_encodings_imported)?;
-    // `open()` at shutdown looks up UTF-8 after `sys.modules` and
-    // `meta_path` are already gone. `encodings.search_function` imports
-    // `encodings.utf_8` on a cache miss, so prime the cache here.
-    let _ = lookup_codec_name("utf-8")?;
-    Ok(())
-}
-
 // PyPy `interp_codecs.py normalize`.
 /// `interp_codecs.py normalize` is `@jit.elidable`.
 #[majit_macros::elidable]
