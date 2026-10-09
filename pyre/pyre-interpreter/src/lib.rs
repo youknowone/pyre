@@ -1012,19 +1012,21 @@ pub use function::*;
 /// `bits()` call is an Opaque Charon body and does not fold.
 pub use gateway::HOPELESS;
 pub use gateway::{
-    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, MethodOwner, Signature,
-    SignatureBuilder, builtin_code_call, builtin_code_get, builtin_code_get_fast_natural_arity,
-    builtin_code_get_signature, builtin_code_name, builtin_code_new,
-    builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
-    builtin_code_new_with_signature, builtin_code_no_keyword_arguments, is_builtin_code,
-    make_builtin_function, make_builtin_function_as_builtin_with_signature,
-    make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
+    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, BuiltinCodePassThroughFn0,
+    BuiltinCodePassThroughFn1, MethodOwner, Signature, SignatureBuilder, builtin_code_call,
+    builtin_code_get, builtin_code_get_fast_natural_arity, builtin_code_get_signature,
+    builtin_code_name, builtin_code_new, builtin_code_new_passthrough_args1,
+    builtin_code_new_passthrough0, builtin_code_new_passthrough1, builtin_code_new_with_arity,
+    builtin_code_new_with_signature, builtin_code_no_keyword_arguments, builtin_code_passthrough0,
+    builtin_code_passthrough1, is_builtin_code, make_builtin_function,
+    make_builtin_function_as_builtin_with_signature, make_builtin_function_maybe_sig,
+    make_builtin_function_passthrough_args1, make_builtin_function_passthrough1,
     make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
     make_builtin_function_with_doc, make_builtin_function_with_opt_doc,
     make_builtin_function_with_signature, make_method_descriptor_with_arity,
-    make_module_builtin_function, make_module_builtin_function_with_arity,
-    make_module_builtin_function_with_arity_and_maybe_sig, make_module_builtin_function_with_doc,
-    make_slot_wrapper, make_slot_wrapper_with_arity,
+    make_module_builtin_function, make_module_builtin_function_passthrough0,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
+    make_module_builtin_function_with_doc, make_slot_wrapper, make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use loop_headers::*;

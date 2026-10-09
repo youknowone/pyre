@@ -664,6 +664,19 @@ pub const BUILTIN_CODE_GC_TYPE_ID: u32 = 13;
 /// pyre equivalent: returns Result so errors propagate through the call stack.
 pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
+/// `gateway.py BuiltinCodePassThroughArguments0.func__args__(space, args)`.
+///
+/// Kind-(c) builtins receive `Arguments` out of band (`keyword_names_w` /
+/// `keywords_w` parallel lists). Invoked only from residual
+/// `call_with_kwargs` / `funcrun`; the traced wrapper ABI stays
+/// `BuiltinCodeFn`.
+pub type BuiltinCodePassThroughFn0 =
+    fn(&crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError>;
+
+/// `gateway.py BuiltinCodePassThroughArguments1.func__args__(space, w_obj, args)`.
+pub type BuiltinCodePassThroughFn1 =
+    fn(PyObjectRef, &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError>;
+
 /// Cold interp2app arity-error formatter.
 ///
 /// RPython's gateway constructs this exception only on the rejected-call
@@ -879,6 +892,14 @@ pub struct BuiltinCode {
     pub ob: PyObject,
     pub name: &'static str,
     pub func: BuiltinCodeFn,
+    /// `BuiltinCodePassThroughArguments0.func__args__`.  Null for every
+    /// builtin that is not a no-receiver passthrough (`__build_class__`,
+    /// `min`/`max`).  A function pointer is not a GC pointer.
+    pub func_args0: Option<BuiltinCodePassThroughFn0>,
+    /// `BuiltinCodePassThroughArguments1.func__args__`.  Null for every
+    /// builtin that is not a receiver passthrough (`dict.__init__`,
+    /// `str.format`, `type.__new__`).
+    pub func_args1: Option<BuiltinCodePassThroughFn1>,
     pub docstring: Option<&'static str>,
     /// eval.py:16-23 — `fast_natural_arity`. For builtins with fixed
     /// positional arity 0-4, this equals the arity directly. Builtins
@@ -887,10 +908,11 @@ pub struct BuiltinCode {
     /// gateway.py `BuiltinCode.sig` — the argument `Signature`
     /// (named params, `*args`/`**kwargs`, kw-only tail) used to bind
     /// keyword arguments into positional order before the function runs.
-    /// `null` means "no declared signature" (positional-only), which is
-    /// every builtin today.  The pointee is leaked to `'static` so the
-    /// raw pointer carries no Drop obligation and is not a GC pointer,
-    /// matching the `func` function-pointer convention.
+    /// `null` means no declared signature: keywords are either rejected
+    /// (arity 0..=4) or packed as a trailing marker until that builtin
+    /// migrates.  The pointee is leaked to `'static` so the raw pointer
+    /// carries no Drop obligation and is not a GC pointer, matching the
+    /// `func` function-pointer convention.
     pub sig: *const Signature,
     /// The type this code object is a descriptor of, or null for a builtin
     /// with no receiver to check (a module-level function, a `__new__`
@@ -1002,6 +1024,38 @@ pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeF
     )
 }
 
+/// `BuiltinCodePassThroughArguments0`: keyword calls invoke `func_args`
+/// with an `Arguments` object (`gateway.py` `funcrun` → `func__args__`).
+/// Positional calls keep `func` so a no-keyword `dict()` / `min(a, b)`
+/// stays on today's traced slice ABI.
+pub fn builtin_code_new_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    unsafe {
+        (*(code as *mut BuiltinCode)).func_args0 = Some(func_args);
+    }
+    code
+}
+
+/// `BuiltinCodePassThroughArguments1`: keyword calls invoke `func_args`
+/// as `func__args__(space, w_obj, args)`.  `fast_natural_arity` stays
+/// `PASSTHROUGHARGS1` so `funccall` still peels the receiver for a
+/// positional call and hands `func` the flat slice.
+pub fn builtin_code_new_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough_args1(name, func);
+    unsafe {
+        (*(code as *mut BuiltinCode)).func_args1 = Some(func_args);
+    }
+    code
+}
+
 /// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
 /// (null for positional-only builtins); the pointee must outlive the
 /// object — callers leak it to `'static`.
@@ -1031,6 +1085,8 @@ fn builtin_code_new_full(
         },
         name,
         func,
+        func_args0: None,
+        func_args1: None,
         docstring,
         fast_natural_arity,
         sig,
@@ -1683,6 +1739,24 @@ pub unsafe fn builtin_code_get_signature(obj: PyObjectRef) -> Option<&'static Si
     unsafe { (*(obj as *const BuiltinCode)).sig.as_ref() }
 }
 
+/// `BuiltinCodePassThroughArguments0.func__args__`, if this code is one.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_passthrough0(obj: PyObjectRef) -> Option<BuiltinCodePassThroughFn0> {
+    unsafe { (*(obj as *const BuiltinCode)).func_args0 }
+}
+
+/// `BuiltinCodePassThroughArguments1.func__args__`, if this code is one.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_passthrough1(obj: PyObjectRef) -> Option<BuiltinCodePassThroughFn1> {
+    unsafe { (*(obj as *const BuiltinCode)).func_args1 }
+}
+
 /// Get the name of a built-in function.
 ///
 /// # Safety
@@ -2094,6 +2168,26 @@ pub fn make_builtin_function_passthrough_args1(
     func: BuiltinCodeFn,
 ) -> PyObjectRef {
     let code = builtin_code_new_passthrough_args1(name, func);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Module-level `BuiltinCodePassThroughArguments0` (`funcrun` → `func__args__`).
+pub fn make_module_builtin_function_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough0(name, func, func_args);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Method-descriptor `BuiltinCodePassThroughArguments1`.
+pub fn make_builtin_function_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
