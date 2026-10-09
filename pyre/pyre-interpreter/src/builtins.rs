@@ -6916,10 +6916,12 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
 /// `#[inline(never)]` keeps the helper a separate graph so rustc does not
 /// fold it into `type_descr_new`.
 ///
-/// `ensure_module_attr` reads `caller.get_w_globals()`. That method reads
-/// the redirected fields `debugdata` / `pycode`, so residual copies run
-/// `force_virtualizable_if_necessary` (`TOKEN_TRACING_RESCALL` →
-/// `TOKEN_NONE`, then `tracing_after_residual_call` aborts `ABORT_ESCAPE`).
+/// `ensure_module_attr` reads `caller.get_w_globals()`. Residual copies
+/// of that graph keep `force_virtualizable_if_necessary`
+/// (`TOKEN_TRACING_RESCALL` → `TOKEN_NONE`, then
+/// `tracing_after_residual_call` aborts `ABORT_ESCAPE`). Native residual
+/// execution has no rewritten graph, so the arm below calls the helper
+/// before the field read.
 #[inline(never)]
 fn type_create_new_type(
     args: &[PyObjectRef],
@@ -7180,9 +7182,11 @@ fn type_create_new_type(
         // `ensure_module_attr` reaches the caller through
         // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
         // rather than through the `CURRENT_FRAME` thread-local.  The walk
-        // itself only dereferences the vref and follows `f_backref`; the
-        // redirected-field force is on `get_w_globals` (`debugdata` /
-        // `pycode`), matching `hook_access_field` on the consumer.
+        // itself only dereferences the vref and follows `f_backref`. Residual
+        // copies keep `force_virtualizable_if_necessary` on this
+        // `get_w_globals` (`hook_access_field` on `debugdata` / `pycode`);
+        // native residual execution has no rewritten graph, so the helper
+        // runs here.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -7192,6 +7196,7 @@ fn type_create_new_type(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
+                crate::executioncontext::force_virtualizable_if_necessary(frame);
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()
                     && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?

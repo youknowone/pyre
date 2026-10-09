@@ -3892,9 +3892,9 @@ impl PyFrame {
         // `getorcreatedebug`). pyre residualizes STORE_NAME
         // (`bh_store_name_fn` → `get_w_locals` → this read), so a native
         // force would abort every module-level store; pypy does not
-        // (`abort: vable escape: 0` on those loops). Residual non-opcode
-        // readers that pypy also residualizes call
-        // `force_virtualizable_if_necessary` on [`Self::get_w_globals`].
+        // (`abort: vable escape: 0` on those loops). Residual
+        // `typeobject.py ensure_module_attr` keeps the Call in
+        // `type_create_new_type`.
         // Spelled without a closure: a closure aggregate lowers to a
         // synthetic ctor call the walker cannot bind, and upstream's
         // `getdebug` is a plain None-checked field read.
@@ -3999,15 +3999,16 @@ impl PyFrame {
     /// code object in another namespace carries the override in debugdata.
     ///
     /// Both arms read a redirected field (`debugdata` via [`Self::getdebug_data`],
-    /// else `pycode`). `hook_access_field` therefore inserts
-    /// `force_virtualizable_if_necessary` on the residual copies of this
-    /// method (`typeobject.py ensure_module_attr` → `get_w_globals`);
-    /// looked-inside callers (`pyopcode.py LOAD_GLOBAL`) have the Call
-    /// deleted. The force sits here rather than on [`Self::getdebug_data`]
-    /// because pyre residualizes STORE_NAME through that read.
+    /// else `pycode`). `hook_access_field` inserts
+    /// `jit_force_virtualizable` on those reads; `jtransform` deletes the
+    /// Call in looked-inside graphs (`pyopcode.py LOAD_GLOBAL` /
+    /// `MAKE_FUNCTION`). pyre residualizes those opcodes through this
+    /// accessor (`bh_load_global_fn`, residual MAKE_FUNCTION), so a native
+    /// force here would abort loops pypy compiles. The residual graph that
+    /// keeps the Call is `typeobject.py ensure_module_attr` inside
+    /// `type_create_new_type`.
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
-        crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
         if let Some(data) = self.getdebug_data() {
             return data.w_globals;
         }
@@ -7285,11 +7286,12 @@ mod tests {
 
     #[test]
     fn residual_vable_field_reads_clear_tracing_rescall() {
-        // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL:
-        // residual `get_w_globals` stores TOKEN_NONE so
-        // `tracing_after_residual_call` observes the escape. TOKEN_NONE
-        // stays idle. `getdebug` / `getcode` do not force: pyre
-        // residualizes STORE_NAME through them.
+        // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: the
+        // residual helper stores TOKEN_NONE so `tracing_after_residual_call`
+        // observes the escape. TOKEN_NONE stays idle. Accessors used by
+        // residual opcode helpers (`get_w_globals`, `getdebug`, `getcode`)
+        // do not force: pyre residualizes LOAD_GLOBAL / STORE_NAME through
+        // them while `pyopcode.py` looks those opcodes inside.
         let code = crate::compile_exec("x = 1\n").expect("compile");
         let w_code = crate::pycode::box_code_constant(&code);
         let globals = pyre_object::w_dict_new();
@@ -7299,11 +7301,15 @@ mod tests {
         let tracing = majit_metainterp::virtualref::token_tracing_rescall() as usize;
 
         frame.vable_token = tracing;
-        let _ = frame.get_w_globals();
+        crate::executioncontext::force_virtualizable_if_necessary(
+            &mut *frame as *mut super::PyFrame,
+        );
         assert_eq!(frame.vable_token, 0);
 
-        // `getdebug` / `getcode` are the STORE_NAME / looked-inside
-        // opcode path; they must not clear the token.
+        frame.vable_token = tracing;
+        let _ = frame.get_w_globals();
+        assert_eq!(frame.vable_token, tracing);
+
         frame.vable_token = tracing;
         let _ = frame.getdebug();
         assert_eq!(frame.vable_token, tracing);
@@ -7313,7 +7319,9 @@ mod tests {
         assert_eq!(frame.vable_token, tracing);
 
         frame.vable_token = 0;
-        let _ = frame.get_w_globals();
+        crate::executioncontext::force_virtualizable_if_necessary(
+            &mut *frame as *mut super::PyFrame,
+        );
         assert_eq!(frame.vable_token, 0);
     }
 

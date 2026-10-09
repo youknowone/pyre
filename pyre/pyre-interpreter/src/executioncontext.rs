@@ -134,14 +134,15 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `__majit_wrap_descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
 /// `f_backref` and `w_builtin`, so they carry none.
 ///
-/// Residual readers of redirected fields that pypy also residualizes
-/// (`get_w_globals`, via `typeobject.py ensure_module_attr`) call
-/// [`force_virtualizable_if_necessary`]: during tracing that is the
+/// Residual `typeobject.py ensure_module_attr` (inside
+/// `type_create_new_type`) calls [`force_virtualizable_if_necessary`]
+/// before `get_w_globals`: during tracing that is the
 /// `TOKEN_TRACING_RESCALL` → `TOKEN_NONE` escape marker, not a
 /// question of whether the heap slot can disagree with the shadow.
-/// `getdebug` / `getcode` omit it: pyre residualizes STORE_NAME through
-/// those reads while `pyopcode.py STORE_NAME` is looked-inside, so a
-/// native force would abort loops pypy compiles. The `f_code` gateway
+/// `get_w_globals` / `getdebug` / `getcode` omit it: pyre residualizes
+/// LOAD_GLOBAL / STORE_NAME / MAKE_FUNCTION through those reads while
+/// `pyopcode.py` looks those opcodes inside, so a native force on the
+/// accessor would abort loops pypy compiles. The `f_code` gateway
 /// still omits the escape-flush marker; that placement is at its own
 /// definition.
 ///
@@ -183,10 +184,11 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// the codewriter never looks inside, so a direct call and a deleted marker
 /// come to the same thing.
 ///
-/// Residual redirected-field reads use [`force_virtualizable_if_necessary`]
-/// instead: that helper *does* open with the token test, matching the
-/// function `replace_force_virtualizable_with_call` installs, and is the
-/// one `get_w_globals` calls.
+/// Residual redirected-field reads that pypy also residualizes use
+/// [`force_virtualizable_if_necessary`] instead: that helper *does* open
+/// with the token test, matching the function
+/// `replace_force_virtualizable_with_call` installs, and is the one
+/// `type_create_new_type`'s `ensure_module_attr` arm calls.
 ///
 /// # No `vable_token` test here
 ///
@@ -224,8 +226,8 @@ pub fn jit_force_virtualizable(frame: *mut PyFrame) {
 /// rewrites the residual copies into this helper; `jtransform.py
 /// rewrite_op_jit_force_virtualizable` deletes the Call in graphs the
 /// codewriter looks inside. Native residual execution has no rewritten
-/// graph, so [`crate::pyframe::PyFrame::get_w_globals`] — the reader
-/// residual `type_create_new_type` uses — calls this directly.
+/// graph, so `type_create_new_type`'s `ensure_module_attr` arm — the
+/// residual graph that keeps the Call — calls this directly.
 ///
 /// `force_now` on `TOKEN_TRACING_RESCALL` only stores `TOKEN_NONE` — the
 /// values are already correct during tracing, and that store is the escape
