@@ -9940,6 +9940,7 @@ mod tests {
             vtable: 0,
             is_gc_managed: true,
             headerless: false,
+            owner: String::new(),
             all_fielddescrs: Vec::new(),
         };
         let spec =
