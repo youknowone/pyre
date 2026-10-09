@@ -3866,6 +3866,19 @@ pub fn make_new_descr_with_signature(
     crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
 }
 
+/// Positional-only [`make_new_descr_with_signature`].  Keywords are refused
+/// by `parse_obj` (`takes no keyword arguments`) before the body runs.
+fn make_new_descr_posonly(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    argnames: Vec<&'static str>,
+) -> PyObjectRef {
+    let n = argnames.len();
+    make_new_descr_with_signature(
+        func,
+        crate::gateway::Signature::new(argnames, None, None, 0, n),
+    )
+}
+
 /// [`make_new_descr`] optionally carrying a `Signature`: `Some` binds keyword
 /// arguments by name before the constructor runs; `None` (a variadic
 /// whole-args `__new__`) keeps the positional-only carrier.
@@ -5042,12 +5055,6 @@ crate::builtin_wrapper_descriptor!(
 /// Only a positional obj argument is accepted.
 #[majit_macros::dont_look_inside]
 fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "bool() takes no keyword arguments",
-        ));
-    }
     // args[0] = w_booltype (cls)
     let w_booltype = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(w_bool) = gettypefor(&pyre_object::BOOL_TYPE) {
@@ -5620,10 +5627,15 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "filter() takes no keyword arguments",
         ));
     }
-    if args_w.len() != 2 {
+    let first = args_w.first().copied().filter(|w| !w.is_null());
+    let second = args_w.get(1).copied().filter(|w| !w.is_null());
+    let extra = args_w
+        .get(2..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let given = usize::from(first.is_some()) + usize::from(second.is_some()) + extra;
+    if first.is_none() || second.is_none() || extra > 0 {
         return Err(crate::PyError::type_error(format!(
-            "filter expected 2 arguments, got {}",
-            args_w.len()
+            "filter expected 2 arguments, got {given}"
         )));
     }
     let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
@@ -5771,7 +5783,7 @@ fn init_super_type(ns: PyObjectRef) {
             ),
         )
     };
-    let new_descr = make_new_descr(super_descr_new);
+    let new_descr = make_new_descr_posonly(super_descr_new, vec!["cls", "type", "obj"]);
     unsafe {
         crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
@@ -6096,6 +6108,17 @@ fn make_functional_new_descr(
     descr
 }
 
+fn make_functional_new_descr_posonly(
+    function: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    argnames: Vec<&'static str>,
+) -> PyObjectRef {
+    let descr = make_new_descr_posonly(function, argnames);
+    unsafe {
+        crate::function::fset_func_text_signature(descr, w_str_new("($type, *args, **kwargs)"))
+    };
+    descr
+}
+
 fn make_functional_method(name: &'static str, function: DunderFn, arity: u16) -> PyObjectRef {
     let text_signature = if arity == 1 {
         "($self, /)"
@@ -6164,7 +6187,11 @@ fn init_reversed_type(ns: PyObjectRef) {
         "__doc__",
         w_str_new("Return a reverse iterator over the values of the given sequence."),
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(reversed_descr_new));
+    install_functional_entry(
+        ns,
+        "__new__",
+        make_functional_new_descr_posonly(reversed_descr_new, vec!["cls", "sequence"]),
+    );
     for (name, function, arity) in [
         (
             "__iter__",
@@ -6221,7 +6248,11 @@ fn init_filter_type(ns: PyObjectRef) {
             "filter(function or None, iterable) --> filter object\n\nReturn an iterator yielding those items of iterable for which function(item)\nis true. If function is None, return the items that are true.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(filter_descr_new));
+    install_functional_entry(
+        ns,
+        "__new__",
+        make_functional_new_descr_posonly(filter_descr_new, vec!["cls", "function", "iterable"]),
+    );
     for (name, function) in [
         (
             "__iter__",
@@ -18629,12 +18660,7 @@ pub(crate) unsafe fn member_descriptor_repr(member: PyObjectRef) -> String {
 /// CPython 3.14 `cell_new`, matching PyPy `descr_new_cell` except that the
 /// 3.14 positional-only argument surface rejects keywords.
 fn cell_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "cell() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     let cls = positional.first().copied().unwrap_or(PY_NULL);
     let cell_type =
         gettypefor(&pyre_object::nestedscope::CELL_TYPE).map_or(PY_NULL, |p| p.as_ptr());
@@ -18766,10 +18792,7 @@ fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 /// the version oracle where it differs: its public cell type deliberately
 /// omits PyPy 3.11's `__reduce__` and `__setstate__` pickle hooks.
 fn init_cell_type(ns: PyObjectRef) {
-    let new_descr = make_new_descr_with_doc(
-        cell_descr_new,
-        "Create and return a new object.  See help(type) for accurate signature.",
-    );
+    let new_descr = make_new_descr_posonly(cell_descr_new, vec!["cls", "contents"]);
     let entries = [
         (
             "__doc__",
@@ -18996,20 +19019,19 @@ fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
 /// `functools_wraps` copies the four presentation attributes while
 /// `__annotations__` and `__annotate__` remain lazy proxy descriptors.
 fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "staticmethod() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
-    let supplied = positional.len().saturating_sub(1);
+    let function = positional.get(1).copied().filter(|w| !w.is_null());
+    let extra = positional
+        .get(2..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let supplied = usize::from(function.is_some()) + extra;
     if supplied != 1 {
         return Err(crate::PyError::type_error(format!(
             "staticmethod expected 1 argument, got {supplied}"
         )));
     }
-    let function = positional[1];
+    let function = function.unwrap();
     unsafe { pyre_object::function::w_staticmethod_set_func(sm, function) };
     // The instance dict moves, the lookup runs Python once per name, and the
     // key string is allocated after the value arrives — so the dict, the
@@ -19237,7 +19259,11 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         ("__new__", make_new_descr(staticmethod_descr_new)),
         (
             "__init__",
-            make_builtin_function("__init__", staticmethod_descr_init),
+            crate::gateway::make_builtin_function_with_signature(
+                "__init__",
+                staticmethod_descr_init,
+                crate::gateway::Signature::new(vec!["self", "function"], None, None, 0, 2),
+            ),
         ),
         ("__call__", make_builtin_function("__call__", descr_call)),
         (
@@ -19344,24 +19370,23 @@ fn instancemethod_type_name(obj: PyObjectRef) -> String {
 /// `classobject.py InstanceMethod.descr_new`. The type is not a base class, so
 /// the requested subtype is ignored. A non-callable is `TypeError`.
 fn instancemethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "instancemethod() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.is_empty() {
         return Err(crate::PyError::type_error(
             "instancemethod.__new__(): not enough arguments",
         ));
     }
-    let supplied = positional.len().saturating_sub(1);
+    let function = positional.get(1).copied().filter(|w| !w.is_null());
+    let extra = positional
+        .get(2..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let supplied = usize::from(function.is_some()) + extra;
     if supplied != 1 {
         return Err(crate::PyError::type_error(format!(
             "instancemethod expected 1 argument, got {supplied}"
         )));
     }
-    let function = positional[1];
+    let function = function.unwrap();
     if !crate::baseobjspace::callable_w(function) {
         return Err(crate::PyError::type_error(format!(
             "instancemethod expected a callable, got {}",
@@ -19374,12 +19399,7 @@ fn instancemethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
 /// `classobject.py InstanceMethod.descr_get`: `None` yields the function,
 /// an instance yields `Method(function, obj)`.
 fn instancemethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "instancemethod.__get__() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     let im = instancemethod_require(positional.first().copied().unwrap_or(PY_NULL), "__get__")?;
     let obj = positional.get(1).copied().unwrap_or(PY_NULL);
     let function = unsafe { pyre_object::instancemethod::w_instancemethod_get_func(im) };
@@ -19456,14 +19476,21 @@ fn init_instancemethod_type(ns: PyObjectRef) {
         make_builtin_function_with_arity("__module__", instancemethod_module_get, 2);
     let doc_getter = make_builtin_function_with_arity("__doc__", instancemethod_doc_get, 2);
     let entries = [
-        ("__new__", make_new_descr(instancemethod_descr_new)),
+        (
+            "__new__",
+            make_new_descr_posonly(instancemethod_descr_new, vec!["cls", "function"]),
+        ),
         (
             "__call__",
             make_builtin_function("__call__", instancemethod_descr_call),
         ),
         (
             "__get__",
-            make_builtin_function("__get__", instancemethod_descr_get),
+            crate::gateway::make_builtin_function_with_signature(
+                "__get__",
+                instancemethod_descr_get,
+                crate::gateway::Signature::new(vec!["self", "obj", "owner"], None, None, 0, 3),
+            ),
         ),
         (
             "__repr__",
@@ -19550,20 +19577,19 @@ fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
 /// `functools_wraps`: copy the four eager presentation attributes while the
 /// two annotation attributes remain lazy proxy descriptors.
 fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "classmethod() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     let cm = classmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
-    let supplied = positional.len().saturating_sub(1);
+    let function = positional.get(1).copied().filter(|w| !w.is_null());
+    let extra = positional
+        .get(2..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let supplied = usize::from(function.is_some()) + extra;
     if supplied != 1 {
         return Err(crate::PyError::type_error(format!(
             "classmethod expected 1 argument, got {supplied}"
         )));
     }
-    let function = positional[1];
+    let function = function.unwrap();
     unsafe { pyre_object::function::w_classmethod_set_func(cm, function) };
     // The `staticmethod.__init__` bracket, for the same reasons.
     let roots = pyre_object::gc_roots::push_roots();
@@ -19763,7 +19789,11 @@ fn init_classmethod_type(ns: PyObjectRef) {
         ("__new__", make_new_descr(classmethod_descr_new)),
         (
             "__init__",
-            make_builtin_function("__init__", classmethod_descr_init),
+            crate::gateway::make_builtin_function_with_signature(
+                "__init__",
+                classmethod_descr_init,
+                crate::gateway::Signature::new(vec!["self", "function"], None, None, 0, 2),
+            ),
         ),
         (
             "__func__",
@@ -22830,7 +22860,7 @@ fn init_bool_type(ns: PyObjectRef) {
             ),
         )
     };
-    let new_descr = make_new_descr(__majit_wrap_bool_descr_new);
+    let new_descr = make_new_descr_posonly(__majit_wrap_bool_descr_new, vec!["cls", "x"]);
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     unsafe {
         crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
@@ -33236,36 +33266,25 @@ fn init_repeat_type(ns: PyObjectRef) {
 
 fn itertools_twoarg_new(
     args: &[PyObjectRef],
-    exact_type: PyObjectRef,
+    _exact_type: PyObjectRef,
     name: &str,
 ) -> Result<(PyObjectRef, PyObjectRef, PyObjectRef), crate::PyError> {
     // interp_itertools.py W_Twoarg__new__, kept in source order.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let cls = positional.first().copied().unwrap_or(PY_NULL);
-    let args_w = positional.get(1..).unwrap_or(&[]);
-    let init_matches = std::ptr::eq(cls, exact_type)
-        || unsafe {
-            match (
-                crate::baseobjspace::lookup_in_type(cls, "__init__"),
-                crate::baseobjspace::lookup_in_type(exact_type, "__init__"),
-            ) {
-                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
-                (None, None) => true,
-                _ => false,
-            }
-        };
-    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+    // Bound scope from parse_obj: `cls`, `predicate`/`function`, `iterable`
+    // (`PY_NULL` omitted). Keywords are refused by the pos-only Signature.
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let first = args.get(1).copied().filter(|w| !w.is_null());
+    let second = args.get(2).copied().filter(|w| !w.is_null());
+    let extra = args
+        .get(3..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let given = usize::from(first.is_some()) + usize::from(second.is_some()) + extra;
+    let (Some(first), Some(second), 0) = (first, second, extra) else {
         return Err(crate::PyError::type_error(format!(
-            "{name}() takes no keyword arguments"
+            "{name} expected 2 arguments, got {given}"
         )));
-    }
-    if args_w.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "{name} expected 2 arguments, got {}",
-            args_w.len()
-        )));
-    }
-    Ok((cls, args_w[0], args_w[1]))
+    };
+    Ok((cls, first, second))
 }
 
 fn takewhile_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -33532,7 +33551,10 @@ fn init_takewhile_type(ns: PyObjectRef) {
     // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
     // entries between __next__ and __doc__).
     let entries = [
-        ("__new__", make_new_descr(takewhile_descr_new)),
+        (
+            "__new__",
+            make_new_descr_posonly(takewhile_descr_new, vec!["cls", "predicate", "iterable"]),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -33556,7 +33578,10 @@ fn init_takewhile_type(ns: PyObjectRef) {
 fn init_dropwhile_type(ns: PyObjectRef) {
     // W_DropWhile.typedef, in source order.
     let entries = [
-        ("__new__", make_new_descr(dropwhile_descr_new)),
+        (
+            "__new__",
+            make_new_descr_posonly(dropwhile_descr_new, vec!["cls", "predicate", "iterable"]),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -33580,7 +33605,10 @@ fn init_dropwhile_type(ns: PyObjectRef) {
 fn init_filterfalse_type(ns: PyObjectRef) {
     // W_FilterFalse.typedef, in source order.
     let entries = [
-        ("__new__", make_new_descr(filterfalse_descr_new)),
+        (
+            "__new__",
+            make_new_descr_posonly(filterfalse_descr_new, vec!["cls", "function", "iterable"]),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -34598,21 +34626,21 @@ fn init_tee_iterable_type(ns: PyObjectRef) {
 }
 
 pub(crate) fn itertools_tee(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "tee() takes no keyword arguments",
-        ));
-    }
-    if positional.is_empty() || positional.len() > 2 {
+    let iterable = args.first().copied().filter(|w| !w.is_null());
+    let n_arg = args.get(1).copied().filter(|w| !w.is_null());
+    let extra = args
+        .get(2..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let given = usize::from(iterable.is_some()) + usize::from(n_arg.is_some()) + extra;
+    if iterable.is_none() || extra > 0 || given > 2 {
         return Err(crate::PyError::type_error(format!(
-            "tee expected at most 2 arguments, got {}",
-            positional.len()
+            "tee expected at most 2 arguments, got {given}"
         )));
     }
+    let positional: [PyObjectRef; 2] = [iterable.unwrap(), n_arg.unwrap_or(PY_NULL)];
     let _roots = pyre_object::gc_roots::push_roots();
-    let source_slot = pyre_object::gc_roots::pin_roots(positional);
-    let n = if positional.len() == 2 {
+    let source_slot = pyre_object::gc_roots::pin_roots(&positional);
+    let n = if n_arg.is_some() {
         crate::builtins::space_index_w(unsafe {
             pyre_object::gc_roots::shadow_stack_get(source_slot + 1)
         })?
@@ -34709,7 +34737,10 @@ fn init_compress_type(ns: PyObjectRef) {
 fn init_starmap_type(ns: PyObjectRef) {
     // interp_itertools.py W_StarMap.typedef, with Python 3.14's public doc.
     let entries = [
-        ("__new__", make_new_descr(starmap_descr_new)),
+        (
+            "__new__",
+            make_new_descr_posonly(starmap_descr_new, vec!["cls", "function", "iterable"]),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", starmap_iter_self, 1),
@@ -34948,21 +34979,21 @@ fn chain_from_iterable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // chain_from_iterable(space, w_cls, w_arg): classmethod binding supplies
     // the requested class as args[0], and this alternate constructor does not
     // invoke the subtype's __init__.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "chain.from_iterable() takes no keyword arguments",
-        ));
-    }
-    let given = positional.len().saturating_sub(1);
+    let positional = args;
+    let iterable = positional.get(1).copied().filter(|w| !w.is_null());
+    let extra = positional
+        .get(2..)
+        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
+    let given = usize::from(iterable.is_some()) + extra;
     if given != 1 {
         return Err(crate::PyError::type_error(format!(
             "chain.from_iterable() takes exactly one argument ({given} given)"
         )));
     }
     let cls = positional[0];
+    let positional_1 = iterable.unwrap();
     let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls, positional[1]]);
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls, positional_1]);
     let iterable_slot = cls_slot + 1;
     let w_iterables = crate::baseobjspace::iter(unsafe {
         pyre_object::gc_roots::shadow_stack_get(iterable_slot)
@@ -34998,10 +35029,13 @@ fn init_chain_type(ns: PyObjectRef) {
         ),
         (
             "from_iterable",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "from_iterable",
-                chain_from_iterable,
-            )),
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_signature(
+                    "from_iterable",
+                    chain_from_iterable,
+                    crate::gateway::Signature::new(vec!["cls", "iterable"], None, None, 0, 2),
+                ),
+            ),
         ),
         (
             "__class_getitem__",

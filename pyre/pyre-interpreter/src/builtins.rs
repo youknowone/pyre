@@ -3444,7 +3444,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function_with_arity("hasattr", builtin_hasattr, 2)
     });
     crate::module_ns_get_or_insert_with(ns, "getattr", || {
-        make_module_builtin_function("getattr", builtin_getattr)
+        // operation.py `getattr(space, w_obj, w_name, w_default)` — three
+        // positional-only slots; `w_default` omitted is `PY_NULL`.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "getattr",
+            builtin_getattr,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["object", "name", "default"], None, None, 0, 3),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "setattr", || {
         make_module_builtin_function_with_arity("setattr", builtin_setattr, 3)
@@ -3491,20 +3498,40 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function("sorted", crate::app_functional::__majit_wrap_builtin_sorted)
     });
     crate::module_ns_get_or_insert_with(ns, "iter", || {
-        make_module_builtin_function("iter", __majit_wrap_builtin_iter)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "iter",
+            __majit_wrap_builtin_iter,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["object", "sentinel"], None, None, 0, 2),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "next", || {
-        make_module_builtin_function("next", builtin_next)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "next",
+            builtin_next,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["iterator", "default"], None, None, 0, 2),
+        )
     });
     // aiter/anext resolve their app-level implementations lazily; the
     // builtins dict is filled before an execution context exists.  Arity is
     // enforced by the app-level `def aiter(obj)` / `def anext(iterator,
     // default=...)` signatures, so no interp-level arity is imposed here.
     crate::module_ns_get_or_insert_with(ns, "aiter", || {
-        make_module_builtin_function("aiter", crate::async_operation::builtin_aiter)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "aiter",
+            crate::async_operation::builtin_aiter,
+            1,
+            crate::gateway::Signature::new(vec!["async_iterable"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "anext", || {
-        make_module_builtin_function("anext", crate::async_operation::builtin_anext)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "anext",
+            crate::async_operation::builtin_anext,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["aiterator", "default"], None, None, 0, 2),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "breakpoint", || {
         make_module_builtin_function("breakpoint", builtin_breakpoint)
@@ -3513,10 +3540,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
     crate::module_ns_get_or_insert_with(ns, "vars", || {
-        make_module_builtin_function("vars", builtin_vars)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "vars",
+            builtin_vars,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "dir", || {
-        make_module_builtin_function("dir", builtin_dir)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "dir",
+            builtin_dir,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "__build_class__", || {
         make_module_builtin_function("__build_class__", builtin_build_class)
@@ -3577,7 +3614,12 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         crate::typedef::gettypeobject(&pyre_object::functional::FILTER_TYPE)
     });
     crate::module_ns_get_or_insert_with(ns, "input", || {
-        make_module_builtin_function("input", builtin_input)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "input",
+            builtin_input,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["prompt"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "open", || {
         make_module_builtin_function("open", builtin_open)
@@ -4168,10 +4210,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     ));
     crate::module_ns_store(ns, "PythonFinalizationError", exc_type);
     crate::module_ns_get_or_insert_with(ns, "any", || {
-        make_module_builtin_function_with_arity("any", builtin_any, 1)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "any",
+            builtin_any,
+            1,
+            crate::gateway::Signature::new(vec!["iterable"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "all", || {
-        make_module_builtin_function_with_arity("all", builtin_all, 1)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "all",
+            builtin_all,
+            1,
+            crate::gateway::Signature::new(vec!["iterable"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "sum", || {
         // `sum(iterable, /, start=0)` — interp body, Signature bind.
@@ -4214,16 +4266,36 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "hex", || {
-        make_module_builtin_function("hex", builtin_hex)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "hex",
+            builtin_hex,
+            1,
+            crate::gateway::Signature::new(vec!["number"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "oct", || {
-        make_module_builtin_function("oct", builtin_oct)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "oct",
+            builtin_oct,
+            1,
+            crate::gateway::Signature::new(vec!["number"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "bin", || {
-        make_module_builtin_function("bin", builtin_bin)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "bin",
+            builtin_bin,
+            1,
+            crate::gateway::Signature::new(vec!["number"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "format", || {
-        make_module_builtin_function("format", builtin_format)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "format",
+            builtin_format,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["value", "format_spec"], None, None, 0, 2),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "issubclass", || {
         make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
@@ -4482,20 +4554,8 @@ fn input_write_prompt(stdout: PyObjectRef, prompt: PyObjectRef) -> Result<(), cr
 /// flush stderr, write and flush the prompt, call `stdin.readline()`, then
 /// strip one trailing newline.
 fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "input() takes no keyword arguments",
-        ));
-    }
-    if pos.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "input expected at most 1 argument, got {}",
-            pos.len()
-        )));
-    }
-
-    let prompt_arg = pos.first().copied();
+    // Bound scope from `parse_obj`: `prompt` (`PY_NULL` omitted).
+    let prompt_arg = args.first().copied().filter(|w| !w.is_null());
     let prompt = prompt_arg.unwrap_or_else(|| pyre_object::w_str_new(""));
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -13487,23 +13547,17 @@ fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `getattr(obj, name[, default])` → value — direct call
 fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "getattr() takes no keyword arguments",
-        ));
-    }
-    // `getattr(object, name[, default])`: two or three app-level arguments.
-    if args.len() < 2 {
+    // Bound scope from `parse_obj`: `object`, `name`, `default` (`PY_NULL`
+    // omitted). Positional-only.
+    let given = args.iter().take(3).filter(|w| !w.is_null()).count() + args.len().saturating_sub(3);
+    if args.len() < 2 || args[0].is_null() || args[1].is_null() {
         return Err(crate::PyError::type_error(format!(
-            "getattr expected at least 2 arguments, got {}",
-            args.len()
+            "getattr expected at least 2 arguments, got {given}"
         )));
     }
     if args.len() > 3 {
         return Err(crate::PyError::type_error(format!(
-            "getattr expected at most 3 arguments, got {}",
-            args.len()
+            "getattr expected at most 3 arguments, got {given}"
         )));
     }
     let obj = args[0];
@@ -13512,7 +13566,7 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // was supplied AND the error is an AttributeError; other errors (and the
     // no-default case) propagate.  With a default the error never surfaces,
     // so that arm runs suppressed (`_PyObject_LookupAttr`).
-    if args.len() > 2 {
+    if args.len() > 2 && !args[2].is_null() {
         // `args` is a native slice the gateway copied out of its own root
         // slots: the pin keeps the default alive, but nothing rewrites this
         // copy, and `lookup_attr` runs Python (`__getattr__`,
@@ -13577,15 +13631,9 @@ fn builtin_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `tuple.__new__` is positional-only, so any keyword is a TypeError
-    // (an empty `**{}` is not a keyword and is allowed).
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "tuple() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // `tuple.__new__` is positional-only; keywords are refused at the
+    // Signature bind. An empty iterable yields `()`.
+    if args.is_empty() || args[0].is_null() {
         return Ok(w_tuple_new(vec![]));
     }
     let obj = args[0];
@@ -13625,15 +13673,9 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 pub fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `list.__new__` is positional-only, so any keyword is a TypeError
-    // (an empty `**{}` is not a keyword and is allowed).
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "list() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // `list.__new__` is positional-only; keywords are refused at the
+    // Signature bind. An empty iterable yields `[]`.
+    if args.is_empty() || args[0].is_null() {
         return Ok(w_list_new(vec![]));
     }
     // CPython `list_vectorcall_impl` allocates an empty list then delegates to
@@ -14259,44 +14301,27 @@ static __majit_wrap_iter_self_target: crate::gateway::BuiltinWrapperDescriptor =
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
 fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `iter` is a keyword-rejecting builtin; a `sentinel` is only ever
-    // positional (`iter(callable, sentinel)`).  Strip the kwargs marker so a
-    // keyword call raises instead of consuming the marker dict as an argument.
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "iter() takes no keyword arguments",
-        ));
-    }
-    match positional.len() {
-        0 => Err(crate::PyError::type_error(
+    // Bound scope from `parse_obj`: `object`, `sentinel` (`PY_NULL` omitted).
+    let object = args.first().copied().filter(|w| !w.is_null());
+    let sentinel = args.get(1).copied().filter(|w| !w.is_null());
+    match (object, sentinel) {
+        (None, _) => Err(crate::PyError::type_error(
             "iter expected at least 1 argument, got 0",
         )),
-        1 => crate::baseobjspace::iter(positional[0]),
-        2 => {
-            if !crate::baseobjspace::callable_w(positional[0]) {
+        (Some(obj), None) => crate::baseobjspace::iter(obj),
+        (Some(obj), Some(sent)) => {
+            if !crate::baseobjspace::callable_w(obj) {
                 return Err(crate::PyError::type_error("iter(v, w): v must be callable"));
             }
-            Ok(pyre_object::operation::w_callable_iterator_new(
-                positional[0],
-                positional[1],
-            ))
+            Ok(pyre_object::operation::w_callable_iterator_new(obj, sent))
         }
-        n => Err(crate::PyError::type_error(format!(
-            "iter expected at most 2 arguments, got {n}"
-        ))),
     }
 }
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next
 fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "next() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // Bound scope from `parse_obj`: `iterator`, `default` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
             "next expected at least 1 argument, got 0",
         ));
@@ -14307,7 +14332,7 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    if args.len() > 1 {
+    if args.len() > 1 && !args[1].is_null() {
         // The iterator body runs Python between the gateway's pin and this
         // return, and `args` is a native copy nothing rewrites when a list or
         // dict default is moved -- see `builtin_getattr`.  Keep the
@@ -18933,19 +18958,14 @@ crate::builtin_wrapper_descriptor!(
 );
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "vars() takes no keyword arguments",
-        ));
+    // Bound scope from `parse_obj`: `object` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
+        return builtin_locals(&[]);
     }
-    if args.is_empty() {
-        return builtin_locals(args);
-    }
-    if args.len() != 1 {
+    if args.len() > 1 && args[1..].iter().any(|w| !w.is_null()) {
         return Err(crate::PyError::type_error(format!(
             "vars expected at most 1 argument, got {}",
-            args.len()
+            args.iter().filter(|w| !w.is_null()).count()
         )));
     }
     // app_inspect.py:21-24 — the attribute lookup itself decides whether the
@@ -19170,13 +19190,8 @@ pub extern "C" fn jit_dir_names_from_locals(mapping: PyObjectRef) -> PyObjectRef
 /// With argument: sorted list of attribute names from obj.__dict__ plus
 /// type MRO. Modules expose their namespace via w_module_get_namespace.
 pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "dir() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // Bound scope from `parse_obj`: `object` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
         // frame exactly as `locals()` does, then return the mapping's sorted
@@ -19194,10 +19209,10 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         return dir_names_from_locals_mapping(w_locals_dict);
     }
-    if args.len() > 1 {
+    if args.len() > 1 && args[1..].iter().any(|w| !w.is_null()) {
         return Err(crate::PyError::type_error(format!(
             "dir expected at most 1 argument, got {}",
-            args.len()
+            args.iter().filter(|w| !w.is_null()).count()
         )));
     }
     let obj = args[0];
@@ -20524,16 +20539,10 @@ pub(crate) fn builtin_filter(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "filter() takes no keyword arguments",
-        ));
-    }
-    if args.len() != 2 {
+    let given = args.iter().filter(|w| !w.is_null()).count();
+    if given != 2 || args.len() < 2 || args[0].is_null() || args[1].is_null() {
         return Err(crate::PyError::type_error(format!(
-            "filter expected 2 arguments, got {}",
-            args.len()
+            "filter expected 2 arguments, got {given}"
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -20796,16 +20805,10 @@ pub(crate) fn builtin_reversed(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "reversed() takes no keyword arguments",
-        ));
-    }
-    if args.len() != 1 {
+    let given = args.iter().filter(|w| !w.is_null()).count();
+    if given != 1 || args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(format!(
-            "reversed expected 1 argument, got {}",
-            args.len()
+            "reversed expected 1 argument, got {given}"
         )));
     }
     // `descr___new__2` can execute `__reversed__`, `__len__`, or allocate an
@@ -21395,12 +21398,7 @@ pub fn builtin_any_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_any(args)
 }
 fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "any() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "any() takes exactly one argument ({} given)",
@@ -25076,12 +25074,7 @@ pub fn builtin_all_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     builtin_all(args)
 }
 fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "all() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     if positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "all() takes exactly one argument ({} given)",
@@ -25912,12 +25905,6 @@ pub(crate) fn format_index_radix(
 
 /// `hex(x)` — PyPy: operation.py hex
 fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "hex() takes no keyword arguments",
-        ));
-    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "hex() takes exactly one argument ({} given)",
@@ -25930,12 +25917,6 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `oct(x)` — PyPy: operation.py oct
 fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "oct() takes no keyword arguments",
-        ));
-    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "oct() takes exactly one argument ({} given)",
@@ -25948,12 +25929,6 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `bin(x)` — PyPy: operation.py bin
 fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "bin() takes no keyword arguments",
-        ));
-    }
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "bin() takes exactly one argument ({} given)",
@@ -26453,22 +26428,11 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 
 /// `format(value, format_spec='')` — operation.py format → space.format
 fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "format() takes no keyword arguments",
-        ));
-    }
-    if args.is_empty() {
+    // Bound scope from `parse_obj`: `value`, `format_spec` (`PY_NULL` omitted).
+    if args.is_empty() || args[0].is_null() {
         return Err(crate::PyError::type_error(
             "format expected at least 1 argument, got 0",
         ));
-    }
-    if args.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "format expected at most 2 arguments, got {}",
-            args.len()
-        )));
     }
     let value = args[0];
     // `builtin_format_impl`: the `format_spec` must be a `str` — validated
@@ -26478,7 +26442,7 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // applies it — dispatching a `__format__` override (including a builtin
     // subclass's) or, for a plain builtin, the shared spec parser; the same
     // path f-string `{v:spec}` and `"{:spec}".format(v)` use.
-    let spec = if args.len() > 1 {
+    let spec = if args.len() > 1 && !args[1].is_null() {
         crate::type_methods::check_format_spec(args[1], "format() argument 2")?
     } else {
         pyre_object::PY_NULL

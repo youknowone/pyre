@@ -6103,7 +6103,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)
 pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removeprefix() takes exactly one argument ({} given)",
@@ -6131,7 +6131,7 @@ pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_removesuffix (Python 3.9+)
 pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removesuffix() takes exactly one argument ({} given)",
