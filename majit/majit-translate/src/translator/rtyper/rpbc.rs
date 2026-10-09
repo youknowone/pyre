@@ -1667,7 +1667,6 @@ impl FunctionRepr {
     /// `op` is upstream's SpaceOperation identity key; the Rust port
     /// threads it as `Option<PositionKey>` to match
     /// [`FunctionDesc::get_graph`](crate::annotator::description::FunctionDesc::get_graph).
-    #[allow(dead_code)]
     pub(crate) fn get_concrete_llfn(
         &self,
         s_pbc: &SomePBC,

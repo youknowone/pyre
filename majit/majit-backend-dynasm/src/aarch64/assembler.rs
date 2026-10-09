@@ -7595,50 +7595,53 @@ impl<'a> AssemblerARM64<'a> {
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
     ///
-    /// Every operand comes from its regalloc location, not `resolve_opref`,
-    /// which only recognises constants and frame slots.  `before_call` spills
-    /// only `CALLER_RESP` (x0..x13), so a value bound to x19/x20 stays
-    /// register-resident across it and has no slot mapping at all.
-    ///
-    /// The predicate is loaded into x0 rather than the ip0 scratch because on
-    /// the not-taken path the predicate IS the result, and
-    /// `store_rax_to_result` reads it from there.  x0 is caller-saved, so
-    /// `before_call` guarantees it is not itself one of the arglocs.
+    /// aarch64/opassembler.py `_emit_op_cond_call` / `emit_op_cond_call_value_i`
+    /// (`_r` is the same). Arglocs are `[argloc, resloc]` from
+    /// `_prepare_op_cond_call`; extra args already sit in `argument_regs`.
+    /// `CMP argloc, 0` then `B.NE` over the slow path; on miss the helper
+    /// returns a plain word that is moved into `res_loc`. No `ref_result`
+    /// Option rewrite and no `store_rax_to_result`.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
-        self.emit_load_to_rax(arglocs[0]);
+        let (argloc, resloc) = match arglocs {
+            [argloc, resloc, ..] => (*argloc, *resloc),
+            other => panic!(
+                "COND_CALL_VALUE arglocs are [argloc, resloc] (aarch64/regalloc.py _prepare_op_cond_call), got {other:?}"
+            ),
+        };
         let skip_label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
+        // Test in ip0 so a miss-path extra arg already in x0 is not clobbered.
+        self.emit_load_loc_to_ip0(argloc);
+        dynasm!(self.mc ; .arch aarch64 ; cbnz x16, =>skip_label);
 
-        // aarch64/opassembler.py `_emit_op_cond_call` for COND_CALL_VALUE:
-        // same slowpath as COND_CALL — push_gcmap, cond_call_slowpath
-        // (`_reload_frame_if_necessary`), pop_gcmap. x0 holds the call
-        // result; `_pop_all_regs_from_jitframe` skips it so the return
-        // survives the restore.
         self.push_all_regs_to_jitframe(&[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
-        let arg_classes = op
-            .getdescr()
-            .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
-            .unwrap_or_default();
-        let ref_result = op.opcode.result_type() == Type::Ref;
-        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes, ref_result);
-        // Result `'S'` returns in s0. Copy it before the float restore
-        // overwrites s0. `fmov w0, s0` zeroes the top of x0.
-        if op.getdescr().is_some_and(|descr| {
-            descr
-                .as_call_descr()
-                .is_some_and(|cd| cd.result_class() == 'S')
-        }) {
-            dynasm!(self.mc ; .arch aarch64 ; fmov w0, s0);
-        }
+        self.emit_cond_call_value_helper(op);
+        // `_build_cond_call_slowpath`: `_reload_frame_if_necessary` does not
+        // touch x0; stash the helper word to ip1 (reload uses ip0) so the
+        // restore can put every managed register back, then `MOV res_loc, ip1`.
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        self.pop_all_regs_from_jitframe(&[crate::aarch64::registers::X0], true);
+        dynasm!(self.mc ; .arch aarch64 ; mov x17, x0);
+        self.pop_all_regs_from_jitframe(&[], true);
+        self.regalloc_mov(&Loc::Reg(crate::aarch64::registers::IP1), &resloc);
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
+    }
 
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
+    /// Inline `cond_call_slowpath` body: extra args already in
+    /// `argument_regs`, func is `op.getarg(1)` Const, `BLR ip1`.
+    fn emit_cond_call_value_helper(&mut self, op: &Op) {
+        let func = match self.resolve_opref(op.arg(1).to_opref()) {
+            ResolvedArg::Const(val) => val,
+            ResolvedArg::Slot(_) => {
+                panic!("COND_CALL_VALUE func is Const (aarch64/regalloc.py _prepare_op_cond_call)")
+            }
+        };
+        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
+        self.emit_mov_imm64(17, func);
+        dynasm!(self.mc ; .arch aarch64
+            ; blr x17
+            ; ldp x29, x30, [sp], #16
+        );
     }
 
     // genop_* — string/array operations

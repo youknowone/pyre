@@ -9782,49 +9782,54 @@ impl<'a> Assembler386<'a> {
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
     ///
-    /// Every operand comes from its regalloc location.  `before_call` only
-    /// spills the registers in `SAVE_AROUND_CALL_CORE_REGS`; a value bound to
-    /// one of the callee-saved members of `ALL_CORE_REGS` (ebx/r12..r15, plus
-    /// esi/edi on Win64) stays register-resident across it, and such a value
-    /// has no `opref_to_slot` entry — `resolve_opref` would panic on it, or
-    /// read whatever unrelated slot the lifetime's `current_frame_loc` names.
-    ///
-    /// The predicate is loaded into rax rather than the scratch because on
-    /// the not-taken path the predicate IS the result, and
-    /// `store_rax_to_result` reads it from there.  rax is caller-saved, so
-    /// `before_call` guarantees it is not itself one of the arglocs.
+    /// x86/regalloc.py `consider_cond_call` / `consider_cond_call_value_i`
+    /// (`_r` is the same) and assembler.py `cond_call` / `CondCallSlowPath`.
+    /// Arglocs are `[argloc, resloc]`; extra args already sit in
+    /// `cond_call_register_arguments`. Test `argloc`, skip when nonzero; on
+    /// miss the helper returns a plain word moved into `resloc`. No Option
+    /// rewrite and no `store_rax_to_result`.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
-        self.emit_load_to_rax(arglocs[0]);
+        let (argloc, resloc) = match arglocs {
+            [argloc, resloc, ..] => (*argloc, *resloc),
+            other => panic!(
+                "COND_CALL_VALUE arglocs are [argloc, resloc] (x86/regalloc.py consider_cond_call), got {other:?}"
+            ),
+        };
         let skip_label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch x64 ; test rax, rax ; jnz =>skip_label);
+        // Test in the scratch so a miss-path extra arg is not clobbered.
+        self.emit_load_loc_to_scratch(argloc);
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; test Rq(scratch), Rq(scratch)
+            ; jnz =>skip_label
+        );
 
-        // x86/opassembler.py `_emit_op_cond_call` for COND_CALL_VALUE:
-        // same slowpath as COND_CALL — push_gcmap, cond_call_slowpath
-        // (`_reload_frame_if_necessary`), pop_gcmap. rax holds the call
-        // result; `_pop_all_regs_from_jitframe` skips it so the return
-        // survives the restore.
         push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_call_from_arglocs(op, arglocs, 1, 0);
-        // `CallBuilder64.load_result` before the XMM restore. Popping the
-        // jitframe overwrites xmm0, so the singlefloat bits have to land in
-        // eax while the callee's return register is still live.
-        if op.getdescr().is_some_and(|descr| {
-            descr
-                .as_call_descr()
-                .is_some_and(|cd| cd.result_class() == 'S')
-        }) {
-            dynasm!(self.mc ; .arch x64 ; movd eax, xmm0);
-        }
+        self.emit_cond_call_value_helper(op);
+        // `_build_cond_call_slowpath` leaves the helper word in eax; stash
+        // to the scratch (outside `ALL_CORE_REGS`) after reload so the
+        // restore can put every managed register back, then `MOV resloc, scratch`.
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        pop_all_regs_from_jitframe_raw(&mut self.mc, &[crate::regloc::EAX], true);
+        dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), rax);
+        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
+        self.regalloc_mov(&Loc::Reg(crate::regloc::X86_64_SCRATCH_REG), &resloc);
 
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
+    }
 
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
+    /// Inline `cond_call_slowpath` body: extra args already in
+    /// `cond_call_register_arguments`, func is `op.getarg(1)` Const.
+    fn emit_cond_call_value_helper(&mut self, op: &Op) {
+        let func = match self.resolve_opref(op.arg(1).to_opref()) {
+            ResolvedArg::Const(val) => val,
+            ResolvedArg::Slot(_) => {
+                panic!("COND_CALL_VALUE func is Const (x86/regalloc.py consider_cond_call)")
+            }
+        };
+        rx86::mov_ri(&mut self.mc, rx86::EAX, func);
+        self.emit_abi_call_rax();
     }
 
     // genop_* — string/array operations

@@ -2206,6 +2206,12 @@ impl HostEnv {
             "isvirtual",
             HostObject::new_builtin_callable("majit_rlib.jit.isvirtual"),
         );
+        // `rlib/jit.py ConditionalCallEntry` (`_about_ =
+        // _jit_conditional_call, _jit_conditional_call_value`). The
+        // residual rlib bodies are interpreter fallbacks; populate
+        // declines them (`registration_decline`) so Layer-3b reaches
+        // these HOST_ENV callables instead of walking `function(*args)`
+        // as an ll funcptr call.
         majit_rlib_jit.module_set(
             "conditional_call0",
             HostObject::new_builtin_callable("majit_rlib.jit.conditional_call0"),
@@ -2225,6 +2231,10 @@ impl HostEnv {
         majit_rlib_jit.module_set(
             "conditional_call4",
             HostObject::new_builtin_callable("majit_rlib.jit.conditional_call4"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call_elidable1",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable1"),
         );
         // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, never a
         // graph: looking inside it would hand the caller back the very

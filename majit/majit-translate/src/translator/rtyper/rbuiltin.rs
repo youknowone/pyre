@@ -1634,6 +1634,136 @@ pub(super) fn rtype_jit_force_virtualizable(
     ))
 }
 
+/// `rlib/jit.py ConditionalCallEntry.specialize_call` for
+/// `_jit_conditional_call`.
+pub(super) fn rtype_jit_conditional_call(
+    hop: &HighLevelOp,
+    kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_conditional_call_entry(hop, kwds_i, false)
+}
+
+/// `rlib/jit.py ConditionalCallEntry.specialize_call` for
+/// `_jit_conditional_call_value`.
+pub(super) fn rtype_jit_conditional_call_value(
+    hop: &HighLevelOp,
+    kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_conditional_call_entry(hop, kwds_i, true)
+}
+
+/// `ConditionalCallEntry.specialize_call`. `is_value` is
+/// `self.instance == _jit_conditional_call_value`.
+///
+/// ```python
+/// if self.instance == _jit_conditional_call:
+///     opname = 'jit_conditional_call'
+///     COND = lltype.Bool
+///     resulttype = None
+/// elif self.instance == _jit_conditional_call_value:
+///     opname = 'jit_conditional_call_value'
+///     COND = hop.r_result
+///     resulttype = hop.r_result.lowleveltype
+/// args_v = hop.inputargs(COND, lltype.Void, *hop.args_r[2:])
+/// args_v[1] = hop.args_r[1].get_concrete_llfn(...)
+/// hop.exception_is_here()
+/// return hop.genop(opname, args_v, resulttype=resulttype)
+/// ```
+///
+/// Void `genop` uses `GenopResult::LLType(Void)` so
+/// `translate_hl_to_ll` keeps a Void Variable for s_None. Flavour
+/// `_i` vs `_r` comes from `hop.r_result.lowleveltype`.
+fn rtype_conditional_call_entry(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+    is_value: bool,
+) -> RTypeResult {
+    use crate::translator::rtyper::rpbc::FunctionRepr;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    if hop.nb_args() < 2 {
+        return Err(TyperError::message(
+            "ConditionalCallEntry.specialize_call: expected at least condition/value and function",
+        ));
+    }
+
+    let r_result = hop.r_result.borrow().clone();
+    let extra: Vec<Arc<dyn Repr>> = {
+        let args_r = hop.args_r.borrow();
+        args_r
+            .iter()
+            .skip(2)
+            .map(|r| {
+                r.clone().ok_or_else(|| {
+                    TyperError::message(
+                        "ConditionalCallEntry.specialize_call: missing extra-arg repr",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let bool_ll = LowLevelType::Bool;
+    let void_ll = LowLevelType::Void;
+    if is_value && r_result.is_none() {
+        return Err(TyperError::message(
+            "ConditionalCallEntry.specialize_call: r_result missing",
+        ));
+    }
+    let mut converted: Vec<ConvertedTo<'_>> = Vec::with_capacity(hop.nb_args());
+    if is_value {
+        converted.push(ConvertedTo::Repr(
+            r_result.as_ref().expect("checked is_none").as_ref(),
+        ));
+    } else {
+        converted.push(ConvertedTo::LowLevelType(&bool_ll));
+    }
+    converted.push(ConvertedTo::LowLevelType(&void_ll));
+    for r in &extra {
+        converted.push(ConvertedTo::Repr(r.as_ref()));
+    }
+    let mut args_v = hop.inputargs(converted)?;
+
+    let s_fn = hop.args_s.borrow().get(1).cloned().ok_or_else(|| {
+        TyperError::message("ConditionalCallEntry.specialize_call: missing function annotation")
+    })?;
+    args_v[1] = match s_fn {
+        SomeValue::PBC(pbc) => {
+            let fn_repr = FunctionRepr::new(&hop.rtyper, pbc.clone())?;
+            let rest = hop.args_s.borrow()[2..].to_vec();
+            fn_repr.get_concrete_llfn(&pbc, rest, hop.position_key.borrow().clone())?
+        }
+        SomeValue::Ptr(_) => {
+            let r_fn = hop.args_r.borrow().get(1).and_then(Clone::clone);
+            if let Some(r_fn) = r_fn {
+                hop.inputarg(ConvertedTo::Repr(r_fn.as_ref()), 1)?
+            } else {
+                hop.args_v.borrow()[1].clone()
+            }
+        }
+        other => {
+            return Err(TyperError::message(format!(
+                "ConditionalCallEntry.specialize_call: function arg should be SomePBC or SomePtr, got {other:?}"
+            )));
+        }
+    };
+
+    hop.exception_is_here()?;
+    if is_value {
+        Ok(hop.genop(
+            "jit_conditional_call_value",
+            args_v,
+            GenopResult::LLType(r_result.expect("checked is_none").lowleveltype().clone()),
+        ))
+    } else {
+        Ok(hop.genop(
+            "jit_conditional_call",
+            args_v,
+            GenopResult::LLType(LowLevelType::Void),
+        ))
+    }
+}
+
 /// `BigInt::from(i64) -> BigInt` residual lowering, reached through
 /// `BuiltinFunctionRepr.findbltintyper` →
 /// `extregistry.lookup(BigInt.from).specialize_call`
@@ -5236,6 +5366,174 @@ mod tests {
         assert!(
             llops._called_exception_is_here_or_cannot_occur,
             "the typer must declare that the force cannot raise",
+        );
+    }
+
+    /// `ConditionalCallEntry.specialize_call` for
+    /// `_jit_conditional_call_value` emits `jit_conditional_call_value`
+    /// with args `(value, funcptr, arg)`. Flavour `_i` comes from
+    /// `hop.r_result.lowleveltype` (`signed_repr()`).
+    #[test]
+    fn rtype_jit_conditional_call_value_emits_value_funcptr_arg() {
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, SomePtr, functionptr};
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        *hop.r_result.borrow_mut() = Some(r_int.clone());
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(false, false)));
+
+        let v_value = Variable::named("v_value");
+        v_value.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_value));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+
+        let fptr = functionptr(
+            FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            },
+            "dummy_cond_call_fn",
+            None,
+            None,
+        );
+        let ptr_ty = fptr._TYPE.clone();
+        let fptr_ll = LowLevelType::Ptr(Box::new(ptr_ty.clone()));
+        let c_func = Constant::with_concretetype(ConstValue::LLPtr(Box::new(fptr)), fptr_ll);
+        hop.args_v.borrow_mut().push(Hlvalue::Constant(c_func));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new(ptr_ty.clone())));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(ptr_ty))));
+
+        let v_arg = Variable::named("v_arg");
+        v_arg.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_arg));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(r_int));
+
+        let result = rtype_jit_conditional_call_value(&hop, &HashMap::new())
+            .unwrap()
+            .expect("value helper returns a result Variable");
+
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the value llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "jit_conditional_call_value");
+        assert_eq!(last.args.len(), 3, "args are (value, funcptr, arg)");
+        match &last.args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("value must stay a Variable, got {other:?}"),
+        }
+        match &last.args[1] {
+            Hlvalue::Constant(c) => {
+                assert!(matches!(c.value, ConstValue::LLPtr(_)));
+                assert!(matches!(c.concretetype, Some(LowLevelType::Ptr(_))));
+            }
+            other => panic!("funcptr must be a Constant, got {other:?}"),
+        }
+        match &last.args[2] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("arg must stay a Variable, got {other:?}"),
+        }
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("value result must be Signed, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "ConditionalCallEntry.specialize_call calls exception_is_here",
+        );
+    }
+
+    /// Void twin of `rtype_jit_conditional_call_value_emits_value_funcptr_arg`.
+    #[test]
+    fn rtype_jit_conditional_call_emits_cond_funcptr_arg() {
+        use crate::annotator::model::{SomeBool, SomeInteger, s_none};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, SomePtr, functionptr};
+        use crate::translator::rtyper::rbool::bool_repr;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        *hop.s_result.borrow_mut() = Some(s_none());
+
+        let r_bool: Arc<dyn Repr> = bool_repr();
+        let v_cond = Variable::named("v_cond");
+        v_cond.set_concretetype(Some(LowLevelType::Bool));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_cond));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Bool(SomeBool::default()));
+        hop.args_r.borrow_mut().push(Some(r_bool));
+
+        let fptr = functionptr(
+            FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            },
+            "dummy_cond_call_void_fn",
+            None,
+            None,
+        );
+        let ptr_ty = fptr._TYPE.clone();
+        let fptr_ll = LowLevelType::Ptr(Box::new(ptr_ty.clone()));
+        let c_func = Constant::with_concretetype(ConstValue::LLPtr(Box::new(fptr)), fptr_ll);
+        hop.args_v.borrow_mut().push(Hlvalue::Constant(c_func));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new(ptr_ty.clone())));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(ptr_ty))));
+
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let v_arg = Variable::named("v_arg");
+        v_arg.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_arg));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(r_int));
+
+        let result = rtype_jit_conditional_call(&hop, &HashMap::new())
+            .unwrap()
+            .expect("void helper returns a Void Variable");
+
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the void llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "jit_conditional_call");
+        assert_eq!(last.args.len(), 3, "args are (cond, funcptr, arg)");
+        match &last.args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Bool)),
+            other => panic!("condition must stay a Variable, got {other:?}"),
+        }
+        match &last.args[1] {
+            Hlvalue::Constant(c) => {
+                assert!(matches!(c.value, ConstValue::LLPtr(_)));
+                assert!(matches!(c.concretetype, Some(LowLevelType::Ptr(_))));
+            }
+            other => panic!("funcptr must be a Constant, got {other:?}"),
+        }
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            other => panic!("void result must be a Void Variable, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "ConditionalCallEntry.specialize_call calls exception_is_here",
         );
     }
 

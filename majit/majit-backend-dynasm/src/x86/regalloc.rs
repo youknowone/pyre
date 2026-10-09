@@ -73,6 +73,14 @@ pub fn call_result_gpr() -> RegLoc {
     EAX
 }
 
+/// x86/assembler.py `cond_call_register_arguments` —
+/// `CallBuilder64.ARGUMENTS_GPR[:4]`. Extra COND_CALL_VALUE arguments
+/// land here so the miss path can `CALL` without remapping.
+pub fn cond_call_argument_regs() -> &'static [RegLoc] {
+    let regs = crate::x86::callbuilder::ARGUMENTS_GPR;
+    &regs[..4]
+}
+
 /// `call_result_fpr` — x86_64 AMD64 ABI XMM return register.
 pub fn call_result_fpr() -> RegLoc {
     XMM0

@@ -65,6 +65,12 @@ pub fn call_result_gpr() -> RegLoc {
     RegLoc::new(0, false)
 }
 
+/// aarch64/registers.py `argument_regs`. `_prepare_op_cond_call` places
+/// extra COND_CALL / COND_CALL_VALUE arguments here (`x0` …).
+pub fn cond_call_argument_regs() -> &'static [RegLoc] {
+    &registers::ARGUMENT_REGS
+}
+
 /// aarch64/locations.py: `call_result_location` returns d0 for VFP.
 pub fn call_result_fpr() -> RegLoc {
     RegLoc::new(0, true)

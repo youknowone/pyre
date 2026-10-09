@@ -9040,6 +9040,75 @@ mod tests {
         }
     }
 
+    /// Layer-1 `call_registry.lookup` beats HOST_ENV. A registered
+    /// residual body is the callable; the `majit_rlib.jit.conditional_call*`
+    /// builtin is not consulted. `registration_decline` exists so populate
+    /// never leaves that body in the registry.
+    #[test]
+    fn conditional_call_registered_body_beats_host_env() {
+        use crate::codewriter::call::GraphStore;
+        use crate::parse::CallPath;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::cutover::populate_call_registry_from_call_graphs;
+
+        let segments = vec![
+            "majit_rlib".to_string(),
+            "jit".to_string(),
+            "conditional_call_elidable1".to_string(),
+        ];
+        let mut caller = LegacyGraph::new("caller");
+        let vars = mint_vars(&mut caller, 4);
+        let value_map: HashMap<Variable, Hlvalue> = vars
+            .iter()
+            .map(|v| (v.clone(), Hlvalue::Variable(Variable::new())))
+            .collect();
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: segments.clone(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vars[..3].iter().cloned()),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+
+        let missing = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("HOST_ENV Layer-3b resolves the helper when the registry is empty");
+        assert_eq!(missing[0].opname, "simple_call");
+        let Hlvalue::Constant(host_callable) = &missing[0].args[0] else {
+            panic!("HOST_ENV callable constant required");
+        };
+        let host = crate::flowspace::model::host_env_callable(&segments)
+            .expect("majit_rlib.jit.conditional_call_elidable1 is a HOST_ENV builtin");
+        assert_eq!(host_callable.value, ConstValue::HostObject(host.clone()));
+
+        // An LLBC body in GraphStore is declined, so populate still
+        // leaves Layer-3b as the resolver.
+        let mut body = LegacyGraph::new("conditional_call_elidable1");
+        let inputs = mint_vars(&mut body, 3);
+        body.block_mut(body.startblock).inputargs = inputs.clone();
+        body.set_return(body.startblock, Some(inputs[0].clone()));
+        let mut graphs = GraphStore::default();
+        graphs.insert(CallPath::from_segments(segments.clone()), body);
+        let registry = std::rc::Rc::new(empty_call_registry());
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            .expect("populate");
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(segments.clone()))
+                .is_none(),
+            "populate must decline the residual body so HOST_ENV wins"
+        );
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("declined helper uses HOST_ENV");
+        let Hlvalue::Constant(callable) = &translated[0].args[0] else {
+            panic!("callable constant required");
+        };
+        assert_eq!(callable.value, ConstValue::HostObject(host));
+    }
+
     #[test]
     fn translate_op_call_method_chains_getattr_simple_call() {
         // Call::Method `obj.method(args)` → 2-op chain `[getattr(obj,

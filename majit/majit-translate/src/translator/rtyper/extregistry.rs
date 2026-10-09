@@ -178,6 +178,16 @@ pub enum ExtRegistryEntry {
     /// path; its `compute_annotation` is unreachable in practice and
     /// fails closed to surface a bypassed early-return loudly.
     WeAreJitted,
+    /// Upstream `rpython/rlib/jit.py ConditionalCallEntry`:
+    ///
+    /// ```python
+    /// class ConditionalCallEntry(ExtRegistryEntry):
+    ///     _about_ = _jit_conditional_call, _jit_conditional_call_value
+    /// ```
+    ///
+    /// One class covers both helpers. `is_value` is
+    /// `self.instance == _jit_conditional_call_value`.
+    ConditionalCall { is_value: bool },
     /// Pyre's explicit source spelling of the force inserted by
     /// `VirtualizableInstanceRepr.hook_access_field`
     /// (`rpython/rtyper/rvirtualizable.py`).  Upstream inserts the
@@ -324,6 +334,11 @@ pub enum ExtRegistryEntryKey {
     /// (rlib/jit.py). No per-instance identity — the variant tag
     /// alone supplies `self.__class__` and there is no `self.instance`.
     WeAreJitted,
+    /// `ConditionalCallEntry` keyed on `_jit_conditional_call` vs
+    /// `_jit_conditional_call_value` (`self.instance`).
+    ConditionalCall {
+        is_value: bool,
+    },
     JitForceVirtualizable,
     /// Singleton key for the `BigInt.from` residual-external entry. No
     /// per-instance identity — the variant tag alone supplies
@@ -369,6 +384,11 @@ impl ExtRegistryEntry {
                 instance_identity: instance.identity_id(),
             },
             ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
+            ExtRegistryEntry::ConditionalCall { is_value } => {
+                ExtRegistryEntryKey::ConditionalCall {
+                    is_value: *is_value,
+                }
+            }
             ExtRegistryEntry::JitForceVirtualizable => ExtRegistryEntryKey::JitForceVirtualizable,
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
@@ -490,6 +510,11 @@ impl ExtRegistryEntry {
             // (bookkeeper.py).  Returning it here keeps the
             // entry a faithful port for any path that consults it.
             ExtRegistryEntry::WeAreJitted => Ok(SomeValue::Bool(Default::default())),
+            // `ConditionalCallEntry.compute_result_annotation` is the
+            // BUILTIN_ANALYZERS path. This unused fallback matches the
+            // void helper's s_None; the value helper's result needs
+            // `args_s` and is served by `jit_conditional_call_elidable`.
+            ExtRegistryEntry::ConditionalCall { .. } => Ok(s_none()),
             // `VirtualizableInstanceRepr.hook_access_field` emits a Void
             // `jit_force_virtualizable` operation.  The explicit Rust marker
             // therefore has the ordinary ExtRegistry callable annotation and
@@ -672,6 +697,13 @@ impl ExtRegistryEntry {
             // at the result repr's lltype.
             ExtRegistryEntry::WeAreJitted => {
                 Ok(super::rbuiltin::rtype_we_are_jitted as BuiltinTyperFn)
+            }
+            // rlib/jit.py — `ConditionalCallEntry.specialize_call`.
+            ExtRegistryEntry::ConditionalCall { is_value: false } => {
+                Ok(super::rbuiltin::rtype_jit_conditional_call as BuiltinTyperFn)
+            }
+            ExtRegistryEntry::ConditionalCall { is_value: true } => {
+                Ok(super::rbuiltin::rtype_jit_conditional_call_value as BuiltinTyperFn)
             }
             // rlib/nonconst.py — `EntryNonConstant.specialize_call(self, hop)`:
             //     hop.exception_cannot_occur()
@@ -936,6 +968,21 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     if host.qualname() == "majit_metainterp.jit.we_are_jitted" {
         return Some(ExtRegistryEntry::WeAreJitted);
     }
+    // rlib/jit.py `ConditionalCallEntry._about_ =
+    // _jit_conditional_call, _jit_conditional_call_value`.
+    if host.qualname() == "majit_rlib.jit.conditional_call_elidable1" {
+        return Some(ExtRegistryEntry::ConditionalCall { is_value: true });
+    }
+    if matches!(
+        host.qualname(),
+        "majit_rlib.jit.conditional_call0"
+            | "majit_rlib.jit.conditional_call1"
+            | "majit_rlib.jit.conditional_call2"
+            | "majit_rlib.jit.conditional_call3"
+            | "majit_rlib.jit.conditional_call4"
+    ) {
+        return Some(ExtRegistryEntry::ConditionalCall { is_value: false });
+    }
     if host.qualname() == "pyre_interpreter.executioncontext.jit_force_virtualizable" {
         return Some(ExtRegistryEntry::JitForceVirtualizable);
     }
@@ -1131,6 +1178,35 @@ mod tests {
         assert!(matches!(entry, ExtRegistryEntry::WeAreJitted));
         assert!(entry.specialize_call().is_ok());
         assert!(matches!(entry.compute_annotation(), Ok(SomeValue::Bool(_))));
+    }
+
+    /// rlib/jit.py `ConditionalCallEntry._about_ =
+    /// _jit_conditional_call, _jit_conditional_call_value`.
+    #[test]
+    fn conditional_call_resolves_specialize_call() {
+        let void_host = HostObject::new_builtin_callable("majit_rlib.jit.conditional_call1");
+        assert!(is_registered(&ConstValue::HostObject(void_host.clone())));
+        let void_entry = lookup(&ConstValue::HostObject(void_host))
+            .expect("conditional_call1 must surface an entry");
+        assert!(matches!(
+            void_entry,
+            ExtRegistryEntry::ConditionalCall { is_value: false }
+        ));
+        assert!(void_entry.specialize_call().is_ok());
+        assert!(matches!(
+            void_entry.compute_annotation(),
+            Ok(SomeValue::None_(_))
+        ));
+
+        let value_host =
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable1");
+        let value_entry = lookup(&ConstValue::HostObject(value_host))
+            .expect("conditional_call_elidable1 must surface an entry");
+        assert!(matches!(
+            value_entry,
+            ExtRegistryEntry::ConditionalCall { is_value: true }
+        ));
+        assert!(value_entry.specialize_call().is_ok());
     }
 
     #[test]
