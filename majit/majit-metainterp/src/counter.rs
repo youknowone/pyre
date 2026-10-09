@@ -991,6 +991,7 @@ mod tests {
     fn clone_shares_the_timetable() {
         // warmspot.py WarmRunnerDesc.jitcounter is one object; Clone is
         // another handle, not a second table.
+        let _generation_guard = DECAY_GENERATION_TEST_LOCK.lock();
         let mut a = JitCounter::new(DEFAULT_SIZE);
         let mut b = a.clone();
         assert!(a.ptr_eq(&b));
