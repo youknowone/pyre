@@ -17,7 +17,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use crate::lowlevel_string::{
     LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, LOWLEVEL_STRING_LEN_OFFSET,
-    bh_alloc_str_nofill, bh_lowlevel_string_len, lowlevel_str_gc_type_id,
+    bh_alloc_prebuilt_lowlevel_string, bh_alloc_str_nofill, bh_lowlevel_string_len,
+    lowlevel_str_gc_type_id,
 };
 use crate::pyobject::*;
 
@@ -25,9 +26,11 @@ use crate::pyobject::*;
 /// ('chars', Array(Char)))`) — `W_UnicodeObject._utf8`.
 ///
 /// Layout matches [`crate::lowlevel_string`]: hash @0, len @8, chars @16.
-/// Mortal strings allocate through the registered low-level STR GC tid;
-/// immortal holders keep a raw `STR` so an immortal header never greys a
-/// young box.
+/// Mortal strings allocate through the registered low-level STR GC tid.
+/// Intern-constant / `convert_const` STRs take the prebuilt old-gen path
+/// (`try_gc_alloc_stable_raw` + `GCFLAG_NO_HEAP_PTRS` + write barrier).
+/// [`alloc_utf8_payload`] with `managed = false` is the no-hook / unit-test
+/// fallback and the off-heap [`intern_lookup_wtf8`] probe.
 #[repr(C)]
 pub struct Utf8Str {
     pub hash: isize,
@@ -86,6 +89,20 @@ fn alloc_raw_utf8_payload(len: usize) -> i64 {
         ptr.add(LOWLEVEL_STRING_CHARS_OFFSET + len).write(0);
     }
     ptr as i64
+}
+
+/// Intern-constant / `convert_const` STR (`CONST_STR_CACHE`): prebuilt GC when
+/// the stable hook and STR tid are live, otherwise the raw fallback.
+fn alloc_prebuilt_utf8_payload(bytes: &[u8]) -> *mut UnicodeValueStorage {
+    let p = bh_alloc_prebuilt_lowlevel_string(bytes.len(), LOWLEVEL_STR_BASE_SIZE, 1);
+    if p == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let dst = (p as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    }
+    p as *mut UnicodeValueStorage
 }
 
 /// Borrow the `chars` array of an rstr `STR` payload.
@@ -673,13 +690,14 @@ pub unsafe fn w_str_cut(recv: PyObjectRef, piece: &Wtf8) -> PyObjectRef {
     w_str_from_wtf8_managed(piece.to_wtf8_buf())
 }
 
-/// Immortal `w_str_from_wtf8`: always allocates through `malloc_typed`,
-/// bypassing the `gc_interp` gate so the result is never collected.
+/// Intern-constant / `convert_const` `W_UnicodeObject`: a prebuilt GC object
+/// (`try_gc_alloc_stable_raw` + `GCFLAG_NO_HEAP_PTRS` + write barrier) so the
+/// wrapper is non-moving, collector-owned, and traced (`value` is greyed).
+/// Falls back to `malloc_typed` when no stable hook is installed.
 ///
-/// `box_str_constant` stores its result as a bare `usize` in the thread-local
-/// `STRING_CONSTANT_CACHE`, which is not a GC root; a collectable interned
-/// constant would be swept out from under the cache (use-after-free).  Interned
-/// constants are bounded, so keeping them immortal is the intended split.
+/// Identity is the intern table (`WEAK_INTERN`); a prebuilt wrapper is in
+/// `prebuilt_root_objects` after the construction barrier, so it is not swept
+/// from under the weakly held intern entry.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
@@ -690,8 +708,8 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         pos = crate::rutf8::next_codepoint_pos(&value, pos);
         char_len += 1;
     }
-    let value = alloc_utf8_payload(value.as_bytes(), false);
-    crate::lltype::malloc_typed(W_UnicodeObject {
+    let value = alloc_prebuilt_utf8_payload(value.as_bytes());
+    let unicode = W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
             w_class: get_instantiate(&STR_TYPE),
@@ -701,7 +719,17 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         len: char_len,
         index_storage: std::ptr::null_mut(),
         hash: 0,
-    }) as PyObjectRef
+    };
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    if raw.is_null() {
+        return crate::lltype::malloc_typed(unicode) as PyObjectRef;
+    }
+    unsafe {
+        crate::gc_hook::stamp_gc_no_heap_ptrs(raw);
+        std::ptr::write(raw as *mut W_UnicodeObject, unicode);
+    }
+    crate::gc_hook::try_gc_write_barrier_managed(raw);
+    raw as PyObjectRef
 }
 
 /// Allocate a `str` subclass instance through the stable GC allocator.
@@ -802,15 +830,18 @@ impl std::hash::Hasher for Fnv1aHasher {
 ///
 /// Allocated once when the collector starts (`init_interned_strings`), the
 /// `ObjSpace.__init__` / `ll_new_weakdict` analogue. A unit test with no GC
-/// lazily mallocs the same shape on first intern.
+/// lazily mallocs the same shape on first intern. With a stable hook the
+/// dict is a prebuilt GC object (`prebuilt_root_objects`); minors skip it
+/// and majors trace it (`seed_major_roots` /
+/// `rescan_major_nonstack_roots_and_drain`).
 struct WeakInternTable(*mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>);
 unsafe impl Send for WeakInternTable {}
 unsafe impl Sync for WeakInternTable {}
 
 /// Process-global intern table lock.  `parking_lot` parks into a
 /// process-global HashTable that `parking_lot_core` 0.9.12 does not reset
-/// after `fork()`; a child that GCs (`walk_interned_strings_gc`) while a
-/// worker interns then parks into that table.  Same OS-backed choice as
+/// after `fork()`; a child that GCs (reading `interned_strings_dict_ptr`)
+/// while a worker interns then parks into that table.  Same OS-backed choice as
 /// `GcSync::quiesce` / the mutator registry.
 struct InternLock(UnsafeCell<Mutex<WeakInternTable>>);
 unsafe impl Sync for InternLock {}
@@ -859,10 +890,23 @@ const INTERN_LOOKUP_STACK_BYTES: usize = 256;
 #[repr(C, align(8))]
 struct InternLookupProbe([u8; LOWLEVEL_STR_BASE_SIZE + INTERN_LOOKUP_STACK_BYTES]);
 
-fn intern_lookup_key(storage: *mut UnicodeValueStorage) -> Option<PyObjectRef> {
-    let key = crate::celldict::StrKey(storage);
+/// `WeakValueDictRepr.ll_get(self, d, llkey)`: `llkey` is `r_key` = `Ptr(STR)`.
+fn intern_lookup(llkey: crate::celldict::StrKey) -> Option<PyObjectRef> {
     let mut table = lock_intern();
-    intern_dict(&mut table).ll_get(key)
+    intern_dict(&mut table).ll_get(llkey)
+}
+
+/// Convert_const intern lookup: live referent whose stored valueref is a
+/// prebuilt weakref (`prebuilt_weakref`, not collector-owned).
+fn intern_lookup_prebuilt(llkey: crate::celldict::StrKey) -> Option<PyObjectRef> {
+    let mut table = lock_intern();
+    let dict = intern_dict(&mut table);
+    let existing = dict.ll_get(llkey)?;
+    if dict.ll_valueref_is_prebuilt(llkey) {
+        Some(existing)
+    } else {
+        None
+    }
 }
 
 /// Fill `buf` as an rstr `STR` whose `chars` are `bytes`, then `ll_get`.
@@ -871,7 +915,12 @@ fn intern_lookup_key(storage: *mut UnicodeValueStorage) -> Option<PyObjectRef> {
 /// `buf` is aligned for [`Utf8Str`], `buf_len` is `LOWLEVEL_STR_BASE_SIZE +
 /// bytes.len()`, and the `buf_len` bytes are writable. `ll_strhash` may
 /// write `STR.hash`.
-unsafe fn intern_lookup_in(bytes: &[u8], buf: *mut u8, buf_len: usize) -> Option<PyObjectRef> {
+unsafe fn intern_lookup_in(
+    bytes: &[u8],
+    buf: *mut u8,
+    buf_len: usize,
+    lookup: fn(crate::celldict::StrKey) -> Option<PyObjectRef>,
+) -> Option<PyObjectRef> {
     debug_assert_eq!(buf_len, LOWLEVEL_STR_BASE_SIZE + bytes.len());
     unsafe {
         (buf as *mut usize).write(0);
@@ -882,23 +931,38 @@ unsafe fn intern_lookup_in(bytes: &[u8], buf: *mut u8, buf_len: usize) -> Option
             bytes.len(),
         );
         buf.add(LOWLEVEL_STRING_CHARS_OFFSET + bytes.len()).write(0);
-        intern_lookup_key(buf as *mut UnicodeValueStorage)
+        lookup(crate::celldict::StrKey(buf as *mut UnicodeValueStorage))
     }
 }
 
 /// Probe with a stack STR so `ll_get` takes `r_key`'s STR (`ll_get(d, llkey)`).
-fn intern_lookup(value: &Wtf8) -> Option<PyObjectRef> {
+fn intern_lookup_wtf8_with(
+    value: &Wtf8,
+    lookup: fn(crate::celldict::StrKey) -> Option<PyObjectRef>,
+) -> Option<PyObjectRef> {
     let bytes = value.as_bytes();
     let Some(total) = LOWLEVEL_STR_BASE_SIZE.checked_add(bytes.len()) else {
         return None;
     };
     if bytes.len() <= INTERN_LOOKUP_STACK_BYTES {
         let mut probe = std::mem::MaybeUninit::<InternLookupProbe>::uninit();
-        unsafe { intern_lookup_in(bytes, probe.as_mut_ptr() as *mut u8, total) }
+        unsafe { intern_lookup_in(bytes, probe.as_mut_ptr() as *mut u8, total, lookup) }
     } else {
         let mut buf = vec![0u8; total];
-        unsafe { intern_lookup_in(bytes, buf.as_mut_ptr(), total) }
+        unsafe { intern_lookup_in(bytes, buf.as_mut_ptr(), total, lookup) }
     }
+}
+
+/// Byte-only `interned_strings.get`: the probe is an off-heap (stack, or Vec
+/// when longer than INTERN_LOOKUP_STACK_BYTES) STR that `ll_get` does not
+/// store. Off-heap so `ll_get` (`dont_look_inside`, no malloc) can hash/eq
+/// it without a root.
+fn intern_lookup_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
+    intern_lookup_wtf8_with(value, intern_lookup)
+}
+
+fn intern_lookup_wtf8_prebuilt(value: &Wtf8) -> Option<PyObjectRef> {
+    intern_lookup_wtf8_with(value, intern_lookup_prebuilt)
 }
 
 /// `ll_new_weakdict` for `interned_strings`. Called after the WEAKDICT type
@@ -909,21 +973,17 @@ pub fn init_interned_strings() {
     table.0 = crate::rweakvaldict::ll_new_weakdict();
 }
 
-/// Extra-root the `WEAKDICT` object (`baseobjspace.py` `interned_strings`).
-/// Its `entries` field is an ordinary GC pointer, traced with the object.
-/// The interned strings themselves are not roots. A minor's extra-root walk
-/// forwards this pointer and does not scan `entries` unless the object write
-/// barrier remembered it. `ll_set_nonnull` write-barriers the entries array
-/// (`setarrayitem_gc`) so `collect_oldrefs_to_nursery` traces a young WEAKREF
-/// and `invalidate_young_weakrefs` rewrites `weakptr` (`incminimark.py`).
-pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    let mut table = lock_intern();
-    if table.0.is_null() || !crate::gc_hook::try_gc_owns_object(table.0 as crate::gc_hook::GCREF) {
-        return;
-    }
-    let mut ptr = table.0 as PyObjectRef;
-    visitor(&mut ptr);
-    table.0 = ptr as *mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>;
+/// The interned_strings `WEAKDICT` pointer (`WEAK_INTERN.0`).
+pub fn interned_strings_dict_ptr() -> *mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey> {
+    lock_intern().0
+}
+
+/// Restore a saved interned_strings `WEAKDICT` pointer. Tests that allocate
+/// a local intern dict put the previous one back with this.
+pub fn set_interned_strings_dict_ptr(
+    ptr: *mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>,
+) {
+    lock_intern().0 = ptr;
 }
 
 /// Immortal weakref to a never-freed target.
@@ -941,18 +1001,18 @@ fn prebuilt_weakref(obj: PyObjectRef) -> *mut crate::weakref::Weakref {
 /// by that object's own STR. Does not collect.
 ///
 /// `replace_managed` is `box_str_constant`'s convert_const behaviour: a live
-/// managed interned value for the same key is replaced so a translation-time
-/// constant stays immortal and does not move. `intern_wtf8_value` passes
-/// false and keeps any live entry of either kind.
+/// `new_interned_w_str` entry (GC weakref, `w_weakref_new`) for the same key
+/// is replaced so a translation-time constant stays prebuilt and does not
+/// move. A convert_const entry (prebuilt weakref, `prebuilt_weakref`) is
+/// kept. `intern_wtf8_value` passes false and keeps any live entry of
+/// either kind.
 fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef {
     let valueref = prebuilt_weakref(obj);
     let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
     let mut table = lock_intern();
     let dict = intern_dict(&mut table);
     if let Some(existing) = dict.ll_get(key) {
-        if !replace_managed
-            || !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF)
-        {
+        if !replace_managed || dict.ll_valueref_is_prebuilt(key) {
             return existing;
         }
     }
@@ -998,7 +1058,7 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    if let Some(existing) = intern_lookup_key(unsafe { w_str_storage(obj) }) {
+    if let Some(existing) = intern_lookup(crate::celldict::StrKey(unsafe { w_str_storage(obj) })) {
         return existing;
     }
     intern_publish(obj)
@@ -1014,7 +1074,7 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub unsafe fn intern_existing_str(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    if let Some(existing) = intern_lookup_key(unsafe { w_str_storage(obj) }) {
+    if let Some(existing) = intern_lookup(crate::celldict::StrKey(unsafe { w_str_storage(obj) })) {
         return existing;
     }
     intern_publish_const(
@@ -1028,16 +1088,16 @@ pub unsafe fn intern_existing_str(obj: PyObjectRef) -> PyObjectRef {
 /// whatever its kind.
 ///
 /// Documented adaptation vs `ObjSpace.new_interned_str`: a miss is the
-/// `WeakValueDictRepr.convert_const` shape ([`intern_publish_const`] of an
-/// immortal exact str), not `newtext`. The ~50 Rust callers of
+/// `WeakValueDictRepr.convert_const` shape ([`intern_publish_const`] of a
+/// prebuilt exact str), not `newtext`. The ~50 Rust callers of
 /// [`intern_wtf8_value`] / [`intern_str_value`] keep the returned pointer
 /// outside any GC root (statics, type slots), so a miss cannot be a movable
 /// nursery object. A live interned entry of either kind is never replaced or
-/// demoted ([`box_str_constant`] does replace a managed one). The miss
-/// publish re-checks under the intern-table lock and keeps any live entry.
+/// demoted ([`box_str_constant`] does replace a GC-weakref interned one). The
+/// miss publish re-checks under the intern-table lock and keeps any live entry.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
-    if let Some(existing) = intern_lookup(value) {
+    if let Some(existing) = intern_lookup_wtf8(value) {
         return existing;
     }
     intern_publish_const(w_str_from_wtf8_immortal(value.to_owned()), false)
@@ -1060,7 +1120,7 @@ pub fn intern_str_value(value: &str) -> PyObjectRef {
 /// the marshal reference-table key.
 #[majit_macros::dont_look_inside]
 pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
-    intern_lookup(value)
+    intern_lookup_wtf8(value)
 }
 
 /// CPython 3.14 `PyUnicode_CHECK_INTERNED`: true only when `obj` itself is the
@@ -1071,7 +1131,8 @@ pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
 #[majit_macros::dont_look_inside]
 pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    intern_lookup_key(unsafe { w_str_storage(obj) }).is_some_and(|existing| existing == obj)
+    intern_lookup(crate::celldict::StrKey(unsafe { w_str_storage(obj) }))
+        .is_some_and(|existing| existing == obj)
 }
 
 /// Number of canonical strings owned by the process-wide intern table.
@@ -1086,12 +1147,12 @@ pub fn interned_size() -> usize {
     }
 }
 
-/// The immortal half of that census - `getunicodeinternedsize(
-/// _only_immortal=True)`.  A build-time constant is immortal; a value first
-/// presented to `sys.intern()` is a managed object the collector owns, and is
-/// not counted.  `libregrtest.refleak` subtracts this number from
-/// `getallocatedblocks`, so a string a test interns dynamically must not move
-/// it.
+/// The immortal half of that census - `getunicodeinternedsize(_only_immortal=True)`.
+/// A convert_const interned string stores a prebuilt weakref (`prebuilt_weakref`);
+/// a value first presented to `sys.intern()` stores a GC weakref (`w_weakref_new`)
+/// and is not counted, including after promotion.  `libregrtest.refleak`
+/// subtracts this number from `getallocatedblocks`, so a string a test interns
+/// dynamically must not move it.
 #[majit_macros::dont_look_inside]
 pub fn interned_size_immortal() -> usize {
     let table = lock_intern();
@@ -1103,47 +1164,52 @@ pub fn interned_size_immortal() -> usize {
 }
 
 /// Box a translation-time string constant (`WeakValueDictRepr.convert_const`
-/// analogue). An immortal intern entry is the result; a managed interned
-/// entry is replaced so the constant does not move. A miss stores an
-/// immortal exact str, weakly, keyed by that object's own STR.
+/// analogue). A convert_const intern entry (prebuilt weakref) is the result;
+/// a `new_interned_w_str` entry (GC weakref) is replaced so the constant does
+/// not move. A miss stores a prebuilt exact str, weakly, keyed by that
+/// object's own STR.
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
-    if let Some(existing) = intern_lookup(value) {
-        if !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF) {
-            return existing;
-        }
+    if let Some(existing) = intern_lookup_wtf8_prebuilt(value) {
+        return existing;
     }
     // convert_const shape: pyre roots by hand and has no get_livevars_for_roots
     // insertion. Convergence is gctransformer root insertion, then newtext.
     intern_publish_const(w_str_from_wtf8_immortal(value.to_owned()), true)
 }
 
-/// Resolve a trace constant that aliases a `&Wtf8` / rstr `STR` to the
-/// interned immortal wrapper. Prebuilt STR constants materialize as the
-/// `_utf8` storage pointer (`runtime_fnaddr_patch.rs`
-/// `materialize_prebuilt_str`). The intern table is probed first: that
-/// pointer is storage, not a `PyObject`, so `is_str` would read it as
-/// an object header.
-pub fn interned_str_from_const_ptr(ptr: usize) -> Option<PyObjectRef> {
+/// Kind of a `box_str_constant` residual operand.
+///
+/// `OpKind::ConstStr` / `StrConstDescriptor.as_unicode_object == false` is
+/// rstr `Ptr(STR)` (`StringRepr.convert_const`). `OpKind::ConstInternedStr`
+/// / `as_unicode_object == true` is the interned `W_UnicodeObject`
+/// (`box_str_constant` / `WeakValueDictRepr.convert_const`). Kind is a
+/// typed-constant property; it is never recovered by probing the pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxStrConstKind {
+    /// rstr `Ptr(STR)` — intern by chars (`WeakValueDictRepr.ll_get`).
+    Str,
+    /// Interned `W_UnicodeObject`.
+    InternedUnicode,
+}
+
+/// Intern a typed string constant. `kind` is `OpKind::ConstStr` vs
+/// `ConstInternedStr` / `StrConstDescriptor.as_unicode_object`.
+///
+/// STR intern is `interned_strings.get(llkey)` (`WeakValueDictRepr.ll_get`)
+/// with `llkey` the operand itself. A miss leaves intern to
+/// [`box_str_constant`] (`convert_const`). Wrapper intern is `ll_get` of
+/// that object's own STR (`ObjSpace.new_interned_w_str`).
+pub fn interned_str_from_typed_const(ptr: usize, kind: BoxStrConstKind) -> Option<PyObjectRef> {
     if ptr == 0 {
         return None;
     }
-    {
-        let mut table = lock_intern();
-        if let Some(wrapper) = intern_dict(&mut table).find_live(|wrapper| {
-            (unsafe { w_str_storage(wrapper) as usize } == ptr).then_some(wrapper)
-        }) {
-            return Some(wrapper);
-        }
+    match kind {
+        BoxStrConstKind::Str => intern_lookup(crate::celldict::StrKey(ptr as *mut Utf8Str)),
+        BoxStrConstKind::InternedUnicode => intern_lookup(crate::celldict::StrKey(unsafe {
+            w_str_storage(ptr as PyObjectRef)
+        })),
     }
-    let obj = ptr as PyObjectRef;
-    if unsafe { is_str(obj) } {
-        return Some(box_str_constant(unsafe { w_str_get_wtf8(obj) }));
-    }
-    // Wrapper (`is_str`) or a storage pointer the intern table already
-    // holds (`find_live` / `w_str_storage`). An untyped word is not a
-    // STR payload to wrap: `execute_box_str_constant` declines it.
-    None
 }
 
 /// The `&str` view of a WTF-8 buffer already known to hold no lone
@@ -2058,7 +2124,7 @@ mod tests {
 
     #[test]
     fn string_length_uses_ascii_byte_count() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let _intern_lock = crate::gc_hook::hook_test_guard();
         {
             // managed_string_length_uses_ascii_byte_count
             let ascii = w_str_from_wtf8_managed(Wtf8Buf::from("stat_result"));
@@ -2101,7 +2167,7 @@ mod tests {
 
     #[test]
     fn intern_str_value_and_table_key() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let _intern_lock = crate::gc_hook::hook_test_guard();
         {
             // intern_str_value_returns_one_object
             let first = intern_str_value("startup-name");
@@ -2349,26 +2415,36 @@ mod tests {
 
     #[test]
     fn test_box_str_constant_reuses_same_object() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let _intern_lock = crate::gc_hook::hook_test_guard();
         let a = box_str_constant(Wtf8::new("pyre"));
         let b = box_str_constant(Wtf8::new("pyre"));
         assert_eq!(a, b);
     }
 
     #[test]
-    fn interned_str_from_const_ptr_finds_wrapper_by_str_key() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
+    fn interned_str_from_typed_const_interns_by_kind() {
+        let _intern_lock = crate::gc_hook::hook_test_guard();
         let value = Wtf8::new("__pyre_const_ptr_immortal_9c1e__");
         let wrapper = box_str_constant(value);
         let storage = unsafe { w_str_storage(wrapper) as usize };
-        assert_eq!(interned_str_from_const_ptr(storage), Some(wrapper));
-        assert_eq!(interned_str_from_const_ptr(wrapper as usize), Some(wrapper));
-        assert_eq!(interned_str_from_const_ptr(0), None);
+        assert_eq!(
+            interned_str_from_typed_const(storage, BoxStrConstKind::Str),
+            Some(wrapper)
+        );
+        assert_eq!(
+            interned_str_from_typed_const(wrapper as usize, BoxStrConstKind::InternedUnicode),
+            Some(wrapper)
+        );
+        assert_eq!(interned_str_from_typed_const(0, BoxStrConstKind::Str), None);
+        assert_eq!(
+            interned_str_from_typed_const(0, BoxStrConstKind::InternedUnicode),
+            None
+        );
     }
 
     #[test]
     fn test_get_interned_wtf8_is_lookup_only_and_returns_canonical_object() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let _intern_lock = crate::gc_hook::hook_test_guard();
         let missing = Wtf8::new("__pyre_lookup_only_missing_4f52d7d0__");
         assert!(get_interned_wtf8(missing).is_none());
         assert!(get_interned_wtf8(missing).is_none());
@@ -2399,46 +2475,51 @@ mod tests {
         MANAGED_ALLOCS.with(|slots| slots.borrow().contains(&addr))
     }
 
-    /// A miss through `intern_wtf8_value` is immortal even when the
-    /// managed-alloc probe hooks are registered, and is stored with a
-    /// prebuilt (non-GC) weakref. `get_interned_wtf8` and a second intern
-    /// return it; `box_str_constant` on the same text returns that object.
-    /// A later `box_str_constant` miss stays immortal.
+    fn intern_probe_guard() -> crate::gc_hook::HookTestGuard {
+        let hook_lock = crate::gc_hook::hook_test_guard();
+        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
+        crate::gc_hook::register_gc_alloc_hook(record_managed_alloc);
+        crate::gc_hook::register_gc_alloc_collecting_hook(record_managed_alloc);
+        crate::gc_hook::register_gc_owns_object_hook(managed_alloc_is_owned);
+        hook_lock
+    }
+
+    struct InternProbeClear;
+    impl Drop for InternProbeClear {
+        fn drop(&mut self) {
+            crate::gc_hook::clear_gc_alloc_collecting_hook();
+            crate::gc_hook::clear_gc_owns_object_hook();
+            crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
+            MANAGED_ALLOCS.with(|slots| slots.borrow_mut().clear());
+        }
+    }
+
+    /// A miss through `intern_wtf8_value` is a convert_const entry (prebuilt
+    /// weakref) even when the managed-alloc probe hooks are registered.
+    /// `get_interned_wtf8` and a second intern return it; `box_str_constant`
+    /// on the same text keeps that object. A later `box_str_constant` miss
+    /// is also convert_const and is counted as immortal.
     #[test]
     fn intern_miss_from_characters_is_immortal_and_constant_intern_stays_immortal() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
-        struct ClearProbe;
-        impl Drop for ClearProbe {
-            fn drop(&mut self) {
-                crate::gc_hook::clear_gc_owns_object_hook();
-                crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
-                MANAGED_ALLOCS.with(|slots| slots.borrow_mut().clear());
-            }
-        }
-        let _clear = ClearProbe;
+        let _hook_lock = intern_probe_guard();
+        let _clear = InternProbeClear;
         assert!(
             crate::gc_interp::enabled(),
             "managed intern falls back to immortal while gc_interp is off"
         );
-        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
-        crate::gc_hook::register_gc_alloc_hook(record_managed_alloc);
-        crate::gc_hook::register_gc_owns_object_hook(managed_alloc_is_owned);
 
+        let immortal_before = interned_size_immortal();
         let miss = Wtf8::new("__pyre_managed_miss_weak_slot_9c1e__");
         assert!(get_interned_wtf8(miss).is_none());
         let interned = intern_wtf8_value(miss);
-        assert!(!crate::gc_hook::try_gc_owns_object(
-            interned as crate::gc_hook::GCREF
-        ));
+        assert_eq!(interned_size_immortal(), immortal_before + 1);
         assert_eq!(get_interned_wtf8(miss), Some(interned));
         assert_eq!(intern_wtf8_value(miss), interned);
         assert_eq!(box_str_constant(miss), interned);
 
         let constant = Wtf8::new("__pyre_constant_immortal_slot_9c1e__");
         let boxed = box_str_constant(constant);
-        assert!(!crate::gc_hook::try_gc_owns_object(
-            boxed as crate::gc_hook::GCREF
-        ));
+        assert_eq!(interned_size_immortal(), immortal_before + 2);
         assert_eq!(get_interned_wtf8(constant), Some(boxed));
         let again = box_str_constant(constant);
         assert_eq!(again, boxed);
@@ -2446,29 +2527,19 @@ mod tests {
 
     /// `ObjSpace.new_interned_str`: a live managed interned identity is
     /// returned as-is by `intern_wtf8_value` / `intern_str_value` and stays
-    /// GC-owned. A miss is immortal (not GC-owned); `get_interned_wtf8` and a
+    /// GC-owned. A miss is convert_const; `get_interned_wtf8` and a
     /// second intern return it, and `box_str_constant` on that text returns
     /// the same object.
     #[test]
     fn intern_wtf8_value_keeps_live_managed_identity_and_miss_is_immortal() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
-        struct ClearProbe;
-        impl Drop for ClearProbe {
-            fn drop(&mut self) {
-                crate::gc_hook::clear_gc_owns_object_hook();
-                crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
-                MANAGED_ALLOCS.with(|slots| slots.borrow_mut().clear());
-            }
-        }
-        let _clear = ClearProbe;
+        let _hook_lock = intern_probe_guard();
+        let _clear = InternProbeClear;
         assert!(
             crate::gc_interp::enabled(),
             "managed intern falls back to immortal while gc_interp is off"
         );
-        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
-        crate::gc_hook::register_gc_alloc_hook(record_managed_alloc);
-        crate::gc_hook::register_gc_owns_object_hook(managed_alloc_is_owned);
 
+        let immortal_before = interned_size_immortal();
         let live = Wtf8::new("__pyre_intern_live_managed_hit_8a1b__");
         let managed = w_str_from_wtf8_managed(live.to_owned());
         assert!(crate::gc_hook::try_gc_owns_object(
@@ -2481,13 +2552,12 @@ mod tests {
         assert!(crate::gc_hook::try_gc_owns_object(
             interned_live as crate::gc_hook::GCREF
         ));
+        assert_eq!(interned_size_immortal(), immortal_before);
 
         let miss = Wtf8::new("__pyre_intern_miss_immortal_8a1b__");
         assert!(get_interned_wtf8(miss).is_none());
         let interned = intern_wtf8_value(miss);
-        assert!(!crate::gc_hook::try_gc_owns_object(
-            interned as crate::gc_hook::GCREF
-        ));
+        assert_eq!(interned_size_immortal(), immortal_before + 1);
         assert_eq!(get_interned_wtf8(miss), Some(interned));
         assert_eq!(intern_wtf8_value(miss), interned);
         assert_eq!(box_str_constant(miss), interned);
@@ -2497,24 +2567,14 @@ mod tests {
     /// intern-table lock keeps that identity (`intern_wtf8_value`).
     #[test]
     fn intern_publish_const_keeps_live_managed_entry() {
-        let _hook_lock = crate::gc_hook::hook_test_guard();
-        struct ClearProbe;
-        impl Drop for ClearProbe {
-            fn drop(&mut self) {
-                crate::gc_hook::clear_gc_owns_object_hook();
-                crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
-                MANAGED_ALLOCS.with(|slots| slots.borrow_mut().clear());
-            }
-        }
-        let _clear = ClearProbe;
+        let _hook_lock = intern_probe_guard();
+        let _clear = InternProbeClear;
         assert!(
             crate::gc_interp::enabled(),
             "managed intern falls back to immortal while gc_interp is off"
         );
-        crate::lowlevel_string::set_lowlevel_str_gc_type_id(1);
-        crate::gc_hook::register_gc_alloc_hook(record_managed_alloc);
-        crate::gc_hook::register_gc_owns_object_hook(managed_alloc_is_owned);
 
+        let immortal_before = interned_size_immortal();
         let live = Wtf8::new("__pyre_intern_publish_keep_managed_c3d4__");
         let managed = w_str_from_wtf8_managed(live.to_owned());
         assert!(crate::gc_hook::try_gc_owns_object(
@@ -2522,6 +2582,7 @@ mod tests {
         ));
         let interned_live = unsafe { intern_exact_str(managed) };
         assert_eq!(interned_live, managed);
+        assert_eq!(interned_size_immortal(), immortal_before);
 
         let immortal = w_str_from_wtf8_immortal(live.to_owned());
         let published = intern_publish_const(immortal, false);
@@ -2530,6 +2591,41 @@ mod tests {
             published as crate::gc_hook::GCREF
         ));
         assert_eq!(get_interned_wtf8(live), Some(interned_live));
+        assert_eq!(interned_size_immortal(), immortal_before);
+    }
+
+    /// A `new_interned_w_str` entry stays mortal after the interned string is
+    /// collector-owned (old-gen): the discriminator is the stored valueref
+    /// (`w_weakref_new`), not the referent generation. `box_str_constant`
+    /// replaces it; a convert_const entry is counted and kept.
+    #[test]
+    fn box_str_constant_replaces_managed_intern_and_immortal_census_skips_it() {
+        let _hook_lock = intern_probe_guard();
+        let _clear = InternProbeClear;
+        assert!(
+            crate::gc_interp::enabled(),
+            "managed intern falls back to immortal while gc_interp is off"
+        );
+
+        let immortal_before = interned_size_immortal();
+        let size_before = interned_size();
+        let live = Wtf8::new("__pyre_intern_replace_managed_e5f6__");
+        let managed = w_str_from_wtf8_managed(live.to_owned());
+        assert!(crate::gc_hook::try_gc_owns_object(
+            managed as crate::gc_hook::GCREF
+        ));
+        let interned_live = unsafe { intern_exact_str(managed) };
+        assert_eq!(interned_live, managed);
+        assert_eq!(interned_size(), size_before + 1);
+        assert_eq!(interned_size_immortal(), immortal_before);
+
+        let boxed = box_str_constant(live);
+        assert_ne!(boxed, interned_live);
+        assert_eq!(get_interned_wtf8(live), Some(boxed));
+        assert_eq!(intern_wtf8_value(live), boxed);
+        assert_eq!(interned_size(), size_before + 1);
+        assert_eq!(interned_size_immortal(), immortal_before + 1);
+        assert_eq!(box_str_constant(live), boxed);
     }
 
     #[test]
@@ -2626,9 +2722,12 @@ mod tests {
         if !WALK_INTERN_TABLE.with(|flag| flag.get()) {
             return;
         }
-        walk_interned_strings_gc(&mut |slot| {
-            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        });
+        let mut ptr = interned_strings_dict_ptr();
+        if ptr.is_null() || !crate::gc_hook::try_gc_owns_object(ptr as crate::gc_hook::GCREF) {
+            return;
+        }
+        visitor(unsafe { &mut *(&mut ptr as *mut _ as *mut majit_ir::GcRef) });
+        set_interned_strings_dict_ptr(ptr);
     }
 
     fn intern_test_gc_alloc(type_id: u32, payload_size: usize) -> crate::gc_hook::GCREF {
