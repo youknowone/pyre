@@ -7466,7 +7466,18 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(str_descr_new),
+            // unicodeobject.py descr_new — `object`/`encoding`/`errors`
+            // are all positional-or-keyword.
+            make_new_descr_with_signature(
+                str_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "object", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     // unicodeobject.py descr_repr / descr_str.  descr_str returns an
@@ -20986,7 +20997,12 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(int_descr_new),
+            // intobject.py descr_new(space, w_inttype, w_x, __posonly__,
+            // w_base=None) — `x` positional-only, `base` positional-or-keyword.
+            make_new_descr_with_signature(
+                int_descr_new,
+                crate::gateway::Signature::new(vec!["cls", "x", "base"], None, None, 0, 2),
+            ),
         )
     };
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose

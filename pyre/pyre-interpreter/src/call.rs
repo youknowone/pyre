@@ -3229,10 +3229,19 @@ pub fn parse_builtin_signature(
     // parameter total when the signature accepts keywords.  parse_obj
     // reports UnknownKwds / TooMany instead (`argument.py`).  Measured
     // against 3.14.6: `sum([1], **{K:0, "start":3})` is
-    // `takes at most 2 arguments (3 given)`.
+    // `takes at most 2 arguments (3 given)`; `int("5", 10, 1)` is
+    // `int expected at most 2 arguments, got 3` (`_PyArg_CheckPositional`
+    // on `descr_new`, cls excluded).
     if signature_accepts_keywords(sig) && !sig.has_vararg() && npos + nkw > sig.argnames.len() {
-        let n = sig.argnames.len();
-        let m = npos + nkw;
+        let skip = usize::from(signature_cls_constructor(sig));
+        let n = sig.argnames.len() - skip;
+        let m = npos + nkw - skip;
+        if skip != 0 && nkw == 0 {
+            let argword = if n == 1 { "argument" } else { "arguments" };
+            return Err(crate::PyError::type_error(format!(
+                "{fname} expected at most {n} {argword}, got {m}"
+            )));
+        }
         let argword = if n == 1 { "argument" } else { "arguments" };
         return Err(crate::PyError::type_error(format!(
             "{fname}() takes at most {n} {argword} ({m} given)"
@@ -3263,10 +3272,15 @@ fn signature_accepts_keywords(sig: &crate::Signature) -> bool {
     sig.has_kwarg() || sig.num_kwonlyargnames() > 0 || sig.num_argnames() > sig.posonlyargcount
 }
 
+fn signature_cls_constructor(sig: &crate::Signature) -> bool {
+    sig.argnames.first().copied() == Some("cls")
+}
+
 /// [3.14-spec] `parse_obj` says `takes no keyword arguments` when there
-/// is no `**` and no kw-only (`argument.py`).  3.14.6 names the extra
-/// key once the signature already accepts some keywords
-/// (`round(1.5, **{K:0})`, `sum([1,2], **{K:0})`).
+/// is no `**` and no kw-only (`argument.py`), and names a posonly-as-kw
+/// as `got some positional-only arguments passed as keyword arguments`.
+/// 3.14.6 names the extra key once the signature already accepts some
+/// keywords (`round(1.5, **{K:0})`, `int(x=5)`, `sum([1,2], **{K:0})`).
 fn rewrite_builtin_keyword_error(
     sig: &crate::Signature,
     fname: &str,
@@ -3276,13 +3290,16 @@ fn rewrite_builtin_keyword_error(
     if err.kind != crate::PyErrorKind::TypeError {
         return err;
     }
-    if !err.message_text().ends_with("takes no keyword arguments") {
-        return err;
-    }
     if !signature_accepts_keywords(sig) {
         return err;
     }
-    let Some(name) = first_unknown_keyword_name(sig, keyword_names_w) else {
+    let msg = err.message_text();
+    let rewrite = msg.ends_with("takes no keyword arguments")
+        || msg.contains("got some positional-only arguments passed as keyword arguments");
+    if !rewrite {
+        return err;
+    }
+    let Some(name) = first_unexpected_keyword_name(sig, keyword_names_w) else {
         return err;
     };
     crate::PyError::type_error(crate::display::wtf8_format!(
@@ -3292,15 +3309,21 @@ fn rewrite_builtin_keyword_error(
     ))
 }
 
-fn first_unknown_keyword_name(
+fn first_unexpected_keyword_name(
     sig: &crate::Signature,
     keyword_names_w: &[PyObjectRef],
 ) -> Option<Wtf8Buf> {
     for &w_name in keyword_names_w {
         let text = keyword_name_text(w_name);
         match keyword_name_utf8(&text) {
-            Some(name) if sig.find_argname(name) >= 0 => continue,
-            _ => return Some(text),
+            Some(name) => {
+                let idx = sig.find_argname(name);
+                if idx >= 0 && (idx as usize) >= sig.posonlyargcount {
+                    continue;
+                }
+                return Some(text);
+            }
+            None => return Some(text),
         }
     }
     None

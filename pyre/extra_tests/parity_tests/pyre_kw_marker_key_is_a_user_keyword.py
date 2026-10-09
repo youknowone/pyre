@@ -96,7 +96,6 @@ def int_rejects_the_marker_key():
             "TypeError",
             "int() got an unexpected keyword argument '%s'" % K,
         ),
-        xfail=("ok", 5),
     )
 
 
@@ -108,7 +107,6 @@ def str_rejects_the_marker_key():
             "TypeError",
             "str() got an unexpected keyword argument '%s'" % K,
         ),
-        xfail=("ok", "b'x'"),
     )
 
 

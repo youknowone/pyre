@@ -1784,6 +1784,9 @@ pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObject
     if let Some(name) = starargs_constructor_type_name(code, receiver) {
         return name;
     }
+    if let Some(name) = new_constructor_type_name(code, receiver) {
+        return name;
+    }
     builtin_names(code, receiver).1
 }
 
@@ -1809,6 +1812,24 @@ fn starargs_constructor_type_name(
         return None;
     };
     if arg0 != "self" && arg0 != "cls" {
+        return None;
+    }
+    let receiver = receiver.filter(|receiver| !receiver.is_null())?;
+    if unsafe { pyre_object::typeobject::is_type(receiver) } {
+        return Some(unsafe { pyre_object::w_type_get_qualname(receiver) }.to_string());
+    }
+    crate::typedef::r#type(receiver)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string())
+}
+
+/// Clinic `tp_new` wrapper names the type (`int()`, not `int.__new__()`).
+/// [3.14-spec] vs PyPy `descr_new` reporting `int.__new__()`.
+fn new_constructor_type_name(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> Option<String> {
+    if code.name != "__new__" {
+        return None;
+    }
+    let sig = unsafe { code.sig.as_ref() }?;
+    if sig.argnames.first().copied() != Some("cls") {
         return None;
     }
     let receiver = receiver.filter(|receiver| !receiver.is_null())?;

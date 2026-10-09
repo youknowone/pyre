@@ -12501,39 +12501,32 @@ pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
 
 /// `str(obj)` → convert to string
 pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["object", "encoding", "errors"], "str")?;
-    let kw_count = kwargs
-        .map(|dict| unsafe {
-            pyre_object::w_dict_str_entries_wtf8(dict)
-                .iter()
-                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
-                .count()
-        })
-        .unwrap_or(0);
-    let arg_count = pos.len() + kw_count;
-    if pos.len() > 3 {
+    // Bound scope from `parse_obj` on `str.__new__`: `object`, `encoding`,
+    // `errors` (`PY_NULL` omitted). unicodeobject.py `descr_new`.
+    if args.len() > 3 {
         return Err(crate::PyError::type_error(format!(
             "str expected at most 3 arguments, got {}",
-            pos.len()
-        )));
-    }
-    if arg_count > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "str() takes at most 3 arguments ({} given)",
-            arg_count
+            args.len()
         )));
     }
     // `str(object='', encoding='utf-8', errors='strict')` — every parameter
-    // is positional-or-keyword (unicodeobject.py:descr_new).  An absent
-    // `object` yields the empty string; an encoding/errors of None counts as
-    // "not given".
-    let mut obj = match resolve_pos_or_kw(pos.first().copied(), kwargs, "object", "str", 1)? {
-        Some(o) => o,
-        None => return Ok(w_str_new("")),
+    // is positional-or-keyword.  An absent `object` yields the empty string;
+    // an encoding/errors of None counts as "not given".
+    let mut obj = if args.is_empty() || args[0].is_null() {
+        return Ok(w_str_new(""));
+    } else {
+        args[0]
     };
-    let w_encoding = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "encoding", "str", 2)?;
-    let w_errors = resolve_pos_or_kw(pos.get(2).copied(), kwargs, "errors", "str", 3)?;
+    let w_encoding = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
+    let w_errors = if args.len() > 2 && !args[2].is_null() {
+        Some(args[2])
+    } else {
+        None
+    };
     // `_get_encoding_and_errors` — a *supplied* encoding/errors must be a
     // str; an explicit `None` is supplied (not "omitted") and so is
     // rejected.  Encoding is validated before errors.
@@ -12792,31 +12785,27 @@ pub fn call_and_check(
 
 /// intobject.py _new_baseint
 pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `int(x=0, base=10)` — `x` is positional-only (a `base` keyword is the
-    // only one accepted), `base` is positional-or-keyword at position 2
-    // (intobject.py descr_new).
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    // `descr_new(space, w_inttype, w_x, __posonly__, w_base=None)` has two
-    // user-visible slots.  PyPy's gateway rejects surplus positionals while
-    // binding that signature, before `_new_int` runs; pyre's flat builtin
-    // ABI must perform the same gateway check explicitly.
-    if pos.len() > 2 {
+    // Bound scope from `parse_obj` on `int.__new__`: `x`, `base`
+    // (`PY_NULL` omitted). intobject.py `descr_new`.
+    if args.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "int expected at most 2 arguments, got {}",
-            pos.len()
+            args.len()
         )));
     }
-    kwarg_reject_unknown(kwargs, &["base"], "int")?;
-    let w_base = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "base", "int", 2)?;
-    let mut obj = match pos.first().copied() {
-        Some(o) => o,
-        None => {
-            // intobject.py:986 — a base without a value is a missing source.
-            if w_base.is_some() {
-                return Err(crate::PyError::type_error("int() missing string argument"));
-            }
-            return Ok(w_int_new(0));
+    let w_base = if args.len() > 1 && !args[1].is_null() {
+        Some(args[1])
+    } else {
+        None
+    };
+    let mut obj = if args.is_empty() || args[0].is_null() {
+        // intobject.py descr_new — a base without a value is a missing source.
+        if w_base.is_some() {
+            return Err(crate::PyError::type_error("int() missing string argument"));
         }
+        return Ok(w_int_new(0));
+    } else {
+        args[0]
     };
 
     if w_base.is_none() {
