@@ -1,7 +1,10 @@
-# pyre-check: max-pypy-ratio=80
+# pyre-check: max-pypy-ratio=18.6
 # Exact-int BINARY_SLICE on a list: the walker descends
 # `binary_slice_values_inner` (no residual CallMayForceR).
-N = 50000
+# N is large enough that pypy's execution-only time clears
+# FLOOR_GATE_MIN_BASELINE_S so the ratio gate is actually evaluated.
+# Darwin dynasm 8.3-9.3x; ceiling is twice the slower, one decimal.
+N = 16000000
 
 
 def slice_loop(n):

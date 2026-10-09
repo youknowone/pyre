@@ -196,6 +196,64 @@ fn tuple_field_of_local(place: &Place) -> Option<(usize, u64)> {
     Some((place_local(inner)?, index))
 }
 
+/// Whether a `Ref` / `RawPtr` kind writes through the borrowed place.
+fn ref_kind_mutates(kind: &Value) -> bool {
+    match kind {
+        Value::String(s) => s.contains("Mut"),
+        Value::Object(m) => m.keys().any(|k| k.contains("Mut")),
+        _ => false,
+    }
+}
+
+/// Assignments of each local: `Assign` destinations, call destinations,
+/// and `&mut` / `*mut` borrows of a local. `StorageLive` / `StorageDead`
+/// are not definitions.
+fn local_def_counts(body: &Unstructured, llbc: &Llbc) -> Vec<u32> {
+    let n = body.locals.locals.len();
+    let mut counts = vec![0u32; n];
+    let bump = |counts: &mut [u32], l: Option<usize>| {
+        if let Some(l) = l
+            && let Some(c) = counts.get_mut(l)
+        {
+            *c = c.saturating_add(1);
+        }
+    };
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(kind) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            match kind {
+                StmtKind::Assign(place, rvalue) => {
+                    bump(&mut counts, place_local(place));
+                    match rvalue {
+                        Rvalue::Ref {
+                            place: src, kind, ..
+                        }
+                        | Rvalue::RawPtr {
+                            place: src, kind, ..
+                        } => {
+                            if ref_kind_mutates(kind) {
+                                bump(
+                                    &mut counts,
+                                    place_local(src).or_else(|| deref_of_local(src)),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {}
+                _ => {}
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) {
+            bump(&mut counts, place_local(&call.dest));
+        }
+    }
+    counts
+}
+
 /// An unsigned scalar constant operand.
 fn const_usize(op: &Operand, llbc: &Llbc) -> Option<usize> {
     let Operand::Const(v) = op else {
@@ -437,9 +495,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // Depth-neutral is the erasure gate (`_fix_graph_after_inlining`):
     // every path restores the entry depth and no instruction reads a
     // caller-owned slot. A body that only "has an Open in one block and
-    // a Close in another" is not enough, and a stack-sensitive callee
-    // does not by itself refuse — the path walk already treated an
-    // unproven sensitive callee as unknown depth, which Close rewinds.
+    // a Close in another" is not enough. An unproven stack-sensitive
+    // callee may read caller-owned slots, so the walk fails the proof.
     let sensitive =
         |path: &str| llbc.is_stack_sensitive_fn(path) && !llbc.is_stack_depth_neutral_fn(path);
     if !body_is_depth_neutral(body, llbc, &sensitive) {
@@ -477,6 +534,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         };
     let slot_local = |k: usize| n_locals + k;
 
+    let def_counts = local_def_counts(body, llbc);
+    let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
     let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
@@ -524,32 +583,32 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             };
             match rvalue {
                 Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
-                    array_lens.insert(dest, operands.len());
+                    if single_def(dest) {
+                        array_lens.insert(dest, operands.len());
+                    }
                 }
                 Rvalue::Len(src) => {
                     let base = place_local(src).or_else(|| deref_of_local(src));
-                    if let Some(n) = base.and_then(|l| array_lens.get(&l).copied()) {
+                    if single_def(dest)
+                        && let Some(n) = base.and_then(|l| array_lens.get(&l).copied())
+                    {
                         const_locals.insert(dest, n);
                     }
                 }
                 Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
                     let base = place_local(src).or_else(|| deref_of_local(src));
-                    if let Some(n) = base.and_then(|l| array_lens.get(&l).copied()) {
+                    if single_def(dest)
+                        && let Some(n) = base.and_then(|l| array_lens.get(&l).copied())
+                    {
                         array_lens.insert(dest, n);
                     }
                 }
-                Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => {
-                    if let Some(l) = operand_local(op) {
-                        if let Some(n) = array_lens.get(&l).copied() {
-                            array_lens.insert(dest, n);
-                        }
-                        if let Some(n) = const_locals.get(&l).copied() {
-                            const_locals.insert(dest, n);
-                        }
-                    }
-                }
+                // Cast / UnaryOp may change the value (narrowing, negation,
+                // bit-not). `constfold.fold_op_list` evaluates them; this
+                // pass does not, so the fact is dropped.
                 Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
-                    if let Some((pair, 1)) = tuple_field_of_local(src)
+                    if single_def(dest)
+                        && let Some((pair, 1)) = tuple_field_of_local(src)
                         && let Some(n) = array_lens.get(&pair).copied()
                     {
                         const_locals.insert(dest, n);
@@ -575,11 +634,13 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 Rvalue::Use(op, _) => match op {
                     Operand::Copy(src) | Operand::Move(src) => {
                         if let Some(l) = place_local(src) {
-                            if let Some(n) = const_locals.get(&l).copied() {
-                                const_locals.insert(dest, n);
-                            }
-                            if let Some(n) = array_lens.get(&l).copied() {
-                                array_lens.insert(dest, n);
+                            if single_def(dest) {
+                                if let Some(n) = const_locals.get(&l).copied() {
+                                    const_locals.insert(dest, n);
+                                }
+                                if let Some(n) = array_lens.get(&l).copied() {
+                                    array_lens.insert(dest, n);
+                                }
                             }
                             match plan.specials.get(&l) {
                                 Some(Special::Index(k)) => Some(Special::Index(*k)),
@@ -597,7 +658,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         }
                     }
                     Operand::Const(_) => {
-                        if let Some(n) = const_usize(op, llbc) {
+                        if single_def(dest)
+                            && let Some(n) = const_usize(op, llbc)
+                        {
                             const_locals.insert(dest, n);
                         }
                         None
@@ -1206,17 +1269,32 @@ pub fn census(llbc: &Llbc) -> std::collections::BTreeMap<&'static str, Vec<Strin
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Depth {
     Known(usize),
+    /// Unknown, but above the entry: a callee ran while the body held
+    /// slots of its own, so the slots under that callee are the body's.
+    Above,
     Unknown,
 }
 
 impl Depth {
+    /// The body holds at least one slot of its own.
+    fn above_entry(self) -> bool {
+        matches!(self, Depth::Known(1..) | Depth::Above)
+    }
+
     fn join(self, other: Depth) -> Depth {
-        if self == other { self } else { Depth::Unknown }
+        if self == other {
+            self
+        } else if self.above_entry() && other.above_entry() {
+            Depth::Above
+        } else {
+            Depth::Unknown
+        }
     }
 
     fn add(self, n: usize) -> Depth {
         match self {
             Depth::Known(d) => Depth::Known(d + n),
+            Depth::Above => Depth::Above,
             Depth::Unknown => Depth::Unknown,
         }
     }
@@ -1224,7 +1302,16 @@ impl Depth {
     fn checked_sub(self, n: usize) -> Option<Depth> {
         match self {
             Depth::Known(d) => d.checked_sub(n).map(Depth::Known),
-            Depth::Unknown => Some(Depth::Unknown),
+            Depth::Above | Depth::Unknown => Some(Depth::Unknown),
+        }
+    }
+
+    /// The depth after a callee that may leave slots behind.
+    fn after_unknown_push(self) -> Depth {
+        if self.above_entry() {
+            Depth::Above
+        } else {
+            Depth::Unknown
         }
     }
 }
@@ -1427,7 +1514,7 @@ fn stack_walk(body: &Unstructured, llbc: &Llbc, sensitive: &dyn Fn(&str) -> bool
                                         }
                                         depth = depth.add(n);
                                     }
-                                    None => depth = Depth::Unknown,
+                                    None => depth = depth.after_unknown_push(),
                                 }
                             }
                             Leaf::Normalize | Leaf::NormalizeMoved => {}
@@ -1452,14 +1539,22 @@ fn stack_walk(body: &Unstructured, llbc: &Llbc, sensitive: &dyn Fn(&str) -> bool
                     }
                     None => {
                         if path.as_deref().is_some_and(sensitive) {
-                            // May leave slots. Close of our own guard
-                            // still rewinds them. Get/Set below entry in
-                            // THIS body is tracked on those arms.
-                            // `_fix_graph_after_inlining` follows the
-                            // same path: a call is wrapped in push/pop
-                            // of the live roots, depth after the call is
-                            // unknown until our pop.
-                            depth = Depth::Unknown;
+                            // Unproven stack-sensitive callee. At
+                            // Known(0) every live slot is the caller's,
+                            // so the body is not neutral. Inside our
+                            // own Open (`eval_slice_index` pin then
+                            // `getindex_w`) only the depth is unknown:
+                            // Close rewinds our guard, and
+                            // `is_stack_depth_neutral_fn` still holds
+                            // so BINARY_SLICE can erase its bracket.
+                            if !depth.above_entry() {
+                                reads_below = true;
+                                why = format!(
+                                    "unproven-stack-sensitive {}",
+                                    path.as_deref().unwrap_or("")
+                                );
+                            }
+                            depth = depth.after_unknown_push();
                         }
                     }
                 }
@@ -2039,6 +2134,29 @@ mod tests {
         );
     }
 
+    fn stack_ops_llbc_with_callee() -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["other", "unproven_callee"], json!("Opaque")),
+                    opaque_fun(6, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.register_stack_sensitive_fns(["other::unproven_callee".into()]);
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
     fn bb_stmts(statements: Vec<Value>, kind: Value) -> Value {
         json!({
             "statements": statements,
@@ -2175,6 +2293,119 @@ mod tests {
             is_neutral(&body, &llbc),
             "SubChecked len-1 of a just-pinned slot must be depth-neutral"
         );
+    }
+
+    fn stmt(kind: Value) -> Value {
+        json!({"span": span(), "kind": kind})
+    }
+
+    #[test]
+    fn depth_neutral_refuses_unproven_stack_sensitive_callee() {
+        let llbc = stack_ops_llbc_with_callee();
+        let unproven = |path: &str| path.ends_with("unproven_callee");
+        // After Close the depth is Known(0): every remaining slot is the
+        // caller's, so an unproven stack-sensitive callee is not neutral.
+        let after_close = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(drop_local(1, 3)),
+                bb(call_fun(5, vec![], 4, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        assert!(
+            !body_is_depth_neutral(&after_close, &llbc, &unproven),
+            "unproven stack-sensitive callee at Known(0) must not be depth-neutral"
+        );
+        assert!(
+            body_is_depth_neutral(&after_close, &llbc, &|_| false),
+            "the same body is depth-neutral once the callee is proven"
+        );
+        // `eval_slice_index`: Open, pin, `getindex_w`, Close. The unproven
+        // callee runs inside our guard; Close rewinds it.
+        let inside_scope = body_of(
+            4,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(5, vec![], 3, 3)),
+                bb(call_fun(5, vec![], 3, 4)),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        assert!(
+            body_is_depth_neutral(&inside_scope, &llbc, &unproven),
+            "unproven callees inside our Open/Close are depth-neutral"
+        );
+    }
+
+    #[test]
+    fn bounds_assert_not_erased_when_length_local_is_reassigned() {
+        let llbc = stack_ops_llbc_with_callee();
+        let array = json!({"Assign": [
+            place(2),
+            {"Aggregate": [
+                {"Array": [ty(), {"Deduplicated": 1}, null]},
+                [
+                    {"Move": place(7)},
+                    {"Move": place(8)},
+                    {"Move": place(9)}
+                ]
+            ]}
+        ]});
+        let len_of_array = json!({"Assign": [
+            place(5),
+            {"Len": place(2)}
+        ]});
+        let unknown = json!({"Assign": [
+            place(5),
+            {"Use": [{"Copy": place(6)}, "Yes"]}
+        ]});
+        let assert_term = json!({"Assert": {
+            "assert": {
+                "cond": {"Copy": place(3)},
+                "expected": true,
+                "check_kind": {"BoundsCheck": {
+                    "len": {"Copy": place(5)},
+                    "index": {"Copy": place(3)}
+                }}
+            },
+            "target": 6,
+            "on_unwind": 99
+        }});
+        let body = body_of(
+            10,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb_stmts(
+                    vec![stmt(array)],
+                    call_fun(6, vec![json!({"Move": place(2)})], 3, 2),
+                ),
+                bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [3, 4]}
+                }})),
+                bb_stmts(vec![stmt(len_of_array)], json!({"Goto": {"target": 5}})),
+                bb_stmts(vec![stmt(unknown)], json!({"Goto": {"target": 5}})),
+                bb_stmts(vec![], assert_term),
+                bb(drop_local(1, 7)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(plan)) => assert!(
+                !plan.terms.contains_key(&5),
+                "bounds assert must not be erased when the length local is assigned on two paths"
+            ),
+            Err(reason) => assert_eq!(
+                reason, "unmodeled-use-in-terminator",
+                "keeping the bracket is the sound answer when the length local disagrees across paths"
+            ),
+            Ok(None) => panic!("body has a root bracket"),
+        }
     }
 
     #[test]

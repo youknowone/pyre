@@ -1254,7 +1254,14 @@ pub extern "C" fn jit_runtime_ops_binary_slice_values(
     stop: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
-    match crate::runtime_ops::binary_slice_values_inner(obj, start, stop) {
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::publish_roots(&[obj, start, stop]);
+    pyre_object::gc_roots::normalize_roots(obj_slot, 3);
+    match crate::runtime_ops::binary_slice_values_inner(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
+        pyre_object::gc_roots::shadow_stack_get(obj_slot + 2),
+    ) {
         Ok(result) => result,
         Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }

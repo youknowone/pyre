@@ -14885,10 +14885,17 @@ fn handle<Sym: WalkSym>(
                                 if p.is_null() {
                                     None
                                 } else {
-                                    if clear {
-                                        unsafe {
-                                            pyre_object::object_array::typed_items_block_clear(p)
-                                        };
+                                    // `alloc_typed_items_block_nursery` stores
+                                    // `cap.max(1)` (other callers keep that).
+                                    // `bh_new_array` / `execute_new_array_clear`
+                                    // use the requested length; 0 stays 0.
+                                    // `ll_alloc_and_set` zeros via
+                                    // `typed_items_block_clear`.
+                                    unsafe {
+                                        if clear {
+                                            pyre_object::object_array::typed_items_block_clear(p);
+                                        }
+                                        (*p).capacity = cap;
                                     }
                                     Some(p as *mut u8)
                                 }
