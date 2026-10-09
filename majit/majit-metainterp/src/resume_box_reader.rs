@@ -703,13 +703,19 @@ pub fn materialize_bridge_virtual(
                 continue;
             }
             // resume.py self.setfields → decoder.setfield(struct,
-            // fieldnum, fielddescr): reuse the parent SizeDescr's live
-            // FieldDescr (canonical immutable / quasi-immutable / ei_index)
-            // rather than reconstructing a partial copy. The descr is keyed
-            // by index_in_parent (small sequential), not the 268M-hash
-            // stable_field_index.
+            // fieldnum, self.fielddescrs[i]): reuse the parent SizeDescr's
+            // live FieldDescr (canonical immutable / quasi-immutable /
+            // ei_index) rather than reconstructing a partial copy. The row
+            // is `fielddescrs[i]`; an offset alone does not name it when two
+            // fields overlay one word.
             let field_descr =
-                majit_ir::descr::field_descr_from_parent_by_offset(&parent_descr, fd_info.offset);
+                crate::resume::live_field_descr_for_resume(Some(&parent_descr), i, fd_info)
+                    .unwrap_or_else(|| {
+                        majit_ir::descr::field_descr_from_parent_by_offset(
+                            &parent_descr,
+                            fd_info.offset,
+                        )
+                    });
             // resume.py allocate_with_vtable materializer operations use
             // `execute_and_record`.
             ctx.profiler()
@@ -1931,6 +1937,37 @@ mod tests {
         assert!(!result.is_none(), "pointer-field virtual must materialize");
         assert_eq!(*alloc.refs.borrow(), vec![0x1111]);
         assert!(alloc.ints.borrow().is_empty());
+
+        // setfields passes `self.fielddescrs[i]`. An Int row overlaying the
+        // pointer's word sits earlier in the list; the row is the one at the
+        // snapshot's position, not the first at that offset.
+        let word_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abd, 16, 8, Type::Int, false).with_index_in_parent(0),
+        );
+        let overlay_ptr_fd = Arc::new(
+            SimpleFieldDescr::new(0x1000_0abc, 16, 8, Type::Ref, false)
+                .with_flag(ArrayFlag::Pointer)
+                .with_index_in_parent(1),
+        );
+        let overlay_parent: majit_ir::DescrRef = Arc::new(
+            SimpleSizeDescr::new(0x3000_0002, 32, 1).with_all_fielddescrs(vec![
+                word_fd.clone() as Arc<dyn FieldDescr>,
+                overlay_ptr_fd.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        let live = crate::resume::live_field_descr_for_resume(
+            Some(&overlay_parent),
+            1,
+            &FieldDescrInfo {
+                index: overlay_ptr_fd.index(),
+                offset: 16,
+                field_type: Type::Ref,
+                field_size: 8,
+            },
+        )
+        .expect("the snapshot row is listed");
+        assert!(live.as_field_descr().unwrap().is_pointer_field());
+        assert_eq!(live.index(), overlay_ptr_fd.index());
     }
 
     /// pyjitpl.py `MetaInterp.rebuild_state_after_failure` /

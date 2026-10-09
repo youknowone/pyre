@@ -7166,12 +7166,23 @@ fn vstr_plain_info_allocate(
 /// `field_type` was stored as Int. Two flattened leaves can share that
 /// pair (`stable_field_index`); then keep the snapshot bank
 /// (`snapshot_field_descr_info`).
-fn live_field_descr_for_resume(
+pub(crate) fn live_field_descr_for_resume(
     parent: Option<&majit_ir::DescrRef>,
+    i: usize,
     info: &majit_ir::FieldDescrInfo,
 ) -> Option<majit_ir::DescrRef> {
     let sd = parent?.as_size_descr()?;
     let fields = sd.all_fielddescrs();
+    // `AbstractVirtualStructInfo.setfields` reads `self.fielddescrs[i]`,
+    // and the snapshot was written from `descr.get_all_fielddescrs()` in
+    // order. Two fields that overlay one word share the offset, so only
+    // the position names the row.
+    if let Some(fd) = fields
+        .get(i)
+        .filter(|fd| fd.index() == info.index && fd.offset() == info.offset)
+    {
+        return Some(std::sync::Arc::clone(fd) as majit_ir::DescrRef);
+    }
     let want_ptr = info.field_type == majit_ir::Type::Ref;
     let want_float = info.field_type == majit_ir::Type::Float;
     let same_index_offset: Vec<&std::sync::Arc<dyn majit_ir::FieldDescr>> = fields
@@ -7259,7 +7270,7 @@ fn abstract_virtual_struct_info_setfields(
     // for i in range(len(self.fielddescrs)):
     //     decoder.setfield(struct, self.fieldnums[i], self.fielddescrs[i])
     for (i, descr_info) in fielddescrs.iter().enumerate() {
-        let live = live_field_descr_for_resume(parent, descr_info);
+        let live = live_field_descr_for_resume(parent, i, descr_info);
         let Some(source) = virtual_struct_field_source(fields, i) else {
             continue;
         };
