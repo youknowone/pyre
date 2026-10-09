@@ -7126,6 +7126,13 @@ impl<'a> Transformer<'a> {
         // not a bare leaf — a user function named `cast_int_to_ptr` is
         // an ordinary call (`pointer_cast_function_names_do_not_alias`).
         if let CallTarget::FunctionPath { segments, .. } = target {
+            // `extfunc.py register_external(..., [], None)` with no
+            // effects: the annotator already answered `s_None`. Drop
+            // the call the way `rewrite_op_getfield` returns on
+            // `RESULT is lltype.Void` (`jtransform.py`).
+            if crate::translator::rtyper::cutover::is_no_effect_external(segments) {
+                return RewriteResult::Replace(Vec::new());
+            }
             // `current_gc_ref` is the residual stand-in for the GC
             // transform's livevar reload (`rgc` rewrites the same box
             // in place). A new SSA box here lets heap CSE keep the
