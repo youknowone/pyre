@@ -3829,7 +3829,7 @@ impl Bookkeeper {
             "()" => return super::model::s_none(),
             _ => {}
         }
-        for list_wrapper in ["Vec<", "VecDeque<"] {
+        for list_wrapper in ["Vec<", "VecDeque<", "Slice<"] {
             if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
                 let s_inner = self.project_struct_field_type(inner);
                 // A projected field list is a fresh `ListDef` stored on

@@ -12040,6 +12040,30 @@ mod tests {
         BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
     };
 
+    /// Production BFS (`helper_roots` empty) seeds the builtin-wrapper PBC
+    /// family into `candidate_graphs`, the two-phase prepass's subject set.
+    /// RPython `call.py find_all_graphs` reaches `BuiltinCode.func` from the
+    /// portal; pyre seeds the same family explicitly.
+    #[test]
+    fn find_all_graphs_seeds_a_builtin_wrapper_as_a_candidate() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "portal"]);
+        let wrapper = CallPath::from_segments(["fixture", "__majit_wrap_cdata_call"]);
+        cc.register_function_graph(portal.clone(), FunctionGraph::new("portal"));
+        cc.register_function_graph(
+            wrapper.clone(),
+            FunctionGraph::new("__majit_wrap_cdata_call"),
+        );
+        cc.register_function_fnaddr(wrapper.clone(), 0x1000);
+        cc.mark_portal(portal);
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        assert!(
+            cc.is_candidate(&wrapper),
+            "a registered __majit_wrap_* graph must be a two-phase candidate"
+        );
+    }
+
     /// An earlier alias's hint set is unioned with a later one, not replaced.
     #[test]
     fn graph_store_unions_hints_across_alias_inserts() {

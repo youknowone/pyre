@@ -8581,37 +8581,9 @@ fn pygraph_initial_block(
             Some("GCREF".to_string())
         } else {
             match &ty {
-                ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
-                    // A `&str` / `str` param strips to the `str` builtin
-                    // (not an ADT), so `tyref_class_root` answers `None`;
-                    // name it `"str"` so `derive_subject_inputcells` seeds
-                    // the byte `SomeString` (`s_str0`) instead of the
-                    // abstract `SomeInstance(None)` a `Ref(None)` projects
-                    // to.  A string param compared against a string literal
-                    // then rtypes as `pair(StringRepr, StringRepr)` rather
-                    // than walling at `pair(InstanceRepr, StringRepr)`.
-                    .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                    // named-ADT leaf — `tyref_class_root` answers `None`
-                    // because `adt_node_class_root` excludes the
-                    // core/std/alloc container family from classdef
-                    // minting.  Carry its full monomorphic spelling so
-                    // `derive_subject_inputcells` projects it through the
-                    // annotator's list model (`project_struct_field_type`)
-                    // instead of the classdef-less `SomeInstance(None)`
-                    // shell, on which a `len()` / iteration would wall at
-                    // `getattr` over a classdef-less instance.
-                    .or_else(|| {
-                        let spelling = tyref_to_ast_string(&local.ty, llbc);
-                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
-                    })
-                    // A tuple param (a closure's `call_once(env, args)`
-                    // args tuple, or `&(A, B)`) is an RPython tuple.
-                    // Carry the same `Tuple<A,B>` shape its `.N` reads
-                    // name as owner, so `derive_subject_inputcells`
-                    // seeds the `SomeTuple` those `getitem`s read.
-                    .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
+                ValueType::Ref(_) => {
+                    tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                }
                 // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                 // so it takes the non-`Ref` arm and would otherwise carry no
                 // `class_root`.  Its variant-name metadata is a side table
@@ -8855,35 +8827,9 @@ impl<'a> Lowering<'a> {
                 Some("GCREF".to_string())
             } else {
                 match &ty {
-                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
-                        // A `&str` / `str` param strips to the `str` builtin
-                        // (not an ADT), so `tyref_class_root` answers `None`;
-                        // name it `"str"` so `derive_subject_inputcells` seeds
-                        // the byte `SomeString` (`s_str0`) instead of the
-                        // abstract `SomeInstance(None)` a `Ref(None)` projects
-                        // to.  A string param compared against a string literal
-                        // then rtypes as `pair(StringRepr, StringRepr)` rather
-                        // than walling at `pair(InstanceRepr, StringRepr)`.
-                        .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                        .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                        // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                        // named-ADT leaf — `tyref_class_root` answers `None`
-                        // because `adt_node_class_root` excludes the
-                        // core/std/alloc container family from classdef
-                        // minting.  Carry its full monomorphic spelling so
-                        // `derive_subject_inputcells` projects it through the
-                        // annotator's list model (`project_struct_field_type`)
-                        // instead of the classdef-less `SomeInstance(None)`
-                        // shell, on which a `len()` / iteration would wall at
-                        // `getattr` over a classdef-less instance.
-                        .or_else(|| {
-                            let spelling = tyref_to_ast_string(&local.ty, llbc);
-                            majit_ir::descr::is_list_container_spelling(&spelling)
-                                .then_some(spelling)
-                        })
-                        // A tuple param is an RPython tuple. Carry the same
-                        // `Tuple<A,B>` shape its `.N` reads name as owner.
-                        .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
+                    ValueType::Ref(_) => {
+                        tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                    }
                     // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                     // so it takes the non-`Ref` arm and would otherwise carry no
                     // `class_root`.  Its variant-name metadata is a side table
@@ -56081,6 +56027,29 @@ fn tyref_input_class_root(
     }
 }
 
+/// `OpKind::Input.class_root` for a `Ref`-typed parameter.
+///
+/// A list-typed param (`Vec<T>`, `&[T]`, Charon builtin `Slice<T>`) is
+/// the annotator's list model. Prefer the monomorphic spelling over an
+/// ADT leaf (`Slice`) so `derive_subject_inputcells` seeds `SomeList`
+/// instead of a classdef-less `SomeInstance` whose `len()` walls at
+/// `getattr("__len__")`.
+fn tyref_ref_param_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    generics: Option<&serde_json::Value>,
+) -> Option<String> {
+    let spelling = tyref_to_ast_string(ty, llbc);
+    if majit_ir::descr::is_list_container_spelling(&spelling) {
+        return Some(spelling);
+    }
+    tyref_input_class_root(ty, llbc, tombstoned)
+        .or_else(|| tyref_strips_to_str(ty, llbc).then(|| "str".to_string()))
+        .or_else(|| tyref_generic_trait_bound_root(ty, llbc, generics))
+        .or_else(|| tyref_shaped_tuple_root(ty, llbc))
+}
+
 /// The inner [`ValueType`] of a `core::sync::atomic::Atomic<T>`
 /// (`Atomic<i64>` → `Int`, `Atomic<usize>` → `Unsigned`, `Atomic<bool>` →
 /// `Bool`, `Atomic<*mut T>` → `Ref(None)`), or `None` when `ty` is not a
@@ -60283,6 +60252,10 @@ fn charon_builtin_adt_to_ast_string(builtin: &serde_json::Value, type_args: &[St
             None => "Box".to_string(),
         },
         "Str" => "str".to_string(),
+        "Slice" => match type_args.first() {
+            Some(inner) => format!("[{inner}]"),
+            None => "[]".to_string(),
+        },
         other => format!("??builtin_{other}"),
     }
 }
@@ -76603,6 +76576,11 @@ mod tests {
         assert!(!borrow(serde_json::json!({"Slice": [u8_ty.clone(), null]})));
         assert!(!borrow(builtin("Str", serde_json::json!([]))));
         assert!(!borrow(serde_json::json!({"DynTrait": {}})));
+
+        let slice_adt = TyRef::Other(builtin("Slice", serde_json::json!([u8_ty])));
+        let spelling = super::tyref_to_ast_string(&slice_adt, &llbc);
+        assert_eq!(spelling, "[u8]");
+        assert!(majit_ir::descr::is_list_container_spelling(&spelling));
 
         // A fixed-length array IS sized, so a pointer to one stays thin.
         let len = serde_json::json!([

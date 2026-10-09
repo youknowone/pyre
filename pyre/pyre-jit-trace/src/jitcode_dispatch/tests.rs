@@ -5787,6 +5787,21 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
 }
 
 #[test]
+fn empty_dict_alloc_jitcode_names_match_build_map_zero_helpers() {
+    // BUILD_MAP 0 residualled as NewEmptyDict; the fully-bound form is
+    // `inline_call_r_r` of these two leaves.  `w_dict_new_kwargs` is a
+    // different helper.
+    assert!(jitcode_is_empty_dict_alloc("w_dict_new"));
+    assert!(jitcode_is_empty_dict_alloc("newdict_empty"));
+    assert!(jitcode_is_empty_dict_alloc(
+        "pyre_object::dictmultiobject::w_dict_new"
+    ));
+    assert!(!jitcode_is_empty_dict_alloc("w_dict_new_kwargs"));
+    assert!(!jitcode_is_empty_dict_alloc("dict_display_setitem"));
+    assert!(!jitcode_is_empty_dict_alloc(""));
+}
+
+#[test]
 fn replay_scan_treats_callee_frame_bookkeeping_as_call_owned() {
     let get_vable = *insns_opname_to_byte()
         .get("getarrayitem_vable_r/ridd>r")

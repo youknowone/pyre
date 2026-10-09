@@ -306,9 +306,22 @@ impl CodeWriter {
     /// two.
     pub fn run_two_phase_prepass(&self, callcontrol: &CallControl) {
         let registry = self.dual_gate_registry(callcontrol);
+        // Upstream `translator.graphs` is the annotate/rtype closure
+        // (`driver.py` task_annotate / task_rtype_lltype) the codewriter
+        // later consumes.  Builtin wrappers join `candidate_graphs` in
+        // `find_all_graphs_bfs` when `helper_roots` is empty; union them
+        // here so the two-phase subject set cannot close without the
+        // PBC family `builtin_wrapper_indirect_graphs` names, even if a
+        // caller ran the prepass against a narrower candidate set.
+        let mut subjects = callcontrol.candidate_graphs().clone();
+        for path in callcontrol.builtin_wrapper_indirect_graphs() {
+            if callcontrol.has_function_graph(path) {
+                subjects.insert(path.clone());
+            }
+        }
         crate::translator::rtyper::cutover::run_two_phase_prepass(
             &registry,
-            callcontrol.candidate_graphs(),
+            &subjects,
             callcontrol.function_graphs(),
         );
         // The annotator is complete and no graph is built after it. The

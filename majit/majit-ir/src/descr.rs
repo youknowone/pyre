@@ -818,14 +818,14 @@ pub fn strip_instantiation_suffix(name: &str) -> &str {
 }
 
 /// Whether `spelling` is a list-shaped container type (`Vec<T>`,
-/// `VecDeque<T>`, `&[T]`, `[T; N]`) that the annotator's
-/// `project_struct_field_type` maps to a `SomeList` element model rather
-/// than a class instance.  The named-ADT root resolver
+/// `VecDeque<T>`, `&[T]`, `[T; N]`, Charon builtin `Slice<T>`) that the
+/// annotator's `project_struct_field_type` maps to a `SomeList` element
+/// model rather than a class instance.  The named-ADT root resolver
 /// (`adt_node_class_root`) answers `None` for the core/std/alloc
 /// container family, so a list-typed parameter would otherwise seed the
 /// classdef-less `SomeInstance(None)` shell; this recognizer lets the
 /// parameter seam route it through the list model instead.  Mirrors the
-/// `Vec<` / `[` arms of `project_struct_field_type`.
+/// `Vec<` / `[` / `Slice<` arms of `project_struct_field_type`.
 pub fn is_list_container_spelling(spelling: &str) -> bool {
     let stripped = spelling
         .trim()
@@ -834,7 +834,10 @@ pub fn is_list_container_spelling(spelling: &str) -> bool {
         .trim_start_matches("*const ")
         .trim_start_matches("*mut ")
         .trim();
-    stripped.starts_with("Vec<") || stripped.starts_with("VecDeque<") || stripped.starts_with('[')
+    stripped.starts_with("Vec<")
+        || stripped.starts_with("VecDeque<")
+        || stripped.starts_with('[')
+        || stripped.starts_with("Slice<")
 }
 
 /// Remove the first balanced generic-argument group from a (possibly
@@ -9246,6 +9249,17 @@ mod register_keyed_size_authority_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_container_spelling_covers_vec_slice_and_charon_slice() {
+        assert!(is_list_container_spelling("[PyObjectRef]"));
+        assert!(is_list_container_spelling("&[PyObjectRef]"));
+        assert!(is_list_container_spelling("Vec<PyObjectRef>"));
+        assert!(is_list_container_spelling("Slice<PyObjectRef>"));
+        assert!(is_list_container_spelling("&mut [u8]"));
+        assert!(!is_list_container_spelling("PyObjectRef"));
+        assert!(!is_list_container_spelling("W_CType"));
+    }
 
     #[test]
     fn quasi_immut_descr_encoder_index_is_not_the_fields() {

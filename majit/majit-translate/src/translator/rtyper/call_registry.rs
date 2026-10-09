@@ -285,6 +285,12 @@ pub struct TwoPhaseTypeCache {
     /// Flowspace graph keys whose Phase-B rtype failed → publish Skips them
     /// to the legacy walker (the migration-scaffold fallback).
     pub rtype_skipped: HashSet<crate::flowspace::model::GraphKey>,
+    /// Canonical keys (`CallPath::canonical_key()`) whose Phase-A
+    /// annotate failed. Publish Skips them as `two-phase-annotate-skipped`
+    /// rather than `two-phase-never-a-subject`: they were prepass subjects,
+    /// matching upstream `translator.graphs` membership (`driver.py`
+    /// annotate then rtype). The value is the annotate-half reason.
+    pub annotate_skipped: HashMap<String, String>,
     /// Set once the prepass has run so publish consults the cache instead of
     /// re-running the real path. Cleared/absent ⟹ legacy per-graph behaviour.
     pub prepass_done: bool,

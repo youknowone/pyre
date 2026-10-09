@@ -4458,6 +4458,18 @@ pub(crate) fn derive_subject_inputcells(
                 cells.push(s_fn);
                 continue;
             }
+            // A list-typed param (`Vec<T>`, `&[T]`, Charon `Slice<T>`) is
+            // the annotator's list model regardless of the Input's
+            // register bank: a one-word item slice can arrive as `Int`
+            // (fat-pointer address) and still needs `SomeList` so
+            // `args.len()` is `len` of a list, not `getattr("__len__")`
+            // on a classdef-less `SomeInstance`.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && majit_ir::descr::is_list_container_spelling(root)
+            {
+                cells.push(bk.project_struct_field_type(root));
+                continue;
+            }
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
                 // source spelling of RPython GC-transformer's opaque root
@@ -4471,21 +4483,6 @@ pub(crate) fn derive_subject_inputcells(
                             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
                         ),
                     );
-                    continue;
-                }
-                // A list-typed param (`Vec<T>`, `&[T]`, …) carries its
-                // full monomorphic spelling as `class_root` (the named-ADT
-                // root resolver excludes the core/std/alloc container
-                // family precisely so the receiver projects to the
-                // annotator's list model here, not a minted classdef).
-                // `project_struct_field_type` maps the spelling to
-                // `SomeList(elem)` so a `len()` / iteration on the receiver
-                // resolves as a list op instead of `getattr` over the
-                // classdef-less `SomeInstance(None)` shell.
-                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
-                    && majit_ir::descr::is_list_container_spelling(root)
-                {
-                    cells.push(bk.project_struct_field_type(root));
                     continue;
                 }
                 // A tuple param carries its `Tuple<A,B>` shape; its `.N`
@@ -6423,6 +6420,58 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_a_slice_of_gc_refs_as_somelist() {
+        let mut graph = LegacyGraph::new("ctypefunc::call");
+        let entry = graph.startblock;
+        let args = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "args_w".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("[PyObjectRef]".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, args);
+        let bk = Rc::new(Bookkeeper::new());
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("a [PyObjectRef] input must seed");
+        assert!(
+            matches!(cells[0], SomeValue::List(_)),
+            "args_w: &[PyObjectRef] must seed SomeList, got {:?}",
+            cells[0]
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_charon_slice_class_root_as_somelist() {
+        let mut graph = LegacyGraph::new("wrapper_args");
+        let entry = graph.startblock;
+        let args = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "args".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("Slice<PyObjectRef>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, args);
+        let bk = Rc::new(Bookkeeper::new());
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("a Slice<PyObjectRef> input must seed");
+        assert!(
+            matches!(cells[0], SomeValue::List(_)),
+            "Charon Slice<T> must seed SomeList even on an Int-colored input, got {:?}",
+            cells[0]
+        );
     }
 
     #[test]
