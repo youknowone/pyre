@@ -6119,6 +6119,17 @@ fn make_functional_new_descr_posonly(
     descr
 }
 
+fn make_functional_new_descr_with_signature(
+    function: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    signature: crate::gateway::Signature,
+) -> PyObjectRef {
+    let descr = make_new_descr_with_signature(function, signature);
+    unsafe {
+        crate::function::fset_func_text_signature(descr, w_str_new("($type, *args, **kwargs)"))
+    };
+    descr
+}
+
 fn make_functional_method(name: &'static str, function: DunderFn, arity: u16) -> PyObjectRef {
     let text_signature = if arity == 1 {
         "($self, /)"
@@ -6145,7 +6156,10 @@ fn init_enumerate_type(ns: PyObjectRef) {
     install_functional_entry(
         ns,
         "__new__",
-        make_functional_new_descr(enumerate_descr_new),
+        make_functional_new_descr_with_signature(
+            enumerate_descr_new,
+            crate::gateway::Signature::new(vec!["cls", "iterable", "start"], None, None, 0, 1),
+        ),
     );
     install_functional_entry(
         ns,
@@ -7634,21 +7648,33 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "split",
-            make_builtin_function("split", crate::type_methods::str_method_split),
+            crate::make_builtin_function_with_signature(
+                "split",
+                crate::type_methods::str_method_split,
+                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rsplit",
-            make_builtin_function("rsplit", crate::type_methods::str_method_rsplit),
+            crate::make_builtin_function_with_signature(
+                "rsplit",
+                crate::type_methods::str_method_rsplit,
+                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "splitlines",
-            make_builtin_function("splitlines", crate::type_methods::str_method_splitlines),
+            crate::make_builtin_function_with_signature(
+                "splitlines",
+                crate::type_methods::str_method_splitlines,
+                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -7690,7 +7716,11 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "expandtabs",
-            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs),
+            crate::make_builtin_function_with_signature(
+                "expandtabs",
+                crate::type_methods::descr_expandtabs,
+                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -7745,7 +7775,17 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "replace",
-            make_builtin_function("replace", crate::type_methods::str_method_replace),
+            crate::make_builtin_function_with_signature(
+                "replace",
+                crate::type_methods::str_method_replace,
+                crate::gateway::Signature::new(
+                    vec!["self", "old", "new", "count"],
+                    None,
+                    None,
+                    0,
+                    3,
+                ),
+            ),
         )
     };
     unsafe {
@@ -7802,7 +7842,17 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "encode",
-            make_builtin_function("encode", crate::type_methods::str_method_encode),
+            crate::make_builtin_function_with_signature(
+                "encode",
+                crate::type_methods::str_method_encode,
+                crate::gateway::Signature::new(
+                    vec!["self", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     unsafe {
@@ -7994,7 +8044,11 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "splitlines",
-            make_builtin_function("splitlines", crate::type_methods::str_method_splitlines),
+            crate::make_builtin_function_with_signature(
+                "splitlines",
+                crate::type_methods::str_method_splitlines,
+                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -8023,7 +8077,11 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "expandtabs",
-            make_builtin_function("expandtabs", crate::type_methods::descr_expandtabs),
+            crate::make_builtin_function_with_signature(
+                "expandtabs",
+                crate::type_methods::descr_expandtabs,
+                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -19975,58 +20033,32 @@ fn property_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
 /// PyPy `W_Property.init`, with CPython 3.14's `prop_name` reset and
 /// subclass-doc placement taking precedence where the versions differ.
 fn property_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.is_empty() {
-        return Err(crate::PyError::type_error(
-            "descriptor '__init__' of 'property' object needs an argument",
-        ));
-    }
-    let prop = positional[0];
+    // Bound scope: `self`, `fget`, `fset`, `fdel`, `doc` (`PY_NULL` omitted).
+    let prop = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error(
+                "descriptor '__init__' of 'property' object needs an argument",
+            )
+        })?;
     if !unsafe { pyre_object::descriptor::is_property(prop) } {
         return Err(crate::PyError::type_error(format!(
             "descriptor '__init__' requires a 'property' object but received a '{}'",
             crate::type_methods::arg_type_name(prop),
         )));
     }
-    let supplied = positional.len() - 1;
-    if supplied > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "property() takes at most 4 arguments ({supplied} given)"
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["fget", "fset", "fdel", "doc"], "property")?;
-    let fget = crate::builtins::resolve_pos_or_kw(
-        positional.get(1).copied(),
-        kwargs,
-        "fget",
-        "property",
-        1,
-    )?
-    .unwrap_or_else(w_none);
-    let fset = crate::builtins::resolve_pos_or_kw(
-        positional.get(2).copied(),
-        kwargs,
-        "fset",
-        "property",
-        2,
-    )?
-    .unwrap_or_else(w_none);
-    let fdel = crate::builtins::resolve_pos_or_kw(
-        positional.get(3).copied(),
-        kwargs,
-        "fdel",
-        "property",
-        3,
-    )?
-    .unwrap_or_else(w_none);
-    let w_doc = crate::builtins::resolve_pos_or_kw(
-        positional.get(4).copied(),
-        kwargs,
-        "doc",
-        "property",
-        4,
-    )?
-    .unwrap_or_else(w_none);
+    let slot_or_none = |i: usize| {
+        args.get(i)
+            .copied()
+            .filter(|o| !o.is_null())
+            .unwrap_or_else(w_none)
+    };
+    let fget = slot_or_none(1);
+    let fset = slot_or_none(2);
+    let fdel = slot_or_none(3);
+    let w_doc = slot_or_none(4);
 
     unsafe { pyre_object::descriptor::w_property_reinit(prop, fget, fset, fdel) };
 
@@ -20159,14 +20191,26 @@ fn init_property_type(ns: PyObjectRef) {
     };
     let entries = [
         ("__new__", new_descr),
-        (
-            "__init__",
-            crate::gateway::make_builtin_function_with_text_signature(
+        ("__init__", {
+            let descr = crate::make_builtin_function_with_signature(
                 "__init__",
                 property_descr_init,
-                "($self, /, *args, **kwargs)",
-            ),
-        ),
+                crate::gateway::Signature::new(
+                    vec!["self", "fget", "fset", "fdel", "doc"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            );
+            unsafe {
+                crate::function::fset_func_text_signature(
+                    descr,
+                    w_str_new("($self, fget=None, fset=None, fdel=None, doc=None)"),
+                )
+            };
+            descr
+        }),
         (
             "__get__",
             crate::gateway::make_builtin_function_with_text_signature(
@@ -24008,7 +24052,17 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "decode",
-            make_builtin_function("decode", descr_decode),
+            crate::make_builtin_function_with_signature(
+                "decode",
+                descr_decode,
+                crate::gateway::Signature::new(
+                    vec!["self", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     unsafe {
@@ -24029,7 +24083,17 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "hex",
-            make_builtin_function("hex", descr_hex),
+            crate::make_builtin_function_with_signature(
+                "hex",
+                descr_hex,
+                crate::gateway::Signature::new(
+                    vec!["self", "sep", "bytes_per_sep"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     unsafe {
@@ -24127,14 +24191,22 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "split",
-            make_builtin_function("split", bytes_method_split),
+            crate::make_builtin_function_with_signature(
+                "split",
+                bytes_method_split,
+                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rsplit",
-            make_builtin_function("rsplit", bytes_method_rsplit),
+            crate::make_builtin_function_with_signature(
+                "rsplit",
+                bytes_method_rsplit,
+                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -24288,14 +24360,22 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "splitlines",
-            make_builtin_function("splitlines", bytes_method_splitlines),
+            crate::make_builtin_function_with_signature(
+                "splitlines",
+                bytes_method_splitlines,
+                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "expandtabs",
-            make_builtin_function("expandtabs", bytes_method_expandtabs),
+            crate::make_builtin_function_with_signature(
+                "expandtabs",
+                bytes_method_expandtabs,
+                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -25289,35 +25369,16 @@ fn rsplit_bytes_ws(data: &[u8], maxsplit: i64) -> Vec<Vec<u8>> {
 /// fields dropped.  `maxsplit < 0` means unlimited.  `forward` selects
 /// split vs rsplit.
 fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate::PyError> {
-    // `sep` and `maxsplit` are both positional-or-keyword; `maxsplit`
+    // Bound scope: `self`, `sep`, `maxsplit` (`PY_NULL` omitted). `maxsplit`
     // routes through `__index__` (`space_index_w`), so a non-integer
     // (including `None`) raises rather than silently defaulting.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let fn_name = if forward { "split" } else { "rsplit" };
-    crate::builtins::clinic_arity(
-        fn_name,
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
-    let sep_arg = pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
-    let maxsplit_arg = pos
-        .get(2)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"));
+    let sep_arg = args.get(1).copied().filter(|o| !o.is_null());
+    let maxsplit_arg = args.get(2).copied().filter(|o| !o.is_null());
     // Argument clinic converts maxsplit before bytearray_split_impl acquires
     // the receiver export; a re-entrant __index__ may therefore resize it.
     // Publish recv/sep/maxsplit first so that conversion cannot move them.
     let _split_roots = pyre_object::gc_roots::push_roots();
-    let mut live = vec![pos[0]];
+    let mut live = vec![args[0]];
     let sep_idx = sep_arg.map(|s| {
         live.push(s);
         live.len() - 1
@@ -26134,25 +26195,12 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// on each emitted line, and a trailing terminator does not produce an
 /// extra empty entry.
 fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::type_methods::require_receiver(pos, "splitlines")?;
-    let positional = pos.len().saturating_sub(1);
-    let keyword = crate::builtins::real_kwarg_count(kwargs);
-    let given = positional + keyword;
-    if given > 1 {
-        let kind = if positional == 0 {
-            "keyword argument"
-        } else {
-            "argument"
-        };
-        return Err(crate::PyError::type_error(format!(
-            "splitlines() takes at most 1 {kind} ({given} given)"
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
-    // keepends is positional-or-keyword.
-    let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
-        .or_else(|| pos.get(1).copied())
+    crate::type_methods::require_receiver(args, "splitlines")?;
+    // Bound scope: `self`, `keepends` (`PY_NULL` omitted).
+    let keepends = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
@@ -26163,9 +26211,9 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // receiver's payload, which a collection may relocate.  The receiver is
     // rooted separately because `cut_bytes_like` preserves its concrete kind
     // and sometimes its identity.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) }.to_vec();
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) }.to_vec();
     let recv_roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = recv_roots.publish(&[pos[0]]);
+    let recv_slot = recv_roots.publish(&[args[0]]);
     recv_roots.normalize(recv_slot, 1);
     // Each `cut_bytes_like` allocates over the lines already cut.
     let mut parts = pyre_object::gc_roots::RootedItems::new();
@@ -26196,37 +26244,19 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// current line (the column resets on `\n` / `\r`); a non-positive
 /// `tabsize` drops tabs entirely.
 fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::type_methods::require_receiver(pos, "expandtabs")?;
-    let positional = pos.len().saturating_sub(1);
-    let keyword = crate::builtins::real_kwarg_count(kwargs);
-    let given = positional + keyword;
-    if given > 1 {
-        let kind = if positional == 0 {
-            "keyword argument"
-        } else {
-            "argument"
-        };
-        return Err(crate::PyError::type_error(format!(
-            "expandtabs() takes at most 1 {kind} ({given} given)"
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
+    crate::type_methods::require_receiver(args, "expandtabs")?;
+    // Bound scope: `self`, `tabsize` (`PY_NULL` omitted).
     // [3.14-spec] PyPy `StringMethods.descr_expandtabs` uses
     // `@unwrap_spec(tabsize=int)`, while CPython's `stringlib_expandtabs`
     // clinic wrapper uses `PyLong_AsInt`.  The latter is observable before
     // the body even for an empty receiver, so narrow through the shared
     // index-protocol C-int converter here.
-    let w_tabsize = pos
-        .get(1)
-        .copied()
-        .filter(|t| !t.is_null())
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"));
+    let w_tabsize = args.get(1).copied().filter(|t| !t.is_null());
     let _roots = pyre_object::gc_roots::push_roots();
     let recv_slot = if let Some(t) = w_tabsize {
-        pyre_object::gc_roots::pin_roots(&[pos[0], t])
+        pyre_object::gc_roots::pin_roots(&[args[0], t])
     } else {
-        pyre_object::gc_roots::pin_roots(&[pos[0]])
+        pyre_object::gc_roots::pin_roots(&[args[0]])
     };
     let tabsize = i64::from(match w_tabsize {
         Some(_) => crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
@@ -26600,32 +26630,15 @@ fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// inserts between pairs; `bytes_per_sep` controls the grouping.
 pub(crate) fn descr_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "hex")?;
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::clinic_arity(
-        "hex",
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "bytes_per_sep", pos.get(2).is_some())?;
-    let sep_arg = pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
-    let group_arg = pos
-        .get(2)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "bytes_per_sep"));
+    // Bound scope: `self`, `sep`, `bytes_per_sep` (`PY_NULL` omitted).
+    let sep_arg = args.get(1).copied().filter(|o| !o.is_null());
+    let group_arg = args.get(2).copied().filter(|o| !o.is_null());
     // CPython 3.14 Argument Clinic converts `bytes_per_sep` before
     // `bytearray_hex_impl` acquires the receiver export. Its `__index__` may
     // therefore resize the receiver, and the live payload must be read only
     // after this conversion. Publish recv/sep/group first.
     let _hex_roots = pyre_object::gc_roots::push_roots();
-    let mut live = vec![pos[0]];
+    let mut live = vec![args[0]];
     let sep_idx = sep_arg.map(|s| {
         live.push(s);
         live.len() - 1
@@ -27336,34 +27349,10 @@ pub(crate) fn decode_utf8_with_errors_incremental(
 /// bytesobject.py descr_decode → stringmethods.py decode_object
 pub(crate) fn descr_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "decode")?;
-    // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
-    // are positional-or-keyword, so accept them from either side.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::clinic_arity(
-        "decode",
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "decode")?;
-    // `encoding` is positional-or-keyword at position 1; giving it both ways is
-    // a TypeError (the rarer 3-positional `errors` over-count is not modelled).
-    if pos.len() > 1 && crate::builtins::kwarg_get(kwargs, "encoding").is_some() {
-        return Err(crate::PyError::type_error(
-            "argument for decode() given by name ('encoding') and position (1)",
-        ));
-    }
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) }.to_vec();
-    let w_encoding = pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "encoding"));
-    let mut w_errors = pos
-        .get(2)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "errors"));
+    // Bound scope: `self`, `encoding`, `errors` (`PY_NULL` omitted).
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) }.to_vec();
+    let w_encoding = args.get(1).copied().filter(|o| !o.is_null());
+    let mut w_errors = args.get(2).copied().filter(|o| !o.is_null());
     // `get_encoding_and_errors` (unicodeobject.py) defaults only on the
     // *omitted* argument; a supplied value — `None` included — goes through
     // `space.text_w` and is refused unless it is a str.
@@ -28325,7 +28314,17 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "decode",
-            make_builtin_function("decode", descr_decode),
+            crate::make_builtin_function_with_signature(
+                "decode",
+                descr_decode,
+                crate::gateway::Signature::new(
+                    vec!["self", "encoding", "errors"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     // The scalar-returning read-only methods (int / bool results) read
@@ -28567,21 +28566,33 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "split",
-            make_builtin_function("split", bytes_method_split),
+            crate::make_builtin_function_with_signature(
+                "split",
+                bytes_method_split,
+                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "rsplit",
-            make_builtin_function("rsplit", bytes_method_rsplit),
+            crate::make_builtin_function_with_signature(
+                "rsplit",
+                bytes_method_rsplit,
+                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "splitlines",
-            make_builtin_function("splitlines", bytes_method_splitlines),
+            crate::make_builtin_function_with_signature(
+                "splitlines",
+                bytes_method_splitlines,
+                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
@@ -28672,14 +28683,28 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "expandtabs",
-            make_builtin_function("expandtabs", bytes_method_expandtabs),
+            crate::make_builtin_function_with_signature(
+                "expandtabs",
+                bytes_method_expandtabs,
+                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "hex",
-            make_builtin_function("hex", descr_hex),
+            crate::make_builtin_function_with_signature(
+                "hex",
+                descr_hex,
+                crate::gateway::Signature::new(
+                    vec!["self", "sep", "bytes_per_sep"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
         )
     };
     unsafe {

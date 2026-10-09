@@ -381,8 +381,8 @@ macro_rules! py_module {
                 fn $ifn_name:ident ( $($ifn_args:tt)* ) $(-> $ifn_ret:ty)? $ifn_body:block
             )*
         })?
-        $(, functions: { $($fn_key:literal / $fn_arity:tt = $fn_path:expr),* $(,)? })?
-        $(, module_functions: { $($mfn_key:literal / $mfn_arity:tt = $mfn_path:expr),* $(,)? })?
+        $(, functions: { $($fn_key:literal / $fn_arity:tt = $fn_path:expr $(; $fn_sig:expr)?),* $(,)? })?
+        $(, module_functions: { $($mfn_key:literal / $mfn_arity:tt = $mfn_path:expr $(; $mfn_sig:expr)?),* $(,)? })?
         $(, extra_init: |$ns:ident| $body:block)?
         $(,)?
     ) => {
@@ -484,7 +484,7 @@ macro_rules! py_module {
                     $fn_key,
                     $crate::gateway::with_module(
                         $name,
-                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path $(, $fn_sig)?),
                     )
                 );
             )*)?
@@ -494,7 +494,7 @@ macro_rules! py_module {
                     $mfn_key,
                     $crate::gateway::with_module(
                         $name,
-                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path $(, $mfn_sig)?),
                     )
                 );
             )*)?
@@ -751,11 +751,22 @@ macro_rules! py_module_fn {
     ($key:literal, *, $path:expr) => {
         $crate::make_module_builtin_function($key, $path)
     };
+    ($key:literal, *, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig($key, $path, $crate::HOPELESS, $sig)
+    };
     ($key:literal, $arity:literal, $path:expr) => {
         $crate::make_module_builtin_function_with_arity(
             $key,
             $crate::py_checked_arity_fn!($key, $arity, $path),
             $arity,
+        )
+    };
+    ($key:literal, $arity:literal, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig(
+            $key,
+            $crate::py_checked_arity_fn!($key, $arity, $path),
+            $arity,
+            $sig,
         )
     };
 }
@@ -786,11 +797,22 @@ macro_rules! py_module_module_fn {
     ($key:literal, *, $path:expr) => {
         $crate::make_module_builtin_function($key, $path)
     };
+    ($key:literal, *, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig($key, $path, $crate::HOPELESS, $sig)
+    };
     ($key:literal, $arity:literal, $path:expr) => {
         $crate::make_module_builtin_function_with_arity(
             $key,
             $crate::py_checked_arity_fn!($key, $arity, $path),
             $arity,
+        )
+    };
+    ($key:literal, $arity:literal, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig(
+            $key,
+            $crate::py_checked_arity_fn!($key, $arity, $path),
+            $arity,
+            $sig,
         )
     };
 }
@@ -1026,7 +1048,8 @@ pub use gateway::{
     make_builtin_function_with_signature, make_method_descriptor_with_arity,
     make_module_builtin_function, make_module_builtin_function_passthrough0,
     make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
-    make_module_builtin_function_with_doc, make_slot_wrapper, make_slot_wrapper_with_arity,
+    make_module_builtin_function_with_arity_and_sig, make_module_builtin_function_with_doc,
+    make_slot_wrapper, make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use loop_headers::*;

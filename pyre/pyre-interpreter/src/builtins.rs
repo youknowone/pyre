@@ -1715,18 +1715,9 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// CPython 3.14 `memoryview_tobytes_impl` — copy the live view through
 /// `PyBuffer_ToContiguous` in C, Fortran, or any-contiguous order.
 fn memoryview_tobytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    clinic_arity(
-        "tobytes",
-        positional.len().saturating_sub(1),
-        real_kwarg_count(kwargs),
-        0,
-        1,
-        0,
-    )?;
-    kwarg_reject_unknown(kwargs, &["order"], "tobytes")?;
-    let mv = positional.first().copied().unwrap_or(w_none());
-    let w_order = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "order", "tobytes", 1)?;
+    // Bound scope: `self`, `order` (`PY_NULL` omitted).
+    let mv = args.first().copied().unwrap_or(w_none());
+    let w_order = args.get(1).copied().filter(|o| !o.is_null());
     unsafe {
         memoryview_check_released(mv)?;
         let order = match w_order {
@@ -1968,22 +1959,16 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// under a new native format and optionally a new N-D shape, sharing the
 /// same backing (`descr_cast` → `_cast_to_1D` / `_cast_to_ND`).
 fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["format", "shape"], "cast")?;
-    // `format` and `shape` are the whole signature; a third positional was
-    // being read past and dropped.
-    if positional.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "cast() takes at most 2 arguments ({} given)",
-            crate::type_methods::args_given(positional)
-        )));
-    }
-    let mut mv = positional.first().copied().unwrap_or(w_none());
-    let fmt_obj = resolve_pos_or_kw(positional.get(1).copied(), kwargs, "format", "cast", 1)?
+    // Bound scope: `self`, `format`, `shape` (`PY_NULL` omitted).
+    let mut mv = args.first().copied().unwrap_or(w_none());
+    let fmt_obj = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
         .ok_or_else(|| {
             crate::PyError::type_error("cast() missing required argument 'format' (pos 1)")
         })?;
-    let shape_obj = resolve_pos_or_kw(positional.get(2).copied(), kwargs, "shape", "cast", 2)?;
+    let shape_obj = args.get(2).copied().filter(|o| !o.is_null());
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
@@ -3186,20 +3171,32 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release_buffer),
         ("__delitem__", memoryview_delitem),
-        ("tobytes", memoryview_tobytes),
         ("hex", memoryview_hex),
     ] {
         type_ns_store(ns_slot, name, make_builtin_function(name, f));
     }
     type_ns_store(
         ns_slot,
-        "cast",
-        crate::gateway::make_builtin_function_with_doc(
-            "cast",
-            memoryview_cast,
-            "Cast a memoryview to a new format or shape.",
+        "tobytes",
+        crate::make_builtin_function_with_signature(
+            "tobytes",
+            memoryview_tobytes,
+            crate::gateway::Signature::new(vec!["self", "order"], None, None, 0, 1),
         ),
     );
+    type_ns_store(ns_slot, "cast", {
+        let code = crate::gateway::builtin_code_new_with_signature(
+            "cast",
+            memoryview_cast,
+            Some("Cast a memoryview to a new format or shape."),
+            crate::gateway::Signature::new(vec!["self", "format", "shape"], None, None, 0, 1),
+        );
+        crate::function_new_with_fixed_code(
+            code as *const (),
+            "cast".to_string(),
+            pyre_object::PY_NULL,
+        )
+    });
     // memoryobject.py:777-788 — `format` / `itemsize` / … are
     // `GetSetProperty(W_MemoryView.w_get_*)`.  `fget` is called
     // `(descriptor, receiver)`.
@@ -3602,10 +3599,37 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function("exec", builtin_exec)
     });
     crate::module_ns_get_or_insert_with(ns, "eval", || {
-        make_module_builtin_function("eval", builtin_eval)
+        // `eval(source, /, globals=None, locals=None)` — Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "eval",
+            builtin_eval,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(vec!["source", "globals", "locals"], None, None, 0, 1),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "compile", || {
-        make_module_builtin_function("compile", builtin_compile)
+        // `compile(source, filename, mode, flags=0, dont_inherit=False,
+        // optimize=-1, *, _feature_version=-1)` — Signature bind.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "compile",
+            builtin_compile,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(
+                vec![
+                    "source",
+                    "filename",
+                    "mode",
+                    "flags",
+                    "dont_inherit",
+                    "optimize",
+                    "_feature_version",
+                ],
+                None,
+                None,
+                1,
+                0,
+            ),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "complex", || {
         crate::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE)
@@ -17910,57 +17934,67 @@ pub(crate) fn replace_compile_syntax_error_filename(
 }
 
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `compile(source, filename, mode, flags=0, dont_inherit=False,
-    // optimize=-1, *, _feature_version=-1)`: the three required parameters and
-    // flags/dont_inherit/optimize are positional-or-keyword; _feature_version
-    // is keyword-only.  PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    let source = bind_pos_or_kw(pos, kwargs, 0, "source", "compile", 1)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
-    })?;
-    let filename_obj =
-        bind_pos_or_kw(pos, kwargs, 1, "filename", "compile", 2)?.ok_or_else(|| {
+    // Bound scope from `parse_obj`: `source`, `filename`, `mode`, `flags`,
+    // `dont_inherit`, `optimize`, kw-only `_feature_version` (`PY_NULL` omitted).
+    // PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
+    let source = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'source' (pos 1)")
+        })?;
+    let filename_obj = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
             crate::PyError::type_error("compile() missing required argument 'filename' (pos 2)")
         })?;
-    let mode_obj = bind_pos_or_kw(pos, kwargs, 2, "mode", "compile", 3)?.ok_or_else(|| {
-        crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
-    })?;
-    // Every declared slot binds before the unrecognized keywords are
-    // reported, so a call missing a required argument names that argument.
-    kwarg_reject_unknown(
-        kwargs,
-        &[
-            "source",
-            "filename",
-            "mode",
-            "flags",
-            "dont_inherit",
-            "optimize",
-            "_feature_version",
-        ],
-        "compile",
-    )?;
+    let mode_obj = args
+        .get(2)
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("compile() missing required argument 'mode' (pos 3)")
+        })?;
+    let flags_obj = args
+        .get(3)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let dont_inherit_obj = args
+        .get(4)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let optimize_obj = args
+        .get(5)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let feature_obj = args
+        .get(6)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
     // compiling.py compile: `space.isinstance_w(w_source, W_AST)` and
     // `source_as_str` run after fsencode / gettypeobject / encode, all of
     // which collect. `w_source` is a gateway local; gct_fv_gc_malloc reloads
     // it. The native path imports `_ast` for the same type probe, which is
-    // another collection, so pin source / filename / mode from here.
-    let n_pos = pos.len();
+    // another collection, so pin the bound slots from here.
     let _compile_roots = pyre_object::gc_roots::push_roots();
     let compile_base = pyre_object::gc_roots::publish_roots(&[
         source,
         filename_obj,
         mode_obj,
-        kwargs.unwrap_or(pyre_object::PY_NULL),
+        flags_obj,
+        dont_inherit_obj,
+        optimize_obj,
+        feature_obj,
     ]);
-    let pos_base = pyre_object::gc_roots::publish_roots(pos);
-    pyre_object::gc_roots::normalize_roots(compile_base, 4 + n_pos);
+    pyre_object::gc_roots::normalize_roots(compile_base, 7);
     let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(compile_base + i);
-    let mut pos_buf = vec![pyre_object::PY_NULL; n_pos];
-    let kwargs = || {
-        let w = reload(3);
-        if w.is_null() { None } else { Some(w) }
-    };
     // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
     let filename_bytes = crate::gateway::fsencode_bytes_w(reload(1))?;
     // The code object spells its filename as `newfilename` does
@@ -17973,37 +18007,35 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let filename_text = crate::gateway::fsdecode_filename_wtf8(&filename_bytes);
     let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
     let mode = crate::baseobjspace::text_w(reload(2))?;
-    // flags / optimize are positional-or-keyword ints.
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut flags = match bind_pos_or_kw(&pos_buf, kwargs(), 3, "flags", "compile", 4)? {
-        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
-        None => 0,
+    let mut flags = if reload(3).is_null() {
+        0
+    } else {
+        crate::baseobjspace::gateway_int_w(reload(3))?
     };
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let dont_inherit = match bind_pos_or_kw(&pos_buf, kwargs(), 4, "dont_inherit", "compile", 5)? {
-        // [3.14-spec] PyPy's unwrap_spec still requires an integer here, but
-        // CPython `builtin_compile_impl` accepts any truth-testable object.
-        // `test_compile_filename_refleak` makes the difference observable with
-        // a __bool__ that raises ValueError.  The surrounding flag merge and
-        // compiler ownership remain PyPy's `compiling.py:compile` path.
-        Some(v) => crate::baseobjspace::is_true(v)?,
-        None => false,
+    // [3.14-spec] PyPy's unwrap_spec still requires an integer here, but
+    // CPython `builtin_compile_impl` accepts any truth-testable object.
+    // `test_compile_filename_refleak` makes the difference observable with
+    // a __bool__ that raises ValueError.  The surrounding flag merge and
+    // compiler ownership remain PyPy's `compiling.py:compile` path.
+    let dont_inherit = if reload(4).is_null() {
+        false
+    } else {
+        crate::baseobjspace::is_true(reload(4))?
     };
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
-    let mut optimize = match bind_pos_or_kw(&pos_buf, kwargs(), 5, "optimize", "compile", 6)? {
-        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
-        None => -1,
+    let mut optimize = if reload(5).is_null() {
+        -1
+    } else {
+        crate::baseobjspace::gateway_int_w(reload(5))?
     };
     // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
     // through `CompileInfo.feature_version` to the parser.
-    let feature_version = match kwarg_get(kwargs(), "_feature_version") {
-        Some(value) => {
-            let value = crate::baseobjspace::gateway_int_w(value)?;
-            i64::from(i32::try_from(value).map_err(|_| {
-                crate::PyError::overflow_error("Python int too large to convert to C int")
-            })?)
-        }
-        None => -1,
+    let feature_version = if reload(6).is_null() {
+        -1
+    } else {
+        let value = crate::baseobjspace::gateway_int_w(reload(6))?;
+        i64::from(i32::try_from(value).map_err(|_| {
+            crate::PyError::overflow_error("Python int too large to convert to C int")
+        })?)
     };
 
     // Any bit outside the recognised compilation-flag set is rejected.
@@ -18291,28 +18323,23 @@ pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `eval(source_or_code, globals=None, locals=None)` — same plumbing as
 /// exec but returns the value of the expression.
 fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `eval(source, /, globals=None, locals=None)`: source is positional-only;
-    // globals/locals are positional-or-keyword.
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    // The positional-only `source` is bound before the unrecognized keywords
-    // are reported, so a keywords-only call is reported against `source`.
-    if pos.is_empty() {
+    // Bound scope: `source` (pos-only), `globals`, `locals` (`PY_NULL` omitted).
+    if args.first().copied().is_none_or(|o| o.is_null()) {
         return Err(crate::PyError::type_error(
             "eval() takes at least 1 positional argument (0 given)",
         ));
     }
-    if pos.len() > 3 {
-        return Err(crate::PyError::type_error(format!(
-            "eval() takes at most 3 arguments ({} given)",
-            pos.len()
-        )));
-    }
-    kwarg_reject_unknown(kwargs, &["globals", "locals"], "eval")?;
-    let source = pos[0];
-    let globals_arg =
-        bind_pos_or_kw(pos, kwargs, 1, "globals", "eval", 2)?.unwrap_or(pyre_object::PY_NULL);
-    let locals_arg =
-        bind_pos_or_kw(pos, kwargs, 2, "locals", "eval", 3)?.unwrap_or(pyre_object::PY_NULL);
+    let source = args[0];
+    let globals_arg = args
+        .get(1)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let locals_arg = args
+        .get(2)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
     // eval() has no closure parameter — pass "absent".
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
@@ -20697,47 +20724,15 @@ pub(crate) fn builtin_enumerate(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = split_builtin_kwargs(args);
-    if positional.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "enumerate() takes at most 2 arguments ({} given)",
-            positional.len()
-        )));
-    }
-    // `iterable` and `start` are the only accepted keywords; an unknown one is
-    // reported with the vectorcall-style "invalid keyword argument" message.
-    if let Some(dict) = kwargs {
-        for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
-            let k = key.as_str().unwrap_or("");
-            if k == "__pyre_kw__" || k == "iterable" || k == "start" {
-                continue;
-            }
-            return Err(crate::PyError::type_error(format!(
-                "'{key}' is an invalid keyword argument for enumerate()"
-            )));
-        }
-    }
-    // `iterable` is positional-or-keyword; once filled positionally a stray
-    // `iterable=` keyword is rejected as invalid rather than "multiple values".
-    let source = if !positional.is_empty() {
-        if kwarg_get(kwargs, "iterable").is_some() {
-            return Err(crate::PyError::type_error(
-                "'iterable' is an invalid keyword argument for enumerate()",
-            ));
-        }
-        positional[0]
-    } else if let Some(iterable) = kwarg_get(kwargs, "iterable") {
-        iterable
-    } else {
-        return Err(crate::PyError::type_error(
-            "enumerate() missing required argument 'iterable'",
-        ));
-    };
-    let start_obj = if positional.len() > 1 {
-        Some(positional[1])
-    } else {
-        kwarg_get(kwargs, "start")
-    };
+    // Bound scope from `enumerate.__new__`: `iterable`, `start` (`PY_NULL` omitted).
+    let source = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error("enumerate() missing required argument 'iterable'")
+        })?;
+    let start_obj = args.get(1).copied().filter(|o| !o.is_null());
     // The constructor can execute user `__index__` and allocate. Keep both
     // arguments in the shadow stack exactly as the translated RPython locals
     // remain GC-visible across `space.index` / `space.iter`.

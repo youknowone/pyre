@@ -4,8 +4,9 @@
 
 use crate::executioncontext::ActionFlagOps;
 use crate::{
-    make_builtin_function, make_builtin_function_with_arity,
-    make_builtin_function_with_arity_and_maybe_sig, module_ns_store,
+    Signature, make_builtin_function, make_builtin_function_with_arity,
+    make_builtin_function_with_arity_and_maybe_sig, make_builtin_function_with_signature,
+    module_ns_store,
 };
 use pyre_object::*;
 use std::sync::OnceLock;
@@ -1165,29 +1166,16 @@ fn sys_get_coroutine_origin_tracking_depth(_args: &[PyObjectRef]) -> crate::PyRe
 }
 
 fn sys_set_coroutine_origin_tracking_depth(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["depth"],
-        "set_coroutine_origin_tracking_depth",
-    )?;
-    if positional.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "set_coroutine_origin_tracking_depth() takes exactly one argument ({} given)",
-            positional.len(),
-        )));
-    }
-    let kw_depth = crate::builtins::kwarg_get(kwargs, "depth");
-    if !positional.is_empty() && kw_depth.is_some() {
-        return Err(crate::PyError::type_error(
-            "set_coroutine_origin_tracking_depth() got multiple values for argument 'depth'",
-        ));
-    }
-    let w_depth = positional.first().copied().or(kw_depth).ok_or_else(|| {
-        crate::PyError::type_error(
-            "set_coroutine_origin_tracking_depth() missing required argument 'depth'",
-        )
-    })?;
+    // Bound scope: `depth` (`PY_NULL` omitted).
+    let w_depth = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error(
+                "set_coroutine_origin_tracking_depth() missing required argument 'depth'",
+            )
+        })?;
     let indexed = crate::baseobjspace::space_index(w_depth)?;
     let depth = crate::baseobjspace::int_w(indexed)?;
     if depth < 0 {
@@ -1237,32 +1225,9 @@ fn sys_get_asyncgen_hooks_impl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_set_asyncgen_hooks_impl(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["firstiter", "finalizer"],
-        "set_asyncgen_hooks",
-    )?;
-    if positional.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "set_asyncgen_hooks() takes at most 2 arguments ({} given)",
-            positional.len()
-        )));
-    }
-    let kw_firstiter = crate::builtins::kwarg_get(kwargs, "firstiter");
-    let kw_finalizer = crate::builtins::kwarg_get(kwargs, "finalizer");
-    if !positional.is_empty() && kw_firstiter.is_some() {
-        return Err(crate::PyError::type_error(
-            "set_asyncgen_hooks() got multiple values for argument 'firstiter'",
-        ));
-    }
-    if positional.len() > 1 && kw_finalizer.is_some() {
-        return Err(crate::PyError::type_error(
-            "set_asyncgen_hooks() got multiple values for argument 'finalizer'",
-        ));
-    }
-    let firstiter = positional.first().copied().or(kw_firstiter);
-    let finalizer = positional.get(1).copied().or(kw_finalizer);
+    // Bound scope: `firstiter`, `finalizer` (`PY_NULL` omitted).
+    let firstiter = args.first().copied().filter(|o| !o.is_null());
+    let finalizer = args.get(1).copied().filter(|o| !o.is_null());
     let ec = current_execution_context();
     if !ec.is_null() {
         unsafe {
@@ -3553,9 +3518,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         "set_coroutine_origin_tracking_depth",
         // `depth` is positional-or-keyword, so this cannot take the
         // fixed-arity carrier (which rejects keywords before the body runs).
-        crate::make_builtin_function(
+        make_builtin_function_with_signature(
             "set_coroutine_origin_tracking_depth",
             sys_set_coroutine_origin_tracking_depth,
+            Signature::new(vec!["depth"], None, None, 0, 0),
         ),
     );
     module_ns_store(
@@ -3566,7 +3532,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     module_ns_store(
         roots.get(ns_slot),
         "set_asyncgen_hooks",
-        crate::make_builtin_function("set_asyncgen_hooks", sys_set_asyncgen_hooks_impl),
+        make_builtin_function_with_signature(
+            "set_asyncgen_hooks",
+            sys_set_asyncgen_hooks_impl,
+            Signature::new(vec!["firstiter", "finalizer"], None, None, 0, 0),
+        ),
     );
     // sys.getfilesystemencoding
     module_ns_store(
