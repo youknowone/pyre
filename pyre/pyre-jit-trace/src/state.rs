@@ -9372,7 +9372,7 @@ fn prepare_bridge_pending_fields(
         return;
     };
     let target_descr = crate::descr::ec_sys_exc_value_descr();
-    for pending in storage.rd_pendingfields() {
+    for pending in storage.rd_pendingfields().unwrap_or(&[]) {
         let Some(descr) = pending.descr.as_ref() else {
             continue;
         };
@@ -9381,20 +9381,20 @@ fn prepare_bridge_pending_fields(
         // `resume.py` `_prepare_pendingfields`: both operands use the same tagged decoder as
         // frame boxes.  Decode the target as well as the fieldbox so virtual
         // preparation and malformed-tag checks stay aligned with deopt.
-        let rd_consts = storage.rd_consts();
+        let rd_consts = storage.rd_consts().unwrap_or(&[]);
         let target = majit_ir::resumedata::decode_tagged_value(
             pending.target_tagged,
             resume_data.num_failargs,
             rd_consts,
             &resume_data.fail_arg_types,
-            storage.rd_virtuals.len(),
+            storage.rd_virtuals().map_or(0, <[_]>::len),
         );
         let value = majit_ir::resumedata::decode_tagged_value(
             pending.value_tagged,
             resume_data.num_failargs,
             rd_consts,
             &resume_data.fail_arg_types,
-            storage.rd_virtuals.len(),
+            storage.rd_virtuals().map_or(0, <[_]>::len),
         );
 
         if is_exc_channel {
@@ -9589,7 +9589,7 @@ fn decode_tagged_concrete(
             let ci = (val - TAG_CONST_OFFSET) as usize;
             // resume.py:1251 fail-loud: direct indexing
             let storage = storage.expect("decode_tagged_concrete: TAGCONST requires storage");
-            storage.rd_consts()[ci].as_raw_i64()
+            storage.rd_consts().unwrap_or(&[])[ci].as_raw_i64()
         }
         TAGVIRTUAL => {
             // resume.py assign_number_to_virtual nested virtuals are numbered negatively;
@@ -11066,7 +11066,7 @@ impl JitState for PyreJitState {
         let no_pending = resume_data
             .storage
             .as_ref()
-            .is_none_or(|storage| storage.rd_pendingfields.is_empty());
+            .is_none_or(|storage| storage.rd_pendingfields().is_none_or(<[_]>::is_empty));
         if no_frame && no_vable && no_vref && no_pending {
             return;
         }
@@ -12177,12 +12177,12 @@ impl JitState for PyreJitState {
         // MetaInterp::initialize_virtualizable(), not carried as reds.
         _meta.trace_extra_reds = 1;
         let storage = storage?;
-        let rd_numb = storage.rd_numb.as_ref();
+        let rd_numb = storage.rd_numb().expect("rd_numb");
         // resume.py `self.consts = storage.rd_consts` — borrow
         // the shared pool; `ResumeDataResult` carries the Arc handle
         // so downstream virtual materialization reads the same pool
         // the GC walker updates.
-        let rd_consts = storage.rd_consts();
+        let rd_consts = storage.rd_consts().unwrap_or(&[]);
 
         // resume.py parity: consume_boxes(f.get_current_position_info())
         // RPython uses jitcode liveness via get_current_position_info; majit
@@ -12193,7 +12193,7 @@ impl JitState for PyreJitState {
             rd_consts,
             fail_arg_types,
             Some(&cb),
-            storage.rd_virtuals.len(),
+            storage.rd_virtuals().map_or(0, <[_]>::len),
         );
 
         // `resume.py` `rebuild_from_resumedata` still returns the box lists
@@ -13977,7 +13977,7 @@ mod tests {
         writer.append_int(0);
         writer.append_int(0);
         writer.patch_current_size(0);
-        let storage = majit_metainterp::resume::ResumeStorage::new(
+        let storage = majit_metainterp::resume::new_resume_storage(
             writer.create_numbering(),
             Vec::new(),
             Vec::new(),
@@ -15531,7 +15531,7 @@ mod tests {
             target_tagged: tagged(0),
             value_tagged: tagged(1),
         }];
-        let storage = majit_metainterp::resume::ResumeStorage::new(vec![], vec![], vec![], pending);
+        let storage = majit_metainterp::resume::new_resume_storage(vec![], vec![], vec![], pending);
         let fail_values = [&mut field_target as *mut FieldTarget as i64, 9];
         let fail_types = [Type::Ref, Type::Int];
         let resume_data = majit_metainterp::ResumeDataResult {
@@ -15641,7 +15641,7 @@ mod tests {
             value_tagged: tagged_virtual(0),
         }];
         let storage =
-            majit_metainterp::resume::ResumeStorage::new(vec![], vec![], virtuals.clone(), pending);
+            majit_metainterp::resume::new_resume_storage(vec![], vec![], virtuals.clone(), pending);
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
@@ -15732,7 +15732,7 @@ mod tests {
             value_tagged: tagged_virtual(0),
         }];
         let storage =
-            majit_metainterp::resume::ResumeStorage::new(vec![], vec![], virtuals.clone(), pending);
+            majit_metainterp::resume::new_resume_storage(vec![], vec![], virtuals.clone(), pending);
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
@@ -15845,7 +15845,7 @@ mod tests {
             value_tagged: tagged_virtual(0),
         }];
         let storage =
-            majit_metainterp::resume::ResumeStorage::new(vec![], vec![], virtuals.clone(), pending);
+            majit_metainterp::resume::new_resume_storage(vec![], vec![], virtuals.clone(), pending);
         let fail_values = [&mut field_target as *mut FieldTarget as i64];
         let fail_types = [Type::Ref];
         let resume_data = majit_metainterp::ResumeDataResult {
