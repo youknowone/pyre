@@ -223,23 +223,9 @@ pub(crate) fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variab
     bm.exits = new_exits;
 }
 
-/// RPython `SSA_to_SSI(graph)` (`ssa.py`) against the codewriter
-/// model graph.  Threads every used-but-not-created variable up its
-/// incoming links until it reaches a block that already defines a value
-/// in the same family, restoring the SSI invariant the register
-/// allocator (`regalloc.rs`) assumes.  Idempotent on graphs already in
-/// SSI form: their per-block used-set is a subset of the created-set, so
-/// `pending` starts empty.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
-    let entrymap = build_entrymap(graph);
-    let mut families = compute_variable_families(graph, &entrymap);
-
-    // Initial pending list (ssa.py:147-169): used-but-not-created vars
-    // per non-start block, in block-id then in-block order.
+/// Initial pending list of `SSA_to_SSI`: used-but-not-created vars
+/// per non-start block, in block-id then in-block order.
+fn collect_pending(graph: &FunctionGraph, entrymap: &EntryMap) -> Vec<(BlockId, Variable)> {
     let mut pending: Vec<(BlockId, Variable)> = Vec::new();
     for id in graph.iterblocks_order() {
         if !entrymap.contains_key(&id) {
@@ -294,10 +280,27 @@ pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
             pending.push((id, v));
         }
     }
+    pending
+}
+
+/// RPython `SSA_to_SSI(graph)` (`ssa.py`) against the codewriter
+/// model graph.  Threads every used-but-not-created variable up its
+/// incoming links until it reaches a block that already defines a value
+/// in the same family, restoring the SSI invariant the register
+/// allocator (`regalloc.rs`) assumes.  Idempotent on graphs already in
+/// SSI form: their per-block used-set is a subset of the created-set, so
+/// `pending` starts empty.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
+    let entrymap = build_entrymap(graph);
 
     // Already in SSI form (the common case for graphs whose blocks all
     // define what they use): nothing to thread, no snapshot needed.
-    if pending.is_empty() {
+    let pending_init = collect_pending(graph, &entrymap);
+    if pending_init.is_empty() {
         return;
     }
 
@@ -310,71 +313,100 @@ pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
     // result"); threading such a variable walks off the top of the graph to
     // the startblock, which has no incoming link to receive it.  Upstream
     // (`rpython/translator/backendopt/ssa.py` `SSA_to_SSI`, which does
-    // `del entrymap[graph.startblock]` at :142) would then `KeyError` on
-    // `links = entrymap[block]` at :186; pyre instead treats that as the
-    // signal that this graph violates the SSI precondition and leaves it
-    // exactly as it was — the same already-degenerate jitcode the previous
-    // (pre-threading) pipeline produced, with no regression.  This is a
-    // migration accommodation, not a permanent structural divergence: pyre
-    // must build `FunctionGraph`s from a Rust interpreter (the codewriter
-    // never sees interpreter source, unlike upstream — `front/mod.rs`), and
-    // is mid-cutover from the transitional legacy rtyper adapters
-    // (`translator/rtyper/legacy_*`, slated for retirement — `lib.rs`) to a
-    // real-rtyper-typed Charon MIR frontend.  While that cutover is
-    // incomplete some graphs are still typed with an undefined operand, so
-    // degrading this one graph beats aborting the whole build; the bail tends
-    // toward dead code as real-rtyper comes to type every production graph.
-    // Well-formed graphs (e.g. `w_list_append`) thread to completion and are
-    // kept.
-    let snapshot = graph.clone();
-    let mut bailed = false;
-
-    while let Some((id, v)) = pending.pop() {
-        let v_rep = families.find_rep(v.clone());
-        let created = variables_created_in(graph, id);
-        if created.contains(&v) {
-            continue;
+    // `del entrymap[graph.startblock]`) would then `KeyError` on
+    // `links = entrymap[block]`.
+    //
+    // Abandoning the whole graph there also drops every *other* variable
+    // that was still in `pending` — including a range iterator the front
+    // already rewrote to `__majit_range` / `slice::iter` / `__iter_next`.
+    // `iter_lower` then sees a continue-edge predecessor that does not
+    // carry the iterator (`"block {si} feeds the iterator loop without
+    // carrying it"`) and leaves the reserved `__majit_range` spelling as a
+    // symbolic residual (`runtime_names::shims::RANGE`).  Upstream never
+    // hits that wall: `rrange.py` `RangeIteratorRepr` / `ll_rangenext_up`
+    // scalarise the same `for i in range(a, b)` loop to int ops.
+    //
+    // Skip the unthreadable variable instead — leave it as a dominating
+    // SSA def — and retry so the rest of `pending` still threads.  The
+    // snapshot undoes the half-threaded walk of the skipped variable;
+    // a naive `continue` would leave startblock passing a value it does
+    // not define.  This is a migration accommodation, not a permanent
+    // structural divergence: pyre must build `FunctionGraph`s from a Rust
+    // interpreter (the codewriter never sees interpreter source, unlike
+    // upstream — `front/mod.rs`), and is mid-cutover from the transitional
+    // legacy rtyper adapters (`translator/rtyper/legacy_*`, slated for
+    // retirement — `lib.rs`) to a real-rtyper-typed Charon MIR frontend.
+    // Well-formed graphs (e.g. `w_list_append`) thread to completion on
+    // the first attempt.
+    let mut skip: HashSet<u64> = HashSet::new();
+    for _ in 0..=pending_init.len() {
+        let mut families = compute_variable_families(graph, &entrymap);
+        let mut pending: Vec<(BlockId, Variable)> = pending_init
+            .iter()
+            .filter(|(_, v)| !skip.contains(&v.id()))
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return;
         }
-        // Reuse a same-family value the block already defines.  Search a
-        // deterministic order (inputargs then op results) rather than the
-        // `HashSet` so codegen output is stable.
-        let mut matched: Option<Variable> = None;
-        {
-            let b = graph.block(id);
-            'find: for w in b
-                .inputargs
-                .iter()
-                .chain(b.operations.iter().filter_map(|op| op.result.as_ref()))
+        let snapshot = graph.clone();
+        let mut bailed: Option<Variable> = None;
+        while let Some((id, v)) = pending.pop() {
+            let v_rep = families.find_rep(v.clone());
+            let created = variables_created_in(graph, id);
+            if created.contains(&v) {
+                continue;
+            }
+            // Reuse a same-family value the block already defines.  Search a
+            // deterministic order (inputargs then op results) rather than the
+            // `HashSet` so codegen output is stable.
+            let mut matched: Option<Variable> = None;
             {
-                if families.find_rep(w.clone()) == v_rep {
-                    matched = Some(w.clone());
-                    break 'find;
+                let b = graph.block(id);
+                'find: for w in b
+                    .inputargs
+                    .iter()
+                    .chain(b.operations.iter().filter_map(|op| op.result.as_ref()))
+                {
+                    if families.find_rep(w.clone()) == v_rep {
+                        matched = Some(w.clone());
+                        break 'find;
+                    }
+                }
+            }
+            if let Some(w) = matched {
+                renamevariables(graph, id, &v, &w);
+            } else {
+                let Some(links) = entrymap.get(&id).cloned() else {
+                    // Undefined operand: threading reached a block with no
+                    // incoming link.  Skip this variable and retry the rest.
+                    bailed = Some(v);
+                    break;
+                };
+                let w = v.copy();
+                families.union(v.clone(), w.clone());
+                renamevariables(graph, id, &v, &w);
+                graph.block_mut(id).inputargs.push(w);
+                for (src, idx) in links {
+                    graph.block_mut(src).exits[idx]
+                        .args
+                        .push(LinkArg::Value(v.clone()));
+                    pending.push((src, v.clone()));
                 }
             }
         }
-        if let Some(w) = matched {
-            renamevariables(graph, id, &v, &w);
-        } else {
-            let Some(links) = entrymap.get(&id).cloned() else {
-                // Undefined operand: threading reached a block with no
-                // incoming link.  Abandon the transform for this graph.
-                bailed = true;
-                break;
-            };
-            let w = v.copy();
-            families.union(v.clone(), w.clone());
-            renamevariables(graph, id, &v, &w);
-            graph.block_mut(id).inputargs.push(w);
-            for (src, idx) in links {
-                graph.block_mut(src).exits[idx]
-                    .args
-                    .push(LinkArg::Value(v.clone()));
-                pending.push((src, v.clone()));
+        match bailed {
+            Some(v) => {
+                *graph = snapshot;
+                let rep = families.find_rep(v.clone());
+                skip.insert(v.id());
+                for (_, pv) in &pending_init {
+                    if families.find_rep(pv.clone()) == rep {
+                        skip.insert(pv.id());
+                    }
+                }
             }
+            None => return,
         }
-    }
-
-    if bailed {
-        *graph = snapshot;
     }
 }
