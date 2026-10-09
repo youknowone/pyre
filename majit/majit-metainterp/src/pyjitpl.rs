@@ -862,17 +862,17 @@ impl Drop for CompileSnapshotRootsGuard {
 /// `walk_active_trace_refs` still forwards its ConstPtrs until intern
 /// or drop. The guard empties the slot on every exit, including `?`
 /// and panic, so a leftover recorder cannot outlive the compile window.
-pub(crate) struct CompileTracingGuard(*mut Option<TraceCtx>);
+pub(crate) struct CompileTracingGuard(*mut Option<Box<TraceCtx>>);
 
 impl CompileTracingGuard {
-    pub(crate) fn new(slot: &mut Option<TraceCtx>) -> Self {
+    pub(crate) fn new(slot: &mut Option<Box<TraceCtx>>) -> Self {
         Self(slot as *mut _)
     }
 }
 
 impl Drop for CompileTracingGuard {
     fn drop(&mut self) {
-        // SAFETY: constructed from `&mut Option<TraceCtx>` on
+        // SAFETY: constructed from `&mut Option<Box<TraceCtx>>` on
         // `MetaInterp.compile_tracing` and dropped before that field
         // is invalidated. Compile paths that finish intern take the
         // recorder out first; Drop then stores `None` into an empty slot.
@@ -2610,12 +2610,18 @@ pub struct MetaInterp<M: Clone> {
     /// `jitdriver.rs`'s target-lookup miss decline every later
     /// interpreter-origin entry bridge at that key.
     pub(crate) speculative_cut_owned_key: Option<u64>,
-    pub(crate) tracing: Option<TraceCtx>,
+    pub(crate) tracing: Option<Box<TraceCtx>>,
     /// Taken recorder parked for the compile window. `walk_active_trace_refs`
     /// still forwards its ConstPtrs until intern / drop; `tracing.take()`
     /// alone would leave those ops unrooted for the whole optimize/compile
     /// allocation storm.
-    pub(crate) compile_tracing: Option<TraceCtx>,
+    pub(crate) compile_tracing: Option<Box<TraceCtx>>,
+    /// Outer `MetaInterp` attempts parked while a nested
+    /// `compile_and_run_once` runs (`warmstate.py` `bound_reached` constructs
+    /// a fresh `MetaInterp` per attempt; pyre reuses one object and stacks
+    /// the per-attempt fields here). Boxed `TraceCtx` so a WalkContext
+    /// `&mut TraceCtx` into the outer heap allocation stays valid.
+    pub(crate) parked_attempts: Vec<ParkedTraceAttempt<M>>,
     /// Single-pass tracing: the `(walk_final_pc, walk_final_reds, green banks)`
     /// snapshot copied off the active `TraceCtx` at the CloseLoop point
     /// BEFORE `compile_loop` drains the ctx, so the merge-point hook can
@@ -2741,7 +2747,10 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) stats: JitStatsCounters,
     /// Host-supplied virtualizable until `TraceCtx` exists.
     /// `sync_before` / tests call `set_vable_ptr` before tracing starts.
-    pending_vable_ptr: *const u8,
+    /// Lifetime is the portal entry that seeded it (`warmstate.py`
+    /// `maybe_compile_and_run` `*args`): cleared when that door returns
+    /// without an attempt taking it over, and at attempt end.
+    pub(crate) pending_vable_ptr: *const u8,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
@@ -3113,6 +3122,88 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) profiler_tracing_active: bool,
 }
 
+/// Per-attempt MetaInterp fields stacked while a nested
+/// `compile_and_run_once` runs. `warmstate.py` `bound_reached` constructs a
+/// fresh `MetaInterp(metainterp_sd, jitdriver_sd)` so the outer object's
+/// history, framestack, heapcache, and portal_call_depth stay on the
+/// call stack; pyre reuses one MetaInterp and parks those fields here.
+pub(crate) struct ParkedTraceAttempt<M: Clone> {
+    tracing: Option<Box<TraceCtx>>,
+    compile_tracing: Option<Box<TraceCtx>>,
+    single_pass_outcome: Option<(
+        usize,
+        Vec<Value>,
+        crate::jitexc::ContinueRunningNormallyArgs,
+    )>,
+    single_pass_finish: bool,
+    single_pass_finish_values: Option<ExitValues>,
+    back_edge_finish: Option<ExitValues>,
+    back_edge_finish_word: Option<i64>,
+    raw_int_fallback: Option<crate::compile::CompileResult<M>>,
+    single_pass_scalar_values: Option<Vec<i64>>,
+    single_pass_ref_scalar_values: Option<Vec<i64>>,
+    single_pass_virt_array_values: Option<Vec<i64>>,
+    pending_abort_blackhole: Option<crate::PendingAbortBlackhole>,
+    single_pass_compact_label_values: Option<(u64, Vec<Value>)>,
+    single_pass_full_live_values: Option<Vec<Value>>,
+    single_pass_compiled_key: Option<u64>,
+    pending_token: Option<(u64, Arc<majit_backend::JitCellToken>)>,
+    pending_vable_ptr: *const u8,
+    vable_array_lengths: Vec<usize>,
+    force_finish_trace: bool,
+    partial_trace: Option<PartialTrace>,
+    retracing_from: Option<crate::recorder::TracePosition>,
+    exported_state: Option<crate::optimizeopt::unroll::ExportedState>,
+    cancel_count: u32,
+    last_compiled_key: Option<u64>,
+    last_compiled_artifact_token: Option<Arc<majit_backend::JitCellToken>>,
+    speculative_cut_owned_key: Option<u64>,
+    potential_retrace_position: Option<crate::recorder::TracePosition>,
+    last_quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
+    compile_snapshot_refs: Vec<usize>,
+    compile_short_preamble_producer: Option<usize>,
+    compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
+    cached_optimizer: Option<crate::optimizeopt::optimizer::Optimizer>,
+    retrace_after_bridge: bool,
+    keep_tracing_after_close: bool,
+    pending_preamble_tokens: crate::FxIndexMap<(usize, u64), Vec<crate::history::TargetToken>>,
+    pending_frontend_boxes: Option<Vec<i64>>,
+    pending_frontend_box_types: Option<Vec<Type>>,
+    framestack: crate::pyjitpl::MIFrameStack,
+    free_frames_list: Vec<crate::pyjitpl::MIFrame>,
+    portal_call_depth: i32,
+    call_ids: Vec<u64>,
+    portal_trace_positions: Option<
+        Vec<(
+            usize,
+            Option<PortalGreenKey>,
+            crate::recorder::TracePosition,
+        )>,
+    >,
+    current_call_id: u64,
+    last_exc_value: i64,
+    exc_resume: Option<(OpRef, OpRef)>,
+    aborted_tracing_jitdriver: Option<usize>,
+    active_jitdriver_sd: Option<usize>,
+    aborted_tracing_greenkey: Option<PortalGreenKey>,
+    pending_abort_green_key: Option<u64>,
+    pending_abort_permanent: bool,
+    pending_abort_has_merge_points: bool,
+    pending_abort_reason: Option<i32>,
+    interpret_framestack_for_abort: bool,
+    last_interpret_abort_reason: Option<i32>,
+    interpret_bail_residual: Option<String>,
+    last_exc_box: Option<OpRef>,
+    class_of_last_exc_is_const: bool,
+    forced_virtualizable: i64,
+    ovf_flag: bool,
+    box_names_memo: crate::FxIndexMap<OpRef, String>,
+    trace_length_at_last_tco: i32,
+    active_trace_session: Option<ActiveTraceSession<M>>,
+    bridge_info: Option<BridgeTraceInfo>,
+    profiler_tracing_active: bool,
+}
+
 /// Internal mutable counters for JIT compilation statistics.
 ///
 /// Holds only the pyre-specific lifetime counters (`loops_compiled`,
@@ -3463,6 +3554,122 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
 }
 
+/// pyjitpl.py `MetaInterp.__init__` stores `last_exc_value` as an ordinary
+/// `OBJECTPTR` field (`lltype.nullptr(rclass.OBJECT)`), so RPython's
+/// collector traces it with the MetaInterp object. `handle_possible_exception`
+/// may also keep `last_exc_box = ConstPtr(val)` of that same object.
+/// Pyre parks both onto `ParkedTraceAttempt` for a nested attempt, so the
+/// extra-root walker has to forward the live slots and the parked copies.
+fn walk_raw_gcref_i64(slot: &mut i64, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if *slot != 0 {
+        let mut gcref = GcRef(*slot as usize);
+        visitor(&mut gcref);
+        *slot = gcref.0 as i64;
+    }
+}
+
+fn walk_raw_gcref_ptr(slot: &mut *const u8, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if slot.is_null() {
+        return;
+    }
+    let mut gcref = GcRef(*slot as usize);
+    visitor(&mut gcref);
+    *slot = gcref.0 as *const u8;
+}
+
+fn walk_last_exc_refs(
+    last_exc_value: &mut i64,
+    last_exc_box: &mut Option<OpRef>,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    walk_raw_gcref_i64(last_exc_value, visitor);
+    if let Some(exc_box) = last_exc_box.as_mut() {
+        exc_box.walk_const_ptr_refs_mut(visitor);
+    }
+}
+
+/// pyjitpl.py `MIFrame.registers_r` — the register holds the box.
+/// `ConstPtr.value` (`history.py`) is the inline gcref; non-constant
+/// boxes are the recorder's `RefFrontendOp` / `InputArgRef`, whose
+/// attached value `getref_base()` reads.
+fn walk_framestack_ref_regs(
+    frames: &mut [crate::pyjitpl::MIFrame],
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    for frame in frames.iter_mut() {
+        for slot in frame.ref_regs.iter_mut() {
+            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
+                visitor(gcref);
+            }
+        }
+    }
+}
+
+fn walk_trace_ctx_refs(trace_ctx: &mut TraceCtx, visitor: &mut dyn FnMut(&mut GcRef)) {
+    trace_ctx.recorder.walk_const_ptr_refs(visitor);
+    // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
+    // InputArgs (loop / bridge entry args). No other walker visits them,
+    // and an InputArg carries no args / fail_args, so `.value` is the only
+    // forwardable slot. Same `Cell` get / forward / set dance as ops above.
+    for ia in trace_ctx.recorder.inputargs() {
+        if let Some(Value::Ref(mut r)) = ia.get_value() {
+            visitor(&mut r);
+            ia.set_value(Value::Ref(r));
+        }
+    }
+    // pyjitpl.py — `initialize_virtualizable` /
+    // `force_start_tracing` / `setup_tracing` snapshot inputarg
+    // constants into `initial_inputarg_consts`. Each is an inline-const
+    // `OpRef`; a `ConstPtr` entry's inline gcref is forwarded in place —
+    // history.py `ConstPtr.value` is a gcref attribute of the Box.
+    for r in trace_ctx.initial_inputarg_consts.iter_mut() {
+        if let OpRef::ConstPtr(gcref) = r {
+            visitor(gcref);
+        }
+    }
+    // The per-guard snapshot side table copies inline gcrefs out of the
+    // `ref_regs` slots walked above into words of its own; see
+    // `recorder::Snapshot::walk_const_ptr_refs` for why nothing else
+    // forwards them.
+    for snapshot in trace_ctx.snapshots.iter_mut() {
+        snapshot.walk_const_ptr_refs(visitor);
+    }
+    // `initialize_state_from_start` `self.virtualizable_boxes` stores
+    // ordinary BoxPtr objects whose concrete refs the GC traces through
+    // the object graph. Forward ConstPtr gcrefs in the box list and the
+    // sync-target cell; InputArg/`*FrontendOp` refs are walked above.
+    trace_ctx.walk_virtualizable_value_refs(&mut *visitor);
+    // heapcache.py CacheEntry — the heapcache caches field values /
+    // replacements / loop-invariant results as `OpRef`. With inline
+    // consts (history.py `ConstPtr.value`) those value slots can be
+    // `ConstPtr(GcRef)`; they are returned on cache hits and
+    // emitted into the op-graph, so a stale gcref is a use-after-move.
+    // Forward them in place. Heapcache key ownership is a separate census
+    // from the independently rooted CALL_PURE constants below.
+    trace_ctx.heap_cache_mut().walk_const_ptr_refs(visitor);
+    // util.py args_dict / history.py ConstPtr.value: CALL_PURE's keys and
+    // results own collector-updated Const slots. Compile/optimizer handles
+    // share that same dictionary; its roots survive even after this trace
+    // is detached, without a callback borrowing TraceCtx during collection.
+
+    // Non-constant Ref registers name the recorder's `RefFrontendOp` /
+    // `InputArgRef`, whose attached concrete value was forwarded above.
+    // `registers_r[i]` is that Box and `getref_base()` reads its
+    // updated `_resref`; there is no second value to refresh.
+}
+
+fn walk_pending_abort_blackhole_refs(
+    pending: &mut crate::PendingAbortBlackhole,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
+    walk_raw_gcref_i64(&mut pending.last_exc_value, visitor);
+    walk_raw_gcref_i64(&mut pending.virtualizable_ptr, visitor);
+    for value in pending.ref_scalar_values.iter_mut() {
+        walk_raw_gcref_i64(value, visitor);
+    }
+    walk_framestack_ref_regs(&mut pending.framestack.frames, visitor);
+}
+
 /// Values produced by the collection-capable half of
 /// `pyjitpl.py initialize_virtualizable`, consumed by the TraceCtx-writing
 /// half. Split so a parked recorder in `compile_tracing` is not borrowed
@@ -3485,11 +3692,210 @@ struct InitializeVirtualizableState {
 }
 
 impl<M: Clone> MetaInterp<M> {
+    /// Park this attempt's per-trace fields so a nested `MetaInterp` run can
+    /// use the same object. `warmstate.py` `bound_reached` constructs a new
+    /// `MetaInterp` instead; shared `warm_state` / `compiled_loops` /
+    /// `cut_compiled_keys` / `backend` / `staticdata` stay on `self`.
+    pub fn park_attempt(&mut self) {
+        let parked = ParkedTraceAttempt {
+            tracing: self.tracing.take(),
+            compile_tracing: self.compile_tracing.take(),
+            single_pass_outcome: self.single_pass_outcome.take(),
+            single_pass_finish: std::mem::take(&mut self.single_pass_finish),
+            single_pass_finish_values: self.single_pass_finish_values.take(),
+            back_edge_finish: self.back_edge_finish.take(),
+            back_edge_finish_word: self.back_edge_finish_word.take(),
+            raw_int_fallback: self.raw_int_fallback.take(),
+            single_pass_scalar_values: self.single_pass_scalar_values.take(),
+            single_pass_ref_scalar_values: self.single_pass_ref_scalar_values.take(),
+            single_pass_virt_array_values: self.single_pass_virt_array_values.take(),
+            pending_abort_blackhole: self.pending_abort_blackhole.take(),
+            single_pass_compact_label_values: self.single_pass_compact_label_values.take(),
+            single_pass_full_live_values: self.single_pass_full_live_values.take(),
+            single_pass_compiled_key: self.single_pass_compiled_key.take(),
+            pending_token: self.pending_token.take(),
+            pending_vable_ptr: std::mem::replace(&mut self.pending_vable_ptr, std::ptr::null()),
+            vable_array_lengths: std::mem::take(&mut self.vable_array_lengths),
+            force_finish_trace: std::mem::take(&mut self.force_finish_trace),
+            partial_trace: self.partial_trace.take(),
+            retracing_from: self.retracing_from.take(),
+            exported_state: self.exported_state.take(),
+            cancel_count: std::mem::take(&mut self.cancel_count),
+            last_compiled_key: self.last_compiled_key.take(),
+            last_compiled_artifact_token: self.last_compiled_artifact_token.take(),
+            speculative_cut_owned_key: self.speculative_cut_owned_key.take(),
+            potential_retrace_position: self.potential_retrace_position.take(),
+            last_quasi_immutable_deps: std::mem::take(&mut self.last_quasi_immutable_deps),
+            compile_snapshot_refs: std::mem::take(&mut self.compile_snapshot_refs),
+            compile_short_preamble_producer: self.compile_short_preamble_producer.take(),
+            compile_resume_memos: std::mem::take(&mut self.compile_resume_memos),
+            cached_optimizer: self.cached_optimizer.take(),
+            retrace_after_bridge: std::mem::take(&mut self.retrace_after_bridge),
+            keep_tracing_after_close: std::mem::take(&mut self.keep_tracing_after_close),
+            pending_preamble_tokens: std::mem::take(&mut self.pending_preamble_tokens),
+            pending_frontend_boxes: self.pending_frontend_boxes.take(),
+            pending_frontend_box_types: self.pending_frontend_box_types.take(),
+            framestack: std::mem::replace(
+                &mut self.framestack,
+                crate::pyjitpl::MIFrameStack::empty(),
+            ),
+            free_frames_list: std::mem::take(&mut self.free_frames_list),
+            portal_call_depth: std::mem::replace(&mut self.portal_call_depth, 0),
+            call_ids: std::mem::take(&mut self.call_ids),
+            portal_trace_positions: std::mem::replace(
+                &mut self.portal_trace_positions,
+                Some(Vec::new()),
+            ),
+            current_call_id: std::mem::replace(&mut self.current_call_id, 0),
+            last_exc_value: std::mem::replace(&mut self.last_exc_value, 0),
+            exc_resume: self.exc_resume.take(),
+            aborted_tracing_jitdriver: self.aborted_tracing_jitdriver.take(),
+            active_jitdriver_sd: self.active_jitdriver_sd.take(),
+            aborted_tracing_greenkey: self.aborted_tracing_greenkey.take(),
+            pending_abort_green_key: self.pending_abort_green_key.take(),
+            pending_abort_permanent: std::mem::take(&mut self.pending_abort_permanent),
+            pending_abort_has_merge_points: std::mem::take(
+                &mut self.pending_abort_has_merge_points,
+            ),
+            pending_abort_reason: self.pending_abort_reason.take(),
+            interpret_framestack_for_abort: std::mem::take(
+                &mut self.interpret_framestack_for_abort,
+            ),
+            last_interpret_abort_reason: self.last_interpret_abort_reason.take(),
+            interpret_bail_residual: self.interpret_bail_residual.take(),
+            last_exc_box: self.last_exc_box.take(),
+            class_of_last_exc_is_const: std::mem::take(&mut self.class_of_last_exc_is_const),
+            forced_virtualizable: std::mem::replace(&mut self.forced_virtualizable, 0),
+            ovf_flag: std::mem::take(&mut self.ovf_flag),
+            box_names_memo: std::mem::take(&mut self.box_names_memo),
+            trace_length_at_last_tco: std::mem::replace(&mut self.trace_length_at_last_tco, -1),
+            active_trace_session: self.active_trace_session.take(),
+            bridge_info: self.bridge_info.take(),
+            profiler_tracing_active: std::mem::take(&mut self.profiler_tracing_active),
+        };
+        self.parked_attempts.push(parked);
+    }
+
+    /// Restore the most recently parked attempt. The inner run must have
+    /// drained its own `tracing` first (`compile_and_run_once` finishes or
+    /// aborts before this returns).
+    pub fn restore_attempt(&mut self) {
+        debug_assert!(
+            self.tracing.is_none()
+                && self.compile_tracing.is_none()
+                && self.active_trace_session.is_none()
+                && !self.profiler_tracing_active,
+            "restore_attempt: nested attempt did not drain its tracing state"
+        );
+        let Some(parked) = self.parked_attempts.pop() else {
+            debug_assert!(false, "restore_attempt without a matching park_attempt");
+            return;
+        };
+        self.tracing = parked.tracing;
+        self.compile_tracing = parked.compile_tracing;
+        self.single_pass_outcome = parked.single_pass_outcome;
+        self.single_pass_finish = parked.single_pass_finish;
+        self.single_pass_finish_values = parked.single_pass_finish_values;
+        self.back_edge_finish = parked.back_edge_finish;
+        self.back_edge_finish_word = parked.back_edge_finish_word;
+        self.raw_int_fallback = parked.raw_int_fallback;
+        self.single_pass_scalar_values = parked.single_pass_scalar_values;
+        self.single_pass_ref_scalar_values = parked.single_pass_ref_scalar_values;
+        self.single_pass_virt_array_values = parked.single_pass_virt_array_values;
+        self.pending_abort_blackhole = parked.pending_abort_blackhole;
+        self.single_pass_compact_label_values = parked.single_pass_compact_label_values;
+        self.single_pass_full_live_values = parked.single_pass_full_live_values;
+        self.single_pass_compiled_key = parked.single_pass_compiled_key;
+        self.pending_token = parked.pending_token;
+        self.pending_vable_ptr = parked.pending_vable_ptr;
+        self.vable_array_lengths = parked.vable_array_lengths;
+        self.force_finish_trace = parked.force_finish_trace;
+        self.partial_trace = parked.partial_trace;
+        self.retracing_from = parked.retracing_from;
+        self.exported_state = parked.exported_state;
+        self.cancel_count = parked.cancel_count;
+        self.last_compiled_key = parked.last_compiled_key;
+        self.last_compiled_artifact_token = parked.last_compiled_artifact_token;
+        self.speculative_cut_owned_key = parked.speculative_cut_owned_key;
+        self.potential_retrace_position = parked.potential_retrace_position;
+        self.last_quasi_immutable_deps = parked.last_quasi_immutable_deps;
+        self.compile_snapshot_refs = parked.compile_snapshot_refs;
+        self.compile_short_preamble_producer = parked.compile_short_preamble_producer;
+        self.compile_resume_memos = parked.compile_resume_memos;
+        self.cached_optimizer = parked.cached_optimizer;
+        self.retrace_after_bridge = parked.retrace_after_bridge;
+        self.keep_tracing_after_close = parked.keep_tracing_after_close;
+        self.pending_preamble_tokens = parked.pending_preamble_tokens;
+        self.pending_frontend_boxes = parked.pending_frontend_boxes;
+        self.pending_frontend_box_types = parked.pending_frontend_box_types;
+        self.framestack = parked.framestack;
+        self.free_frames_list = parked.free_frames_list;
+        self.portal_call_depth = parked.portal_call_depth;
+        self.call_ids = parked.call_ids;
+        self.portal_trace_positions = parked.portal_trace_positions;
+        self.current_call_id = parked.current_call_id;
+        self.last_exc_value = parked.last_exc_value;
+        self.exc_resume = parked.exc_resume;
+        self.aborted_tracing_jitdriver = parked.aborted_tracing_jitdriver;
+        self.active_jitdriver_sd = parked.active_jitdriver_sd;
+        self.aborted_tracing_greenkey = parked.aborted_tracing_greenkey;
+        self.pending_abort_green_key = parked.pending_abort_green_key;
+        self.pending_abort_permanent = parked.pending_abort_permanent;
+        self.pending_abort_has_merge_points = parked.pending_abort_has_merge_points;
+        self.pending_abort_reason = parked.pending_abort_reason;
+        self.interpret_framestack_for_abort = parked.interpret_framestack_for_abort;
+        self.last_interpret_abort_reason = parked.last_interpret_abort_reason;
+        self.interpret_bail_residual = parked.interpret_bail_residual;
+        self.last_exc_box = parked.last_exc_box;
+        self.class_of_last_exc_is_const = parked.class_of_last_exc_is_const;
+        self.forced_virtualizable = parked.forced_virtualizable;
+        self.ovf_flag = parked.ovf_flag;
+        self.box_names_memo = parked.box_names_memo;
+        self.trace_length_at_last_tco = parked.trace_length_at_last_tco;
+        self.active_trace_session = parked.active_trace_session;
+        self.bridge_info = parked.bridge_info;
+        self.profiler_tracing_active = parked.profiler_tracing_active;
+    }
+
     /// resume.py:1314 parity: `metainterp_sd.virtualref_info` shared
     /// `VirtualRefInfo` handed to `blackhole_from_resumedata` /
     /// `consume_virtualref_info` so JIT_VIRTUAL_REF handles decode.
     pub fn virtualref_info(&self) -> &crate::virtualref::VirtualRefInfo {
         &self.staticdata.virtualref_info
+    }
+
+    /// Drop the throwaway `MetaInterp` `compile_and_run_once` built.
+    ///
+    /// pyre reuses one MetaInterp. A walk that returns without compiling or
+    /// aborting would leave `tracing` / MIFrame `ref_regs` ConstPtrs as extra
+    /// roots after the portal frame that started the attempt is gone. Take the
+    /// leftover History without `aborted_tracing` (the destructor does not
+    /// count an abort) and re-run the constructor half [`Self::begin_attempt`]
+    /// so the next `bound_reached` sees the same empty attempt fields a fresh
+    /// MetaInterp would.
+    ///
+    /// `JC_TRACING` is cleared by [`JitDriver::abort_entry_tracing`] on the
+    /// entering driver's `WarmEnterState`, not here.
+    pub fn discard_unfinished_compile_and_run_once(&mut self, _starting_tracing_key: u64) {
+        let _ = self.tracing.take();
+        let _ = self.compile_tracing.take();
+        self.clear_trace_session();
+        self.begin_attempt();
+        // `set_vable_ptr` is seeded before tracing starts (`sync_before`),
+        // so `begin_attempt` (`MetaInterp.__init__`) must not drop it.
+        // After the attempt the portal frame is gone; keep the leftover
+        // out of `walk_active_trace_refs`.
+        self.drop_leftover_active_trace_roots();
+    }
+
+    /// Slots `walk_active_trace_refs` still visits after History is gone.
+    /// A throwaway MetaInterp (`warmstate.py bound_reached` /
+    /// `compile.py _trace_and_compile_from_bridge`) drops them with the
+    /// object; the reused one has to empty them at every attempt end.
+    fn drop_leftover_active_trace_roots(&mut self) {
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        self.pending_vable_ptr = std::ptr::null();
+        self.vable_array_lengths.clear();
     }
 
     /// framework.py `root_walker.walk_roots` parity for the JIT-side
@@ -3733,15 +4139,7 @@ impl<M: Clone> MetaInterp<M> {
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
-        for frame in self.framestack.frames.iter_mut() {
-            for slot in frame.ref_regs.iter_mut() {
-                // Forward the inline `ConstPtr` gcref in place; non-Const
-                // positions (ResOp / InputArg refs) carry no inline ref.
-                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                    visitor(gcref);
-                }
-            }
-        }
+        walk_framestack_ref_regs(&mut self.framestack.frames, &mut visitor);
         if let (Some(values), Some(types)) = (
             self.pending_frontend_boxes.as_mut(),
             self.pending_frontend_box_types.as_deref(),
@@ -3754,59 +4152,65 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        let Some(trace_ctx) = self.tracing.as_mut().or(self.compile_tracing.as_mut()) else {
-            return;
-        };
-        trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
-        // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
-        // InputArgs (loop / bridge entry args). No other walker visits them,
-        // and an InputArg carries no args / fail_args, so `.value` is the only
-        // forwardable slot. Same `Cell` get / forward / set dance as ops above.
-        for ia in trace_ctx.recorder.inputargs() {
-            if let Some(Value::Ref(mut r)) = ia.get_value() {
-                visitor(&mut r);
-                ia.set_value(Value::Ref(r));
+        walk_last_exc_refs(
+            &mut self.last_exc_value,
+            &mut self.last_exc_box,
+            &mut visitor,
+        );
+        walk_raw_gcref_i64(&mut self.forced_virtualizable, &mut visitor);
+        walk_raw_gcref_ptr(&mut self.pending_vable_ptr, &mut visitor);
+        if let Some(values) = self.single_pass_ref_scalar_values.as_mut() {
+            for value in values.iter_mut() {
+                walk_raw_gcref_i64(value, &mut visitor);
             }
         }
-        // pyjitpl.py — `initialize_virtualizable` /
-        // `force_start_tracing` / `setup_tracing` snapshot inputarg
-        // constants into `initial_inputarg_consts`. Each is an inline-const
-        // `OpRef`; a `ConstPtr` entry's inline gcref is forwarded in place —
-        // history.py `ConstPtr.value` is a gcref attribute of the Box.
-        for r in trace_ctx.initial_inputarg_consts.iter_mut() {
-            if let OpRef::ConstPtr(gcref) = r {
-                visitor(gcref);
+        if let Some(pending) = self.pending_abort_blackhole.as_mut() {
+            walk_pending_abort_blackhole_refs(pending, &mut visitor);
+        }
+        if let Some(trace_ctx) = self.tracing.as_mut().or(self.compile_tracing.as_mut()) {
+            walk_trace_ctx_refs(trace_ctx, &mut visitor);
+        }
+        for parked in &mut self.parked_attempts {
+            walk_framestack_ref_regs(&mut parked.framestack.frames, &mut visitor);
+            if let (Some(values), Some(types)) = (
+                parked.pending_frontend_boxes.as_mut(),
+                parked.pending_frontend_box_types.as_deref(),
+            ) {
+                for (value, ty) in values.iter_mut().zip(types.iter()) {
+                    if *ty == Type::Ref && *value != 0 {
+                        let mut gcref = GcRef(*value as usize);
+                        visitor(&mut gcref);
+                        *value = gcref.0 as i64;
+                    }
+                }
+            }
+            walk_last_exc_refs(
+                &mut parked.last_exc_value,
+                &mut parked.last_exc_box,
+                &mut visitor,
+            );
+            walk_raw_gcref_i64(&mut parked.forced_virtualizable, &mut visitor);
+            walk_raw_gcref_ptr(&mut parked.pending_vable_ptr, &mut visitor);
+            if let Some(values) = parked.single_pass_ref_scalar_values.as_mut() {
+                for value in values.iter_mut() {
+                    walk_raw_gcref_i64(value, &mut visitor);
+                }
+            }
+            if let Some(pending) = parked.pending_abort_blackhole.as_mut() {
+                walk_pending_abort_blackhole_refs(pending, &mut visitor);
+            }
+            if let Some(partial) = parked.partial_trace.as_mut() {
+                for op in partial.ops.iter_mut() {
+                    walk_op_const_ptr_refs(op, &mut visitor);
+                }
+            }
+            if let Some(exported_state) = parked.exported_state.as_mut() {
+                exported_state.walk_const_ptr_refs_mut(&mut visitor);
+            }
+            if let Some(trace_ctx) = parked.tracing.as_mut().or(parked.compile_tracing.as_mut()) {
+                walk_trace_ctx_refs(trace_ctx, &mut visitor);
             }
         }
-        // The per-guard snapshot side table copies inline gcrefs out of the
-        // `ref_regs` slots walked above into words of its own; see
-        // `recorder::Snapshot::walk_const_ptr_refs` for why nothing else
-        // forwards them.
-        for snapshot in trace_ctx.snapshots.iter_mut() {
-            snapshot.walk_const_ptr_refs(&mut visitor);
-        }
-        // `initialize_state_from_start` `self.virtualizable_boxes` stores
-        // ordinary BoxPtr objects whose concrete refs the GC traces through
-        // the object graph. Forward ConstPtr gcrefs in the box list and the
-        // sync-target cell; InputArg/`*FrontendOp` refs are walked above.
-        trace_ctx.walk_virtualizable_value_refs(&mut visitor);
-        // heapcache.py CacheEntry — the heapcache caches field values /
-        // replacements / loop-invariant results as `OpRef`. With inline
-        // consts (history.py `ConstPtr.value`) those value slots can be
-        // `ConstPtr(GcRef)`; they are returned on cache hits and
-        // emitted into the op-graph, so a stale gcref is a use-after-move.
-        // Forward them in place. Heapcache key ownership is a separate census
-        // from the independently rooted CALL_PURE constants below.
-        trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
-        // util.py args_dict / history.py ConstPtr.value: CALL_PURE's keys and
-        // results own collector-updated Const slots. Compile/optimizer handles
-        // share that same dictionary; its roots survive even after this trace
-        // is detached, without a callback borrowing TraceCtx during collection.
-
-        // Non-constant Ref registers name the recorder's `RefFrontendOp` /
-        // `InputArgRef`, whose attached concrete value was forwarded above.
-        // `registers_r[i]` is that Box and `getref_base()` reads its
-        // updated `_resref`; there is no second value to refresh.
     }
 
     /// GC walker for ConstPtr GcRefs from snapshot maps during
@@ -4465,6 +4869,7 @@ impl<M: Clone> MetaInterp<M> {
             speculative_cut_owned_key: None,
             tracing: None,
             compile_tracing: None,
+            parked_attempts: Vec::new(),
             single_pass_outcome: None,
             single_pass_finish: false,
             single_pass_finish_values: None,
@@ -6424,6 +6829,12 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // `warmstate.py bound_reached` constructs a new MetaInterp for a
+        // sibling overflow. Callers that park (`NestedTraceGuard` /
+        // `JitDriver::park_nested_trace`) clear this slot first. Incremental
+        // `function_entry_internal` has no such park, so refuse rather than
+        // clobber the outer attempt. The sibling tick already ran in
+        // `function_entry_step` / `maybe_compile_and_run`.
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -6544,7 +6955,7 @@ impl<M: Clone> MetaInterp<M> {
                 // see `setup_tracing` for the contract on raw-pointer
                 // lifetime pinning by MetaInterp ownership.
                 ctx.set_cpu(Some(&self.backend));
-                self.tracing = Some(ctx);
+                self.tracing = Some(Box::new(ctx));
                 self.arm_portal_trace_positions();
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
                 // `setup_tracing` for rationale.  Bridge-trace
@@ -6625,6 +7036,12 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // `warmstate.py bound_reached` constructs a new MetaInterp for a
+        // sibling overflow. Callers that park (`NestedTraceGuard` /
+        // `JitDriver::park_nested_trace`) clear this slot first. Incremental
+        // `commit_start_tracing` has no such park, so refuse rather than
+        // clobber the outer attempt. The sibling tick already ran in
+        // `maybe_compile_and_run` / `on_back_edge_typed_decision`.
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
@@ -6720,9 +7137,12 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
     ) -> HotResult {
-        if self.tracing.is_some() {
-            return HotResult::AlreadyTracing;
-        }
+        // `opimpl_jit_merge_point` records the loop being traced; those back
+        // edges never reach `maybe_compile_and_run`. This is the interpreter
+        // door: only the matching cell's `JC_TRACING` returns
+        // (`maybe_compile_and_run`). A sibling still ticks, and overflow
+        // goes to `bound_reached`. Matching-cell `JC_TRACING` is answered
+        // inside `maybe_compile_decision*`.
 
         // warmstate.py maybe_compile_and_run — decide via the typed greenkey when the
         // raw (code, pc) is available so the installed cell carries a
@@ -6895,6 +7315,27 @@ impl<M: Clone> MetaInterp<M> {
         // loop-token bit after this reset, matching `__init__(...,
         // force_finish_trace=...)`.
         self.force_finish_trace = false;
+        // Per-attempt extra-root slots `MetaInterp::new` leaves empty.
+        // `walk_active_trace_refs` visits them independently of `tracing`,
+        // so a reused MetaInterp that returns from `compile_and_run_once`
+        // would otherwise keep the last walk's boxes alive after the
+        // portal frame is gone.
+        self.single_pass_outcome = None;
+        self.single_pass_finish = false;
+        self.single_pass_finish_values = None;
+        self.back_edge_finish = None;
+        self.back_edge_finish_word = None;
+        self.raw_int_fallback = None;
+        self.single_pass_scalar_values = None;
+        self.single_pass_ref_scalar_values = None;
+        self.single_pass_virt_array_values = None;
+        self.single_pass_compact_label_values = None;
+        self.single_pass_full_live_values = None;
+        self.single_pass_compiled_key = None;
+        self.pending_token = None;
+        // In-flight `compile_loop_body` claim. A fresh MetaInterp has None;
+        // `cut_compiled_keys` is the compiled_loops side table and stays.
+        self.speculative_cut_owned_key = None;
     }
 
     fn setup_tracing(
@@ -6995,7 +7436,7 @@ impl<M: Clone> MetaInterp<M> {
         // this trace because `self` (MetaInterp) owns both `tracing`
         // and `backend`, and tracing is torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
-        self.tracing = Some(ctx);
+        self.tracing = Some(Box::new(ctx));
         self.arm_portal_trace_positions();
         // pyjitpl.py `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
@@ -7041,7 +7482,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Access the active TraceCtx (if currently tracing).
     pub fn trace_ctx(&mut self) -> Option<&mut TraceCtx> {
-        self.tracing.as_mut()
+        self.tracing.as_deref_mut()
     }
 
     /// Header-revisit CloseLoop: publish the greens `bhimpl_jit_merge_point`
@@ -12147,6 +12588,7 @@ impl<M: Clone> MetaInterp<M> {
             self.clear_trace_session();
         }
         self.clear_trace_session();
+        self.drop_leftover_active_trace_roots();
     }
 
     /// Drop a trace which the frontend declined before it became a traced
@@ -12169,6 +12611,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         self.clear_pending_abort();
         self.clear_trace_session();
+        self.drop_leftover_active_trace_roots();
     }
 
     /// Drop the `pending_abort_*` payload staged by live trace teardown.
@@ -13490,32 +13933,22 @@ impl<M: Clone> MetaInterp<M> {
         green_key_raw: (usize, usize),
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
-        let engine_is_tracing = self.is_tracing();
         let compiled_loops = &self.compiled_loops;
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            return warm_state.function_entry_step(
-                cell_key,
-                None,
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
-                engine_is_tracing,
-            );
+            return warm_state.function_entry_step(cell_key, None, || {
+                compiled_loops.contains_key(&(jd_no, cell_key))
+            });
         }
         match Self::with_typed_decision_key(green_key_hash, green_key_raw, |key| {
-            warm_state.function_entry_step(
-                cell_key,
-                Some(key),
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
-                engine_is_tracing,
-            )
+            warm_state.function_entry_step(cell_key, Some(key), || {
+                compiled_loops.contains_key(&(jd_no, cell_key))
+            })
         }) {
             Some(step) => step,
-            None => warm_state.function_entry_step(
-                cell_key,
-                None,
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
-                engine_is_tracing,
-            ),
+            None => warm_state.function_entry_step(cell_key, None, || {
+                compiled_loops.contains_key(&(jd_no, cell_key))
+            }),
         }
     }
 
@@ -15092,9 +15525,18 @@ impl<M: Clone> MetaInterp<M> {
     /// (RPython's `LoopToken.__del__` analog).
     /// `memmgr.py` `release_all_loops` via `jit_hooks.stats_memmgr_release_all`
     /// on the one `warmrunnerdesc.memory_manager`, which every
-    /// `jitdriver_sd.warmstate` shares.
+    /// `jitdriver_sd.warmstate` shares, plus the crate-split
+    /// `compiled_loops` retirement `try_to_free_some_loops` already does
+    /// after `_kill_old_loops_now`.
+    ///
+    /// `pypyjit.releaseall` can run during tracing. Upstream only
+    /// clears `alive_loops`; leftover History / MIFrame / vable slots
+    /// belong to `warmstate.py bound_reached` dropping the throwaway
+    /// MetaInterp, which pyre runs as
+    /// [`Self::discard_unfinished_compile_and_run_once`].
     pub fn release_all_driver_loops(&mut self) {
-        self.memory_manager.release_all_loops();
+        let evicted = self.memory_manager.release_all_loops();
+        self.retire_evicted_loop_tokens(evicted);
     }
 
     pub fn try_to_free_some_loops(&mut self) {
@@ -15102,6 +15544,13 @@ impl<M: Clone> MetaInterp<M> {
         // `self.staticdata.warmrunnerdesc.memory_manager.next_generation()`,
         // once, on the runner's one manager.
         let evicted = self.memory_manager.next_generation();
+        self.retire_evicted_loop_tokens(evicted);
+    }
+
+    /// Drop `compiled_loops` metadata whose token just left
+    /// `alive_loops`, matching by token-object identity as
+    /// `try_to_free_some_loops` does after `next_generation`.
+    fn retire_evicted_loop_tokens(&mut self, evicted: Vec<std::sync::Arc<JitCellToken>>) {
         for token in evicted {
             // Counters move in `CompiledLoopToken::drop`
             // (`model.py` `CompiledLoopToken.__del__`). This loop only
@@ -18106,7 +18555,7 @@ impl<M: Clone> MetaInterp<M> {
         let jd_no = source_jitdriver_index.unwrap_or(self.active_jitdriver_sd.unwrap_or(0));
         ctx.set_trace_limit(self.warm_state_for_driver(jd_no).trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
-        self.tracing = Some(ctx);
+        self.tracing = Some(Box::new(ctx));
         self.arm_portal_trace_positions();
         let self_ptr = self as *const Self as *const ();
         let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
@@ -20215,7 +20664,7 @@ impl<M: Clone> MetaInterp<M> {
             materialized,
             resume_liveness,
             resume_op_live,
-            tracing.as_mut(),
+            tracing.as_deref_mut(),
             resume_owned.as_ref(),
             reader,
         );
@@ -20554,10 +21003,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py: reuse / allocate MIFrame, push onto framestack.
         let frame = if let Some(mut frame) = self.free_frames_list.pop() {
-            frame.setup_reused(jitcode, 0, greenkey, self.tracing.as_mut());
+            frame.setup_reused(jitcode, 0, greenkey, self.tracing.as_deref_mut());
             frame
         } else {
-            crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut())
+            crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_deref_mut())
         };
         self.framestack.push(frame);
         self.framestack.len() - 1
@@ -24812,7 +25261,7 @@ mod portal_resume_rebuild_tests {
             num_failargs: 0,
             fail_arg_types: vec![],
         });
-        meta.tracing = Some(tracing);
+        meta.tracing = Some(Box::new(tracing));
 
         let frames = [section(0, vec![RebuiltValue::Virtual(0)])];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
@@ -24901,7 +25350,7 @@ mod portal_resume_rebuild_tests {
             num_failargs: 0,
             fail_arg_types: vec![],
         });
-        meta.tracing = Some(tracing);
+        meta.tracing = Some(Box::new(tracing));
 
         let frames = [
             section(
@@ -25004,7 +25453,7 @@ mod portal_resume_rebuild_tests {
         assert!(!first.is_none());
         assert_eq!(tracing.bridge_virtual_op(0), Some(first));
 
-        meta.tracing = Some(tracing);
+        meta.tracing = Some(Box::new(tracing));
         let frames = [section(0, vec![RebuiltValue::Virtual(0)])];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
             jitcode,
@@ -26172,8 +26621,12 @@ mod metainterp_static_data_tests {
         meta.call_ids = vec![1, 2];
         meta.last_exc_value = 0xabc;
         meta.forced_virtualizable = 0xdef;
+        meta.single_pass_ref_scalar_values = Some(vec![0x111, 0x222]);
         meta.ovf_flag = true;
         meta.trace_length_at_last_tco = 12;
+        meta.speculative_cut_owned_key = Some(0xC0DE);
+        meta.cut_compiled_keys
+            .insert(meta.compiled_loop_key(0xC0DE));
         let leftover = std::sync::Arc::new(JitCodeBuilder::new().finish());
         meta.perform_call(leftover, &[], None).unwrap_err();
         assert!(!meta.framestack.is_empty());
@@ -26193,6 +26646,13 @@ mod metainterp_static_data_tests {
             meta.portal_trace_positions
                 .as_ref()
                 .is_some_and(|p| p.is_empty())
+        );
+        assert!(meta.single_pass_ref_scalar_values.is_none());
+        assert!(meta.speculative_cut_owned_key.is_none());
+        // Side table of `compiled_loops`, shared like warm_state.
+        assert!(
+            meta.cut_compiled_keys
+                .contains(&meta.compiled_loop_key(0xC0DE))
         );
         // Long-lived owner: the same WarmEnterState instance remains.
         assert_eq!(meta.warm_state_for_driver(0).threshold(), 10);
@@ -30830,7 +31290,7 @@ mod tests {
             &[OpRef::const_ptr(GcRef(0xA000)), OpRef::input_arg_int(0)],
             5,
         ));
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == 0xA000 {
@@ -30845,11 +31305,13 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_refreshes_miframe_ref_mirrors() {
+        // `RefOp.getref_base` / `InputArgRef.getref_base` read the value
+        // off the box in the register (`history.py`).
         let mut meta = MetaInterp::<()>::new(0);
         let trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
         let input = trace_ctx.recorder.inputargs()[0].opref();
         trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         let mut b = crate::jitcode::JitCodeBuilder::default();
         b.ref_return(0);
@@ -30883,7 +31345,7 @@ mod tests {
         let int_op = mk_op(OpCode::IntAdd, &[OpRef::input_arg_int(0)], 6);
         int_op.set_value(Value::Int(7));
         trace_ctx.recorder.push_op_for_test(int_op);
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == 0xA000 {
@@ -30908,7 +31370,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         let trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
         trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == 0x7000 {
@@ -30951,7 +31413,7 @@ mod tests {
                 Type::Ref,
             )],
         });
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == 0xA000 {
@@ -30987,6 +31449,88 @@ mod tests {
         let mut visited = 0u32;
         meta.walk_active_trace_refs(|_| visited += 1);
         assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_active_last_exc_value_and_box() {
+        // pyjitpl.py `MetaInterp.__init__` `self.last_exc_value` is an
+        // ordinary `OBJECTPTR` GC field; `handle_possible_exception`
+        // stores `last_exc_box = ConstPtr(val)` of the same object.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xA000;
+        meta.last_exc_box = Some(OpRef::const_ptr(GcRef(0xA000)));
+        meta.forced_virtualizable = 0xA000;
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        assert_eq!(meta.last_exc_value, 0xB000);
+        assert_eq!(
+            meta.last_exc_box.and_then(OpRef::as_const_ptr),
+            Some(GcRef(0xB000))
+        );
+        assert_eq!(meta.forced_virtualizable, 0xB000);
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_parked_last_exc_value_and_box() {
+        // `park_attempt` stashes the outer `last_exc_value` /
+        // `last_exc_box` while a nested attempt runs. A minor
+        // collection in that window must forward the parked slots so
+        // `restore_attempt` does not write a from-space pointer back.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.last_exc_value = 0xA000;
+        meta.last_exc_box = Some(OpRef::const_ptr(GcRef(0xA000)));
+        meta.forced_virtualizable = 0xA000;
+        meta.park_attempt();
+        assert_eq!(meta.last_exc_value, 0);
+        assert!(meta.last_exc_box.is_none());
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        meta.restore_attempt();
+        assert_eq!(meta.last_exc_value, 0xB000);
+        assert_eq!(
+            meta.last_exc_box.and_then(OpRef::as_const_ptr),
+            Some(GcRef(0xB000))
+        );
+        assert_eq!(meta.forced_virtualizable, 0xB000);
+    }
+
+    /// `warmstate.py` `bound_reached` constructs a fresh MetaInterp; pyre
+    /// parks the outer attempt on the same object. `speculative_cut_owned_key`
+    /// is the in-flight `compile_loop_body` claim (`MetaInterp::new` leaves
+    /// it None), so inner and outer values must not leak across park/restore.
+    #[test]
+    fn park_attempt_isolates_speculative_cut_owned_key() {
+        const OUTER_KEY: u64 = 0x0A11;
+        const INNER_KEY: u64 = 0x1B22;
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.speculative_cut_owned_key = Some(OUTER_KEY);
+
+        meta.park_attempt();
+        assert!(
+            meta.speculative_cut_owned_key.is_none(),
+            "inner attempt starts constructor-empty, as MetaInterp::new"
+        );
+
+        meta.speculative_cut_owned_key = Some(INNER_KEY);
+        meta.begin_attempt();
+        assert!(
+            meta.speculative_cut_owned_key.is_none(),
+            "begin_attempt is MetaInterp.__init__ for the reused object"
+        );
+        meta.speculative_cut_owned_key = Some(INNER_KEY);
+
+        meta.restore_attempt();
+        assert_eq!(meta.speculative_cut_owned_key, Some(OUTER_KEY));
     }
 
     /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled
@@ -36257,6 +36801,117 @@ mod loop_side_table_tests {
             .memory_manager
             .release_all_loops();
         assert_ne!(meta.runnable_generation(), before_release);
+    }
+
+    #[test]
+    fn release_all_loops_retires_compiled_loops_like_eviction() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let token = std::sync::Arc::new(JitCellToken::new(1));
+        token.set_compiled(Box::new(()));
+        token.green_key.set(7);
+        meta.memory_manager.keep_loop_alive(&token);
+        let mut entry = compiled_entry(100);
+        entry.token = std::sync::Arc::downgrade(&token);
+        meta.insert_compiled_loop(7, entry);
+        meta.record_loop_header_pc(7, 7);
+        meta.record_loop_header_greens(7, (vec![7], vec![], vec![]));
+        drop(token);
+
+        assert_eq!(meta.compiled_loops.len(), 1);
+        meta.release_all_driver_loops();
+        assert!(
+            meta.compiled_loops.is_empty(),
+            "current-token eviction drops the compiled_loops entry"
+        );
+        assert!(meta.loop_header_pc_for(7).is_none());
+        assert!(!meta.loop_header_greens.contains_key(&(0, 7)));
+    }
+
+    #[test]
+    fn release_all_loops_drops_previous_tokens_only_when_current_stays() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let current = std::sync::Arc::new(JitCellToken::new(1));
+        current.set_compiled(Box::new(()));
+        current.green_key.set(7);
+        let previous = std::sync::Arc::new(JitCellToken::new(2));
+        previous.set_compiled(Box::new(()));
+        previous.green_key.set(7);
+        meta.memory_manager.keep_loop_alive(&previous);
+        let mut entry = compiled_entry(100);
+        entry.token = std::sync::Arc::downgrade(&current);
+        entry
+            .previous_tokens
+            .push(std::sync::Arc::downgrade(&previous));
+        meta.insert_compiled_loop(7, entry);
+        drop(previous);
+
+        meta.release_all_driver_loops();
+        let entry = meta
+            .compiled_loops
+            .get(&(0, 7))
+            .expect("current token was not in alive_loops");
+        assert!(entry.previous_tokens.is_empty());
+        assert!(entry.token.upgrade().is_some());
+    }
+
+    /// `walk_active_trace_refs` visits leftover MIFrame ConstPtrs and
+    /// `pending_vable_ptr` independently of `tracing`. A throwaway
+    /// MetaInterp (`warmstate.py` `bound_reached`) drops them with the
+    /// object; pyre's reused MetaInterp empties them at attempt end.
+    #[test]
+    fn discard_unfinished_compile_and_run_once_drops_leftover_active_trace_roots() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.pending_vable_ptr = 0xBEEF as *const u8;
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.ref_regs[0] = Some(majit_ir::OpRef::const_ptr(GcRef(0xAAAA)));
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        let mut before = 0usize;
+        meta.walk_active_trace_refs(|_| before += 1);
+        assert!(
+            before >= 2,
+            "pending_vable_ptr and the MIFrame ConstPtr are extra roots"
+        );
+
+        meta.discard_unfinished_compile_and_run_once(0);
+
+        let mut after = 0usize;
+        meta.walk_active_trace_refs(|_| after += 1);
+        assert_eq!(
+            after, 0,
+            "attempt end drops leftover walk_active_trace_refs slots"
+        );
+        assert!(meta.pending_vable_ptr.is_null());
+        assert_eq!(meta.framestack.len(), 0);
+    }
+
+    /// `memmgr.py release_all_loops` / `interp_jit.py releaseall` only
+    /// clear `alive_loops`. An in-progress `compile_and_run_once` keeps
+    /// its History and MIFrame.
+    #[test]
+    fn release_all_loops_leaves_in_progress_trace_intact() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.tracing = Some(Box::new(crate::trace_ctx::TraceCtx::for_test(1)));
+        meta.pending_vable_ptr = 0xBEEF as *const u8;
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.ref_regs[0] = Some(majit_ir::OpRef::const_ptr(GcRef(0xAAAA)));
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.release_all_driver_loops();
+
+        assert!(meta.tracing.is_some(), "releaseall leaves History");
+        assert_eq!(meta.framestack.len(), 1);
+        assert_eq!(meta.pending_vable_ptr, 0xBEEF as *const u8);
+        let mut after = 0usize;
+        meta.walk_active_trace_refs(|_| after += 1);
+        assert!(
+            after >= 2,
+            "in-progress MIFrame ConstPtr and pending_vable_ptr stay rooted"
+        );
     }
 
     #[test]

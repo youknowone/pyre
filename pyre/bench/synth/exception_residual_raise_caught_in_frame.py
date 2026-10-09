@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=18.4
+# pyre-check: max-pypy-ratio=8.9
+# Run 37213275404 widest gated 7.7x (ubuntu cranelift); macos 6.0x/6.3x,
+# ubuntu dynasm 6.9x, windows ?6.7x. The ceiling is 15% over the widest.
 # Tightened 34 -> 27 when `seeded_callee_resume` stopped requiring the
 # callee's own exception table: execution-only time here fell 1.40x against a
 # same-day build of the parent commit, so the previous headroom is kept and

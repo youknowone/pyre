@@ -882,7 +882,9 @@ impl MIFrame {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc))
+        self.with_ctx(|this, ctx| {
+            this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc, true)
+        })
     }
 
     #[doc(hidden)]
@@ -1750,7 +1752,7 @@ impl MIFrame {
         // `last_instr` / `valuestackdepth` are plain values that evolve
         // with the trace, so they stay snapshot-sourced below.
         let statics_addr = {
-            let live = self.sym().live_vable_frame_addr;
+            let live = self.sym().live_vable_frame_addr();
             if live != 0 && self.sym().owns_virtualizable_shadow() {
                 live
             } else {
@@ -1786,17 +1788,29 @@ impl MIFrame {
         // as a loop-carried box for exactly this reason; the remaining pointer
         // statics keep their promoted-constant representation because the
         // bytecode path cannot rebind them mid-loop.
+        //
+        // That seeded box is `virtualizable_boxes[debugdata]`, not the
+        // pyre-only `s.vable_debugdata` cache. A bridge failarg compaction
+        // leaves the cache as the outer `InputArgRef(1)` while
+        // `reached_loop_header` `remove_consts_and_duplicates` rewrites the
+        // shadow. Mirroring the cache here would stomp the merge-point box
+        // and `close_loop_args_at` would publish the outer inputarg on the
+        // JUMP (`compile.py compile_loop` / `pyjitpl.py reached_loop_header`).
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
         let pycode_op = ctx.const_ref(code_ptr as i64);
         let vsd_op = ctx.const_int(vsd);
-        let debugdata_op = self.sym().vable_debugdata;
+        let debugdata_op = ctx
+            .virtualizable_box_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+            .filter(|r| !r.is_none())
+            .unwrap_or(self.sym().vable_debugdata);
         let w_globals_op = ctx.const_ref(ns_ptr);
         let owns = {
             let s = self.sym_mut();
             s.vable_last_instr = last_instr_op;
             s.vable_pycode = pycode_op;
             s.vable_valuestackdepth = vsd_op;
+            s.vable_debugdata = debugdata_op;
             s.frame_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
@@ -1972,6 +1986,7 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        emit_future_condition: bool,
     ) -> Vec<OpRef> {
         // The `--TICK--` poll now lives in JUMP_BACKWARD's jitcode
         // (`emit_jump_absolute_tick`: `raw_load_i` / `uint_ge` / `goto_if_not`
@@ -2267,14 +2282,37 @@ impl MIFrame {
                 (locals_vec, stack_vec)
             };
             stack_vec.resize(target_stack_capacity, OpRef::NONE);
+            // pyjitpl.py `reached_loop_header`: JUMP args are
+            // `live_arg_boxes = reds + virtualizable_boxes[:-1]`.
+            // `PyreSym.vable_*` is a pyre-only cache
+            // (`mirror_vable_static_to_boxes`); RPython has only
+            // `metainterp.virtualizable_boxes`. A bridge seeds
+            // `s.vable_debugdata` as the compacted failarg
+            // `InputArgRef(1)` while an earlier merge point's
+            // `remove_consts_and_duplicates` rewrites the shadow to a
+            // SameAs/Const. Reading the cache then publishes that outer
+            // inputarg on the JUMP, a slot `original_boxes` (the shadow)
+            // never had, and `cut_trace_from` appends it as an extra
+            // start-LABEL input (`compile.py compile_loop`).
+            let vable_last_instr = ctx
+                .virtualizable_box_at(crate::virtualizable_spec::LAST_INSTR_VABLE_FIELD_INDEX)
+                .unwrap_or(s.vable_last_instr);
+            let vable_pycode = ctx
+                .virtualizable_box_at(crate::virtualizable_spec::PYCODE_VABLE_FIELD_INDEX)
+                .unwrap_or(s.vable_pycode);
+            let vable_vsd = ctx
+                .virtualizable_box_at(2)
+                .unwrap_or(s.vable_valuestackdepth);
+            let vable_debugdata = ctx
+                .virtualizable_box_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+                .unwrap_or(s.vable_debugdata);
             (
                 s.frame,
                 recovered_ec,
-                s.vable_last_instr,
-                s.vable_pycode,
-                ctx.virtualizable_box_at(2)
-                    .unwrap_or(s.vable_valuestackdepth),
-                s.vable_debugdata,
+                vable_last_instr,
+                vable_pycode,
+                vable_vsd,
+                vable_debugdata,
                 nlocals,
                 locals_vec,
                 stack_vec,
@@ -2467,14 +2505,16 @@ impl MIFrame {
         // whose flag is decoupled from any watcher, which can spuriously
         // exit a hot inner loop with no chance of re-tracing.
         //
-        // RPython parity: orgpc must be the loop header TARGET, not the
-        // JUMP_BACKWARD's PC. The patchguardop from this GuardFutureCondition
-        // provides the resume_position for all peeled body virtual state guards.
-        // If orgpc is wrong, all those guards resume at the wrong PC.
-        if let Some(pc) = target_pc {
-            self.orgpc = pc;
+        // orgpc is the loop header target, so this guard's resume is the
+        // header. `reached_loop_header` records GUARD_FUTURE_CONDITION once,
+        // before the compiled-target check; that close passes false and does
+        // not record the guard again.
+        if emit_future_condition {
+            if let Some(pc) = target_pc {
+                self.orgpc = pc;
+            }
+            self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         }
-        self.generate_guard(ctx, majit_ir::OpCode::GuardFutureCondition, &[]);
         // pyjitpl.py:2995 assert len(self.virtualref_boxes) == 0,
         //     "missing virtual_ref_finish()?"
         // Reached loop header must not have dangling virtualrefs — every

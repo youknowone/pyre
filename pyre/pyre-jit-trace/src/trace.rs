@@ -73,16 +73,6 @@ thread_local! {
     /// from `ContinueRunningNormally` mirrors `_exit_frame_with_exception`.
     static WALK_END_PROPAGATED_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::PyError>> =
         const { std::cell::RefCell::new(None) };
-    /// Stable address for the in-flight walk-end exception carrier above.
-    ///
-    /// RPython keeps this value in the translated MIFrame / exception object
-    /// graph, which its root walker visits for every mutator. Pyre's
-    /// trace→portal seam is genuinely per-thread, but its raw TLS is outside
-    /// that graph, so the owning mutator publishes its address to the
-    /// collector's STW root-area registry.
-    static WALK_END_ROOT_AREA: WalkEndRootArea = WalkEndRootArea {
-        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|value| value as *const _),
-    };
     /// True at portal trace sites that can consume
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
@@ -94,8 +84,61 @@ thread_local! {
     static WALK_END_RESTART_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// Walk-end TLS stacked with a nested `compile_and_run_once`.
+pub struct ParkedWalkEnd {
+    commit_leg: u8,
+    propagated_exception: Option<pyre_interpreter::PyError>,
+    propagate_allowed: bool,
+    restart_pc: Option<usize>,
+}
+
+/// Take the outer walk-end TLS so the inner attempt starts clean.
+pub fn park_walk_end() {
+    let parked = ParkedWalkEnd {
+        commit_leg: WALK_END_COMMIT_LEG.with(|c| c.replace(0)),
+        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take()),
+        propagate_allowed: WALK_END_PROPAGATE_ALLOWED.with(|c| c.replace(false)),
+        restart_pc: WALK_END_RESTART_PC.with(|c| c.take()),
+    };
+    PARKED_WALK_END_STACK.with(|s| s.borrow_mut().push(parked));
+}
+
+/// Restore the outer walk-end TLS after the nested run.
+pub fn restore_walk_end() {
+    let Some(parked) = PARKED_WALK_END_STACK.with(|s| s.borrow_mut().pop()) else {
+        return;
+    };
+    WALK_END_COMMIT_LEG.with(|c| c.set(parked.commit_leg));
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = parked.propagated_exception);
+    WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(parked.propagate_allowed));
+    WALK_END_RESTART_PC.with(|c| c.set(parked.restart_pc));
+}
+
 struct WalkEndRootArea {
     propagated_exception: *const std::cell::RefCell<Option<pyre_interpreter::PyError>>,
+    parked_stack: *const std::cell::RefCell<Vec<ParkedWalkEnd>>,
+}
+
+thread_local! {
+    /// Outer walk-end TLS stacked while a nested `compile_and_run_once` runs.
+    /// `park_walk_end` moves the propagated exception out of
+    /// `WALK_END_PROPAGATED_EXCEPTION`, so this stack is the collector-visible
+    /// owner until `restore_walk_end`.
+    static PARKED_WALK_END_STACK: std::cell::RefCell<Vec<ParkedWalkEnd>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Stable addresses for this mutator's walk-end exception carrier and
+    /// parked outer-walk stack.
+    ///
+    /// RPython keeps these values in the translated MIFrame / exception object
+    /// graph, which its root walker visits for every mutator
+    /// (`rthread.py` `_trace_tlref`). Pyre's trace→portal seam is genuinely
+    /// per-thread, but its raw TLS is outside that graph, so the owning
+    /// mutator publishes both cell addresses to the collector's STW root-area
+    /// registry.
+    static WALK_END_ROOT_AREA: WalkEndRootArea = WalkEndRootArea {
+        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|value| value as *const _),
+        parked_stack: PARKED_WALK_END_STACK.with(|value| value as *const _),
+    };
 }
 
 /// The flush legs that can commit a walk's end state, in the order they are
@@ -317,9 +360,19 @@ pub unsafe fn walk_walk_end_roots_area(
     let exception_cell = unsafe { &*area.propagated_exception };
     // SAFETY: the owner is either synchronously collecting or STW-quiesced;
     // no Rust borrow is live while the collector forwards these raw slots.
+    // Every address comes from the registered extra-area `data`, the same
+    // ownership `ThreadLocalReference._trace_tlref` (`rthread.py`) gives each
+    // mutator's block through `_RPython_ThreadLocals_Enum`.
     let opt = unsafe { &mut *exception_cell.as_ptr() };
     if let Some(err) = opt.as_mut() {
         err.walk_gc_refs(visitor);
+    }
+    let parked_cell = unsafe { &*area.parked_stack };
+    let parked = unsafe { &mut *parked_cell.as_ptr() };
+    for parked in parked.iter_mut() {
+        if let Some(err) = parked.propagated_exception.as_mut() {
+            err.walk_gc_refs(visitor);
+        }
     }
 }
 
@@ -335,6 +388,7 @@ pub struct TraceRoots {
     prev_active: bool,
     _register_roots: [crate::jitcode_dispatch::RegisterListRoot; 4],
     _exception_roots: [ExceptionRoot; 2],
+    _live_vable_frame: majit_gc::shadow_stack::MutatorExtraAreaGuard,
 }
 
 impl TraceRoots {
@@ -349,11 +403,23 @@ impl TraceRoots {
             ExceptionRoot::new(&owner.last_exc_value),
             ExceptionRoot::new(&owner.current_exc_value),
         ];
+        // `virtualizable.py` the live virtualizable is a GC pointer. pyre
+        // keeps a parallel raw address for write-through / identity bake;
+        // root it so a minor rewrites the cell in place, the way
+        // `LiveFrameRoot` already does across one residual.
+        let live_vable_frame = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_live_vable_frame,
+                (&owner.live_vable_frame_addr as *const std::cell::Cell<usize>).cast(),
+                "live_vable_frame",
+            )
+        };
         let prev_active = ACTIVE_TRACE.with(|c| c.replace(true));
         Self {
             prev_active,
             _register_roots: register_roots,
             _exception_roots: exception_roots,
+            _live_vable_frame: live_vable_frame,
         }
     }
 }
@@ -387,6 +453,17 @@ impl ExceptionRoot {
             _owner: owner.clone(),
         }
     }
+}
+
+unsafe fn walk_live_vable_frame(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let slot = unsafe { &*(data as *const std::cell::Cell<usize>) };
+    let addr = slot.get();
+    if addr == 0 {
+        return;
+    }
+    let mut gcref = majit_ir::GcRef(addr);
+    visitor(&mut gcref);
+    slot.set(gcref.0);
 }
 
 unsafe fn walk_exception_slot(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -5076,12 +5153,15 @@ fn run_perfn_walk<Sym: WalkSym>(
             // The closing frame and GuardFutureCondition remain anchored at
             // the loop header.  The tick poll is walked inside JUMP_BACKWARD
             // (`emit_jump_absolute_tick`), not synthesized here.
+            // `reached_loop_header` already recorded GUARD_FUTURE_CONDITION
+            // before the compiled-target check. Reuse that guard.
             *jump_args = sym.close_loop_args_at(
                 ctx,
                 cf_addr,
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
+                false,
             );
         }
         // pyjitpl.py raise_continue_running_normally parity: a
@@ -7499,6 +7579,15 @@ mod tests {
             // offsets once the collector follows that handle, not as separate
             // roots of this TLS cell. The previous expected pair
             // `(0x3000 + 0x20, 0x4000 + 0x20)` was those two fields.
+            let parked_err = pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "parked foreign mutator root",
+            );
+            let parked_handle = parked_err.as_raw() as usize;
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                *slot.borrow_mut() = Some(parked_err);
+            });
+            super::park_walk_end();
             let err = pyre_interpreter::PyError::new(
                 pyre_interpreter::PyErrorKind::RuntimeError,
                 "foreign mutator root",
@@ -7508,16 +7597,25 @@ mod tests {
                 *slot.borrow_mut() = Some(err);
             });
             area_tx
-                .send((super::capture_walk_end_root_area() as usize, handle))
+                .send((
+                    super::capture_walk_end_root_area() as usize,
+                    handle,
+                    parked_handle,
+                ))
                 .unwrap();
             resume_rx.recv().unwrap();
             super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
                 let err = slot.borrow_mut().take().unwrap();
                 handle_tx.send(err.as_raw() as usize).unwrap();
             });
+            super::restore_walk_end();
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                let err = slot.borrow_mut().take().unwrap();
+                handle_tx.send(err.as_raw() as usize).unwrap();
+            });
         });
 
-        let (area, handle) = area_rx.recv().unwrap();
+        let (area, handle, parked_handle) = area_rx.recv().unwrap();
         let area = area as *const ();
         // The owner is blocked after publishing its stable TLS addresses,
         // matching the mutator quiescence required by the STW registry.
@@ -7530,8 +7628,9 @@ mod tests {
             });
         }
         resume_tx.send(()).unwrap();
-        assert_eq!(seen, vec![handle]);
+        assert_eq!(seen, vec![handle, parked_handle]);
         assert_eq!(handle_rx.recv().unwrap(), handle);
+        assert_eq!(handle_rx.recv().unwrap(), parked_handle);
         owner.join().unwrap();
     }
 

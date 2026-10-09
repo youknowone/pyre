@@ -284,7 +284,8 @@ macro_rules! invoke_stub {
 /// Same argument slots as [`invoke_stub`], but the Rust ABI. A two-word
 /// return such as `Option<*mut T>` is a scalar pair in registers on SysV
 /// and on Win64. `extern "C"` `(i64, i64)` is a hidden return buffer on
-/// Win64 and would shift the callee's arguments.
+/// Win64 and would shift the callee's arguments. wasm32 `bh_call_r` uses
+/// the word stub (`dispatch_word_stub`).
 macro_rules! invoke_stub_rust {
     ($func:ident, $args:ident, $ret:ty $(, $class:ident)*) => {{
         let f: unsafe extern "Rust" fn($(invoke_ty!($class)),*) -> $ret =
@@ -449,7 +450,9 @@ macro_rules! define_call_sig_stubs {
 
         /// Both return words. `Option<*mut T>` puts the discriminant in the
         /// first and the pointer in the second; a one-word return leaves the
-        /// value in the first.
+        /// value in the first. wasm32 uses [`dispatch_word_stub`] instead:
+        /// the descr FUNC is `(i64…) -> i64`.
+        #[cfg(not(target_arch = "wasm32"))]
         unsafe fn call_pair(func: usize, classes: &[ArgClass], args: &[i64]) -> (i64, i64) {
             match classes {
                 $(
@@ -539,29 +542,45 @@ unsafe fn dispatch_word_stub(func: usize, classes: &[ArgClass], args: &[i64], re
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-/// wasm32 `call_indirect` type-checks the callee. The descr class list is not
-/// that type: published targets are widening `i64` shims, raw pointers are
-/// `i32`. The host reads the table signature. Native keeps the stub.
+/// wasm32 `call_indirect` type-checks the callee against the descr FUNC.
+/// `descr.py` `CallDescr.create_call_stub` builds that type from the same
+/// FUNC the calldescr came from, and every published target has that wasm
+/// type. A callee with no single wasm function type, or a host import outside
+/// the guest table, is handled by the host hook.
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
     unsafe { dispatch_word_stub(func, classes, args, 'i') }
 }
 
 /// `llmodel.py bh_call_r`. The staged wrapper returns the pointer as an `i64`
-/// word. A table type that is a real `i32` is host-reflected.
+/// word. The published target's wasm type is that word. A callee with no
+/// single wasm function type stays on the host hook.
+///
+/// Native reads both return words so `Option<*mut T>` yields the pointer
+/// (`ref_word_from_return_pair`). wasm32 `call_indirect` type-checks the
+/// descr FUNC `(i64…) -> i64` (`descr.py CallDescr.create_call_stub`); that
+/// is the same word stub `bh_call_i` uses.
 ///
 /// # Safety
 /// `func` must match `classes`, and its result must be a GCREF.
 pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    if let Some(value) = wasm_residual_host_call(func, args, classes, 'r', false, 8) {
-        return value;
+    #[cfg(target_arch = "wasm32")]
+    {
+        unsafe { dispatch_word_stub(func, classes, args, 'r') }
     }
-    let (first, second) = unsafe { call_pair(func, classes, args) };
-    ref_word_from_return_pair(first, second)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(value) = wasm_residual_host_call(func, args, classes, 'r', false, 8) {
+            return value;
+        }
+        let (first, second) = unsafe { call_pair(func, classes, args) };
+        ref_word_from_return_pair(first, second)
+    }
 }
 
 /// A one-word pointer, and a niche `Option<&T>`, is the first return word.
 /// `Option<*mut T>` is the discriminant then the pointer; discriminant 1 is
 /// not an aligned address.
+#[cfg(not(target_arch = "wasm32"))]
 fn ref_word_from_return_pair(first: i64, second: i64) -> i64 {
     if first == 1 { second } else { first }
 }
@@ -1137,24 +1156,54 @@ pub type ResidualHostCallFn = fn(
     result_size: usize,
 ) -> Option<i64>;
 
-thread_local! {
-    static RESIDUAL_HOST_CALL: std::cell::Cell<Option<ResidualHostCallFn>> =
-        const { std::cell::Cell::new(None) };
-}
+/// The CPU's residual-call strategy, process-global and installed once at startup.
+///
+/// `llmodel.py AbstractLLCPU.bh_call_i` is a method of the one CPU per process.
+/// This hook is that strategy for the wasm32 backend and is read on every
+/// residual call. The word holds a [`ResidualHostCallFn`] as `usize` bits, or
+/// 0 when none is installed and dispatch uses the direct transmute.
+static RESIDUAL_HOST_CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Install the active residual-call host trampoline. Pass `None` to clear.
+const _: () = assert!(std::mem::size_of::<ResidualHostCallFn>() == std::mem::size_of::<usize>());
+
+/// Install the CPU's residual-call strategy. Pass `None` to clear it.
+///
+/// Process-global, installed once at startup. See
+/// `llmodel.py AbstractLLCPU.bh_call_i`.
 pub fn set_residual_host_call(hook: Option<ResidualHostCallFn>) {
-    RESIDUAL_HOST_CALL.with(|c| c.set(hook));
+    let bits = match hook {
+        Some(hook) => hook as usize,
+        None => 0,
+    };
+    RESIDUAL_HOST_CALL.store(bits, std::sync::atomic::Ordering::Release);
 }
 
-/// The active residual-call host trampoline, or `None` for direct transmute.
+/// The CPU's residual-call strategy, or `None` for the direct transmute.
+///
+/// Process-global, installed once at startup. See
+/// `llmodel.py AbstractLLCPU.bh_call_i`.
 pub fn residual_host_call() -> Option<ResidualHostCallFn> {
-    RESIDUAL_HOST_CALL.with(|c| c.get())
+    let bits = RESIDUAL_HOST_CALL.load(std::sync::atomic::Ordering::Acquire);
+    if bits == 0 {
+        None
+    } else {
+        // SAFETY: a non-zero word was stored from `ResidualHostCallFn as usize`.
+        // Rust function pointers are never null, and the two types have equal size.
+        Some(unsafe { std::mem::transmute::<usize, ResidualHostCallFn>(bits) })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The residual-call strategy is process-global, so tests that install it
+    /// and tests that call `bh_call_*` / `*_dispatch` must not overlap.
+    static HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     extern "C" fn single_int(a: f32, b: i64) -> i64 {
         a.to_bits() as i64 + b
@@ -1180,6 +1229,7 @@ mod tests {
     /// receives a C `float`.
     #[test]
     fn call_stub_i_singlefloat_passes_f32() {
+        let _hook_test = hold_hook_test_lock();
         let bits = 1.5f32.to_bits() as i64;
         let collected = collect_call_args("Si", Some(&[bits, 7]), None, None);
         assert_eq!(collected.classes(), &[ArgClass::Single, ArgClass::Int]);
@@ -1211,6 +1261,7 @@ mod tests {
     /// `rpython/jit/backend/llsupport/test/test_descr.py::test_call_stubs_2`.
     #[test]
     fn call_stub_f_interleaved_float_ref_preserves_declaration_order() {
+        let _hook_test = hold_hook_test_lock();
         let b = [1_i64];
         let result = unsafe {
             bh_call_f_dispatch(
@@ -1224,6 +1275,7 @@ mod tests {
 
     #[test]
     fn call_stub_i_interleaved_int_float_int_preserves_declaration_order() {
+        let _hook_test = hold_hook_test_lock();
         let result = unsafe {
             bh_call_i_dispatch(
                 int_float_int as *const () as usize,
@@ -1236,6 +1288,7 @@ mod tests {
 
     #[test]
     fn call_stub_f_interleaved_float_float_int_preserves_declaration_order() {
+        let _hook_test = hold_hook_test_lock();
         let result = unsafe {
             bh_call_f_dispatch(
                 float_float_int as *const () as usize,
@@ -1255,6 +1308,7 @@ mod tests {
     /// states on the descr-build side.
     #[test]
     fn call_stub_i_dispatches_a_float_in_the_last_covered_slot() {
+        let _hook_test = hold_hook_test_lock();
         let result = unsafe {
             bh_call_i_dispatch(
                 four_ints_then_float as *const () as usize,
@@ -1287,6 +1341,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unsupported arg class sequence")]
     fn call_stub_i_refuses_a_float_past_the_covered_width() {
+        let _hook_test = hold_hook_test_lock();
         unsafe {
             bh_call_i_dispatch(
                 four_ints_then_float as *const () as usize,
@@ -1368,9 +1423,10 @@ mod tests {
         ));
     }
 
-    /// The host hook runs before stub lookup and its `Some` result is the call.
+    /// The installed hook runs before stub lookup and its `Some` result is the call's result.
     #[test]
-    fn host_hook_dispatches_a_wide_mixed_signature_without_a_stub_arm() {
+    fn installed_host_hook_runs_before_the_stub_table() {
+        let _hook_test = hold_hook_test_lock();
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
@@ -1401,6 +1457,7 @@ mod tests {
     /// raw bits; `bh_call_f_with_descr` reinterprets them.
     #[test]
     fn host_hook_longlong_result_is_stored_as_float_bits() {
+        let _hook_test = hold_hook_test_lock();
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
@@ -1425,6 +1482,7 @@ mod tests {
     /// for the interleaved float/ref case of `test_call_stubs_2`.
     #[test]
     fn create_call_stub_f_interleaved_float_ref_preserves_declaration_order() {
+        let _hook_test = hold_hook_test_lock();
         let b = [1_i64];
         let descr = BhCallDescr::from_arg_classes(
             "fr".to_string(),
@@ -1447,6 +1505,7 @@ mod tests {
     /// must serve without walking the class string on the second call.
     #[test]
     fn create_call_stub_i_rii_places_ref_then_two_ints() {
+        let _hook_test = hold_hook_test_lock();
         extern "C" fn rii(a: i64, b: i64, c: i64) -> i64 {
             a + b * 10 + c * 100
         }
@@ -1476,5 +1535,23 @@ mod tests {
         };
         assert_eq!(again, 321);
         assert!(descr.call_stub.get().is_some());
+    }
+
+    /// Native `bh_call_r` reads both return words so `Option<*mut T>`
+    /// yields the pointer (`ref_word_from_return_pair`).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bh_call_r_dispatch_reads_the_option_payload() {
+        let _hook_test = hold_hook_test_lock();
+        fn option_some() -> Option<*mut u8> {
+            Some(0x2000 as *mut u8)
+        }
+        fn option_none() -> Option<*mut u8> {
+            None
+        }
+        let some = unsafe { bh_call_r_dispatch(option_some as *const () as usize, &[], &[]) };
+        let none = unsafe { bh_call_r_dispatch(option_none as *const () as usize, &[], &[]) };
+        assert_eq!(some, 0x2000);
+        assert_eq!(none, 0);
     }
 }

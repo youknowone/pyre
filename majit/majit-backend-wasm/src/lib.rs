@@ -3263,8 +3263,10 @@ pub fn clear_test_residual_target_sigs() {
 }
 
 /// Declared wasm type of table slot `addr`, or `None` when the slot is not a
-/// function in this module's table. No address-keyed cache: each lookup reads
-/// the table (or the test injection).
+/// function, the type is not a single result (`encode_func_sig` = 0:
+/// multi-value, sret / aggregate), or the address is a host import outside
+/// the guest table. No address-keyed cache: each lookup reads the table (or
+/// the test injection).
 pub fn residual_target_sig(addr: i64) -> Option<WasmSig> {
     decode_func_sig(query_residual_target_sig(addr))
 }
@@ -3293,6 +3295,8 @@ fn query_residual_target_sig(addr: i64) -> i64 {
     }
 }
 
+/// `None` (encoding 0) when the slot is not one wasm function type: multi-value
+/// result, sret / aggregate, or a host import outside the guest table.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
@@ -3309,21 +3313,26 @@ mod jit_func_sig_web {
     }
 }
 
-/// Install the wasm guest-side residual-call trampoline.
+/// Install the host fallback for a residual callee wasm cannot name as one
+/// function type, or whose address is a host import outside the guest table.
 ///
-/// Consumers with additional exact-function ABI knowledge can install their
-/// own hook and delegate its fallback to [`residual_host_call`].
+/// `descr.py` `CallDescr.create_call_stub` calls `lltype.Ptr(FUNC)` built
+/// from the same FUNC as the calldescr. Published guests match that type and
+/// take the word stub; this hook is the remaining case.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 pub fn install_residual_host_call() {
     majit_backend::call_stub::set_residual_host_call(Some(residual_host_call));
 }
 
-/// Call a residual target using the backend-owned call area and host import.
+/// Call a residual target whose wasm type is not a single function type the
+/// descr can name, or whose address is a host import outside the guest table.
 ///
-/// This is the wasm transport for `llmodel.py AbstractLLCPU.bh_call_i` and its
-/// siblings. Upstream uses native ABI call builders; wasm requires reflection
-/// for targets whose real signature is not the uniform word ABI. Keep that
-/// platform adaptation here until those calls carry exact typed signatures.
+/// `descr.py` `CallDescr.create_call_stub` calls `lltype.Ptr(FUNC)` built from
+/// the same FUNC as the calldescr. Published guests match that type, and
+/// `stub_matches_table` then returns `None` so the word stub runs. This hook
+/// remains for a callee `encode_func_sig` cannot describe (multi-value result,
+/// sret / aggregate such as `Vec` or `Result`, encoding 0) and for host
+/// imports that are not in the guest table.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 pub fn residual_host_call(
     func_ptr: usize,
@@ -3391,6 +3400,10 @@ pub fn widen_reflected_result(
     }
 }
 
+/// True when the guest table type is the descr's FUNC (`'i'`/`'r'` → i64,
+/// `'f'` → f64, `'S'` → f32, `'v'` → no result). A match falls through to the
+/// word stub. `None` from `residual_target_sig` (no table type: multi-value,
+/// sret/aggregate, or a host import) is not a match.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 fn stub_matches_table(
     func_ptr: usize,
@@ -3431,6 +3444,8 @@ fn stub_matches_table(
     sig.result == expect_result
 }
 
+/// Host import used when the callee has no single wasm function type or lives
+/// outside the guest table.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 #[link(wasm_import_module = "majit_host")]
 unsafe extern "C" {
@@ -4119,12 +4134,10 @@ impl WasmBackend {
                 // The out-of-line bridge grows the frame to its JUMP target's
                 // depth in its prologue (`assembler.py` `_assemble` sizes
                 // `_check_frame_depth` by the target's `jfi_frame_depth`). A
-                // merged region has no prologue of its own, and a CALL_ASSEMBLER
-                // entry gives the owner only its homes prefix (`ca_frame_bytes`),
-                // so a region storing at another layout's offsets past that
-                // prefix stays out of line.
-                let owner_live_items =
-                    candidate.frame.ca_frame_bytes as usize / std::mem::size_of::<isize>();
+                // merged region has no prologue of its own, so a region storing
+                // at another layout's offsets past the owner's live depth
+                // stays out of line.
+                let owner_live_items = candidate.frame.ca_frame_depth();
                 if region.external_jump.as_ref().is_some_and(|ext| {
                     ext.frame != candidate.frame && ext.frame.signed_item_count() > owner_live_items
                 }) {
@@ -4362,7 +4375,9 @@ impl WasmBackend {
         // (`_check_frame_depth`). A merged region is that bridge inside the
         // owner, so the owner takes the region's depth: extend the layout by
         // the shortage (the prefix, and so every published offset, is kept)
-        // and grow the frame at entry.
+        // and grow the frame at entry. The replacement is tail-called with
+        // the live jitframe, so the prologue always checks.
+        inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) = loop {
             let mut shortage = None;
             match codegen::build_wasm_module_reporting_shortage(&inputs, &mut shortage) {
@@ -5564,11 +5579,12 @@ impl majit_backend::Backend for WasmBackend {
                 },
             ),
         };
-        if frame.has_tail() {
-            // `fn as usize` is the table index on wasm32. Taking it here keeps
-            // `wasm_realloc_frame` in `__indirect_function_table`.
-            module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
-        }
+        // `assembler.py` `_check_frame_depth`: a loop can run on a JITFRAME
+        // another trace allocated (CALL_ASSEMBLER, a JUMP, a re-emitted
+        // replacement tail-called with the live frame). The compare is a
+        // no-op when `jf_frame.length` already matches `signed_item_count`.
+        // `fn as usize` is the table index on wasm32.
+        module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
         let mut asm_resources = release::LoopAsmResources::default();
         asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
@@ -5828,7 +5844,7 @@ impl majit_backend::Backend for WasmBackend {
                 func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
                 dispatch_key_ofs: compiled.frame.dispatch_key_ofs,
-                callee_frame_bytes: compiled.frame.ca_frame_bytes,
+                callee_frame_bytes: compiled.frame.frame_bytes,
                 callee_gcmap_ptr,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
                 home_slot_base: compiled.frame.home_slot_base as u32,
@@ -6668,25 +6684,18 @@ impl majit_backend::Backend for WasmBackend {
             ca: ca_params,
         };
         // `assembler.py` `_assemble` takes `max(frame_depth, target jfi_frame_depth)`.
-        // `assemble_bridge` emits `_check_frame_depth` and `update_frame_depth`
-        // on the source token. The bridge keeps `frozen_frame.extend` for its
-        // own spills; the target's slot counts are not appended.
+        // `assemble_bridge` always emits `_check_frame_depth` and
+        // `update_frame_depth` on the source token. The bridge keeps
+        // `frozen_frame.extend` for its own spills; the target's slot counts
+        // are not appended. Host and CALL_ASSEMBLER entries allocate
+        // `jfi_frame_depth` (`ca_frame_depth` = the full signed item count).
         let mut required_items = source_frame.signed_item_count();
-        let mut live_items = frozen_frame.signed_item_count();
         if let Some(target_frame) = jump_target_frame {
             module_inputs.ca.external_jump_frame = Some(target_frame);
             required_items = required_items.max(target_frame.signed_item_count());
-            // A CALL_ASSEMBLER entry allocates only the homes prefix
-            // (`callee_frame_bytes`), so a JUMP that stores at another
-            // layout's offsets cannot assume the full frozen frame is live.
-            if target_frame != frozen_frame {
-                live_items = frozen_frame.ca_frame_bytes as usize / std::mem::size_of::<isize>();
-            }
         }
-        if required_items > live_items {
-            module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
-            module_inputs.ca.frame_depth_items = required_items;
-        }
+        module_inputs.ca.realloc_fn_ptr = wasm_realloc_frame as *const () as usize as i64;
+        module_inputs.ca.frame_depth_items = required_items;
         module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         // `runner.rs` captures `AttachedDescrPtrs` at `compile_bridge` entry.
@@ -7068,9 +7077,8 @@ impl majit_backend::Backend for WasmBackend {
             .materialize_func_handle()
             .expect("wasm backend failed to materialize a runnable trace");
 
-        // Host entry allocates the complete frozen geometry, including the tail
-        // call area. Chained bridges share these exact offsets; only CA callee
-        // frames use the smaller homes prefix (`ca_frame_bytes`).
+        // Host entry allocates the complete frozen geometry, including the
+        // tail call area. CALL_ASSEMBLER uses the same `jfi_frame_depth`.
         let frame_size = entry_frame_bytes(token, compiled.frame.frame_bytes).div_ceil(8);
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -8367,6 +8375,68 @@ mod tests {
         assert_eq!(target.callee_frame_bytes, installed.callee_frame_bytes);
         assert_eq!(target.dispatch_key_ofs as u64, installed.dispatch_key_ofs);
         assert_eq!(target.callee_gcmap_ptr, installed.callee_gcmap_ptr);
+    }
+
+    #[test]
+    fn compile_loop_publishes_full_signed_item_depth() {
+        let _compile_guard = failguard::lock_cpu();
+        let mut backend = WasmBackend::new();
+        let token = JitCellToken::new(9_900_071);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let finish = majit_ir::Op::new(
+            majit_ir::OpCode::Finish,
+            &[rb(majit_ir::OpRef::input_arg_int(0))],
+        );
+        finish.pos().set(majit_ir::OpRef::void_op(1));
+        finish.set_fail_arg_types(vec![majit_ir::Type::Int]);
+        backend
+            .compile_loop(&inputargs, &[majit_ir::OpRc::new(finish)], &token)
+            .expect("compile loop");
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+            .expect("compiled wasm loop");
+        let depth = token
+            .compiled_loop_token()
+            .expect("clt")
+            .frame_info
+            .lock()
+            .depth() as usize;
+        assert_eq!(
+            compiled.frame.ca_frame_depth(),
+            compiled.frame.signed_item_count()
+        );
+        assert_eq!(depth, compiled.frame.signed_item_count());
+        assert!(
+            depth > compiled.frame.ca_frame_bytes as usize / std::mem::size_of::<isize>(),
+            "CALL_ASSEMBLER / execute_token must allocate the full assembled depth, \
+             not the homes prefix"
+        );
+        let map = codegen::build_home_gcmap(
+            compiled.frame,
+            compiled.frame.ordinary_home_slots(),
+            compiled.frame.label_ref_slots,
+        );
+        let bits = usize::BITS as usize;
+        let mut max_bit = 0usize;
+        for (i, &w) in map[1..].iter().enumerate() {
+            if w != 0 {
+                max_bit = max_bit.max(i * bits + (bits - 1 - w.leading_zeros() as usize));
+            }
+        }
+        assert!(
+            max_bit < depth,
+            "home gcmap bit {max_bit} past published jfi_frame_depth {depth}"
+        );
+        let alloc = majit_backend::jitframe::JitFrame::alloc_size(depth);
+        let mut storage = vec![0u8; alloc];
+        let jf = storage.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
+        unsafe {
+            majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth);
+            (*jf).jf_gcmap = map.as_ptr().cast();
+            majit_backend::jitframe::jitframe_trace_gcmap(jf, |_| {});
+        }
     }
 
     /// llsupport/gc.py GcLLDescr_framework

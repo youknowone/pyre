@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=30
-# Measured 15.2x on macOS dynasm with `classify` inlined into the loop.
+# pyre-check: max-pypy-ratio=20
+# Measured dynasm 7.2/7.1/7.2x, cranelift 8.2/8.1/8.0x, wasm 14.3/14.7/13.4x on macOS with `classify` inlined into the loop.
 # What is left is the rejection itself: the type call builds the
 # UnicodeEncodeError eagerly on every iteration.
 # The hot loop is the rejection alone, and N keeps pypy's execution time

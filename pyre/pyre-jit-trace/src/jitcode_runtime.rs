@@ -4041,6 +4041,21 @@ mod tests {
     }
 
     #[test]
+    fn list_getitem_wrapper_look_inside_reaches_inner() {
+        // `W_ListObject.getitem` (`listobject.py`) is looked inside. A
+        // `dont_look_inside` wrapper would hide `w_list_getitem_inner` from
+        // `CallControl.find_all_graphs`, and `list_getitem_jitcode` would
+        // resolve to None.
+        assert!(
+            compute_named_jitcode_index("w_list_getitem").is_some(),
+            "w_list_getitem must stay look-inside so BINARY_SUBSCR reaches inner"
+        );
+        let jc = list_getitem_jitcode().expect("w_list_getitem_inner");
+        assert_eq!(jc.name, "w_list_getitem_inner");
+        assert!(!jc.code.is_empty());
+    }
+
+    #[test]
     fn opname_round_trips_through_byte() {
         // RPython assembler.py keys are `opname/argcode` (the argcode is
         // appended during `write_insn`). `live/` — the canonical BC_LIVE

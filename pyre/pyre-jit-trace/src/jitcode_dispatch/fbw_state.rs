@@ -602,6 +602,365 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_GENERATOR_YIELD_TOS.with(|c| c.set(None));
 }
 
+/// Walk-local TLS stacked while a nested `compile_and_run_once` runs.
+/// Owner is the outer MetaInterp attempt; parked on `PARKED_WALK_TLS_STACK`
+/// (a GC root area) and restored after the inner attempt finishes.
+pub struct ParkedWalkTls {
+    store_journal: Vec<[pyre_object::PyObjectRef; 3]>,
+    list_effect_journal: Vec<super::FbwListEffect>,
+    append_promote_journal: Vec<pyre_object::PyObjectRef>,
+    cell_store_journal: Vec<super::FbwCellStore>,
+    namespace_store_journal: Vec<super::FbwNamespaceStore>,
+    namespace_store_rolled_back: bool,
+    sys_exc_journal: Vec<pyre_object::PyObjectRef>,
+    traceback_store_journal: Vec<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
+    foriter_inflight: Vec<super::InflightForiter>,
+    bridge_iter_journal: Vec<super::BridgeIterJournalEntry>,
+    executed_nonpure_residual: bool,
+    executed_body_residual: bool,
+    unjournaled_value_unavailable: bool,
+    unjournaled_symbolic: bool,
+    executed_residual_void: u32,
+    executed_residual_mayforce: u32,
+    executed_residual_plain: u32,
+    executed_effect_count: usize,
+    opcode_entry_effects: Option<(usize, usize)>,
+    qmut_abort_stack: Option<(usize, Vec<OpRef>)>,
+    branch_abort_stack: Option<(usize, Vec<OpRef>)>,
+    structural_abort_opcode_effects: Option<(usize, usize)>,
+    abort_call_resume: Option<super::InlineAbortCarrier>,
+    built_exc: std::collections::HashSet<OpRef>,
+    context_chained: std::collections::HashSet<OpRef>,
+    exc_prev: Vec<(OpRef, pyre_object::PyObjectRef)>,
+    exc_pending_push_set: bool,
+    exit_last_instr_undo: Vec<(usize, isize)>,
+    locals_mirror_undo: Vec<FbwLocalsMirrorUndo>,
+    frame_vsd_undo: Vec<(usize, usize)>,
+    generator_yield_tos: Option<GeneratorStackStore>,
+    finish_is_exception: bool,
+    finish_concrete: Option<FinishConcrete>,
+    foriter_inflight_pending: Option<(usize, usize)>,
+    // Nested `compile_and_run_once` (`warmstate.py bound_reached` builds a
+    // fresh MetaInterp). The inner `discard_escape_flush_undo` /
+    // `reset_unflushed_escaped_callee` start that attempt clean; these
+    // three hold the outer capture until `restore_walk_tls`.
+    escape_flush_undo: Option<super::EscapeFlushUndo>,
+    escape_flush_undo_pending: bool,
+    unflushed_escaped_callee: usize,
+}
+
+thread_local! {
+    /// Outer-walk journals stacked while a nested `compile_and_run_once` runs.
+    /// `park_walk_tls` moves refs out of the registered FBW_* root areas, so
+    /// this stack is the collector-visible owner until `restore_walk_tls`.
+    /// The extra area captures this cell's address at registration so a
+    /// collecting thread walks the owner's parked entries, not its own TLS.
+    static PARKED_WALK_TLS_STACK: std::cell::RefCell<Vec<ParkedWalkTls>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Address of this mutator's parked-journal stack, captured into the extra
+/// area at registration so a collecting thread walks the owner.
+pub(crate) fn parked_walk_tls_stack_cell_ptr() -> *const std::cell::RefCell<Vec<ParkedWalkTls>> {
+    PARKED_WALK_TLS_STACK.with(|s| s as *const _)
+}
+
+/// Take the current walk's journals and escape-flush undo so a nested
+/// trace starts clean. `fbw_store_journal_reset` / `discard_escape_flush_undo`
+/// would otherwise clear the outer attempt (`warmstate.py bound_reached`
+/// builds a fresh MetaInterp).
+pub fn park_walk_tls() {
+    let parked = ParkedWalkTls {
+        store_journal: super::FBW_STORE_JOURNAL.with(|j| std::mem::take(&mut *j.borrow_mut())),
+        list_effect_journal: super::FBW_LIST_EFFECT_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        append_promote_journal: super::FBW_APPEND_PROMOTE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        cell_store_journal: super::FBW_CELL_STORE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        namespace_store_journal: super::FBW_NAMESPACE_STORE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        namespace_store_rolled_back: super::FBW_NAMESPACE_STORE_ROLLED_BACK
+            .with(|c| c.replace(false)),
+        sys_exc_journal: super::FBW_SYS_EXC_JOURNAL.with(|j| std::mem::take(&mut *j.borrow_mut())),
+        traceback_store_journal: super::FBW_TRACEBACK_STORE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        foriter_inflight: super::FBW_FORITER_INFLIGHT
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        bridge_iter_journal: super::FBW_BRIDGE_ITER_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        executed_nonpure_residual: FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.replace(false)),
+        executed_body_residual: FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.replace(false)),
+        unjournaled_value_unavailable: super::FBW_UNJOURNALED_VALUE_UNAVAILABLE
+            .with(|c| c.replace(false)),
+        unjournaled_symbolic: super::FBW_UNJOURNALED_SYMBOLIC.with(|c| c.replace(false)),
+        executed_residual_void: super::FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.replace(0)),
+        executed_residual_mayforce: super::FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.replace(0)),
+        executed_residual_plain: super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.replace(0)),
+        executed_effect_count: super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.replace(0)),
+        opcode_entry_effects: super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.take()),
+        qmut_abort_stack: super::FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take()),
+        branch_abort_stack: super::FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take()),
+        structural_abort_opcode_effects: super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
+            .with(|c| c.take()),
+        abort_call_resume: super::FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take()),
+        built_exc: FBW_BUILT_EXC.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        context_chained: FBW_CONTEXT_CHAINED.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        exc_prev: super::FBW_EXC_PREV.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        exc_pending_push_set: super::FBW_EXC_PENDING_PUSH_SET.with(|c| c.replace(false)),
+        exit_last_instr_undo: FBW_EXIT_LAST_INSTR_UNDO
+            .with(|c| std::mem::take(&mut *c.borrow_mut())),
+        locals_mirror_undo: FBW_LOCALS_MIRROR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        frame_vsd_undo: FBW_FRAME_VSD_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        generator_yield_tos: FBW_GENERATOR_YIELD_TOS.with(|c| c.take()),
+        finish_is_exception: FBW_FINISH_IS_EXCEPTION.with(|c| c.replace(false)),
+        finish_concrete: FBW_FINISH_CONCRETE.with(|c| c.take()),
+        foriter_inflight_pending: FORITER_INFLIGHT_PENDING.with(|c| c.take()),
+        escape_flush_undo: super::ESCAPE_FLUSH_UNDO.with(|c| c.borrow_mut().take()),
+        escape_flush_undo_pending: super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.replace(false)),
+        unflushed_escaped_callee: super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.replace(0)),
+    };
+    PARKED_WALK_TLS_STACK.with(|s| s.borrow_mut().push(parked));
+}
+
+/// Put the outer attempt's journals and escape-flush undo back after the nested run.
+pub fn restore_walk_tls() {
+    let Some(parked) = PARKED_WALK_TLS_STACK.with(|s| s.borrow_mut().pop()) else {
+        return;
+    };
+    super::FBW_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.store_journal);
+    super::FBW_LIST_EFFECT_JOURNAL.with(|j| *j.borrow_mut() = parked.list_effect_journal);
+    super::FBW_APPEND_PROMOTE_JOURNAL.with(|j| *j.borrow_mut() = parked.append_promote_journal);
+    super::FBW_CELL_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.cell_store_journal);
+    super::FBW_NAMESPACE_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.namespace_store_journal);
+    super::FBW_NAMESPACE_STORE_ROLLED_BACK.with(|c| c.set(parked.namespace_store_rolled_back));
+    super::FBW_SYS_EXC_JOURNAL.with(|j| *j.borrow_mut() = parked.sys_exc_journal);
+    super::FBW_TRACEBACK_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.traceback_store_journal);
+    super::FBW_FORITER_INFLIGHT.with(|j| *j.borrow_mut() = parked.foriter_inflight);
+    super::FBW_BRIDGE_ITER_JOURNAL.with(|j| *j.borrow_mut() = parked.bridge_iter_journal);
+    FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(parked.executed_nonpure_residual));
+    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.set(parked.executed_body_residual));
+    super::FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(parked.unjournaled_value_unavailable));
+    super::FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(parked.unjournaled_symbolic));
+    super::FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(parked.executed_residual_void));
+    super::FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.set(parked.executed_residual_mayforce));
+    super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.set(parked.executed_residual_plain));
+    super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(parked.executed_effect_count));
+    super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(parked.opcode_entry_effects));
+    super::FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = parked.qmut_abort_stack);
+    super::FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = parked.branch_abort_stack);
+    super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
+        .with(|c| c.set(parked.structural_abort_opcode_effects));
+    super::FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = parked.abort_call_resume);
+    FBW_BUILT_EXC.with(|s| *s.borrow_mut() = parked.built_exc);
+    FBW_CONTEXT_CHAINED.with(|s| *s.borrow_mut() = parked.context_chained);
+    super::FBW_EXC_PREV.with(|s| *s.borrow_mut() = parked.exc_prev);
+    super::FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(parked.exc_pending_push_set));
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| *c.borrow_mut() = parked.exit_last_instr_undo);
+    FBW_LOCALS_MIRROR_UNDO.with(|c| *c.borrow_mut() = parked.locals_mirror_undo);
+    FBW_FRAME_VSD_UNDO.with(|c| *c.borrow_mut() = parked.frame_vsd_undo);
+    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(parked.generator_yield_tos));
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.set(parked.finish_is_exception));
+    FBW_FINISH_CONCRETE.with(|c| c.set(parked.finish_concrete));
+    FORITER_INFLIGHT_PENDING.with(|c| c.set(parked.foriter_inflight_pending));
+    super::ESCAPE_FLUSH_UNDO.with(|c| *c.borrow_mut() = parked.escape_flush_undo);
+    super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.set(parked.escape_flush_undo_pending));
+    super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(parked.unflushed_escaped_callee));
+}
+
+fn visit_pyobject_ref(
+    slot: &mut pyre_object::PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if slot.is_null() {
+        return;
+    }
+    visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+}
+
+fn visit_opref_const_ptr(op: &mut OpRef, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    if let OpRef::ConstPtr(gcref) = op {
+        visitor(gcref);
+    }
+}
+
+fn walk_parked_abort_resume(
+    carrier: &mut super::InlineAbortCarrier,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    match carrier {
+        super::InlineAbortCarrier::Entry { call_stack, .. } => {
+            for slot in call_stack {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        super::InlineAbortCarrier::MidBody(payload) => {
+            visit_pyobject_ref(&mut payload.w_code, visitor);
+            visit_pyobject_ref(&mut payload.w_globals, visitor);
+            visit_pyobject_ref(&mut payload.return_value, visitor);
+            visit_pyobject_ref(&mut payload.constructor_instance, visitor);
+            for slot in payload.live_locals.iter_mut().flatten() {
+                if let ConcreteValue::Ref(value) = slot {
+                    visit_pyobject_ref(value, visitor);
+                }
+            }
+            for slot in &mut payload.live_stack {
+                if let ConcreteValue::Ref(value) = slot {
+                    visit_pyobject_ref(value, visitor);
+                }
+            }
+            if let Some(fallback) = payload.entry_fallback.as_mut() {
+                for slot in &mut fallback.call_stack {
+                    visit_pyobject_ref(slot, visitor);
+                }
+            }
+        }
+    }
+}
+
+/// Forward refs in parked outer-walk journals while a nested trace runs.
+///
+/// `parked_stack` is the owner's cell captured into the extra area at
+/// registration. Resolving TLS on the collecting thread would miss a
+/// quiesced mutator's parked journals (`rthread.py` `_trace_tlref`).
+pub(crate) fn walk_parked_walk_tls_stack(
+    parked_stack: *const std::cell::RefCell<Vec<ParkedWalkTls>>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // SAFETY: the owner is either synchronously collecting or STW-quiesced;
+    // the pointer is the one published in `FbwStoreJournalRootArea`.
+    let parked_cell = unsafe { &*parked_stack };
+    let stack = unsafe { &mut *parked_cell.as_ptr() };
+    for parked in stack.iter_mut() {
+        for triple in &mut parked.store_journal {
+            for slot in triple {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        for effect in &mut parked.list_effect_journal {
+            match effect {
+                super::FbwListEffect::Append { list, .. } => {
+                    visit_pyobject_ref(list, visitor);
+                }
+                super::FbwListEffect::PopEnd { list, w_item, .. } => {
+                    visit_pyobject_ref(list, visitor);
+                    visit_pyobject_ref(w_item, visitor);
+                }
+            }
+        }
+        for list in &mut parked.append_promote_journal {
+            visit_pyobject_ref(list, visitor);
+        }
+        for entry in &mut parked.cell_store_journal {
+            match entry {
+                super::FbwCellStore::Int { cell, .. } => visit_pyobject_ref(cell, visitor),
+                super::FbwCellStore::Obj { cell, before } => {
+                    visit_pyobject_ref(cell, visitor);
+                    visit_pyobject_ref(before, visitor);
+                }
+            }
+        }
+        for entry in &mut parked.namespace_store_journal {
+            visit_pyobject_ref(&mut entry.namespace, visitor);
+            visit_pyobject_ref(&mut entry.name, visitor);
+            visit_pyobject_ref(&mut entry.displaced, visitor);
+        }
+        for displaced in &mut parked.sys_exc_journal {
+            visit_pyobject_ref(displaced, visitor);
+        }
+        for (exception, node) in &mut parked.traceback_store_journal {
+            visit_pyobject_ref(exception, visitor);
+            visit_pyobject_ref(node, visitor);
+        }
+        for entry in &mut parked.foriter_inflight {
+            visit_pyobject_ref(&mut entry.item, visitor);
+        }
+        for entry in &mut parked.bridge_iter_journal {
+            match entry {
+                super::BridgeIterJournalEntry::Range { iter, .. } => {
+                    visit_pyobject_ref(iter, visitor);
+                }
+                super::BridgeIterJournalEntry::Cursor { iter, pre_seq, .. } => {
+                    visit_pyobject_ref(iter, visitor);
+                    visit_pyobject_ref(pre_seq, visitor);
+                }
+            }
+        }
+        if let Some(carrier) = parked.abort_call_resume.as_mut() {
+            walk_parked_abort_resume(carrier, visitor);
+        }
+        for (op, prev) in &mut parked.exc_prev {
+            visit_opref_const_ptr(op, visitor);
+            visit_pyobject_ref(prev, visitor);
+        }
+        for entry in &mut parked.locals_mirror_undo {
+            for slot in &mut entry.slots {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        if let Some(store) = parked.generator_yield_tos.as_mut() {
+            visit_opref_const_ptr(&mut store.value, visitor);
+        }
+        if let Some(finish) = parked.finish_concrete.as_mut() {
+            let value = match finish {
+                FinishConcrete::Return(value) | FinishConcrete::Raise(value) => value,
+            };
+            if let ConcreteValue::Ref(ptr) = value {
+                visit_pyobject_ref(ptr, visitor);
+            }
+        }
+        if let Some(undo) = parked.escape_flush_undo.as_mut() {
+            for slot in &mut undo.slots {
+                visit_pyobject_ref(slot, visitor);
+            }
+            for slot in &mut undo.flush_image {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parked_walk_tls_root_tests {
+    use super::*;
+
+    #[test]
+    fn fbw_store_journal_root_area_forwards_a_quiesced_foreign_mutator() {
+        let (area_tx, area_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let parked = 0xBEEF_usize as pyre_object::PyObjectRef;
+            let live = 0xF00D_usize as pyre_object::PyObjectRef;
+            fbw_store_journal_root(parked, std::ptr::null_mut(), std::ptr::null_mut());
+            park_walk_tls();
+            fbw_store_journal_root(live, std::ptr::null_mut(), std::ptr::null_mut());
+            area_tx
+                .send((
+                    capture_fbw_store_journal_root_area() as usize,
+                    live as usize,
+                    parked as usize,
+                ))
+                .unwrap();
+            resume_rx.recv().unwrap();
+            restore_walk_tls();
+            fbw_store_journal_reset();
+        });
+
+        let (area, live, parked) = area_rx.recv().unwrap();
+        let mut seen = Vec::new();
+        unsafe {
+            super::super::fbw_store_journal_root_walker_area(area as *const (), &mut |root| {
+                if root.as_usize() != 0 {
+                    seen.push(root.as_usize());
+                }
+            });
+        }
+        resume_tx.send(()).unwrap();
+        assert_eq!(seen, vec![live, parked]);
+        owner.join().unwrap();
+    }
+}
+
 /// The address a journalled frame lives at NOW.
 ///
 /// A journal entry names its frame by raw address, and a JIT-created frame can
@@ -3702,10 +4061,10 @@ impl CalleeReplayScan {
 /// residual that did not inline.  Every other unproven residual is `Dirty`.
 ///
 /// A `new_with_vtable/d>r` or `new_array*` result is fresh within this body.
-/// A `setfield_gc` initialization write into one is benign only when the
-/// target field is immutable (`wrapint` is the important instance,
-/// `W_IntObject.intval`); a `setarrayitem_gc` into a fresh array is benign
-/// outright, since replay writes the replay's own array (`BUILD_TUPLE` /
+/// A `setfield_gc` into one is an initialization of the replay's own object
+/// (`wrapint`'s `W_IntObject.intval` is the immutable instance; `ll_newdict`
+/// / `space.newdict()` writes mutable strategy fields the same way).  A
+/// `setarrayitem_gc` into a fresh array is the same shape (`BUILD_TUPLE` /
 /// `BUILD_LIST` fill their backing block this way).  Freshness may pass
 /// through `ref_copy`, but every other Ref-producing instruction clears it,
 /// so a later store cannot accidentally be classified as an initialization of
@@ -3816,7 +4175,10 @@ macro_rules! replay_unscannable {
         if fbw_inline_diag_enabled() {
             eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
         }
-        return CalleeReplayScan::unscannable();
+        return ReplayScanCore {
+            scan: CalleeReplayScan::unscannable(),
+            ret: ReplayReturnFacts::default(),
+        };
     }};
 }
 
@@ -3825,6 +4187,137 @@ macro_rules! replay_unscannable {
 /// the number cannot be matched against any op.  `PYRE_FBW_REPLAY_DIRTY_BODY=1`
 /// lists each body as it is scanned, so the verdict line that follows a listing
 /// names an op within it.
+/// Return-value facts the scan proved about every `ref_return` in the body.
+///
+/// An `inline_call_*` whose callee itself passes this scan copies these onto
+/// its destination register: a callee that returns a `new_with_vtable` result
+/// marks `dst` fresh, the same way `pyjitpl.py` `perform_call`/`inline_call`
+/// traces a look-inside helper (`ll_newdict` / `space.newdict()`) rather than
+/// name-checking it.
+#[derive(Clone, Copy, Default)]
+struct ReplayReturnFacts {
+    fresh: bool,
+    exact_numeric: bool,
+    exact_plain_int: bool,
+    exact_bool: bool,
+}
+
+struct ReplayScanCore {
+    scan: CalleeReplayScan,
+    ret: ReplayReturnFacts,
+}
+
+fn replay_scan_descr_ref(
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    index: usize,
+) -> Option<DescrRef> {
+    if let Some(descr) = callee_descr_refs.get(index) {
+        return Some(descr.clone());
+    }
+    if callee_descr_refs.is_empty() {
+        if let super::RawDescrPool::Global = callee_pool {
+            return crate::jitcode_runtime::descr_ref_at(index);
+        }
+    }
+    None
+}
+
+fn descr_refs_from_runtime_bh(
+    descrs: &[majit_metainterp::jitcode::RuntimeBhDescr],
+) -> Vec<DescrRef> {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    descrs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match d {
+            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            RuntimeBhDescr::ResolvedDescr { .. } => d
+                .as_optimizer_descr()
+                .cloned()
+                .unwrap_or_else(|| crate::descr::make_jitcode_descr(i)),
+            RuntimeBhDescr::JitCode(_)
+            | RuntimeBhDescr::JitCodeBackEdge(_)
+            | RuntimeBhDescr::Call(_)
+            | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
+        })
+        .collect()
+}
+
+/// Resolve the callee jitcode an `inline_call_*` `d` operand names.
+/// The descr indexes the scanned body's pool (`runtime_jitcode_at`);
+/// else `callee_descr_refs[..].as_jitcode_descr()` /
+/// `get_runtime_jitcode_by_index`.
+fn inline_call_callee_jitcode(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    if !d.argcodes.starts_with('d') {
+        return None;
+    }
+    let descr_index = {
+        let lo = *body_code.get(d.pc + 1)? as usize;
+        let hi = *body_code.get(d.pc + 2)? as usize;
+        lo | (hi << 8)
+    };
+    if let Some(jc) = callee_pool.runtime_jitcode_at(descr_index) {
+        return Some(jc);
+    }
+    let sub_index = callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_jitcode_descr())
+        .map(|jc| jc.jitcode_index())?;
+    match callee_pool {
+        super::RawDescrPool::PerFn(descrs) => {
+            descrs.get(sub_index).and_then(|d| d.as_jitcode_owned())
+        }
+        super::RawDescrPool::Global => {
+            crate::jitcode_runtime::get_runtime_jitcode_by_index(sub_index)
+        }
+    }
+}
+
+fn replay_scan_inline_call_callee(
+    jc: &majit_metainterp::jitcode::JitCode,
+    depth: usize,
+) -> ReplayScanCore {
+    let code = jc.code.as_slice();
+    let constants_i = jc.constants_i.as_slice();
+    let constants_r = jc.constants_r.as_slice();
+    let num_regs_i = jc.num_regs_i();
+    let num_regs_r = jc.num_regs_r();
+    if jc.uses_global_descr_pool() {
+        fbw_callee_body_replay_scan_at_depth(
+            code,
+            &[],
+            num_regs_i,
+            constants_i,
+            num_regs_r,
+            constants_r,
+            &[],
+            super::RawDescrPool::Global,
+            false,
+            depth,
+        )
+    } else {
+        let descr_refs = descr_refs_from_runtime_bh(&jc.exec.descrs);
+        fbw_callee_body_replay_scan_at_depth(
+            code,
+            &[],
+            num_regs_i,
+            constants_i,
+            num_regs_r,
+            constants_r,
+            &descr_refs,
+            super::RawDescrPool::PerFn(&jc.exec.descrs),
+            false,
+            depth,
+        )
+    }
+}
+
 fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
     if !fbw_inline_diag_enabled() || std::env::var_os("PYRE_FBW_REPLAY_DIRTY_BODY").is_none() {
         return;
@@ -3866,6 +4359,38 @@ pub(crate) fn fbw_callee_body_replay_scan(
     callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {
+    fbw_callee_body_replay_scan_at_depth(
+        body_code,
+        arg_facts,
+        num_regs_i,
+        constants_i,
+        num_regs_r,
+        constants_r,
+        callee_descr_refs,
+        callee_pool,
+        method_form_deferred_helpers,
+        0,
+    )
+    .scan
+}
+
+/// Depth is the number of `inline_call_*` callees already entered from the
+/// root body.  Bounded by [`fbw_max_multiframe_depth`] — the same cap
+/// `walker_capture_multi_frame_inline_snapshot` uses for a value-returning
+/// callee chain — so a look-inside helper nest cannot walk past the inline
+/// depth the walker itself unrolls.
+fn fbw_callee_body_replay_scan_at_depth(
+    body_code: &[u8],
+    arg_facts: &[CalleeArgFact],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    num_regs_r: usize,
+    constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    method_form_deferred_helpers: bool,
+    depth: usize,
+) -> ReplayScanCore {
     replay_safety_dump_body(body_code, callee_descr_refs);
     let mut poison: Vec<usize> = Vec::new();
     let mut protected: Vec<usize> = Vec::new();
@@ -3912,19 +4437,26 @@ pub(crate) fn fbw_callee_body_replay_scan(
     // holds the caller's argument.
     let mut seed_numeric_ref_regs = [false; u8::MAX as usize + 1];
     let mut seed_plain_int_ref_regs = [false; u8::MAX as usize + 1];
-    for (index, raw) in constants_r.iter().enumerate() {
-        let Some(reg) = num_regs_r
-            .checked_add(index)
-            .filter(|r| *r < seed_numeric_ref_regs.len())
-        else {
-            break;
-        };
-        let obj = raw.get() as usize as pyre_object::PyObjectRef;
-        if !obj.is_null() {
-            let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
-            seed_plain_int_ref_regs[reg] = exact_int;
-            seed_numeric_ref_regs[reg] =
-                exact_int || unsafe { pyre_object::is_plain_float_strict(obj) };
+    // The Python callee's `constants_r` slots are interned `PyObject`s
+    // (`box_str_constant` / `LoadConst`).  A look-inside helper jitcode's
+    // slots are not — they may be tagged immediates or rpython pointers —
+    // so the exactness seed runs only at the root body.  Nested scans still
+    // see `new_with_vtable` / `box_int` freshness from the ops themselves.
+    if depth == 0 {
+        for (index, raw) in constants_r.iter().enumerate() {
+            let Some(reg) = num_regs_r
+                .checked_add(index)
+                .filter(|r| *r < seed_numeric_ref_regs.len())
+            else {
+                break;
+            };
+            let obj = raw.get() as usize as pyre_object::PyObjectRef;
+            if !obj.is_null() {
+                let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
+                seed_plain_int_ref_regs[reg] = exact_int;
+                seed_numeric_ref_regs[reg] =
+                    exact_int || unsafe { pyre_object::is_plain_float_strict(obj) };
+            }
         }
     }
     let mut numeric_ref_regs = seed_numeric_ref_regs;
@@ -3958,6 +4490,13 @@ pub(crate) fn fbw_callee_body_replay_scan(
     // frames, so it stops claiming anything.
     let mut vable_reg: Option<u8> = None;
     let mut deferred_call = false;
+    let mut seen_ref_return = false;
+    let mut return_facts = ReplayReturnFacts {
+        fresh: true,
+        exact_numeric: true,
+        exact_plain_int: true,
+        exact_bool: true,
+    };
     // `RETURN_VALUE` stores `frame_finished_execution` as
     // `getfield flags; int_or FLAG_FRAME_FINISHED; setfield flags`
     // immediately before `ref_return` (`pyopcode.py`). The bit is sticky.
@@ -4000,6 +4539,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
         let mut dst_exact_numeric = false;
         let mut dst_exact_plain_int = false;
         let mut dst_exact_bool = false;
+        let mut dst_fresh = false;
 
         // The ref-slot accessors name the frame in operand 0 and the slot in
         // operand 1, both one byte wide.  The `_i` / `_f` variants address a
@@ -4050,17 +4590,20 @@ pub(crate) fn fbw_callee_body_replay_scan(
         // descr does not resolve is poisoned here and then matches no arm — it
         // is not a `setfield_gc`, a `setarrayitem_gc`, or any of the store
         // forms below, so the chain runs off the end, which is the intent.
-        let residual_call_descr = if d.opname.starts_with("residual_call") {
+        let residual_call_owned = if d.opname.starts_with("residual_call") {
             match residual_call_descr_index_in_body(body_code, &d) {
                 None => {
                     replay_poison!(poison, "ResidualCallDescrIndexMissing", d.pc, d.opname);
                     None
                 }
                 Some(descr_index) => {
-                    let resolved = callee_descr_refs
-                        .get(descr_index)
-                        .and_then(|descr| descr.as_call_descr());
-                    if resolved.is_none() {
+                    let resolved =
+                        replay_scan_descr_ref(callee_descr_refs, callee_pool, descr_index);
+                    if resolved
+                        .as_ref()
+                        .and_then(|descr| descr.as_call_descr())
+                        .is_none()
+                    {
                         replay_poison!(poison, "ResidualCallDescrNotACall", d.pc, d.opname);
                     }
                     resolved
@@ -4070,7 +4613,10 @@ pub(crate) fn fbw_callee_body_replay_scan(
             None
         };
 
-        if let Some(call_descr) = residual_call_descr {
+        if let Some(call_descr) = residual_call_owned
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+        {
             let ei = call_descr.get_extra_info();
             // `ForIterNext` is deliberately not accepted here: it advances the
             // shared heap iterator irreversibly (no journal undo), so replaying
@@ -4451,11 +4997,6 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if !d.argcodes.starts_with('r') {
                 replay_poison!(poison, "SetfieldGcTargetNotRefReg", d.pc, d.opname);
             } else if let Some(&target_reg) = body_code.get(d.pc + 1) {
-                let descr_index = decode_descr_index(body_code, &d, 2);
-                let immutable_field = callee_descr_refs
-                    .get(descr_index)
-                    .and_then(|descr| descr.as_field_descr())
-                    .is_some_and(|field| field.is_immutable());
                 // PyPy's `MetaInterp._interpret` owns one MIFrame per inlined
                 // call.  Replaying the caller CALL abandons and rebuilds that
                 // callee frame, so lifecycle/bookkeeping stores on the
@@ -4483,10 +5024,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                         && crate::jitcode_runtime::decode_op_at(body_code, d.next_pc)
                             .is_some_and(|next| next.key == "ref_return/r")
                 });
-                if !finished_return
-                    && !callee_owned_frame
-                    && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
-                {
+                if !finished_return && !callee_owned_frame && !fresh_ref_regs[target_reg as usize] {
                     replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
                 }
             } else {
@@ -4530,7 +5068,35 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     dst_exact_bool = true;
                 }
                 None => {
-                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    // `pyjitpl.py` `perform_call`/`inline_call` traces a
+                    // look-inside callee (`ll_newdict` / `space.newdict()`),
+                    // so replay safety is a property of that body.  Recurse
+                    // with the same scan, bounded by
+                    // [`fbw_max_multiframe_depth`].
+                    if depth >= fbw_max_multiframe_depth() {
+                        replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    } else if let Some(jc) = inline_call_callee_jitcode(
+                        body_code,
+                        &d,
+                        callee_descr_refs,
+                        callee_pool,
+                    ) {
+                        let nested = replay_scan_inline_call_callee(&jc, depth + 1);
+                        if nested.scan.unscannable || !nested.scan.poison.is_empty() {
+                            replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                        } else {
+                            if nested.scan.safety == CalleeReplaySafety::DeferredCall {
+                                deferred_call = true;
+                            } else {
+                                dst_fresh = nested.ret.fresh;
+                                dst_exact_numeric = nested.ret.exact_numeric;
+                                dst_exact_plain_int = nested.ret.exact_plain_int;
+                                dst_exact_bool = nested.ret.exact_bool;
+                            }
+                        }
+                    } else {
+                        replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                    }
                 }
             }
         } else if d.opname.starts_with("setinteriorfield_gc")
@@ -4561,7 +5127,8 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if vable_reg == Some(dst) {
                 vable_reg = None;
             }
-            fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
+            fresh_ref_regs[dst as usize] = dst_fresh
+                || d.key == "new_with_vtable/d>r"
                 || d.opname.starts_with("new_array")
                 || (d.key == "ref_copy/r>r"
                     && body_code
@@ -4641,19 +5208,42 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 }
             }
         }
+        if d.key == "ref_return/r" {
+            if let Some(&src) = body_code.get(d.pc + 1) {
+                let src = src as usize;
+                if !seen_ref_return {
+                    seen_ref_return = true;
+                    return_facts.fresh = fresh_ref_regs[src];
+                    return_facts.exact_numeric = numeric_ref_regs[src];
+                    return_facts.exact_plain_int = plain_int_ref_regs[src];
+                    return_facts.exact_bool = bool_ref_regs[src];
+                } else {
+                    return_facts.fresh &= fresh_ref_regs[src];
+                    return_facts.exact_numeric &= numeric_ref_regs[src];
+                    return_facts.exact_plain_int &= plain_int_ref_regs[src];
+                    return_facts.exact_bool &= bool_ref_regs[src];
+                }
+            }
+        }
         flags_get = next_get;
         finished_or = next_or;
         pc = d.next_pc;
     }
-    CalleeReplayScan {
-        safety: if deferred_call {
-            CalleeReplaySafety::DeferredCall
-        } else {
-            CalleeReplaySafety::Clean
+    if !seen_ref_return {
+        return_facts = ReplayReturnFacts::default();
+    }
+    ReplayScanCore {
+        scan: CalleeReplayScan {
+            safety: if deferred_call {
+                CalleeReplaySafety::DeferredCall
+            } else {
+                CalleeReplaySafety::Clean
+            },
+            poison,
+            protected,
+            unscannable: false,
         },
-        poison,
-        protected,
-        unscannable: false,
+        ret: return_facts,
     }
 }
 

@@ -98,11 +98,16 @@ pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
     }
 }
 
-/// [`w_list_lock`] for the residual-call ABI: the guard's lock word.  The
-/// jitcode's drop of the guard releases it through [`w_list_lock_release`].
+/// [`w_list_lock`] for the residual-call ABI: the guard's lock word.
+/// Arguments and the result are descr words (`'r'`/`'i'` → i64;
+/// `descr.py` `CallDescr.create_call_stub`, `callbuilder.py` `emit_raw_call`).
+/// Conversion matches `helper_arg_from_i64` / `helper_return_to_i64` on the
+/// macro trampoline (`emit_helper_fnaddr_registration`). The jitcode's drop
+/// of the guard releases it through [`w_list_lock_release`].
 /// `obj` must be a live list, as for [`w_list_lock_acquire`].
-pub extern "C" fn w_list_lock_jit_abi(obj: PyObjectRef) -> usize {
-    std::mem::ManuallyDrop::new(unsafe { w_list_lock(obj) }).lock
+pub extern "C" fn w_list_lock_jit_abi(obj: i64) -> i64 {
+    let obj = obj as usize as PyObjectRef;
+    std::mem::ManuallyDrop::new(unsafe { w_list_lock(obj) }).lock as i64
 }
 
 // The traced call names `w_list_lock`. Its return is `ListGuard`, which the
@@ -3569,7 +3574,10 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
-    // The getitem fold descends the lock-free body by name.
+    // Same wrapper/inner split as `w_list_append`: the getitem fold descends
+    // the lock-free body.  A `w_list_lock` pair inside that body declines
+    // the sub-walk, and a `dont_look_inside` wrapper would hide the inner
+    // graph from `grab_initial_jitcodes`.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
