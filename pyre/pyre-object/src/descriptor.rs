@@ -28,6 +28,14 @@ pub struct W_Super {
 /// `objspace.py` `allocate_instance`: `w_subtype` null (or the builtin
 /// `super` type) is the base layout; a user subclass is `W_SuperUser`.
 /// The three payload refs and `w_subtype` stay pinned across that malloc.
+///
+/// Exact `W_Super` is `instantiate` / `malloc_fixedsize` (young).
+/// `_init_subclass` builds `super(w_type, w_type)` as a local; an
+/// old-gen proxy joins `old_objects_pointing_to_young` with
+/// `super_type` / `obj` the heap type (`incminimark.py`
+/// `collect_oldrefs_to_nursery`) and keeps the type alive across
+/// every minor. Young-nonmoving matches that nursery birth with a
+/// stable address for the raw field readers.
 pub fn w_super_new(
     super_type: PyObjectRef,
     obj_type: PyObjectRef,
@@ -98,9 +106,9 @@ pub unsafe fn w_super_set_fields(
     bound_obj: PyObjectRef,
 ) {
     unsafe {
-        // `super().__init__(...)` re-initialises a proxy that may already be
-        // old-gen, so grey it before the stores the way `w_super_new` does for
-        // the freshly allocated one.
+        // `super().__init__(...)` re-initialises a proxy that may already
+        // have been promoted, so grey it before the stores the way
+        // `w_super_new` does for the freshly allocated one.
         crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
         let super_obj = obj as *mut W_Super;
         (*super_obj).super_type = super_type;

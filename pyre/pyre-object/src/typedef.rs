@@ -313,8 +313,16 @@ impl GetSetProperty {
 }
 
 /// Allocate a `GetSetProperty` bound to `GETSET_DESCRIPTOR_TYPE`.
-/// Mirrors `typedef.py _init` — every slot is set in one shot
-/// so the descriptor is fully initialised before the first reader.
+/// Mirrors `typedef.py _init` / `instantiate(GetSetProperty)` —
+/// every slot is set in one shot so the descriptor is fully
+/// initialised before the first reader.
+///
+/// Young-nonmoving (`malloc_fixedsize`): `copy_for_type` writes
+/// `new.w_objclass = w_objclass` on this instance, and
+/// `create_dict_slot` / `create_weakref_slot` store it in the
+/// type dict. An old-gen copy enters the remembered set and
+/// promotes the young type on every minor, so `add_subclass`
+/// never reuses a dead `weak_subclasses` slot.
 ///
 /// `name` may be `PY_NULL`, in which case the caller is responsible
 /// for substituting `'<generic property>'` (matching `typedef.py
@@ -439,10 +447,17 @@ pub unsafe fn w_getset_get_objclass(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_objclass(obj: PyObjectRef, value: PyObjectRef) {
-    // Immortal-descriptor slot reached only by `walk_raw_getset_roots`,
-    // skipped on clean minor collections; record the store.
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut GetSetProperty)).w_objclass = value }
+    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        // GC-owned: traced through the type-id offsets. A young
+        // descriptor ignores the barrier; an old-gen fallback joins
+        // the remembered set so `w_objclass` is forwarded.
+        crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+    } else {
+        // Immortal template reached only by `walk_raw_getset_roots`,
+        // skipped on a clean minor; record the store.
+        crate::gc_roots::mark_prebuilt_roots_dirty();
+    }
 }
 
 /// `typedef.py self.w_qualname = None` — lazy cache slot for
@@ -459,10 +474,12 @@ pub unsafe fn w_getset_get_qualname(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `GetSetProperty`.
 #[inline]
 pub unsafe fn w_getset_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
-    // Immortal-descriptor slot (see `w_getset_set_objclass`); the lazy
-    // qualname cache stores a freshly allocated string.
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut GetSetProperty)).w_qualname = value }
+    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+    } else {
+        crate::gc_roots::mark_prebuilt_roots_dirty();
+    }
 }
 
 /// `typedef.py:345 self.use_closure` — read-only accessor.

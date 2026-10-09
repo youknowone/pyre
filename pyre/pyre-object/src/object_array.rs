@@ -1784,16 +1784,12 @@ pub unsafe fn dealloc_mro_block(block: *mut FixedObjectArray) {
 /// `w_type_get_mro`'s result as `SomeList(SomeInstance(PyObjectRef))`.
 ///
 /// Allocated on the **stable** (non-moving old-gen) path via
-/// [`crate::gc_hook::try_gc_alloc_stable_raw`] — the owning `W_TypeObject`
-/// is a `malloc_typed` Box-immortal whose custom trace never fires, so the
-/// MRO block cannot be marked through its owner; keeping it old-gen means
-/// the major collector always scans it from the prebuilt-root set (the
-/// `walk_type_dicts_gc` mro forwarding), never minor-relocates it, and the
-/// caller's `values` slice stays valid because the stable allocator does
-/// not collect. Falls back to a header-prefixed `std::alloc` block when no
-/// GC hook is installed (bootstrap / pure interpreter). A young MRO element
-/// (a metaclass `mro()` returning fresh types) is registered on the
-/// remembered set via the old→young write barrier.
+/// [`crate::gc_hook::try_gc_alloc_stable_raw`] — code-object const/name
+/// tables share this helper and outlive a minor collection as old-gen
+/// arrays. Heap-type `mro_w` uses [`alloc_mro_block_gc_young`] so the
+/// type↔MRO cycle can die at the next minor.
+/// Falls back to a header-prefixed `std::alloc` block when no GC hook
+/// is installed (bootstrap / pure interpreter).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

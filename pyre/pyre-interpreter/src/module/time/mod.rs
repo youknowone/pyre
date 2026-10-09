@@ -117,6 +117,8 @@ crate::py_module! {
         // /etc/localtime) outside the controller, so under sandbox the four
         // timezone attributes stay at the UTC interplevel defaults and tzset
         // is not exposed — matching the tz-dependent stubs installed below.
+        // `init_timezone` still allocates the four module objects, so `ns`
+        // stays rooted across that call.
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let mut ns = ns;
@@ -127,9 +129,9 @@ crate::py_module! {
                 crate::make_builtin_function_with_arity("tzset", t::tzset, 0),
             );
         }
-        // Windows reads the same four attributes off the host zone record.
-        // `tzset` stays absent: it is the POSIX call that rereads `$TZ`, and
-        // the MSVC runtime's `_tzset` is not exposed under that name either.
+        // Windows `_init_timezone` calls `_tzset` then `_get_timezone` /
+        // `_get_daylight` / `_get_tzname` from the same CRT.  `tzset` stays
+        // absent: it is the POSIX call that rereads `$TZ`.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             let mut ns = ns;

@@ -107,10 +107,10 @@ impl TypeCache {
                 TypeDefValue::Root(slot) => {
                     let value = unsafe { *slot.get() };
                     if unsafe { pyre_object::typedef::is_getset_property(value) } {
-                        crate::typedef::copy_for_type(
+                        gc_roots::pin_root(crate::typedef::copy_for_type(
                             value,
                             gc_roots::shadow_stack_get(w_type_slot),
-                        )
+                        ))
                     } else if unsafe { pyre_object::gateway::is_interp2app(value) } {
                         crate::gateway::interp2app_spacebind(value, &space)
                     } else {

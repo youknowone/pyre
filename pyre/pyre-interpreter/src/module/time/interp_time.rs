@@ -1481,97 +1481,131 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
     }
 }
 
-/// `_init_timezone` POSIX non-Cygwin arm: copy `-p.c_tm_gmtoff` and
-/// `charp2str(p.c_tm_zone)` off the raw `struct tm` into scalars. A null
-/// `c_localtime` keeps the zero/empty defaults.
-#[cfg(unix)]
-fn tm_gmtoff_zone(tm: &libc::tm) -> (i64, String) {
-    let zone = if tm.tm_zone.is_null() {
-        String::new()
-    } else {
-        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    (tm.tm_gmtoff as i64, zone)
-}
-
+/// `interp_time.py _init_timezone` reads `c_time()` for the January/July
+/// pair.  Product Unix goes through `rtime.c_time` under `host_env`
+/// (sandbox included); the non-`host_env` build calls `libc::time`
+/// directly.
 #[cfg(all(unix, feature = "host_env"))]
-fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
-    let mut t = seconds as majit_rlib::rtime::TIME_T;
-    let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
-    if p.is_null() {
-        return None;
-    }
-    Some(tm_gmtoff_zone(unsafe { &*p }))
+fn c_time_now() -> i64 {
+    unsafe { majit_rlib::rtime::c_time(std::ptr::null_mut()) as i64 }
 }
 
 #[cfg(all(unix, not(feature = "host_env")))]
-fn localtime_gmtoff_zone(seconds: time_t) -> Option<(i64, String)> {
-    let t = seconds as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let p = unsafe { libc::localtime_r(&t, &mut tm) };
-    if p.is_null() {
-        return None;
-    }
-    Some(tm_gmtoff_zone(&tm))
+fn c_time_now() -> i64 {
+    unsafe { libc::time(std::ptr::null_mut()) as i64 }
 }
 
-/// `interp_time.py _init_timezone` — derive the module's four
-/// timezone attributes from libc's January/July broken-down times.  This
-/// preserves the standard-vs-DST ordering in both hemispheres.
+/// Raw `c_localtime` for `_init_timezone`.  Upstream dereferences the
+/// pointer with no NULL check and no `PyError`; a NULL return panics
+/// rather than inventing `(0, 0, 0, "", "")`.
+#[cfg(all(unix, feature = "host_env"))]
+fn c_localtime_broken_down(seconds: i64) -> libc::tm {
+    let mut t = seconds as majit_rlib::rtime::TIME_T;
+    let p = unsafe { majit_rlib::rtime::c_localtime(&mut t) };
+    if p.is_null() {
+        panic!("c_localtime returned null during _init_timezone");
+    }
+    unsafe { *p }
+}
+
+#[cfg(all(unix, not(feature = "host_env")))]
+fn c_localtime_broken_down(seconds: i64) -> libc::tm {
+    let t = seconds as libc::time_t;
+    let p = unsafe { libc::localtime(&t) };
+    if p.is_null() {
+        panic!("c_localtime returned null during _init_timezone");
+    }
+    unsafe { *p }
+}
+
+/// `rffi.charp2str(p.c_tm_zone)` then `["   ", tm_zone][bool(tm_zone)]`.
+/// Copy the C bytes as-is; `_init_timezone` wraps them with `charp2uni`
+/// (`str_decode_locale_surrogateescape`), the same decode the Windows arm
+/// uses for `_tzname`.  A non-UTF-8 byte then round-trips as a
+/// surrogateescape sequence rather than U+FFFD.
+#[cfg(unix)]
+fn tm_zone_name(tm_zone: *const libc::c_char) -> Vec<u8> {
+    let tm_zone = if tm_zone.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(tm_zone) }
+            .to_bytes()
+            .to_vec()
+    };
+    if tm_zone.is_empty() {
+        b"   ".to_vec()
+    } else {
+        tm_zone
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tm_zone_name_tests {
+    use super::tm_zone_name;
+    use std::ffi::CString;
+
+    #[test]
+    fn tm_zone_name_copies_non_utf8_bytes() {
+        let raw = CString::new(vec![b'E', 0xFF, b'T']).unwrap();
+        assert_eq!(tm_zone_name(raw.as_ptr()), vec![b'E', 0xFF, b'T']);
+    }
+
+    #[test]
+    fn tm_zone_name_empty_is_three_spaces() {
+        assert_eq!(tm_zone_name(std::ptr::null()), b"   ");
+        let empty = CString::new("").unwrap();
+        assert_eq!(tm_zone_name(empty.as_ptr()), b"   ");
+    }
+
+    #[test]
+    fn tm_zone_name_ascii_abbreviation() {
+        let raw = CString::new("EST").unwrap();
+        assert_eq!(tm_zone_name(raw.as_ptr()), b"EST");
+    }
+}
+
+/// `interp_time.py _init_timezone` POSIX (non-Cygwin) arm: `c_localtime`
+/// on a January and a July timestamp, then `timezone` / `altzone` /
+/// `daylight` / `tzname` from `tm_gmtoff` / `tm_zone`.  The raw libc
+/// (or host-channel) call does not allocate a `PyError`, so nothing
+/// between the `ns` reads collects.
 #[cfg(unix)]
 pub(crate) fn init_timezone(ns: PyObjectRef) {
     const YEAR: i64 = (365 * 24 + 6) * 3600;
-    let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
-    let january = localtime_gmtoff_zone(start);
-    let july = localtime_gmtoff_zone(start + YEAR / 2);
-
-    let (timezone, altzone, daylight, standard_name, daylight_name) = match (january, july) {
-        (Some((january_gmtoff, january_zone)), Some((july_gmtoff, july_zone))) => {
-            let january_offset = -january_gmtoff;
-            let july_offset = -july_gmtoff;
-            let january_name = if january_zone.is_empty() {
-                "   ".to_string()
-            } else {
-                january_zone
-            };
-            let july_name = if july_zone.is_empty() {
-                "   ".to_string()
-            } else {
-                july_zone
-            };
-            if january_offset < july_offset {
-                // DST is reversed in the southern hemisphere.
-                (
-                    july_offset,
-                    january_offset,
-                    i64::from(january_offset != july_offset),
-                    july_name,
-                    january_name,
-                )
-            } else {
-                (
-                    january_offset,
-                    july_offset,
-                    i64::from(january_offset != july_offset),
-                    january_name,
-                    july_name,
-                )
-            }
-        }
-        _ => (0, 0, 0, String::new(), String::new()),
+    let t = c_time_now() / YEAR * YEAR;
+    let january = c_localtime_broken_down(t);
+    let janzone = -(january.tm_gmtoff as i64);
+    let janname = tm_zone_name(january.tm_zone);
+    let july = c_localtime_broken_down(t + YEAR / 2);
+    let julyzone = -(july.tm_gmtoff as i64);
+    let julyname = tm_zone_name(july.tm_zone);
+    let (timezone, altzone, daylight, tzname0, tzname1) = if janzone < julyzone {
+        // DST is reversed in the southern hemisphere
+        (
+            julyzone,
+            janzone,
+            i64::from(janzone != julyzone),
+            julyname,
+            janname,
+        )
+    } else {
+        (
+            janzone,
+            julyzone,
+            i64::from(janzone != julyzone),
+            janname,
+            julyname,
+        )
     };
-
     crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
     crate::module_ns_store(ns, "daylight", w_int_new(daylight));
     crate::module_ns_store(ns, "tzname", {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new_managed(&standard_name));
-        fields.push(w_str_new_managed(&daylight_name));
+        fields.push(crate::typedef::charp2uni(&tzname0));
+        fields.push(crate::typedef::charp2uni(&tzname1));
         w_tuple_new(fields.take())
     });
+    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
 }
 
 /// `interp_time.py tzset` — ask libc to reread `TZ`, then refresh
@@ -1632,38 +1666,59 @@ fn windows_fill_local_zone(tm: &mut c_tm, when: time_t) {
     tm.tm_gmtoff = as_utc - when as i64;
 }
 
-/// `_init_timezone`'s Windows arm.  The runtime derives `_timezone` /
-/// `_daylight` / `_tzname` from the same zone record `GetTimeZoneInformation`
-/// reports, and reading the record is what keeps the two names as text rather
-/// than bytes in whichever code page the runtime is set to.
-///
-/// `Bias` is minutes to add to local time to reach UTC, which is the sign
-/// `time.timezone` already uses.  `altzone` is `timezone - 3600` — the value
-/// the module publishes on this platform, not a second reading of the record.
-/// `daylight` says the zone observes DST at all, which is what the runtime
-/// reports and what a January/July pair shows.
+/// `interp_time.py _init_timezone` Windows arm: `c_tzset` then
+/// `c_get_timezone` / `c_get_daylight` / `c_get_tzname` from the same
+/// CRT (`_tzset`, `_get_timezone`, `_get_daylight`, `_get_tzname`).
+/// `altzone` is `timezone - 3600`.  Each `_tzname` buffer is decoded
+/// with `str_decode_locale_surrogateescape` (`charp2uni`).
 #[cfg(windows)]
-pub(crate) fn init_timezone(mut ns: PyObjectRef) {
-    const YEAR: i64 = (365 * 24 + 6) * 3600;
-    let info = host_time::get_tz_info();
-    let timezone = i64::from(info.bias + info.standard_bias) * 60;
-    let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
-    let observes_dst = pyre_object::with_roots!(ns => {
-        [start, start + YEAR / 2]
-            .iter()
-            .filter_map(|&when| _c_localtime(when).ok())
-            .any(|tm| tm.tm_isdst > 0)
-    });
-
+pub(crate) fn init_timezone(ns: PyObjectRef) {
+    unsafe extern "C" {
+        fn _tzset();
+        fn _get_timezone(p_value: *mut libc::c_long) -> libc::c_int;
+        fn _get_daylight(p_daylight: *mut libc::c_int) -> libc::c_int;
+        fn _get_tzname(
+            p_return_value: *mut usize,
+            time_zone_name: *mut libc::c_char,
+            size_in_bytes: usize,
+            index: libc::c_int,
+        ) -> libc::c_int;
+    }
+    unsafe { _tzset() };
+    let mut timezone: libc::c_long = 0;
+    unsafe { _get_timezone(&mut timezone) };
+    let timezone = i64::from(timezone);
+    let altzone = timezone - 3600;
+    let mut daylight: libc::c_int = 0;
+    unsafe { _get_daylight(&mut daylight) };
+    let daylight = i64::from(daylight);
+    let mut tzname_bytes = [Vec::new(), Vec::new()];
+    for i in 0usize..2 {
+        let mut blen: usize = 0;
+        unsafe { _get_tzname(&mut blen, std::ptr::null_mut(), 0, i as libc::c_int) };
+        let mut buf = vec![0u8; blen];
+        let mut s: usize = 0;
+        unsafe {
+            _get_tzname(
+                &mut s,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                blen,
+                i as libc::c_int,
+            )
+        };
+        let n = s.saturating_sub(1).min(buf.len());
+        buf.truncate(n);
+        tzname_bytes[i] = buf;
+    }
     crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
-    crate::module_ns_store(ns, "daylight", w_int_new(i64::from(observes_dst)));
+    crate::module_ns_store(ns, "daylight", w_int_new(daylight));
     crate::module_ns_store(ns, "tzname", {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new_managed(&info.standard_name));
-        fields.push(w_str_new_managed(&info.daylight_name));
+        fields.push(crate::typedef::charp2uni(&tzname_bytes[0]));
+        fields.push(crate::typedef::charp2uni(&tzname_bytes[1]));
         w_tuple_new(fields.take())
     });
+    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
 }
 
 #[cfg(windows)]

@@ -787,7 +787,12 @@ unsafe fn is_exact_ascii_str(obj: PyObjectRef) -> bool {
 /// (`unerase` is [`AbstractUnwrappedSetStrategy::storage_ptr`], `get_empty_dict`
 /// is the `RDict` behind [`AbstractUnwrappedSetStrategy::get_empty_storage`]).
 pub trait AbstractUnwrappedSetStrategy: Sized {
-    type Key: Copy + Eq + std::hash::Hash + crate::rordereddict::EntryDummy + 'static;
+    type Key: Copy
+        + Eq
+        + std::hash::Hash
+        + crate::rordereddict::EntryDummy
+        + crate::rordereddict::GcRefOffsets
+        + 'static;
     type Hasher: std::hash::BuildHasher + Clone + Default + 'static;
 
     fn kind(&self) -> SetStrategyKind;

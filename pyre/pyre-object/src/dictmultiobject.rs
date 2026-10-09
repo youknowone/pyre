@@ -1393,10 +1393,7 @@ pub(crate) unsafe fn install_object_dict_storage(
     w_dict: PyObjectRef,
     new_storage: *mut ObjectDictStorage,
 ) {
-    let dict = &mut *(w_dict as *mut W_DictObject);
-    dict.dstorage = new_storage as *mut u8;
-    dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
-    dict_write_barrier(w_dict);
+    install_dict_storage(w_dict, new_storage as *mut u8, &OBJECT_DICT_STRATEGY_REF);
 }
 
 /// `pypy/objspace/std/dictmultiobject.py W_DictObject.get_strategy`
@@ -1599,6 +1596,44 @@ pub fn newdict_empty() -> PyObjectRef {
 #[inline(never)]
 pub fn w_dict_new() -> PyObjectRef {
     newdict_empty()
+}
+
+/// Type-namespace twin of [`w_dict_new`].
+///
+/// `new_typeobject_with_metatype_and_layout` hands this dict to an `init`
+/// closure as a Rust `PyObjectRef`. Descriptor allocation inside that
+/// closure collects (`instantiate(GetSetProperty)` is young-nonmoving), and
+/// the translator is not there to reload the local. A moving nursery birth
+/// leaves `init` holding the corpse; `w_dict_setitem_str` then reads
+/// poison (`posix.DirEntry` under `PYPY_GC_NURSERY=1`). Young-nonmoving
+/// keeps the header address stable the way [`w_getset_property_new`] does.
+#[majit_macros::dont_look_inside]
+pub fn w_dict_new_nonmoving() -> PyObjectRef {
+    let value = W_DictObject {
+        ob_header: PyObject {
+            ob_type: &DICT_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_TYPE),
+        },
+        dstorage: std::ptr::null_mut(),
+        dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
+        keys_version: 0,
+        clear_gen: 0,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+        W_DICT_GC_TYPE_ID,
+        W_DICT_OBJECT_SIZE,
+    );
+    if raw.is_null() {
+        // Stable (old) header: the caller hands this pointer into an `init`
+        // closure by value, so a moving nursery fallback would recreate the
+        // DirEntry poison read. Address stability is the contract.
+        return alloc_dict_object(value, true);
+    }
+    unsafe {
+        std::ptr::write(raw as *mut W_DictObject, value);
+    }
+    crate::gc_hook::try_gc_write_barrier(raw);
+    raw as PyObjectRef
 }
 
 pub type MakeInstanceDictHookFn = fn() -> PyObjectRef;
@@ -3971,15 +4006,14 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     let copy_dict = &*(w_copy as *const W_DictObject);
     let old_dstorage = dst_dict.dstorage;
 
-    dst_dict.dstrategy = copy_dict.dstrategy;
-    dst_dict.dstorage = copy_dict.dstorage;
     // PyPy aliases the GC storage pointer here:
     // `w_dict.dstorage = w_copy.dstorage`.  The storage box is an independent
     // GC object, not memory owned by `w_copy`, so both dicts must keep tracing
     // it until the consumed temporary is swept.  Clearing the temporary's
     // field would leave a live W_DictObject whose strategy cannot trace its
-    // null storage during that same collection.
-    dict_write_barrier(dst);
+    // null storage during that same collection. `setfield_gc` records the
+    // old-to-young edge on `dst`.
+    install_dict_storage(dst, copy_dict.dstorage, copy_dict.dstrategy);
 
     // Empty dest storage is `erased(None)`.  The off-GC side-table case
     // is freed via the shared guarded helper.
@@ -5119,6 +5153,31 @@ pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
     w_dict_get_strategy(obj).copy(obj)
 }
 
+/// `dictmultiobject.py AbstractTypedStrategy.copy` —
+/// `W_DictObject(space, self, self.erase(dstorage.copy()))`.
+///
+/// Shared by `ObjectDictStrategy` and `UnicodeDictStrategy` the way
+/// `w_dict_lookup_object_strategy` / `w_dict_items_object_strategy`
+/// share the erased `ObjectDictStorage` backing. `strategy` is mixin
+/// `self`: the dest keeps the source's typed strategy.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` whose `dstorage` is
+/// `ObjectDictStorage`.
+pub unsafe fn w_dict_copy_object_strategy(
+    w_dict: PyObjectRef,
+    strategy: &'static DictStrategyRef,
+) -> PyObjectRef {
+    let dict = &*(w_dict as *const W_DictObject);
+    let storage = &*(dict.dstorage as *const ObjectDictStorage);
+    // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
+    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
+        storage.clone(),
+        object_dict_storage_gc_type_id(),
+    );
+    w_dict_new_with(strategy, new_storage as *mut u8)
+}
+
 /// Internal helper: `IntDictStrategy::setitem` body.
 ///
 /// look_inside_iff lives on `ll_dict_setitem_lookup_done`.
@@ -5133,7 +5192,9 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut IntDictStorage);
     let k = crate::listobject::plain_int_w(key);
-    if entries.insert(k, value).is_none() {
+    let fresh = entries.insert(k, value).is_none();
+    if fresh {
+        let dict = &mut *(_dict_guard.root(0) as *mut W_DictObject);
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
 }
@@ -7047,6 +7108,20 @@ pub static INT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
 /// into the Object fallback.
 pub struct EmptyDictStrategy;
 
+/// `w_dict.dstorage = strategy.erase(storage)` / `w_dict.set_strategy`:
+/// one `setfield_gc` pair. The GC transform records the old-to-young
+/// edge; [`dict_write_barrier`] is that record.
+pub(crate) unsafe fn install_dict_storage(
+    w_dict: PyObjectRef,
+    storage: *mut u8,
+    strategy: &'static DictStrategyRef,
+) {
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    dict.dstorage = storage;
+    dict.dstrategy = strategy;
+    dict_write_barrier(w_dict);
+}
+
 /// Install a freshly allocated strategy storage on an empty dict.
 ///
 /// RPython's `w_dict.dstorage = strategy.erase(storage)` is a `setfield_gc`:
@@ -7057,11 +7132,9 @@ unsafe fn install_empty_strategy(w_dict: PyObjectRef, strategy: &'static DictStr
     let dict_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_dict);
     let storage = strategy.get_empty_storage();
+    let _ = crate::gc_roots::pin_root(storage as crate::PyObjectRef);
     let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
-    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-    dict.dstorage = storage;
-    dict.dstrategy = strategy;
-    crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+    install_dict_storage(w_dict, storage, strategy);
 }
 
 impl EmptyDictStrategy {
@@ -7668,19 +7741,11 @@ impl DictStrategy for ObjectDictStrategy {
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` —
     /// `W_DictObject(space, self, self.erase(dstorage.copy()))`.
-    /// Clone the IndexMap backing and wrap with the same
-    /// ObjectDictStrategy.  Proxy-attached W_DictObjects bypass this
-    /// override in `w_dict_copy` so str-key entries that live only in
-    /// the proxy survive.
+    /// Proxy-attached W_DictObjects bypass this override in
+    /// `w_dict_copy` so str-key entries that live only in the proxy
+    /// survive.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage as *const crate::dictmultiobject::ObjectDictStorage);
-        // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-            storage.clone(),
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        );
-        crate::dictmultiobject::w_dict_new_with(&OBJECT_DICT_STRATEGY_REF, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_copy_object_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF)
     }
 }
 
@@ -8146,14 +8211,7 @@ impl DictStrategy for UnicodeDictStrategy {
     /// `dictmultiobject.py`).  Proxy-attached W_DictObjects
     /// route through `w_dict_copy`'s union-walk fallback.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage as *const crate::dictmultiobject::ObjectDictStorage);
-        // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-            storage.clone(),
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        );
-        crate::dictmultiobject::w_dict_new_with(&UNICODE_DICT_STRATEGY_REF, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_copy_object_strategy(w_dict, &UNICODE_DICT_STRATEGY_REF)
     }
 }
 

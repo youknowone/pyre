@@ -485,8 +485,9 @@ static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
 /// so this cell is filled where that copy is made.
 ///
 /// The wrapper is allocated in the movable nursery like any other function
-/// object, so this raw copy is forwarded by `walk_process_import_roots` for
-/// the reason `SYS_MODULES_DICT` is.
+/// object. A mutator store into this cell takes `mark_prebuilt_roots_dirty`
+/// (`incminimark.py remember_young_pointer_from_prebuilt`); the gated
+/// `walk_process_import_roots` then forwards the raw copy.
 static DEFAULT_IMPORTLIB_IMPORT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "host_env")]
 static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -1750,6 +1751,8 @@ fn builtin_modules_get(
         .get_mut(static_name)
         .expect("a registered builtin module stays registered");
     if entry.w_mod == 0 {
+        // Young module pointer into a prebuilt `space.builtin_modules` slot
+        // (`incminimark.py remember_young_pointer_from_prebuilt`).
         entry.w_mod = w_mod as usize;
         pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     }
@@ -3723,12 +3726,14 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 /// for a fresh builtins dict, and the module that dict belongs to is not the
 /// one every frame resolves `__import__` through.
 pub fn set_default_importlib_import(w_import: PyObjectRef) {
-    let _ = DEFAULT_IMPORTLIB_IMPORT.compare_exchange(
-        0,
-        w_import as usize,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    if DEFAULT_IMPORTLIB_IMPORT
+        .compare_exchange(0, w_import as usize, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // Young `__import__` wrapper into a prebuilt space slot
+        // (`incminimark.py remember_young_pointer_from_prebuilt`).
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
 }
 
 /// `space.w_default_importlib_import`, or `None` before builtins is bound.
@@ -3786,16 +3791,15 @@ pub(crate) unsafe fn walk_import_roots_area(
     }
 }
 
-/// Walk the import state owned by PyPy's process/interpreter object space.
+/// The process-owned object pointers in the import state.
 ///
-/// Unlike `SYS_ARGV_PENDING`, these slots are not thread-local.  Keeping this
-/// walk separate lets the collector's `collect_nonstack_roots` parity rescan
-/// them exactly once at the end of incremental marking.
-pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
-    // mutator, so the process-global cache cannot be semantically mutated
-    // while this walk holds its native lock.
-    unsafe { walk_bound_module_dicts(visitor) };
+/// These slots are prebuilt (`space.sys` / `SysModuleState`). A mutator store
+/// of a young pointer into them takes `mark_prebuilt_roots_dirty`
+/// (`incminimark.py remember_young_pointer_from_prebuilt`); this walk is the
+/// corresponding `prebuilt_root_objects` visit, reached only through the gated
+/// [`walk_process_import_roots`]. Stores here rewrite forwarded addresses and
+/// are not mutator stores.
+unsafe fn walk_process_import_object_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         visitor(&mut dict);
@@ -3816,6 +3820,19 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
             def.w_mod = w_mod as usize;
         }
     }
+}
+
+/// Walk the import state owned by PyPy's process/interpreter object space.
+///
+/// Unlike `SYS_ARGV_PENDING`, these slots are not thread-local.  Keeping this
+/// walk separate lets the collector's `collect_nonstack_roots` parity rescan
+/// them exactly once at the end of incremental marking.
+pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
+    // mutator, so the process-global cache cannot be semantically mutated
+    // while this walk holds its native lock.
+    unsafe { walk_bound_module_dicts(visitor) };
+    walk_process_import_object_roots(visitor);
 }
 
 /// Set the Python-visible sys.modules dict reference. Called during sys
@@ -4091,8 +4108,8 @@ pub fn take_pending_sys_argv() -> pyre_object::PyObjectRef {
 }
 
 pub fn set_sys_modules_dict(dict: PyObjectRef) {
-    // The fast-path cell walked by `walk_sys_modules_dict_gc` now holds
-    // a possibly-young dict; rescan on the next minor collection.
+    // Young `sys.modules` dict into a prebuilt process slot
+    // (`incminimark.py remember_young_pointer_from_prebuilt`).
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
     // The cell just stored is walked; the parameter is a bare local the

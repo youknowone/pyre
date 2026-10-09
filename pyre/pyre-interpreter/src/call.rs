@@ -7747,8 +7747,15 @@ pub unsafe fn create_all_slots(
 unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
     unsafe {
         if !pyre_object::w_type_get_hasdict(w_type) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let save = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
+            let _ = pyre_object::gc_roots::pin_root(descr);
+            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
+            let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
             if !crate::type_dict_contains(w_type, "__dict__") {
                 crate::type_dict_store(w_type, "__dict__", descr);
             }
@@ -7769,8 +7776,15 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
 unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     unsafe {
         if !pyre_object::w_type_get_weakrefable(w_type) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let save = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             let descr =
                 crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
+            let _ = pyre_object::gc_roots::pin_root(descr);
+            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
+            let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
             if !crate::type_dict_contains(w_type, "__weakref__") {
                 crate::type_dict_store(w_type, "__weakref__", descr);
             }
