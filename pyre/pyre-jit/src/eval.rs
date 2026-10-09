@@ -10504,6 +10504,10 @@ fn deliver_exit_frame_exception(
         report_exit_frame_delivery("deliver", frame_root.frame(), refused);
     }
     if refused {
+        // `pyopcode.py handle_operation_error` marks the frame finished on
+        // the no-handler propagation too (`frame_finished_execution = True`
+        // before `raise operr`), which `frame.clear()` requires.
+        frame_root.frame().set_frame_finished_execution(true);
         return Err(err);
     }
     if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
@@ -11005,6 +11009,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                             report_exit_frame_delivery("eval_loop", unsafe { &*f }, refused);
                         }
                         if refused {
+                            // `handle_operation_error`'s no-handler path:
+                            // `frame_finished_execution = True` before the
+                            // raise propagates.
+                            unsafe { &mut *f }.set_frame_finished_execution(true);
                             return Err(err);
                         }
                         if pyre_interpreter::eval::handle_exception(
@@ -11680,6 +11688,13 @@ fn handle_fail(
 enum HandleFailDispatch {
     ContinueRunningNormally,
     Done(PyResult),
+    /// `jitexc.py ExitFrameWithExceptionRef` raised by the bridge walk
+    /// (`pyjitpl.py interpret` from the post-walk state).  `warmspot.py
+    /// handle_jitexception` re-raises it into the interpreter loop, where
+    /// `pyopcode.py handle_operation_error` consults this frame's exception
+    /// table and marks the frame finished before it propagates; the doors
+    /// deliver it the way the compiled-run exit is delivered.
+    ExitFrameWithException(PyError),
     Fallthrough,
 }
 
@@ -11732,7 +11747,9 @@ fn dispatch_handle_fail(
     ) {
         (HandleFailOutcome::BridgeCompiled, _) => compiled(),
         (HandleFailOutcome::BridgeFinished(v), _) => HandleFailDispatch::Done(Ok(v)),
-        (HandleFailOutcome::BridgeRaised(err), _) => HandleFailDispatch::Done(Err(err)),
+        (HandleFailOutcome::BridgeRaised(err), _) => {
+            HandleFailDispatch::ExitFrameWithException(err)
+        }
         (HandleFailOutcome::ResumeInBlackhole, savedata) => {
             // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
             let bh_result = resume_in_blackhole_from_exit_layout(
@@ -12259,6 +12276,9 @@ fn execute_assembler(
                     Some(LoopResult::ContinueRunningNormally)
                 }
                 HandleFailDispatch::Done(r) => Some(LoopResult::Done(r)),
+                HandleFailDispatch::ExitFrameWithException(err) => {
+                    Some(LoopResult::ExitFrameWithException(err))
+                }
                 HandleFailDispatch::Fallthrough => None,
             }
         }
@@ -12736,6 +12756,9 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailDispatch::Done(r) => return Some(LoopResult::Done(r)),
+                HandleFailDispatch::ExitFrameWithException(err) => {
+                    return Some(LoopResult::ExitFrameWithException(err));
+                }
                 HandleFailDispatch::Fallthrough => {}
             }
         } else {
@@ -13018,6 +13041,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 true,
             ) {
                 HandleFailDispatch::Done(r) => return Some(r),
+                HandleFailDispatch::ExitFrameWithException(err) => {
+                    return Some(deliver_exit_frame_exception(frame_root.frame(), err));
+                }
                 // Bridge compiled / blackhole CRN: ContinueRunningNormally
                 // re-enters compiled code via eval_loop_jit below.
                 HandleFailDispatch::ContinueRunningNormally | HandleFailDispatch::Fallthrough => {}
