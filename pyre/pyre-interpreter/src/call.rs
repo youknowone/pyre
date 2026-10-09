@@ -6995,9 +6995,10 @@ fn build_class_inner(
             dict_obj as *mut u8,
         );
         let _ = pyre_object::gc_roots::pin_root(w);
-        // `w_type_new` may minor-collect (`try_gc_alloc_young_nonmoving_raw`
-        // when the nursery is full, plus the name-storage box). The namespace
-        // is a nursery dict; the pre-alloc local is then recycled poison.
+        // `w_type_new` allocates the name-storage box
+        // (`gc_alloc_young_storage_box`) and may spill the header to old-gen
+        // when the nursery is full. Either collect. The namespace is a
+        // nursery dict; the pre-alloc local is then recycled poison.
         // `_create_new_type` reloads both words from their slots
         // (`type_new_take_qualname(w_type(), shadow_stack_get(dict_root))`).
         crate::builtins::type_new_take_qualname(
