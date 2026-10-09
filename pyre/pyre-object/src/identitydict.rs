@@ -190,7 +190,7 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     }
     // Box the empty `RDict` before insert. A stack array would be unrooted
     // across the stores (`_ll_malloc_entries` runs inside `insert`).
-    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         crate::dictmultiobject::object_dict_storage_new(),
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
     );
@@ -281,7 +281,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// bucket for O(1) lookup + insertion-order preserving iteration.
     /// GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> *mut u8 {
-        crate::gc_storage::gc_alloc_storage_box(
+        crate::gc_storage::gc_alloc_young_storage_box(
             IdentityDictStorage::new(),
             identity_dict_storage_gc_type_id(),
         ) as *mut u8
@@ -404,8 +404,8 @@ impl DictStrategy for IdentityDictStrategy {
     /// same IdentityDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let storage = identity_storage(w_dict);
-        // `gc_alloc_storage_box` is a stable allocation and never collects.
-        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
+        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
             storage.clone(),
             identity_dict_storage_gc_type_id(),
         );

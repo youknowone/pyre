@@ -126,7 +126,7 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
         hashes.push(object_key.hash);
         roots.publish(&[object_key.obj, v]);
     }
-    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         crate::dictmultiobject::object_dict_storage_with_capacity(len),
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
     );
@@ -440,7 +440,7 @@ impl DictStrategy for KwargsDictStrategy {
     /// same KwargsDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let storage = kwargs_storage(w_dict);
-        let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
             storage.clone(),
             kwargs_dict_storage_gc_type_id(),
         );

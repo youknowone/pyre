@@ -5838,6 +5838,11 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
     };
     dict.dstorage = dstorage;
     dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
+    // `setfield_gc` on `w_dict.dstorage`: the fresh table is born young and
+    // an already-old dict has to be remembered before the next minor.
+    pyre_object::gc_hook::try_gc_write_barrier(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut u8
+    );
     // materialize_r_dict(space, w_obj, dict_w).
     unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
 }
@@ -5863,6 +5868,11 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
     };
     dict.dstorage = dstorage;
     dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+    // `setfield_gc` on `w_dict.dstorage`: the fresh table is born young and
+    // an already-old dict has to be remembered before the next minor.
+    pyre_object::gc_hook::try_gc_write_barrier(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut u8
+    );
     // materialize_str_dict(space, w_obj, str_dict).
     unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
 }

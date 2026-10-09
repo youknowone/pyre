@@ -432,6 +432,16 @@ impl<K, V, S> RDict<K, V, S> {
         }
     }
 
+    /// `setfield_gc(d, 'entries')` write barrier on the dict itself, taken
+    /// before `d.entries = newitems`.  The array is born young
+    /// (`alloc_entries`), so an old `dicttable` box must be remembered or the
+    /// next minor never reaches it.  The guarded form: the dict may be a
+    /// stack temporary or a pre-hook `malloc_raw` box.
+    #[inline]
+    fn barrier_self(&self) {
+        crate::gc_hook::try_gc_write_barrier(self as *const Self as *mut u8);
+    }
+
     /// The `entries` field slot, one GcRef (`d.entries`).
     #[inline]
     pub fn entries_slot(&mut self) -> *mut *mut u8 {
@@ -919,6 +929,7 @@ where
             }
         } else {
             crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+            self.barrier_self();
             self.entries = newitems;
         }
         self.num_ever_used_items = self.num_live_items;
@@ -1134,6 +1145,7 @@ where
             }
         }
         crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+        self.barrier_self();
         self.entries = newitems;
         self.generation = self.generation.wrapping_add(1);
         false
@@ -1437,6 +1449,7 @@ where
                 }
             }
             crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+            self.barrier_self();
             self.entries = newitems;
             self.generation = self.generation.wrapping_add(1);
         }
