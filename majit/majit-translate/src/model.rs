@@ -5792,12 +5792,18 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 /// An operand is threaded only when it is available on every predecessor path
 /// into the use block.  This is the same condition `SSA_to_SSI` enforces while
 /// adding one inputarg to every block and one argument to every incoming link
-/// (`rpython/translator/backendopt/ssa.py`).  Diamond joins are valid
-/// when the definition dominates the split; a value defined in only one arm,
-/// or one with no upstream definition, is left untouched so the adapter can
-/// Skip the malformed graph.  Back edges provisionally satisfy the recursive
-/// check, but a separate ancestor-definition check prevents a source-less SCC
-/// from manufacturing a definition.  Graphs with no cross-block-undefined
+/// (`rpython/translator/backendopt/ssa.py`).  `SSA_to_SSI.record_used_var`
+/// walks `op.args`, `block.exitswitch`, and `link.args`; this pass matches
+/// that census so a loop-carried iterator named only on the back-edge
+/// (`range_iter` plants `iter()` in the preheader, the latch forwards it)
+/// is an inputarg of the latch, the way `ll_listnext` (`rlist.py`) keeps
+/// the iterator live across a body that does not mention it.
+/// Diamond joins are valid when the definition dominates the split; a
+/// value defined in only one arm, or one with no upstream definition, is
+/// left untouched so the adapter can Skip the malformed graph.  Back
+/// edges provisionally satisfy the recursive check, but a separate
+/// ancestor-definition check prevents a source-less SCC from
+/// manufacturing a definition.  Graphs with no cross-block-undefined
 /// operand collect no work and stay byte-identical.
 pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
@@ -5861,27 +5867,38 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     }
 
     let mut work: Vec<(BlockId, Variable)> = Vec::new();
+    let mut consider = |block_id: BlockId, var: Variable| {
+        if graph.variable_defined_in_block(block_id, &var) {
+            return;
+        }
+        let has_definition =
+            ancestor_has_definition(graph, &preds, block_id, &var, &mut HashSet::new());
+        let available = available_on_every_predecessor_path(
+            graph,
+            &preds,
+            block_id,
+            &var,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+        );
+        if has_definition && available {
+            work.push((block_id, var));
+        }
+    };
     for block in &graph.blocks {
         if block.dead {
             continue;
         }
         for op in &block.operations {
             for var in crate::inline::op_variable_refs(&op.kind) {
-                if graph.variable_defined_in_block(block.id, &var) {
-                    continue;
-                }
-                let has_definition =
-                    ancestor_has_definition(graph, &preds, block.id, &var, &mut HashSet::new());
-                let available = available_on_every_predecessor_path(
-                    graph,
-                    &preds,
-                    block.id,
-                    &var,
-                    &mut HashSet::new(),
-                    &mut HashMap::new(),
-                );
-                if has_definition && available {
-                    work.push((block.id, var));
+                consider(block.id, var);
+            }
+        }
+        // `SSA_to_SSI` `record_used_var` on `link.args` (`ssa.py`).
+        for link in &block.exits {
+            for arg in &link.args {
+                if let Some(var) = arg.as_variable() {
+                    consider(block.id, var.clone());
                 }
             }
         }
@@ -15362,6 +15379,69 @@ mod tests {
             "one-arm definition must not be invented at the join",
         );
         assert!(graph.block(right).inputargs.is_empty());
+    }
+
+    /// A for-loop latch that names the preheader `iter()` result on the
+    /// back-edge without defining it (`range_iter` plants `iter()` in the
+    /// preheader; `rlist.py` `ll_listnext` keeps that iterator live through
+    /// a body that does not mention it). `SSA_to_SSI` `record_used_var` on
+    /// `link.args` threads it so the adapter's `link_arg_to_hlvalue` sees a
+    /// defined operand.
+    #[test]
+    fn thread_undefined_link_arg_on_loop_back_edge() {
+        let mut graph = FunctionGraph::new("thread_link_arg_latch");
+        let entry = graph.startblock;
+        let (header, header_args) = graph.create_block_with_arg_vars(1);
+        let latch = graph.create_block();
+        let iter = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let iter_phi = header_args[0].clone();
+        let next_item = graph.alloc_value_var();
+        graph.block_mut(header).operations.push(SpaceOperation {
+            result: Some(next_item),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__iter_next".to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![iter_phi.clone()]),
+                result_ty: ValueType::Int,
+            },
+        });
+        graph.set_goto(entry, header, vec![iter.clone()]);
+        graph.set_goto(header, latch, vec![]);
+        graph.set_goto(latch, header, vec![iter.clone()]);
+
+        assert!(
+            !graph.variable_defined_in_block(latch, &iter),
+            "pre-thread latch must not define the preheader iterator",
+        );
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert!(
+            graph.variable_defined_in_block(latch, &iter),
+            "latch back-edge iterator must become an inputarg",
+        );
+        assert!(
+            graph.block(latch).exits[0]
+                .args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == &iter)),
+            "latch still passes the iterator to the header",
+        );
     }
 
     /// `framestate.py getvariables` walks `locals + flatten(stack) +
