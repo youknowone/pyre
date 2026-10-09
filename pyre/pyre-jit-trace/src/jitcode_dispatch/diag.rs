@@ -93,10 +93,10 @@ pub(crate) fn fbw_inline_poison_enabled() -> bool {
 /// change in one command.  It stands on two rewinds a non-CALL entry did not
 /// have before.  The record-time one is the trace cut the caller takes on a
 /// `NotImplemented` result, under the same all-clear odometer reading the
-/// un-lowered-helper rollback uses.  The runtime one is the forward-flush
-/// carrier, which `latch_abort_call_resume` names from the frame's own resume
-/// sources; `caller_operand_slots` is where that entry's `[lhs, rhs]` operand
-/// image comes from, and reading the image off a CALL residual's operand list
+/// un-lowered-helper rollback uses.  The runtime one converts the live
+/// framestack through `convert_and_run_from_pyjitpl` (`blackhole.py`);
+/// `caller_operand_slots` is where that entry's `[lhs, rhs]` operand image
+/// comes from, and reading the image off a CALL residual's operand list
 /// instead is what resumed one operand short at a `BINARY_OP`.
 ///
 /// What it does NOT widen is the promise the entry makes about commits.  A

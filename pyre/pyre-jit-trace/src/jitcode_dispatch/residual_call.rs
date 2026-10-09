@@ -16,7 +16,7 @@
 //! arms themselves stay in `handle` (mod.rs) and call into these.
 
 use super::symbolic_fold::try_fold_registered_symbolic_residual;
-use super::*;
+use super::{InlineParentBlackhole, InlineParentFrame, *};
 use pyre_interpreter::{locals_w, locals_w_mut};
 
 /// The published fnaddrs whose registered path matches `pred`, collected once.
@@ -661,6 +661,20 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
             .call_stack_overrides
             .iter()
             .find_map(|&(candidate, value)| (candidate == slot).then_some(value))
+            .or_else(|| {
+                // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) writes each
+                // operand-stack slot through `setarrayitem_vable_via_metainterp`
+                // → `store_live_frame_array_slot` onto the inline callee's
+                // `callee_shadow.concrete_frame` before a nested sub-walk
+                // starts.  `paused_concrete_frame` is that shadow's frame
+                // (None on a root parent, whose live PyFrame is still parked
+                // at the loop header).  Fill a missing override from that
+                // array so a complete image can latch when the CALL-site
+                // capture was sparse.
+                parent
+                    .paused_concrete_frame()
+                    .and_then(|frame| crate::state::concrete_stack_value(frame, slot))
+            })
         else {
             latchdbg!(
                 "root-parent-stack: no call_stack_override for slot {slot} \
@@ -1311,6 +1325,248 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     true
 }
 
+/// Result-register of the CALL this paused parent sits on, if the op returns
+/// a value.  `_setup_return_value_*` writes that color when the callee
+/// finishes, so the captured image must leave it unset.
+fn parent_call_result_color(
+    pjc: &crate::pyjitcode::PyJitCode,
+    call_jit_pc: usize,
+) -> Option<(char, usize)> {
+    let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
+    let result_bank = call.argcodes.chars().last()?;
+    if result_bank == 'v' {
+        return None;
+    }
+    let color = pjc.jitcode.code.get(call.next_pc.checked_sub(1)?)?;
+    Some((result_bank, usize::from(*color)))
+}
+
+fn parent_resume_pc(
+    parent: &InlineParentFrame,
+    pjc: &crate::pyjitcode::PyJitCode,
+) -> Option<usize> {
+    if let Some(concrete) = parent.blackhole.as_ref() {
+        return Some(concrete.resume_pc);
+    }
+    let call_jit_pc = parent.call_jitcode_pc?;
+    decode_op_at(&pjc.jitcode.code, call_jit_pc).map(|call| call.next_pc)
+}
+
+/// One paused caller as an `MIFrame`. Prefer the CALL-site blackhole capture;
+/// if that capture missed, reconstruct from the live banks `attach_live_caller`
+/// stored. Continuation tails (`descr_call`, operator) own no banks and stay
+/// declined — a chain with a missing level would deliver the callee return
+/// into the wrong caller's slot.
+fn build_parent_miframe<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &InlineParentFrame,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: no pyjitcode for parent \
+                 jitcode_index={}",
+                parent.jitcode_index
+            );
+        }
+        return None;
+    };
+    if let Some(concrete) = parent.blackhole.as_ref() {
+        return copy_captured_parent_blackhole(ctx, &pjc, concrete, origin, index);
+    }
+    build_parent_miframe_from_live_banks(ctx, parent, &pjc, origin, index)
+}
+
+fn copy_captured_parent_blackhole<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pjc: &crate::pyjitcode::PyJitCode,
+    concrete: &InlineParentBlackhole,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
+    for &(color, value) in &concrete.int_values {
+        let bank_len = miframe.int_regs.len();
+        let Some(slot) = miframe.int_regs.get_mut(color) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: int color {color} \
+                     out of range (len {bank_len})"
+                );
+            }
+            return None;
+        };
+        *slot = Some(OpRef::const_int(value));
+    }
+    for &(color, value) in &concrete.ref_values {
+        let bank_len = miframe.ref_regs.len();
+        let Some(slot) = miframe.ref_regs.get_mut(color) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: ref color {color} \
+                     out of range (len {bank_len})"
+                );
+            }
+            return None;
+        };
+        *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+    }
+    for &(color, opref) in &concrete.float_values {
+        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: float opref {opref:?} \
+                     not a stamped Float"
+                );
+            }
+            return None;
+        };
+        let bank_len = miframe.float_regs.len();
+        let Some(slot) = miframe.float_regs.get_mut(color) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: float color {color} \
+                     out of range (len {bank_len})"
+                );
+            }
+            return None;
+        };
+        *slot = Some(OpRef::const_float(value));
+    }
+    Some(miframe)
+}
+
+fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &InlineParentFrame,
+    pjc: &crate::pyjitcode::PyJitCode,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let Some(resume_pc) = parent_resume_pc(parent, pjc) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: parent.blackhole None \
+                 and no CALL resume pc (continuation tail / capture missing)"
+            );
+        }
+        return None;
+    };
+    if !instruction_starts_at(&pjc.jitcode, resume_pc) {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: resume_pc={resume_pc} \
+                 is not an instruction start"
+            );
+        }
+        return None;
+    }
+    let (Some(registers_i), Some(registers_r), Some(registers_f), Some(frame_state)) = (
+        parent.registers_i.as_ref(),
+        parent.registers_r.as_ref(),
+        parent.registers_f.as_ref(),
+        parent.frame_state.as_ref(),
+    ) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: parent.blackhole None \
+                 and no live banks (descr_call / operator continuation)"
+            );
+        }
+        return None;
+    };
+    let result = parent
+        .call_jitcode_pc
+        .and_then(|pc| parent_call_result_color(pjc, pc));
+    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    for color in 0..miframe.int_regs.len() {
+        if result == Some(('i', color)) {
+            continue;
+        }
+        let Some(opref) = registers_i.get(color) else {
+            continue;
+        };
+        if opref == OpRef::NONE {
+            continue;
+        }
+        let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: live int color \
+                     {color} opref={opref:?} has no concrete"
+                );
+            }
+            return None;
+        };
+        miframe.int_regs[color] = Some(OpRef::const_int(value));
+    }
+    for color in 0..miframe.ref_regs.len() {
+        if result == Some(('r', color)) {
+            continue;
+        }
+        let Some(opref) = registers_r.get(color) else {
+            continue;
+        };
+        if opref.is_none() {
+            continue;
+        }
+        let from_shadow = {
+            let borrowed = frame_state.borrow();
+            borrowed
+                .concrete_registers_r
+                .get(color)
+                .copied()
+                .and_then(|value| match value {
+                    ConcreteValue::Ref(value) => Some(value as i64),
+                    _ => None,
+                })
+        };
+        let forwarded = match ctx
+            .trace_ctx
+            .lookup_opref_concrete(opref)
+            .or_else(|| ctx.trace_ctx.recover_ref_value(opref, 8))
+        {
+            Some(majit_ir::Value::Ref(gc)) => Some(gc.0 as i64),
+            _ => None,
+        };
+        if let Some(value) = forwarded.or(from_shadow) {
+            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        } else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: live ref color \
+                     {color} opref={opref:?} has no concrete"
+                );
+            }
+            return None;
+        }
+    }
+    for color in 0..miframe.float_regs.len() {
+        if result == Some(('f', color)) {
+            continue;
+        }
+        let Some(opref) = registers_f.get(color) else {
+            continue;
+        };
+        if opref == OpRef::NONE {
+            continue;
+        }
+        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: live float color \
+                     {color} opref={opref:?} has no concrete"
+                );
+            }
+            return None;
+        };
+        miframe.float_regs[color] = Some(OpRef::const_float(value));
+    }
+    Some(miframe)
+}
+
 #[derive(Clone, Copy)]
 enum InnermostMiframeBuild {
     LiveMarker(Option<(char, usize, i64)>),
@@ -1357,58 +1613,9 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         .flat_map(|inline| inline.parents.iter())
         .enumerate()
     {
-        let Some(concrete) = parent.blackhole.as_ref() else {
-            // `descr_call`'s tail reaches here too, and captures no image
-            // because it owns no register banks. Declining is the same
-            // best-effort answer any uncaptured parent gets — never a chain
-            // with a level missing, which would deliver the callee's return
-            // into the wrong caller's slot.
-            s2dbg!("origin={origin} frame {index}: parent.blackhole None (capture missing)");
+        let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
             return None;
         };
-        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
-        else {
-            s2dbg!(
-                "origin={origin} frame {index}: no pyjitcode for parent jitcode_index={}",
-                parent.jitcode_index
-            );
-            return None;
-        };
-        let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
-        for &(color, value) in &concrete.int_values {
-            let bank_len = miframe.int_regs.len();
-            let Some(slot) = miframe.int_regs.get_mut(color) else {
-                s2dbg!(
-                    "origin={origin} frame {index}: int color {color} out of range (len {bank_len})"
-                );
-                return None;
-            };
-            *slot = Some(OpRef::const_int(value));
-        }
-        for &(color, value) in &concrete.ref_values {
-            let bank_len = miframe.ref_regs.len();
-            let Some(slot) = miframe.ref_regs.get_mut(color) else {
-                s2dbg!(
-                    "origin={origin} frame {index}: ref color {color} out of range (len {bank_len})"
-                );
-                return None;
-            };
-            *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
-        }
-        for &(color, opref) in &concrete.float_values {
-            let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
-                s2dbg!("origin={origin} frame {index}: float opref {opref:?} not a stamped Float");
-                return None;
-            };
-            let bank_len = miframe.float_regs.len();
-            let Some(slot) = miframe.float_regs.get_mut(color) else {
-                s2dbg!(
-                    "origin={origin} frame {index}: float color {color} out of range (len {bank_len})"
-                );
-                return None;
-            };
-            *slot = Some(OpRef::const_float(value));
-        }
         frames.push(miframe);
     }
 
@@ -4829,8 +5036,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
         // the walk-end flush needs the caller's mid-expression stack, which
-        // the vable shadow cannot provide (`reconstructed_all_ref_call_stack`
-        // resolves the same mirror for the inline-abort Entry carrier).
+        // the vable shadow cannot provide.
         //
         // A WRITING residual is latched too, but never to resume AT this
         // opcode: the withdrawal below cancels its commit and restores the

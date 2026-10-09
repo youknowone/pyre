@@ -405,12 +405,6 @@ pub(crate) fn fbw_mark_executed_nonpure_residual() {
     FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(true));
 }
 
-/// Whether the current walk has concretely executed a non-provably-pure
-/// residual.
-pub(crate) fn fbw_executed_nonpure_residual() -> bool {
-    FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.get())
-}
-
 /// Clear the executed-residual latch at a walk boundary.
 pub(crate) fn fbw_executed_nonpure_residual_reset() {
     FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(false));
@@ -2852,47 +2846,6 @@ pub(crate) fn fbw_bump_executed_effect(site: &'static str) {
     });
 }
 
-/// gh#467 latch the inline-abort forward-flush carrier (see
-/// [`FBW_ABORT_CALL_RESUME`]).
-///
-/// Does not displace an already-latched `MidBody` carrier — it is stored inside
-/// it as [`MidBodyPayload::entry_fallback`] instead.  Rebuilding the callee at
-/// its own pc and resuming the caller past its call is what upstream does
-/// (`blackhole.py convert_and_run_from_pyjitpl`, `:1653-1662`); rewinding the caller TO the call
-/// has no upstream counterpart, so it stands in only for a callee the rebuild
-/// could not describe or could not flush.  Both sites are `is_top_inline` on an
-/// aborting sub-walk, which ends the walk, so at most one of each is latched
-/// per walk, and both read the same outer CALL coordinate.
-pub(crate) fn fbw_set_abort_call_resume(
-    outer_jitcode_index: u32,
-    call_jitcode_pc: usize,
-    stack: Vec<pyre_object::PyObjectRef>,
-) {
-    FBW_ABORT_CALL_RESUME.with(|c| {
-        let mut slot = c.borrow_mut();
-        if let Some(InlineAbortCarrier::MidBody(payload)) = slot.as_mut() {
-            if payload.outer_jitcode_index == outer_jitcode_index
-                && payload.call_jitcode_pc == call_jitcode_pc
-            {
-                payload.entry_fallback = Some(crate::jitcode_dispatch::EntryFallback {
-                    call_stack: stack,
-                    entry_executed_effects: fbw_executed_effect_count(),
-                });
-            }
-            return;
-        }
-        *slot = Some(InlineAbortCarrier::Entry {
-            outer_jitcode_index,
-            call_jitcode_pc,
-            call_stack: stack,
-            // The latch is only set at the CALL, and only under the caller's
-            // zero-delta gate, so the odometer read here IS the count at the
-            // pc this carrier resumes at.
-            entry_executed_effects: fbw_executed_effect_count(),
-        })
-    });
-}
-
 pub(crate) fn fbw_set_midbody_abort_resume(payload: MidBodyPayload) {
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = Some(InlineAbortCarrier::MidBody(payload)));
 }
@@ -3017,11 +2970,9 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     if matches!(cause, Some(ResidualDecline::PureUnfolded)) {
         return Ok(());
     }
-    // A nested unjournaled residual used to be declined outright, on the
-    // grounds that an abort could only resume at the caller's CALL and would
-    // re-apply it.  Under the current portal-runner ABI the inline frame is a
-    // real red frame in the captured chain and aborts resume forward, so the
-    // residual is executed and recorded exactly as `do_residual_call` does.
+    // Under the current portal-runner ABI the inline frame is a real red
+    // frame in the captured chain and aborts resume forward, so the residual
+    // is executed and recorded exactly as `do_residual_call` does.
     // The one remaining miscompile, a self-recursive callee whose hot
     // `CALL_ASSEMBLER` recursion-bridge frame the residual trampoline cannot
     // retain, is the `CALL_ASSEMBLER` fold itself and is exempted by
@@ -3035,8 +2986,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
 }
 
 /// Refuse the innermost inline callee: deny it for the rest of this thread's
-/// tracing, latch the outer caller's CALL coordinate, and build the decline the
-/// walk returns.
+/// tracing and build the decline the walk returns.
 ///
 /// Shared by the poisoned-pc refusal in [`crate::jitcode_dispatch::walk`] and
 /// the declined `locals()` expansion in `specialize.rs`, which answer the same
@@ -3113,72 +3063,24 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
                 .disable_noninlinable_function_for_key(&key);
         }
     }
-    // The flush this latch feeds resumes the OUTERMOST caller at the CALL
-    // that entered the inline region, re-executing that call from scratch,
-    // while the walk's store journal is committed — a
-    // `WalkEndResume::Rewind` leg.  So it is sound only while the inline
-    // region has executed nothing irreversible: an executed-effect delta
-    // means the call would apply its effects a second time on top of the
-    // committed ones.  Same zero-delta gate the entry carrier applies at
-    // its own CALL (`try_walker_inline_user_call`) and the contract
-    // `FBW_EXECUTED_EFFECT_COUNT` documents.  The snapshot travels with the
-    // latch so `commit_walk_end` re-checks it at the commit point, not just
-    // here.
+    // A seeded inline already has the callee `PyFrame`, and
+    // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py`) converts the
+    // live framestack in place.  Unseeded stays residual-not-abort — the
+    // enclosing CALL was never entered.
     //
-    // Declining here leaves the legacy path, which is exactly-once only for
-    // the effects a journal covers.  `residual_call.rs` bumps the odometer
-    // for a non-pure residual that wrote live heap or entered a user Python
-    // frame, and neither is journaled, so a legacy drop after such a
-    // residual re-applies it.  That is not a property of this gate — the
-    // walk reaches the same state through any non-committing abort inside a
-    // sub-walk — so this gate does not attempt to repair it.
-    let (outer_resume, stack_overrides, blackhole_required) = {
+    // `blackhole_required` still names whether the aborting MIFrame has
+    // already applied an effect, so an unjournaled FOR_ITER consume converts
+    // instead of dropping the item.  `convert_and_run_from_pyjitpl` copies
+    // every `MIFrame` independently (`blackhole.py`).
+    let blackhole_required = {
         let session = ctx.session.borrow();
-        let outermost = session
-            .first_inline()
-            .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
-        let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parents.first()) {
-            Some(frame) => (
-                frame.call_jitcode_pc.map(|jit_pc| {
-                    (
-                        frame.jitcode_index,
-                        jit_pc,
-                        crate::jitcode_dispatch::fbw_executed_effect_count(),
-                    )
-                }),
-                frame.call_stack_overrides.clone(),
-            ),
-            None => (None, Vec::new()),
-        };
-        // The aborting operation belongs to the innermost live MIFrame,
-        // including the portal at `framestack[0]`. A root walk has no
-        // inline frame, so `last_inline()` would miss the portal's own
-        // effect delta and drop `fbw_blackhole_adopted_single_frame`.
-        // `first_inline()` above is only for the paused caller's parent
-        // resume record; this test is the per-frame boundary
-        // `convert_and_run_from_pyjitpl` preserves when it copies every
-        // `MIFrame` independently (`blackhole.py`).
-        // An in-flight FOR_ITER item is in no frame image, so the per-frame
-        // test above cannot see it: a body effect committed in an enclosing
-        // frame leaves the innermost frame's delta at zero while
-        // `fbw_foriter_inflight_take` refuses that very item, and the legacy
-        // path then drops it.  Arm the conversion on the same signal the
-        // refusal reads, so the item is carried forward instead of lost.
-        // An unjournaled consume is the same hole with the body-effect signal
-        // clear: entry replay calls `__next__` again.
-        // `convert_and_run_from_pyjitpl` continues the framestack instead.
-        let blackhole_required = session
+        session
             .framestack
             .last()
             .is_some_and(|frame| fbw_executed_effect_count() != frame.entry_executed_effects)
             || (fbw_foriter_inflight_active()
-                && (fbw_foriter_any_body_effect_signal() || fbw_foriter_unjournaled_consume()));
-        (outer_resume, stack_overrides, blackhole_required)
+                && (fbw_foriter_any_body_effect_signal() || fbw_foriter_unjournaled_consume()))
     };
-    FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));
-    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
-        *c.borrow_mut() = stack_overrides;
-    });
     DispatchError::callee_inline_abort(pc, blackhole_required)
 }
 
@@ -3190,39 +3092,6 @@ pub(crate) fn fbw_innermost_inline_callee_key<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<usize> {
     ctx.session.borrow().last_inline().map(|f| f.w_code)
-}
-
-/// Take the outer-caller CALL JitCode coordinate stashed by
-/// [`fbw_abort_nested_unjournaled_residual`].  The stack overrides stay in
-/// `FBW_ABORT_OUTER_STACK_OVERRIDES` (rooted by the #447 area walker,
-/// `abort_overrides`) until [`fbw_abort_outer_stack_overrides_clear`]; the
-/// flush reads them in place from the rooted cell so a minor collection while
-/// boxing Int/Float locals forwards the very refs it writes.
-///
-/// The third element is the executed-effect odometer at the outer CALL this
-/// resumes at — `WalkEndResume::Rewind`'s `effects_at_resume_point`.
-pub(crate) fn fbw_abort_outer_resume_take() -> Option<(u32, usize, usize)> {
-    FBW_ABORT_OUTER_RESUME.with(|c| c.replace(None))
-}
-
-/// Run `f` with the rooted outer-frame stack overrides borrowed in place.
-/// A GC during `f` forwards the cell's ref slots via the area walker's
-/// `as_ptr` access, so the borrowed slice observes the forwarded values.
-pub(crate) fn fbw_abort_outer_stack_overrides_with<R>(
-    f: impl FnOnce(&[(usize, pyre_object::PyObjectRef)]) -> R,
-) -> R {
-    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| f(&c.borrow()))
-}
-
-/// Clear the outer-frame stack overrides after the flush consumed them.
-pub(crate) fn fbw_abort_outer_stack_overrides_clear() {
-    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| c.borrow_mut().clear());
-}
-
-/// Clear the nested inline abort resume latch at a walk boundary.
-pub(crate) fn fbw_abort_outer_resume_reset() {
-    FBW_ABORT_OUTER_RESUME.with(|c| c.set(None));
-    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| c.borrow_mut().clear());
 }
 
 /// Whether the walk recorded an effect outside the journal's reach.
