@@ -19124,71 +19124,47 @@ unsafe fn tuple_exact_cursor_exhausted(it: PyObjectRef) -> bool {
 /// would box plain ints as `Cls_ii` and change the unpack). A shape this
 /// arm does not own goes to `zip_two_tuple_next_other`.
 unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
-    // Same pin as `zip_two_tuple_next_other`: the first item stays live
-    // across the second `next`, and `w_specialised_tuple_oo_new` allocates.
-    // Own RootScope and `shadow_stack_len` captured before each pin
-    // (`binary_slice_values_inner` / `eval_slice_index`) so
-    // `shadow_stack_erase` can scalar-replace the pins. Extra pins live
-    // in nested scopes so every merge is at one depth. `iterators` is
-    // a `getfield` then `getarrayitem` (`ll_list_obj_getitem_fast`)
-    // before the first collecting call, so it is not pinned.
+    // `tuple_iter_descr_next` and `w_specialised_tuple_oo_new` collect.
+    // Around each, `gct_direct_call` / `get_livevars_for_roots` keep
+    // zip_obj, both iterators, and the first item live. `iterators` is
+    // a getfield then getarrayitem (`ll_list_obj_getitem_fast`) before
+    // the first collecting call, so it is not pinned.
     let _roots = pyre_object::gc_roots::push_roots();
-    let zip_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(zip_obj);
-    // One return so the RootScope Drop is a regular close, not an
-    // unwind-only cleanup `body_is_depth_neutral` misses.
-    let result = {
-        let iterators = pyre_object::functional::w_zip_get_iterators(
+    let iterators = pyre_object::functional::w_zip_get_iterators(zip_obj);
+    if !zip_two_exact_object_list(iterators) {
+        return zip_two_tuple_next_other(zip_obj);
+    }
+    let it0 = zip_object_list_item(iterators, 0);
+    let it1 = zip_object_list_item(iterators, 1);
+    if !pyre_object::is_tuple_iter(it0) || !pyre_object::is_tuple_iter(it1) {
+        return zip_two_tuple_next_other(zip_obj);
+    }
+    let zip_slot = pyre_object::gc_roots::pin_roots(&[zip_obj, it0, it1]);
+    let it0_slot = zip_slot + 1;
+    let it1_slot = zip_slot + 2;
+    // Progress is a local fact of which call returned: the field store is
+    // recorded, and the strict arms below do not re-read it.
+    pyre_object::functional::w_zip_set_iteration_progress(
+        pyre_object::gc_roots::shadow_stack_get(zip_slot),
+        0,
+    );
+    let a = tuple_iter_descr_next(pyre_object::gc_roots::shadow_stack_get(it0_slot));
+    if a.is_null() {
+        return zip_two_tuple_first_stopped(
             pyre_object::gc_roots::shadow_stack_get(zip_slot),
+            pyre_object::gc_roots::shadow_stack_get(it1_slot),
         );
-        if !zip_two_exact_object_list(iterators) {
-            zip_two_tuple_next_other(pyre_object::gc_roots::shadow_stack_get(zip_slot))
-        } else {
-            let it0 = zip_object_list_item(iterators, 0);
-            let it1 = zip_object_list_item(iterators, 1);
-            if !pyre_object::is_tuple_iter(it0) || !pyre_object::is_tuple_iter(it1) {
-                zip_two_tuple_next_other(pyre_object::gc_roots::shadow_stack_get(zip_slot))
-            } else {
-                let _cursors = pyre_object::gc_roots::push_roots();
-                let it0_slot = pyre_object::gc_roots::pin_roots(&[it0, it1]);
-                let it1_slot = it0_slot + 1;
-                // Progress is a local fact of which call returned: the field
-                // store is recorded, and the strict arms below do not re-read it.
-                pyre_object::functional::w_zip_set_iteration_progress(
-                    pyre_object::gc_roots::shadow_stack_get(zip_slot),
-                    0,
-                );
-                let a = tuple_iter_descr_next(pyre_object::gc_roots::shadow_stack_get(it0_slot));
-                if a.is_null() {
-                    zip_two_tuple_first_stopped(
-                        pyre_object::gc_roots::shadow_stack_get(zip_slot),
-                        pyre_object::gc_roots::shadow_stack_get(it1_slot),
-                    )
-                } else {
-                    let _item = pyre_object::gc_roots::push_roots();
-                    let a_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(a);
-                    pyre_object::functional::w_zip_set_iteration_progress(
-                        pyre_object::gc_roots::shadow_stack_get(zip_slot),
-                        1,
-                    );
-                    let b =
-                        tuple_iter_descr_next(pyre_object::gc_roots::shadow_stack_get(it1_slot));
-                    if b.is_null() {
-                        zip_two_tuple_second_stopped(pyre_object::gc_roots::shadow_stack_get(
-                            zip_slot,
-                        ))
-                    } else {
-                        pyre_object::w_specialised_tuple_oo_new(
-                            pyre_object::gc_roots::shadow_stack_get(a_slot),
-                            b,
-                        )
-                    }
-                }
-            }
-        }
-    };
-    result
+    }
+    let a_slot = pyre_object::gc_roots::pin_roots(&[a]);
+    pyre_object::functional::w_zip_set_iteration_progress(
+        pyre_object::gc_roots::shadow_stack_get(zip_slot),
+        1,
+    );
+    let b = tuple_iter_descr_next(pyre_object::gc_roots::shadow_stack_get(it1_slot));
+    if b.is_null() {
+        return zip_two_tuple_second_stopped(pyre_object::gc_roots::shadow_stack_get(zip_slot));
+    }
+    pyre_object::w_specialised_tuple_oo_new(pyre_object::gc_roots::shadow_stack_get(a_slot), b)
 }
 
 /// First `next` stopped before progress advanced (`W_Zip.next_w`, progress
