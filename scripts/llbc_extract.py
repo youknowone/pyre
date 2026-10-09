@@ -2457,8 +2457,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     host_config = [
         "--config",
         "target-applies-to-host=false",
-        "--config",
-        f'host.rustflags=["{crate_attr}"]',
     ]
 
     prepared_std: set[str] = set()
