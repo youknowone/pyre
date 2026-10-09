@@ -56,16 +56,31 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
 ///
 /// The box keeps the non-moving address the self-mutating rule needs, but a
 /// minor collection frees it once nothing reaches it, instead of the next
-/// major.  A young box needs no barrier on its payload stores.  The caller
-/// owes the box a root until it is stored into a traced object.
-#[inline]
+/// major.  A dict's `dicttable` and the type's name string are nursery
+/// objects upstream, so a program that builds and drops a class or a dict
+/// gives the whole graph back on the next minor.  The caller owes the box a
+/// root until it is stored into a traced object, and the store takes the
+/// holder's `setfield_gc` barrier when the holder is old.
+///
+/// `value` is built on the Rust stack before the birth, so the entry is the
+/// no-collect twin of `external_malloc`: a collection run inside the malloc
+/// would leave the payload's own references stale.  A refused young birth
+/// (`MAJIT_GC_YOUNG_RAWMALLOC=0`) is born old instead, and the barrier after
+/// the write keeps a filled table's children reachable in that case; it is a
+/// no-op on a young header.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
 pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
     if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_raw(tid, std::mem::size_of::<T>());
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            std::mem::size_of::<T>(),
+        );
         if !raw.is_null() {
             unsafe {
                 std::ptr::write(raw as *mut T, value);
             }
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
             return raw as *mut T;
         }
     }

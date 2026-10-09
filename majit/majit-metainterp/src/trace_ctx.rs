@@ -23,7 +23,7 @@ use crate::heapcache::{HeapCache, HeapCacheView, HeapCacheViewMut};
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use indexmap::IndexMap;
-use majit_ir::{DescrRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
 
@@ -783,10 +783,11 @@ pub struct TraceCtx {
     /// stale carrier leaking across bridges structurally impossible.
     pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
     /// resume.py consume_boxes parity: per-bank live register indices
-    /// of the bridge's guard resume frame, stashed by `start_bridge_tracing`
-    /// (which has the dispatch JitCode) so a JitDriver `setup_bridge_sym`
-    /// (a static trait method with no metainterp access) can map each
-    /// decoded frame value to its sym slot via `reg_idx - identity_base`.
+    /// of the bridge's root (section 0) guard resume frame, stashed by
+    /// `start_bridge_tracing` (which has the dispatch JitCode) so a
+    /// JitDriver `setup_bridge_sym` (a static trait method with no
+    /// metainterp access) can map each decoded frame value to its
+    /// sym slot via `reg_idx - identity_base`.
     pub(crate) bridge_reg_indices: Option<crate::resume::FrameLivenessRegIndices>,
     /// `resume.py` `VirtualCache`, shared by the split readers that
     /// upstream keeps on one `ResumeDataBoxReader`: `setup_bridge_sym`
@@ -796,8 +797,8 @@ pub struct TraceCtx {
     /// a second `NEW`.
     bridge_virtual_ops: Vec<Option<OpRef>>,
     /// `resume.py` `rebuild_from_resumedata` storage, parked so
-    /// `consume_boxes` can `getvirtual_ptr` after `start_bridge_tracing`
-    /// returns. `None` outside a bridge.
+    /// `consume_boxes` can `getvirtual_ptr` (`create_history` already
+    /// made tracing live). `None` outside a bridge.
     bridge_resume_data: Option<crate::jit_state::ResumeDataResult>,
     /// Whether the source guard descr for this bridge is a
     /// ResumeGuardExcDescr analog. Set by `start_bridge_tracing` from
@@ -2377,8 +2378,8 @@ impl TraceCtx {
         self.bridge_resume_data.as_ref()
     }
 
-    /// Park the guard's `ResumeDataResult` for the rebuild that runs
-    /// after `start_bridge_tracing` returns.
+    /// Park the guard's `ResumeDataResult` before
+    /// `rebuild_portal_framestack_from_resumedata` / `consume_boxes`.
     pub fn set_bridge_resume_data(&mut self, resume_data: crate::jit_state::ResumeDataResult) {
         self.bridge_resume_data = Some(resume_data);
     }
@@ -7872,6 +7873,26 @@ mod tests {
         // A genuine descriptor identity still supports forwarding.
         ctx.heapcache_getfield_now_known(obj, 1, value);
         assert_eq!(ctx.heapcache_getfield_cached(obj, 1), Some(value));
+    }
+
+    /// `pyjitpl.py do_residual_call` step 5 invalidates on CALL_MAY_FORCE,
+    /// the opcode executed in step 2, after CALL_ASSEMBLER is recorded.
+    /// `clear_caches_not_necessary` does not list CALL_MAY_FORCE and
+    /// `is_plain_call` excludes it, so `clear_caches_varargs` takes
+    /// `reset_keep_likely_virtuals` and a seeded GETFIELD (int) cache is gone.
+    /// `invalidate_caches_for_escaped` would keep an unescaped object's field,
+    /// which is the leftover that failed
+    /// `synth/frame_chain_survives_a_recursive_call_assembler`.
+    #[test]
+    fn call_assembler_invalidate_caches_varargs_drops_getfield_cache() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let obj = OpRef::input_arg_ref(0);
+        let field = 1u32;
+        let cached = ctx.const_int(0);
+        ctx.heapcache_getfield_now_known(obj, field, cached);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, field), Some(cached));
+        ctx.heapcache_invalidate_caches_varargs(OpCode::CallMayForceR, None, &[obj]);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, field), None);
     }
 
     /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream

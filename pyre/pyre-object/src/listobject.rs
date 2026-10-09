@@ -3560,14 +3560,16 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 ///
 /// Supports negative indexing. Returns None if out of bounds.
 ///
-/// The stripe acquire and its release both finish inside this call.
-/// `w_list_getitem_inner` is the lock-free body; `getitem_list` calls it
-/// while `gil_ready` is still 0. The locked iterator arm is a separate
-/// opaque residual so a guard there cannot keep the stripe.
+/// Same wrapper/inner split as `w_list_setitem`: the getitem fold descends
+/// the lock-free body. A `w_list_lock` pair inside that body declines the
+/// sub-walk, and a `dont_look_inside` wrapper would hide the inner graph
+/// from `grab_initial_jitcodes`. The stripe acquire and its release both
+/// finish inside this call. `getitem_list` calls the inner while `gil_ready`
+/// is still 0. The locked iterator arm (`list_iter_getitem_locked`) stays a
+/// separate opaque residual so a guard there cannot keep the stripe.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     // The getitem fold descends the lock-free body by name.
     let _roots = crate::gc_roots::push_roots();
@@ -3599,6 +3601,10 @@ fn ll_getitem_index(index: i64, length: i64) -> Option<usize> {
     Some(index_u as usize)
 }
 
+/// `#[inline(never)]` keeps a unique Charon leaf so
+/// `list_getitem_jitcode()` resolves `w_list_getitem_inner` the way
+/// `list_setitem_jitcode()` resolves `w_list_setitem_inner`.
+#[inline(never)]
 pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {

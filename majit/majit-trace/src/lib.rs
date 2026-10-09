@@ -6,7 +6,6 @@
 /// - Warm state management (interpreter → tracing → compiled)
 ///
 /// Reference: rpython/jit/metainterp/pyjitpl.py, warmstate.py, counter.py
-pub mod counter;
 #[expect(
     clippy::too_many_arguments,
     reason = "heap-cache transfer functions retain RPython's explicit operation operands and descriptor state so the port remains structurally auditable against heapcache.py"

@@ -107,6 +107,16 @@ fn pyre_object_gc_alloc_young_nonmoving_trampoline(type_id: u32, size: usize) ->
     majit_gc::alloc_young_nonmoving_typed(type_id, size).0 as *mut u8
 }
 
+/// Trampoline for young non-moving host-side allocations that must not
+/// collect — the `#[pyre_class]` constructors and `w_type_new`, which fill
+/// the block from words held on the Rust stack.
+fn pyre_object_gc_alloc_young_nonmoving_no_collect_trampoline(
+    type_id: u32,
+    size: usize,
+) -> *mut u8 {
+    majit_gc::alloc_young_nonmoving_typed_no_collect(type_id, size).0 as *mut u8
+}
+
 /// Trampoline for *collecting* nursery host-side allocations — routes
 /// pyre-object's collecting-allocation hook to the backend's collecting nursery
 /// allocator (minor-on-full). Only the elidable bigint payload helpers use it,
@@ -5607,6 +5617,9 @@ fn install_pyre_object_hooks() {
     pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(
         pyre_object_gc_alloc_young_nonmoving_trampoline,
     );
+    pyre_object::gc_hook::register_gc_alloc_young_nonmoving_no_collect_hook(
+        pyre_object_gc_alloc_young_nonmoving_no_collect_trampoline,
+    );
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
         pyre_object_gc_alloc_collecting_trampoline,
     );
@@ -5975,6 +5988,17 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
+    // rlib/jit.py `set_param(driver, 'threshold', n)` on that driver's
+    // `jitdriver_sd.warmstate`; `PYRE_JIT` below is `set_param(None, ...)`.
+    let extra_threshold = i64::from(jd1_trace_threshold());
+    for jd_no in [
+        pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
+        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
+    ] {
+        d.meta_interp_mut()
+            .warm_state_for_driver(jd_no)
+            .set_param("threshold", extra_threshold);
+    }
     // `finish_setup` installs opcode ids and `all_liveness` before a trace
     // clones `staticdata`. That install waits for the first trace
     // (`install_build_time_liveness_before_trace`). Doing it here decodes
@@ -6068,8 +6092,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     if let Some(text) = env_var("PYRE_JIT") {
         let text = text.trim();
         if !text.is_empty() && text != "0" {
-            let ws = d.meta_interp_mut().warm_state_mut();
-            let _ = apply_jit_param_string(ws, text);
+            let _ = d.meta_interp_mut().set_user_param_all_drivers(text);
         }
     }
     // Publish the wasm CA deopt-helper's `__indirect_function_table` slot so
@@ -7239,7 +7262,7 @@ pub fn get_jitcell_at_key(
     w_bool_from(key.is_some_and(|green_key| {
         driver
             .meta_interp_mut()
-            .warm_state_mut()
+            .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
             .get_cell_for_key(&green_key)
             .is_some()
     }))
@@ -7263,7 +7286,7 @@ pub fn dont_trace_here(
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
-        .warm_state_mut()
+        .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
         .disable_noninlinable_function_for_key(&green_key);
 }
 
@@ -7285,7 +7308,7 @@ pub fn mark_as_being_traced(
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
-        .warm_state_mut()
+        .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
         .mark_as_being_traced_for_key(&green_key);
 }
 
@@ -7312,7 +7335,7 @@ pub fn trace_next_iteration(
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
-        .warm_state_mut()
+        .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
         .trace_next_iteration(green_key);
 }
 
@@ -7323,7 +7346,7 @@ pub fn trace_next_iteration_hash(_space: pyre_object::PyObjectRef, green_key_has
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
-        .warm_state_mut()
+        .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
         .trace_next_iteration(green_key_hash as u64);
 }
 
@@ -7505,10 +7528,7 @@ pub fn eval_with_jit(
 /// from `ExecutionContext::settrace` into the live `WarmState`.
 fn set_jit_param_via_warmstate(name: &str, value: i64) {
     let (driver, _) = driver_pair();
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .set_param(name, value);
+    driver.meta_interp_mut().set_param_all_drivers(name, value);
 }
 
 /// `pypyjit.set_param(str)` seam: apply a whole parameter string
@@ -7517,8 +7537,7 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
 /// with the `PYRE_JIT` env lever regardless of backend.
 fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
     let (driver, _) = driver_pair();
-    let ws = driver.meta_interp_mut().warm_state_mut();
-    apply_jit_param_string(ws, text)
+    driver.meta_interp_mut().set_user_param_all_drivers(text)
 }
 
 /// `interp_jit.py` keyword `enable_opts`. `set_param_enable_opts` receives
@@ -7527,8 +7546,7 @@ fn set_jit_param_enable_opts_via_warmstate(value: &str) {
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
-        .warm_state_mut()
-        .set_param_enable_opts(value);
+        .set_param_enable_opts_all_drivers(value);
 }
 
 /// Gate for jd1 (`unpackiterable_driver`): the merge-point hook drives a
@@ -7878,17 +7896,9 @@ fn jd1_enter_enabled() -> bool {
     *E.get_or_init(|| env_var_os("PYRE_JD1_NO_ENTER").is_none())
 }
 
-thread_local! {
-    /// Scaffold jd1 warmup counter keyed by the iterator-type green key.
-    /// `unpackiterable_driver` in PyPy is gated by the per-driver `JitCounter`;
-    /// pyre's single `WarmState` is jd0-owned, so jd1 keeps its own tick until
-    /// it gets a dedicated warmstate. Fires once an iterator type's unpack loop
-    /// is hot.
-    static JD1_LOOP_COUNTER: std::cell::RefCell<std::collections::HashMap<u64, u32>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Merge-point crossings for one iterator type before jd1 drives a trace.
+/// `threshold` of `unpackiterable_driver` and `generatorentry_driver`,
+/// applied at registration through `set_param` on each
+/// `jitdriver_sd.warmstate` (rlib/jit.py `set_param(driver, 'threshold', n)`).
 /// Above trivial fixed-size unpacks (`a, b = pair`) so only genuinely long
 /// drains warm it, matching the hot-loop intent of `unpackiterable_driver`.
 const JD1_TRACE_THRESHOLD: u32 = 100;
@@ -7902,21 +7912,6 @@ fn jd1_trace_threshold() -> u32 {
             .and_then(|s| s.trim().parse().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(JD1_TRACE_THRESHOLD)
-    })
-}
-
-fn jd1_counter_tick(green_key: u64) -> bool {
-    let threshold = jd1_trace_threshold();
-    JD1_LOOP_COUNTER.with(|c| {
-        let mut map = c.borrow_mut();
-        let n = map.entry(green_key).or_insert(0);
-        *n += 1;
-        if *n >= threshold {
-            *n = 0;
-            true
-        } else {
-            false
-        }
     })
 }
 
@@ -7964,7 +7959,26 @@ fn unpack_merge_point_jit(
     // (`pc = 0`, novable — no bytecode offset). The jd1 driver has no
     // `is_being_profiled` green, so its pypyjit-shaped key uses false.
     let green_key = make_green_key(greenkey as *const (), 0, false);
-    if !jd1_counter_tick(green_key) {
+    // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
+    // `unpackiterable_driver`'s `jitdriver_sd.warmstate`: `lookup_chain`,
+    // then `jitcounter.tick`; `bound_reached` / `EnterJitAssembler` are
+    // `drive_unpack_iterable_trace`.
+    let hot = {
+        let (driver, _) = driver_pair();
+        driver
+            .meta_interp_mut()
+            .maybe_compile_and_run_step_on_driver(
+                pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
+                green_key,
+                (0, 0),
+            )
+            .0
+    };
+    if !matches!(
+        hot,
+        majit_metainterp::warmstate::HotResult::StartTracing
+            | majit_metainterp::warmstate::HotResult::RunCompiled
+    ) {
         return;
     }
     if std::env::var_os("PYRE_JD1_DEBUG").is_some() {
@@ -8022,14 +8036,26 @@ fn genentry_merge_point_jit(
     // the loop (`warmstate.py JitCell`); jd0's `(pycode, 0, false)` cell
     // is a different key. The red frame's `last_instr` distinguishes yields.
     let green_key = genentry_resolved_cell_key(pycode);
-    // `JitCell.is_compiled` excludes the `compile_tmp_callback` token.
-    // A compiled cell enters on every call. A temporary cell keeps
-    // counting (`maybe_compile_and_run`).
-    let compiled = {
+    // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
+    // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
+    // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
+    // counting, and the tick is on the one runner `jitcounter`.
+    let hot = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().jitcell_is_compiled(green_key)
+        driver
+            .meta_interp_mut()
+            .maybe_compile_and_run_step_on_driver(
+                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
+                green_key,
+                (0, 0),
+            )
+            .0
     };
-    if !compiled && !genentry_counter_tick(green_key) {
+    if !matches!(
+        hot,
+        majit_metainterp::warmstate::HotResult::StartTracing
+            | majit_metainterp::warmstate::HotResult::RunCompiled
+    ) {
         return None;
     }
     if majit_metainterp::majit_log_enabled() {
@@ -8045,26 +8071,14 @@ fn genentry_merge_point_jit(
     driven
 }
 
-/// Cell key for `jitdrivers_sd[2]`. Resolved on the process warmstate,
-/// the table `jitcell_is_compiled` / `force_start_tracing` /
-/// `run_compiled_detailed_with_values` read (`warmstate.py JitCell`).
+/// Cell key for `jitdrivers_sd[2]`. Resolved on that driver's
+/// `WarmEnterState` (`warmstate.py JitCell`).
 fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
-        driver.meta_interp_mut().warm_state_mut(),
+        &driver.meta_interp_mut().warm_state_for_driver(2),
         pycode,
     )
-}
-
-/// Crossings of one jd2 cell before `generatorentry` drives a trace.
-/// `warmstate.py` `JitCounter` on `jd.warmstate`: slot 2 has its own
-/// timetable (`warm_state_for_driver`), so alternating generators do not
-/// reset each other and jd0's back-edge counter is left alone.
-fn genentry_counter_tick(green_key: u64) -> bool {
-    let (driver, _) = driver_pair();
-    let warm = driver.meta_interp_mut().warm_state_for_driver(2);
-    let increment = warm.counter.compute_threshold(jd1_trace_threshold());
-    warm.counter.tick(green_key, increment)
 }
 
 /// Enter the `generatorentry` portal. The registered main jitcode is
@@ -8409,7 +8423,7 @@ fn run_compiled_generatorentry(
         let extracted = {
             let (driver, _) = driver_pair();
             let meta = driver.meta_interp_mut();
-            meta.run_compiled_detailed_with_values(green_key, &live_values)
+            meta.run_compiled_detailed_with_values_on_driver(2, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
@@ -8714,7 +8728,7 @@ fn drive_unpack_iterable_trace(
                 exit_layout,
                 guard_exc,
             )) = meta
-                .run_compiled_detailed_with_values(green_key, &live_values)
+                .run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
@@ -10490,6 +10504,10 @@ fn deliver_exit_frame_exception(
         report_exit_frame_delivery("deliver", frame_root.frame(), refused);
     }
     if refused {
+        // `pyopcode.py handle_operation_error` marks the frame finished on
+        // the no-handler propagation too (`frame_finished_execution = True`
+        // before `raise operr`), which `frame.clear()` requires.
+        frame_root.frame().set_frame_finished_execution(true);
         return Err(err);
     }
     if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
@@ -10991,6 +11009,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                             report_exit_frame_delivery("eval_loop", unsafe { &*f }, refused);
                         }
                         if refused {
+                            // `handle_operation_error`'s no-handler path:
+                            // `frame_finished_execution = True` before the
+                            // raise propagates.
+                            unsafe { &mut *f }.set_frame_finished_execution(true);
                             return Err(err);
                         }
                         if pyre_interpreter::eval::handle_exception(
@@ -11247,7 +11269,9 @@ fn maybe_compile_and_run(
         let runnable = driver.has_runnable_compiled_loop(green_key);
         let meta = driver.get_compiled_meta(green_key).is_some();
         let last = driver.last_compiled_key();
-        let ws = driver.meta_interp_mut().warm_state_mut();
+        let ws = driver
+            .meta_interp_mut()
+            .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX);
         let state = ws.get_cell_state(green_key);
         let (present, seen_token, has_token) = match ws.get_cell(green_key) {
             Some(cell) => (
@@ -11664,6 +11688,13 @@ fn handle_fail(
 enum HandleFailDispatch {
     ContinueRunningNormally,
     Done(PyResult),
+    /// `jitexc.py ExitFrameWithExceptionRef` raised by the bridge walk
+    /// (`pyjitpl.py interpret` from the post-walk state).  `warmspot.py
+    /// handle_jitexception` re-raises it into the interpreter loop, where
+    /// `pyopcode.py handle_operation_error` consults this frame's exception
+    /// table and marks the frame finished before it propagates; the doors
+    /// deliver it the way the compiled-run exit is delivered.
+    ExitFrameWithException(PyError),
     Fallthrough,
 }
 
@@ -11716,7 +11747,9 @@ fn dispatch_handle_fail(
     ) {
         (HandleFailOutcome::BridgeCompiled, _) => compiled(),
         (HandleFailOutcome::BridgeFinished(v), _) => HandleFailDispatch::Done(Ok(v)),
-        (HandleFailOutcome::BridgeRaised(err), _) => HandleFailDispatch::Done(Err(err)),
+        (HandleFailOutcome::BridgeRaised(err), _) => {
+            HandleFailDispatch::ExitFrameWithException(err)
+        }
         (HandleFailOutcome::ResumeInBlackhole, savedata) => {
             // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
             let bh_result = resume_in_blackhole_from_exit_layout(
@@ -12243,6 +12276,9 @@ fn execute_assembler(
                     Some(LoopResult::ContinueRunningNormally)
                 }
                 HandleFailDispatch::Done(r) => Some(LoopResult::Done(r)),
+                HandleFailDispatch::ExitFrameWithException(err) => {
+                    Some(LoopResult::ExitFrameWithException(err))
+                }
                 HandleFailDispatch::Fallthrough => None,
             }
         }
@@ -12505,10 +12541,7 @@ fn compile_and_run_once(
     if tracing_finished {
         // warmstate.py `finally`: the starting cell owns JC_TRACING
         // even when a cross-loop cut attaches the token to another key.
-        driver
-            .meta_interp_mut()
-            .warm_state_mut()
-            .clear_tracing_flag(starting_tracing_key);
+        driver.abort_entry_tracing(starting_tracing_key);
         // compile.py record_loop_or_bridge: register every compiled
         // loop/bridge's quasi_immutable_deps against its token. The
         // `!had_compiled` extra gate dropped deps on a replace compile,
@@ -12629,16 +12662,9 @@ fn bound_reached(
             locals,
         );
     }
-    // warmstate.py:429: jitcounter.decay_all_counters()
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .counter
-        .decay_all_counters();
-    // warmstate.py:430
-    if stack_almost_full() {
-        return None;
-    }
+    // warmstate.py bound_reached: `jitcounter.decay_all_counters()` and
+    // then `rstack.stack_almost_full()` run inside `MetaInterp::bound_reached`
+    // (compile_and_run_once → JitDriver::bound_reached), in that order.
     // warmstate.py:437-444: MetaInterp.compile_and_run_once
     frame_root
         .frame()
@@ -12730,6 +12756,9 @@ fn bound_reached(
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 HandleFailDispatch::Done(r) => return Some(LoopResult::Done(r)),
+                HandleFailDispatch::ExitFrameWithException(err) => {
+                    return Some(LoopResult::ExitFrameWithException(err));
+                }
                 HandleFailDispatch::Fallthrough => {}
             }
         } else {
@@ -13012,6 +13041,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 true,
             ) {
                 HandleFailDispatch::Done(r) => return Some(r),
+                HandleFailDispatch::ExitFrameWithException(err) => {
+                    return Some(deliver_exit_frame_exception(frame_root.frame(), err));
+                }
                 // Bridge compiled / blackhole CRN: ContinueRunningNormally
                 // re-enters compiled code via eval_loop_jit below.
                 HandleFailDispatch::ContinueRunningNormally | HandleFailDispatch::Fallthrough => {}
@@ -13046,7 +13078,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // fast path above already fired the counter for this entry, so go
     // straight to bound_reached without re-ticking.
     if majit_metainterp::majit_log_enabled() {
-        let function_threshold = driver.meta_interp().warm_state_ref().function_threshold();
+        let function_threshold = driver
+            .meta_interp()
+            .warm_state_ref_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
+            .expect("pypyjit warmstate")
+            .function_threshold();
         eprintln!(
             "[jit][func-entry] fired key={} arg0={:?} threshold={}",
             green_key,
@@ -13054,16 +13090,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             function_threshold,
         );
     }
-    // warmstate.py bound_reached parity:
+    // warmstate.py bound_reached:
     //   if not confirm_enter_jit(*args): return
     //   jitcounter.decay_all_counters()
     //   if rstack.stack_almost_full(): return
     //   metainterp.compile_and_run_once(jitdriver_sd, *args)
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .counter
-        .decay_all_counters();
+    driver.meta_interp_mut().decay_counters();
     if stack_almost_full() {
         return None;
     }
@@ -14274,6 +14306,32 @@ fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) ->
         .collect()
 }
 
+/// The objects the direct reader allocated for this guard's virtuals, by
+/// virtual number: the `all_virtuals` the recording reader that follows is
+/// constructed with (`BridgeVirtualCache::recording`).
+fn direct_virtual_objects(cache: &HashMap<usize, Value>) -> Vec<Option<majit_ir::GcRef>> {
+    let n = cache.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut slots = vec![None; n];
+    for (&vidx, value) in cache {
+        if let Value::Ref(gcref) = *value {
+            slots[vidx] = Some(gcref);
+        }
+    }
+    slots
+}
+
+/// What the direct reader of a guard failure decoded, for the bridge entry
+/// that follows it.
+pub(crate) struct DecodedGuardFailure {
+    #[allow(dead_code)]
+    pub typed: Vec<Value>,
+    pub resume_pc: usize,
+    pub num_resume_frames: usize,
+    pub coords: Vec<(usize, usize)>,
+    /// `ResumeDataDirectReader.virtuals_cache` objects by virtual number.
+    pub direct_virtuals: Vec<Option<majit_ir::GcRef>>,
+}
+
 /// Phase A: decode rd_numb + materialize virtuals + restore frame state.
 /// RPython: this corresponds to rebuild_from_resumedata (resume.py)
 /// which decodes the deadframe into typed values and writes them to the
@@ -14285,7 +14343,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>)> {
+) -> Option<DecodedGuardFailure> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -14387,6 +14445,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             &mut pending_virtuals_cache,
         )
     };
+    let direct_virtuals = direct_virtual_objects(&pending_virtuals_cache);
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -14478,7 +14537,13 @@ pub(crate) fn decode_and_restore_guard_failure(
             .iter()
             .map(|f| (f.code as usize, f.py_pc))
             .collect();
-        Some((typed, resume_pc, resumed_frames.len(), coords))
+        Some(DecodedGuardFailure {
+            typed,
+            resume_pc,
+            num_resume_frames: resumed_frames.len(),
+            coords,
+            direct_virtuals,
+        })
     } else {
         None
     }
@@ -15921,7 +15986,7 @@ mod tests {
             let (driver, _) = driver_pair();
             driver
                 .meta_interp_mut()
-                .warm_state_mut()
+                .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
                 .set_default_params();
             driver.set_param("threshold", 2);
             driver.set_param("function_threshold", 2);
@@ -15934,7 +15999,7 @@ mod tests {
             let (driver, _) = driver_pair();
             driver
                 .meta_interp_mut()
-                .warm_state_mut()
+                .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
                 .set_default_params();
             driver.set_param("threshold", JIT_THRESHOLD as i64);
         }

@@ -3,6 +3,7 @@
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
 # corpus=bdfb0846f5cebb63 platform=darwin
+# Attributed joins after w_list_getitem lost dont_look_inside so list_getitem_jitcode resolves w_list_getitem_inner: w_list_getitem and its _collections block_get caller (#2165).
 direct-skip (never reaches unported_category)	pyre_interpreter::module::_collections::<Impl>::__len__
 direct-skip (never reaches unported_category)	pyre_interpreter::module::_collections::check_index_under_guard
 direct-skip (never reaches unported_category)	pyre_object::listobject::range_list_length
@@ -49,6 +50,7 @@ two-phase-never-a-subject	majit_rlib::rtermios::tcflush
 two-phase-never-a-subject	majit_rlib::rtermios::tcsendbreak
 two-phase-never-a-subject	majit_rlib::rthread::threadlocalref_addr
 two-phase-never-a-subject	majit_rlib::rthread::tlfield_getraw_int
+two-phase-never-a-subject	module::_collections::block_get
 two-phase-never-a-subject	module::_csv::csv_error__spec_String_dab26f2fea8aa173
 two-phase-never-a-subject	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_1_d661696d4db4ef32
 two-phase-never-a-subject	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_432f9a978308aeed
@@ -2176,6 +2178,7 @@ two-phase-never-a-subject	pyre_object::listobject::switch_to_correct_strategy
 two-phase-never-a-subject	pyre_object::listobject::w_list_adopt_int_items
 two-phase-never-a-subject	pyre_object::listobject::w_list_append
 two-phase-never-a-subject	pyre_object::listobject::w_list_append_inner
+two-phase-never-a-subject	pyre_object::listobject::w_list_getitem
 two-phase-never-a-subject	pyre_object::listobject::w_list_getitem_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_len
 two-phase-never-a-subject	pyre_object::listobject::w_list_pop

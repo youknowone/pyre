@@ -1549,8 +1549,8 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// this being an infallible surface) once the key's hash started raising.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            // `gc_alloc_storage_box` is a stable allocation and never collects.
-            let new_storage = crate::gc_storage::gc_alloc_storage_box(
+            // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
+            let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
                 entries.clone(),
                 crate::dictmultiobject::object_dict_storage_gc_type_id(),
             );

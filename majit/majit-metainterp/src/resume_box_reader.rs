@@ -56,14 +56,24 @@ pub struct BridgeVirtualCache<'a> {
     /// for and which is sound only because the direct reader has already run
     /// for this guard: applying again would allocate a SECOND set of virtuals
     /// and record an identity the interpreter does not hold.
+    ///
+    /// The reader is built once in `start_bridge_tracing` and lives through
+    /// `_prepare`, `consume_boxes` and `setup_bridge_sym`, so the allocator
+    /// borrow spans the whole `rebuild_from_resumedata`.
     executing: Option<&'a dyn crate::resume::BlackholeAllocator>,
+    /// `_prepare_pendingfields` writes this reader applied to a ref array:
+    /// the target box, the item index and the value box. Upstream needs no
+    /// record because `consume_boxes` hands frames their boxes; a consumer
+    /// that rediscovers a frame's locals through that same array reuses the
+    /// box the write just produced instead of a fresh load.
+    pending_ref_array_writes: Vec<PendingRefArrayWrite>,
     /// The guard's fail values, which `resume.py decode_ref` reads a TAGBOX
     /// operand out of (`cpu.get_ref_value(self.deadframe, num)`). Empty for
     /// the recording-only reader, which never needs a concrete.
     ///
     /// Int and float failargs only — a ref failarg is read out of
     /// [`Self::fail_ref_roots`] instead.
-    fail_values: &'a [i64],
+    fail_values: Vec<i64>,
     /// The ref-typed fail values, indexed as `fail_values` is and registered
     /// as resume-construction GC roots.
     ///
@@ -105,6 +115,15 @@ impl Drop for BridgeVirtualCache<'_> {
     }
 }
 
+/// One `SETARRAYITEM_GC` of a ref item that `_prepare_pendingfields`
+/// applied, kept on the reader (see `BridgeVirtualCache`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingRefArrayWrite {
+    pub target: OpRef,
+    pub item_index: usize,
+    pub value: OpRef,
+}
+
 impl<'a> BridgeVirtualCache<'a> {
     /// The recording-only reader, for a bridge entered after a direct reader
     /// has already applied this guard's writes.
@@ -118,6 +137,27 @@ impl<'a> BridgeVirtualCache<'a> {
             bool,
         ) -> majit_ir::DescrRef,
     ) -> Self {
+        Self::recording(size, mint_raw_array_descr, &[])
+    }
+
+    /// The recording-only reader seeded with the objects the direct reader
+    /// that preceded it allocated, indexed by virtual number — the
+    /// `all_virtuals` a `ResumeDataDirectReader` is constructed with
+    /// (`compile.py` `ResumeGuardForcedDescr.handle_fail`), carried here
+    /// because this reader records what that one applied. A
+    /// `getvirtual_ptr` hit then returns that object's box rather than
+    /// allocating a second one.
+    pub fn recording(
+        size: usize,
+        mint_raw_array_descr: fn(
+            usize,
+            usize,
+            Option<usize>,
+            majit_ir::Type,
+            bool,
+        ) -> majit_ir::DescrRef,
+        all_virtuals: &[Option<majit_ir::GcRef>],
+    ) -> Self {
         // Recording-only still allocates concrete shadows
         // (`materialize_concrete_virtual_ptr`). resume.py keeps each virtual
         // in `virtuals_cache` before filling its fields, because the next
@@ -130,7 +170,8 @@ impl<'a> BridgeVirtualCache<'a> {
             concrete_int_cache: vec![None; size],
             mint_raw_array_descr,
             executing: None,
-            fail_values: &[],
+            pending_ref_array_writes: Vec::new(),
+            fail_values: Vec::new(),
             fail_ref_roots: Vec::new(),
             concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
@@ -138,6 +179,11 @@ impl<'a> BridgeVirtualCache<'a> {
         if size > 0 {
             unsafe {
                 majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
+        }
+        for (vidx, slot) in all_virtuals.iter().enumerate() {
+            if let Some(gcref) = *slot {
+                cache.set_concrete_ptr(vidx, gcref);
             }
         }
         cache
@@ -155,7 +201,7 @@ impl<'a> BridgeVirtualCache<'a> {
             bool,
         ) -> majit_ir::DescrRef,
         allocator: &'a dyn crate::resume::BlackholeAllocator,
-        fail_values: &'a [i64],
+        fail_values: &[i64],
         fail_types: &[majit_ir::Type],
     ) -> Self {
         // Built field by field rather than from `Self::new`: the cache
@@ -168,7 +214,8 @@ impl<'a> BridgeVirtualCache<'a> {
             concrete_int_cache: vec![None; size],
             mint_raw_array_descr,
             executing: Some(allocator),
-            fail_values,
+            pending_ref_array_writes: Vec::new(),
+            fail_values: fail_values.to_vec(),
             fail_ref_roots: fail_values
                 .iter()
                 .enumerate()
@@ -224,9 +271,19 @@ impl<'a> BridgeVirtualCache<'a> {
         self.executing
     }
 
+    /// `_prepare_pendingfields` applied this ref-array write.
+    pub fn push_pending_ref_array_write(&mut self, write: PendingRefArrayWrite) {
+        self.pending_ref_array_writes.push(write);
+    }
+
+    /// The ref-array writes `_prepare_pendingfields` applied, in order.
+    pub fn pending_ref_array_writes(&self) -> &[PendingRefArrayWrite] {
+        &self.pending_ref_array_writes
+    }
+
     /// The guard's fail values, for resolving a TAGBOX operand's concrete.
-    fn fail_values(&self) -> &'a [i64] {
-        self.fail_values
+    fn fail_values(&self) -> &[i64] {
+        &self.fail_values
     }
 
     /// The address a ref failarg currently lives at, read back through the
@@ -279,6 +336,10 @@ impl<'a> BridgeVirtualCache<'a> {
         if i < self.concrete_ptr_cache.len() {
             self.concrete_ptr_cache[i] = Some(v);
         }
+        // `resume.py virtuals_cache` is the object the collector traces.
+        // Seed `concrete_roots` so `get_concrete_ptr` re-reads the
+        // forwarded address after an allocating `_prepare_pendingfields`
+        // / `consume_boxes` step, rather than the unrooted copy.
         self.set_concrete_root(i, v.0 as i64);
     }
 
@@ -577,13 +638,16 @@ pub fn materialize_bridge_virtual(
     // (ptr and int banks). This bridge helper is still OpRef-typed, so it
     // probes both banks before allocating.
     if let Some(cached) = cache.get_any(vidx) {
-        // The local cache already holds the box. Publish it so a later
-        // reader (`consume_boxes` after `setup_bridge_sym`) stores the
-        // same OpRef instead of allocating again.
+        // resume.py `getvirtual_ptr`: cache hit returns the box. Publish
+        // it so a later reader (`consume_boxes` after `_prepare`) stores
+        // the same OpRef. Do not allocate or setfields again.
         ctx.remember_bridge_virtual_op(vidx, cached);
         return cached;
     }
     if let Some(cached) = ctx.bridge_virtual_op(vidx) {
+        // Same `virtuals_cache` the first reader filled. `allocate()`
+        // already ran setfields; a second apply would SETFIELD a second
+        // `wrappeditems` array against the live object.
         cache.recall_op(vidx, cached);
         return cached;
     }
@@ -1747,6 +1811,25 @@ mod tests {
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1080)));
         assert_eq!(cache.get_concrete_ptr(1), Some(majit_ir::GcRef(0x2080)));
         assert_eq!(cache.get_concrete_int(0), None);
+    }
+
+    /// `resume.py virtuals_cache` is a field on the reader. A DirectReader
+    /// object copied into the recording cache is re-read from `concrete_roots`
+    /// after a collection, not from the unrooted `concrete_ptr_cache` copy.
+    #[test]
+    fn seed_direct_virtuals_rereads_concrete_roots_after_collect() {
+        let mut cache = BridgeVirtualCache::recording(
+            1,
+            default_bridge_array_descr,
+            &[Some(majit_ir::GcRef(0x1000))],
+        );
+        assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1000)));
+        majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+            if root.0 == 0x1000 {
+                root.0 = 0x2000;
+            }
+        });
+        assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x2000)));
     }
 
     /// The funnel folds through the executor row, so the concrete this helper

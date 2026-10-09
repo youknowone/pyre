@@ -3664,6 +3664,26 @@ fn bridge_bail_stage() -> u32 {
     })
 }
 
+/// Frontend compiled-loop metadata for the loop a failing guard belongs to.
+///
+/// `pyjitpl.py handle_guard_failure` / `compile.py _trace_and_compile_from_bridge`
+/// read `rd_loop_token.outermost_jitdriver_sd`. `get_compiled_meta` keys
+/// `compiled_loops` by leftover `active_jitdriver_sd`.
+pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
+    meta_interp: &majit_metainterp::MetaInterp<M>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    green_key: u64,
+) -> Option<std::sync::Arc<M>> {
+    let jd_no = descr_arc
+        .as_fail_descr()
+        .and_then(majit_backend::descr_owning_jct)
+        .and_then(|token| token.outermost_jitdriver_index)
+        .unwrap_or(0);
+    meta_interp
+        .get_compiled_meta_on_driver(jd_no, green_key)
+        .cloned()
+}
+
 /// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -3802,14 +3822,15 @@ pub fn trace_and_compile_from_bridge(
         info.clone()
     };
 
-    // pyjitpl.py handle_guard_failure parity:
-    // RPython creates a fresh MetaInterp and calls
-    // initialize_state_from_guard_failure(resumedescr, deadframe)
+    // pyjitpl.py handle_guard_failure / compile.py _trace_and_compile_from_bridge:
+    // frontend meta is the compiled_loops row on
+    // `rd_loop_token.outermost_jitdriver_sd`, not leftover `active_jitdriver_sd`.
+    // RPython then calls initialize_state_from_guard_failure(resumedescr, deadframe)
     // which internally calls rebuild_from_resumedata (resume.py).
     // This restores the complete frame stack INSIDE the bridge function.
     let meta = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().get_compiled_meta(green_key).cloned()
+        compiled_meta_for_bridge_source(driver.meta_interp(), descr_arc, green_key)
     };
     let mut jit_state_local = build_jit_state(frame, &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
@@ -3829,7 +3850,14 @@ pub fn trace_and_compile_from_bridge(
     if bridge_bail_stage() == 2 {
         return BridgeResolution::ResumeBlackhole;
     }
-    let Some((_, resume_pc, num_resume_frames, resume_coords)) = decoded_resume else {
+    let Some(crate::eval::DecodedGuardFailure {
+        resume_pc,
+        num_resume_frames,
+        coords: resume_coords,
+        direct_virtuals,
+        ..
+    }) = decoded_resume
+    else {
         return BridgeResolution::ResumeBlackhole;
     };
     let is_multiframe_resume = num_resume_frames > 1;
@@ -3890,8 +3918,10 @@ pub fn trace_and_compile_from_bridge(
             // `decode_and_restore_guard_failure` has already walked this
             // guard's resume data applying every write — `replay_pending_fields`
             // for the deferred stores, `ResumeVableMode::GuardFailureSync` for
-            // the virtualizable — so the replay owes recording only.
+            // the virtualizable — so the replay owes recording only, seeded
+            // with the objects that reader allocated.
             false,
+            &direct_virtuals,
         )
     };
     if !started {
@@ -3903,63 +3933,9 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
-    // resume.py `rebuild_from_resumedata`: `newframe(jitcodes[jitcode_pos])`
-    // per section, then `setup_resume_at_op` and `consume_boxes`. The portal
-    // jitcode is only the stand-in when a section has no registered jitcode.
-    if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
-        // resume.py `rebuild_from_resumedata` reads one section at a time:
-        // `newframe`, `setup_resume_at_op(pc)`, then `consume_boxes`.
-        // Outermost first. Clone the sections before the meta borrow.
-        let resume_frames = {
-            let (driver, _) = crate::eval::driver_pair();
-            driver
-                .resume_data_result
-                .as_ref()
-                .map(|result| result.frames.clone())
-                .unwrap_or_default()
-        };
-        // `frame_value_count_at` materializes `jitcodes[jitcode_pos]` before
-        // it counts the section (`resume.py` `staticdata.jitcodes`). A
-        // skeleton at that index makes `read_frame_liveness_reg_indices`
-        // return empty banks, so `consume_boxes` sees a length mismatch.
-        let materialized: Vec<Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>>> =
-            resume_frames
-                .iter()
-                .map(|section| {
-                    usize::try_from(section.jitcode_index)
-                        .ok()
-                        .and_then(|index| {
-                            pyre_jit_trace::state::ensure_build_time_jitcode_at(index)
-                                .map(|payload| std::sync::Arc::clone(&payload.jitcode))
-                        })
-                })
-                .collect();
-        // `resume.py` `rebuild_from_resumedata` reads
-        // `metainterp.staticdata` for both the jitcode and `liveness_info`.
-        // The driver's lock is the one `intern_liveness` publishes
-        // (`adopt_published_liveness`), so an empty buffer selects it.
-        // `materialized` is still required: runtime Python bodies are not
-        // seated in the driver's `jitcodes` vector.
-        let (driver, _) = crate::eval::driver_pair();
-        let consumed = driver.rebuild_portal_framestack_from_resumedata(
-            portal,
-            &resume_frames,
-            raw_values,
-            &exit_layout.exit_types,
-            &materialized,
-            &[],
-            0,
-        );
-        if !consumed {
-            // `resume.py consume_boxes` always consumes the section. A
-            // liveness/section length mismatch does not build the bridge;
-            // the same blackhole fallback as the other resume errors.
-            if driver.is_tracing() {
-                driver.meta_interp_mut().abort_trace(false);
-            }
-            return BridgeResolution::ResumeBlackhole;
-        }
-    }
+    // resume.py `rebuild_from_resumedata` ran once, inside
+    // `start_bridge_tracing` (`rebuild_state_after_failure`); the portal's
+    // `jd.mainjitcode` seats the frames (`call.py grab_initial_jitcodes`).
     // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`
     // once, after `rebuild_from_resumedata`. The same call covers the path
     // with no portal jitcode: there is no framestack to rebuild, and the

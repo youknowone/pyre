@@ -1867,7 +1867,11 @@ fn expand_pyre_class(
                             ::pyre_object::pyobject::get_instantiate(&#pytype_static),
                         )
                     {
-                        let obj = Self::allocate_stable(payload);
+                        // `malloc_fixedsize`: born young (see `allocate`), so a
+                        // `super(w_type, w_type)` built for `__init_subclass__`
+                        // dies with its class instead of pinning it to the
+                        // next major from the remembered set.
+                        let obj = Self::allocate(payload);
                         // objspace.py `allocate_instance`: hasuserdel types
                         // enqueue the fresh instance after the malloc.
                         ::pyre_object::gc_hook::maybe_register_finalizer(obj);
@@ -1880,7 +1884,7 @@ fn expand_pyre_class(
                         ::pyre_object::lltype::TypeIdCell::UNASSIGNED => 0,
                         id => id,
                     };
-                    let raw = ::pyre_object::gc_hook::try_gc_alloc_stable_raw(
+                    let raw = ::pyre_object::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
                         type_id,
                         ::std::mem::size_of::<#user_struct_name>(),
                     );
@@ -2018,20 +2022,25 @@ fn expand_pyre_class(
                 }
             }
 
-            /// Allocate a fresh instance via `lltype::malloc_typed_stable`,
-            /// stamping the PyObject header so the collector and dispatcher
-            /// can identify it. `payload` carries the user-defined fields;
-            /// the `ob` header is filled in by this fn.
+            /// Allocate a fresh instance via
+            /// `lltype::malloc_typed_young_nonmoving`, stamping the PyObject
+            /// header so the collector and dispatcher can identify it.
+            /// `payload` carries the user-defined fields; the `ob` header is
+            /// filled in by this fn.
             ///
-            /// PyPy's translated `gct_fv_gc_malloc` may use the nursery because
+            /// PyPy's translated `gct_fv_gc_malloc` uses the nursery because
             /// the framework GC transform roots every live GC pointer around a
             /// collecting operation.  Pyre's Rust interpreter has not yet
             /// completed that transform for arbitrary Rust locals, so a
             /// `#[pyre_class]` value can outlive this call in an unrewritable
             /// raw local (a range iterator held by a compiled loop is the
-            /// smallest example).  Keep these payloads collector-owned but
-            /// non-moving until that transform exists; the old host allocation
-            /// was not collector-owned at all and leaked permanently.
+            /// smallest example).  Keep these payloads non-moving until that
+            /// transform exists — `external_malloc(..., alloc_young=True)`,
+            /// so the block is still young and the first minor collection
+            /// that does not reach it frees it, as `malloc_fixedsize` would.
+            /// A birth in the old generation instead kept every such object,
+            /// and everything it pointed at, alive until the next major: a
+            /// `copy_for_type` descriptor held its class that long.
             #[allow(dead_code)]
             pub fn allocate(payload: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();
@@ -2042,7 +2051,7 @@ fn expand_pyre_class(
                     },
                     ..payload
                 };
-                ::pyre_object::lltype::malloc_typed_stable(full) as ::pyre_object::PyObjectRef
+                ::pyre_object::lltype::malloc_typed_young_nonmoving(full) as ::pyre_object::PyObjectRef
             }
 
             /// Stable-address variant of [`Self::allocate`]: allocates via

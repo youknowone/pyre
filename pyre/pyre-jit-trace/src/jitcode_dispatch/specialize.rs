@@ -8905,8 +8905,9 @@ fn int_subclass_new_argument(arg: pyre_object::PyObjectRef) -> Option<i64> {
 /// pair: surplus arguments are accepted once `__new__` is not object's. The
 /// trace is `NewWithVtable` of `W_IntObjectUser`, the user-layout `intval`,
 /// then `w_class` / terminator `map` / empty `storage`. The argument is an
-/// exact machine int with its `w_class` pinned, because `builtin_int`
-/// dispatches `__int__` / `__index__` on a subclass argument.
+/// exact machine int with its `w_class` pinned,
+/// because `builtin_int` dispatches `__int__` / `__index__` on a subclass
+/// argument.
 pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,

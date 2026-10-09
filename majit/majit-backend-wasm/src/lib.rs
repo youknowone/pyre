@@ -1315,6 +1315,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
     majit_gc::set_active_alloc_young_nonmoving_typed(Some(wasm_alloc_young_nonmoving_typed));
+    majit_gc::set_active_alloc_young_nonmoving_typed_no_collect(Some(
+        wasm_alloc_young_nonmoving_typed_no_collect,
+    ));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     majit_gc::set_active_gc_shrink_array(Some(wasm_gc_shrink_array));
@@ -1878,6 +1881,13 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// `minor_collection_with_major_progress`).
 fn wasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
     with_wasm_active_gc_mut(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// [`wasm_alloc_young_nonmoving_typed`] without the collection in front of
+/// the birth (`GcAllocator::alloc_young_nonmoving_typed_no_collect`).
+fn wasm_alloc_young_nonmoving_typed_no_collect(type_id: u32, size: usize) -> GcRef {
+    with_wasm_active_gc_mut(|gc| gc.alloc_young_nonmoving_typed_no_collect(type_id, size))
+        .unwrap_or(GcRef(0))
 }
 
 /// Allocate the block a blackhole `bh_new*` descr describes, in the non-moving

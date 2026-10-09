@@ -2734,6 +2734,30 @@ mod tests {
         );
     }
 
+    /// `pyjitpl.py do_residual_call` step 5 uses `invalidate_caches_varargs`
+    /// on CALL_MAY_FORCE, which takes `reset_keep_likely_virtuals` and
+    /// drops an unescaped object's GETFIELD. `invalidate_caches_for_escaped`
+    /// would keep that cache.
+    #[test]
+    fn call_may_force_varargs_drops_unescaped_getfield() {
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
+        let unescaped_obj = OpRef::ref_op(1);
+        cache.new_object(unescaped_obj);
+        cache.getfield_now_known(unescaped_obj, 1, OpRef::ref_op(20), IDENTITY_ORACLE);
+        cache.invalidate_caches_varargs(
+            OpCode::CallMayForceR,
+            None,
+            &[unescaped_obj],
+            IDENTITY_ORACLE,
+            |_| None,
+        );
+        assert_eq!(
+            cache.getfield_cached(unescaped_obj, 1, IDENTITY_ORACLE),
+            None
+        );
+    }
+
     #[test]
     fn test_new_object() {
         let mut fx = Fixture::new();

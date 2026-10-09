@@ -212,11 +212,16 @@ where
     let bytes = entries_payload_bytes::<K, V>(n);
     let tid = <(K, V)>::entries_gc_type_id();
     if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, bytes);
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(tid, bytes);
         if !raw.is_null() {
             // pyre adaptation of `_ll_malloc_entries`: Rust hands out `&K` / `&V`
-            // into the array, so the block is allocated on the non-moving tier.
-            // `try_gc_alloc_stable_raw` zero-fills and never collects.
+            // into the array, so the block is allocated on the non-moving tier,
+            // young (`external_malloc(..., alloc_young=True)`) so that a dropped
+            // dict gives its array back on the next minor as the nursery
+            // `DICTENTRYARRAY` does.  The no-collect entry zero-fills and never
+            // collects; the barrier is for a refused young birth, which lands
+            // in the old generation and may be filled with young items before
+            // the next minor.
             let entries = raw as *mut GcEntries<K, V>;
             unsafe {
                 (*entries).length = n;

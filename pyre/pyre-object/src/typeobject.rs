@@ -557,17 +557,25 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(bases);
     let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
-    // `typeobject.py W_TypeObject` is `malloc_fixedsize` (young). pyre
-    // births the wrapper old-gen: `w_class` / `instantiate` / type caches
-    // hold raw type pointers the translator would rewrite as GCREFs, and
-    // an old instance whose `w_class` is a young type is not scanned on a
-    // minor unless the instance is in the remembered set. A nursery type
-    // that dies leaves those slots as recycled poison (`mro_w` reads
-    // `0xaaaaaaaaaaaaaaaa`). `try_gc_alloc_stable_raw` keeps the identity
-    // still, matching `w_type_alloc_builtin`'s non-moving contract for the
-    // same raw couriers. Young `bases` / name boxes still take the barrier
-    // below.
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
+    // `typeobject.py W_TypeObject` is `malloc_fixedsize`: born young, so
+    // the first minor collection that does not reach it frees it, and the
+    // weakref `add_subclass` recorded in each base is nulled by
+    // `invalidate_young_weakrefs` on that same minor. A type born old
+    // instead (`alloc_in_oldgen`) survives every minor, so a program that
+    // builds and drops classes grows every base's `weak_subclasses` until
+    // the next major, and `add_subclass`'s linear scan for a dead slot
+    // grows with it. The block is `external_malloc(..., alloc_young=True)`
+    // rather than a nursery bump because `w_class` / `instantiate` / type
+    // caches hold raw type pointers the translator would rewrite as GCREFs,
+    // so the address has to stay put, matching `w_type_alloc_builtin`'s
+    // non-moving contract for the same raw couriers. An old instance whose
+    // `w_class` is this young type reaches it through the remembered set:
+    // `alloc_instance_object` and `descr_set___class__` take the barrier on
+    // the store. Young `bases` / name boxes still take the barrier below.
+    let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+        W_TYPE_GC_TYPE_ID,
+        W_TYPE_OBJECT_SIZE,
+    );
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
     // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
@@ -581,11 +589,13 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
             crate::lltype::malloc_raw(name_value),
         )
     } else {
-        let name =
-            crate::gc_storage::gc_alloc_storage_box(name_value.clone(), name_storage_gc_type_id());
+        let name = crate::gc_storage::gc_alloc_young_storage_box(
+            name_value.clone(),
+            name_storage_gc_type_id(),
+        );
         let _ = crate::gc_roots::pin_root(name as PyObjectRef);
         let qualname =
-            crate::gc_storage::gc_alloc_storage_box(name_value, name_storage_gc_type_id());
+            crate::gc_storage::gc_alloc_young_storage_box(name_value, name_storage_gc_type_id());
         let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
         (name, qualname)
     };
@@ -1752,7 +1762,11 @@ pub unsafe fn w_type_get_best_base(w_type: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     let purely_of_types = is_mro_purely_of_types(&mro);
-    let mro_w = crate::object_array::alloc_mro_block_gc(&mro);
+    let mro_w = if (*(obj as *const W_TypeObject)).flag_heaptype {
+        crate::object_array::alloc_mro_block_gc_young(&mro)
+    } else {
+        crate::object_array::alloc_mro_block_gc(&mro)
+    };
     type_write_barrier(obj);
     (*(obj as *mut W_TypeObject)).mro_w = mro_w;
     if !purely_of_types {

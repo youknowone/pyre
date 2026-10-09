@@ -4050,12 +4050,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    // `memmgr.max_unroll_recursion` is the shared manager. An extra driver's
-    // warmstate is built with `MemoryManager::new(0)`.
-    let max_unroll = driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .max_unroll_recursion() as usize;
+    // `warmrunnerdesc.memory_manager.max_unroll_recursion`: the one manager.
+    let max_unroll = driver.meta_interp().memory_manager.max_unroll_recursion() as usize;
     let can_inline = driver
         .meta_interp_mut()
         .warm_state_for_driver(jd_index)
@@ -4116,7 +4112,6 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                 // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), Some(green_key.clone())),
-                    ctx.trace_ctx.get_trace_position(),
                     Some(index),
                 );
                 let walked = match inline_call::run_sub_jitcode_walk(
@@ -4134,11 +4129,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
                     other => other,
                 };
-                if let Some(jd_no) = subwalk_jd {
-                    crate::state::note_inline_subwalk_end(
-                        jd_no,
-                        ctx.trace_ctx.get_trace_position(),
-                    );
+                if subwalk_jd.is_some() {
+                    crate::state::note_inline_subwalk_end();
                 }
                 let walked = walked?;
                 return Ok(Some(finish_recursive_inline(
@@ -4235,6 +4227,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         }
         _ => unreachable!("dst_bank matched above"),
     };
+    // `pyjitpl.py do_residual_call` step 5: invalidate on the
+    // CALL_MAY_FORCE executed in step 2, not the recorded CALL_ASSEMBLER.
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        call_opcode,
+        Some(call_descr.get_extra_info()),
+        &allboxes,
+    );
     // `make_result_of_lastop(resbox)`: the executed result is the op's
     // value whatever its bits (zero, +0.0 and null included).
     if recorded != OpRef::NONE && raised == 0 {
@@ -4958,6 +4957,12 @@ node,
                     // recorder and the emitted one, which falls back to that
                     // field.  Compiled code never wrote it, so publish it here.
                     fbw_publish_exit_last_instr(ctx, recording_opcode_position);
+                    // `pyopcode.py handle_operation_error`: the no-handler
+                    // path stores `frame_finished_execution = True` before
+                    // `raise operr` leaves the portal, so the store precedes
+                    // the exit's token protocol; the inlined-callee sibling is
+                    // `walker_ec_leave`.
+                    fbw_record_top_level_frame_finished(ctx);
                     // `pyjitpl.py compile_exit_frame_with_exception` opens
                     // with `store_token_in_vable()`, exactly as
                     // `compile_done_with_this_frame` does. Keep this exit lazy
@@ -5016,6 +5021,11 @@ node,
 node,
                         );
                     }
+                    // The concrete bit lands only once `fbw_store_token_in_vable`
+                    // above has accepted the exit (see
+                    // `finish_current_frame_execution`); the recorded store is
+                    // already in the trace.
+                    commit_top_level_frame_finished(ctx);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
@@ -10799,7 +10809,7 @@ pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
 /// `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
 /// The portal red is an input; this is that recording-time value. The IR
 /// operand stays the input.
-fn stamp_live_execution_context(trace_ctx: &mut TraceCtx, ec_box: OpRef) {
+pub(crate) fn stamp_live_execution_context(trace_ctx: &mut TraceCtx, ec_box: OpRef) {
     if ec_box.is_none() {
         return;
     }

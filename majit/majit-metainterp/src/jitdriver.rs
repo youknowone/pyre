@@ -1413,6 +1413,11 @@ pub struct JitDriverStaticData {
     /// is_being_profiled, bytecode)`. `None` leaves the portal-frame unique
     /// id as the greenkey hash, the previous fallback.
     pub get_unique_id: Option<fn(&[i64]) -> i64>,
+    /// warmspot.py `make_enter_function`: `jd.warmstate = WarmEnterState(self, jd)`.
+    ///
+    /// Absent until `MetaInterp::make_enter_function` runs for this slot.
+    /// Clones of the descriptor share the one state.
+    pub warmstate: Option<std::rc::Rc<std::cell::RefCell<crate::warmstate::WarmEnterState>>>,
 }
 
 impl JitDriverStaticData {
@@ -1499,6 +1504,7 @@ impl JitDriverStaticData {
             vable_token_descr: None,
             frame_value_count_fn: None,
             get_unique_id: None,
+            warmstate: None,
         };
         // warmspot.py:529/538 — keep `index_of_virtualizable` in sync
         // with the `virtualizable_arg_index()` derived from `reds`.
@@ -2494,6 +2500,13 @@ impl<S: JitState> JitDriver<S> {
             .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
     }
 
+    /// Frames `start_bridge_tracing` already seated via
+    /// `rebuild_from_resumedata`. Zero means that rebuild has not run, so a
+    /// portal wrapper may still call it.
+    pub fn portal_framestack_len(&self) -> usize {
+        self.meta.framestack.frames.len()
+    }
+
     /// `MetaInterp::rebuild_portal_framestack_from_resumedata` with this
     /// driver's allocator, so a virtual the register rebuild materializes
     /// is allocated like one a frame value names.
@@ -2507,11 +2520,8 @@ impl<S: JitState> JitDriver<S> {
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
         resume_liveness: &[u8],
         resume_op_live: u8,
+        reader: &mut crate::BridgeVirtualCache<'_>,
     ) -> bool {
-        let allocator = self
-            .blackhole_allocator
-            .as_deref()
-            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator);
         self.meta.rebuild_portal_framestack_from_resumedata(
             mainjitcode,
             frames,
@@ -2520,7 +2530,7 @@ impl<S: JitState> JitDriver<S> {
             materialized,
             resume_liveness,
             resume_op_live,
-            allocator,
+            reader,
         )
     }
 
@@ -2780,6 +2790,9 @@ impl<S: JitState> JitDriver<S> {
         // staticdata Vec, so the stamped clone must live on the driver too.
         self.descriptor = Some(sd_mut.jitdrivers_sd[idx].clone());
         self.descriptor_cache = None;
+        // warmspot.py `make_enter_functions`: the driver's `warmstate`
+        // exists from registration on.
+        self.meta.make_enter_function(idx);
         idx
     }
 
@@ -2787,21 +2800,39 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// The `Arc` is the entry's own, not a copy: a caller that needs to hold
     /// the metadata across a run clones the refcount.
+    ///
+    /// Bound on this driver's WarmEnterState (`JitDriver::index`).
+    /// `warmstate.py maybe_compile_and_run` / `JitCell.get_procedure_token`
+    /// stay on `jitdriver_sd.warmstate`; the metadata row for that cell uses
+    /// the executing driver's index.
     pub fn get_compiled_meta(&self, green_key: u64) -> Option<&std::sync::Arc<S::Meta>> {
-        self.meta.get_compiled_meta(green_key)
+        self.meta
+            .get_compiled_meta_on_driver(self.index().unwrap_or(0), green_key)
     }
 
     /// PyPy warmstate.py get_assembler_token(greenkey).
     /// Returns the JitCellToken for the compiled loop at this green key.
+    ///
+    /// Bound on this driver's WarmEnterState (`JitDriver::index`).
     pub fn get_loop_token(
         &self,
         green_key: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_loop_token(green_key)
+        self.meta
+            .get_loop_token_on_driver(self.index().unwrap_or(0), green_key)
+    }
+
+    /// `warmstate.py bound_reached` finally `cell.flags &= ~JC_TRACING`
+    /// on that driver's WarmEnterState.
+    pub fn abort_entry_tracing(&mut self, green_key: u64) {
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .clear_tracing_flag(green_key);
     }
 
     pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
-        self.meta.front_target_inputarg_types(green_key)
+        self.meta
+            .front_target_inputarg_types_on_driver(self.index().unwrap_or(0), green_key)
     }
 
     /// resume.py blackhole_from_resumedata parity: get the
@@ -2975,7 +3006,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// PyPy warmspot.py set_param_max_unroll_recursion().
     pub fn set_max_unroll_recursion(&mut self, value: usize) {
-        self.meta.set_max_unroll_recursion(value);
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_param_max_unroll_recursion(value as u32);
     }
 
     /// RPython-compatible alias used by warmstate/compile wiring.
@@ -2991,7 +3024,11 @@ impl<S: JitState> JitDriver<S> {
     /// process-wide switch. `set_param` cannot carry it — that surface is
     /// `i64`-valued, and this parameter is a string upstream too.
     pub fn set_param_enable_opts(&mut self, value: &str) {
-        self.meta.warm_state_mut().set_param_enable_opts(value);
+        // warmspot.py `jd.warmstate.set_param_enable_opts` is bound on
+        // that driver's WarmEnterState (`JitDriver::index`).
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_param_enable_opts(value);
     }
 
     /// Whether this driver was declared recursive.
@@ -3019,11 +3056,12 @@ impl<S: JitState> JitDriver<S> {
     /// `maybe_compile_and_run` skips only a cell that is already being
     /// traced in an outer invocation of the same greens. A live session
     /// on another key or another driver does not suppress this cell.
+    /// Bound on this driver's WarmEnterState (`JitDriver::index`).
     #[inline]
     pub fn cell_is_tracing(&self, green_key: u64) -> bool {
         self.meta
-            .warm_state_ref()
-            .get_cell(green_key)
+            .warm_state_ref_for_driver(self.index().unwrap_or(0))
+            .and_then(|warm| warm.get_cell(green_key))
             .is_some_and(|cell| cell.is_tracing())
     }
 
@@ -3037,12 +3075,12 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn cell_is_abort_ceiling_banned(&self, green_key: u64) -> bool {
         self.meta
-            .warm_state_ref()
-            .get_cell(green_key)
+            .warm_state_ref_for_driver(self.index().unwrap_or(0))
+            .and_then(|warm| warm.get_cell(green_key))
             .is_some_and(|cell| {
                 let dead_token =
                     cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-                !dead_token && cell.abort_count >= crate::warmstate::MAX_TRACE_ABORT_COUNT
+                !dead_token && cell.abort_count.get() >= crate::warmstate::MAX_TRACE_ABORT_COUNT
             })
     }
 
@@ -3666,14 +3704,17 @@ impl<S: JitState> JitDriver<S> {
             }
             return false;
         };
-        let has_compiled = self.meta.has_compiled_loop(key);
-        let loop_header_pc = self.meta.loop_header_pc_for(key);
-        let dispatch_key = self.meta.front_target_dispatch_key(key);
+        let jd_no = self.index().unwrap_or(0);
+        let has_compiled = self.has_compiled_loop(key);
+        let loop_header_pc = self.meta.loop_header_pc_for_driver(jd_no, key);
+        let dispatch_key = self.meta.front_target_dispatch_key_on_driver(jd_no, key);
         let direct_entry = dispatch_key.is_some_and(|dispatch_key| {
-            self.meta.entry_procedure_token(key).is_some_and(|token| {
-                self.meta
-                    .backend_supports_dispatch_key_entry_for(&token, dispatch_key)
-            })
+            self.meta
+                .entry_procedure_token_on_driver(self.index().unwrap_or(0), key)
+                .is_some_and(|token| {
+                    self.meta
+                        .backend_supports_dispatch_key_entry_for(&token, dispatch_key)
+                })
         });
         let ok = has_compiled && loop_header_pc != Some(0) && direct_entry;
         if crate::callee_rca_enabled() {
@@ -3707,7 +3748,10 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         let key = self.meta.single_pass_compiled_key;
-        let dispatch_key = key.and_then(|k| self.meta.front_target_dispatch_key(k));
+        let dispatch_key = key.and_then(|k| {
+            self.meta
+                .front_target_dispatch_key_on_driver(self.index().unwrap_or(0), k)
+        });
         let meta = S::build_meta(state, resume_pc, env);
         eprintln!(
             "[portal-rca][parity-crn] resume_pc={resume_pc} compiled_key={key:?} \
@@ -3768,18 +3812,22 @@ impl<S: JitState> JitDriver<S> {
                 return None;
             }
         };
-        let has = self.meta.has_compiled_loop(key);
+        let has = self.has_compiled_loop(key);
         if dbg {
             eprintln!("@@@DE try_resume key={key} has_compiled={has} resume_pc={resume_pc}");
         }
         if !has {
             return None;
         }
-        if self.meta.loop_header_pc_for(key) == Some(0) {
+        let jd_no = self.index().unwrap_or(0);
+        if self.meta.loop_header_pc_for_driver(jd_no, key) == Some(0) {
             return None;
         }
-        let dispatch_key = self.meta.front_target_dispatch_key(key)?;
-        let Some(token) = self.meta.entry_procedure_token(key) else {
+        let dispatch_key = self.meta.front_target_dispatch_key_on_driver(jd_no, key)?;
+        let Some(token) = self
+            .meta
+            .entry_procedure_token_on_driver(self.index().unwrap_or(0), key)
+        else {
             return None;
         };
         if !self
@@ -3821,7 +3869,11 @@ impl<S: JitState> JitDriver<S> {
             Some(values) => Some(values),
             None => match full_live_values {
                 Some(values) => {
-                    let packed = self.meta.pack_front_target_live_values(key, &values);
+                    let packed = self.meta.pack_front_target_live_values_on_driver(
+                        self.index().unwrap_or(0),
+                        key,
+                        &values,
+                    );
                     if crate::callee_rca_enabled() {
                         match packed.as_ref() {
                             Some(packed) => eprintln!(
@@ -4009,10 +4061,12 @@ impl<S: JitState> JitDriver<S> {
         // JitCellToken.  pyre's `compile_simple_loop` returns the
         // green_key; the actual `Arc<JitCellToken>` is the `token` field
         // of the freshly-installed `CompiledEntry` in `self.compiled_loops`.
+        // `compile_simple_loop` inserted the entry under the compiling
+        // driver (`self.jitdriver_sd`); read it back from the same one.
+        let jd_no = self.meta.active_jitdriver_sd.unwrap_or(0);
         let install_token = self
             .meta
-            .compiled_loops
-            .get(&green_key)
+            .compiled_entry_on_driver(jd_no, green_key)
             .expect(
                 "compile_simple_loop returned Some(green_key) ⇒ \
                  compiled_loops has the new CompiledEntry",
@@ -4024,7 +4078,7 @@ impl<S: JitState> JitDriver<S> {
         // (rare; eviction is independent of this insertion path).
         if let Some(install_token) = install_token {
             self.meta
-                .attach_procedure_with_redirect(green_key, install_token);
+                .attach_procedure_with_redirect_on_driver(jd_no, green_key, install_token);
         }
     }
 
@@ -4095,7 +4149,7 @@ impl<S: JitState> JitDriver<S> {
     /// - `CloseLoop` → validates depths, collects jump args, compiles
     /// - `Finish` → compiles a terminal trace ending in `FINISH`
     /// - `Abort` → aborts trace (may retry later)
-    /// - `AbortPermanent` → aborts trace permanently
+    /// - `AbortPermanent` → `aborted_tracing`; does not set `JC_DONT_TRACE_HERE`
     /// - `Continue` → no action
     ///
     /// # Example
@@ -4501,7 +4555,11 @@ impl<S: JitState> JitDriver<S> {
                                 // into a three-input one.  So the cost is not the lost close
                                 // but the resumed walk: declining and then giving the trace
                                 // up outright reproduces the un-compiled output exactly.
-                                None if self.meta.is_cross_loop_cut_key(target_key) => {
+                                None if self.meta.is_cross_loop_cut_key_on_driver(
+                                    self.index().unwrap_or(0),
+                                    target_key,
+                                ) =>
+                                {
                                     crate::pyjitpl::BridgeCompileResult::Declined
                                 }
                                 None => match self.compile_trace_entry_data() {
@@ -4634,7 +4692,10 @@ impl<S: JitState> JitDriver<S> {
                         let resolved_key = match &close_key {
                             Some(key) => {
                                 let make_key = || key.clone();
-                                Some(self.meta.resolve_cell_key(
+                                // compile.py / pyjitpl.py reached_loop_header
+                                // match greens on jitdriver_sd.warmstate.
+                                Some(self.meta.resolve_cell_key_on_driver(
+                                    self.meta.active_jitdriver_sd.unwrap_or(0),
                                     key.get_uhash(),
                                     Some(&make_key as &dyn Fn() -> majit_ir::GreenKey),
                                 ))
@@ -5643,31 +5704,18 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.clear_trace_session();
                 }
                 TraceAction::AbortPermanent => {
-                    // The permanent answer belongs to a PRIMARY trace, where the
-                    // green key names the code the walk gave up on: that is
-                    // `codewriter/policy.py look_inside_graph` answering "no" for
-                    // the graph, and `JC_DONT_TRACE_HERE` is the same terminal
-                    // state — never traced here, never inlined from elsewhere.
-                    //
-                    // A bridge session's green key names the SOURCE LOOP instead
-                    // (`start_retrace_from_guard` builds its `TraceCtx` with the
-                    // key it looked the compiled loop up by), while the
-                    // coordinate the walk could not record lies in the guard's
-                    // resume region.  Retiring it would answer for a loop that
-                    // already compiled, and answer twice: `abort_tracing(key,
-                    // true)` runs `disable_noninlinable_function`, whose flag is
-                    // both what refuses a later trace at that key and what
-                    // `can_inline_callable` (`warmstate.py`) reads — so one
-                    // unrecordable opcode reached from one guard made the whole
-                    // enclosing function permanently non-inlinable everywhere.
-                    // Upstream never reaches that flag from here: `pyjitpl.py`
-                    // `handle_guard_failure` answers a `SwitchToBlackhole` with
-                    // `run_blackhole_interp_to_cancel_tracing`, whose only
-                    // bookkeeping is `aborted_tracing(stb.reason)`, and
-                    // `disable_noninlinable_function` is reached from the
-                    // `ABORT_TOO_LONG` arm of `blackhole_if_trace_too_long`
-                    // alone — which names the huge function's greenkey, not the
-                    // trace's.
+                    // `pyjitpl.py aborted_tracing` does not set
+                    // `JC_DONT_TRACE_HERE`. The only upstream writer of that
+                    // flag from an abort is `blackhole_if_trace_too_long`
+                    // ABORT_TOO_LONG, which names the huge function via
+                    // `disable_noninlinable_function`. This arm is a
+                    // `SwitchToBlackhole` whose unwind is
+                    // `run_blackhole_interp_to_cancel_tracing` →
+                    // `aborted_tracing(stb.reason)` — same bookkeeping as
+                    // Abort. Passing `permanent=true` would stamp the flag
+                    // through `abort_tracing`, and `can_inline_callable`
+                    // (`warmstate.py`) reads it, so one unrecordable opcode
+                    // would retire the function from inlining everywhere.
                     let is_bridge = self.meta.bridge_info().is_some();
                     if is_bridge {
                         crate::mc_diag_bump(82); // bridge_abort_permanent
@@ -5676,7 +5724,7 @@ impl<S: JitState> JitDriver<S> {
                     if self.bridge_attempt_declined {
                         crate::mc_diag_bump(52); // abort_after_declined
                     }
-                    self.meta.abort_trace(!is_bridge);
+                    self.meta.abort_trace(false);
                     self.sym = None;
                     // The session ends here, so the latch must not outlive it.
                     // This arm does not share the Abort/Decline teardown, so it
@@ -6176,7 +6224,7 @@ impl<S: JitState> JitDriver<S> {
         }
         // No blackhole runs before this entry, so its replay is the one that
         // owes the guard's deferred writes to the heap.
-        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true) {
+        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true, &[]) {
             return None;
         }
         // From here the trace session is LIVE, so a decline has to tear it
@@ -6820,8 +6868,13 @@ impl<S: JitState> JitDriver<S> {
         }
         // A chained bucket needs comparekey and stays on `back_edge_internal`.
         // A lone cell is the tick arm only when this hash owns it.
-        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
-            if cell.next.is_some() {
+        let jd_no = self.index().unwrap_or(0);
+        if let Some(cell) = self
+            .meta
+            .warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.lookup_chain(green_key_hash))
+        {
+            if cell.next.borrow().is_some() {
                 return None;
             }
             // `lookup_chain` returns the table-slot head. `_get_index` keeps
@@ -6829,7 +6882,7 @@ impl<S: JitState> JitDriver<S> {
             // different green key. Its compiled / tracing / dead-token /
             // abort-ceiling / `JC_DONT_TRACE_HERE` state is not ours: the
             // not-found arm of `maybe_compile_and_run` ticks this hash.
-            if cell.cell_bucket == green_key_hash {
+            if cell.cell_bucket.get() == green_key_hash {
                 if cell.is_compiled() {
                     return None;
                 }
@@ -6841,7 +6894,7 @@ impl<S: JitState> JitDriver<S> {
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return None;
                 }
-                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
                     // `should_start_dont_trace_here_trace`: never traced
                     // starts immediately, `JC_TRACING_OCCURRED` ticks. Both
                     // stay on the occupied door.
@@ -6852,7 +6905,10 @@ impl<S: JitState> JitDriver<S> {
         if !state.can_trace() {
             return Some(None);
         }
-        if self.meta.warm_state_mut().tick_empty_chain(green_key_hash)
+        if self
+            .meta
+            .warm_state_for_driver(jd_no)
+            .tick_empty_chain(green_key_hash)
             && self.commit_start_tracing(
                 green_key_hash,
                 structured_green_key,
@@ -6976,7 +7032,9 @@ impl<S: JitState> JitDriver<S> {
         // counter: a cut key must not tick into `bound_reached` either.
         if dispatch_key.is_none()
             && !self.meta.cut_compiled_keys.is_empty()
-            && self.meta.is_cross_loop_cut_key(green_key)
+            && self
+                .meta
+                .is_cross_loop_cut_key_on_driver(self.index().unwrap_or(0), green_key)
         {
             return None;
         }
@@ -7023,15 +7081,18 @@ impl<S: JitState> JitDriver<S> {
         #[cfg(feature = "__back-edge-stage-probe")]
         let stage_repeats = back_edge_stage_repeats();
         if let Some(procedure_token) = entry_procedure_token
-            && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
+            && let Some(compiled_meta) = self
+                .meta
+                .get_compiled_meta_on_driver(self.index().unwrap_or(0), green_key)
+                .cloned()
         {
             // warmstate.py `WarmEnterState.make_entry_point` /
             // `maybe_compile_and_run`: the confirmation veto sits between
             // finding the procedure token and `EnterJitAssembler`.
             if !self
                 .meta
-                .warm_state_ref()
-                .confirm_compiled_entry_for_cell_key(green_key)
+                .warm_state_ref_for_driver(self.index().unwrap_or(0))
+                .is_some_and(|warm| warm.confirm_compiled_entry_for_cell_key(green_key))
             {
                 return None;
             }
@@ -7042,7 +7103,7 @@ impl<S: JitState> JitDriver<S> {
             let descriptor = unsafe { descriptor_ptr.map(|ptr| &*ptr) };
             let vable = descriptor.and_then(JitDriverStaticData::virtualizable);
             if !state.is_compatible(&compiled_meta) {
-                self.meta.invalidate_loop(green_key);
+                self.invalidate_loop(green_key);
                 return None;
             }
             // Stage E1, and the barrier the other stages are differenced
@@ -7059,7 +7120,10 @@ impl<S: JitState> JitDriver<S> {
                     } else {
                         self.meta.entry_procedure_token(green_key)
                     };
-                    let repeat_meta = self.meta.get_compiled_meta(green_key).cloned();
+                    let repeat_meta = self
+                        .meta
+                        .get_compiled_meta_on_driver(self.index().unwrap_or(0), green_key)
+                        .cloned();
                     let repeat_descriptor = self.driver_descriptor_for(state, &compiled_meta);
                     let compatible = state.is_compatible(&compiled_meta);
                     // Without this the four answers are dead and the loop
@@ -7170,10 +7234,11 @@ impl<S: JitState> JitDriver<S> {
             }
             if dispatch_key.is_some() && !values_are_label_ordered {
                 let full_len = scratch.live_values.len();
-                let Some(packed) = self
-                    .meta
-                    .pack_front_target_live_values(green_key, &scratch.live_values)
-                else {
+                let Some(packed) = self.meta.pack_front_target_live_values_on_driver(
+                    self.index().unwrap_or(0),
+                    green_key,
+                    &scratch.live_values,
+                ) else {
                     if crate::callee_rca_enabled() {
                         eprintln!(
                             "[callee-rca][direct-entry-pack] key={green_key} \
@@ -7201,7 +7266,10 @@ impl<S: JitState> JitDriver<S> {
                 // The compact values are LABEL-ordered by construction, but the
                 // same unchecked Ref dereference is downstream of them, so the
                 // types are confirmed here as well.
-                let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
+                let Some(types) = self
+                    .meta
+                    .front_target_inputarg_types_on_driver(self.index().unwrap_or(0), green_key)
+                else {
                     self.entry_scratch_out(scratch);
                     return None;
                 };
@@ -7235,8 +7303,8 @@ impl<S: JitState> JitDriver<S> {
                 let labels = state.debug_state_live_labels(&compiled_meta);
                 let compiled_inputs = self
                     .meta
-                    .warm_state_ref()
-                    .get_compiled(green_key)
+                    .warm_state_ref_for_driver(self.index().unwrap_or(0))
+                    .and_then(|ws| ws.get_compiled(green_key))
                     .map(|compiled| compiled.inputarg_types().len())
                     .unwrap_or(0);
                 eprintln!(
@@ -8195,9 +8263,9 @@ impl<S: JitState> JitDriver<S> {
             .map(|pc| pc as usize)
             .unwrap_or(target_pc);
         state.recover_after_compiled_run();
-        self.meta.invalidate_loop(green_key);
-        self.meta.remove_compiled_loop(green_key);
-        self.meta.warm_state_mut().abort_tracing(green_key, true);
+        self.invalidate_loop(green_key);
+        self.remove_compiled_loop(green_key);
+        self.abort_entry_tracing(green_key);
         if let Some(raw_values) = raw_values_for_bridge {
             self.exit_raw_scratch_out(raw_values);
         }
@@ -8393,10 +8461,11 @@ impl<S: JitState> JitDriver<S> {
         // comparator-less cell at the hash cannot answer for a sibling
         // (`chained_ceiling_latch_does_not_refuse_the_typed_sibling`).
         // The empty-chain door never reaches here; it ticked already.
-        match self
-            .meta
-            .on_back_edge_typed_decision(green_key, (state.code_ptr(), target_pc))
-        {
+        match self.meta.on_back_edge_typed_decision_on_driver(
+            self.index().unwrap_or(0),
+            green_key,
+            (state.code_ptr(), target_pc),
+        ) {
             HotResult::StartTracing => {
                 self.commit_start_tracing(green_key, structured_green_key, target_pc, state, env)
             }
@@ -8416,11 +8485,16 @@ impl<S: JitState> JitDriver<S> {
         if !self.meta.cut_compiled_keys.is_empty() {
             return BackEdgeWarmth::Full;
         }
-        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
-            if cell.next.is_some() {
+        let jd_no = self.index().unwrap_or(0);
+        if let Some(cell) = self
+            .meta
+            .warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.lookup_chain(green_key_hash))
+        {
+            if cell.next.borrow().is_some() {
                 return BackEdgeWarmth::Full;
             }
-            if cell.cell_bucket == green_key_hash {
+            if cell.cell_bucket.get() == green_key_hash {
                 if cell.is_compiled() {
                     return BackEdgeWarmth::Full;
                 }
@@ -8430,7 +8504,7 @@ impl<S: JitState> JitDriver<S> {
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return BackEdgeWarmth::Full;
                 }
-                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
                     return BackEdgeWarmth::Full;
                 }
             }
@@ -8438,7 +8512,11 @@ impl<S: JitState> JitDriver<S> {
         if !state.can_trace() {
             return BackEdgeWarmth::Interpret;
         }
-        if self.meta.warm_state_mut().tick_empty_chain(green_key_hash) {
+        if self
+            .meta
+            .warm_state_for_driver(jd_no)
+            .tick_empty_chain(green_key_hash)
+        {
             BackEdgeWarmth::Trace
         } else {
             BackEdgeWarmth::Interpret
@@ -8780,7 +8858,7 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<Vec<Value>> {
         // The cold form keeps the lookup: its callers hold a green key and no
         // token.
-        let procedure_token = self.meta.warm_state_ref().get_compiled(green_key)?;
+        let procedure_token = self.get_loop_token(green_key)?;
         let mut boxes = Vec::new();
         let mut array_lengths = Vec::new();
         self.extend_compiled_live_values_into(
@@ -8942,7 +9020,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// Set the compilation threshold.
     pub fn set_threshold(&mut self, threshold: u32) {
-        self.meta.set_threshold(threshold);
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_threshold(threshold);
     }
 
     /// RPython-compatible wrapper used by compile.py.
@@ -8968,7 +9048,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
     pub fn set_trace_eagerness(&mut self, eagerness: u32) {
-        self.meta.set_trace_eagerness(eagerness);
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_param_trace_eagerness(eagerness);
     }
 
     /// Set a callback for loop compilation events.
@@ -9030,13 +9112,12 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Unknown parameter names are silently ignored.
     pub fn set_param(&mut self, name: &str, value: i64) {
-        match name {
-            "threshold" => self.meta.set_threshold(value as u32),
-            "trace_eagerness" => self.meta.set_trace_eagerness(value as u32),
-            "function_threshold" => self.meta.set_function_threshold(value as u32),
-            "max_unroll_recursion" => self.set_param_max_unroll_recursion(value as usize),
-            _ => self.meta.warm_state_mut().set_param(name, value),
-        }
+        // rlib/jit.py `set_param(driver, name, value)` writes
+        // `jitdriver.warmstate`. `set_param(None, ...)` is
+        // `MetaInterp::set_param_all_drivers`.
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_param(name, value);
     }
 
     /// Return a snapshot of the cumulative JIT compilation statistics.
@@ -9128,7 +9209,11 @@ impl<S: JitState> JitDriver<S> {
         pre_run: impl FnOnce(),
         dispatch_key: Option<u32>,
     ) -> DetailedDriverRunOutcome {
-        let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+        let Some(meta) = self
+            .meta
+            .get_compiled_meta_on_driver(self.index().unwrap_or(0), green_key)
+            .cloned()
+        else {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -9187,10 +9272,11 @@ impl<S: JitState> JitDriver<S> {
         // `live_values` is in state-field order; a dispatch-key entry lands on a
         // LABEL whose arguments are its own, so the mapping runs unconditionally.
         if dispatch_key.is_some() {
-            let Some(packed) = self
-                .meta
-                .pack_front_target_live_values(green_key, &live_values)
-            else {
+            let Some(packed) = self.meta.pack_front_target_live_values_on_driver(
+                self.index().unwrap_or(0),
+                green_key,
+                &live_values,
+            ) else {
                 self.restore_trace_vable_ptr(saved_vable_ptr);
                 return DetailedDriverRunOutcome::Abort {
                     restored: false,
@@ -9200,15 +9286,17 @@ impl<S: JitState> JitDriver<S> {
             live_values = packed;
         }
         pre_run();
+        let jd_no = self.index().unwrap_or(0);
         let result = if let Some(dispatch_key) = dispatch_key {
-            self.meta.run_compiled_detailed_with_values_at_dispatch_key(
+            self.meta.run_compiled_detailed_with_values_on_driver(
+                jd_no,
                 green_key,
                 &live_values,
                 dispatch_key,
             )
         } else {
             self.meta
-                .run_compiled_detailed_with_values(green_key, &live_values)
+                .run_compiled_detailed_with_values_on_driver(jd_no, green_key, &live_values, 0)
         };
         let Some(mut result) = result else {
             self.restore_trace_vable_ptr(saved_vable_ptr);
@@ -9274,7 +9362,11 @@ impl<S: JitState> JitDriver<S> {
         _env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> DetailedDriverRunOutcome {
-        let Some(meta) = self.meta.get_compiled_meta(green_key).cloned() else {
+        let Some(meta) = self
+            .meta
+            .get_compiled_meta_on_driver(self.index().unwrap_or(0), green_key)
+            .cloned()
+        else {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=missing-compiled-meta target_pc={}",
@@ -9376,10 +9468,12 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         pre_run();
-        let Some(mut result) = self
-            .meta
-            .run_compiled_detailed_with_values(green_key, &live_values)
-        else {
+        let Some(mut result) = self.meta.run_compiled_detailed_with_values_on_driver(
+            self.index().unwrap_or(0),
+            green_key,
+            &live_values,
+            0,
+        ) else {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=backend-run target_pc={}",
@@ -9417,8 +9511,10 @@ impl<S: JitState> JitDriver<S> {
         let savedata = result.savedata;
         let deadframe = result.deadframe.take();
 
-        // memmgr.py: keep_loop_alive(loop_token)
-        self.meta.keep_loop_alive(green_key);
+        // memmgr.py: keep_loop_alive(loop_token) on the executing
+        // driver's warmstate, matching execute_assembler.
+        self.meta
+            .keep_loop_alive_on_driver(self.index().unwrap_or(0), green_key);
 
         if is_finish {
             let typed_values = std::mem::take(&mut result.typed_values).into_vec();
@@ -9525,8 +9621,23 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Invalidate a compiled loop, forcing fallback to interpretation.
+    ///
+    /// `cpu.invalidate_loop` runs on the token filed on this driver's
+    /// WarmEnterState (`JitDriver::index`). Compile-time
+    /// `MetaInterp::invalidate_loop` still reads `get_procedure_token`.
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        self.meta.invalidate_loop(green_key);
+        if let Some(token) = self
+            .meta
+            .get_procedure_token_on_driver(self.index().unwrap_or(0), green_key)
+        {
+            token.invalidate();
+            if crate::debug::have_debug_prints() {
+                crate::debug::log_one(
+                    "jit-invalidate",
+                    &format!("invalidated loop at key={green_key}"),
+                );
+            }
+        }
     }
 
     /// Drop the metainterpreter metadata for a loop that has already been
@@ -9537,13 +9648,19 @@ impl<S: JitState> JitDriver<S> {
     /// instead needs a fresh root trace, so its stale targets must not make
     /// `compile_loop` choose the old loop's bridge path.
     pub fn remove_compiled_loop(&mut self, green_key: u64) {
-        self.meta.remove_compiled_loop(green_key);
+        self.meta
+            .remove_compiled_loop_on_driver(self.index().unwrap_or(0), green_key);
     }
 
     /// Check whether a compiled loop exists for a given green key.
+    ///
+    /// `warmstate.py maybe_compile_and_run` is bound on this driver's
+    /// WarmEnterState (`JitDriver::index`), not leftover portal slot 0.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
-        self.meta.has_compiled_loop(green_key)
+        self.meta
+            .entry_procedure_token_on_driver(self.index().unwrap_or(0), green_key)
+            .is_some()
     }
 
     /// [`Self::has_compiled_loop`] with both flag reads removed, so an
@@ -9610,8 +9727,8 @@ impl<S: JitState> JitDriver<S> {
         self.has_runnable_compiled_loop(green_key)
             && self
                 .meta
-                .warm_state_ref()
-                .confirm_compiled_entry_for_cell_key(green_key)
+                .warm_state_ref_for_driver(self.index().unwrap_or(0))
+                .is_some_and(|warm| warm.confirm_compiled_entry_for_cell_key(green_key))
     }
 
     /// See [`MetaInterp::runnable_generation`]: a number that holds while
@@ -9648,8 +9765,11 @@ impl<S: JitState> JitDriver<S> {
         green_key_hash: u64,
         make_green_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
-        self.meta
-            .resolved_entry_procedure_token(green_key_hash, make_green_key)
+        self.meta.resolved_entry_procedure_token_on_driver(
+            self.index().unwrap_or(0),
+            green_key_hash,
+            make_green_key,
+        )
     }
 
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed
@@ -9662,7 +9782,7 @@ impl<S: JitState> JitDriver<S> {
     /// asks the cell again. This is the reader that makes the same carry
     /// expressible for a caller outside this crate.
     ///
-    /// How the predicate's two conjuncts divide here: `entry_procedure_token`
+    /// How the predicate's two conjuncts divide here: `entry_procedure_token_on_driver`
     /// IS the `has_compiled_loop` half — that predicate is defined as this
     /// token being present, not merely as something equivalent to it — so
     /// binding the token subsumes the first conjunct exactly. It does NOT
@@ -9673,6 +9793,9 @@ impl<S: JitState> JitDriver<S> {
     /// here explicitly, matching the flag-first branch in upstream
     /// `WarmEnterState.maybe_compile_and_run`.
     ///
+    /// `warmstate.py maybe_compile_and_run` is bound on this driver's
+    /// WarmEnterState (`JitDriver::index`), not leftover portal slot 0.
+    ///
     /// `green_key` must already name one cell — see [`Self::resolve_cell_key`],
     /// whose result is what a door should ask this with. A raw bucket hash
     /// answers for whichever cell heads the bucket.
@@ -9681,25 +9804,51 @@ impl<S: JitState> JitDriver<S> {
         &self,
         green_key: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.entry_procedure_token(green_key).filter(|_| {
-            !self
-                .meta
-                .warm_state_ref()
-                .procedure_token_is_temporary(green_key)
-                && self.meta.get_compiled_meta(green_key).is_some()
-        })
+        let jd_no = self.index().unwrap_or(0);
+        self.meta
+            .entry_procedure_token_on_driver(jd_no, green_key)
+            .filter(|_| {
+                !self
+                    .meta
+                    .warm_state_ref_for_driver(jd_no)
+                    .is_some_and(|warm| warm.procedure_token_is_temporary(green_key))
+                    && self
+                        .meta
+                        .get_compiled_meta_on_driver(jd_no, green_key)
+                        .is_some()
+            })
     }
 
     /// The back-edge door's whole answer from the warm-state policy that owns
     /// both trace-start and compiled-entry decisions.
+    ///
+    /// `warmstate.py maybe_compile_and_run` is bound on this driver's
+    /// WarmEnterState (`JitDriver::index`).
     #[inline]
     pub fn maybe_compile_and_run_step(
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
     ) -> (crate::warmstate::HotResult, u64) {
+        self.meta.maybe_compile_and_run_step_on_driver(
+            self.index().unwrap_or(0),
+            green_key,
+            green_key_raw,
+        )
+    }
+
+    /// `compile.py ResumeFromInterpDescr.compile_and_attach` files the
+    /// frontend row on this driver's cell (`JitDriver::index()`), matching
+    /// [`Self::maybe_compile_and_run_step`]. Leftover `active_jitdriver_sd`
+    /// is the last traced driver.
+    #[cfg(test)]
+    pub(crate) fn insert_compiled_loop(
+        &mut self,
+        green_key: u64,
+        entry: crate::pyjitpl::CompiledEntry<S::Meta>,
+    ) -> Option<crate::pyjitpl::CompiledEntry<S::Meta>> {
         self.meta
-            .maybe_compile_and_run_step(green_key, green_key_raw)
+            .insert_compiled_loop_on_driver(self.index().unwrap_or(0), green_key, entry)
     }
 
     /// The function-entry door's whole answer, from one walk of the cell chain.
@@ -9713,14 +9862,22 @@ impl<S: JitState> JitDriver<S> {
     /// `cell_key` must already name one cell; `green_key_hash` and
     /// `green_key_raw` reconstruct its structured greens only when the
     /// optional veto is installed.
+    ///
+    /// `warmstate.py maybe_compile_and_run` with
+    /// `increment_function_threshold` is bound on this driver's
+    /// WarmEnterState (`JitDriver::index`).
     pub fn function_entry_step(
         &mut self,
         cell_key: u64,
         green_key_hash: u64,
         green_key_raw: (usize, usize),
     ) -> FunctionEntryStep {
-        self.meta
-            .function_entry_step(cell_key, green_key_hash, green_key_raw)
+        self.meta.function_entry_step_on_driver(
+            self.index().unwrap_or(0),
+            cell_key,
+            green_key_hash,
+            green_key_raw,
+        )
     }
 
     /// `warmspot.py` `ll_portal_runner`: maybe enter from the function's start.
@@ -9850,18 +10007,23 @@ impl<S: JitState> JitDriver<S> {
         &self,
         hash: u64,
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
-        if self.meta.warm_state_ref().has_confirm_enter_jit() {
+        let jd_no = self.index().unwrap_or(0);
+        let Some(warm) = self.meta.warm_state_ref_for_driver(jd_no) else {
+            return None;
+        };
+        if warm.has_confirm_enter_jit() {
             return None;
         }
-        let warm = self.meta.warm_state_ref();
         let cell = warm.lookup_chain(hash)?;
-        if cell.next.is_some() || cell.cell_bucket != hash {
+        if cell.next.borrow().is_some() || cell.cell_bucket.get() != hash {
             return None;
         }
-        if cell.flags.contains(JcFlags::JC_TRACING) || cell.flags.contains(JcFlags::JC_TEMPORARY) {
+        if cell.flags.get().contains(JcFlags::JC_TRACING)
+            || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+        {
             return None;
         }
-        let cell_key = cell.cell_key?;
+        let cell_key = cell.cell_key.get()?;
         let token = cell.get_procedure_token()?;
         if !token.has_compiled_code() {
             return None;
@@ -10003,7 +10165,10 @@ impl<S: JitState> JitDriver<S> {
         let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
             true
         } else {
-            let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
+            let Some(meta) = self
+                .meta
+                .get_compiled_meta_on_driver(self.index().unwrap_or(0), cell_key)
+            else {
                 self.entry_scratch_out(scratch);
                 return SteadyCompiledEntry::NeedsInternal;
             };
@@ -10020,7 +10185,7 @@ impl<S: JitState> JitDriver<S> {
         };
         if !compatible {
             self.entry_scratch_out(scratch);
-            self.meta.invalidate_loop(cell_key);
+            self.invalidate_loop(cell_key);
             return SteadyCompiledEntry::Done(None);
         }
         // Same inputarg-length test as the raw path. This arm did not fill
@@ -10104,7 +10269,7 @@ impl<S: JitState> JitDriver<S> {
         self.entry_scratch_out(scratch);
         let compiled_meta = self
             .meta
-            .get_compiled_meta(cell_key)
+            .get_compiled_meta_on_driver(self.index().unwrap_or(0), cell_key)
             .cloned()
             .expect("compiled meta survived the run");
         SteadyCompiledEntry::Done(
@@ -10227,11 +10392,16 @@ impl<S: JitState> JitDriver<S> {
                     .and_then(|resume| self.resume_pc_recycling(resume)),
             );
         }
-        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
-            if cell.next.is_some() {
+        let jd_no = self.index().unwrap_or(0);
+        if let Some(cell) = self
+            .meta
+            .warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.lookup_chain(green_key_hash))
+        {
+            if cell.next.borrow().is_some() {
                 return None;
             }
-            if cell.cell_bucket == green_key_hash {
+            if cell.cell_bucket.get() == green_key_hash {
                 if cell.is_compiled() {
                     return None;
                 }
@@ -10243,12 +10413,12 @@ impl<S: JitState> JitDriver<S> {
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return None;
                 }
-                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
                     // Immediate-Proceed (never traced) vs tick-normally
                     // (TRACING_OCCURRED) stay on the occupied door.
                     return None;
                 }
-                if cell.flags.contains(JcFlags::JC_TEMPORARY) {
+                if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
                     return None;
                 }
             }
@@ -10258,7 +10428,7 @@ impl<S: JitState> JitDriver<S> {
         }
         if self
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(jd_no)
             .tick_function_entry_empty_chain(green_key_hash)
         {
             return Some(self.function_entry_internal(
@@ -10307,7 +10477,7 @@ impl<S: JitState> JitDriver<S> {
                 // warmstate.py bound_reached: decay, then refuse a nearly
                 // full stack, then start the function-entry trace.
                 // `force_start_tracing` republishes the frame decoder.
-                self.meta.warm_state_mut().decay_counters();
+                self.meta.decay_counters();
                 if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
                     return None;
                 }
@@ -10331,6 +10501,9 @@ impl<S: JitState> JitDriver<S> {
     /// exactly one cell, so the door's decision, its token read and the run it
     /// hands them to are all about that one cell.
     ///
+    /// `warmstate.py maybe_compile_and_run` matches greens on this driver's
+    /// WarmEnterState (`JitDriver::index`).
+    ///
     /// The producer-side half of `MetaInterp::resolve_cell_key`, exposed
     /// because a door outside this crate carries the same obligation as the one
     /// inside it: `warmstate.py` matches the greens with `comparekey`
@@ -10346,17 +10519,23 @@ impl<S: JitState> JitDriver<S> {
         green_key_hash: u64,
         make_green_key: impl Fn() -> GreenKey,
     ) -> u64 {
-        self.meta
-            .resolve_cell_key(green_key_hash, Some(&make_green_key))
+        self.meta.resolve_cell_key_on_driver(
+            self.index().unwrap_or(0),
+            green_key_hash,
+            Some(&make_green_key),
+        )
     }
 
     /// Typed twin of [`Self::has_compiled_loop`], and the shape upstream
-    /// actually has: `warmstate.py:455-464` walks the bucket and tests
-    /// `comparekey(*greenargs)` before deciding anything, and only then
-    /// (`warmstate.py`) reads `cell.get_procedure_token()` and gates on
-    /// it. The hash form has no upstream counterpart at all — a bare bucket
-    /// hash can answer for whichever cell holds it — so this is the reader to
-    /// ask wherever the typed key is in scope at the decision point.
+    /// actually has: `warmstate.py maybe_compile_and_run` walks the bucket and
+    /// tests `comparekey(*greenargs)` before deciding anything, and only then
+    /// reads `cell.get_procedure_token()` and gates on it. The hash form has
+    /// no upstream counterpart at all — a bare bucket hash can answer for
+    /// whichever cell holds it — so this is the reader to ask wherever the
+    /// typed key is in scope at the decision point.
+    ///
+    /// Bound on this driver's WarmEnterState (`JitDriver::index`), not leftover
+    /// portal slot 0.
     ///
     /// Kept as the typed reader API even though its only callers today are
     /// tests: `the_typed_entry_predicate_reads_the_keys_own_cell_not_the_bucket_head`
@@ -10364,7 +10543,8 @@ impl<S: JitState> JitDriver<S> {
     /// and a chained bucket is the only state in which the two can differ.
     #[inline]
     pub fn has_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
-        self.meta.has_compiled_loop_for_key(key)
+        self.meta
+            .has_compiled_loop_for_key_on_driver(self.index().unwrap_or(0), key)
     }
 
     /// Actual key the last compile_loop stored under.
@@ -10441,7 +10621,7 @@ impl<S: JitState> JitDriver<S> {
         // (`memmgr.rs alive_loops` Arc owner) made `alive_loops`
         // a strong owner of every running loop, so releasing here
         // is the only path that drops those Arcs.
-        self.meta.warm_state.memory_manager.release_all_loops();
+        self.meta.release_all_driver_loops();
         self.meta.clear_compiled_loops();
     }
 
@@ -10463,7 +10643,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// Get the loop token number for a compiled loop.
     pub fn get_loop_token_number(&self, green_key: u64) -> Option<u64> {
-        self.meta.get_loop_token(green_key).map(|t| t.number)
+        self.get_loop_token(green_key).map(|t| t.number)
     }
 
     /// Get the owning token object for a compiled loop.
@@ -10471,7 +10651,7 @@ impl<S: JitState> JitDriver<S> {
         &self,
         green_key: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_loop_token_arc(green_key)
+        self.get_loop_token(green_key)
     }
 
     /// Get the pre-allocated token number for the trace being recorded.
@@ -10801,6 +10981,10 @@ impl<S: JitState> JitDriver<S> {
         // entry no direct reader preceded, so the replay must apply each write
         // as `execute_and_record` does as well as record it.
         execute_replay: bool,
+        // The objects the direct reader that preceded a recording-only entry
+        // allocated, by virtual number (`ResumeDataDirectReader`'s
+        // `all_virtuals`). Empty for an applying entry.
+        all_virtuals: &[Option<majit_ir::GcRef>],
     ) -> bool {
         // Same close as `force_start_tracing`: bridge codegen reads
         // `type_info_group` (`gctypelayout.py encode_type_shapes_now`).
@@ -10843,10 +11027,10 @@ impl<S: JitState> JitDriver<S> {
         if already_compiled {
             return false;
         }
-        let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
-            majit_metainterp::mc_diag_bump(15); // sbt early: no compiled_meta
-            return false;
-        };
+        // compile.py `_trace_and_compile_from_bridge` already gated on
+        // `rd_loop_token.loop_token_wref()` (`descr_owning_jct` above).
+        // `get_compiled_meta(green_key)` is the leftover numeric table;
+        // a live token with no `compiled_loops` row still traces.
 
         if !state.can_trace() {
             majit_metainterp::mc_diag_bump(16); // sbt early: !can_trace
@@ -10944,16 +11128,23 @@ impl<S: JitState> JitDriver<S> {
             self.last_bridge_is_exception_guard = false;
             return false;
         }
-        // resume.py:1050-1056 pushes a real MIFrame per encoded section and
-        // resumes in the INNERMOST one, which is what
-        // `bridge_from_guard_resume_position` rebuilds: every section becomes a
-        // frame with its own jitcode, its own resume pc and its own registers,
-        // and the callers underneath the guard get back the two fields the
-        // stream does not carry (their `BC_INLINE_CALL`'s result slot and the
-        // callee it named). `setup_bridge_sym` below still reads
-        // `frames.first()` alone, and that stays right: the state fields live
-        // on the root frame, and an inlined `#[jit_inline]` callee holds none
-        // of them.
+        // resume.py `ResumeDataBoxReader.__init__` parks storage, then
+        // `AbstractResumeDataReader._prepare` (`_prepare_virtuals` then
+        // `_prepare_pendingfields`) runs before `rebuild_from_resumedata`'s
+        // `newframe` / `consume_boxes`. `handle_guard_failure` already ran
+        // `create_history` (`start_retrace_from_guard` set `self.meta.tracing`).
+        // Park storage on that live ctx first; `prepare_bridge_resume` is
+        // `_prepare`; `rebuild_portal_framestack_from_resumedata` is
+        // `newframe` + `consume_boxes`; `setup_bridge_sym` fills the
+        // frontend after those frames exist.
+        if let Some(bfm) = resume_data_result.as_ref() {
+            let ctx = self
+                .meta
+                .tracing
+                .as_mut()
+                .expect("bridge: tracing context must be live after start_retrace_from_guard");
+            ctx.set_bridge_resume_data(bfm.clone());
+        }
         let mut sym = S::create_sym(&trace_meta, resume_pc);
         state.initialize_sym(&mut sym, &trace_meta);
         // `create_sym` numbers the state fields off its own `__offset`, which
@@ -11036,7 +11227,11 @@ impl<S: JitState> JitDriver<S> {
         // The parent loop (the guard's owning loop, keyed by `green_key`) lives
         // at this header pc; the bridge closes by JUMPing into it there, not at
         // its own `resume_pc`. Resolve before the `ctx` mutable borrow below.
-        let parent_header_pc = self.meta.loop_header_pc_for(green_key);
+        let parent_header_pc = self.meta.loop_header_pc_for_driver(
+            jct.outermost_jitdriver_index
+                .unwrap_or(self.index().unwrap_or(0)),
+            green_key,
+        );
         // pyjitpl.py `rebuild_state_after_failure` ends with
         // `synchronize_virtualizable()` / `check_synchronized_virtualizable()`,
         // both of which read the LIVE virtualizable.  Resolve it here (the same
@@ -11165,22 +11360,21 @@ impl<S: JitState> JitDriver<S> {
             // then a later field or box reads `fail_values[n]`). The caller
             // keeps this slice on a GC-visible holder for the whole call —
             // the deadframe, or `DeadFrameRefRoots` over the Ref slots.
-            // resume.py consume_boxes parity: decode the guard frame's
-            // per-bank live register indices here, where the dispatch JitCode
-            // + `liveness_info` are reachable, and stash them on the trace ctx.
-            // A JitDriver `setup_bridge_sym` (static, metainterp-blind) reads
-            // them back to map each decoded frame value to its sym slot. The
-            // macro mainloop bridge is single-frame, so the root frame's
-            // dispatch JitCode is the only coordinate needed.
+            // `resume.py` `rebuild_from_resumedata` walks every encoded
+            // section: `read_jitcode_pos_pc` then `newframe(jitcode)` then
+            // `consume_boxes` with that frame's `get_current_position_info`.
+            // Decode each section's live register indices here, where the
+            // jitcode table + `liveness_info` are reachable, and stash them
+            // on the trace ctx. A JitDriver `setup_bridge_sym` (static,
+            // metainterp-blind) reads the root banks back to map each
+            // decoded frame value to its sym slot.
             //
             // The frame's `pc` word is a position in the frame's OWN
-            // jitcode (`resume.py` `rebuild_from_resumedata` pairs each
-            // section's `jitcode_pos` with its `pc`; `consume_boxes` reads
-            // the live set from that jitcode). A frame resumed inside a
-            // runtime-registered jitcode carries a pc the portal jitcode
-            // cannot decode, and reading it there yields empty banks: every
-            // register of that frame then resumes unset. The dispatch
-            // jitcode is only the fallback for a section without an index.
+            // jitcode. A frame resumed inside a runtime-registered jitcode
+            // carries a pc the portal jitcode cannot decode, and reading it
+            // there yields empty banks: every register of that frame then
+            // resumes unset. The dispatch jitcode is only the fallback for
+            // a section without an index.
             let bridge_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
             let bridge_reg_indices = bfm.frames.first().and_then(|frame| {
                 let Ok(pc) = usize::try_from(frame.pc) else {
@@ -11204,12 +11398,12 @@ impl<S: JitState> JitDriver<S> {
             // `self.meta.tracing` (set by `start_retrace_from_guard`) must be
             // live by construction at this point. Skipping `setup_bridge_sym`
             // silently would leave the bridge sym uninitialized.
-            let sym = self
-                .sym
-                .as_mut()
-                .expect("bridge: sym must be live after S::create_sym");
-            // `Send` is the driver's storage bound, not the reader's, so drop
-            // it here rather than push it onto the `JitState` contract.
+            // resume.py `ResumeDataBoxReader.__init__`: one reader object for
+            // the whole `rebuild_from_resumedata` — `_prepare`, then
+            // `consume_boxes` per frame, then the frontend's
+            // `rebuild_state_after_failure` fill — so `virtuals_cache` and
+            // the deadframe values are one object's fields. Built inside the
+            // caller's deadframe root window, so the roots it registers nest.
             let replay_allocator: Option<&dyn crate::resume::BlackholeAllocator> = if execute_replay
             {
                 self.blackhole_allocator
@@ -11218,69 +11412,144 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 None
             };
-            let ctx = self
-                .meta
-                .tracing
-                .as_mut()
-                .expect("bridge: tracing context must be live");
-            if let Some(idx) = bridge_reg_indices {
-                ctx.set_bridge_reg_indices(idx);
-            }
-            // `consume_boxes` runs after this function returns and still
-            // has to `getvirtual_ptr` into the rebuilt `MIFrame` registers.
-            ctx.set_bridge_resume_data(bfm.clone());
-            // An entry that asked to apply and has no allocator to apply
-            // through cannot fall back to recording only: nothing else will
-            // write this guard's deferred stores.
-            //
-            // Only where there are any. `ResumeDataBoxReader` allocates and
-            // stores for the virtuals and the pending fields the stream
-            // carries and for nothing else, so a guard carrying neither asks
-            // the allocator for nothing and is served whether one exists or
-            // not.
-            if execute_replay
-                && replay_allocator.is_none()
-                && retrace.storage.as_deref().is_some_and(|storage| {
-                    !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
-                })
+            let virtual_count = retrace
+                .storage
+                .as_deref()
+                .map_or(0, |storage| storage.rd_virtuals().len());
+            let boxes: crate::VrefVableBoxes;
+            let mut reader = match replay_allocator {
+                Some(allocator) => crate::BridgeVirtualCache::executing(
+                    virtual_count,
+                    S::mint_bridge_array_descr,
+                    allocator,
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                ),
+                None => crate::BridgeVirtualCache::recording(
+                    virtual_count,
+                    S::mint_bridge_array_descr,
+                    all_virtuals,
+                ),
+            };
             {
-                ctx.mark_bridge_replay_incomplete();
+                let ctx = self
+                    .meta
+                    .tracing
+                    .as_mut()
+                    .expect("bridge: tracing context must be live");
+                if let Some(idx) = bridge_reg_indices {
+                    ctx.set_bridge_reg_indices(idx);
+                }
+                // An entry that asked to apply and has no allocator to apply
+                // through cannot fall back to recording only: nothing else will
+                // write this guard's deferred stores.
+                if execute_replay
+                    && replay_allocator.is_none()
+                    && retrace.storage.as_deref().is_some_and(|storage| {
+                        !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
+                    })
+                {
+                    ctx.mark_bridge_replay_incomplete();
+                }
+                let sym = self
+                    .sym
+                    .as_mut()
+                    .expect("bridge: sym must be live after S::create_sym");
+                S::prepare_bridge_resume(
+                    sym,
+                    ctx,
+                    bfm,
+                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    &mut reader,
+                );
+                // resume.py `rebuild_from_resumedata`:
+                // `consume_vref_and_vable_boxes` before the frame loop.
+                boxes = S::consume_vref_and_vable_boxes(
+                    sym,
+                    ctx,
+                    bfm,
+                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    &mut reader,
+                );
             }
-            S::setup_bridge_sym(
-                sym,
-                ctx,
-                bfm,
-                retrace.storage.as_deref().map(|s| s.rd_virtuals()),
-                frontend_fail_values,
-                &retrace.fail_types,
-                replay_allocator,
-            );
-            // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail: the
-            // call above is `rebuild_from_resumedata`, which leaves the
-            // virtualizable described by the trace's boxes and by nothing
-            // else — the object itself still holds whatever the compiled
-            // loop last spilled into it. Upstream closes the same routine
-            // by writing those boxes back, and an entry that asked to apply
-            // is the entry upstream reaches it from: no blackhole ran ahead
-            // of it, so no one else has written them.
-            //
-            // Assembler (virtualizable.py case 4) into tracing (case 2).
-            // CALL_MAY_FORCE left `vable_token` as the jitframe; a later
-            // non-GUARD_NOT_FORCED exit does not force. Reset to TOKEN_NONE
-            // before the first residual, which asserts that.
-            // The other site is resume.py `consume_vable_info`
-            // (`seed_bridge_virtualizable_boxes`).
-            if let Some((info, ptr)) = &live_vable
-                && info.has_vable_token()
-            {
-                unsafe {
-                    if info.is_token_nonnull_gcref(*ptr) {
-                        info.reset_token_gcref(*ptr as *mut u8);
-                    }
+            // resume.py `rebuild_from_resumedata`: `newframe(jitcode)` per
+            // encoded section then `consume_boxes`. `setup_bridge_sym` is
+            // `rebuild_state_after_failure`'s vable / pending / register
+            // fill and runs after those frames exist, matching
+            // `synchronize_virtualizable` after the newframe loop.
+            if let Some(mainjitcode) = self.dispatch_jitcode().cloned() {
+                let materialized: Vec<Option<std::sync::Arc<crate::jitcode::JitCode>>> = bfm
+                    .frames
+                    .iter()
+                    .map(|section| {
+                        usize::try_from(section.jitcode_index).ok().and_then(|pos| {
+                            S::resolve_resume_jitcode(pos)
+                                .or_else(|| self.meta.staticdata.jitcodes.get(pos).cloned())
+                        })
+                    })
+                    .collect();
+                let liveness = self.meta.staticdata.liveness_info.snapshot_arc();
+                let op_live = self.meta.staticdata.op_live as u8;
+                // `self.meta` directly: `reader` borrows this driver's
+                // allocator for the whole rebuild.
+                let rebuilt = self.meta.rebuild_portal_framestack_from_resumedata(
+                    mainjitcode,
+                    &bfm.frames,
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    &materialized,
+                    liveness.as_ref(),
+                    op_live,
+                    &mut reader,
+                );
+                if !rebuilt {
+                    drop(reader);
+                    self.meta.stage_abort_reason(AbortReason::Bridge.as_int());
+                    self.meta.abort_trace(false);
+                    self.clear_tracing_session_state();
+                    self.resume_data_result = None;
+                    self.last_bridge_is_exception_guard = false;
+                    return false;
                 }
             }
-            if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
-                ctx.synchronize_virtualizable_after_guard_failure();
+            {
+                let sym = self
+                    .sym
+                    .as_mut()
+                    .expect("bridge: sym must be live after S::create_sym");
+                let ctx = self
+                    .meta
+                    .tracing
+                    .as_mut()
+                    .expect("bridge: tracing context must be live");
+                S::setup_bridge_sym(
+                    sym,
+                    ctx,
+                    bfm,
+                    retrace.storage.as_deref().map(|s| s.rd_virtuals()),
+                    frontend_fail_values,
+                    &retrace.fail_types,
+                    &mut reader,
+                    &boxes,
+                );
+                // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail.
+                // Assembler (virtualizable.py case 4) into tracing (case 2).
+                if let Some((info, ptr)) = &live_vable
+                    && info.has_vable_token()
+                {
+                    unsafe {
+                        if info.is_token_nonnull_gcref(*ptr) {
+                            info.reset_token_gcref(*ptr as *mut u8);
+                        }
+                    }
+                }
+                if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
+                    ctx.synchronize_virtualizable_after_guard_failure();
+                }
             }
         }
         self.meta.begin_trace_session(trace_meta);
@@ -11663,6 +11932,37 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct IncompatibleDoorState;
+
+    impl JitState for IncompatibleDoorState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            false
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
     /// `compile.py make_and_attach_done_descrs([self, cpu])` runs from
     /// `MetaInterp::new`, which `JitDriver::new` calls, and again from
     /// `finish_setup_descrs_for_jitdrivers` when the descriptor is registered.
@@ -11890,7 +12190,7 @@ mod tests {
         });
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .set_confirm_enter_jit(Some(refuse));
         let mut pre_ran = false;
 
@@ -11932,7 +12232,7 @@ mod tests {
         });
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .set_confirm_enter_jit(Some(allow));
         let mut pre_ran = false;
 
@@ -12075,9 +12375,12 @@ mod tests {
         ));
         driver.meta.abort_trace(false);
         for _ in 1..MAX_TRACE_ABORT_COUNT {
-            driver.meta.warm_state_mut().abort_tracing(key, false);
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .abort_tracing(key, false);
         }
-        assert!(driver.meta.warm_state.is_ceiling_latched(key));
+        assert!(driver.meta.warm_state_for_driver(0).is_ceiling_latched(key));
 
         let mut state = CountingDoorState::default();
         assert!(
@@ -12106,28 +12409,34 @@ mod tests {
         // The key's own cell reaches its ceiling.
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .disable_noninlinable_function_for_key(&key);
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             driver
                 .meta
-                .warm_state_mut()
+                .warm_state_for_driver(0)
                 .abort_tracing_for_key(&key, false);
         }
         assert_eq!(
-            driver.meta.warm_state.get_stats().num_cells,
+            driver.meta.warm_state_for_driver(0).get_stats().num_cells,
             1,
             "one green key, one cell",
         );
-        assert!(driver.meta.warm_state.is_dont_trace_here(green_key));
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .is_dont_trace_here(green_key)
+        );
         let typed = driver
             .meta
-            .warm_state
+            .warm_state_for_driver(0)
             .lookup_chain_with_key(&key)
             .expect("the key's cell");
         assert!(
             typed
                 .flags
+                .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
             "dont-trace lives on the one cell this green key owns",
         );
@@ -12153,32 +12462,40 @@ mod tests {
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         assert_eq!(
-            driver.meta.warm_state.counter._get_index(occupant),
-            driver.meta.warm_state.counter._get_index(colliding),
+            driver.meta.jitcounter._get_index(occupant),
+            driver.meta.jitcounter._get_index(colliding),
             "fixture hashes must share one celltable slot",
         );
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .disable_noninlinable_function(occupant);
         let cell = driver
             .meta
-            .warm_state
+            .warm_state_for_driver(0)
             .lookup_chain(colliding)
             .expect("the colliding hash must see the occupied slot");
-        assert!(cell.next.is_none(), "the bucket must be a single cell");
-        assert_eq!(cell.cell_bucket, occupant);
-        assert_ne!(cell.cell_bucket, colliding);
+        assert!(
+            cell.next.borrow().is_none(),
+            "the bucket must be a single cell"
+        );
+        assert_eq!(cell.cell_bucket.get(), occupant);
+        assert_ne!(cell.cell_bucket.get(), colliding);
         assert!(
             cell.flags
+                .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE)
         );
 
-        let increment = driver.meta.warm_state.counter.compute_threshold(2);
+        let increment = driver
+            .meta
+            .warm_state_for_driver(0)
+            .counter
+            .compute_threshold(2);
         assert!(
             !driver
                 .meta
-                .warm_state
+                .warm_state_for_driver(0)
                 .counter
                 .would_tick_fire(colliding, increment),
             "the colliding hash has not been counted yet",
@@ -12193,7 +12510,7 @@ mod tests {
         assert!(
             driver
                 .meta
-                .warm_state
+                .warm_state_for_driver(0)
                 .counter
                 .would_tick_fire(colliding, increment),
             "a stranger in the slot must not swallow this hash's tick",
@@ -12221,17 +12538,18 @@ mod tests {
         let key = 0xD017_u64;
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .disable_noninlinable_function(key);
         let cell = driver
             .meta
-            .warm_state
+            .warm_state_for_driver(0)
             .lookup_chain(key)
             .expect("disable_noninlinable_function installs a cell");
-        assert!(cell.next.is_none());
-        assert_eq!(cell.cell_bucket, key);
+        assert!(cell.next.borrow().is_none());
+        assert_eq!(cell.cell_bucket.get(), key);
         assert!(
             cell.flags
+                .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE)
         );
         assert!(!cell.has_seen_a_procedure_token());
@@ -12254,7 +12572,10 @@ mod tests {
         // increment_function_threshold, not the back-edge increment.
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        driver.meta.warm_state_mut().set_function_threshold(2);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(2);
         let hash = 0xA11u64;
         let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
         let mut state = CountingDoorState {
@@ -12283,10 +12604,667 @@ mod tests {
     }
 
     #[test]
+    fn compiled_function_token_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run with increment_function_threshold
+        // is bound on that driver's WarmEnterState.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x7e14_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(74));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+
+        let found = driver.compiled_function_token(key);
+        assert!(
+            found.is_some_and(
+                |(cell_key, got)| cell_key == key && std::sync::Arc::ptr_eq(&got, &token)
+            ),
+            "function-entry compiled lookup on jd1 reads that driver's cell"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .get_compiled(key)
+                .is_none(),
+            "portal slot 0 does not hold jd1's compiled cell"
+        );
+    }
+
+    #[test]
+    fn resume_into_compiled_loop_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run / cell.get_procedure_token()
+        // is bound on that driver's WarmEnterState (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x7e19_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(79));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+
+        assert!(
+            driver.has_compiled_loop(key),
+            "compiled-loop resume lookup on jd1 reads that driver's cell"
+        );
+        assert!(
+            driver
+                .meta
+                .entry_procedure_token_on_driver(idx1, key)
+                .is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
+            "entry token on jd1 is the attached compiled token"
+        );
+        assert!(
+            driver.meta.entry_procedure_token(key).is_none(),
+            "portal slot 0 does not hold jd1's compiled cell"
+        );
+    }
+
+    #[test]
+    fn has_compiled_loop_for_key_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run / cell.get_procedure_token()
+        // via comparekey is bound on that driver's WarmEnterState
+        // (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = GreenKey::new(vec![0x7e1a]);
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(80));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp_for_key(&key, std::sync::Arc::clone(&token));
+
+        assert!(
+            driver.has_compiled_loop_for_key(&key),
+            "typed compiled-loop lookup on jd1 reads that driver's cell"
+        );
+        assert!(
+            !driver.meta.has_compiled_loop_for_key(&key),
+            "portal slot 0 does not hold jd1's compiled cell"
+        );
+    }
+
+    #[test]
+    fn resolve_cell_key_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run matches greens on that driver's
+        // WarmEnterState (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = GreenKey::with_types(vec![0x7e16], vec![GreenType::Int]);
+        let hash = key.get_uhash();
+        // Occupy the raw hash so the typed cell mints a distinct identity.
+        // A miss on portal 0 also returns `hash`; the minted key is what
+        // proves the shipped resolve walked jd1.
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .disable_noninlinable_function(hash);
+        let cell_key = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_key(&key);
+        assert_ne!(cell_key, hash, "typed cell on jd1 must mint a distinct key");
+
+        let found = driver.resolve_cell_key(hash, || key.clone());
+        assert_eq!(
+            found, cell_key,
+            "function-entry resolve on jd1 reads that driver's cell"
+        );
+        let make = || key.clone();
+        let portal = driver.meta.resolve_cell_key(hash, Some(&make));
+        assert_eq!(
+            portal, hash,
+            "portal slot 0 does not see jd1's cell and returns the unmatched hash"
+        );
+    }
+
+    #[test]
+    fn invalidate_loop_reads_the_entry_driver() {
+        // cpu.invalidate_loop runs on the token filed on that driver's
+        // WarmEnterState (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x7e17_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(77));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+
+        driver.invalidate_loop(key);
+        assert!(
+            token.is_invalidated(),
+            "invalidate_loop on jd1 hits that driver's token"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .get_procedure_token(key)
+                .is_none(),
+            "portal slot 0 has no token"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .is_none(),
+            "portal slot 0 has no cell to invalidate"
+        );
+    }
+
+    #[test]
+    fn back_edge_incompatible_invalidates_the_entry_driver() {
+        // cpu.invalidate_loop runs on the token filed on that driver's
+        // WarmEnterState (`JitDriver::index`).
+        let mut driver = JitDriver::<IncompatibleDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x7e18_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(78));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+        driver.insert_compiled_loop(
+            key,
+            crate::pyjitpl::CompiledEntry {
+                token: std::sync::Arc::downgrade(&token),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        let mut state = IncompatibleDoorState;
+        let result = driver.back_edge_resolved(
+            key,
+            std::sync::Arc::clone(&token),
+            0,
+            &mut state,
+            &(),
+            || {},
+        );
+        assert!(
+            result.is_none(),
+            "incompatible compiled entry declines the run"
+        );
+        assert!(
+            token.is_invalidated(),
+            "incompatible compiled entry on jd1 invalidates that driver's token"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .get_procedure_token(key)
+                .is_none(),
+            "portal slot 0 has no token"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .is_none(),
+            "portal slot 0 has no cell to invalidate"
+        );
+    }
+
+    #[test]
+    fn runnable_procedure_token_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run is bound on that driver's
+        // WarmEnterState (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x7e15_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(76));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+        driver.insert_compiled_loop(
+            key,
+            crate::pyjitpl::CompiledEntry {
+                token: std::sync::Arc::downgrade(&token),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        let found = driver.runnable_procedure_token(key);
+        assert!(
+            found.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
+            "runnable_procedure_token on jd1 reads that driver's cell"
+        );
+        assert!(
+            driver.meta.entry_procedure_token(key).is_none(),
+            "portal slot 0 does not hold jd1's compiled cell"
+        );
+    }
+
+    #[test]
+    fn get_compiled_meta_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run / JitCell.get_procedure_token
+        // stay on jitdriver_sd.warmstate; the compiled_loops row for that
+        // cell uses the executing driver's index (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x7e1b_u64;
+        let meta0 = Arc::new(());
+        let meta1 = Arc::new(());
+        let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
+            token: std::sync::Weak::new(),
+            meta,
+            front_target_tokens: Vec::new(),
+            front_entry_index: None,
+            front_target_source_positions: None,
+            root_trace_id,
+            traces: crate::FxIndexMap::default(),
+            previous_tokens: Vec::new(),
+            loop_header_pc: None,
+            next_global_opref: 0,
+        };
+        driver
+            .meta
+            .insert_compiled_loop_on_driver(idx0, key, entry(Arc::clone(&meta0), 1));
+        driver
+            .meta
+            .insert_compiled_loop_on_driver(idx1, key, entry(Arc::clone(&meta1), 2));
+        driver.meta.active_jitdriver_sd = Some(idx0);
+        assert!(
+            driver
+                .get_compiled_meta(key)
+                .is_some_and(|got| Arc::ptr_eq(got, &meta1)),
+            "get_compiled_meta on jd1 returns that driver's compiled_loops meta"
+        );
+    }
+
+    #[test]
+    fn back_edge_empty_chain_ticks_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run `:465-469` ticks
+        // jitdriver_sd.warmstate's counter.
+        let mut driver = JitDriver::<CountingDoorState>::new(100);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.meta.warm_state_for_driver(idx1).set_threshold(1);
+
+        let hash = 0xBE11_u64;
+        let state = CountingDoorState::default();
+        assert!(
+            matches!(driver.back_edge_warmth(hash, &state), BackEdgeWarmth::Trace),
+            "empty-chain tick on jd1 fires that driver's threshold"
+        );
+        let increment = driver
+            .meta
+            .warm_state_for_driver(0)
+            .counter
+            .compute_threshold(100);
+        assert!(
+            !driver
+                .meta
+                .warm_state_for_driver(0)
+                .counter
+                .would_tick_fire(hash, increment),
+            "portal slot 0 must not consume the back-edge tick"
+        );
+    }
+
+    #[test]
+    fn abort_entry_tracing_clears_the_entry_driver() {
+        // warmstate.py bound_reached finally clears JC_TRACING on
+        // that driver's cell, not leftover portal slot 0.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0xAB07_u64;
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .mark_as_being_traced(key);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .mark_as_being_traced(key);
+        driver.abort_entry_tracing(key);
+
+        let extra = driver
+            .meta
+            .warm_state_ref_for_driver(idx1)
+            .expect("jd1 warmstate");
+        let extra_cell = extra.cell_by_key(key).expect("jd1 cell");
+        assert!(
+            !extra_cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_TRACING),
+            "bound_reached finally clears JC_TRACING on that driver's cell"
+        );
+        assert!(
+            !extra_cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+            "finally does not set JC_DONT_TRACE_HERE"
+        );
+        drop(extra);
+        let primary_cell = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_by_key(key)
+            .expect("jd0 cell");
+        assert!(
+            primary_cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_TRACING),
+            "portal slot 0 keeps its own tracing cell"
+        );
+    }
+
+    #[test]
+    fn cell_is_tracing_reads_the_entry_driver() {
+        // warmstate.py cell.flags & JC_TRACING is bound on that driver's
+        // WarmEnterState (`JitDriver::index`).
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(driver.index(), Some(1));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0xAB08_u64;
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .mark_as_being_traced(key);
+        assert!(
+            driver.cell_is_tracing(key),
+            "cell_is_tracing on jd1 reads that driver's JC_TRACING"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .is_none_or(|cell| !cell
+                    .flags
+                    .get()
+                    .contains(crate::warmstate::JcFlags::JC_TRACING)),
+            "portal slot 0 does not hold jd1's tracing cell"
+        );
+    }
+
+    #[test]
+    fn set_param_writes_the_entry_driver() {
+        // rlib/jit.py set_param(driver, name, value) writes that
+        // driver's WarmEnterState, not leftover portal slot 0.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = driver.register_descriptor(first);
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx1 = driver.register_descriptor(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let primary_before = driver.meta.warm_state_for_driver(0).threshold();
+        driver.set_param("threshold", 7);
+        driver.set_param_enable_opts("intbounds");
+        assert_eq!(
+            driver.meta.warm_state_for_driver(idx1).threshold(),
+            7,
+            "set_param on jd1 writes that driver's threshold"
+        );
+        assert_eq!(
+            driver.meta.warm_state_for_driver(0).threshold(),
+            primary_before,
+            "portal slot 0 keeps its own threshold"
+        );
+        assert_eq!(
+            driver
+                .meta
+                .warm_state_ref_for_driver(idx1)
+                .expect("jd1 warmstate")
+                .get_enable_opts(),
+            &["intbounds".to_string()][..],
+            "set_param_enable_opts on jd1 writes that driver's enable_opts"
+        );
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .get_enable_opts()
+                .iter()
+                .any(|opt| opt == "unroll"),
+            "portal slot 0 keeps the default unroll pass"
+        );
+        driver.set_max_unroll_recursion(3);
+        assert_eq!(
+            driver
+                .meta
+                .warm_state_for_driver(idx1)
+                .max_unroll_recursion(),
+            3,
+            "set_max_unroll_recursion on jd1 writes warmrunnerdesc.memory_manager"
+        );
+        assert_eq!(
+            driver.meta.warm_state_for_driver(0).max_unroll_recursion(),
+            3,
+            "every WarmEnterState reads the one warmrunnerdesc.memory_manager"
+        );
+        driver.set_threshold(17);
+        driver.set_trace_eagerness(4);
+        assert_eq!(
+            driver.meta.warm_state_for_driver(idx1).threshold(),
+            17,
+            "set_threshold on jd1 writes that driver's WarmEnterState"
+        );
+        assert_eq!(
+            driver.meta.warm_state_for_driver(idx1).trace_eagerness(),
+            4,
+            "set_trace_eagerness on jd1 writes that driver's WarmEnterState"
+        );
+    }
+
+    #[test]
     fn suppress_function_entry_skips_the_next_door_only() {
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        driver.meta.warm_state_mut().set_function_threshold(1);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(1);
         let hash = 0xB0Du64;
         let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
         let mut state = CountingDoorState {
@@ -12380,6 +13358,77 @@ mod tests {
         assert_eq!(state.restored_values, typed_live_values);
         assert_eq!(state.raw_restore_calls, 0);
         assert_eq!(state.typed_restore_calls, 1);
+    }
+
+    #[test]
+    fn run_compiled_detailed_keyed_reads_the_entry_driver() {
+        // warmstate.py maybe_compile_and_run / execute_assembler
+        // run the cell on jitdriver_sd.warmstate (`JitDriver::index()`),
+        // not leftover active_jitdriver_sd / portal 0.
+        let mut driver = JitDriver::<TypedInputState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 12u64;
+        let typed_live_values = vec![Value::Int(1), Value::Ref(GcRef(0x1234)), Value::Float(3.5)];
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
+            let i0 = OpRef::input_arg_int(0);
+            let r1 = OpRef::input_arg_ref(1);
+            let f2 = OpRef::input_arg_float(2);
+            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
+            ctx.set_fail_args(g, &[i0, r1, f2]);
+        }
+        driver.meta.compile_loop(
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_float(2),
+            ],
+            (),
+        );
+        let token = driver
+            .meta
+            .get_procedure_token_on_driver(0, key)
+            .expect("compiled token on the tracing driver");
+        let entry = driver
+            .meta
+            .take_compiled_loop(key)
+            .expect("compiled_loops row on the tracing driver");
+        driver.meta.insert_compiled_loop_on_driver(1, key, entry);
+        driver
+            .meta
+            .warm_state_for_driver(1)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+        driver.meta.active_jitdriver_sd = Some(0);
+        assert!(
+            driver
+                .meta
+                .run_compiled_detailed_with_values(key, &typed_live_values)
+                .is_none(),
+            "portal 0 wrapper must miss jd1's compiled_loops row"
+        );
+        let result = driver
+            .meta
+            .run_compiled_detailed_with_values_on_driver(1, key, &typed_live_values, 0)
+            .expect("execute_assembler reads jitdriver_sd.warmstate for jd1");
+        assert!(!result.is_finish);
     }
 
     #[test]
@@ -12717,7 +13766,10 @@ mod tests {
     fn close_loop_with_args_retrace_cancel_keeps_walk() {
         let mut driver = JitDriver::<AcceptCloseState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        driver.meta.warm_state.set_param("max_unroll_loops", 1);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_param("max_unroll_loops", 1);
         let mut state = AcceptCloseState::default();
         let key = 42u64;
         driver.force_start_tracing(key, 0, &mut state, &());
@@ -12728,12 +13780,12 @@ mod tests {
         token.record_target_token(crate::history::TargetToken::new_loop(1).as_jump_target_descr());
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .memory_manager
             .keep_loop_alive(&token);
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
         driver.meta.partial_trace = Some(crate::pyjitpl::PartialTrace {
             ops: Vec::new(),
@@ -12929,10 +13981,12 @@ mod tests {
         });
 
         assert!(!driver.is_tracing());
-        let warmstate = driver.meta.warm_state_mut();
-        assert!(!warmstate.can_inline_callable(CALLEE));
-        assert!(warmstate.can_inline_callable(ROOT));
-        assert!(!warmstate.should_force_finish_tracing(ROOT));
+        {
+            let warmstate = driver.meta.warm_state_for_driver(0);
+            assert!(!warmstate.can_inline_callable(CALLEE));
+            assert!(warmstate.can_inline_callable(ROOT));
+            assert!(!warmstate.should_force_finish_tracing(ROOT));
+        }
         // A fresh attempt must remain possible after the callee is disabled.
         driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
@@ -12942,19 +13996,13 @@ mod tests {
         );
     }
 
-    /// `TraceAction::AbortPermanent` retires the trace's green key through
-    /// `abort_trace(true)` -> `disable_noninlinable_function`.  For a PRIMARY
-    /// trace that key names the code the walk gave up on, which is
-    /// `codewriter/policy.py look_inside_graph` answering "no".  A BRIDGE's
-    /// green key names the SOURCE LOOP instead — a loop that already compiled
-    /// — and `JC_DONT_TRACE_HERE` is also what `can_inline_callable`
-    /// (`warmstate.py`) reads, so the permanent answer additionally made the
-    /// whole enclosing function non-inlinable everywhere.  `pyjitpl.py`
-    /// `handle_guard_failure` never reaches that flag: its unwind ends in
-    /// `run_blackhole_interp_to_cancel_tracing` -> `aborted_tracing(reason)`.
-    ///
-    /// Both halves run in one test so the assertion is a difference between
-    /// the two sessions, not a claim about `AbortPermanent` in general.
+    /// `pyjitpl.py aborted_tracing` does not set `JC_DONT_TRACE_HERE`.
+    /// A BRIDGE's green key names the SOURCE LOOP — a loop that already
+    /// compiled — and `can_inline_callable` (`warmstate.py`) reads that
+    /// flag, so `abort_trace(true)` would additionally make the enclosing
+    /// function non-inlinable everywhere. `handle_guard_failure` never
+    /// reaches that flag: its unwind ends in
+    /// `run_blackhole_interp_to_cancel_tracing` → `aborted_tracing(reason)`.
     #[test]
     fn an_abort_permanent_on_a_bridge_does_not_retire_the_source_loop() {
         #[derive(Debug)]
@@ -12974,11 +14022,11 @@ mod tests {
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
         assert!(
-            !driver
+            driver
                 .meta
-                .warm_state_mut()
+                .warm_state_for_driver(0)
                 .can_inline_callable(primary_key),
-            "a primary AbortPermanent must retire the key it names",
+            "a primary AbortPermanent must not stamp JC_DONT_TRACE_HERE",
         );
 
         let bridge_pc = 11usize;
@@ -12997,7 +14045,10 @@ mod tests {
         let before = crate::mc_diag(82);
         driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
         assert!(
-            driver.meta.warm_state_mut().can_inline_callable(bridge_key),
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .can_inline_callable(bridge_key),
             "an AbortPermanent reached from a guard retired the source loop",
         );
         // `MC_DIAG` is a process-wide static, so a concurrent test can only
@@ -13005,6 +14056,55 @@ mod tests {
         assert!(
             crate::mc_diag(82) > before,
             "the bridge arm must name itself in slot 82",
+        );
+    }
+
+    /// `pyjitpl.py aborted_tracing` does not set `JC_DONT_TRACE_HERE`.
+    /// `disable_noninlinable_function` is only the ABORT_TOO_LONG arm of
+    /// `blackhole_if_trace_too_long`. A primary `AbortPermanent` is the
+    /// same `SwitchToBlackhole` unwind: clear `JC_TRACING`, leave the
+    /// cell inlinable.
+    #[test]
+    fn an_abort_permanent_on_a_primary_trace_clears_tracing_without_dont_trace_here() {
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = ScalarWalkState {
+            selected: 3,
+            writeback_applied: None,
+        };
+
+        let primary_pc = 7usize;
+        let primary_key = primary_pc as u64;
+        driver.force_start_tracing(primary_key, primary_pc, &mut state, &());
+        assert!(driver.is_tracing(), "fixture: the primary trace started");
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(primary_key)
+                .is_some_and(|cell| cell.is_tracing()),
+            "force_start_tracing marked JC_TRACING"
+        );
+        driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
+        assert!(!driver.is_tracing(), "AbortPermanent ended the session");
+        let cell = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_by_key(primary_key)
+            .expect("the aborted cell remains");
+        assert!(
+            !cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_TRACING),
+            "aborted_tracing clears JC_TRACING"
+        );
+        assert!(
+            !cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+            "aborted_tracing does not set JC_DONT_TRACE_HERE"
         );
     }
 
@@ -13188,14 +14288,18 @@ mod tests {
         driver.meta.finish_setup_descrs_for_jitdrivers();
 
         compile_once_at(&mut driver, key, first_adds);
-        let first_opref = driver.meta.compiled_loops[&key].next_global_opref;
+        let first_opref = driver
+            .meta
+            .compiled_entry(key)
+            .expect("compiled entry")
+            .next_global_opref;
         // `compile_loop` can only ever carry `loop_header_pc` forward, never
         // mint one, so stamp the first entry the way a closing bridge does.
         driver.meta.record_loop_header_pc(key, header_pc);
 
-        driver.meta.warm_state.invalidate_all();
+        driver.meta.warm_state_for_driver(0).invalidate_all();
         assert!(
-            driver.meta.compiled_loops.contains_key(&key),
+            driver.meta.has_compiled_loop_entry(key),
             "invalidating the token must leave the entry to be displaced"
         );
 
@@ -13205,7 +14309,7 @@ mod tests {
             2,
             "the second compile did not happen"
         );
-        let replacement = &driver.meta.compiled_loops[&key];
+        let replacement = &driver.meta.compiled_entry(key).expect("compiled entry");
         (
             first_opref,
             replacement.next_global_opref,
@@ -13224,7 +14328,11 @@ mod tests {
         let mut probe = JitDriver::<TypedRestoreState>::new(2);
         probe.meta.finish_setup_descrs_for_jitdrivers();
         compile_once_at(&mut probe, 91, 1);
-        let short_alone = probe.meta.compiled_loops[&91].next_global_opref;
+        let short_alone = probe
+            .meta
+            .compiled_entry(91)
+            .expect("compiled entry")
+            .next_global_opref;
 
         let (first, replacement, _) = compile_twice_at_one_green_key(77, 4242, 8, 1);
         assert!(
@@ -13538,6 +14646,7 @@ mod tests {
             &fail_values,
             0,
             false,
+            &[],
         );
         assert!(!started);
         assert!(!driver.meta.is_tracing());
@@ -13606,11 +14715,21 @@ mod tests {
             ctx.set_fail_args(guard, &[]);
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
-        let failure = driver.meta.run_compiled_detailed(green_key, &[0]).unwrap();
+        // warmstate.py maybe_compile_and_run reads the compiling
+        // jitdriver_sd.warmstate cell, not leftover portal 0.
+        let failure = driver
+            .meta
+            .run_compiled_detailed_with_values_on_driver(
+                source_driver,
+                green_key,
+                &[Value::Int(0)],
+                0,
+            )
+            .unwrap();
         let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
         let descr = failure.descr_arc.clone().unwrap();
         let mut state = BridgeState;
-        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false));
+        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false, &[]));
         assert_eq!(driver.meta.active_jitdriver_sd, Some(source_driver));
         assert_eq!(
             driver
@@ -13619,6 +14738,265 @@ mod tests {
                 .and_then(|ctx| ctx.driver_descriptor())
                 .and_then(|descriptor| descriptor.index),
             Some(source_driver),
+        );
+    }
+
+    #[test]
+    fn start_bridge_tracing_starts_when_compiled_loops_misses() {
+        // compile.py `_trace_and_compile_from_bridge` gates on
+        // `rd_loop_token.loop_token_wref()`, not the leftover
+        // `compiled_loops` row.
+        struct BridgeState;
+        impl JitState for BridgeState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+            fn build_meta(&self, _: usize, _: &()) {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                vec![0]
+            }
+            fn create_sym(_: &(), _: usize) {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                vec![]
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn rebuild_from_resumedata(
+                _: &mut (),
+                fail_arg_types: &[Type],
+                storage: Option<&Arc<crate::resume::ResumeStorage>>,
+            ) -> Option<crate::ResumeDataResult> {
+                assert!(fail_arg_types.is_empty());
+                Some(crate::ResumeDataResult {
+                    frames: vec![],
+                    virtualizable_boxes: vec![],
+                    virtualref_values: vec![],
+                    storage: storage.cloned(),
+                    num_failargs: 0,
+                    fail_arg_types: vec![],
+                })
+            }
+        }
+        let mut driver = JitDriver::<BridgeState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let source_driver = driver
+            .register_descriptor(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+        let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
+        let green_key = 407;
+        assert!(matches!(
+            driver
+                .meta
+                .force_start_tracing(green_key, (0, 0), Some(descriptor), &[Value::Int(0)],),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().unwrap();
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(guard, &[]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let failure = driver
+            .meta
+            .run_compiled_detailed_with_values_on_driver(
+                source_driver,
+                green_key,
+                &[Value::Int(0)],
+                0,
+            )
+            .unwrap();
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
+        let descr = failure.descr_arc.clone().unwrap();
+        assert!(driver.meta.take_compiled_loop(green_key).is_some());
+        assert!(driver.meta.get_compiled_meta(green_key).is_none());
+        let mut state = BridgeState;
+        assert!(
+            driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false, &[]),
+            "live loop_token_wref starts a bridge without compiled_loops"
+        );
+        assert!(driver.meta.is_tracing());
+    }
+
+    #[test]
+    fn setup_bridge_sym_runs_after_rebuild_seats_frames() {
+        // `rebuild_state_after_failure` runs `newframe` / `consume_boxes`
+        // then `synchronize_virtualizable`. `setup_bridge_sym` fills the
+        // frontend after those frames exist.
+        use std::cell::Cell;
+
+        use majit_ir::resumedata::RebuiltFrame;
+        use majit_jitcode::insns::BC_LIVE;
+        use majit_jitcode::jitcode::JitCodeBody;
+
+        thread_local! {
+            static FRAMESTACK_LEN_AT_PREPARE: Cell<Option<usize>> = const { Cell::new(None) };
+            static FRAMESTACK_LEN_AT_SETUP: Cell<Option<usize>> = const { Cell::new(None) };
+            static META_PTR: Cell<*const crate::pyjitpl::MetaInterp<()>> =
+                const { Cell::new(std::ptr::null()) };
+        }
+
+        struct MetaPtrReset;
+        impl Drop for MetaPtrReset {
+            fn drop(&mut self) {
+                META_PTR.with(|p| p.set(std::ptr::null()));
+            }
+        }
+
+        struct BridgePendingOrderState;
+        impl JitState for BridgePendingOrderState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+            fn build_meta(&self, _: usize, _: &()) {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                vec![0]
+            }
+            fn create_sym(_: &(), _: usize) {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                vec![]
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn rebuild_from_resumedata(
+                _: &mut (),
+                fail_arg_types: &[Type],
+                storage: Option<&Arc<crate::resume::ResumeStorage>>,
+            ) -> Option<crate::ResumeDataResult> {
+                assert!(fail_arg_types.is_empty());
+                Some(crate::ResumeDataResult {
+                    frames: vec![RebuiltFrame {
+                        jitcode_index: 0,
+                        pc: 0,
+                        values: vec![],
+                    }],
+                    virtualizable_boxes: vec![],
+                    virtualref_values: vec![],
+                    storage: storage.cloned(),
+                    num_failargs: 0,
+                    fail_arg_types: vec![],
+                })
+            }
+            fn prepare_bridge_resume(
+                _: &mut (),
+                _: &mut crate::TraceCtx,
+                _: &crate::ResumeDataResult,
+                _: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                _: &[i64],
+                _: &[Type],
+                _: &mut crate::BridgeVirtualCache<'_>,
+            ) {
+                FRAMESTACK_LEN_AT_PREPARE.with(|c| {
+                    c.set(META_PTR.with(|p| {
+                        let ptr = p.get();
+                        if ptr.is_null() {
+                            None
+                        } else {
+                            Some(unsafe { &*ptr }.framestack.frames.len())
+                        }
+                    }))
+                });
+            }
+            fn setup_bridge_sym(
+                _: &mut (),
+                _: &mut crate::TraceCtx,
+                _: &crate::ResumeDataResult,
+                _: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                _: &[i64],
+                _: &[Type],
+                _: &mut crate::BridgeVirtualCache<'_>,
+                _: &crate::VrefVableBoxes,
+            ) {
+                FRAMESTACK_LEN_AT_SETUP.with(|c| {
+                    c.set(META_PTR.with(|p| {
+                        let ptr = p.get();
+                        if ptr.is_null() {
+                            None
+                        } else {
+                            Some(unsafe { &*ptr }.framestack.frames.len())
+                        }
+                    }))
+                });
+            }
+        }
+
+        FRAMESTACK_LEN_AT_PREPARE.with(|c| c.set(None));
+        FRAMESTACK_LEN_AT_SETUP.with(|c| c.set(None));
+        let mut driver = JitDriver::<BridgePendingOrderState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.register_descriptor(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+
+        let jc = crate::jitcode::JitCode::new("bridge-pending-order");
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0, 0],
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        let jitcode = std::sync::Arc::new(jc);
+        {
+            let sd = std::sync::Arc::get_mut(&mut driver.meta.staticdata)
+                .expect("staticdata uniquely owned before tracing");
+            sd.op_live = i32::from(BC_LIVE);
+            sd.jitcodes.push(jitcode.clone());
+        }
+        driver.install_extracted_portal_jitcode(jitcode);
+
+        let green_key = 407u64;
+        assert!(matches!(
+            driver
+                .meta
+                .force_start_tracing(green_key, (0, 0), None, &[Value::Int(0)]),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().unwrap();
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(guard, &[]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let failure = driver
+            .meta
+            .run_compiled_detailed(green_key, &[0])
+            .expect("guard should fail");
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
+        let descr = failure.descr_arc.clone().unwrap();
+        drop(failure);
+
+        META_PTR.with(|p| p.set(&driver.meta as *const _));
+        let _reset = MetaPtrReset;
+        let mut state = BridgePendingOrderState;
+        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false, &[]));
+        assert_eq!(
+            FRAMESTACK_LEN_AT_PREPARE.with(|c| c.get()),
+            Some(0),
+            "_prepare runs while framestack is empty"
+        );
+        assert_eq!(
+            FRAMESTACK_LEN_AT_SETUP.with(|c| c.get()),
+            Some(1),
+            "setup_bridge_sym runs after rebuild_from_resumedata seats frames"
+        );
+        assert_eq!(
+            driver.meta.framestack.frames.len(),
+            1,
+            "rebuild_portal_framestack_from_resumedata seats frames before setup_bridge_sym"
+        );
+        assert_eq!(
+            driver.portal_framestack_len(),
+            1,
+            "call_jit skips a second rebuild_from_resumedata when frames are already seated"
         );
     }
 
@@ -13876,7 +15254,7 @@ mod tests {
         let key_c = sd.unwrap_greenkey(&[7, 0x2000]);
 
         let mut cell = BaseJitCell::new();
-        cell.comparekey = Some(key_a);
+        *cell.comparekey.borrow_mut() = Some(key_a);
         assert!(cell.comparekey_matches(&key_b));
         assert!(!cell.comparekey_matches(&key_c));
     }
@@ -13908,7 +15286,7 @@ mod tests {
         let token = alive_tmp_token(driver);
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .attach_tmp_callback_to_interp(green_key, token);
     }
 
@@ -13918,7 +15296,7 @@ mod tests {
         let token = alive_tmp_token(driver);
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .attach_tmp_callback_to_interp_for_key(key, token);
     }
 
@@ -13926,7 +15304,7 @@ mod tests {
         driver: &mut JitDriver<S>,
     ) -> std::sync::Arc<majit_backend::JitCellToken> {
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
-            driver.meta.warm_state_mut().alloc_token_number(),
+            driver.meta.warm_state_for_driver(0).alloc_token_number(),
         ));
         token.set_compiled(Box::new(()));
         // `compile.py` — `compile_tmp_callback` registers the token
@@ -13935,7 +15313,7 @@ mod tests {
         // the token dies here and the cell reads back as "never compiled".
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .memory_manager
             .keep_loop_alive(&token);
         token
@@ -14006,19 +15384,29 @@ mod tests {
         let token_number = {
             let cell = driver
                 .meta
-                .warm_state
+                .warm_state_for_driver(0)
                 .lookup_chain(green_key)
                 .expect("the temporary callback installed one cell");
-            assert!(cell.next.is_none(), "the fast path only owns a lone cell");
-            assert_eq!(cell.cell_bucket, green_key);
+            assert!(
+                cell.next.borrow().is_none(),
+                "the fast path only owns a lone cell"
+            );
+            assert_eq!(cell.cell_bucket.get(), green_key);
             assert!(cell.comparekey_matches(&key));
-            assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
+            assert!(
+                cell.flags
+                    .get()
+                    .contains(crate::warmstate::JcFlags::JC_TEMPORARY)
+            );
             assert!(!cell.is_tracing());
             cell.get_procedure_token()
                 .expect("the callback token is live")
                 .number
         };
-        assert_eq!(driver.meta.warm_state.get_stats().num_cells, 1);
+        assert_eq!(
+            driver.meta.warm_state_for_driver(0).get_stats().num_cells,
+            1
+        );
 
         let mut state = CountingDoorState {
             code_ptr,
@@ -14038,21 +15426,25 @@ mod tests {
         );
         assert!(driver.meta.is_tracing());
         assert_eq!(
-            driver.meta.warm_state.get_stats().num_cells,
+            driver.meta.warm_state_for_driver(0).get_stats().num_cells,
             1,
             "bound_reached must mark the found cell, not install another",
         );
 
         let cell = driver
             .meta
-            .warm_state
+            .warm_state_for_driver(0)
             .lookup_chain(green_key)
             .expect("the original cell is still the bucket");
-        assert!(cell.next.is_none());
+        assert!(cell.next.borrow().is_none());
         assert!(cell.is_tracing());
-        assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
+        assert!(
+            cell.flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_TEMPORARY)
+        );
         assert!(cell.comparekey_matches(&key));
-        assert_eq!(cell.cell_key, Some(green_key));
+        assert_eq!(cell.cell_key.get(), Some(green_key));
         assert_eq!(
             cell.get_procedure_token()
                 .expect("the callback token stays on the found cell")
@@ -14075,21 +15467,24 @@ mod tests {
         // A hash-only writer files the cell and gives it a code-bearing token.
         // The typed writer for the SAME key stamps that cell (`JitCell.__init__`).
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
-            driver.meta.warm_state_mut().alloc_token_number(),
+            driver.meta.warm_state_for_driver(0).alloc_token_number(),
         ));
         token.set_compiled(Box::new(()));
         // See `attach_tmp_callback_cell`: `alive_loops` is the token's only
         // strong owner (`memmgr.py:9-14`).
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .memory_manager
             .keep_loop_alive(&token);
         driver
             .meta
-            .warm_state_mut()
+            .warm_state_for_driver(0)
             .attach_tmp_callback_to_interp_for_key(&key, token);
-        driver.meta.warm_state_mut().mark_dont_trace_for_key(&key);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .mark_dont_trace_for_key(&key);
 
         assert!(
             !driver.meta.green_key_bucket_is_chained(hash),

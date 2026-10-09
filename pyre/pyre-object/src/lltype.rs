@@ -503,6 +503,41 @@ pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
     malloc_typed(value)
 }
 
+/// `malloc_fixedsize` (`framework.py` `gct_fv_gc_malloc`) with the address
+/// kept stable: `external_malloc(..., alloc_young=True)` (`incminimark.py`).
+/// The object is born young, so the first minor collection that does not
+/// reach it frees it, and it never relocates, so a method that re-derives
+/// `self` from a raw `PyObjectRef` across an allocating call keeps a valid
+/// pointer — the one property [`malloc_typed_stable`] was taken for. What
+/// the old-generation birth bought on top of that, surviving to the next
+/// major with no root at all, is not a property any RPython object has.
+///
+/// The barrier covers the births the young hook declines (no hook
+/// installed, a weakref type, `MAJIT_GC_YOUNG_RAWMALLOC=0`), which land old
+/// with `TRACK_YOUNG_PTRS` set; on a young block it is a no-op.
+#[inline]
+pub fn malloc_typed_young_nonmoving<T: GcType>(value: T) -> *mut T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        T::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(type_id, T::SIZE);
+    if raw.is_null() {
+        malloc_typed(value)
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut T, value);
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
+            raw as *mut T
+        }
+    }
+}
+
 /// Stable-address variant of [`malloc_typed`]: routes through the
 /// non-moving old-gen allocator (`try_gc_alloc_stable_raw`) so the object
 /// never relocates across a later collection.  A self-mutating typed payload

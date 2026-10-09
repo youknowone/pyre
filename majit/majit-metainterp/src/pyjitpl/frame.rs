@@ -997,6 +997,9 @@ impl MIFrame {
                     OpBox::ConstPtr(0)
                 } else if idx < num_regs_r {
                     // pyjitpl.py `add_box_to_storage(self.registers_r[index])`.
+                    // The box is `ref_regs[i]`. `register_to_box_ref` reads
+                    // ConstPtr from that OpRef (`history.py ConstPtr.value`);
+                    // the `ref_values` mirror is optional.
                     // A raising residual leaves the result slot empty. The
                     // in-call clear stores CONST_NULL there; record the same
                     // null when the slot was never written.
@@ -1689,6 +1692,60 @@ mod tests {
         let p1 = p0 + c0;
         let (tag1, _) = crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[p1..]);
         assert!(tag1 != 0, "ref register should encode to non-zero tag");
+    }
+
+    /// pyjitpl.py `add_box_to_storage(self.registers_r[index])` snapshots
+    /// the box in `ref_regs`. `ref_values` is an optional pyre mirror.
+    #[test]
+    fn get_list_of_active_boxes_reads_ref_regs_when_values_are_none() {
+        use crate::opencoder::{TAGCONSTPTR, TraceRecordBuffer, tag};
+        use majit_ir::OpRef;
+        use std::sync::Arc;
+
+        const LIVE_OP: u8 = 0x42;
+        let mut builder = JitCodeBuilder::new();
+        let mut jitcode = builder.finish();
+        jitcode.body_mut().c_num_regs_i = 0;
+        jitcode.body_mut().c_num_regs_r = 2;
+        jitcode.body_mut().c_num_regs_f = 0;
+        jitcode.body_mut().code = vec![LIVE_OP, 0x00, 0x00];
+        let jitcode = Arc::new(jitcode);
+
+        // length_r=2; bitset lights registers 0 and 1.
+        let all_liveness: Vec<u8> = vec![0, 2, 0, 0b0000_0011];
+
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xdead_beef)));
+        frame.ref_regs[1] = Some(OpRef::ref_op(7));
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(16, sd);
+        let storage = frame.get_list_of_active_boxes(
+            /* in_a_call */ false,
+            &mut trace,
+            /* clear_result_register */ false,
+            LIVE_OP,
+            &all_liveness,
+            /* after_residual_call */ true,
+        );
+
+        let (length, consumed) =
+            crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[storage as usize..]);
+        assert_eq!(length, 2, "array length prefix");
+        let p0 = storage as usize + consumed;
+        let (tag0, c0) = crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[p0..]);
+        let ptr_idx = *trace
+            ._refs_dict
+            .get(&0xdead_beef)
+            .expect("ConstPtr bits come from ref_regs, not the missing mirror");
+        assert_eq!(tag0, tag(TAGCONSTPTR, ptr_idx) as i64);
+        let p1 = p0 + c0;
+        let (tag1, _) = crate::opencoder::decode_varint_signed(&trace._snapshot_array_data[p1..]);
+        assert_eq!(
+            tag1,
+            TraceRecordBuffer::_encode_box_position(7),
+            "ResOp ref register → TAGBOX(7) with no ref_values"
+        );
     }
 
     /// pyjitpl.py:180-193 in_a_call branch — the parent frame in a

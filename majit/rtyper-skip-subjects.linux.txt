@@ -9,6 +9,7 @@
 # #2239 look_inside tuple list-extend / _iff, #2240 cell ABI / Result shells.
 # Combined tree first showed the 64 added names in #2231 dispatcher-graph
 # job 113586429198 (743248fa2f1); main 37856557223 job 113586687125 inherited them.
+# Attributed joins after w_list_getitem lost dont_look_inside so list_getitem_jitcode resolves w_list_getitem_inner: w_list_getitem and its _collections block_get caller (#2165).
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
 two-phase-never-a-subject	error::PyError::oefmt_name_error_text__spec_String_0f8488b534c96dc1
 two-phase-never-a-subject	error::PyError::oefmt_name_error_text__spec__str_57a0acd0311bcd80
@@ -53,6 +54,7 @@ two-phase-never-a-subject	majit_rlib::rtermios::tcflush
 two-phase-never-a-subject	majit_rlib::rtermios::tcsendbreak
 two-phase-never-a-subject	majit_rlib::rthread::threadlocalref_addr
 two-phase-never-a-subject	majit_rlib::rthread::tlfield_getraw_int
+two-phase-never-a-subject	module::_collections::block_get
 two-phase-never-a-subject	module::_csv::csv_error__spec_String_dab26f2fea8aa173
 two-phase-never-a-subject	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_1_d661696d4db4ef32
 two-phase-never-a-subject	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_432f9a978308aeed
@@ -2054,6 +2056,7 @@ two-phase-never-a-subject	pyre_object::listobject::switch_to_correct_strategy
 two-phase-never-a-subject	pyre_object::listobject::w_list_append
 two-phase-never-a-subject	pyre_object::listobject::w_list_append_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_append_preallocated
+two-phase-never-a-subject	pyre_object::listobject::w_list_getitem
 two-phase-never-a-subject	pyre_object::listobject::w_list_getitem_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_iter_item
 two-phase-never-a-subject	pyre_object::listobject::w_list_len

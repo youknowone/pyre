@@ -283,10 +283,50 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// holds only the raw address — the old-generation twin would have
 /// survived to the next major instead.
 ///
+/// Unlike the stable twin this one *collects*: `external_malloc` runs
+/// `minor_collection_with_major_progress` when `threshold_reached` holds,
+/// and the hook keeps that. So every word the caller will store into the
+/// block has to be a root across the call and read back afterwards, the
+/// way `FrameBox::new` publishes a frame's inputs; a caller that builds the
+/// payload first takes [`try_gc_alloc_young_nonmoving_no_collect_raw`].
+///
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> *mut u8 {
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_HOOK.get() else {
+        return try_gc_alloc_stable_raw(type_id, payload_size);
+    };
+    GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
+        .allocated_or_abort(payload_size)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+majit_gc::global_hook!(static GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK: GcAllocHookFn);
+
+/// Install the non-collecting young non-moving allocation callback
+/// ([`try_gc_alloc_young_nonmoving_no_collect_raw`]).
+pub fn register_gc_alloc_young_nonmoving_no_collect_hook(hook: GcAllocHookFn) {
+    GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.set(Some(hook));
+}
+
+/// Remove the non-collecting young non-moving allocation callback.
+pub fn clear_gc_alloc_young_nonmoving_no_collect_hook() {
+    GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.set(None);
+}
+
+/// [`try_gc_alloc_young_nonmoving_raw`] on [`try_gc_alloc_stable_raw`]'s
+/// collection contract: the birth is young and non-moving, and nothing
+/// collects inside it, so a caller may read its field values before the
+/// call and store them after without rooting them across it — the
+/// `malloc_fixedsize` every `#[pyre_class]` constructor and `w_type_new`
+/// take. The threshold `external_malloc` would have answered with a
+/// collection becomes the deferred major request the interpreter safepoint
+/// serves, as it does for the stable twin.
+///
+/// With no such hook installed this answers exactly as the stable twin.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+    let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
     GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
