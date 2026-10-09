@@ -3843,7 +3843,9 @@ impl CallControl {
                         base_size,
                         item_size,
                         flag,
-                        ir_type,
+                        // `get_type_flag(ARRAY_INSIDE.OF)` — the element
+                        // type, not the op's IR bank (`ir_type`).
+                        item_type,
                         nolength,
                         length_offset,
                         is_pure,
@@ -3891,7 +3893,7 @@ impl CallControl {
                         base_size,
                         item_size,
                         flag,
-                        item_type: ir_type,
+                        item_type,
                         nolength,
                         length_offset,
                         is_pure,
