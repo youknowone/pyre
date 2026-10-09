@@ -215,11 +215,6 @@ pub struct Bookkeeper {
     /// the same rather than building a fresh ListDef per call outside
     /// a reflow frame.
     pub(crate) listdefs: RefCell<HashMap<Option<PositionKey>, ListDef>>,
-    /// Interned `ListDef` per projected item-type spelling.
-    /// `project_struct_field_type` used to mint a fresh ListDef per
-    /// Vec/array site; `listdef.agree` / `ListItem.merge` then could not
-    /// unify them under `contains()`'s `SideEffectFreeGuard`.
-    pub(crate) type_listdefs: RefCell<HashMap<String, ListDef>>,
     /// RPython `self.dictdefs = {}` (bookkeeper.py). Same
     /// `Option<PositionKey>` key semantics as `listdefs`.
     pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
@@ -1092,7 +1087,6 @@ impl Bookkeeper {
             policy,
             position_key: RefCell::new(None),
             listdefs: RefCell::new(HashMap::new()),
-            type_listdefs: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
             descs: RefCell::new(IndexMap::new()),
             classdefs: RefCell::new(Vec::new()),
@@ -2035,22 +2029,6 @@ impl Bookkeeper {
         crate::annotator::signature::annotationoftype(spec, Some(self))
     }
 
-    fn intern_projected_listdef(self: &Rc<Self>, item_ty: &str, s_inner: SomeValue) -> ListDef {
-        let key = list_item_type_key(item_ty);
-        {
-            let cache = self.type_listdefs.borrow();
-            if let Some(existing) = cache.get(&key) {
-                let existing = existing.clone();
-                drop(cache);
-                let _ = existing.generalize(&s_inner);
-                return existing;
-            }
-        }
-        let new_ld = ListDef::new(Some(self.clone()), s_inner, false, false);
-        self.type_listdefs.borrow_mut().insert(key, new_ld.clone());
-        new_ld
-    }
-
     /// RPython `Bookkeeper.getlistdef(**flags_if_new)` (bookkeeper.py).
     ///
     /// Returns the (cached or freshly constructed) ListDef for the
@@ -2077,6 +2055,30 @@ impl Bookkeeper {
         }
         listdefs.insert(pk, new_ld.clone());
         new_ld
+    }
+
+    /// Bind a list-typed spelling (`Vec<T>`, `VecDeque<T>`, `[T; N]`) to
+    /// the `ListDef` of the current `position_key`.
+    ///
+    /// Field rows mint a fresh `ListDef` into `ClassDef.attrs[name].s_value`
+    /// (`Attribute.s_value`). `__cast_instance_intrinsic` / FUNC.ARGS
+    /// re-project the same spelling at an operation, and that site is
+    /// `Bookkeeper.getlistdef` — two analyses of one op share the ListDef
+    /// so `setbinding` / `SomeObject.contains` can succeed under
+    /// `TLS.no_side_effects_in_union`. Named structs that *model* as a
+    /// list (`FixedObjectArray._items`) keep the attribute identity:
+    /// this only rebinds spellings `is_list_container_spelling` accepts.
+    pub fn project_list_spelling_at_position(self: &Rc<Self>, spelling: &str) -> SomeValue {
+        let projected = self.project_struct_field_type(spelling);
+        if !majit_ir::descr::is_list_container_spelling(spelling) {
+            return projected;
+        }
+        let SomeValue::List(list) = projected else {
+            return projected;
+        };
+        let listdef = self.getlistdef(None);
+        let _ = listdef.generalize(&list.listdef.s_value());
+        SomeValue::List(SomeList::new(listdef))
     }
 
     /// RPython `Bookkeeper.newlist(*s_values, **flags)` (bookkeeper.py).
@@ -3751,7 +3753,14 @@ impl Bookkeeper {
         for list_wrapper in ["Vec<", "VecDeque<"] {
             if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
                 let s_inner = self.project_struct_field_type(inner);
-                let listdef = self.intern_projected_listdef(inner, s_inner);
+                // A projected field list is a fresh `ListDef` stored on
+                // `ClassDef.attrs[name].s_value` (`Attribute.s_value`).
+                // `Bookkeeper.getlistdef` keys by allocation site, not
+                // item type; two fields with the same item spelling stay
+                // distinct until `ListDef.agree` / `union` join values
+                // that actually flow together.
+                let listdef =
+                    super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
                 return SomeValue::List(super::model::SomeList::new(listdef));
             }
         }
@@ -3761,7 +3770,7 @@ impl Bookkeeper {
                 None => rest.trim(),
             };
             let s_inner = self.project_struct_field_type(inner);
-            let listdef = self.intern_projected_listdef(inner, s_inner);
+            let listdef = super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
             return SomeValue::List(super::model::SomeList::new(listdef));
         }
         if let Some(inner) = strip_generic_one(stripped, "Option<") {
@@ -3863,11 +3872,10 @@ impl Bookkeeper {
         // ArrayRead -> flowspace `getitem`) onto the receiver, so the
         // receiver must model as the element list — not the wrapping
         // struct, whose `getitem` over `SomeInstance(None)` would rewrite
-        // to `getattr("__getitem__")` and dead-end.  Project the `_items`
-        // flexible-array tail: `[PyObjectRef; 0]` resolves through the
-        // array arm above to `SomeList(item=SomeInstance(PyObjectRef),
-        // resized=false)`, giving a typed element rather than a
-        // classdef-less stub.
+        // to `getattr("__getitem__")` and dead-end.  The list identity is
+        // `ClassDef.attrs["_items"].s_value` (`Attribute.s_value`); two
+        // projections of this field share that attribute rather than
+        // minting a second `ListDef`.
         let canonical_stripped = majit_ir::descr::canonical_struct_name(stripped);
         if canonical_stripped == "FixedObjectArray"
             || canonical_stripped == "object_array::FixedObjectArray"
@@ -3879,6 +3887,13 @@ impl Bookkeeper {
                 .as_ref()
                 .and_then(|reg| reg.field_type(stripped, "_items").map(str::to_string));
             if let Some(items_ty) = items_ty {
+                if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(stripped)
+                    && let Some(s_items) =
+                        super::classdesc::ClassDef::about_attribute(&classdef, "_items")
+                    && matches!(s_items, SomeValue::List(_))
+                {
+                    return s_items;
+                }
                 return self.project_struct_field_type(&items_ty);
             }
         }
@@ -5087,19 +5102,6 @@ pub(crate) fn raw_fn_ptr_somevalue() -> SomeValue {
 fn is_fn_type_spelling(t: &str) -> bool {
     let t = t.trim();
     t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
-}
-
-fn list_item_type_key(item_ty: &str) -> String {
-    let mut t = item_ty.trim();
-    if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
-        return "pyobject::PyObject".to_string();
-    }
-    t = t
-        .trim_start_matches("*mut ")
-        .trim_start_matches("*const ")
-        .trim_start_matches('&')
-        .trim_start_matches("mut ");
-    t.trim().to_string()
 }
 
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
@@ -7841,16 +7843,104 @@ mod tests {
     }
 
     #[test]
-    fn same_item_vecdeque_and_array_share_one_listdef() {
+    fn projected_field_listdefs_are_keyed_by_attribute_position() {
+        // Two structs with the same item spelling keep distinct ListDefs
+        // (`Attribute.s_value` / `Bookkeeper.getlistdef` by position).
+        use crate::front::StructFieldRegistry;
         let bk = bk();
-        let a = bk.project_struct_field_type("VecDeque<PyObjectRef>");
-        let b = bk.project_struct_field_type("[pyobject::PyObject]");
-        let (SomeValue::List(la), SomeValue::List(lb)) = (a, b) else {
-            panic!("expected two SomeList");
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "OwnerDeque".to_string(),
+            vec![("items".to_string(), "VecDeque<PyObjectRef>".to_string())],
+        );
+        reg.fields.insert(
+            "OwnerArray".to_string(),
+            vec![("items".to_string(), "[PyObjectRef; 4]".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let deque_cd = bk
+            .getuniqueclassdef_for_struct_root("OwnerDeque")
+            .expect("OwnerDeque registers");
+        let array_cd = bk
+            .getuniqueclassdef_for_struct_root("OwnerArray")
+            .expect("OwnerArray registers");
+
+        let deque_list = match &deque_cd.borrow().attrs.get("items").expect("items").s_value {
+            SomeValue::List(l) => l.listdef.clone(),
+            other => panic!("OwnerDeque.items must be SomeList, got {other:?}"),
+        };
+        let array_list = match &array_cd.borrow().attrs.get("items").expect("items").s_value {
+            SomeValue::List(l) => l.listdef.clone(),
+            other => panic!("OwnerArray.items must be SomeList, got {other:?}"),
         };
         assert!(
-            la.listdef.same_as(&lb.listdef),
-            "same item type must intern one ListDef"
+            !deque_list.same_as(&array_list),
+            "fields on different structs must not share a ListDef"
+        );
+
+        deque_list.resize().expect("resize OwnerDeque.items");
+        assert!(
+            deque_list.listitem_rc().borrow().resized,
+            "resized flag lives on the deque field's ListDef"
+        );
+        assert!(
+            !array_list.listitem_rc().borrow().resized,
+            "resizing one field must leave the other unchanged"
+        );
+
+        let deque_again = bk
+            .getuniqueclassdef_for_struct_root("OwnerDeque")
+            .expect("OwnerDeque re-lookup");
+        let deque_list_again = match &deque_again
+            .borrow()
+            .attrs
+            .get("items")
+            .expect("items")
+            .s_value
+        {
+            SomeValue::List(l) => l.listdef.clone(),
+            other => panic!("OwnerDeque.items must stay SomeList, got {other:?}"),
+        };
+        assert!(
+            deque_list.same_as(&deque_list_again),
+            "two reads of the same field must return the same ListDef"
+        );
+    }
+
+    #[test]
+    fn list_spelling_at_a_position_reuses_getlistdef() {
+        // `__cast_instance_intrinsic` of `[T]` re-projects the spelling
+        // at an op; identity is `Bookkeeper.getlistdef`, not the item type.
+        let bk = bk();
+        bk.set_position_key(Some(PositionKey::new(11, 22, 3)));
+        let first = bk.project_list_spelling_at_position("[PyObjectRef]");
+        let second = bk.project_list_spelling_at_position("[PyObjectRef]");
+        let (SomeValue::List(a), SomeValue::List(b)) = (first, second) else {
+            panic!("[PyObjectRef] must project to SomeList");
+        };
+        assert!(
+            a.listdef.same_as(&b.listdef),
+            "two projections of one list spelling at one position share a ListDef"
+        );
+        assert!(
+            a.listdef.same_as(&bk.getlistdef(None)),
+            "the bound ListDef is Bookkeeper.getlistdef of the current position"
+        );
+
+        bk.set_position_key(Some(PositionKey::new(11, 22, 4)));
+        let other_pos = bk.project_list_spelling_at_position("[PyObjectRef]");
+        let SomeValue::List(c) = other_pos else {
+            panic!("[PyObjectRef] must project to SomeList at a second position");
+        };
+        assert!(
+            !a.listdef.same_as(&c.listdef),
+            "distinct positions keep distinct ListDefs"
+        );
+        a.listdef.resize().expect("resize first position");
+        assert!(
+            !c.listdef.listitem_rc().borrow().resized,
+            "resizing one position must leave the other unchanged"
         );
     }
 
