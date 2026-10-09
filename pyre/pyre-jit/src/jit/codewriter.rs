@@ -12182,7 +12182,13 @@ impl CodeWriter {
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "build_map_from_array",
+                                // `space.newdict()` alone when there is no
+                                // pair to `space.setitem`.
+                                if nitems == 0 {
+                                    "build_map_from_empty_array"
+                                } else {
+                                    "build_map_from_array"
+                                },
                                 vec![super::flow::FlowValue::Variable(array_var).into()],
                                 Kind::Ref,
                                 py_pc as i64,

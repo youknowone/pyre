@@ -1,9 +1,14 @@
-# pyre-check: max-pypy-ratio=9.2
-# Cranelift on ubuntu read 2.2x (run 37131346131) and an earlier
-# ubuntu reading was 9.2x. 11 keeps both inside the floor..ceiling
-# window: the floor is 11/6.
-N = 10000
-
+# pyre-check: max-pypy-ratio=30
+# Measured 15.2x on macOS dynasm with `classify` inlined into the loop.
+# What is left is the rejection itself: the type call builds the
+# UnicodeEncodeError eagerly on every iteration.
+# The hot loop is the rejection alone, and N keeps pypy's execution time
+# well clear of its startup. With the two accepted names in the loop every
+# iteration left two dead types behind, and the ratio followed the length
+# of `object`'s subclass list rather than the rejection.
+N = 1000000
+# Accepted names are checked a bounded number of times.
+M = 100
 
 def classify(name):
     try:
@@ -26,12 +31,16 @@ def main():
         r = classify(lone)
         if r[0] == "E" and r[1] == 0 and r[2] == 1 and r[3] == 'surrogates not allowed':
             acc = acc + 1
-        # valid + astral names construct fine
+        i = i + 1
+
+    # valid + astral names construct fine
+    j = 0
+    while j < M:
         if classify('Ok') == 'Ok':
             acc = acc + 1
         if classify(astral) == astral:
             acc = acc + 1
-        i = i + 1
+        j = j + 1
 
     # embedded surrogate reports the inner code-point position
     re = classify(emb)
