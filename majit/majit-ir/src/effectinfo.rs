@@ -1022,6 +1022,11 @@ pub enum RuntimeHelperKind {
     /// recovered from the backing array (const length + per-index element
     /// shadows) rather than from residual args.
     NewlistFromArray,
+    /// `bh_build_map_from_array(array)` over the zero-length array BUILD_MAP 0
+    /// emits — `space.newdict()` with no `space.setitem` after it
+    /// (`pyopcode.py BUILD_MAP`).  No key is hashed, so the call allocates an
+    /// empty dict and does nothing else.
+    NewEmptyDict,
     /// `bh_build_string_from_array(array)` — the BUILD_STRING array consumer
     /// (`pyopcode.py BUILD_STRING`).  Fragments are already strings
     /// (FORMAT_* / CONVERT_VALUE ran first).  The walker recovers them
@@ -1270,6 +1275,13 @@ pub enum RuntimeHelperKind {
     /// (`pyjitpl.py _establish_nullity`).  A guard failure resumes at the
     /// opcode, where the interpreter re-runs it and raises.
     LoadFastCheck,
+    /// `unbound_local_error_fn(code, name_idx)` — the unbound arm of
+    /// DELETE_FAST (`pyopcode.py DELETE_FAST`, the `oefmt` under
+    /// `if self.locals_cells_stack_w[varindex] is None`).  It builds the
+    /// `UnboundLocalError` value from the code object's immutable
+    /// `co_varnames` and returns it for the `raise` that follows: nothing is
+    /// published and no user code runs.
+    UnboundLocalError,
     /// `bh_convert_value_fn(value, conv)` — the CONVERT_VALUE helper
     /// (`runtime_ops::convert_value`: `!s`/`!r`/`!a`).  A user `__str__` /
     /// `__repr__` runs Python here, so the generic residual is opaque.

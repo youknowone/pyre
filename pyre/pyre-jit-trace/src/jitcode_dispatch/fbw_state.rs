@@ -4150,6 +4150,14 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     // copies poison every `super()`-bearing body out of its
                     // inline.
                     | majit_ir::RuntimeHelperKind::SuperAttrUnwrap
+                    // Both allocate a fresh object nothing else can reach and
+                    // run no user code: the unbound arm of DELETE_FAST builds
+                    // the exception value its `raise` takes, and BUILD_MAP 0
+                    // builds an empty dict.  `except E as e` ends in that
+                    // DELETE_FAST, so without the first every handler that
+                    // binds its exception poisons the body it sits in.
+                    | majit_ir::RuntimeHelperKind::UnboundLocalError
+                    | majit_ir::RuntimeHelperKind::NewEmptyDict
             );
             // `box_int` is the only generic replay-safe helper here whose
             // result is necessarily numeric.  `load_const` may return a str,
