@@ -107,9 +107,24 @@ fn check_resource(resource: i32) -> Result<(), pyre_interpreter::PyError> {
     }
 }
 
-/// `Modules/resource.c py2rlim`: unsigned conversion (`uint_w`), then the
-/// value must fit `rlim_t`. Negative → ValueError; wider than unsigned
-/// long long or `rlim_t` → OverflowError. `RLIM_INFINITY` fits `rlim_t`.
+/// `rlim_t` as a Python int, unsigned. `lib_pypy/_resource_build.py`
+/// `my_getrlimit` writes `rlim_cur` into a C `long long`; on hosts where
+/// `rlim_t` is unsigned, that signed widen turns `RLIM_INFINITY` into `-1`
+/// (Linux `~0ULL`) or `-2**63` (Darwin `1<<63`). `rlim_w` then rejects the
+/// value `getrlimit` just produced, so `setrlimit(r, getrlimit(r))` fails.
+/// `test_resource.ResourceTest.test_fsize_ismax` requires that round trip,
+/// and `test_fsize_negative` requires `RLIM_INFINITY != -2**63`.
+fn rlim_as_w(v: libc::rlim_t) -> pyre_object::PyObjectRef {
+    if v <= i64::MAX as libc::rlim_t {
+        pyre_object::w_int_new(v as i64)
+    } else {
+        pyre_object::w_long_new(majit_rlib::rbigint::RBigInt::from_u128(v as u128))
+    }
+}
+
+/// Convert each limit with `uint_w` so a negative is ValueError
+/// (`test_resource.ResourceTest.test_fsize_negative`) and a value wider
+/// than `rlim_t` is OverflowError. `RLIM_INFINITY` fits `rlim_t`.
 fn rlim_w(obj: pyre_object::PyObjectRef) -> Result<libc::rlim_t, pyre_interpreter::PyError> {
     let v = pyre_interpreter::baseobjspace::uint_w(obj)?;
     libc::rlim_t::try_from(v).map_err(|_| {
@@ -125,7 +140,9 @@ fn rlim_w(obj: pyre_object::PyObjectRef) -> Result<libc::rlim_t, pyre_interprete
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
 /// `error = OSError` alias. Calls `rtime.c_getrusage` and `c_getrlimit`
 /// / `c_setrlimit`.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+pub fn register_module(
+    mut ns: pyre_object::PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
     // `lib_pypy/resource.py error = OSError` and
     // `:15-37 class struct_rusage`.
     let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
@@ -202,8 +219,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     ))
                 } else {
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_int_new(rl.rlim_cur as i64));
-                    fields.push(pyre_object::w_int_new(rl.rlim_max as i64));
+                    fields.push(rlim_as_w(rl.rlim_cur));
+                    fields.push(rlim_as_w(rl.rlim_max));
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 }
             },
@@ -354,12 +371,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "RLIMIT_MEMLOCK",
             pyre_object::w_int_new(host_resource::RLIMIT_MEMLOCK as i64),
         );
-        // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
-        pyre_interpreter::module_ns_store(
-            ns,
-            "RLIM_INFINITY",
-            pyre_object::w_int_new(host_resource::RLIM_INFINITY as i64),
-        );
+        let w_inf = pyre_object::with_roots!(ns => rlim_as_w(host_resource::RLIM_INFINITY));
+        pyre_interpreter::module_ns_store(ns, "RLIM_INFINITY", w_inf);
     }
     Ok(())
 }

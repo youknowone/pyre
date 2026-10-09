@@ -186,7 +186,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // than maximum".  `interp_pwd.py getpwuid` catches
                 // OverflowError and converts it to KeyError "uid not
                 // found".
-                let uid = match pwd_uid_converter(args[0]) {
+                let mut w_uid = args[0];
+                let uid = match pyre_object::with_roots!(w_uid => pwd_uid_converter(w_uid)) {
                     Ok(u) => u,
                     Err(e) if matches!(e.kind, pyre_interpreter::PyErrorKind::OverflowError) => {
                         return Err(pyre_interpreter::PyError::key_error(
@@ -195,7 +196,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     Err(e) => return Err(e),
                 };
-                let mut w_uid = args[0];
                 let pw = pyre_object::with_roots!(w_uid => unsafe { ll::c_getpwuid(uid) });
                 if pw.is_null() {
                     Err(pyre_interpreter::PyError::key_error(format!(

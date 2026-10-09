@@ -261,7 +261,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     const SECS_TO_NS: i64 = 1_000_000_000;
     let mut w_secs = args[0];
     let timeout_ns: i64 = unsafe {
-        let overflow = || {
+        let overflow = |w_secs: PyObjectRef| {
             crate::PyError::overflow_error(crate::display::wtf8_format!(
                 "timestamp ",
                 crate::display::py_repr_wtf8(w_secs).unwrap_or_else(|_| {
@@ -278,7 +278,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // `rarithmetic.ovfcheck_float_to_longlong` bounds.
             let result_float = (secs * SECS_TO_NS as f64).ceil();
             if !(-9223372036854776832.0..9223372036854775296.0).contains(&result_float) {
-                return Err(overflow());
+                return Err(overflow(w_secs));
             }
             result_float as i64
         } else {
@@ -289,13 +289,15 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 w_int_get_value(w_secs)
             } else if pyre_object::pyobject::is_long(w_secs) {
                 let big = pyre_object::longobject::w_long_get_value(w_secs);
-                i64::try_from(big).map_err(|_| overflow())?
+                i64::try_from(big).map_err(|_| overflow(w_secs))?
             } else {
                 // `timeutils.py` — `space.bigint_w(w_secs)` applies
                 // `space.int`, so an object with `__int__` / `__index__` is
                 // accepted and reduced to a longlong.
-                let has_int = crate::baseobjspace::lookup(w_secs, "__int__").is_some()
-                    || crate::baseobjspace::lookup(w_secs, "__index__").is_some();
+                let has_int = pyre_object::with_roots!(w_secs => {
+                    crate::baseobjspace::lookup(w_secs, "__int__").is_some()
+                        || crate::baseobjspace::lookup(w_secs, "__index__").is_some()
+                });
                 if !has_int {
                     // `_PyTime_FromSecondsObject` accepts either domain, so
                     // an argument that is neither names both.
@@ -304,15 +306,17 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         crate::type_methods::arg_type_name(w_secs)
                     )));
                 }
-                let w_int = crate::baseobjspace::space_int(w_secs)?;
+                let w_int =
+                    pyre_object::with_roots!(w_secs => crate::baseobjspace::space_int(w_secs))?;
                 if is_int(w_int) {
                     w_int_get_value(w_int)
                 } else {
                     i64::try_from(pyre_object::longobject::w_long_get_value(w_int))
-                        .map_err(|_| overflow())?
+                        .map_err(|_| overflow(w_secs))?
                 }
             };
-            sec.checked_mul(SECS_TO_NS).ok_or_else(overflow)?
+            sec.checked_mul(SECS_TO_NS)
+                .ok_or_else(|| overflow(w_secs))?
         }
     };
     // `interp_time.py` — `if not (timeout >= 0)`.

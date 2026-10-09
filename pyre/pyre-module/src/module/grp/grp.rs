@@ -66,7 +66,8 @@ mod ll {
 /// `lib_pypy/grp.py _group_from_gstruct`. String fields are copied with
 /// `charp2str` immediately: `getgrent` (and `getgrgid` / `getgrnam`) may
 /// return a pointer into a static buffer. `gr_mem` is a NULL-terminated
-/// `char**` walked into a list of strings.
+/// `char**` walked into a list of strings. Each C string is `os.fsdecode`
+/// (`_group_from_gstruct`), via `fsdecode_filename_bytes`.
 fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
     let name = unsafe { majit_rlib::rffi::charp2str((*g).gr_name.cast()) };
     let passwd = unsafe { majit_rlib::rffi::charp2str((*g).gr_passwd.cast()) };
@@ -83,22 +84,20 @@ fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
             p = p.add(1);
         }
     }
+    let holder = pyre_object::gc_roots::push_roots();
     let mem_list = {
         let mut mem = pyre_object::gc_roots::RootedItems::new();
         for s in &member_bytes {
-            mem.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(s)));
+            mem.push(pyre_interpreter::gateway::fsdecode_filename_bytes(s));
         }
         pyre_object::w_list_new(mem.take())
     };
+    let mem_slot = holder.pin_roots(&[mem_list]);
     let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
-        &name,
-    )));
-    fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
-        &passwd,
-    )));
+    fields.push(pyre_interpreter::gateway::fsdecode_filename_bytes(&name));
+    fields.push(pyre_interpreter::gateway::fsdecode_filename_bytes(&passwd));
     fields.push(pyre_object::w_int_new(gid));
-    fields.push(mem_list);
+    fields.push(holder.get(mem_slot));
     pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
 }
 

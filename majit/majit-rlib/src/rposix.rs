@@ -49,6 +49,12 @@ static CLOSED_STDIO_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 
 /// Occupy EBADF 0/1/2 before rustc `sys::pal::unix::init` /
 /// `sanitize_standard_fds` opens `/dev/null` onto them.
+///
+/// Building the launcher with `#![no_main]` and a C-ABI `main` would skip
+/// the Rust runtime's startup (`sanitize_standard_fds`, its SIGPIPE
+/// disposition, the main-thread stack guard) and would remove the need for
+/// this occupy/restore pair. That changes startup on every platform, so
+/// the ctor keeps the Rust entry and restores EBADF after it.
 #[cfg(unix)]
 extern "C" fn preserve_closed_stdio() {
     let mut mask = 0u8;

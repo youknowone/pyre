@@ -4322,6 +4322,9 @@ pub fn init_stream_codecs() -> Result<(), crate::PyError> {
         if let Ok(stream) =
             pyre_object::with_roots!(sys => crate::baseobjspace::getattr_str(sys, name))
         {
+            if unsafe { pyre_object::is_none(stream) } {
+                continue;
+            }
             pyre_object::with_roots!(sys => crate::module::_io::W_TextIOWrapper::attach_stdio_codec(stream))?;
         }
     }
@@ -4379,15 +4382,24 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let writable = fd != 0;
     let to_stderr = fd == 2;
     let unbuffered = writable && crate::importing::unbuffered_flag();
-    // PyPy app_main.py `create_stdio`: retain the FileIO-backed binary layer
+    // `app_main.py create_stdio`: retain the FileIO-backed binary layer
     // as TextIOWrapper.buffer. libregrtest workers deliberately write invalid
     // byte sequences through this exact owner.
     //
-    // `create_stdio` also answers a descriptor `_io.open` rejects with no
-    // stream at all. These streams keep instance-override methods that reach
-    // the descriptor without going through the buffer, so a descriptor the
-    // host does not open — the sandbox controller mounts no real files —
-    // leaves the buffer absent instead of removing `sys.stdout` outright.
+    // `create_stdio` returns `None` when `_io.open` raises OSError EBADF, so
+    // `initstdio` binds `sys.stdout` / `sys.stderr` / `sys.stdin` to `None`
+    // for a closed standard fd. A wrapper that still names the fd number
+    // would write into whichever file a later `open()` reused.
+    //
+    // Any other `_io.open` failure keeps the stream with its buffer absent:
+    // the instance-override methods reach the descriptor without the buffer,
+    // and the sandbox controller mounts no real files to open.
+    #[cfg(unix)]
+    {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return w_none();
+        }
+    }
     let allow_windows_console = !crate::importing::legacy_windows_stdio_flag();
     let buffer = crate::builtins::builtin_open_stdio(
         &[

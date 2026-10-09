@@ -6931,7 +6931,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // Initialise the DirEntry type (`set_instantiate`) before allocating
         // any entry of it.
         let _ = dir_entry_type();
-        let list = pyre_object::w_list_new(Vec::new());
+        w_arg = path_roots.get(path_base);
+        let list = pyre_object::with_roots!(w_arg => pyre_object::w_list_new(Vec::new()));
         // The entries are `allocate_stable` (non-nursery) objects, but a stable
         // allocation can still drive a moving collection over a large listing,
         // so `list` and each per-entry temporary live on the shadow stack.
@@ -7544,13 +7545,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // behalf rather than as an argument of its own.
                     let mut w_path = args[0];
                     let mut w_argv = args[1];
-                    let command = pyre_object::with_roots!(w_argv =>
+                    let command = pyre_object::with_roots!(w_path, w_argv =>
                         crate::gateway::fsencode_path_named_w(w_path, "execv", "path")
                             .map(|path| path.as_bytes))?;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
-                    let argv = pyre_object::with_roots!(w_path => exec_argv(w_argv, "execv"))?;
+                    let argv =
+                        pyre_object::with_roots!(w_path, w_argv => exec_argv(w_argv, "execv"))?;
                     let argv_ptrs = exec_pointer_array(&argv);
                     // `rposix.c_execv` releases the GIL and saves errno.
                     // The call returns only on failure.
@@ -7577,16 +7579,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_path = args[0];
                     let mut w_argv = args[1];
                     let mut w_env = args[2];
-                    let command = pyre_object::with_roots!(w_argv, w_env =>
+                    let command = pyre_object::with_roots!(w_path, w_argv, w_env =>
                         crate::gateway::fsencode_path_named_w(w_path, "execve", "path")
                             .map(|path| path.as_bytes))?;
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execve() path contains an embedded null byte")
                     })?;
-                    let argv = pyre_object::with_roots!(w_path, w_env => exec_argv(w_argv, "execve"))?;
+                    let argv = pyre_object::with_roots!(w_path, w_argv, w_env =>
+                        exec_argv(w_argv, "execve"))?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
-                    let env = pyre_object::with_roots!(w_path, w_argv => {
+                    let env = pyre_object::with_roots!(w_path, w_argv, w_env => {
                         collect_env_entries(w_env, "execve", false)
                     })?
                         .into_iter()
@@ -8126,17 +8129,23 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // `c_uid_t_w` reaches `__index__` for a non-int entry, so
                     // converting one entry can collect and move the entries not
                     // yet converted -- `collect_iterable` hands back a plain
-                    // vector, its own roots already dropped.  Publish the
-                    // sequence once and read each entry back per iteration.
-                    let _seq_roots = pyre_object::gc_roots::push_roots();
-                    let items_base = pyre_object::gc_roots::pin_roots(&items);
+                    // vector, its own roots already dropped.  Publish `w_list`
+                    // with that sequence as one live set: a later entry's
+                    // `__index__` must not move the argument list still read
+                    // after the loop (`interp_posix.py setgroups`).
+                    let seq_roots = pyre_object::gc_roots::push_roots();
+                    let mut live = Vec::with_capacity(items.len() + 1);
+                    live.push(w_list);
+                    live.extend_from_slice(&items);
+                    let base = seq_roots.pin_roots(&live);
                     let mut groups: Vec<libc::gid_t> = Vec::with_capacity(items.len());
                     for offset in 0..items.len() {
-                        let w_gid = pyre_object::gc_roots::shadow_stack_get(items_base + offset);
+                        let w_gid = seq_roots.get(base + 1 + offset);
                         groups.push(crate::baseobjspace::c_uid_t_w(w_gid)?);
                     }
-                    pyre_object::with_roots!(w_list => host_setgroups(&groups))
-                        .map_err(|e| io_err(e, ""))?;
+                    w_list = seq_roots.get(base);
+                    host_setgroups(&groups).map_err(|e| io_err(e, ""))?;
+                    let _ = seq_roots.get(base);
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -14084,9 +14093,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // The path names itself; the argv entries do not, because
                     // each of those is converted on the sequence's behalf
                     // rather than as an argument of its own.
-                    let path = crate::gateway::fsencode_path_named_w(args[0], "execv", "path")?;
+                    let mut w_path = args[0];
+                    let mut w_argv = args[1];
+                    let path = pyre_object::with_roots!(w_path, w_argv =>
+                        crate::gateway::fsencode_path_named_w(w_path, "execv", "path"))?;
                     let command_w = wide_path(&path.as_bytes)?;
-                    let argv = exec_argv_wide(args[1], "execv")?;
+                    let argv =
+                        pyre_object::with_roots!(w_path, w_argv => exec_argv_wide(w_argv, "execv"))?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
                     rustpython_host_env::os::ensure_drive_current_directory();
                     // The runtime's invalid parameter handler is silenced
@@ -14114,12 +14127,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
-                    let path = crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?;
+                    let mut w_path = args[0];
+                    let mut w_argv = args[1];
+                    let mut w_env = args[2];
+                    let path = pyre_object::with_roots!(w_path, w_argv, w_env =>
+                        crate::gateway::fsencode_path_named_w(w_path, "execve", "path"))?;
                     let command_w = wide_path(&path.as_bytes)?;
-                    let argv = exec_argv_wide(args[1], "execve")?;
+                    let argv = pyre_object::with_roots!(w_path, w_argv, w_env =>
+                        exec_argv_wide(w_argv, "execve"))?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
 
-                    let env = collect_env_entries(args[2], "execve", false)?
+                    let env = pyre_object::with_roots!(w_path, w_argv, w_env => {
+                        collect_env_entries(w_env, "execve", false)
+                    })?
                         .into_iter()
                         .map(|entry| {
                             widestring::WideCString::from_os_str(&*os_str_from_bytes(&entry))
