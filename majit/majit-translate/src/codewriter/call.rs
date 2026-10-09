@@ -11341,6 +11341,23 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
+        // descr.py get_type_flag: a Ptr whose pointee has `_gckind == 'raw'`
+        // is FLAG_UNSIGNED. A one-word-item Vec is
+        // `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs rust_vec_lltype`);
+        // `Bookkeeper::project_rust_vec` names that header with the same
+        // recognizer (`rust_vec_item_kind_for_spelling`).
+        s if majit_ir::rvec::rust_vec_item_kind_for_spelling(
+            s,
+            crate::layout::target_word_size(),
+        )
+        .is_some() =>
+        {
+            (
+                ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                crate::layout::target_word_size(),
+            )
+        }
         // A `&dyn Trait` / `Box<dyn Trait>` field is two words: the data
         // pointer and the vtable (metadata) pointer. A one-word descr would
         // keep only the data word, and `ptr_metadata` would then load a
@@ -16120,6 +16137,64 @@ mod tests {
         assert_eq!(flag, ArrayFlag::Unsigned);
         assert_eq!(field_type, Type::Int);
         assert_eq!(size, crate::layout::target_word_size());
+    }
+
+    /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`
+    /// (`rrustvec.rs rust_vec_lltype`). `descr.py get_type_flag` of a raw
+    /// Ptr is FLAG_UNSIGNED; the header address is int-banked, one word.
+    #[test]
+    fn rust_vec_header_pointer_is_int_banked() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let expected = (ArrayFlag::Unsigned, Type::Int, word);
+        let known = std::collections::HashSet::new();
+        let sizes = std::collections::HashMap::new();
+        for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
+            assert_eq!(get_type_flag(spelling), expected, "{spelling}");
+            assert_eq!(
+                super::field_metadata(spelling, &known, &sizes),
+                expected,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// `StructLayout::from_type_strings` / `fielddescrof` consume the
+    /// published `*mut Vec<…>` row; the getfield descr is int-banked.
+    #[test]
+    fn rust_vec_header_field_descr_is_int_banked() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let layout = StructLayout::from_type_strings(
+            &[("items".into(), "*mut Vec<usize>".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Unsigned);
+        assert_eq!(layout.fields[0].field_type, Type::Int);
+        assert_eq!(layout.fields[0].size, word);
+
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "Holder".to_string(),
+            vec![("items".to_string(), "*mut Vec<usize>".to_string())],
+        );
+        cc.set_struct_fields(registry);
+        let descr = cc
+            .fielddescrof(0, "Holder", None, "items")
+            .expect("items descr");
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.field_flag(), ArrayFlag::Unsigned);
+        assert_eq!(fd.field_type(), Type::Int);
+        assert_eq!(fd.field_size(), word);
     }
 
     #[derive(Debug)]
