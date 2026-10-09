@@ -1421,6 +1421,7 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     };
     match crate::jitcode_dispatch::exc_handler_shape(caller_jitcode, catch_target) {
         crate::jitcode_dispatch::ExcHandlerShape::Returns
+        | crate::jitcode_dispatch::ExcHandlerShape::ExceptAsReturn
         | crate::jitcode_dispatch::ExcHandlerShape::Unproven => {
             Err(InlineCallerFrameDecline::TryBlockCatchMarker)
         }

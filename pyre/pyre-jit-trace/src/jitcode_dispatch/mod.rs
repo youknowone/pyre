@@ -5412,6 +5412,10 @@ pub(crate) enum ExcHandlerShape {
     Returns,
     /// Clears state and `reraise`s, and no path returns.
     Reraise,
+    /// `except E as e: return` — the match path returns, the CHECK_EXC_MATCH
+    /// miss reraises. `perform_call` (`pyjitpl.py`) traces the taken return;
+    /// the miss is a guard side-exit, not a reason to residualize the callee.
+    ExceptAsReturn,
     /// Switch, budget, or a scan that proved neither.
     Unproven,
 }
@@ -5458,7 +5462,8 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
         // `opimpl_goto_if_exception_mismatch` jumps to `next_exc_target`),
         // and `*_jump_if_ovf`. A mismatch arm that reraises must be
         // seen, or a matching `ref_return` classifies the handler
-        // `Returns`. `switch` and an unmodelled label are Unproven.
+        // `Returns`. Mixed return+reraise is `ExceptAsReturn`.
+        // `switch` and an unmodelled label are Unproven.
         match control_successors(code, &op) {
             None => return ExcHandlerShape::Unproven,
             Some(succs) => work.extend(succs),
@@ -5468,10 +5473,9 @@ pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerS
         ExcHandlerShape::Returns
     } else if saw_reraise && !saw_return {
         ExcHandlerShape::Reraise
+    } else if saw_return && saw_reraise {
+        ExcHandlerShape::ExceptAsReturn
     } else {
-        // Mixed return-and-reraise is Unproven: except-as-return
-        // admit does not install `inline_poison_pcs`, so a re-raise
-        // after a mutation would replay the outer CALL.
         ExcHandlerShape::Unproven
     }
 }
@@ -5523,9 +5527,10 @@ pub(crate) fn handler_except_as_return_scan_admits(scan: &CalleeReplayScan, code
 
 /// Whether any `catch_exception` target is a returning handler.
 ///
-/// `except E as e: return` compiles to `ExcHandlerShape::Returns`. The
-/// try body may still carry happy-path poison (`BUILD_MAP` for `type(name,
-/// (), {})`), so the except-as admit asks this instead of
+/// `except E as e: return` compiles to `ExcHandlerShape::Returns` or
+/// `ExceptAsReturn` (CHECK_EXC_MATCH miss reraises). The try body may
+/// still carry happy-path poison (`BUILD_MAP` for `type(name, (), {})`),
+/// so the except-as admit asks this instead of
 /// [`poison_confined_to_returning_handlers`].
 pub(crate) fn body_has_returning_handler(code: &[u8]) -> bool {
     let mut pc = 0usize;
@@ -5535,7 +5540,10 @@ pub(crate) fn body_has_returning_handler(code: &[u8]) -> bool {
         };
         if op.key == "catch_exception/L" {
             let target = read_label(code, &op, 0);
-            if exc_handler_shape(code, target) == ExcHandlerShape::Returns {
+            if matches!(
+                exc_handler_shape(code, target),
+                ExcHandlerShape::Returns | ExcHandlerShape::ExceptAsReturn
+            ) {
                 return true;
             }
         }

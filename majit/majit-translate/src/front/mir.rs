@@ -23868,13 +23868,17 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `type_write_barrier(obj)` guards the `setfield` on the same
-                // type object that every caller performs next.  Jitcode is
-                // produced before the GC transform, so it carries no barrier:
-                // the backend rewrite inserts `COND_CALL_GC_WB` in front of
-                // that `setfield_gc` (`handle_write_barrier_setfield`).  The
-                // call returns `()`; its destination binds to a unit constant.
-                if args.len() == 1 && self.is_type_write_barrier_call(&reg) {
+                // Source-level write-barrier helpers guard the `setfield` the
+                // caller performs next (`type_write_barrier`,
+                // `object_mutable_cell_write_barrier` in `write_cell`).
+                // Jitcode is produced before the GC transform, so it carries
+                // no barrier: the backend rewrite inserts `COND_CALL_GC_WB`
+                // in front of that `setfield_gc` (`handle_write_barrier_setfield`).
+                // The call returns `()`; its destination binds to a unit
+                // constant.  Leaving the helper as a residual `CallN` is the
+                // `info = sys.exc_info()` ObjectMutableCell store paying a
+                // function call every iteration.
+                if args.len() == 1 && self.is_source_write_barrier_call(&reg) {
                     self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -29419,14 +29423,20 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `typeobject::type_write_barrier(obj)`, the barrier in front of a
-    /// `W_TypeObject` field store.
-    fn is_type_write_barrier_call(&self, reg: &RegularCall) -> bool {
+    /// Source-level write-barrier helpers in front of a following `setfield`.
+    /// `typeobject::type_write_barrier` for `W_TypeObject` fields;
+    /// `celldict::object_mutable_cell_write_barrier` for
+    /// `typeobject.py write_cell`'s in-place `ObjectMutableCell.w_value` store.
+    fn is_source_write_barrier_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path() == "pyre_object::typeobject::type_write_barrier"
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "pyre_object::typeobject::type_write_barrier"
+                    | "pyre_object::celldict::object_mutable_cell_write_barrier"
+            )
         })
     }
 
@@ -71192,6 +71202,26 @@ mod tests {
                 |op| matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "w_doc")
             ),
             "w_type_set_w_doc lost its w_doc setfield"
+        );
+    }
+
+    /// `write_cell`'s in-place `ObjectMutableCell` arm is
+    /// `object_mutable_cell_write_barrier(cell); cell.w_value = w_value`.
+    /// Drop the helper so rewrite can put `COND_CALL_GC_WB` on the
+    /// `setfield_gc`, the same collapse as `type_write_barrier`.
+    #[test]
+    fn object_mutable_cell_write_barrier_call_leaves_only_the_setfield() {
+        use crate::model::OpKind;
+        let graph = lower_object_fn("pyre_object::celldict::write_cell");
+        assert!(
+            !calls_leaf(&graph, "object_mutable_cell_write_barrier"),
+            "write_cell still calls object_mutable_cell_write_barrier"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "w_value")
+            ),
+            "write_cell lost its ObjectMutableCell.w_value setfield"
         );
     }
 
