@@ -13486,7 +13486,21 @@ mod set_member_lookup_tests {
             let SetMemberLookup::Resolved(descr) = found else {
                 panic!("pyobject::PyObject.w_class did not resolve");
             };
-            assert!(std::sync::Arc::ptr_eq(&descr, &w_class_descr()));
+            // Another test in this process may have published the header's
+            // own layout into the process-global `gc_cache`; the lookup then
+            // answers with that size's field. Both name the same word.
+            let published = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_size
+                .contains_key(&majit_ir::descr::LLType::Struct(struct_id));
+            if !published {
+                assert!(std::sync::Arc::ptr_eq(&descr, &w_class_descr()));
+            }
+            let canonical = w_class_descr();
+            assert_eq!(
+                descr.as_field_descr().map(|f| f.offset()),
+                canonical.as_field_descr().map(|f| f.offset())
+            );
         }
         {
             // a_gc_only_w_class_on_the_size_is_the_effectinfo_field
