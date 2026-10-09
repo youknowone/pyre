@@ -69,19 +69,22 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
    A `stopped` row is not a missing container — `container start pyre-linux`
    and keep the toolchain it already has.
 
-2. Start it if absent, from the repository root. **Three** mounts are required:
+2. Start it if absent, from the repository root. **Four** mounts are required:
    the worktree; the shared build cache **outside** the worktree so sibling
-   worktrees and container runs reuse one charon install; and the main checkout
+   worktrees and container runs reuse one charon install; the main checkout
    at its own host path, because these worktrees are `git worktree`s (see the
-   trap below).
+   trap below); and a per-container directory over `/workspace/pyre/build/llbc`
+   so extraction never writes into the host's artefacts.
 
    ```shell
-   mkdir -p "$(dirname "$PWD")/.pyre-build"
+   mkdir -p "$(dirname "$PWD")/.pyre-build" \
+            "$(dirname "$PWD")/.pyre-build/llbc-container/pyre-linux"
    MAIN=$(sed -n 's|^gitdir: \(.*\)/\.git/worktrees/.*|\1|p' .git)   # empty in a normal clone
    container run -d --name pyre-linux --platform linux/arm64 -m 12G -c 4 \
      --mount type=bind,source="$(pwd)",target=/workspace/pyre \
      --mount type=bind,source="$(dirname "$PWD")/.pyre-build",target=/workspace/.pyre-build \
      --mount type=bind,source="$MAIN",target="$MAIN" \
+     --mount type=bind,source="$(dirname "$PWD")/.pyre-build/llbc-container/pyre-linux",target=/workspace/pyre/build/llbc \
      pyre-ubuntu24-arm64-repro sleep infinity
    ```
 
@@ -124,6 +127,9 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
      && cargo build --release -p pyrex --bin pyre-cranelift \
           --no-default-features --features cranelift'
    ```
+
+   Extraction and the Linux `pyre-jit-trace` build both read and write
+   `/workspace/pyre/build/llbc` as usual; that is the step-2 mount.
 
    `scripts/extract-llbc.py` takes **no crate arguments** — the bare form
    extracts the whole set. Naming a subset mixes fresh and stale artefacts.
@@ -186,11 +192,13 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
   other way too: `source=` is a hash of the tree, so editing anything after an
   extraction marks the artefacts stale — do the extract last and leave the tree
   alone until whatever you are measuring has finished.
-- **The container's extraction overwrites the host's `build/llbc`.** The
-  driver's `out_dir` is a fixed `<repo-root>/build/llbc` with no override, and
-  the worktree is bind-mounted, so `extract-llbc.py` inside the container
-  replaces the artefacts your macOS build reads. Budget a full host re-extract
-  (~25 min) before building on the host again. Every field the freshness check
-  compares is computed from the tracked tree and so agrees across hosts;
-  `platform=` is the one that does not, and `fail_if_llbc_stale` now refuses on
-  it rather than letting the build fail somewhere downstream.
+- **A container lacking the `build/llbc` mount must not extract.** The
+  driver's `out_dir` is a fixed `<repo-root>/build/llbc` with no override,
+  and the worktree is bind-mounted, so an extract without the nested mount
+  replaces the artefacts your macOS build reads. The step-2 mount is now
+  mandatory; recreate a container that lacks it (`container rm` then
+  `container run`; the pinned nightly toolchain is reinstalled, see step 3)
+  rather than running `extract-llbc.py` in it. Every field the freshness
+  check compares is computed from the tracked tree and so agrees across
+  hosts; `platform=` is the one that does not, and `fail_if_llbc_stale` now
+  refuses on it rather than letting the build fail somewhere downstream.

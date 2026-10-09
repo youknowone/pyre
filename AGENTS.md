@@ -104,6 +104,9 @@ PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepa
 - `extract-llbc.py` **skips** a crate whose source fingerprint is unchanged;
   `--force` / `LLBC_FORCE_REEXTRACT=1` overrides. `pyre-interpreter.ullbc` is
   ~300 MB and takes minutes.
+- **A Linux container never extracts into the host's `build/llbc`.** Mount a
+  per-container directory over `/workspace/pyre/build/llbc` at `container run`
+  (see `/apple-container`, step 2).
 - **On Windows, keep `CHARON_TARGET_DIR` short.** cargo passes one
   `-L dependency=...` per dependency build dir, so under a long target path
   `pyre-interpreter`'s rustc line passes the 32767-character limit; cargo then
