@@ -178,31 +178,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getgrnam() missing argument",
                     ));
                 }
+                // `lib_pypy/grp.py getgrnam`: `isinstance(name, str)`, then
+                // `os.fsencode(name)`, then `if b'\0' in name_b`.
                 if !unsafe { pyre_object::is_str(args[0]) } {
                     return Err(pyre_interpreter::PyError::type_error(
                         "getgrnam(): name should be a string",
                     ));
                 }
                 let mut w_name = args[0];
-                let name = pyre_object::with_roots!(w_name => {
-                    pyre_interpreter::baseobjspace::str_utf8_w(w_name)
+                let name_b = pyre_object::with_roots!(w_name => {
+                    pyre_interpreter::gateway::fsencode(w_name)
                 })?;
-                // Reject embedded NULs (parity with PyPy's @unwrap_spec
-                // text0 used for similar lookup APIs).
-                if name.as_bytes().contains(&0) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "getgrnam: name must not contain NUL bytes",
-                    ));
+                if name_b.contains(&0) {
+                    return Err(pyre_interpreter::PyError::value_error("embedded null byte"));
                 }
                 let g = pyre_object::with_roots!(w_name => {
                     let ll_name =
-                        majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
+                        majit_rlib::rffi::scoped_str2charp::new(Some(&name_b));
                     unsafe { ll::c_getgrnam(ll_name.buf) }
                 });
                 if g.is_null() {
                     Err(pyre_interpreter::PyError::key_error(format!(
                         "getgrnam(): name not found: {}",
-                        name
+                        String::from_utf8_lossy(&name_b)
                     )))
                 } else {
                     Ok(make_struct_group(g))

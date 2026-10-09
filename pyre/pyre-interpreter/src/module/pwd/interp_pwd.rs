@@ -220,22 +220,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "getpwnam() missing argument",
                     ));
                 }
-                if !unsafe { pyre_object::is_str(args[0]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getpwnam(): name should be a string",
-                    ));
-                }
+                // `interp_pwd.py @unwrap_spec(name='text0')` → `text0_w`.
                 let mut w_name = args[0];
                 let name = pyre_object::with_roots!(w_name => {
-                    pyre_interpreter::baseobjspace::str_utf8_w(w_name)
+                    pyre_interpreter::baseobjspace::text0_w(w_name)
                 })?;
-                // `interp_pwd.py @unwrap_spec(name='text0')` rejects
-                // embedded NULs.
-                if name.as_bytes().contains(&0) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "getpwnam: name must not contain NUL bytes",
-                    ));
-                }
                 let pw = pyre_object::with_roots!(w_name => {
                     let ll_name =
                         majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
