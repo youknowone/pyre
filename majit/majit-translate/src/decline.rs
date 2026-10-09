@@ -139,6 +139,10 @@ pub mod gate {
     /// A structural miss leaves the residual `Range::map` FunctionPath,
     /// which then fails phaseA as an unregistered CallRegistry path.
     pub const ITER_ADAPTER: &str = "front::iter_adapter";
+    /// Drop of a one-word `Vec` whose header this graph did not allocate.
+    /// `rewrite_op_free` still wants a free; omitting it is a leak when
+    /// the header was allocated here and only a phi hid the producer.
+    pub const RUST_VEC_DROP: &str = "rust-vec-drop";
 }
 
 /// Verbosity of the decline census.  Resolved once, from the environment.
@@ -361,6 +365,23 @@ pub fn dump_to_stderr(label: &str) {
             subjects.to_string()
         };
         eprintln!("    {events:6}  {subjects:>8}  {reason}");
+    }
+    // rust-vec-drop names the graphs, so a leak census can say which
+    // headers a Drop could not prove this graph allocated.
+    for reason in [
+        "header-not-allocated-in-graph",
+        "header-not-live-at-drop",
+        "maybe-initialised",
+        "vec-drop-unknown-item-kind",
+    ] {
+        let names = subjects_of(gate::RUST_VEC_DROP, reason);
+        if names.is_empty() {
+            continue;
+        }
+        eprintln!("  rust-vec-drop {reason} subjects ({n}):", n = names.len());
+        for name in names {
+            eprintln!("    {name}");
+        }
     }
 }
 

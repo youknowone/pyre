@@ -1960,6 +1960,7 @@ impl<'l> CrateLowering<'l> {
             return Err(DeclBuildError::NoBody);
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
+        elaborate_vec_drops(llbc, &mut body);
         let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
@@ -2049,6 +2050,7 @@ impl<'l> CrateLowering<'l> {
             return None;
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
+        elaborate_vec_drops(llbc, &mut body);
         let signature = crate::front::clause_spec::substituted_signature(
             &fd.signature,
             llbc,
@@ -4701,6 +4703,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         ))
     })?;
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
+    elaborate_vec_drops(llbc, &mut u);
     let u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
@@ -5004,6 +5007,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     );
     let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        lo.emit_pending_vec_frees();
         lo.graph.return_class_root = dont_look_inside_return_class_root(
             &fd.signature.output,
             llbc,
@@ -8079,6 +8083,12 @@ struct Lowering<'a> {
     /// `&mut vec` / `&mut vec[..]` to this word. A block input copied from
     /// it is recorded too.
     object_vec_headers: std::collections::HashSet<u64>,
+    /// Definitely-initialised `Vec` Drops recorded while lowering. The
+    /// `ll_vec_free_*` is emitted after block links are in SSA-final form
+    /// (framestate Pass 2 / monotonic `edge_args`), because
+    /// `rewrite_op_free` follows the header through those links and a
+    /// Pass-1 leftover inputarg position does not match a live-in link.
+    pending_vec_frees: Vec<(BlockId, Variable, majit_ir::rvec::VecItemKind)>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
@@ -9198,6 +9208,7 @@ impl<'a> Lowering<'a> {
             root_bracket,
             owner_root: analyze_owner_roots(body, llbc),
             owner_root_reroot: None,
+            pending_vec_frees: Vec::new(),
         })
     }
 
@@ -21609,6 +21620,27 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc) {
             return Ok(true);
         }
+        if tyref_is_owned_vec(&place.ty, self.llbc) {
+            if let PlaceKind::Local(local) = place.kind {
+                match vec_init_at_drop(self.body, self.llbc, mir_bb, local as usize) {
+                    VecInit::Maybe => {
+                        crate::decline::record_named(
+                            crate::decline::gate::RUST_VEC_DROP,
+                            "maybe-initialised",
+                            &self.graph.name,
+                        );
+                        return Ok(true);
+                    }
+                    VecInit::Uninit => return Ok(true),
+                    VecInit::Init => {
+                        self.lower_rust_vec_drop(self.block_id[mir_bb], place);
+                        return Ok(true);
+                    }
+                }
+            }
+            self.lower_rust_vec_drop(self.block_id[mir_bb], place);
+            return Ok(true);
+        }
         if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
             self.lower_rust_vec_drop(self.block_id[mir_bb], place);
             return Ok(true);
@@ -21626,59 +21658,46 @@ impl<'a> Lowering<'a> {
     /// contents untraced and roots them where it allocates, and the lowered
     /// code keeps that contract, so freeing it releases no GC object.
     ///
-    /// Only a header this graph allocated through `ll_vec_newemptylist` /
-    /// `ll_vec_newlist_hint` / `ll_vec_alloc_and_set` is `raw_malloc_varsize_char`
-    /// memory; any other
-    /// `Vec` value (a phi merge, a call result) is left as before and the
-    /// decline is recorded.
+    /// `rewrite_op_free` (`jtransform.py`) emits `raw_free` wherever the
+    /// graph frees; the pointer is threaded through Links like any other
+    /// variable. Ownership is a header this graph allocated through
+    /// `ll_vec_newemptylist` / `ll_vec_newlist_hint` / `ll_vec_alloc_and_set`,
+    /// following SSA copies through block-input Links and phi merges. A
+    /// call result or function input is not this graph's allocation.
     fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) {
-        use majit_ir::rvec::VecOp;
         let PlaceKind::Local(local) = place.kind else {
             return;
         };
         let Some(kind) = tyref_rust_vec_item_kind(&place.ty, self.llbc) else {
+            if tyref_is_vec_value(&place.ty, self.llbc) {
+                crate::decline::record_named(
+                    crate::decline::gate::RUST_VEC_DROP,
+                    "vec-drop-unknown-item-kind",
+                    &self.graph.name,
+                );
+            }
             return;
         };
         let Some(header) = self.local_var[local as usize]
             .as_ref()
             .and_then(|value| value.one().ok())
         else {
-            return;
-        };
-        let allocated_here =
-            resolve_to_producer_op(&self.graph, &header).is_some_and(|(block, index)| {
-                let producer = &self.graph.block(block).operations[index];
-                let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } = &producer.kind
-                else {
-                    return false;
-                };
-                matches!(
-                    majit_ir::rvec::vec_helper_for_path(&segments.join("::")),
-                    Some((VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet, _))
-                )
-            });
-        if !allocated_here {
-            crate::decline::record(
-                "rust-vec-drop",
-                "header-not-allocated-in-graph",
-                format_args!("{}", self.graph.name),
+            crate::decline::record_named(
+                crate::decline::gate::RUST_VEC_DROP,
+                "header-not-live-at-drop",
+                &self.graph.name,
             );
             return;
+        };
+        // Prove ownership after links match inputargs (framestate Pass 2).
+        self.pending_vec_frees.push((bb_id, header, kind));
+    }
+
+    fn emit_pending_vec_frees(&mut self) {
+        let pending = std::mem::take(&mut self.pending_vec_frees);
+        for (bb_id, header, kind) in pending {
+            emit_rust_vec_drop_if_allocated(&mut self.graph, bb_id, &header, kind);
         }
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: rust_vec_helper_segments(VecOp::Free, kind),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![header]),
-                result_ty: ValueType::Void,
-            },
-        });
     }
 
     /// Drop a one-word guard local by passing its word to the bound release
@@ -41648,6 +41667,7 @@ pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
         || is_list_lock_release_call(kind)
         || is_set_lock_release_call(kind)
         || is_slice_buffer_free_call(kind)
+        || is_rust_vec_free_call(kind)
 }
 
 /// Match the `ll_slice_buffer_free` a raw array's frame exit emits.
@@ -41660,6 +41680,22 @@ pub(crate) fn is_slice_buffer_free_call(kind: &OpKind) -> bool {
         return false;
     };
     segments.join("::") == majit_ir::rvec::SLICE_BUFFER_FREE
+}
+
+/// Match `ll_vec_free_*` of a one-word `Vec` header, the `rewrite_op_free`
+/// residual a Drop of that vec emits. Result/exception rewrites replay it
+/// the same way they replay `ll_slice_buffer_free`.
+pub(crate) fn is_rust_vec_free_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments
+        .last()
+        .is_some_and(|leaf| leaf.starts_with("ll_vec_free_"))
 }
 
 /// `core::mem::drop(move local)`: the local that call drops.
@@ -41881,6 +41917,11 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
             out.insert(bb_idx);
         }
     }
+    // A definitely-initialised `Drop _v` of a `Vec<T>` local is a use:
+    // the destructor reads the header. `elaborate_vec_drops` has already
+    // rewritten a definitely-moved-out Drop to `Goto`, so those never
+    // ask liveness for `_v`. A maybe-initialised Drop is left unmarked.
+    out.union_with(&definitely_init_vec_drop_blocks(body, llbc));
     out
 }
 
@@ -43488,6 +43529,7 @@ impl<'a> RootStackAnalyzer<'a> {
                 elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
                     regular_call_name_path(reg, self.llbc)
                 });
+                elaborate_vec_drops(self.llbc, &mut body);
                 self.analyze_body(&body, seen)
             }
             None => self.analyze_external_call(fd),
@@ -47352,6 +47394,301 @@ fn gc_root_scope_base_path(name: &str) -> bool {
     matches!(segments.last(), Some(&"base")) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
+/// CFG successors the lowering keeps: `Goto` / `Call` / `Assert` / `Drop`
+/// / `Switch` targets, leaving out `on_unwind`.
+///
+/// [`elaborate_explicit_root_closes`] and [`elaborate_vec_drops`] share
+/// this edge set so a drop-elaboration fact is the same one the flow
+/// graph will see.
+fn model_successors(body: &Unstructured, llbc: &Llbc, bb: usize) -> Vec<usize> {
+    let Some(block) = body.body.get(bb) else {
+        return Vec::new();
+    };
+    let targets: Vec<u64> = match block.term_ref(llbc) {
+        Ok(TermKind::Goto { target }) => vec![*target],
+        Ok(
+            TermKind::Call { target, .. }
+            | TermKind::Assert { target, .. }
+            | TermKind::Drop { target, .. },
+        ) => vec![*target],
+        Ok(TermKind::Switch { targets, .. }) => match targets {
+            SwitchTargets::If(a, b) => vec![*a, *b],
+            SwitchTargets::SwitchInt(_, arms, default) => arms
+                .iter()
+                .map(|(_, bb)| *bb)
+                .chain(std::iter::once(*default))
+                .collect(),
+        },
+        _ => Vec::new(),
+    };
+    targets
+        .into_iter()
+        .map(|t| t as usize)
+        .filter(|&t| t < body.body.len())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VecInit {
+    Init,
+    Uninit,
+    Maybe,
+}
+
+const VEC_INIT: u8 = 1;
+const VEC_UNINIT: u8 = 2;
+
+fn vec_init_from_bits(bits: u8) -> VecInit {
+    match bits {
+        VEC_INIT => VecInit::Init,
+        VEC_UNINIT => VecInit::Uninit,
+        _ => VecInit::Maybe,
+    }
+}
+
+/// An owned `alloc::vec::Vec<T>` value, not `&Vec<_>` and not `*mut Vec<_>`.
+fn tyref_is_owned_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if node
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"))
+    {
+        return false;
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+}
+
+fn operand_moves_local(op: &Operand, local: usize) -> bool {
+    matches!(
+        op,
+        Operand::Move(place) if matches!(place.kind, PlaceKind::Local(l) if l as usize == local)
+    )
+}
+
+fn rvalue_moves_local(rvalue: &Rvalue, local: usize) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => operand_moves_local(op, local),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            operand_moves_local(lhs, local) || operand_moves_local(rhs, local)
+        }
+        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_moves_local(op, local)),
+        Rvalue::Ref { .. }
+        | Rvalue::RawPtr { .. }
+        | Rvalue::Len(_)
+        | Rvalue::Discriminant(_)
+        | Rvalue::NullaryOp(_, _)
+        | Rvalue::Unknown => false,
+    }
+}
+
+fn place_is_local(place: &Place, local: usize) -> bool {
+    matches!(place.kind, PlaceKind::Local(l) if l as usize == local)
+}
+
+fn vec_transfer_stmt(s: u8, stmt: &majit_charon_reader::ullbc::Statement, local: usize) -> u8 {
+    match stmt.stmt_kind_ref() {
+        Ok(StmtKind::Assign(place, rvalue)) => {
+            let mut s = s;
+            if rvalue_moves_local(rvalue, local) {
+                s = VEC_UNINIT;
+            }
+            if place_is_local(place, local) {
+                s = VEC_INIT;
+            }
+            s
+        }
+        Ok(StmtKind::Assert(assert)) => {
+            if operand_moves_local(&assert.cond, local) {
+                VEC_UNINIT
+            } else {
+                s
+            }
+        }
+        _ => s,
+    }
+}
+
+fn vec_transfer_term(
+    s: u8,
+    term: &TermKind,
+    local: usize,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> u8 {
+    if term_dropped_local(term, name_of) == Some(local as u64) {
+        return VEC_UNINIT;
+    }
+    match term {
+        TermKind::Call { call, .. } => {
+            let mut s = s;
+            if call.args.iter().any(|op| operand_moves_local(op, local)) {
+                s = VEC_UNINIT;
+            }
+            if let CallFunc::Dynamic(op) = &call.func
+                && operand_moves_local(op, local)
+            {
+                s = VEC_UNINIT;
+            }
+            if place_is_local(&call.dest, local) {
+                s = VEC_INIT;
+            }
+            s
+        }
+        TermKind::Switch { discr, .. } => {
+            if operand_moves_local(discr, local) {
+                VEC_UNINIT
+            } else {
+                s
+            }
+        }
+        TermKind::Assert { assert, .. } => {
+            if operand_moves_local(&assert.cond, local) {
+                VEC_UNINIT
+            } else {
+                s
+            }
+        }
+        _ => s,
+    }
+}
+
+fn vec_local_entry_bits(body: &Unstructured, llbc: &Llbc, local: usize) -> Vec<u8> {
+    let n = body.body.len();
+    let mut state = vec![0u8; n];
+    if n == 0 {
+        return state;
+    }
+    let arg_count = body.locals.arg_count as usize;
+    state[0] = if (1..=arg_count).contains(&local) {
+        VEC_INIT
+    } else {
+        VEC_UNINIT
+    };
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let mut work = vec![0usize];
+    while let Some(bb) = work.pop() {
+        let mut s = state[bb];
+        for stmt in &body.body[bb].statements {
+            s = vec_transfer_stmt(s, stmt, local);
+        }
+        if let Ok(term) = body.body[bb].term_ref(llbc) {
+            s = vec_transfer_term(s, term, local, &name_of);
+        }
+        for succ in model_successors(body, llbc, bb) {
+            if state[succ] | s != state[succ] {
+                state[succ] |= s;
+                work.push(succ);
+            }
+        }
+    }
+    state
+}
+
+fn vec_init_bits_at_term(body: &Unstructured, bb: usize, local: usize, entry: u8) -> u8 {
+    let mut s = entry;
+    for stmt in &body.body[bb].statements {
+        s = vec_transfer_stmt(s, stmt, local);
+    }
+    s
+}
+
+fn vec_init_at_drop(body: &Unstructured, llbc: &Llbc, bb: usize, local: usize) -> VecInit {
+    let entry = vec_local_entry_bits(body, llbc, local);
+    let bits = vec_init_bits_at_term(body, bb, local, entry.get(bb).copied().unwrap_or(0));
+    vec_init_from_bits(bits)
+}
+
+/// Charon keeps the scope-end `Drop _v` that rustc's drop elaboration
+/// (`elaborate_drops`) removes for a local moved out on every path to it.
+/// The same rule [`elaborate_explicit_root_closes`] applies to a root
+/// guard: a `Vec<T>` local definitely moved out at its `Drop` becomes a
+/// `Goto`, a definitely-initialised `Drop` stays (it USES `_v` and
+/// lowers to `ll_vec_free_*`), and a mixed (maybe-initialised) `Drop`
+/// is left for the lowering to decline rather than invent a drop flag.
+fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstructured) {
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let vec_locals: Vec<usize> = body
+        .locals
+        .locals
+        .iter()
+        .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
+        .map(|local| local.index as usize)
+        .collect();
+    if vec_locals.is_empty() {
+        return;
+    }
+    let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();
+    for local in vec_locals {
+        let entry = vec_local_entry_bits(body, llbc, local);
+        for bb_idx in 0..body.body.len() {
+            let (dropped, target) = match body.body[bb_idx].term_ref(llbc) {
+                Ok(term) => (
+                    term_dropped_local(term, &name_of),
+                    match term {
+                        TermKind::Drop { target, .. } | TermKind::Call { target, .. } => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    },
+                ),
+                _ => continue,
+            };
+            if dropped != Some(local as u64) {
+                continue;
+            }
+            let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
+            if vec_init_from_bits(at_term) != VecInit::Uninit {
+                continue;
+            }
+            let Some(target) = target else {
+                continue;
+            };
+            rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
+        }
+    }
+    for (bb_idx, kind) in rewrites {
+        body.body[bb_idx].set_terminator_kind(kind);
+    }
+}
+
+fn definitely_init_vec_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let mut out = bit_set::BitSet::with_capacity(body.body.len());
+    let vec_locals: Vec<usize> = body
+        .locals
+        .locals
+        .iter()
+        .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
+        .map(|local| local.index as usize)
+        .collect();
+    for local in vec_locals {
+        let entry = vec_local_entry_bits(body, llbc, local);
+        for bb_idx in 0..body.body.len() {
+            let dropped = match body.body[bb_idx].term_ref(llbc) {
+                Ok(term) => term_dropped_local(term, &name_of),
+                _ => continue,
+            };
+            if dropped != Some(local as u64) {
+                continue;
+            }
+            let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
+            if vec_init_from_bits(at_term) == VecInit::Init {
+                out.insert(bb_idx);
+            }
+        }
+    }
+    out
+}
+
 /// `drop(guard)`: `_t = move _g; _ = core::mem::drop(move _t)`.
 ///
 /// The guard's destructor runs inside that call, so the call is the close of
@@ -47451,30 +47788,6 @@ fn elaborate_explicit_root_closes(
         }
     }
     let move_counts = local_move_counts(body, llbc);
-    let model_successors = |bb: usize| -> Vec<usize> {
-        let targets: Vec<u64> = match body.body[bb].term(llbc) {
-            Ok(TermKind::Goto { target }) => vec![target],
-            Ok(
-                TermKind::Call { target, .. }
-                | TermKind::Assert { target, .. }
-                | TermKind::Drop { target, .. },
-            ) => vec![target],
-            Ok(TermKind::Switch { targets, .. }) => match targets {
-                SwitchTargets::If(a, b) => vec![a, b],
-                SwitchTargets::SwitchInt(_, arms, default) => arms
-                    .iter()
-                    .map(|(_, bb)| *bb)
-                    .chain(std::iter::once(default))
-                    .collect(),
-            },
-            _ => Vec::new(),
-        };
-        targets
-            .into_iter()
-            .map(|t| t as usize)
-            .filter(|&t| t < body.body.len())
-            .collect()
-    };
     let drop_of = |bb: &majit_charon_reader::ullbc::BasicBlock| -> Option<usize> {
         match bb.term(llbc) {
             Ok(TermKind::Drop { place, .. }) => match place.kind {
@@ -47567,7 +47880,7 @@ fn elaborate_explicit_root_closes(
             } else {
                 state[bb]
             };
-            for succ in model_successors(bb) {
+            for succ in model_successors(body, llbc, bb) {
                 if state[succ] | out != state[succ] {
                     state[succ] |= out;
                     work.push(succ);
@@ -63252,6 +63565,150 @@ pub(crate) fn resolve_to_producer_op(
     }
 }
 
+/// Whether `op` is this graph's `ll_vec_newemptylist` / `ll_vec_newlist_hint`
+/// / `ll_vec_alloc_and_set` — the helpers that produce the
+/// `raw_malloc_varsize_char` header `ll_vec_free` releases.
+fn op_is_in_graph_vec_alloc(op: &SpaceOperation) -> bool {
+    op_vec_alloc_kind(op).is_some()
+}
+
+fn op_vec_alloc_kind(op: &SpaceOperation) -> Option<majit_ir::rvec::VecItemKind> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    match majit_ir::rvec::vec_helper_for_path(&segments.join("::")) {
+        Some((
+            majit_ir::rvec::VecOp::NewEmpty
+            | majit_ir::rvec::VecOp::NewHint
+            | majit_ir::rvec::VecOp::AllocAndSet,
+            kind,
+        )) => Some(kind),
+        _ => None,
+    }
+}
+
+/// Whether `header` is a `Vec` this graph allocated through
+/// `ll_vec_newemptylist` / `ll_vec_newlist_hint` / `ll_vec_alloc_and_set`.
+///
+/// `rewrite_op_free` (`jtransform.py`) emits `raw_free` wherever the graph
+/// frees; the pointer is threaded through Links like any other variable,
+/// so a phi merge is not a different owner. Every incoming SSA path must
+/// reach one of those producers. A call result or function input is not
+/// this graph's allocation.
+pub(crate) fn rust_vec_header_allocated_in_graph(graph: &FunctionGraph, header: &Variable) -> bool {
+    rust_vec_header_allocated_in_graph_rec(graph, header, &mut Vec::new(), &mut Vec::new())
+        == Some(true)
+}
+
+/// `Some(true)` allocated here, `Some(false)` not, `None` a cycle in the
+/// current walk (a loop-carried phi). Other incoming arms decide a cycle.
+fn rust_vec_header_allocated_in_graph_rec(
+    graph: &FunctionGraph,
+    header: &Variable,
+    visiting: &mut Vec<u64>,
+    cache: &mut Vec<(u64, bool)>,
+) -> Option<bool> {
+    let id = header.id();
+    if let Some((_, ok)) = cache.iter().find(|(k, _)| *k == id) {
+        return Some(*ok);
+    }
+    if visiting.contains(&id) {
+        return None;
+    }
+    visiting.push(id);
+
+    let computed = 'compute: {
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref().is_some_and(|r| r.id() == id) {
+                    break 'compute Some(op_is_in_graph_vec_alloc(op));
+                }
+            }
+        }
+        let Some((owner, pos)) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|a| a.id() == id)
+                .map(|pos| (block.id, pos))
+        }) else {
+            break 'compute Some(false);
+        };
+        let incoming: Vec<&Link> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .filter(|link| link.target == owner)
+            .collect();
+        if incoming.is_empty() {
+            break 'compute Some(false);
+        }
+        let mut saw_alloc = false;
+        let mut saw_other = false;
+        for link in incoming {
+            match link.args.get(pos) {
+                Some(LinkArg::Value(v)) => {
+                    match rust_vec_header_allocated_in_graph_rec(graph, v, visiting, cache) {
+                        Some(true) => saw_alloc = true,
+                        Some(false) => saw_other = true,
+                        None => {}
+                    }
+                }
+                _ => saw_other = true,
+            }
+        }
+        if saw_other {
+            Some(false)
+        } else if saw_alloc {
+            Some(true)
+        } else {
+            Some(false)
+        }
+    };
+
+    visiting.pop();
+    if let Some(ok) = computed {
+        cache.push((id, ok));
+    }
+    computed
+}
+
+/// Emit `ll_vec_free_*` of `header` when this graph allocated it.
+///
+/// Returns whether a free was emitted. A call-result or function-input
+/// header records `header-not-allocated-in-graph` and is left alone.
+pub(crate) fn emit_rust_vec_drop_if_allocated(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    header: &Variable,
+    kind: majit_ir::rvec::VecItemKind,
+) -> bool {
+    if !rust_vec_header_allocated_in_graph(graph, header) {
+        crate::decline::record_named(
+            crate::decline::gate::RUST_VEC_DROP,
+            "header-not-allocated-in-graph",
+            &graph.name,
+        );
+        return false;
+    }
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
+                fun_decl_id: None,
+            },
+            args: crate::model::call_args(vec![header.clone()]),
+            result_ty: ValueType::Void,
+        },
+    });
+    true
+}
+
 /// Whether `dom` dominates `target`: every path from the graph entry to
 /// `target` passes through `dom`.  Computed as "with `dom` removed, is
 /// `target` unreachable from `startblock`" (the standard reachability
@@ -72966,6 +73423,724 @@ mod tests {
         assert_eq!(resolve_to_producer_op(&graph, &x), Some((a, 0)));
         // An unrelated free Variable has no producer.
         assert_eq!(resolve_to_producer_op(&graph, &Variable::new()), None);
+    }
+
+    fn vec_alloc_and_set_r(result: Variable) -> SpaceOperation {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+        SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(
+                    vec_helper_path(VecOp::AllocAndSet, VecItemKind::Ref).split("::"),
+                ),
+                args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
+                result_ty: ValueType::Int,
+            },
+        }
+    }
+
+    fn vec_call_result(result: Variable, leaf: &str) -> SpaceOperation {
+        SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["other", leaf]),
+                args: vec![],
+                result_ty: ValueType::Int,
+            },
+        }
+    }
+
+    fn graph_call_leaves(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `rewrite_op_free` frees a header that reached the drop through a
+    /// return/unwind phi: both incoming Links carry the same in-graph
+    /// `ll_vec_alloc_and_set` result, so the drop emits `ll_vec_free`.
+    #[test]
+    fn rust_vec_drop_frees_phi_merged_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("phi_vec_drop");
+        let alloc_bb = graph.create_block();
+        let ok_bb = graph.create_block();
+        let err_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+
+        let ok_h = Variable::new();
+        graph.block_mut(ok_bb).inputargs = vec![ok_h.clone()];
+        let err_h = Variable::new();
+        graph.block_mut(err_bb).inputargs = vec![err_h.clone()];
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], ok_bb, None)
+                .with_prevblock(alloc_bb),
+            Link::from_variables(&graph, vec![allocated.clone()], err_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(ok_bb).exits = vec![
+            Link::from_variables(&graph, vec![ok_h.clone()], drop_bb, None).with_prevblock(ok_bb),
+        ];
+        graph.block_mut(err_bb).exits = vec![
+            Link::from_variables(&graph, vec![err_h.clone()], drop_bb, None).with_prevblock(err_bb),
+        ];
+
+        // The drop header is a two-predecessor phi: `resolve_to_producer_op`
+        // has no single producer, which is the leak the SSA walk closes.
+        assert_eq!(super::resolve_to_producer_op(&graph, &drop_h), None);
+        assert!(rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            leaves.iter().any(|leaf| leaf == "ll_vec_free_r"),
+            "phi-merged in-graph header must be freed: {leaves:?}"
+        );
+    }
+
+    /// A header that is only a call result in this graph is not this
+    /// graph's `raw_malloc` allocation; `rewrite_op_free` of it would
+    /// free a pointer another graph (or a residual) owns.
+    #[test]
+    fn rust_vec_drop_does_not_free_call_result_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("call_result_vec_drop");
+        let call_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let returned = Variable::new();
+        graph
+            .block_mut(call_bb)
+            .operations
+            .push(vec_call_result(returned.clone(), "returns_vec"));
+
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+        graph.block_mut(call_bb).exits = vec![
+            Link::from_variables(&graph, vec![returned.clone()], drop_bb, None)
+                .with_prevblock(call_bb),
+        ];
+
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &returned));
+        assert!(!emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
+            "call-result header must not be freed by this graph: {leaves:?}"
+        );
+    }
+
+    /// A phi that mixes an in-graph alloc with a call result cannot prove
+    /// ownership of the live header.
+    #[test]
+    fn rust_vec_drop_does_not_free_mixed_phi_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("mixed_phi_vec_drop");
+        let alloc_bb = graph.create_block();
+        let call_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+        let returned = Variable::new();
+        graph
+            .block_mut(call_bb)
+            .operations
+            .push(vec_call_result(returned.clone(), "returns_vec"));
+
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], drop_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(call_bb).exits = vec![
+            Link::from_variables(&graph, vec![returned.clone()], drop_bb, None)
+                .with_prevblock(call_bb),
+        ];
+
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(!emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
+            "mixed phi must not free: {leaves:?}"
+        );
+    }
+
+    fn owned_vec_drop_llbc(
+        name: &str,
+        arg_count: u64,
+        locals: Vec<serde_json::Value>,
+        blocks: Vec<serde_json::Value>,
+        extra_types: Vec<serde_json::Value>,
+        extra_funs: Vec<serde_json::Value>,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| {
+                    if *segment == "<Impl>" {
+                        serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                    } else {
+                        serde_json::json!({"Ident": [segment, 0]})
+                    }
+                }).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [i64_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let unit = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let inputs: Vec<serde_json::Value> = locals
+            .iter()
+            .skip(1)
+            .take(arg_count as usize)
+            .filter_map(|local| local.get("ty").cloned())
+            .collect();
+        let subject = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {"arg_count": arg_count, "locals": locals},
+                    "body": blocks
+                }
+            }
+        });
+        let vec_new = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["alloc", "vec", "<Impl>", "new"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": vec_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let sink = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "sink"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [vec_ty],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let vec_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["alloc", "vec", "Vec"], false),
+            "kind": {"Struct": []}
+        });
+        let mut types = vec![vec_decl];
+        types.extend(extra_types);
+        let mut funs = vec![subject, vec_new, sink];
+        funs.extend(extra_funs);
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": funs,
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("owned vec drop fixture parses")
+    }
+
+    fn owned_vec_ty() -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"Scalar": {"Integer": {"Signed": "I64"}}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn owned_vec_unit_ty() -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn owned_vec_span() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    }
+
+    fn owned_vec_local(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "index": index,
+            "name": null,
+            "span": owned_vec_span(),
+            "ty": ty
+        })
+    }
+
+    fn owned_vec_place(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"kind": {"Local": index}, "ty": ty})
+    }
+
+    fn owned_vec_block(
+        statements: Vec<serde_json::Value>,
+        terminator: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "statements": statements,
+            "terminator": {"span": owned_vec_span(), "kind": terminator}
+        })
+    }
+
+    fn owned_vec_new_call(
+        dest: u64,
+        dest_ty: &serde_json::Value,
+        target: u64,
+        unwind: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 1},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": [],
+                "dest": owned_vec_place(dest, dest_ty)
+            },
+            "target": target,
+            "on_unwind": unwind
+        }})
+    }
+
+    fn owned_vec_drop(
+        local: u64,
+        ty: &serde_json::Value,
+        target: u64,
+        unwind: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"Drop": {
+            "place": owned_vec_place(local, ty),
+            "fn_ptr": {"kind": {"Fun": 1}, "generics": {}},
+            "target": target,
+            "on_unwind": unwind
+        }})
+    }
+
+    fn owned_vec_return_unit(unit: &serde_json::Value) -> serde_json::Value {
+        owned_vec_block(
+            vec![serde_json::json!({
+                "span": owned_vec_span(),
+                "kind": {"Assign": [
+                    owned_vec_place(0, unit),
+                    {"Aggregate": ["Tuple", []]}
+                ]}
+            })],
+            serde_json::json!("Return"),
+        )
+    }
+
+    fn owned_vec_leaves(graph: &FunctionGraph) -> Vec<String> {
+        graph_call_leaves(graph)
+    }
+
+    fn owned_vec_has_free(graph: &FunctionGraph) -> bool {
+        owned_vec_leaves(graph)
+            .iter()
+            .any(|leaf| leaf.starts_with("ll_vec_free"))
+    }
+
+    fn owned_vec_has_alloc(graph: &FunctionGraph) -> bool {
+        owned_vec_leaves(graph)
+            .iter()
+            .any(|leaf| leaf.starts_with("ll_vec_newemptylist"))
+    }
+
+    fn drop_term_is_goto(
+        body: &majit_charon_reader::ullbc::Unstructured,
+        llbc: &Llbc,
+        bb: usize,
+    ) -> bool {
+        matches!(
+            body.body[bb].term(llbc),
+            Ok(majit_charon_reader::ullbc::TermKind::Goto { .. })
+        )
+    }
+
+    fn drop_term_is_drop(
+        body: &majit_charon_reader::ullbc::Unstructured,
+        llbc: &Llbc,
+        bb: usize,
+    ) -> bool {
+        matches!(
+            body.body[bb].term(llbc),
+            Ok(majit_charon_reader::ullbc::TermKind::Drop { .. })
+        )
+    }
+
+    /// A definitely-initialised `Vec` Drop stays a Drop and lowers to
+    /// `ll_vec_free_*` at that terminator, the `rewrite_op_free` site.
+    #[test]
+    fn rust_vec_drop_of_definitely_init_vec_frees_at_the_drop() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let name = "drop_init_vec";
+        let llbc = owned_vec_drop_llbc(
+            name,
+            0,
+            vec![owned_vec_local(0, &unit), owned_vec_local(1, &vec_ty)],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(1, &vec_ty, 1, 3)),
+                owned_vec_block(vec![], owned_vec_drop(1, &vec_ty, 2, 3)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_drop(&body, &llbc, 1),
+            "definitely-init Drop stays a Drop"
+        );
+        assert_eq!(
+            super::vec_init_at_drop(&body, &llbc, 1, 1),
+            super::VecInit::Init
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_init_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            owned_vec_has_free(&graph),
+            "definitely-init Drop must free at the Drop: {leaves:?}"
+        );
+    }
+
+    /// A `Vec` moved into a call is uninitialised at the trailing Drop;
+    /// elaboration turns that Drop into a Goto, so this graph does not free.
+    #[test]
+    fn rust_vec_drop_after_move_into_call_does_not_free() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let name = "drop_moved_into_call_vec";
+        let sink = serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 2},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": [{"Move": owned_vec_place(1, &vec_ty)}],
+                "dest": owned_vec_place(2, &unit)
+            },
+            "target": 2,
+            "on_unwind": 4
+        }});
+        let llbc = owned_vec_drop_llbc(
+            name,
+            0,
+            vec![
+                owned_vec_local(0, &unit),
+                owned_vec_local(1, &vec_ty),
+                owned_vec_local(2, &unit),
+            ],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(1, &vec_ty, 1, 4)),
+                owned_vec_block(vec![], sink),
+                owned_vec_block(vec![], owned_vec_drop(1, &vec_ty, 3, 4)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_goto(&body, &llbc, 2),
+            "moved-out Drop becomes Goto"
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_moved_into_call_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            !owned_vec_has_free(&graph),
+            "moved-into-call must not free: {leaves:?}"
+        );
+    }
+
+    /// A `Vec` stored into a struct field is uninitialised at the trailing
+    /// Drop; this graph does not free the moved-out header.
+    #[test]
+    fn rust_vec_drop_after_store_into_struct_does_not_free() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let holder_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let name = "drop_stored_into_struct_vec";
+        let store = serde_json::json!({
+            "span": owned_vec_span(),
+            "kind": {"Assign": [
+                owned_vec_place(2, &holder_ty),
+                {"Aggregate": [
+                    {"Adt": [1, null]},
+                    [{"Move": owned_vec_place(1, &vec_ty)}]
+                ]}
+            ]}
+        });
+        let holder_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["Holder", 0]}
+                ],
+                "span": owned_vec_span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": [{
+                "name": "items",
+                "ty": vec_ty,
+                "attr_info": null
+            }]}
+        });
+        let llbc = owned_vec_drop_llbc(
+            name,
+            0,
+            vec![
+                owned_vec_local(0, &unit),
+                owned_vec_local(1, &vec_ty),
+                owned_vec_local(2, &holder_ty),
+            ],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(1, &vec_ty, 1, 4)),
+                owned_vec_block(vec![store], serde_json::json!({"Goto": {"target": 2}})),
+                owned_vec_block(vec![], owned_vec_drop(1, &vec_ty, 3, 4)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![holder_decl],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_goto(&body, &llbc, 2),
+            "stored-into-struct Drop becomes Goto"
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_stored_into_struct_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            !owned_vec_has_free(&graph),
+            "stored-into-struct must not free: {leaves:?}"
+        );
+    }
+
+    /// Mixed init at a `Vec` Drop is a drop-flag case: leave the Drop,
+    /// decline `maybe-initialised`, emit no free.
+    #[test]
+    fn rust_vec_drop_maybe_initialised_declines_without_free() {
+        let vec_ty = owned_vec_ty();
+        let unit = owned_vec_unit_ty();
+        let cond_ty = serde_json::json!({"Scalar": "Bool"});
+        let name = "drop_maybe_init_vec";
+        let sink = serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 2},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": [{"Move": owned_vec_place(2, &vec_ty)}],
+                "dest": owned_vec_place(3, &unit)
+            },
+            "target": 4,
+            "on_unwind": 6
+        }});
+        let llbc = owned_vec_drop_llbc(
+            name,
+            1,
+            vec![
+                owned_vec_local(0, &unit),
+                owned_vec_local(1, &cond_ty),
+                owned_vec_local(2, &vec_ty),
+                owned_vec_local(3, &unit),
+            ],
+            vec![
+                owned_vec_block(vec![], owned_vec_new_call(2, &vec_ty, 1, 6)),
+                owned_vec_block(
+                    vec![],
+                    serde_json::json!({"Switch": {
+                        "discr": {"Copy": owned_vec_place(1, &cond_ty)},
+                        "targets": {"If": [2, 3]}
+                    }}),
+                ),
+                owned_vec_block(vec![], sink),
+                owned_vec_block(vec![], serde_json::json!({"Goto": {"target": 4}})),
+                owned_vec_block(vec![], owned_vec_drop(2, &vec_ty, 5, 6)),
+                owned_vec_return_unit(&unit),
+                owned_vec_block(vec![], serde_json::json!("UnwindResume")),
+            ],
+            vec![],
+            vec![],
+        );
+        let mut body = llbc.local_fn(name).unwrap().unstructured().unwrap();
+        super::elaborate_vec_drops(&llbc, &mut body);
+        assert!(
+            drop_term_is_drop(&body, &llbc, 4),
+            "maybe-init Drop is left unlowered"
+        );
+        assert_eq!(
+            super::vec_init_at_drop(&body, &llbc, 4, 2),
+            super::VecInit::Maybe
+        );
+        let graph = super::lower_function(&llbc, name).expect("lower drop_maybe_init_vec");
+        let leaves = owned_vec_leaves(&graph);
+        assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
+        assert!(
+            !owned_vec_has_free(&graph),
+            "maybe-init must not free: {leaves:?}"
+        );
     }
 
     /// `&*(*p).f` reads the value the field holds; `&(*p).f` names the

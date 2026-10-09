@@ -807,6 +807,15 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
         calls_to(&graph, "call") > 0,
         "wrap must still reach ctypefunc::call"
     );
+    assert!(
+        calls_to(&graph, "ll_vec_alloc_and_set_r") > 0,
+        "wrap must allocate the rest-args vec"
+    );
+    assert!(
+        calls_to(&graph, "ll_vec_free_r") > 0,
+        "wrap must free the rest-args vec; drop elaboration keeps the \
+         definitely-init Drop of rest and rewrite_op_free frees that header"
+    );
 }
 
 /// `do_call` `n == 1` pins `args_w[0]` with `base()` + `pin_root` + `get(base)`.
