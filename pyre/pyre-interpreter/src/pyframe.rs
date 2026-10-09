@@ -439,11 +439,17 @@ pub mod frame_locals_proxy {
             if token == 0 {
                 return;
             }
-            // `virtualizable.py force_now`: TOKEN_TRACING_RESCALL values are
-            // already correct during tracing; reset to TOKEN_NONE as the
-            // escape marker `tracing_after_residual_call` reads.
+            // `virtualizable.py force_now` values are already correct during
+            // tracing. Do not store TOKEN_NONE: that marker is
+            // `tracing_after_residual_call`'s escape, and a proxy write is a
+            // residual `space.setitem` under looked-inside STORE_SUBSCR
+            // (`pyopcode.py`). Clearing here aborts the loop and the
+            // single-frame blackhole adopt then leaves a name/int/str where
+            // FOR_ITER expects its iterator. `vable_and_vrefs_before_residual_call`
+            // already stored the boxes; `adopt_residual_locals_writes` owns
+            // the tracing write. An Active token still forces — compiled
+            // code owns the frame, which is when the write has a shadow.
             if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
-                unsafe { (*frame).vable_token = 0 };
                 return;
             }
             // The force materializes through a backend hook this crate cannot
@@ -3880,10 +3886,15 @@ impl PyFrame {
     #[inline]
     fn getdebug_data(&self) -> Option<&FrameDebugData> {
         // `debugdata` is a redirected virtualizable field (`interp_jit.py
-        // _virtualizable_`). Residual (non-access_directly) reads go through
-        // `force_virtualizable_if_necessary`; looked-inside graphs delete
-        // that Call (`rewrite_op_jit_force_virtualizable`).
-        crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
+        // _virtualizable_`). `hook_access_field` inserts
+        // `jit_force_virtualizable` here and `jtransform` deletes it in
+        // looked-inside graphs (`pyopcode.py STORE_NAME` /
+        // `getorcreatedebug`). pyre residualizes STORE_NAME
+        // (`bh_store_name_fn` → `get_w_locals` → this read), so a native
+        // force would abort every module-level store; pypy does not
+        // (`abort: vable escape: 0` on those loops). Residual non-opcode
+        // readers that pypy also residualizes call
+        // `force_virtualizable_if_necessary` on [`Self::get_w_globals`].
         // Spelled without a closure: a closure aggregate lowers to a
         // synthetic ctor call the walker cannot bind, and upstream's
         // `getdebug` is a plain None-checked field read.
@@ -3897,7 +3908,6 @@ impl PyFrame {
     /// pyframe.py getorcreatedebug
     #[inline]
     fn getorcreate_debug_data(&mut self, init_lineno: isize) -> &mut FrameDebugData {
-        crate::executioncontext::force_virtualizable_if_necessary(self as *mut Self);
         if self.debugdata.is_null() {
             // The stable allocation below is still a collection point.  Keep
             // the owning frame rooted and reload it before publishing the new
@@ -3966,7 +3976,6 @@ impl PyFrame {
     /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
-        crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
         let pycode = majit_metainterp::jit::promote(self.pycode);
         unsafe {
             &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject)
@@ -3991,9 +4000,11 @@ impl PyFrame {
     ///
     /// Both arms read a redirected field (`debugdata` via [`Self::getdebug_data`],
     /// else `pycode`). `hook_access_field` therefore inserts
-    /// `force_virtualizable_if_necessary` on the residual copies; the
-    /// `pycode` arm issues the same Call so a None `debugdata` still
-    /// clears `TOKEN_TRACING_RESCALL` during a residual.
+    /// `force_virtualizable_if_necessary` on the residual copies of this
+    /// method (`typeobject.py ensure_module_attr` → `get_w_globals`);
+    /// looked-inside callers (`pyopcode.py LOAD_GLOBAL`) have the Call
+    /// deleted. The force sits here rather than on [`Self::getdebug_data`]
+    /// because pyre residualizes STORE_NAME through that read.
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
         crate::executioncontext::force_virtualizable_if_necessary(self as *const Self as *mut Self);
@@ -7274,10 +7285,11 @@ mod tests {
 
     #[test]
     fn residual_vable_field_reads_clear_tracing_rescall() {
-        // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL: residual
-        // redirected-field readers store TOKEN_NONE so
+        // `virtualizable.py force_now` on TOKEN_TRACING_RESCALL:
+        // residual `get_w_globals` stores TOKEN_NONE so
         // `tracing_after_residual_call` observes the escape. TOKEN_NONE
-        // stays idle.
+        // stays idle. `getdebug` / `getcode` do not force: pyre
+        // residualizes STORE_NAME through them.
         let code = crate::compile_exec("x = 1\n").expect("compile");
         let w_code = crate::pycode::box_code_constant(&code);
         let globals = pyre_object::w_dict_new();
@@ -7290,13 +7302,15 @@ mod tests {
         let _ = frame.get_w_globals();
         assert_eq!(frame.vable_token, 0);
 
+        // `getdebug` / `getcode` are the STORE_NAME / looked-inside
+        // opcode path; they must not clear the token.
         frame.vable_token = tracing;
         let _ = frame.getdebug();
-        assert_eq!(frame.vable_token, 0);
+        assert_eq!(frame.vable_token, tracing);
 
         frame.vable_token = tracing;
         let _ = frame.getcode();
-        assert_eq!(frame.vable_token, 0);
+        assert_eq!(frame.vable_token, tracing);
 
         frame.vable_token = 0;
         let _ = frame.get_w_globals();

@@ -134,12 +134,16 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `__majit_wrap_descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
 /// `f_backref` and `w_builtin`, so they carry none.
 ///
-/// Residual readers of redirected fields (`getdebug`, `get_w_globals`,
-/// `getcode`) call [`force_virtualizable_if_necessary`]: during tracing that
-/// is the `TOKEN_TRACING_RESCALL` → `TOKEN_NONE` escape marker, not a
+/// Residual readers of redirected fields that pypy also residualizes
+/// (`get_w_globals`, via `typeobject.py ensure_module_attr`) call
+/// [`force_virtualizable_if_necessary`]: during tracing that is the
+/// `TOKEN_TRACING_RESCALL` → `TOKEN_NONE` escape marker, not a
 /// question of whether the heap slot can disagree with the shadow.
-/// The `f_code` gateway still omits the escape-flush marker; that
-/// placement is at its own definition.
+/// `getdebug` / `getcode` omit it: pyre residualizes STORE_NAME through
+/// those reads while `pyopcode.py STORE_NAME` is looked-inside, so a
+/// native force would abort loops pypy compiles. The `f_code` gateway
+/// still omits the escape-flush marker; that placement is at its own
+/// definition.
 ///
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the
@@ -182,7 +186,7 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// Residual redirected-field reads use [`force_virtualizable_if_necessary`]
 /// instead: that helper *does* open with the token test, matching the
 /// function `replace_force_virtualizable_with_call` installs, and is the
-/// one `getdebug` / `get_w_globals` / `getcode` call.
+/// one `get_w_globals` calls.
 ///
 /// # No `vable_token` test here
 ///
@@ -220,8 +224,8 @@ pub fn jit_force_virtualizable(frame: *mut PyFrame) {
 /// rewrites the residual copies into this helper; `jtransform.py
 /// rewrite_op_jit_force_virtualizable` deletes the Call in graphs the
 /// codewriter looks inside. Native residual execution has no rewritten
-/// graph, so [`crate::pyframe::PyFrame`] readers that residual code uses
-/// call this directly.
+/// graph, so [`crate::pyframe::PyFrame::get_w_globals`] — the reader
+/// residual `type_create_new_type` uses — calls this directly.
 ///
 /// `force_now` on `TOKEN_TRACING_RESCALL` only stores `TOKEN_NONE` — the
 /// values are already correct during tracing, and that store is the escape
