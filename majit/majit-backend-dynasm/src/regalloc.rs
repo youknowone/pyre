@@ -3255,7 +3255,12 @@ impl<'a> RegAlloc<'a> {
                 );
             }
             OpCode::IntForceGeZero if !args.is_empty() => {
-                self.consider_unary_int_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
+                self.consider_int_force_ge_zero_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             OpCode::IntFloorDiv | OpCode::IntMod if args.len() >= 2 => {
                 self.consider_binop_j2(dst.unwrap_or(op.pos().get()), args[0], args[1], i, output);
@@ -3517,7 +3522,7 @@ impl<'a> RegAlloc<'a> {
                 self.consider_unary_int(op, i, output);
             }
             OpCode::IntForceGeZero => {
-                self.consider_unary_int(op, i, output);
+                self.consider_int_force_ge_zero_j2(op.pos().get(), op.arg(0).to_opref(), i, output);
             }
             OpCode::IntFloorDiv | OpCode::IntMod => {
                 self.consider_binop(op, i, output);
@@ -3856,6 +3861,21 @@ impl<'a> RegAlloc<'a> {
     // `consider_uint_mul_high_j2` is arch-specific: aarch64 uses the
     // 3-operand `umulh`, x86 forces EAX/EDX pinning for `MUL`. See
     // the arch-specific impl blocks.
+
+    /// x86/regalloc.py `consider_int_force_ge_zero`.
+    /// The result is forbidden from the argument's register: `genop_int_force_ge_zero`
+    /// does `MOV res, 0` before `CMOVNS res, src`.
+    fn consider_int_force_ge_zero_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let argloc = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
+        let resloc = self.force_allocate_reg(dst, Type::Int, &[arg], None, false);
+        self.perform(i, [argloc], Some(Loc::Reg(resloc)), output);
+    }
 
     fn consider_int_signext_j2(
         &mut self,

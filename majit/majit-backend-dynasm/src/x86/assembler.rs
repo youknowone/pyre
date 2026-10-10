@@ -1773,6 +1773,19 @@ impl CompiledCode {
     }
 }
 
+/// `_build_float_constants`: 16-byte, 16-aligned sign masks. Both halves are
+/// the same pattern so a 128-bit XORPD/ANDPD updates the low double.
+#[repr(C, align(16))]
+struct AlignedPdConst([u8; 16]);
+
+static FLOAT_CONST_NEG: AlignedPdConst = AlignedPdConst([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+]);
+
+static FLOAT_CONST_ABS: AlignedPdConst = AlignedPdConst([
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+]);
+
 /// The `genop_*` methods here are line-by-line ports of the RPython emitters
 /// (`x86/assembler.py` `genop_*`).  Emission runs through `regalloc_perform`,
 /// which works from regalloc `arglocs`, so the ports whose opcode that
@@ -1961,6 +1974,23 @@ impl<'a> Assembler386<'a> {
         } else {
             let (reg, offset) = self.addr_as_reg_offset(addr);
             rx86::movsd_xm(&mut self.mc, dst, (reg, offset));
+        }
+    }
+
+    /// `heap`: location code `'j'`, or `_addr_as_reg_offset` then `'m'`
+    /// when the address does not fit a signed disp32.
+    fn emit_pd_heap(
+        &mut self,
+        xmm: u8,
+        addr: i64,
+        xm: fn(&mut Assembler, u8, (u8, i32)),
+        xj: fn(&mut Assembler, u8, i32),
+    ) {
+        if rx86::fits_in_32bits(addr) {
+            xj(&mut self.mc, xmm, addr as i32);
+        } else {
+            let (reg, offset) = self.addr_as_reg_offset(addr);
+            xm(&mut self.mc, xmm, (reg, offset));
         }
     }
 
@@ -2194,6 +2224,13 @@ impl<'a> Assembler386<'a> {
                 }
             }
             Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                // genop_int_and: AND with (1<<32)-1 is one zero-extending MOV32.
+                // and r, imm32 would sign-extend 0xffffffff into an all-ones no-op.
+                if opcode == OpCode::IntAnd && i.value == (1i64 << 32) - 1 {
+                    self.forget_if_scratch_written(dst_reg);
+                    rx86::mov32_rr(&mut self.mc, dst_reg, dst_reg);
+                    return;
+                }
                 // regloc.py:456-464 — an immediate that does not fit in 32
                 // bits cannot use the imm32 form (the encoder would truncate
                 // it and the CPU sign-extend the low half, e.g. an
@@ -4221,22 +4258,37 @@ impl<'a> Assembler386<'a> {
                 }
             }
             OpCode::IntForceGeZero => {
-                if let Some(Loc::Reg(r)) = result_loc {
-                    dynasm!(self.mc ; .arch x64
-                    ; test Rq(r.value), Rq(r.value)
+                // genop_int_force_ge_zero: TEST src, src; MOV res, 0; CMOVNS res, src.
+                // consider_int_force_ge_zero forbids the result from aliasing src:
+                // MOV 0 would otherwise clobber the value CMOVNS reads.
+                let (Some(src_loc), Some(Loc::Reg(res))) = (arglocs.first(), result_loc) else {
+                    panic!(
+                        "int_force_ge_zero: expected a source and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
                     );
-                    dynasm!(self.mc ; .arch x64
-                    ; jge >pos
-                    );
-                    self.forget_if_scratch_written(r.value);
-                    dynasm!(self.mc ; .arch x64
-                    ; xor Rq(r.value), Rq(r.value)
-                    );
-                    self.forget_scratch_register();
-                    dynasm!(self.mc ; .arch x64
-                        ; pos:
-                    );
+                };
+                let src = match src_loc {
+                    Loc::Reg(s) => s.value,
+                    Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                        self.load_scratch(i.value);
+                        scratch
+                    }
+                    other => {
+                        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+                        self.regalloc_mov(other, &Loc::Reg(scratch));
+                        scratch.value
+                    }
+                };
+                if src == res.value {
+                    panic!("int_force_ge_zero: result register aliases the source");
                 }
+                dynasm!(self.mc ; .arch x64 ; test Rq(src), Rq(src));
+                self.forget_if_scratch_written(res.value);
+                // mov(): MOV of 0 is MOV_riu32 (zero-extending), and it does not
+                // clobber the flags TEST just set.
+                rx86::mov_ri(&mut self.mc, res.value, 0);
+                rx86::cmovns_rr(&mut self.mc, res.value, src);
             }
             OpCode::IntSignext => {
                 // x86/assembler.py `genop_int_signext`: numbytes is an immediate,
@@ -4332,30 +4384,19 @@ impl<'a> Assembler386<'a> {
                 }
             }
             OpCode::FloatNeg => {
+                // genop_float_neg: XORPD against heap(float_const_neg_addr).
+                // The sign mask from _build_float_constants flips ±0.0 and a NaN sign.
                 if let Some(Loc::Reg(r)) = result_loc {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    // `genop_float_neg`: res = x ^ 0x8000000000000000. Staging
-                    // the mask through the XMM scratch, which must be
-                    // X86_64_XMM_SCRATCH_REG (outside the allocation pool);
-                    // reusing the GPR scratch INDEX (r11 → xmm11) addressed a
-                    // pool register and clobbered whatever the allocator kept
-                    // there. Subtracting from zero instead would answer `+0.0`
-                    // for a `+0.0` operand, since `(+0) - (+0)` is positive.
-                    let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                    self.load_scratch(0x8000000000000000_u64 as i64);
-                    rx86::movdq_xr(&mut self.mc, xmm_scratch, scratch);
-                    rx86::xorpd_xx(&mut self.mc, r.value, xmm_scratch);
+                    let addr = &FLOAT_CONST_NEG as *const AlignedPdConst as i64;
+                    self.emit_pd_heap(r.value, addr, rx86::xorpd_xm, rx86::xorpd_xj);
                 }
             }
             OpCode::FloatAbs => {
+                // genop_float_abs: ANDPD against heap(float_const_abs_addr).
+                // The mask clears the sign bit, so -0.0 becomes +0.0 and a NaN payload stays.
                 if let Some(Loc::Reg(r)) = result_loc {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    // See FloatNeg — the mask must stage through the XMM
-                    // scratch, not pool register xmm11.
-                    let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                    self.load_scratch(0x7FFFFFFFFFFFFFFF_u64 as i64);
-                    rx86::movdq_xr(&mut self.mc, xmm_scratch, scratch);
-                    rx86::andpd_xx(&mut self.mc, r.value, xmm_scratch);
+                    let addr = &FLOAT_CONST_ABS as *const AlignedPdConst as i64;
+                    self.emit_pd_heap(r.value, addr, rx86::andpd_xm, rx86::andpd_xj);
                 }
             }
             // ── Float comparisons ──
@@ -6305,62 +6346,70 @@ impl<'a> Assembler386<'a> {
         rx86::mov32_rm(&mut self.mc, dst_reg, (obj_reg, tid_ofs));
     }
 
-    /// x86/assembler.py `_cmp_guard_gc_type`, adjusted for
-    /// majit's object pointer: the GC header word lives at
-    /// `obj - GcHeader::SIZE`, and a 32-bit load zero-extends the type id.
+    /// `_cmp_guard_gc_type`: one `CMP32_mi` of an immediate type id.
+    /// The header word lives at `obj - GcHeader::SIZE`; its low 32 bits are the type id.
     fn _cmp_guard_gc_type(&mut self, obj_loc: &Loc, expected_typeid_loc: &Loc) {
-        // Callers (guard_class typeid form, guard_gc_type, ...) rely on
-        // CC_E being set from this CMP. A silent no-op would leave the
-        // guard branching on stale flags.
+        // Callers (guard_class typeid form, guard_gc_type) branch on CC_E.
         let Loc::Reg(obj) = obj_loc else {
             panic!("guard_gc_type: obj_loc must be Loc::Reg, got {obj_loc:?}");
         };
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.emit_load_gc_typeid_into_reg(obj.value, scratch);
-        match expected_typeid_loc {
-            Loc::Reg(expected) => {
-                dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), Rq(expected.value));
-            }
-            Loc::Frame(frame) => {
-                let ofs = frame.ebp_loc.value;
-                rx86::cmp_rb(&mut self.mc, scratch, ofs);
-            }
-            Loc::Immed(expected) | Loc::ImmedFloat(expected) => {
-                let expected_i32 = expected.value as i32;
-                rx86::cmp_ri(&mut self.mc, scratch, expected_i32);
-            }
-            other => {
-                panic!("guard_gc_type: expected_typeid_loc must be Reg/Frame/Immed, got {other:?}",)
-            }
+        let (Loc::Immed(expected) | Loc::ImmedFloat(expected)) = expected_typeid_loc else {
+            panic!(
+                "_cmp_guard_gc_type: expected typeid must be ImmedLoc, got {expected_typeid_loc:?}"
+            );
+        };
+        let tid_ofs = -(majit_gc::header::GcHeader::SIZE as i32);
+        rx86::cmp32_mi(&mut self.mc, (obj.value, tid_ofs), expected.value as i32);
+    }
+
+    /// `AddressLoc` scale is 0..3 (`addr_add`). A larger `shift_by` is a
+    /// `SHL` of the typeid and scale 0, so the address stays
+    /// `base + (typeid << shift_by) + offset`.
+    fn sib_scale_and_shl(shift_by: u8) -> (u8, u8) {
+        if shift_by < 4 {
+            (shift_by, 0)
+        } else {
+            (0, shift_by)
         }
     }
 
-    /// x86/assembler.py `genop_guard_guard_is_object`.
+    /// `addr_add(imm(base), index, scale, offset)`, location code `'a'`.
+    /// A static offset that does not fit a signed disp32 uses
+    /// `_fix_static_offset_64_a` with `NO_BASE_REGISTER`, which is
+    /// `_addr_as_reg_offset`.
+    fn addr_add_imm_index(
+        &mut self,
+        index: u8,
+        scale: u8,
+        static_offset: i64,
+    ) -> (i16, u8, u8, i32) {
+        if rx86::fits_in_32bits(static_offset) {
+            (rx86::NO_BASE_REGISTER, index, scale, static_offset as i32)
+        } else {
+            let (reg, ofs) = self.addr_as_reg_offset(static_offset);
+            (i16::from(reg), index, scale, ofs)
+        }
+    }
+
+    /// `genop_guard_guard_is_object`: `MOV32` of the typeid, then `TEST8` of
+    /// `addr_add(imm(base_type_info), typeid, scale=shift_by, offset=infobits_offset)`.
+    /// Success is NZ.
     fn emit_guard_is_object(&mut self, obj_loc: &Loc, typeid_loc: &Loc) {
         let info = self.require_guard_gc_type_info("GUARD_IS_OBJECT");
         let (Loc::Reg(obj), Loc::Reg(typeid)) = (obj_loc, typeid_loc) else {
-            return;
+            panic!(
+                "guard_is_object: expected [Reg object, Reg typeid], got {obj_loc:?} {typeid_loc:?}"
+            );
         };
         self.emit_load_gc_typeid_into_reg(obj.value, typeid.value);
-        if info.shift_by > 0 {
-            let shift = info.shift_by as i8;
+        let (scale, shl) = Self::sib_scale_and_shl(info.shift_by);
+        if shl > 0 {
             self.forget_if_scratch_written(typeid.value);
-            rx86::shl_ri(&mut self.mc, typeid.value, i32::from(shift));
+            rx86::shl_ri(&mut self.mc, typeid.value, i32::from(shl));
         }
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        let base_type_info = info.base_type_info as i64;
-        let infobits_offset = info.infobits_offset as i32;
-        let is_object_flag = info.is_object_flag as i8;
-        self.load_scratch(base_type_info);
-        self.forget_if_scratch_written(typeid.value);
-        dynasm!(self.mc ; .arch x64
-                    ; add Rq(typeid.value), Rq(scratch)
-        );
-        rx86::test8_mi(
-            &mut self.mc,
-            (typeid.value, infobits_offset),
-            i32::from(is_object_flag),
-        );
+        let static_offset = (info.base_type_info as i64).wrapping_add(info.infobits_offset as i64);
+        let addr = self.addr_add_imm_index(typeid.value, scale, static_offset);
+        rx86::test8_ai(&mut self.mc, addr, i32::from(info.is_object_flag));
     }
 
     /// x86/assembler.py `genop_guard_guard_subclass`.
@@ -6413,22 +6462,21 @@ impl<'a> Assembler386<'a> {
             self.forget_if_scratch_written(tmp.value);
             rx86::mov_rm(&mut self.mc, tmp.value, (tmp.value, offset2));
         } else {
+            // genop_guard_guard_subclass typeid arm: MOV32, then
+            // MOV tmp, addr_add(imm(base_type_info), tmp, scale=shift_by,
+            // offset=sizeof_ti + offset2).
             self.emit_load_gc_typeid_into_reg(obj.value, tmp.value);
-            if info.shift_by > 0 {
-                let shift = info.shift_by as i8;
+            let (scale, shl) = Self::sib_scale_and_shl(info.shift_by);
+            if shl > 0 {
                 self.forget_if_scratch_written(tmp.value);
-                rx86::shl_ri(&mut self.mc, tmp.value, i32::from(shift));
+                rx86::shl_ri(&mut self.mc, tmp.value, i32::from(shl));
             }
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            let base =
-                (info.base_type_info + info.sizeof_ti + info.subclassrange_min_offset) as i64;
-            self.load_scratch(base);
+            let static_offset = (info.base_type_info as i64)
+                .wrapping_add(info.sizeof_ti as i64)
+                .wrapping_add(info.subclassrange_min_offset as i64);
+            let addr = self.addr_add_imm_index(tmp.value, scale, static_offset);
             self.forget_if_scratch_written(tmp.value);
-            dynasm!(self.mc ; .arch x64
-                            ; add Rq(tmp.value), Rq(scratch)
-            );
-            self.forget_if_scratch_written(tmp.value);
-            rx86::mov_rm(&mut self.mc, tmp.value, (tmp.value, 0));
+            rx86::mov_ra(&mut self.mc, tmp.value, addr);
         }
         self.emit_sub_imm64(tmp.value, check_min);
         self.emit_cmp_imm64(tmp.value, check_max - check_min);
