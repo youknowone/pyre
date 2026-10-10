@@ -2909,7 +2909,7 @@ fn expand_pyre_methods(
                             // joins the remembered set.
                             unsafe { (*__pyre_obj).w_class = __pyre_cls; }
                             ::pyre_object::gc_hook::try_gc_write_barrier(
-                                __pyre_obj as *mut u8,
+                                __pyre_obj as ::pyre_object::gc_hook::GCREF,
                             );
                         }
                     }

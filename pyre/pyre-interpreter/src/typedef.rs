@@ -46,7 +46,7 @@ mod typedef_identity_tests {
                 let w_type = super::new_builtin_typeobject(
                     name,
                     bases,
-                    gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+                    gc_roots::shadow_stack_get(ns_slot) as pyre_object::gc_hook::GCREF,
                     &INSTANCE_TYPE,
                     PY_NULL,
                 );
@@ -123,7 +123,7 @@ mod typedef_identity_tests {
                 let child = gc_roots::pin_root(w_type_new(
                     "Child",
                     gc_roots::shadow_stack_get(bases_slot),
-                    gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+                    gc_roots::shadow_stack_get(ns_slot) as pyre_object::gc_hook::GCREF,
                 ));
                 crate::call::create_all_slots(child, gc_roots::shadow_stack_get(bases_slot))
                     .unwrap();
@@ -2741,7 +2741,7 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
 fn new_builtin_typeobject(
     name: &str,
     bases: PyObjectRef,
-    dict_ptr: *mut u8,
+    dict_ptr: pyre_object::gc_hook::GCREF,
     _layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
 ) -> PyObjectRef {
@@ -2782,7 +2782,7 @@ pub(crate) fn init_builtin_typeobject(
             type_obj,
             name,
             pyre_object::gc_roots::shadow_stack_get(save_point),
-            pyre_object::gc_roots::shadow_stack_get(save_point + 1) as *mut u8,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1) as pyre_object::gc_hook::GCREF,
         );
     }
     // `typeobject.py ensure_common_attributes` runs for every PyPy TypeDef,
@@ -2840,7 +2840,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     let type_obj = new_builtin_typeobject(
         name,
         PY_NULL,
-        ns as *mut u8,
+        ns as pyre_object::gc_hook::GCREF,
         &INSTANCE_TYPE as *const PyType,
         PY_NULL,
     );
@@ -3354,7 +3354,13 @@ fn new_typeobject_with_metatype_and_layout(
     // The type object it allocates is what the namespace has to survive: the
     // word handed over is stored in the new type, but this frame's copy is
     // pre-move, so the probes below take a fresh read.
-    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype, w_metatype);
+    let type_obj = new_builtin_typeobject(
+        name,
+        bases,
+        ns as pyre_object::gc_hook::GCREF,
+        layout_pytype,
+        w_metatype,
+    );
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
@@ -3506,7 +3512,7 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     let type_obj = new_builtin_typeobject(
         name,
         bases_tuple,
-        ns as *mut u8,
+        ns as pyre_object::gc_hook::GCREF,
         unsafe { (*typedef).instance_type },
         PY_NULL,
     );
@@ -5167,7 +5173,7 @@ pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef 
 /// # Safety
 /// `obj` must point to a valid object whose header is writable.
 pub(crate) unsafe fn store_subclass_tag(obj: PyObjectRef, sub: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     unsafe {
         (*obj).w_class = sub;
     }
@@ -13910,7 +13916,7 @@ fn init_type_type(ns: PyObjectRef) {
                     "__abstractmethods__",
                     pyre_object::gc_roots::shadow_stack_get(base + 1),
                 );
-                pyre_object::gc_hook::try_gc_write_barrier(w_type as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(w_type as pyre_object::gc_hook::GCREF);
                 pyre_object::w_type_set_abstract(w_type, abstract_);
                 crate::baseobjspace::mutated(w_type, "__abstractmethods__");
             }
@@ -34473,7 +34479,7 @@ fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             unsafe { &mut *(current as *mut pyre_object::interp_itertools::W_TeeChainedListNode) };
         state.w_obj = unsafe { pyre_object::gc_roots::shadow_stack_get(item_slot) };
         state.w_next = unsafe { pyre_object::gc_roots::shadow_stack_get(next_slot) };
-        pyre_object::gc_hook::try_gc_write_barrier(current as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(current as pyre_object::gc_hook::GCREF);
         current_slot = next_slot;
     }
 
@@ -35016,7 +35022,7 @@ fn init_chain_type(ns: PyObjectRef) {
 /// `intern_exact_str`.
 fn root_cached_object(obj: pyre_object::PyObjectRef) -> Box<usize> {
     let mut slot = Box::new(obj as usize);
-    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+    let root_slot = (&mut *slot) as *mut usize as *mut pyre_object::gc_hook::GCREF;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
     slot
 }
@@ -35389,7 +35395,7 @@ mod tests {
         let child = gc_roots::pin_root(w_type_new(
             "A",
             gc_roots::shadow_stack_get(bases_slot),
-            gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+            gc_roots::shadow_stack_get(ns_slot) as pyre_object::gc_hook::GCREF,
         ));
         unsafe {
             crate::call::create_all_slots(child, gc_roots::shadow_stack_get(bases_slot)).unwrap();

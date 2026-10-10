@@ -176,7 +176,9 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
         // Barrier for the same reason as `ExecutionContext::enter`: this is a
         // traced `Type::Ref` store and `frame` can be an old-generation frame
         // taking a young predecessor.
-        pyre_object::gc_hook::try_gc_write_barrier(frame as *mut PyFrame as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            frame as *mut PyFrame as pyre_object::gc_hook::GCREF,
+        );
         majit_gc::bh_probe_note_store(
             frame as *mut PyFrame as usize,
             crate::pyframe::PYFRAME_F_BACKREF_OFFSET,
@@ -431,7 +433,7 @@ unsafe fn visit_prebuilt_declaration(
     }
     unsafe {
         visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-        if pyre_object::gc_hook::try_gc_owns_object(*slot as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(*slot as pyre_object::gc_hook::GCREF) {
             return;
         }
         walk_raw_function_roots(*slot, visitor);
@@ -452,7 +454,7 @@ pub unsafe fn method_cache_custom_trace(
 ) {
     unsafe {
         crate::baseobjspace::trace_method_cache_entries(&mut |slot| {
-            if pyre_object::gc_hook::try_gc_owns_object(*slot as *mut u8) {
+            if pyre_object::gc_hook::try_gc_owns_object(*slot as pyre_object::gc_hook::GCREF) {
                 visitor(slot as *mut PyObjectRef as *mut majit_ir::GcRef);
                 return;
             }
@@ -681,11 +683,12 @@ unsafe fn walk_immortal_rec(
         // fall through — re-walking a managed graph here is redundant.
         // Positive predicate (no `!` over a cross-crate bool): compute the
         // offsets only for a non-owned object.
-        let immortal_offsets = if pyre_object::gc_hook::try_gc_owns_object(value as *mut u8) {
-            None
-        } else {
-            pyre_object::gc_hook::offsets_for_pytype((*value).ob_type)
-        };
+        let immortal_offsets =
+            if pyre_object::gc_hook::try_gc_owns_object(value as pyre_object::gc_hook::GCREF) {
+                None
+            } else {
+                pyre_object::gc_hook::offsets_for_pytype((*value).ob_type)
+            };
         if let Some(offsets) = immortal_offsets {
             for &off in offsets {
                 let slot = (value as usize + off) as *mut PyObjectRef;
@@ -832,7 +835,7 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
             // over a cross-crate bool is `UnaryNotUnknownOperand` to the
             // annotator, so guard with a positive `if`.
             if pyre_object::is_type(w_type) {
-                if pyre_object::gc_hook::try_gc_owns_object(w_type as *mut u8) {
+                if pyre_object::gc_hook::try_gc_owns_object(w_type as pyre_object::gc_hook::GCREF) {
                     continue;
                 }
                 // `bases` is a movable tuple created at class definition and
@@ -857,7 +860,7 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                 // because this root slot is visited, so explicitly descend
                 // through the strategy storage as the translated prebuilt
                 // object's trace function does.
-                let dict_slot = &mut t.dict as *mut *mut u8 as *mut PyObjectRef;
+                let dict_slot = &mut t.dict as *mut pyre_object::gc_hook::GCREF as *mut PyObjectRef;
                 forward(&mut *dict_slot);
                 forward(&mut t.lifeline);
                 pyre_object::dictmultiobject::w_dict_walk_gc_refs(*dict_slot, &mut |slot| {
@@ -894,7 +897,9 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                 // ownership so the `std::alloc` bootstrap fallback (not owned)
                 // is left in place.
                 if !t.mro_w.is_null()
-                    && pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8)
+                    && pyre_object::gc_hook::try_gc_owns_object(
+                        t.mro_w as pyre_object::gc_hook::GCREF,
+                    )
                 {
                     forward(&mut *(std::ptr::addr_of_mut!(t.mro_w) as *mut PyObjectRef));
                 }
@@ -1011,7 +1016,8 @@ fn reraise_bad_operand_diag(
     // Addresses only. The operand that fails `is_exception` is often not a
     // PyObject, and reading `ob_type` there is the segfault this diag used to
     // hit on the yield-from `GeneratorExit` throw.
-    let owned = !w_exc.is_null() && pyre_object::gc_hook::try_gc_owns_object(w_exc as *mut u8);
+    let owned = !w_exc.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(w_exc as pyre_object::gc_hook::GCREF);
     let tid = if owned {
         unsafe { majit_gc::header::header_of(w_exc as usize).read().type_id() }
     } else {
@@ -1391,7 +1397,9 @@ pub unsafe fn walk_pyframe_roots_area(
                 // `locals()` dict, or an `exec` mapping), so forwarding the
                 // object pointer keeps the whole namespace reachable.
                 if !(*frame).debugdata.is_null() {
-                    if pyre_object::gc_hook::try_gc_owns_object((*frame).debugdata as *mut u8) {
+                    if pyre_object::gc_hook::try_gc_owns_object(
+                        (*frame).debugdata as pyre_object::gc_hook::GCREF,
+                    ) {
                         let debugdata_slot =
                             &mut (*frame).debugdata as *mut *mut crate::pyframe::FrameDebugData;
                         visitor(&mut *(debugdata_slot as *mut majit_ir::GcRef));
@@ -1780,7 +1788,9 @@ pub fn walk_suspended_generator_frame(
         }
 
         if !(*frame).debugdata.is_null() {
-            if pyre_object::gc_hook::try_gc_owns_object((*frame).debugdata as *mut u8) {
+            if pyre_object::gc_hook::try_gc_owns_object(
+                (*frame).debugdata as pyre_object::gc_hook::GCREF,
+            ) {
                 let debugdata_slot =
                     &mut (*frame).debugdata as *mut *mut crate::pyframe::FrameDebugData;
                 visitor(&mut *(debugdata_slot as *mut majit_ir::GcRef));
@@ -5905,8 +5915,12 @@ impl OpcodeStepExecutor for PyFrame {
                 let _ = pyre_object::gc_roots::pin_root(result);
                 let frame = unsafe { &mut *anchor.live() };
                 frame.w_yielding_from = iter;
-                if pyre_object::gc_hook::try_gc_owns_object(frame as *mut PyFrame as *mut u8) {
-                    pyre_object::gc_hook::try_gc_write_barrier(frame as *mut PyFrame as *mut u8);
+                if pyre_object::gc_hook::try_gc_owns_object(
+                    frame as *mut PyFrame as pyre_object::gc_hook::GCREF,
+                ) {
+                    pyre_object::gc_hook::try_gc_write_barrier(
+                        frame as *mut PyFrame as pyre_object::gc_hook::GCREF,
+                    );
                 }
                 Self::push_anchored(
                     &anchor,
@@ -7249,7 +7263,7 @@ result = (
             pyre_object::gateway::interp2app::new(young_before as PyObjectRef, "interior_probe")
         };
         assert!(!pyre_object::gc_hook::try_gc_owns_object(
-            gateway as *mut u8
+            gateway as pyre_object::gc_hook::GCREF
         ));
         let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(gateway) };
 
@@ -7257,7 +7271,9 @@ result = (
         unsafe {
             let value = *pyre_object::typedef::test_last_declaration_slot();
             assert_eq!(value, gateway);
-            assert!(!pyre_object::gc_hook::try_gc_owns_object(value as *mut u8));
+            assert!(!pyre_object::gc_hook::try_gc_owns_object(
+                value as pyre_object::gc_hook::GCREF
+            ));
             let mut record = |gcref: &mut majit_ir::GcRef| {
                 seen.push(gcref.0);
             };

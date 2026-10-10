@@ -886,7 +886,9 @@ mod context_methods {
                 native_result(unsafe {
                     pyre_native::ssl::context_set_keylog_filename(self.backend, None)
                 })?;
-                pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(
+                    self as *mut W_SSLContext as pyre_object::gc_hook::GCREF,
+                );
                 self.keylog_filename = w_none();
                 return Ok(());
             }
@@ -897,7 +899,9 @@ mod context_methods {
             native_result(unsafe {
                 pyre_native::ssl::context_set_keylog_filename(self.backend, Some(&path))
             })?;
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *mut W_SSLContext as pyre_object::gc_hook::GCREF,
+            );
             self.keylog_filename = value;
             Ok(())
         }
@@ -946,7 +950,9 @@ mod context_methods {
                     "not a callable object",
                 ));
             }
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *mut W_SSLContext as pyre_object::gc_hook::GCREF,
+            );
             self.sni_callback = value;
             Ok(())
         }
@@ -969,7 +975,9 @@ mod context_methods {
                     pyre_interpreter::type_methods::arg_type_name(value)
                 )));
             }
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *mut W_SSLContext as pyre_object::gc_hook::GCREF,
+            );
             self.msg_callback = value;
             Ok(())
         }
@@ -2441,7 +2449,9 @@ mod ssl_socket_methods {
                     "context must be an SSLContext",
                 ));
             }
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLSocket as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *mut W_SSLSocket as pyre_object::gc_hook::GCREF,
+            );
             self.context = value;
             Ok(())
         }

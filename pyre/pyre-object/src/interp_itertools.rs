@@ -136,7 +136,7 @@ pub unsafe fn w_count_get_c(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_count_set_c(obj: PyObjectRef, v: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Count)).w_c = v;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -846,7 +846,7 @@ pub fn w_groupby_iterator_new(groupby: PyObjectRef, w_tgtkey: PyObjectRef) -> Py
     });
     unsafe {
         (*(groupby as *mut W_GroupBy)).w_currgrouper = grouper;
-        crate::gc_hook::try_gc_write_barrier(groupby as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(groupby as crate::gc_hook::GCREF);
     }
     grouper
 }
@@ -1087,7 +1087,7 @@ pub unsafe fn is_accumulate(obj: PyObjectRef) -> bool {
 pub unsafe fn w_accumulate_set_total(obj: PyObjectRef, w_value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Accumulate)).w_total = w_value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -1098,7 +1098,7 @@ pub unsafe fn w_accumulate_set_total(obj: PyObjectRef, w_value: PyObjectRef) {
 pub unsafe fn w_accumulate_set_initial(obj: PyObjectRef, w_value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Accumulate)).w_initial = w_value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -1218,7 +1218,7 @@ pub unsafe fn w_pairwise_get_prev(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_pairwise_set_prev(obj: PyObjectRef, w_prev: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Pairwise)).w_prev = w_prev;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -1381,7 +1381,7 @@ pub unsafe fn w_chain_get_it(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_chain_set_iterables(obj: PyObjectRef, w_value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Chain)).w_iterables = w_value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -1394,7 +1394,7 @@ pub unsafe fn w_chain_set_iterables(obj: PyObjectRef, w_value: PyObjectRef) {
 pub unsafe fn w_chain_set_it(obj: PyObjectRef, w_value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Chain)).w_it = w_value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 

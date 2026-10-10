@@ -8034,7 +8034,7 @@ pub unsafe fn object_setattr_surrogate(
                 )));
             }
             if crate::type_dict_store_wtf8(obj, name, value) {
-                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
                 mutated_wtf8(obj, name);
                 return Ok(w_none());
             }
@@ -8662,7 +8662,7 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
         pyre_object::w_dict_new()
     };
     crate::type_dict_store(obj(), "__annotations_cache__", annotations);
-    pyre_object::gc_hook::try_gc_write_barrier(obj() as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj() as pyre_object::gc_hook::GCREF);
     Ok(annotations)
 }
 
@@ -8686,7 +8686,7 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
     // `cls.__dict__`.
     crate::type_dict_delete(obj, "__annotate_func__");
     crate::type_dict_delete(obj, "__annotate__");
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     unsafe { mutated(obj, "__annotations__") };
     Ok(w_none())
 }
@@ -8713,7 +8713,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
     if !unsafe { is_none(value) } {
         crate::type_dict_delete(obj, "__annotations_cache__");
     }
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     unsafe { mutated(obj, "__annotate__") };
     Ok(w_none())
 }
@@ -8739,7 +8739,7 @@ pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
     // A class that declared no annotations acquires the slot on the first
     // read, so `__annotate_func__` becomes visible in `cls.__dict__`.
     crate::type_dict_store(obj, "__annotate_func__", w_none());
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     Ok(w_none())
 }
 
@@ -8764,7 +8764,7 @@ pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyRe
         )));
     }
     crate::type_dict_store(obj, "__type_params__", value);
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     unsafe { mutated(obj, "__type_params__") };
     Ok(w_none())
 }
@@ -8786,7 +8786,7 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     }
     crate::type_dict_delete(obj, "__annotate_func__");
     crate::type_dict_delete(obj, "__annotate__");
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     unsafe { mutated(obj, "__annotations__") };
     Ok(w_none())
 }
@@ -11852,7 +11852,7 @@ unsafe fn _cached_lookup_where_name(
     entry.lookup_where = tup;
     let container = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
     if container != 0 {
-        pyre_object::gc_hook::try_gc_write_barrier(container as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(container as pyre_object::gc_hook::GCREF);
     }
     // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
     // Rust owns the bytes instead, so overwrite the buffer the slot
@@ -14524,7 +14524,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // `setfield` of a GC pointer into `w_obj`: a heap class is born young
         // (`w_type_new`), so an old instance pointing at it has to be in the
         // remembered set before the next minor collection.
-        pyre_object::gc_hook::try_gc_write_barrier(w_obj as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(w_obj as pyre_object::gc_hook::GCREF);
     }
     Ok(w_none())
 }
@@ -15175,7 +15175,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> P
                     crate::type_dict_store(obj, name, value);
                     mutated(obj, name);
                 }
-                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
                 if let Some(a) = abstract_flag {
                     pyre_object::w_type_set_abstract(obj, a);
                 }
@@ -16285,7 +16285,7 @@ fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static
     if exc.is_null() || unsafe { !pyre_object::interp_exceptions::is_exception(exc) } {
         return None;
     }
-    if pyre_object::gc_hook::try_gc_owns_object(exc as *mut u8) {
+    if pyre_object::gc_hook::try_gc_owns_object(exc as pyre_object::gc_hook::GCREF) {
         return None;
     }
     let offsets =
@@ -18962,7 +18962,7 @@ fn groupby_step(obj: PyObjectRef) -> Result<(), PyError> {
     let state = unsafe { &mut *(w_self as *mut pyre_object::interp_itertools::W_GroupBy) };
     state.w_currkey = unsafe { pyre_object::gc_roots::shadow_stack_get(key_slot) };
     state.w_currvalue = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
-    pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
     Ok(())
 }
 
@@ -20145,7 +20145,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let initial = pyre_object::w_list_new(initial_items);
                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 (*(w_self as *mut pyre_object::interp_itertools::W_Product)).lst = initial;
-                pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
             } else {
                 let gear_count = pyre_object::w_list_len(state.gears);
                 if gear_count == 0 {
@@ -20342,7 +20342,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             (*(w_self as *mut pyre_object::interp_itertools::W_Combinations)).last_result_w =
                 pyre_object::gc_roots::shadow_stack_get(result_slot);
-            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
 
             let mut result_slots = Vec::with_capacity(r);
             for i in 0..r {
@@ -20470,7 +20470,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             (*(w_self as *mut pyre_object::interp_itertools::W_CombinationsWithReplacement))
                 .last_result_w = pyre_object::gc_roots::shadow_stack_get(result_slot);
-            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
 
             let mut result_slots = Vec::with_capacity(r);
             for i in 0..r {
@@ -20632,7 +20632,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             (*(w_self as *mut pyre_object::interp_itertools::W_GroupBy)).w_tgtkey =
                 pyre_object::gc_roots::shadow_stack_get(key_slot);
-            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
 
             let grouper = pyre_object::interp_itertools::w_groupby_iterator_new(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -20744,7 +20744,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             (*(w_self as *mut pyre_object::interp_itertools::W_TeeIterable))
                                 .w_chained_list = PY_NULL;
-                            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+                            pyre_object::gc_hook::try_gc_write_barrier(
+                                w_self as pyre_object::gc_hook::GCREF,
+                            );
                         }
                         return Err(err);
                     }
@@ -20761,7 +20763,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 node_state.running = false;
                 node_state.w_obj = pyre_object::gc_roots::shadow_stack_get(item_slot);
                 node_state.w_next = pyre_object::gc_roots::shadow_stack_get(next_slot);
-                pyre_object::gc_hook::try_gc_write_barrier(node as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(node as pyre_object::gc_hook::GCREF);
             }
 
             let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
@@ -20775,7 +20777,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             (*(w_self as *mut pyre_object::interp_itertools::W_TeeIterable)).w_chained_list =
                 pyre_object::gc_roots::shadow_stack_get(next_slot);
-            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as pyre_object::gc_hook::GCREF);
             return Ok(pyre_object::gc_roots::shadow_stack_get(item_slot));
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.
@@ -22633,7 +22635,8 @@ pub fn generator_send_ex_body(
         // `GcRef`; publishing it lets a collection rewrite the pointer.
         // `try_gc_owns_object` is the gate. `FrameAnchor` publishes the
         // same pointer as `GcRef`, so it is not a substitute.
-        let frame_owned = pyre_object::gc_hook::try_gc_owns_object(frame_ptr as *mut u8);
+        let frame_owned =
+            pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF);
         let frame_slot = pyre_object::gc_roots::shadow_stack_len();
         if frame_owned {
             let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
@@ -22808,10 +22811,10 @@ pub(crate) fn resume_yield_from(
             // executing, `gi_yieldfrom` must therefore remain None.
             frame.w_yielding_from = roots.get(yf_slot);
             if pyre_object::gc_hook::try_gc_owns_object(
-                frame as *mut crate::pyframe::PyFrame as *mut u8,
+                frame as *mut crate::pyframe::PyFrame as pyre_object::gc_hook::GCREF,
             ) {
                 pyre_object::gc_hook::try_gc_write_barrier(
-                    frame as *mut crate::pyframe::PyFrame as *mut u8,
+                    frame as *mut crate::pyframe::PyFrame as pyre_object::gc_hook::GCREF,
                 );
             }
             Ok(Some(value))
@@ -24266,8 +24269,12 @@ pub fn generator_finalize(mut gen_obj: PyObjectRef) -> PyResult {
                 );
                 (*(frame_ptr as *mut crate::pyframe::PyFrame)).f_generator_wref =
                     wref as PyObjectRef;
-                if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as *mut u8) {
-                    pyre_object::gc_hook::try_gc_write_barrier(frame_ptr as *mut u8);
+                if pyre_object::gc_hook::try_gc_owns_object(
+                    frame_ptr as pyre_object::gc_hook::GCREF,
+                ) {
+                    pyre_object::gc_hook::try_gc_write_barrier(
+                        frame_ptr as pyre_object::gc_hook::GCREF,
+                    );
                 }
                 return match crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(base + 1),

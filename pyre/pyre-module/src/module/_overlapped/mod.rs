@@ -190,7 +190,7 @@ fn set_object_refs(
     this.w_buffer = w_buffer;
     this.w_buffer_owner = w_owner;
     this.w_result = w_result;
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     Ok(())
 }
 
@@ -538,7 +538,7 @@ fn overlapped_getresult(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
             fields.push(address);
             let result = pyre_object::w_tuple_new(fields.take());
             this(obj)?.w_result = result;
-            pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             Ok(result)
         }
         _ => Ok(pyre_object::w_int_new(transferred as i64)),

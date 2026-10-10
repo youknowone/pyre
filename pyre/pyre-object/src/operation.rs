@@ -80,7 +80,7 @@ pub unsafe fn w_callable_iterator_get_callable(obj: PyObjectRef) -> PyObjectRef 
 pub unsafe fn w_callable_iterator_set_callable(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut _CallableIterator)).callable = value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 

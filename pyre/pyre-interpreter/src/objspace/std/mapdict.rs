@@ -3261,7 +3261,9 @@ pub unsafe fn store_attr_add_fast_path(
     // hook) would leak once the emitted allocation replaces it without a free.
     let inst = unsafe { mapdict_carrier(w_obj) };
     let storage = unsafe { inst.storage() };
-    if !storage.is_null() && !pyre_object::gc_hook::try_gc_owns_object(storage as *mut u8) {
+    if !storage.is_null()
+        && !pyre_object::gc_hook::try_gc_owns_object(storage as pyre_object::gc_hook::GCREF)
+    {
         return None;
     }
     // The emitted transition allocates a `storage_needed + 1` block, so spare
@@ -3686,12 +3688,14 @@ pub trait MapdictObject {
 /// too — otherwise the block stays TRACK-set and a non-moving major's
 /// `debug_check_not_white` sees black storage → white nursery values.
 fn instance_write_barrier(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
 }
 
 fn mapdict_storage_write_barrier(storage: *mut pyre_object::object_array::ItemsBlock) {
-    if !storage.is_null() && pyre_object::gc_hook::try_gc_owns_object(storage as *mut u8) {
-        pyre_object::gc_hook::try_gc_write_barrier(storage as *mut u8);
+    if !storage.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(storage as pyre_object::gc_hook::GCREF)
+    {
+        pyre_object::gc_hook::try_gc_write_barrier(storage as pyre_object::gc_hook::GCREF);
     }
 }
 
@@ -5841,7 +5845,7 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
     // `setfield_gc` on `w_dict.dstorage`: the fresh table is born young and
     // an already-old dict has to be remembered before the next minor.
     pyre_object::gc_hook::try_gc_write_barrier(
-        pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut u8
+        pyre_object::gc_roots::shadow_stack_get(dict_slot) as pyre_object::gc_hook::GCREF
     );
     // materialize_r_dict(space, w_obj, dict_w).
     unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
@@ -5871,7 +5875,7 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
     // `setfield_gc` on `w_dict.dstorage`: the fresh table is born young and
     // an already-old dict has to be remembered before the next minor.
     pyre_object::gc_hook::try_gc_write_barrier(
-        pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut u8
+        pyre_object::gc_roots::shadow_stack_get(dict_slot) as pyre_object::gc_hook::GCREF
     );
     // materialize_str_dict(space, w_obj, str_dict).
     unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
@@ -5929,13 +5933,13 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     /// fresh fake `W_ObjectObject` carrier on the shared dict terminator,
     /// erased. Production dstorage is likewise the backing instance
     /// (mapdict.py).
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> pyre_object::gc_hook::GCREF {
         let w_result = pyre_object::w_instance_new(pyre_object::PY_NULL);
         unsafe {
             (&mut *(w_result as *mut pyre_object::W_ObjectObject))
                 ._set_mapdict_map(get_terminator_for_dicts());
         }
-        w_result as *mut u8
+        w_result as pyre_object::gc_hook::GCREF
     }
 
     /// mapdict.py `getitem`.
@@ -6312,7 +6316,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     let dict_slot = self_slot + 1;
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
         &MAP_DICT_STRATEGY_REF,
-        pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8,
+        pyre_object::gc_roots::shadow_stack_get(self_slot) as pyre_object::gc_hook::GCREF,
     ));
     unsafe {
         let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
@@ -6322,8 +6326,8 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
         // allocation that produced the wrapper is not covered, so restate
         // the back-pointer from the instance's current address.
         (*(w_dict as *mut pyre_object::W_DictObject)).dstorage =
-            pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8;
-        pyre_object::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+            pyre_object::gc_roots::shadow_stack_get(self_slot) as pyre_object::gc_hook::GCREF;
+        pyre_object::gc_hook::try_gc_write_barrier(w_dict as pyre_object::gc_hook::GCREF);
         let flag = instance_set_dict_slot(
             pyre_object::gc_roots::shadow_stack_get(self_slot),
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -6358,7 +6362,7 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         if (*storage_slot).is_null() {
             return;
         }
-        if pyre_object::gc_hook::try_gc_owns_object(*storage_slot as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(*storage_slot as pyre_object::gc_hook::GCREF) {
             f(storage_slot as *mut PyObjectRef);
         }
         // Both forms are needed, unlike in `list_object_custom_trace`, which
@@ -7130,7 +7134,10 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(
+                &MAP_DICT_STRATEGY_REF,
+                obj_ref as pyre_object::gc_hook::GCREF,
+            );
 
             assert_eq!(MAP_DICT_STRATEGY.strategy_kind(), StrategyKind::Map);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
@@ -7203,7 +7210,10 @@ mod tests {
             ));
             assert!(instance_node_setdictvalue(obj_ref, &sur, sentinel(0x55)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(
+                &MAP_DICT_STRATEGY_REF,
+                obj_ref as pyre_object::gc_hook::GCREF,
+            );
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
 
             let (w_sur_key, w_sur_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
@@ -7365,7 +7375,10 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x11)));
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(
+                &MAP_DICT_STRATEGY_REF,
+                obj_ref as pyre_object::gc_hook::GCREF,
+            );
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
 
             // A non-str key forces switch_to_object_strategy → materialise.
@@ -7406,7 +7419,10 @@ mod tests {
             obj._set_mapdict_map(term);
             assert!(instance_node_setdictvalue(obj_ref, wn("a"), sentinel(0x55)));
 
-            let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY_REF, obj_ref as *mut u8);
+            let w_dict = pyre_object::w_dict_new_with(
+                &MAP_DICT_STRATEGY_REF,
+                obj_ref as pyre_object::gc_hook::GCREF,
+            );
 
             // The LIMIT-devolve path (mapdict.py:317-323) switches to text.
             mapdict_switch_to_text_strategy(w_dict);

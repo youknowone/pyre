@@ -63,13 +63,15 @@ impl Drop for FrameLocalsRoot {
 
 #[majit_macros::dont_look_inside]
 unsafe fn register_frame_locals_slot(frame: *mut PyFrame) -> bool {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
+    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) }
+        as *mut pyre_object::gc_hook::GCREF;
     unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
 }
 
 #[majit_macros::dont_look_inside]
 fn unregister_frame_locals_slot(frame: *mut PyFrame) {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
+    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) }
+        as *mut pyre_object::gc_hook::GCREF;
     pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
@@ -5573,13 +5575,14 @@ mod pack_varargs_tests {
     /// `w_tuple_new` allocates through the no-collect hook, which spills
     /// instead of moving. This test hook takes the collecting entry so a
     /// full nursery relocates a pinned positional during that allocation.
-    fn collecting_alloc_hook(type_id: u32, payload_size: usize) -> *mut u8 {
+    fn collecting_alloc_hook(type_id: u32, payload_size: usize) -> majit_gc::GCREF {
         if !COLLECT_ON_ALLOC.with(Cell::get) {
             let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
                 .expect("probe fallback layout");
-            return unsafe { std::alloc::alloc_zeroed(layout) };
+            return unsafe { std::alloc::alloc_zeroed(layout) as majit_gc::GCREF };
         }
-        majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(type_id, payload_size)).0 as *mut u8
+        majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(type_id, payload_size)).0
+            as majit_gc::GCREF
     }
 
     fn install_collecting_heap() {
@@ -5693,7 +5696,7 @@ mod pack_varargs_tests {
         );
     }
 
-    fn collecting_stable_hook(type_id: u32, payload_size: usize) -> *mut u8 {
+    fn collecting_stable_hook(type_id: u32, payload_size: usize) -> majit_gc::GCREF {
         if COLLECT_ON_ALLOC.with(Cell::get) {
             // A full nursery makes the collecting entry run a minor collection
             // before this stable request returns.
@@ -5701,7 +5704,7 @@ mod pack_varargs_tests {
         }
         let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
             .expect("stable fallback layout");
-        unsafe { std::alloc::alloc_zeroed(layout) }
+        unsafe { std::alloc::alloc_zeroed(layout) as majit_gc::GCREF }
     }
 
     #[test]
@@ -6992,7 +6995,7 @@ fn build_class_inner(
         let w = pyre_object::w_type_new(
             name,
             pyre_object::gc_roots::shadow_stack_get(bases_root),
-            dict_obj as *mut u8,
+            dict_obj as pyre_object::gc_hook::GCREF,
         );
         let w = pyre_object::gc_roots::pin_root(w);
         crate::builtins::type_new_take_qualname(w, dict_obj)?;
@@ -7009,7 +7012,7 @@ fn build_class_inner(
         // `setfield_gc` of `w_class` on an old-gen type: remember the
         // holder so a young class survives the next minor
         // (`incminimark.py write_barrier`).
-        pyre_object::gc_hook::try_gc_write_barrier(w as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(w as pyre_object::gc_hook::GCREF);
         // typeobject.py `compute_mro(w_self)`, reached only once
         // `check_and_find_best_base` inside `create_all_slots` above accepted
         // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s

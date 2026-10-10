@@ -1449,7 +1449,9 @@ impl W_Struct {
         let format = format_to_string(w_format)?;
         self.size = parse_format(&format)?.calcsize()?;
         self.format = w_str_new_managed(&format);
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(())
     }
 

@@ -222,13 +222,13 @@ fn weakref_set_hash(obj: PyObjectRef, value: PyObjectRef) {
 /// Registering the slot keeps the instance alive and relocates the local
 /// in place when the collector promotes it, mirroring `FrameLocalsRoot`.
 struct InstanceRoot {
-    slot: *mut *mut u8,
+    slot: *mut pyre_object::gc_hook::GCREF,
     registered: bool,
 }
 
 impl InstanceRoot {
     fn new(obj: &mut PyObjectRef) -> Self {
-        let slot = obj as *mut PyObjectRef as *mut *mut u8;
+        let slot = obj as *mut PyObjectRef as *mut pyre_object::gc_hook::GCREF;
         let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
         Self { slot, registered }
     }

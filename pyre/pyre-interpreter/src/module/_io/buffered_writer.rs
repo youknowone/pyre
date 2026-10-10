@@ -421,7 +421,9 @@ impl W_BufferedWriter {
         // knows, so construction owes no `lseek`.
         self.abs_pos = -1;
         self.state = STATE_OK;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(())
     }
 
@@ -592,12 +594,16 @@ impl W_BufferedWriter {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let mut error = error;
                 let error_slot = error.pin(&_roots);
-                pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(
+                    self as *mut Self as pyre_object::gc_hook::GCREF,
+                );
                 error.reload(&_roots, error_slot);
                 Err(error)
             }
             None => {
-                pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(
+                    self as *mut Self as pyre_object::gc_hook::GCREF,
+                );
                 Ok(())
             }
         }
@@ -610,7 +616,9 @@ impl W_BufferedWriter {
         self.w_raw = PY_NULL;
         self.buffer = PY_NULL;
         self.state = STATE_DETACHED;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(raw)
     }
 

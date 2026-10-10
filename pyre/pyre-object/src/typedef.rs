@@ -448,11 +448,11 @@ pub unsafe fn w_getset_get_objclass(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_getset_set_objclass(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GetSetProperty)).w_objclass = value }
-    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+    if crate::gc_hook::try_gc_owns_object(obj as crate::gc_hook::GCREF) {
         // GC-owned: traced through the type-id offsets. A young
         // descriptor ignores the barrier; an old-gen fallback joins
         // the remembered set so `w_objclass` is forwarded.
-        crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
     } else {
         // Immortal template reached only by `walk_raw_getset_roots`,
         // skipped on a clean minor; record the store.
@@ -475,8 +475,8 @@ pub unsafe fn w_getset_get_qualname(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_getset_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GetSetProperty)).w_qualname = value }
-    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
-        crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+    if crate::gc_hook::try_gc_owns_object(obj as crate::gc_hook::GCREF) {
+        crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
     } else {
         crate::gc_roots::mark_prebuilt_roots_dirty();
     }
@@ -758,7 +758,7 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// `typedef.py Member.index` — the slot index (`base_nslots + position`),

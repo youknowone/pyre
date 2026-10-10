@@ -265,7 +265,8 @@ pub extern "C" fn jit_ll_arraymove(
     // `gc_shrink_array` resolves the same way for the same reason; RPython's
     // GC transform makes the equivalent reload around `rgc.ll_arraymove`
     // automatically.
-    let address = crate::gc_hook::try_gc_current_object_address(array as *mut u8) as usize;
+    let address =
+        crate::gc_hook::try_gc_current_object_address(array as crate::gc_hook::GCREF) as usize;
     let layout = majit_gc::gc_varsize_layout(address).unwrap_or(majit_gc::GcVarSizeLayout {
         base_size: ITEMS_BLOCK_TOKEN.base_size,
         item_size: ITEMS_BLOCK_TOKEN.item_size,
@@ -289,9 +290,9 @@ pub extern "C" fn jit_ll_arraymove(
         if length == 1 {
             // rgc.py `ll_arraymove`: the literal `copy_item` head exists for
             // EffectInfo and performs an ordinary GC-pointer store.
-            crate::gc_hook::try_gc_write_barrier(address as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(address as crate::gc_hook::GCREF);
         } else {
-            crate::gc_hook::try_gc_write_barrier_before_move(address as *mut u8);
+            crate::gc_hook::try_gc_write_barrier_before_move(address as crate::gc_hook::GCREF);
         }
     }
     unsafe {
@@ -348,7 +349,7 @@ pub extern "C" fn jit_ll_arraycopy(
 
     let follow = |slot: usize| {
         crate::gc_hook::try_gc_current_object_address(
-            crate::gc_roots::shadow_stack_get(slot) as *mut u8
+            crate::gc_roots::shadow_stack_get(slot) as crate::gc_hook::GCREF
         ) as usize
     };
     let dest_address = follow(dest_slot);
@@ -741,7 +742,7 @@ pub unsafe fn grow_instance_items_block(
         }
         // Copied slots can be young. A nursery-full `fresh` block is
         // old-gen with TRACK_YOUNG_PTRS still set.
-        crate::gc_hook::try_gc_write_barrier_managed(fresh as *mut u8);
+        crate::gc_hook::try_gc_write_barrier_managed(fresh as crate::gc_hook::GCREF);
         fresh
     }
 }
@@ -874,7 +875,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     // alloc_tuple_items_block_gc): registers an old-gen block holding young
     // elements onto the remembered set, no-op for a nursery block.
     if owns_block {
-        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(block as crate::gc_hook::GCREF);
     }
     if len > 0 {
         // RPython's pop_roots reloads the livevars as one generated block.
@@ -1006,7 +1007,7 @@ pub unsafe fn try_grow_list_items_block_gc(
     // Old→young barrier if the grown block landed in old-gen (see
     // alloc_tuple_items_block_gc).
     if owns_new {
-        crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(new_block as crate::gc_hook::GCREF);
     }
     // rlist.py `_ll_list_resize_hint_really`: `rgc.ll_arraycopy` then
     // `l.items = newitems`. The copy's `copy_item` head is what writeanalyze
@@ -1074,7 +1075,7 @@ pub unsafe fn alloc_tuple_items_block_gc(save_point: usize, cap: usize) -> *mut 
     // no-op. Guard on GC ownership exactly like `list_write_barrier`.
     if owns_block {
         crate::gc_hook::try_gc_write_barrier_managed(
-            crate::gc_roots::shadow_stack_get(block_slot) as *mut u8
+            crate::gc_roots::shadow_stack_get(block_slot) as crate::gc_hook::GCREF
         );
     }
     crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock
@@ -1262,7 +1263,7 @@ unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
     if block.is_null() || block == ll_prebuilt_empty_items_block() {
         return;
     }
-    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+    if crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF) {
         return;
     }
     unsafe {
@@ -1547,7 +1548,7 @@ pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
     if block.is_null() {
         return;
     }
-    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+    if crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF) {
         return;
     }
     unsafe {
@@ -1704,7 +1705,7 @@ impl FixedObjectArray {
         // used to wait on `try_gc_current_object_address` and consume
         // the birth remembered-set entry mid-fill, after which later
         // stores took the no-barrier arm.
-        crate::gc_hook::try_gc_write_barrier_managed(self as *mut Self as *mut u8);
+        crate::gc_hook::try_gc_write_barrier_managed(self as *mut Self as crate::gc_hook::GCREF);
         unsafe { self.items_mut_ptr().add(index).write(value) };
     }
 
@@ -1736,7 +1737,9 @@ impl FixedObjectArray {
                 if unsafe { (*header).is_forwarded() } {
                     stale_array_abort(self as *const Self as usize, index);
                 }
-                crate::gc_hook::try_gc_write_barrier_managed(self as *const Self as *mut u8);
+                crate::gc_hook::try_gc_write_barrier_managed(
+                    self as *const Self as crate::gc_hook::GCREF,
+                );
             }
         }
         self.item_atomic_ptr(index)
@@ -1818,7 +1821,7 @@ fn mro_block_layout(len: usize) -> Layout {
 /// # Safety
 /// `block` is null or a block [`alloc_mro_block_gc`] returned, not yet freed.
 pub unsafe fn dealloc_mro_block(block: *mut FixedObjectArray) {
-    if block.is_null() || crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+    if block.is_null() || crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF) {
         return;
     }
     unsafe {
@@ -1866,7 +1869,10 @@ pub unsafe fn alloc_mro_block_gc_young(values: &[PyObjectRef]) -> *mut FixedObje
     unsafe { fill_mro_block(values, raw) }
 }
 
-unsafe fn fill_mro_block(values: &[PyObjectRef], raw: *mut u8) -> *mut FixedObjectArray {
+unsafe fn fill_mro_block(
+    values: &[PyObjectRef],
+    raw: crate::gc_hook::GCREF,
+) -> *mut FixedObjectArray {
     let len = values.len();
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray
@@ -1882,14 +1888,14 @@ unsafe fn fill_mro_block(values: &[PyObjectRef], raw: *mut u8) -> *mut FixedObje
     // between them and the barrier — see `alloc_list_items_block_gc`.  This
     // block is raw-malloced and never moves, so no re-read is owed for the
     // address.
-    let owns_block = crate::gc_hook::try_gc_owns_object(block as *mut u8);
+    let owns_block = crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF);
     unsafe {
         (*block).len = len;
         // Old→young barrier if the block landed in old-gen and any element is a
         // young object: registers the block on the remembered set so a later
         // minor collection forwards the young MRO entries.
         if owns_block {
-            crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(block as crate::gc_hook::GCREF);
         }
         let items = (*block).items_mut_ptr();
         let src = values.as_ptr();

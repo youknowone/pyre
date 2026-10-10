@@ -295,7 +295,7 @@ pub unsafe fn read_weakref_lifeline(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn write_weakref_lifeline(obj: PyObjectRef, value: PyObjectRef) {
     let off = unsafe { (*(*obj).ob_type).weakref_offset };
     debug_assert!(off != 0);
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     unsafe {
         *((obj as *mut u8).add(off) as *mut PyObjectRef) = value;
     }

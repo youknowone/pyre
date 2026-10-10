@@ -16,7 +16,7 @@ static AST_TYPE: std::sync::OnceLock<Box<usize>> = std::sync::OnceLock::new();
 fn register_root(cell: &std::sync::OnceLock<Box<usize>>, value: PyObjectRef) {
     let _ = cell.get_or_init(|| {
         let mut slot = Box::new(value as usize);
-        let root = (&mut *slot) as *mut usize as *mut *mut u8;
+        let root = (&mut *slot) as *mut usize as *mut pyre_object::gc_hook::GCREF;
         unsafe { pyre_object::gc_hook::try_gc_add_root(root) };
         slot
     });

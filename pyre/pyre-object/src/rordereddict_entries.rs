@@ -269,12 +269,16 @@ unsafe fn copy_struct_item<K: Copy + GcRefOffsets, V: Copy + GcRefOffsets>(
     let src = entries_item_ptr(source);
     let dst = entries_item_ptr(dest);
     unsafe {
-        if !K::GC_REF_OFFSETS.is_empty() && crate::gc_hook::try_gc_owns_object(dest as *mut u8) {
+        if !K::GC_REF_OFFSETS.is_empty()
+            && crate::gc_hook::try_gc_owns_object(dest as crate::gc_hook::GCREF)
+        {
             majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(dest as usize), di);
         }
         (*dst.add(di)).key = (*src.add(si)).key;
         (*dst.add(di)).f_valid = (*src.add(si)).f_valid;
-        if !V::GC_REF_OFFSETS.is_empty() && crate::gc_hook::try_gc_owns_object(dest as *mut u8) {
+        if !V::GC_REF_OFFSETS.is_empty()
+            && crate::gc_hook::try_gc_owns_object(dest as crate::gc_hook::GCREF)
+        {
             majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(dest as usize), di);
         }
         (*dst.add(di)).value = (*src.add(si)).value;
@@ -324,8 +328,8 @@ pub unsafe fn ll_arraycopy<K: Copy + GcRefOffsets, V: Copy + GcRefOffsets>(
         return;
     }
     let mut slowpath = false;
-    if crate::gc_hook::try_gc_owns_object(dest as *mut u8) {
-        if crate::gc_hook::try_gc_owns_object(source as *mut u8) {
+    if crate::gc_hook::try_gc_owns_object(dest as crate::gc_hook::GCREF) {
+        if crate::gc_hook::try_gc_owns_object(source as crate::gc_hook::GCREF) {
             slowpath = !majit_gc::gc_writebarrier_before_copy(
                 majit_ir::GcRef(source as usize),
                 majit_ir::GcRef(dest as usize),

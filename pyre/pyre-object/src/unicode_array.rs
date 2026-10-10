@@ -157,7 +157,7 @@ impl UnicodeArray {
     #[inline]
     fn barrier(&self) {
         if !self.block.is_null() {
-            crate::gc_hook::try_gc_write_barrier(self.block as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(self.block as crate::gc_hook::GCREF);
         }
     }
 
@@ -171,7 +171,7 @@ impl UnicodeArray {
     #[inline]
     fn before_move_barrier(&self) {
         if !self.block.is_null() {
-            crate::gc_hook::try_gc_write_barrier_before_move(self.block as *mut u8);
+            crate::gc_hook::try_gc_write_barrier_before_move(self.block as crate::gc_hook::GCREF);
         }
     }
 

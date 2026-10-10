@@ -67,7 +67,7 @@ mod imp {
 
         let mut slot = Box::new(current_obj() as usize);
         let slot_ptr = (&mut *slot) as *mut usize;
-        let root_slot = slot_ptr as *mut *mut u8;
+        let root_slot = slot_ptr as *mut pyre_object::gc_hook::GCREF;
         unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
 
         let thunk = host_ctypes::CallbackThunk::new(

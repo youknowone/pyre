@@ -279,7 +279,7 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_module_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let module = &mut *(obj as *mut Module);
     module.w_name = w_name;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// `MixedModule.w_initialdict`.
@@ -299,7 +299,7 @@ pub unsafe fn w_module_get_initialdict(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_set_initialdict(obj: PyObjectRef, w_initialdict: PyObjectRef) {
     (*(obj as *mut Module)).w_initialdict = w_initialdict;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     crate::gc_roots::mark_prebuilt_roots_dirty();
 }
 

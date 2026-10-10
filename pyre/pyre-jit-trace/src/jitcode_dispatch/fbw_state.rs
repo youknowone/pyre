@@ -616,7 +616,8 @@ pub(crate) fn fbw_store_journal_reset() {
 /// application suffices — the drag-out promotes the frame out of the nursery,
 /// and nothing outside it moves (`gc_current_object_address`).
 fn live_frame_addr(frame: usize) -> usize {
-    pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize
+    pyre_object::gc_hook::try_gc_current_object_address(frame as pyre_object::gc_hook::GCREF)
+        as usize
 }
 
 /// Record the `last_instr` an eager walk-time write is about to displace, so
@@ -1094,7 +1095,7 @@ pub(crate) fn fbw_gc_store_journal_push(
     before: Value,
     op_count: u32,
 ) {
-    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8);
+    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
     if fbw_debug_abort_enabled() {
         eprintln!(
             "[fbw-gc-store-journal] push obj=0x{:x} offset={offset} size={size} before={before:?} managed={managed}",
@@ -1188,7 +1189,7 @@ pub(crate) unsafe fn fbw_gc_store_word(
         Value::Ref(r) if size == std::mem::size_of::<usize>() => {
             unsafe { addr.cast::<usize>().write_unaligned(r.0) };
             if managed {
-                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+                pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             }
         }
         _ => return false,
@@ -2524,7 +2525,9 @@ fn undo_cell_store_entry(entry: FbwCellStore) {
                 // A minor collection can run between the speculative
                 // store's barrier and rollback, so restoring a young
                 // `before` needs its own barrier.
-                pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8);
+                pyre_object::celldict::object_mutable_cell_write_barrier(
+                    cell as pyre_object::gc_hook::GCREF,
+                );
                 (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
             }
             FbwCellStore::Gc {

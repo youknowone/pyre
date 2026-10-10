@@ -254,7 +254,9 @@ pub unsafe fn walk_module_value_slot(
         visitor(slot);
         return;
     }
-    if !is_mutable_cell(w_value) || crate::gc_hook::try_gc_owns_object(w_value as *mut u8) {
+    if !is_mutable_cell(w_value)
+        || crate::gc_hook::try_gc_owns_object(w_value as crate::gc_hook::GCREF)
+    {
         visitor(slot);
         return;
     }
@@ -273,7 +275,7 @@ pub unsafe fn walk_module_value_slot(
 /// pointer: the incremental collector relies on the first prebuilt write
 /// registering the object, and the JIT write barrier does not take `newvalue`.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn object_mutable_cell_write_barrier(cell: *mut u8) {
+pub fn object_mutable_cell_write_barrier(cell: crate::gc_hook::GCREF) {
     if crate::gc_hook::try_gc_owns_object(cell) {
         crate::gc_hook::try_gc_write_barrier(cell);
     } else {
@@ -325,7 +327,7 @@ pub unsafe fn write_cell(
             let cell = w_cell_word;
             // Barrier before the store, the `remember_young_pointer` order.
             // An in-place int store writes no `PyObjectRef` and needs none.
-            object_mutable_cell_write_barrier(cell as *mut u8);
+            object_mutable_cell_write_barrier(cell as crate::gc_hook::GCREF);
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
@@ -1371,8 +1373,8 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// `ModuleDictStorage` directly (no `rerased` indirection); return
     /// the storage as an erased `*mut u8` so the trait surface stays
     /// strategy-agnostic.
-    fn get_empty_storage(&self) -> *mut u8 {
-        crate::lltype::malloc_raw(ModuleDictStorage::new()) as *mut u8
+    fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
+        crate::lltype::malloc_raw(ModuleDictStorage::new()) as crate::gc_hook::GCREF
     }
 
     /// `celldict.py getitem` — str fast path, else
@@ -1689,7 +1691,7 @@ mod tests {
             crate::gc_roots::clear_prebuilt_roots_dirty();
             storage.set("k", crate::w_str_new("v"));
             assert!(crate::gc_roots::prebuilt_roots_dirty());
-            let cell = crate::w_str_new("cell") as *mut u8;
+            let cell = crate::w_str_new("cell") as crate::gc_hook::GCREF;
             crate::gc_roots::clear_prebuilt_roots_dirty();
             object_mutable_cell_write_barrier(cell);
             assert!(crate::gc_roots::prebuilt_roots_dirty());

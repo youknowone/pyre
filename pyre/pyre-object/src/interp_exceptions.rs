@@ -788,7 +788,7 @@ impl crate::lltype::GcType for RList {
 /// call this for the same reason `function.rs` barriers its setters.
 #[inline]
 fn exception_write_barrier(obj: PyObjectRef) {
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// Fixed payload size (`framework.py` `malloc` / `init_gc_object`) of the slim base layout.
@@ -1173,7 +1173,7 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
         // allocator can still spill old (pinned nursery gap); only that
         // placement remembers the `w_class` edge.
         if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(raw);
+            crate::gc_hook::try_gc_write_barrier(raw as crate::gc_hook::GCREF);
         }
         return raw as PyObjectRef;
     }

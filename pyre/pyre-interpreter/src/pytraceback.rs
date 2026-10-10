@@ -173,7 +173,7 @@ pub fn w_pytraceback_new(
     // and are re-read below.  Before the GC hook is wired (bootstrap, tests)
     // the collecting hook returns `None`; fall back to the leaked
     // `malloc_typed` block.
-    let mut allocation_root = roots.get(inputs) as *mut u8;
+    let mut allocation_root = roots.get(inputs) as pyre_object::gc_hook::GCREF;
     let mut needs_write_barrier = true;
     let raw = unsafe {
         pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
@@ -219,7 +219,7 @@ pub fn w_pytraceback_new(
     // The node may point at a still-young `w_next` / `w_code` (and, once
     // GC-owned, the frame); remember it if this alloc spilled old.
     if needs_write_barrier {
-        pyre_object::gc_hook::try_gc_write_barrier(raw);
+        pyre_object::gc_hook::try_gc_write_barrier(raw as pyre_object::gc_hook::GCREF);
     }
     raw as PyObjectRef
 }
@@ -275,7 +275,7 @@ pub unsafe fn w_pytraceback_set_w_next(
         // An older `obj` now names a possibly younger `w_new_next`; remember it
         // for the next minor tracer, as the allocation above does for the
         // fields written at birth.
-        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     }
     Ok(())
 }

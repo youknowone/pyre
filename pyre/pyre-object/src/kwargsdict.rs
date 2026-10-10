@@ -284,11 +284,11 @@ impl DictStrategy for KwargsDictStrategy {
     /// `kwargsdict.py get_empty_storage` — erased `([], [])`, born young
     /// like the nursery tuple upstream erases.  GC-managed box (`setfield_gc`
     /// on reassign).
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
         crate::gc_storage::gc_alloc_young_storage_box(
             KwargsDictStorage::default(),
             kwargs_dict_storage_gc_type_id(),
-        ) as *mut u8
+        ) as crate::gc_hook::GCREF
     }
 
     /// `kwargsdict.py switch_to_object_strategy` — walk
@@ -485,7 +485,10 @@ impl DictStrategy for KwargsDictStrategy {
             storage.clone(),
             kwargs_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&KWARGS_DICT_STRATEGY_REF, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(
+            &KWARGS_DICT_STRATEGY_REF,
+            new_storage as crate::gc_hook::GCREF,
+        )
     }
 }
 

@@ -124,7 +124,7 @@ pub fn new_allocator(
     allocator.w_free = roots.get(base + 2);
     // The allocator is born old-gen and its three policy objects may be
     // young, so the post-allocation writes need a remembered-set entry.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     Ok(obj)
 }
 

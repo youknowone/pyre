@@ -227,8 +227,8 @@ pub struct W_TypeObject {
     pub text_signature: *mut String,
     /// Tuple of base type objects (PyObjectRef → W_TupleObject or PY_NULL).
     pub bases: PyObjectRef,
-    /// Raw pointer to the class dict backing storage (`dict_w` analogue).
-    pub dict: *mut u8,
+    /// Class dict backing storage (`dict_w` analogue). `llmemory.GCREF`.
+    pub dict: crate::gc_hook::GCREF,
     /// Cached C3 MRO — W_TypeObject.mro_w (typeobject.py `mro_w?[*]`,
     /// an immutable `[W_Root]`). Stored as a stable `Ptr(GcArray(OBJECTPTR))`
     /// block (`alloc_mro_block_gc`) so the length-prefixed inline layout
@@ -551,7 +551,7 @@ pub fn snapshot_builtin_type_roots() -> Vec<usize> {
 /// typeobject.py:174 `__init__(..., is_heaptype=True)`.
 /// Layout is set to null initially; caller must set it via set_layout
 /// after running create_all_slots / setup_builtin_type.
-pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObjectRef {
+pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCREF) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
@@ -601,7 +601,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     // Install the forwarded bases and managed namespace addresses rather than the
     // pre-collection arguments (the pins survive any collection the alloc forces).
     let bases = crate::gc_roots::shadow_stack_get(save_point);
-    let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
+    let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as crate::gc_hook::GCREF;
     let value = W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
@@ -668,7 +668,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // Young-nonmoving header ignores the barrier (no TRACK_YOUNG_PTRS);
         // the old-gen fallback (no young hook) still needs it so `bases` /
         // name boxes that are young get forwarded.
-        crate::gc_hook::try_gc_write_barrier(w_type as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
     } else {
         // Immortal fallback type (pre-GC): its trace never fires, so root its
         // namespace the same way builtin types are rooted.
@@ -721,7 +721,7 @@ pub unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
 pub fn w_type_new_builtin(
     name: &str,
     bases: PyObjectRef,
-    dict_ptr: *mut u8,
+    dict_ptr: crate::gc_hook::GCREF,
     _layout_pytype: *const PyType,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
@@ -734,7 +734,7 @@ pub fn w_type_new_builtin(
             w_type,
             name,
             crate::gc_roots::shadow_stack_get(save_point),
-            crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8,
+            crate::gc_roots::shadow_stack_get(save_point + 1) as crate::gc_hook::GCREF,
         );
     }
     w_type
@@ -818,7 +818,7 @@ pub unsafe fn w_type_init_builtin(
     w_type: PyObjectRef,
     name: &str,
     bases: PyObjectRef,
-    dict_ptr: *mut u8,
+    dict_ptr: crate::gc_hook::GCREF,
 ) {
     let w_self = &mut *(w_type as *mut W_TypeObject);
     assert!(w_self.name.is_null(), "builtin type initialized twice");
@@ -1607,7 +1607,7 @@ fn type_write_barrier(obj: PyObjectRef) {
     if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
         return;
     }
-    crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
 }
 
 /// Get the bases tuple.
@@ -1630,11 +1630,11 @@ pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
     (*(obj as *mut W_TypeObject)).bases = bases;
 }
 
-/// Get the class namespace pointer (as *mut u8).
+/// Get the class namespace pointer (`llmemory.GCREF`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_type_get_dict_ptr(obj: PyObjectRef) -> *mut u8 {
+pub unsafe fn w_type_get_dict_ptr(obj: PyObjectRef) -> crate::gc_hook::GCREF {
     (*(obj as *const W_TypeObject)).dict
 }
 
@@ -1784,7 +1784,7 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
 pub unsafe fn w_type_clear_mro(obj: PyObjectRef) {
     (*(obj as *mut W_TypeObject)).mro_w = std::ptr::null_mut();
     w_type_set_version_tag(obj, 0);
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// typeobject.py `is_mro_purely_of_types(mro_w)`.
@@ -2375,7 +2375,7 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
 #[inline]
 unsafe fn note_weak_subclass_store(w_parent: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    crate::gc_hook::try_gc_write_barrier(w_parent as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(w_parent as crate::gc_hook::GCREF);
 }
 
 /// `typeobject.py W_TypeObject.remove_subclass`.
@@ -2530,10 +2530,15 @@ mod tests {
             assert!(snapshot_builtin_type_roots().contains(&(shell as usize)));
             let _roots = crate::gc_roots::push_roots();
             let ns = crate::gc_roots::pin_root(crate::w_dict_new());
-            w_type_init_builtin(shell, "module.Example", PY_NULL, ns as *mut u8);
+            w_type_init_builtin(
+                shell,
+                "module.Example",
+                PY_NULL,
+                ns as crate::gc_hook::GCREF,
+            );
             assert_eq!(w_type_get_name(shell), "module.Example");
             assert_eq!(&*(*(shell as *const W_TypeObject)).qualname, "Example");
-            assert_eq!(w_type_get_dict_ptr(shell), ns as *mut u8);
+            assert_eq!(w_type_get_dict_ptr(shell), ns as crate::gc_hook::GCREF);
             assert!(!w_type_is_heaptype(shell));
         }
     }

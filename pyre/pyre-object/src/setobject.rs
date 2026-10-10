@@ -15,6 +15,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::gc_hook::GCREF;
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 use std::cell::UnsafeCell;
@@ -102,7 +103,7 @@ pub unsafe fn w_set_iter_get_set(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_set_iter_set_set(obj: PyObjectRef, w_set: PyObjectRef) {
     (*(obj as *mut W_SetIterObject)).w_set = w_set;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -186,7 +187,7 @@ pub trait SetStrategy {
     fn strategy_kind(&self) -> SetStrategyKind;
 
     /// `SetStrategy.get_empty_storage`.
-    fn get_empty_storage(&self) -> *mut u8;
+    fn get_empty_storage(&self) -> GCREF;
 
     /// `SetStrategy.length`. The published atomic `len` slot, the count
     /// [`w_set_len`] loads without the stripe.
@@ -337,7 +338,7 @@ pub struct SetStrategyRef {
     pub kind: SetStrategyKind,
     pub imp: &'static dyn SetStrategy,
     /// `space.fromcache` singletons leave this null.
-    pub owner: *mut u8,
+    pub owner: GCREF,
 }
 
 unsafe impl Sync for SetStrategyRef {}
@@ -459,10 +460,10 @@ pub static IDENTITY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 #[repr(C)]
 pub struct W_SetObject {
     pub ob_header: PyObject,
-    /// `setobject.py W_BaseSetObject.sstorage`. The cast to `*mut u8` is the
+    /// `setobject.py W_BaseSetObject.sstorage`. The cast to [`GCREF`] is the
     /// erase; [`w_set_object_storage`] casts it back. Null is
     /// `EmptySetStrategy.get_empty_storage` (`erase(None)`).
-    pub sstorage: *mut u8,
+    pub sstorage: GCREF,
     /// `setobject.py W_BaseSetObject.strategy`, one word. `w_set_new` stores
     /// [`EMPTY_SET_STRATEGY_REF`]; the first add stores
     /// [`INTEGER_SET_STRATEGY_REF`], [`BYTES_SET_STRATEGY_REF`],
@@ -763,7 +764,7 @@ unsafe fn object_set_storage_ptr(set: &W_SetObject) -> *mut SetItemsStorage {
 /// box must not unerase the live word after that.
 #[inline]
 fn same_live_object_box(set: &W_SetObject, items: *mut SetItemsStorage) -> bool {
-    set.strategy.kind == SetStrategyKind::Object && set.sstorage == items as *mut u8
+    set.strategy.kind == SetStrategyKind::Object && set.sstorage == items as GCREF
 }
 
 /// `BytesSetStrategy.is_correct_type` — `type(w_key) is W_BytesObject`.
@@ -839,14 +840,14 @@ pub trait AbstractUnwrappedSetStrategy: Sized {
     }
 
     /// `get_empty_storage` — `erase(get_empty_dict())`.
-    fn get_empty_storage(&self) -> *mut u8
+    fn get_empty_storage(&self) -> GCREF
     where
         (Self::Key, ()): crate::rordereddict::GcEntriesType,
     {
         crate::gc_storage::gc_alloc_storage_box(
             crate::rordereddict::RDict::<Self::Key, (), Self::Hasher>::new(),
             self.storage_gc_type_id(),
-        ) as *mut u8
+        ) as GCREF
     }
 
     /// True when `Key` is a GC block (`BytesKey`, `StrKey`, `IdentitySetKey`).
@@ -1154,7 +1155,7 @@ where
     {
         let set = unsafe { &mut *(obj as *mut W_SetObject) };
         let len = unsafe { (*storage).len() };
-        set.sstorage = storage as *mut u8;
+        set.sstorage = storage as GCREF;
         set.strategy = &OBJECT_SET_STRATEGY_REF;
         // `clear` during `hash_w` has already published length 0 on the empty
         // strategy. The installed table is the pre-callback image, so the
@@ -1373,8 +1374,8 @@ where
     let len = copied.len();
     {
         let d = unsafe { &mut *(dst as *mut W_SetObject) };
-        d.sstorage = crate::gc_storage::gc_alloc_storage_box(copied, strategy.storage_gc_type_id())
-            as *mut u8;
+        d.sstorage =
+            crate::gc_storage::gc_alloc_storage_box(copied, strategy.storage_gc_type_id()) as GCREF;
         d.strategy = strategy.strategy_ref();
         d.set_len_relaxed(len);
         d.hash = -1;
@@ -1534,7 +1535,7 @@ where
         let dst = crate::gc_roots::shadow_stack_get(dst_slot);
         {
             let set = unsafe { &mut *(dst as *mut W_SetObject) };
-            set.sstorage = storage as *mut u8;
+            set.sstorage = storage as GCREF;
             set.strategy = strategy.strategy_ref();
             set.set_len_relaxed(len);
             set.hash = -1;
@@ -1609,7 +1610,7 @@ where
     let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     {
         let set = unsafe { &mut *(dst as *mut W_SetObject) };
-        set.sstorage = storage as *mut u8;
+        set.sstorage = storage as GCREF;
         set.strategy = strategy.strategy_ref();
         set.set_len_relaxed(len);
         set.hash = -1;
@@ -2000,7 +2001,7 @@ where
         self.kind()
     }
 
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> GCREF {
         AbstractUnwrappedSetStrategy::get_empty_storage(self)
     }
 
@@ -2454,7 +2455,7 @@ pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
 /// collector-owned.
 #[inline]
 fn set_write_barrier(obj: PyObjectRef) {
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     if obj.is_null() {
         return;
     }
@@ -2468,8 +2469,8 @@ fn set_write_barrier(obj: PyObjectRef) {
         return;
     }
     let items = unsafe { object_set_storage_ptr(set) };
-    if !items.is_null() && crate::gc_hook::try_gc_owns_object(items as *mut u8) {
-        crate::gc_hook::try_gc_write_barrier(items as *mut u8);
+    if !items.is_null() && crate::gc_hook::try_gc_owns_object(items as crate::gc_hook::GCREF) {
+        crate::gc_hook::try_gc_write_barrier(items as crate::gc_hook::GCREF);
     }
 }
 
@@ -2573,7 +2574,7 @@ unsafe fn publish_discard_if_live_box(obj: PyObjectRef, items: *mut SetItemsStor
 /// `setobject.py`).
 #[inline]
 fn set_items_write_barrier(items: *mut SetItemsStorage) {
-    crate::gc_hook::try_gc_write_barrier(items as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(items as crate::gc_hook::GCREF);
 }
 
 /// Process-wide source of [`W_SetObject::set_id`].
@@ -2932,11 +2933,11 @@ static STRATEGY_RESULT_ERR_CHANGED_SIZE: StrategyResultShell = StrategyResultShe
     payload: 1,
 };
 
-fn strategy_result_ptr<T>(shell: &'static T) -> *mut u8 {
-    std::ptr::from_ref(shell) as *mut u8
+fn strategy_result_ptr<T>(shell: &'static T) -> crate::gc_hook::GCREF {
+    std::ptr::from_ref(shell) as crate::gc_hook::GCREF
 }
 
-fn set_strategy_add_shell(result: Result<(), SetUpdateError>) -> *mut u8 {
+fn set_strategy_add_shell(result: Result<(), SetUpdateError>) -> crate::gc_hook::GCREF {
     let shell = match result {
         Ok(()) => &STRATEGY_RESULT_OK_ZERO,
         Err(SetUpdateError::Key(_)) => &STRATEGY_RESULT_ERR_KEY,
@@ -2945,7 +2946,9 @@ fn set_strategy_add_shell(result: Result<(), SetUpdateError>) -> *mut u8 {
     strategy_result_ptr(shell)
 }
 
-fn set_strategy_bool_shell(result: Result<bool, crate::dictmultiobject::DictKeyError>) -> *mut u8 {
+fn set_strategy_bool_shell(
+    result: Result<bool, crate::dictmultiobject::DictKeyError>,
+) -> crate::gc_hook::GCREF {
     match result {
         Ok(true) => strategy_result_ptr(&STRATEGY_RESULT_OK_TRUE),
         Ok(false) => strategy_result_ptr(&STRATEGY_RESULT_OK_ZERO),
@@ -2960,11 +2963,14 @@ fn set_strategy_bool_shell(result: Result<bool, crate::dictmultiobject::DictKeyE
 /// method is `fn(&self, PyObjectRef, ObjectKey)` — hash and obj in registers —
 /// so calling that pointer with the two residual words reads the key pointer
 /// as the set. This trampoline is the operation the trace recorded.
+///
+/// The method returns a `Result` ADT (`setobject.py SetStrategy.add`); the
+/// interned shell is that residual word, `llmemory.GCREF`.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_add_key_ptr(
     w_set: PyObjectRef,
     key: *const crate::dictmultiobject::ObjectKey,
-) -> *mut u8 {
+) -> crate::gc_hook::GCREF {
     let key = unsafe { std::ptr::read(key) };
     let result = unsafe { (*(w_set as *const W_SetObject)).strategy.add(w_set, key) };
     set_strategy_add_shell(result)
@@ -2976,7 +2982,7 @@ pub extern "C" fn set_strategy_add_key_ptr(
 pub extern "C" fn set_strategy_remove_key_ptr(
     w_set: PyObjectRef,
     key: *const crate::dictmultiobject::ObjectKey,
-) -> *mut u8 {
+) -> crate::gc_hook::GCREF {
     let key = unsafe { std::ptr::read(key) };
     let result = unsafe { (*(w_set as *const W_SetObject)).strategy.remove(w_set, key) };
     set_strategy_bool_shell(result)
@@ -2988,7 +2994,7 @@ pub extern "C" fn set_strategy_remove_key_ptr(
 pub extern "C" fn set_strategy_has_key_ptr(
     w_set: PyObjectRef,
     key: *const crate::dictmultiobject::ObjectKey,
-) -> *mut u8 {
+) -> crate::gc_hook::GCREF {
     let key = unsafe { std::ptr::read(key) };
     let result = unsafe {
         (*(w_set as *const W_SetObject))
@@ -3890,7 +3896,7 @@ impl SetStrategy for EmptySetStrategy {
     }
 
     /// `EmptySetStrategy.get_empty_storage` — `erase(None)`.
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> GCREF {
         std::ptr::null_mut()
     }
 
@@ -4045,9 +4051,9 @@ impl SetStrategy for ObjectSetStrategy {
     }
 
     /// `ObjectSetStrategy.get_empty_storage` — `erase(newset)`.
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> GCREF {
         crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id())
-            as *mut u8
+            as GCREF
     }
 
     unsafe fn length(&self, w_set: PyObjectRef) -> usize {
@@ -4160,7 +4166,7 @@ impl SetStrategy for ObjectSetStrategy {
             let d = &mut *(dst as *mut W_SetObject);
             // Box first, then the kind, so the word is never Object over null.
             d.sstorage =
-                crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id()) as *mut u8;
+                crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id()) as GCREF;
             d.strategy = &OBJECT_SET_STRATEGY_REF;
             d.set_len_relaxed((*object_set_storage_ptr(d)).len());
             d.hash = -1;
@@ -4333,7 +4339,7 @@ fn ascii_storage_from_unwrapped_iff(
 /// `get_empty_dict` then insert. `gc_alloc_storage_box` first so the
 /// rdict is a GC object before the loop.
 #[majit_macros::look_inside_iff(int_storage_from_unwrapped_iff)]
-fn int_storage_from_unwrapped(items: &[i64]) -> (*mut u8, usize) {
+fn int_storage_from_unwrapped(items: &[i64]) -> (GCREF, usize) {
     let _roots = crate::gc_roots::push_roots();
     let storage =
         crate::gc_storage::gc_alloc_storage_box(IntSetStorage::new(), int_set_storage_gc_type_id());
@@ -4345,7 +4351,7 @@ fn int_storage_from_unwrapped(items: &[i64]) -> (*mut u8, usize) {
         dict.reload_indexes_root(idx_slot);
     }
     let len = dict.len();
-    (storage as *mut u8, len)
+    (storage as GCREF, len)
 }
 
 /// `get_storage_from_unwrapped_list` for `bytes` blocks. The key is the
@@ -4353,9 +4359,7 @@ fn int_storage_from_unwrapped(items: &[i64]) -> (*mut u8, usize) {
 ///
 /// `get_empty_dict` then insert through `gc_alloc_storage_box`.
 #[majit_macros::look_inside_iff(bytes_storage_from_unwrapped_iff)]
-fn bytes_storage_from_unwrapped(
-    items: &[*const crate::bytesobject::BytesBlock],
-) -> (*mut u8, usize) {
+fn bytes_storage_from_unwrapped(items: &[*const crate::bytesobject::BytesBlock]) -> (GCREF, usize) {
     let _roots = crate::gc_roots::push_roots();
     let base = crate::gc_roots::shadow_stack_len();
     for &item in items {
@@ -4375,7 +4379,7 @@ fn bytes_storage_from_unwrapped(
         dict.reload_indexes_root(idx_slot);
     }
     let len = dict.len();
-    (storage as *mut u8, len)
+    (storage as GCREF, len)
 }
 
 /// `get_storage_from_unwrapped_list` for ASCII rstrs.
@@ -4387,7 +4391,7 @@ fn bytes_storage_from_unwrapped(
 #[majit_macros::look_inside_iff(ascii_storage_from_unwrapped_iff)]
 fn ascii_storage_from_unwrapped(
     items: &[*const crate::unicodeobject::UnicodeValueStorage],
-) -> (*mut u8, usize) {
+) -> (GCREF, usize) {
     let _roots = crate::gc_roots::push_roots();
     let mut published = Vec::with_capacity(items.len());
     for &item in items {
@@ -4409,7 +4413,7 @@ fn ascii_storage_from_unwrapped(
         dict.reload_indexes_root(idx_slot);
     }
     let len = dict.len();
-    (storage as *mut u8, len)
+    (storage as GCREF, len)
 }
 
 /// Publish unwrapped storage. `sstorage` lands before the strategy, the
@@ -4421,7 +4425,7 @@ fn ascii_storage_from_unwrapped(
 /// `storage` must be the box for `strategy_ref`.
 unsafe fn publish_set_listview_storage(
     obj: PyObjectRef,
-    storage: *mut u8,
+    storage: GCREF,
     strategy_ref: &'static SetStrategyRef,
     len: usize,
 ) {
@@ -4453,7 +4457,7 @@ pub unsafe fn w_set_install_int_items(obj: PyObjectRef, items: &[i64]) {
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let _guard = w_set_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
+    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as GCREF;
     publish_set_listview_storage(obj, storage, &INTEGER_SET_STRATEGY_REF, len);
 }
 
@@ -4475,7 +4479,7 @@ pub unsafe fn w_set_install_bytes_items(
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let _guard = w_set_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
+    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as GCREF;
     publish_set_listview_storage(obj, storage, &BYTES_SET_STRATEGY_REF, len);
 }
 
@@ -4512,7 +4516,7 @@ pub unsafe fn w_set_install_ascii_items(
     let obj = crate::gc_roots::shadow_stack_get(base);
     let _guard = w_set_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(base);
-    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
+    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as GCREF;
     publish_set_listview_storage(obj, storage, &ASCII_SET_STRATEGY_REF, len);
 }
 
@@ -4768,7 +4772,7 @@ mod tests {
     use crate::dictmultiobject::DictKeyError;
     use crate::intobject::w_int_new;
 
-    fn shell_words(ptr: *mut u8) -> (i64, i64) {
+    fn shell_words(ptr: crate::gc_hook::GCREF) -> (i64, i64) {
         unsafe {
             let base = ptr as *const i64;
             (*base, *base.add(1))

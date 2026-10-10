@@ -806,7 +806,9 @@ impl RootedOnceRef {
         {
             return true;
         }
-        let ok = unsafe { crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8) };
+        let ok = unsafe {
+            crate::gc_hook::try_gc_add_root(self.slot.get() as *mut crate::gc_hook::GCREF)
+        };
         if !ok {
             self.registered
                 .store(false, std::sync::atomic::Ordering::Release);

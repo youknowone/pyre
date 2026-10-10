@@ -698,7 +698,9 @@ impl W_BufferedReader {
         // asks, which is every use, so construction owes no `lseek`.
         self.abs_pos = -1;
         self.state = STATE_OK;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(())
     }
 
@@ -986,7 +988,9 @@ impl W_BufferedReader {
             return Err(error);
         }
         self.buffer = PY_NULL;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         // `close_w`, on the line after `self.buffer = None`: the object is
         // closed, so `iobase_del` has nothing left to do for it.
         super::maybe_unregister_rpython_finalizer_io(self.self_obj());
@@ -1000,7 +1004,9 @@ impl W_BufferedReader {
         self.w_raw = PY_NULL;
         self.buffer = PY_NULL;
         self.state = STATE_DETACHED;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(raw)
     }
 

@@ -68,7 +68,7 @@ pub fn new_lib(
     lib.w_ffi = roots.get(ffi_slot);
     lib.dict_w = roots.get(dict_slot);
     lib.w_libname = roots.get(name_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     Ok(obj)
 }
 
@@ -132,7 +132,7 @@ pub fn make_includes_from(
     }
     ffi_of(lib_arg(roots.get(lib_slot))?)?.included_ffis_libs = roots.get(includes_slot);
     pyre_object::gc_hook::try_gc_write_barrier_managed(
-        lib_arg(roots.get(lib_slot))?.w_ffi.cast::<u8>(),
+        lib_arg(roots.get(lib_slot))?.w_ffi as pyre_object::gc_hook::GCREF,
     );
     Ok(())
 }

@@ -440,9 +440,9 @@ impl<K, V, S> RDict<K, V, S> {
     #[inline]
     fn barrier_entries(&self) {
         if !self.entries.is_null() {
-            crate::gc_hook::try_gc_write_barrier(self.entries as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(self.entries as crate::gc_hook::GCREF);
         }
-        crate::gc_hook::try_gc_write_barrier(self as *const Self as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(self as *const Self as crate::gc_hook::GCREF);
     }
 
     /// `framework.py` `push_roots` around `_ll_malloc_entries`: the table
@@ -462,7 +462,7 @@ impl<K, V, S> RDict<K, V, S> {
     #[inline]
     pub(crate) fn pin_table_and_entries(&self) {
         self.barrier_entries();
-        let table = self as *const Self as *mut u8;
+        let table = self as *const Self as crate::gc_hook::GCREF;
         if crate::gc_hook::try_gc_owns_object(table) {
             let _ = crate::gc_roots::pin_root(table as crate::PyObjectRef);
         }
@@ -533,29 +533,29 @@ impl<K, V, S> RDict<K, V, S> {
     /// stack temporary or a pre-hook `malloc_raw` box.
     #[inline]
     fn barrier_self(&self) {
-        crate::gc_hook::try_gc_write_barrier(self as *const Self as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(self as *const Self as crate::gc_hook::GCREF);
     }
 
     /// The `entries` field slot, one GcRef (`d.entries`).
     #[inline]
-    pub fn entries_slot(&mut self) -> *mut *mut u8 {
-        &raw mut self.entries as *mut *mut u8
+    pub fn entries_slot(&mut self) -> *mut crate::gc_hook::GCREF {
+        &raw mut self.entries as *mut crate::gc_hook::GCREF
     }
 
     /// The `indexes` field slot, one GcRef (`d.indexes`).
     #[inline]
-    pub fn indexes_slot(&mut self) -> *mut *mut u8 {
-        &raw mut self.indexes as *mut *mut u8
+    pub fn indexes_slot(&mut self) -> *mut crate::gc_hook::GCREF {
+        &raw mut self.indexes as *mut crate::gc_hook::GCREF
     }
 
     /// Forward `d.indexes` when the collector owns the block. The words are
     /// probe slots, not GC pointers, so marking the array is the whole visit.
     /// Null (no table yet) and the std-alloc fallback are not slots.
-    pub fn visit_indexes(&mut self, visitor: &mut dyn FnMut(*mut *mut u8)) {
+    pub fn visit_indexes(&mut self, visitor: &mut dyn FnMut(*mut crate::gc_hook::GCREF)) {
         if self.indexes.is_null() {
             return;
         }
-        if crate::gc_hook::try_gc_owns_object(self.indexes as *mut u8) {
+        if crate::gc_hook::try_gc_owns_object(self.indexes as crate::gc_hook::GCREF) {
             visitor(self.indexes_slot());
         }
     }
@@ -1144,6 +1144,7 @@ where
     unsafe {
         ll_arraycopy(d.entries, newitems, 0, 0, d.allocated_len());
     }
+
     d.barrier_self();
     d.entries = newitems;
     d.generation = d.generation.wrapping_add(1);
@@ -1495,7 +1496,7 @@ where
                 continue;
             }
             if !newitems.is_null() {
-                crate::gc_hook::try_gc_write_barrier(newitems as *mut u8);
+                crate::gc_hook::try_gc_write_barrier(newitems as crate::gc_hook::GCREF);
             }
             unsafe {
                 std::ptr::write(dst_base.add(idst), src);
@@ -1512,7 +1513,7 @@ where
             };
             while idst < isrclimit {
                 if !newitems.is_null() {
-                    crate::gc_hook::try_gc_write_barrier(newitems as *mut u8);
+                    crate::gc_hook::try_gc_write_barrier(newitems as crate::gc_hook::GCREF);
                 }
                 unsafe {
                     std::ptr::write(dst_base.add(idst), dead);
@@ -1520,7 +1521,7 @@ where
                 idst += 1;
             }
         } else {
-            crate::gc_hook::try_gc_write_barrier_managed(newitems as *mut u8);
+            crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
             self.barrier_self();
             self.entries = newitems;
         }
@@ -1921,6 +1922,7 @@ where
             DICT_INITSIZE
         };
         dst.reindex(index_size);
+
         dst
     }
 
@@ -1973,6 +1975,7 @@ where
             DICT_INITSIZE
         };
         dst.reindex(index_size);
+
         dst
     }
 
@@ -1992,6 +1995,7 @@ where
             unsafe {
                 ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
             }
+
             self.barrier_self();
             self.entries = newitems;
             self.generation = self.generation.wrapping_add(1);
@@ -2086,6 +2090,7 @@ where
             unsafe {
                 ll_arraycopy(self.entries, entries, 0, 0, self.num_ever_used_items);
             }
+
             entries
         };
         Self {

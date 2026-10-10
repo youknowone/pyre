@@ -234,7 +234,7 @@ pub mod rbuilder_runtime {
     #[inline]
     fn barrier_gc_fields(obj: i64) {
         if obj != 0 {
-            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         }
     }
 

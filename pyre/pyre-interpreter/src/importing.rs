@@ -1662,7 +1662,7 @@ unsafe fn untraced_mixed_module_function(value: PyObjectRef) -> bool {
     } else {
         unsafe { py_type_check(value, &crate::function::BUILTIN_FUNCTION_TYPE) }
     };
-    carrier && !pyre_object::gc_hook::try_gc_owns_object(value as *mut u8)
+    carrier && !pyre_object::gc_hook::try_gc_owns_object(value as pyre_object::gc_hook::GCREF)
 }
 
 /// `baseobjspace.py getbuiltinmodule`.

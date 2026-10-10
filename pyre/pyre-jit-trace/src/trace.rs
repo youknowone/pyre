@@ -14,13 +14,13 @@ use pyre_interpreter::{locals_w, locals_w_mut};
 use crate::state::{PyreMeta, PyreSym, WalkSym};
 
 struct ObjectSlotRoot {
-    slot: *mut *mut u8,
+    slot: *mut pyre_object::gc_hook::GCREF,
     registered: bool,
 }
 
 impl ObjectSlotRoot {
     fn new(value: &mut pyre_object::PyObjectRef) -> Self {
-        let slot = value as *mut pyre_object::PyObjectRef as *mut *mut u8;
+        let slot = value as *mut pyre_object::PyObjectRef as *mut pyre_object::gc_hook::GCREF;
         let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
         Self { slot, registered }
     }
@@ -38,14 +38,14 @@ impl Drop for ObjectSlotRoot {
 /// lifetime.  The `Vec` must not be resized while this is alive: the roots are
 /// the element addresses, and a realloc would move them.
 struct ObjectVecRoot {
-    slots: Vec<*mut *mut u8>,
+    slots: Vec<*mut pyre_object::gc_hook::GCREF>,
 }
 
 impl ObjectVecRoot {
     fn new(values: &mut [pyre_object::PyObjectRef]) -> Self {
         let mut slots = Vec::with_capacity(values.len());
         for value in values.iter_mut() {
-            let slot = value as *mut pyre_object::PyObjectRef as *mut *mut u8;
+            let slot = value as *mut pyre_object::PyObjectRef as *mut pyre_object::gc_hook::GCREF;
             if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
                 slots.push(slot);
             }
@@ -3821,8 +3821,8 @@ fn try_adopt_multi_frame_blackhole(
         // `enter` stores into a frame whose allocation barrier is still in
         // effect; these frames were built many collections ago, so each
         // store needs its own remembered-set entry.
-        if pyre_object::gc_hook::try_gc_owns_object(callee as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(callee as *mut u8);
+        if pyre_object::gc_hook::try_gc_owns_object(callee as pyre_object::gc_hook::GCREF) {
+            pyre_object::gc_hook::try_gc_write_barrier(callee as pyre_object::gc_hook::GCREF);
         }
     };
     let mut saved_links: Vec<(

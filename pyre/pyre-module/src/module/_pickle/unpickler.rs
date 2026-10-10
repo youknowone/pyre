@@ -262,7 +262,7 @@ impl W_Unpickler {
         current.w_persistent_load = pyre_object::PY_NULL;
         pyre_object::gc_hook::try_gc_write_barrier(pyre_object::gc_roots::shadow_stack_get(
             self_slot,
-        ) as *mut u8);
+        ) as pyre_object::gc_hook::GCREF);
         Ok(())
     }
 
@@ -304,7 +304,7 @@ impl W_Unpickler {
             current.w_file_read = pyre_object::gc_roots::shadow_stack_get(read_slot);
             current.w_file_readline = pyre_object::gc_roots::shadow_stack_get(readline_slot);
             pyre_object::gc_hook::try_gc_write_barrier(
-                pyre_object::gc_roots::shadow_stack_get(slot) as *mut u8,
+                pyre_object::gc_roots::shadow_stack_get(slot) as pyre_object::gc_hook::GCREF,
             );
         }
 
@@ -693,7 +693,7 @@ fn cur(slot: usize) -> &'static mut W_Unpickler {
 /// over.
 #[inline]
 fn unpickler_write_barrier(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
 }
 
 // ── stack / metastack helpers ────────────────────────────────────────

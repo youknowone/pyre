@@ -124,7 +124,9 @@ impl W_BufferedRWPair {
         )?;
         self.w_reader = pyre_object::gc_roots::shadow_stack_get(reader_slot);
         self.w_writer = writer;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(())
     }
 

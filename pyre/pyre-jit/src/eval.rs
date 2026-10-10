@@ -71,10 +71,9 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
 }
 
 /// Bridge pyre-object's `GcAllocHookFn` to `majit_gc::alloc_nursery_typed`.
-/// pyre-object deliberately carries no majit-gc dep, so pyre-jit owns
-/// the `GcRef` → `*mut u8` conversion.
-fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
-    majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
+/// pyre-jit owns the `GcRef` → `GCREF` conversion.
+fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> majit_gc::GCREF {
+    majit_gc::alloc_nursery_typed(type_id, size).0 as majit_gc::GCREF
 }
 
 /// Placement-reporting companion of [`pyre_object_gc_alloc_trampoline`].
@@ -86,9 +85,9 @@ unsafe fn pyre_object_gc_alloc_with_placement_trampoline(
     type_id: u32,
     size: usize,
     needs_write_barrier: *mut bool,
-) -> *mut u8 {
+) -> majit_gc::GCREF {
     unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size, needs_write_barrier) }.0
-        as *mut u8
+        as majit_gc::GCREF
 }
 
 /// Trampoline for stable-address host-side allocations.
@@ -96,14 +95,14 @@ unsafe fn pyre_object_gc_alloc_with_placement_trampoline(
 /// `alloc_oldgen_typed`. MiniMark's old-gen is mark-sweep
 /// (non-moving), so the returned pointer is safe to hold on the Rust
 /// stack across subsequent allocations.
-fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 {
-    majit_gc::alloc_oldgen_typed(type_id, size).0 as *mut u8
+fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> majit_gc::GCREF {
+    majit_gc::alloc_oldgen_typed(type_id, size).0 as majit_gc::GCREF
 }
 
 /// Trampoline for young non-moving host-side allocations —
 /// `external_malloc(..., alloc_young=True)` on the active backend's GC.
-fn pyre_object_gc_alloc_young_nonmoving_trampoline(type_id: u32, size: usize) -> *mut u8 {
-    majit_gc::alloc_young_nonmoving_typed(type_id, size).0 as *mut u8
+fn pyre_object_gc_alloc_young_nonmoving_trampoline(type_id: u32, size: usize) -> majit_gc::GCREF {
+    majit_gc::alloc_young_nonmoving_typed(type_id, size).0 as majit_gc::GCREF
 }
 
 /// Trampoline for young non-moving host-side allocations that must not
@@ -112,8 +111,8 @@ fn pyre_object_gc_alloc_young_nonmoving_trampoline(type_id: u32, size: usize) ->
 fn pyre_object_gc_alloc_young_nonmoving_no_collect_trampoline(
     type_id: u32,
     size: usize,
-) -> *mut u8 {
-    majit_gc::alloc_young_nonmoving_typed_no_collect(type_id, size).0 as *mut u8
+) -> majit_gc::GCREF {
+    majit_gc::alloc_young_nonmoving_typed_no_collect(type_id, size).0 as majit_gc::GCREF
 }
 
 /// Trampoline for *collecting* nursery host-side allocations — routes
@@ -121,8 +120,8 @@ fn pyre_object_gc_alloc_young_nonmoving_no_collect_trampoline(
 /// allocator (minor-on-full). Only the elidable bigint payload helpers use it,
 /// from a gcmap-carrying residual call holding no unrooted pointer across the
 /// allocation, so the embedded minor cycle is safe.
-fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> *mut u8 {
-    majit_gc::alloc_nursery_collecting_typed(type_id, size).0 as *mut u8
+fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> majit_gc::GCREF {
+    majit_gc::alloc_nursery_collecting_typed(type_id, size).0 as majit_gc::GCREF
 }
 
 /// Rooted collecting allocation trampoline. Unlike registering the slot around
@@ -135,9 +134,9 @@ fn pyre_object_gc_alloc_collecting_trampoline(type_id: u32, size: usize) -> *mut
 unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
     type_id: u32,
     size: usize,
-    root: *mut *mut u8,
+    root: *mut majit_gc::GCREF,
     needs_write_barrier: *mut bool,
-) -> *mut u8 {
+) -> majit_gc::GCREF {
     unsafe {
         majit_gc::alloc_nursery_collecting_typed_rooted(
             type_id,
@@ -145,7 +144,7 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
             root as *mut majit_ir::GcRef,
             needs_write_barrier,
         )
-        .0 as *mut u8
+        .0 as majit_gc::GCREF
     }
 }
 
@@ -220,8 +219,7 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
 }
 
 /// Trampoline: register a caller-owned slot as
-/// a GC root with the active backend. Bridges `*mut *mut u8` (the
-/// pyre-object-facing shape that does not depend on majit-gc) to
+/// a GC root with the active backend. Bridges `*mut GCREF` to
 /// `*mut GcRef` expected by `majit_gc::gc_add_root`. `GcRef` is
 /// `#[repr(transparent)]` over `usize`, so the pointer-pointer and
 /// `*mut GcRef` share representation.
@@ -230,12 +228,12 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
 /// Caller must keep `slot` valid until
 /// [`pyre_object_gc_remove_root_trampoline`] is called with the same
 /// pointer.
-unsafe fn pyre_object_gc_add_root_trampoline(slot: *mut *mut u8) -> bool {
+unsafe fn pyre_object_gc_add_root_trampoline(slot: *mut majit_gc::GCREF) -> bool {
     unsafe { majit_gc::gc_add_root(slot as *mut majit_ir::GcRef) }
 }
 
 /// Companion to [`pyre_object_gc_add_root_trampoline`].
-fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
+fn pyre_object_gc_remove_root_trampoline(slot: *mut majit_gc::GCREF) {
     majit_gc::gc_remove_root(slot as *mut majit_ir::GcRef);
 }
 
@@ -440,15 +438,15 @@ fn release_green_ref(handle: usize) {
     majit_gc::shadow_stack::release_owner_root(handle);
 }
 
-fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
+fn pyre_object_gc_write_barrier_trampoline(obj: majit_gc::GCREF) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
-fn pyre_object_gc_write_barrier_before_move_trampoline(obj: *mut u8) {
+fn pyre_object_gc_write_barrier_before_move_trampoline(obj: majit_gc::GCREF) {
     majit_gc::gc_write_barrier_before_move(majit_ir::GcRef(obj as usize));
 }
 
-fn pyre_object_gc_write_barrier_managed_trampoline(obj: *mut u8) {
+fn pyre_object_gc_write_barrier_managed_trampoline(obj: majit_gc::GCREF) {
     majit_gc::gc_write_barrier_managed(majit_ir::GcRef(obj as usize));
 }
 
@@ -563,17 +561,21 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // the box, and the box tid's drop glue reclaims the buffer on sweep. An
     // immortal type's `malloc_raw` name is not collector-owned, so the guard
     // skips it.
-    if !t.name.is_null() && pyre_object::gc_hook::try_gc_owns_object(t.name as *mut u8) {
+    if !t.name.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(t.name as pyre_object::gc_hook::GCREF)
+    {
         let name_slot = std::ptr::addr_of_mut!(t.name);
         f(name_slot as *mut majit_ir::GcRef);
     }
     // `qualname` has the same ownership and storage shape as `name`.
-    if !t.qualname.is_null() && pyre_object::gc_hook::try_gc_owns_object(t.qualname as *mut u8) {
+    if !t.qualname.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(t.qualname as pyre_object::gc_hook::GCREF)
+    {
         let qualname_slot = std::ptr::addr_of_mut!(t.qualname);
         f(qualname_slot as *mut majit_ir::GcRef);
     }
     if !t.mro_w.is_null() {
-        if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as pyre_object::gc_hook::GCREF) {
             // GC-owned type-9 block: forward the `mro_w` field slot; the
             // varsize walker forwards items[0..len]. Forwarding each element
             // instead would mark the elements but leave the block itself
@@ -596,7 +598,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
         }
     }
-    f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(std::ptr::from_mut(&mut t.dict).cast());
 }
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
@@ -711,13 +713,15 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     };
     if !gen_obj.frame_ptr.is_null() {
         let frame = gen_obj.frame_ptr as *mut PyFrame;
-        if pyre_object::gc_hook::try_gc_owns_object(gen_obj.frame_ptr) {
+        if pyre_object::gc_hook::try_gc_owns_object(
+            gen_obj.frame_ptr as pyre_object::gc_hook::GCREF,
+        ) {
             // GC-managed suspended frame: forward the `frame_ptr` slot as a
             // managed edge so mark greys the frame block, and its own
             // `pyframe_object_custom_trace` recursively forwards the
             // locals/cells/valuestack — keeping both the block and its
             // contents live without sweeping the frame the generator holds.
-            f(&mut gen_obj.frame_ptr as *mut *mut u8 as *mut majit_ir::GcRef);
+            f(std::ptr::from_mut(&mut gen_obj.frame_ptr).cast());
             // CPython 3.11+ exposes the interpreter frame's live values as
             // direct coroutine/generator referents while the internal frame
             // itself is absent from `gc.get_objects()`.  Re-read after the
@@ -795,7 +799,9 @@ unsafe fn pytraceback_object_custom_trace(
     f(&mut tb.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_next as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut tb.w_code as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if !tb.frame.is_null() && pyre_object::gc_hook::try_gc_owns_object(tb.frame as *mut u8) {
+    if !tb.frame.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(tb.frame as pyre_object::gc_hook::GCREF)
+    {
         f(&mut tb.frame as *mut *mut pyre_interpreter::pyframe::PyFrame as *mut majit_ir::GcRef);
     }
 }
@@ -819,13 +825,18 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map
         && strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Class
     {
-        if !dict.dstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(dict.dstorage) {
+        if !dict.dstorage.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(
+                dict.dstorage as pyre_object::gc_hook::GCREF,
+            )
+        {
             let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
             f(dstorage_slot as *mut majit_ir::GcRef);
         }
     }
-    // Strategy-side dispatch — `W_DictObject.dstorage: *mut u8` erases
-    // the storage layout, so each strategy walks its own native shape
+    // Strategy-side dispatch — `W_DictObject.dstorage` is GCREF
+    // (`llmemory.GCREF`) and erases the storage layout, so each strategy
+    // walks its own native shape
     // through `DictStrategy::walk_gc_refs` (`dictmultiobject.rs`).  PyPy's
     // counterpart is the per-`rerased`-pair GC trace fn generated from
     // `new_erasing_pair("name")` at translation time
@@ -971,7 +982,9 @@ unsafe fn identity_set_storage_custom_trace(
 unsafe fn bytes_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let bytes = unsafe { &mut *(obj_addr as *mut pyre_object::bytesobject::W_BytesObject) };
     f(&mut bytes.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if !bytes.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(bytes.data as *mut u8) {
+    if !bytes.data.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(bytes.data as pyre_object::gc_hook::GCREF)
+    {
         let data_slot = std::ptr::addr_of_mut!(bytes.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
@@ -992,7 +1005,9 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if !ba.data.is_null() && pyre_object::gc_hook::try_gc_owns_object(ba.data as *mut u8) {
+    if !ba.data.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(ba.data as pyre_object::gc_hook::GCREF)
+    {
         let data_slot = std::ptr::addr_of_mut!(ba.data);
         f(data_slot as *mut majit_ir::GcRef);
     }
@@ -1195,14 +1210,15 @@ unsafe fn module_dict_object_custom_trace(
     // minor-GC forward is a no-op.  Guard on GC ownership: a `tid == 0`
     // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
     if pyre_object::dictmultiobject::is_module_dict(obj) {
-        for field in [
-            std::ptr::addr_of_mut!(md.dstorage) as *mut *mut u8,
-            std::ptr::addr_of_mut!(md.mstrategy) as *mut *mut u8,
-        ] {
-            let boxed = *field;
-            if !boxed.is_null() && pyre_object::gc_hook::try_gc_owns_object(boxed) {
-                f(field as *mut majit_ir::GcRef);
-            }
+        let dstorage = std::ptr::addr_of_mut!(md.dstorage);
+        if !(*dstorage).is_null() && pyre_object::gc_hook::try_gc_owns_object(*dstorage) {
+            f(dstorage.cast());
+        }
+        let mstrategy = std::ptr::addr_of_mut!(md.mstrategy);
+        if !(*mstrategy).is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(*mstrategy as pyre_object::gc_hook::GCREF)
+        {
+            f(mstrategy.cast());
         }
         // A module holder owns the concrete ModuleDictStrategy.  Forward the
         // actual owner slot after forwarding `mstrategy`, so the holder and
@@ -1212,10 +1228,14 @@ unsafe fn module_dict_object_custom_trace(
         // slot points at the immutable process-wide ObjectDictStrategy holder;
         // do not manufacture a mutable reference to that static.
         if !md.mstrategy.is_null()
-            && pyre_object::gc_hook::try_gc_owns_object(md.mstrategy as *mut u8)
+            && pyre_object::gc_hook::try_gc_owns_object(md.mstrategy as pyre_object::gc_hook::GCREF)
         {
             let holder = &mut *md.mstrategy;
-            if !holder.owner.is_null() && pyre_object::gc_hook::try_gc_owns_object(holder.owner) {
+            if !holder.owner.is_null()
+                && pyre_object::gc_hook::try_gc_owns_object(
+                    holder.owner as pyre_object::gc_hook::GCREF,
+                )
+            {
                 f(std::ptr::addr_of_mut!(holder.owner) as *mut majit_ir::GcRef);
             }
         }
@@ -1250,7 +1270,9 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // The forward is the erased word, so an int box stays alive the same
     // way an object box does. A no-GC-hook fallback allocation is not
     // collector-owned.
-    if !set.sstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.sstorage) {
+    if !set.sstorage.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(set.sstorage as pyre_object::gc_hook::GCREF)
+    {
         let storage_slot = std::ptr::addr_of_mut!(set.sstorage);
         f(storage_slot as *mut majit_ir::GcRef);
     }
@@ -1282,7 +1304,7 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
     if block.is_null() {
         return;
     }
-    if pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
+    if pyre_object::gc_hook::try_gc_owns_object(block as pyre_object::gc_hook::GCREF) {
         // Forward the `wrappeditems` field slot; the type-9 varsize
         // walker forwards items[0..capacity] (tuples are exact-size).
         let items_slot = unsafe { std::ptr::addr_of_mut!((*tuple_ptr).wrappeditems) };
@@ -1315,12 +1337,14 @@ unsafe fn unicode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     // must not treat as a box, while a managed value box has to be greyed
     // or a later `hash()` reads a swept `Vec` length (`capacity overflow`).
     if !unicode.value.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(unicode.value as *mut u8)
+        && pyre_object::gc_hook::try_gc_owns_object(unicode.value as pyre_object::gc_hook::GCREF)
     {
         f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
     }
     if !unicode.index_storage.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(unicode.index_storage as *mut u8)
+        && pyre_object::gc_hook::try_gc_owns_object(
+            unicode.index_storage as pyre_object::gc_hook::GCREF,
+        )
     {
         f(std::ptr::addr_of_mut!(unicode.index_storage) as *mut majit_ir::GcRef);
     }
@@ -1367,13 +1391,15 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         // the range strategies share their immutable erased tuple. Pyre keeps
         // either state box in the otherwise inactive `items` edge.
         let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
-        if pyre_object::gc_hook::try_gc_owns_object(unsafe { *items_slot } as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(
+            unsafe { *items_slot } as pyre_object::gc_hook::GCREF
+        ) {
             f(items_slot as *mut majit_ir::GcRef);
         }
     } else if list.strategy == pyre_object::listobject::ListStrategy::Object
         && !list.items.is_null()
     {
-        if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(list.items as pyre_object::gc_hook::GCREF) {
             // A GC-managed (moving) block is forwarded by handing the
             // collector the `items` field slot itself; the type-9 varsize walker
             // then forwards items[0..capacity] (spare slots are NULL). This is
@@ -1403,13 +1429,17 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // pointer already says. `list.items` above is guarded the same way.
     let int_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).int_items.block) };
     if !unsafe { *int_block_slot }.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(unsafe { *int_block_slot } as *mut u8)
+        && pyre_object::gc_hook::try_gc_owns_object(
+            unsafe { *int_block_slot } as pyre_object::gc_hook::GCREF
+        )
     {
         f(int_block_slot as *mut majit_ir::GcRef);
     }
     let float_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).float_items.block) };
     if !unsafe { *float_block_slot }.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(unsafe { *float_block_slot } as *mut u8)
+        && pyre_object::gc_hook::try_gc_owns_object(
+            unsafe { *float_block_slot } as pyre_object::gc_hook::GCREF
+        )
     {
         f(float_block_slot as *mut majit_ir::GcRef);
     }
@@ -1419,7 +1449,7 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let bytes_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).bytes_items.block) };
     let bytes_block = unsafe { *bytes_block_slot };
     if !bytes_block.is_null() {
-        if pyre_object::gc_hook::try_gc_owns_object(bytes_block as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(bytes_block as pyre_object::gc_hook::GCREF) {
             f(bytes_block_slot as *mut majit_ir::GcRef);
         } else {
             let base = unsafe { pyre_object::object_array::items_block_items_base(bytes_block) };
@@ -1433,7 +1463,7 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let ascii_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).ascii_items.block) };
     let ascii_block = unsafe { *ascii_block_slot };
     if !ascii_block.is_null() {
-        if pyre_object::gc_hook::try_gc_owns_object(ascii_block as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(ascii_block as pyre_object::gc_hook::GCREF) {
             f(ascii_block_slot as *mut majit_ir::GcRef);
         } else {
             let base = unsafe { pyre_object::object_array::items_block_items_base(ascii_block) };
@@ -1654,7 +1684,8 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     // `jitframe_trace`, covers the raw counterpart below, not a GC array.
     let array = frame.locals_cells_stack_w;
     if !array.is_null() {
-        let managed = pyre_object::gc_hook::try_gc_owns_object(array as *mut u8);
+        let managed =
+            pyre_object::gc_hook::try_gc_owns_object(array as pyre_object::gc_hook::GCREF);
         if managed {
             f(
                 &mut frame.locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray
@@ -1720,7 +1751,8 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         // exactly as an ordinary object field is. RPython's precedent for
         // scanning a block in place, jitframe.py `jitframe_trace`, covers
         // the raw counterpart below, not a GC instance.
-        let managed = pyre_object::gc_hook::try_gc_owns_object(debugdata as *mut u8);
+        let managed =
+            pyre_object::gc_hook::try_gc_owns_object(debugdata as pyre_object::gc_hook::GCREF);
         if managed {
             f(
                 &mut frame.debugdata as *mut *mut pyre_interpreter::pyframe::FrameDebugData
@@ -12216,11 +12248,11 @@ fn execute_assembler(
     {
         let f = frame_root.frame() as *mut PyFrame as *mut u8;
         let arr = unsafe { (*(f as *mut PyFrame)).locals_cells_stack_w };
-        if pyre_object::gc_hook::try_gc_owns_object(arr as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(arr as *mut u8);
+        if pyre_object::gc_hook::try_gc_owns_object(arr as pyre_object::gc_hook::GCREF) {
+            pyre_object::gc_hook::try_gc_write_barrier(arr as pyre_object::gc_hook::GCREF);
         }
-        if pyre_object::gc_hook::try_gc_owns_object(f) {
-            pyre_object::gc_hook::try_gc_write_barrier(f);
+        if pyre_object::gc_hook::try_gc_owns_object(f as pyre_object::gc_hook::GCREF) {
+            pyre_object::gc_hook::try_gc_write_barrier(f as pyre_object::gc_hook::GCREF);
         }
     }
 
@@ -15593,7 +15625,7 @@ pub(crate) struct PyreBlackholeAllocator;
 /// — and the next minor collection reclaims the value while the container still
 /// points at it.
 fn write_barrier_after_ref_store(container: i64) {
-    let container = container as *mut u8;
+    let container = container as pyre_object::gc_hook::GCREF;
     if pyre_object::gc_hook::try_gc_owns_object(container) {
         pyre_object::gc_hook::try_gc_write_barrier(container);
     }

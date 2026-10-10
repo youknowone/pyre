@@ -514,7 +514,7 @@ impl W_Profiler {
 
     fn write_barrier(&self) {
         let self_obj = self as *const Self as PyObjectRef;
-        pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF);
     }
 
     fn get_or_make_entry(&mut self, frame: PyObjectRef, make: bool) -> Option<usize> {

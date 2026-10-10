@@ -361,7 +361,9 @@ impl W_RawFuncType {
             W_RawFuncType::from_obj(roots.get(raw_slot))
                 .expect("the rooted raw function keeps its layout")
                 .ctfuncptr = ctfuncptr;
-            pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(raw_slot).cast::<u8>());
+            pyre_object::gc_hook::try_gc_write_barrier_managed(
+                roots.get(raw_slot) as pyre_object::gc_hook::GCREF
+            );
         }
         Ok(W_RawFuncType::from_obj(roots.get(raw_slot))
             .expect("the rooted raw function keeps its layout")
@@ -416,7 +418,9 @@ impl W_RawFuncType {
             raw.nostruct_locs = pyre_object::bytesobject::w_bytes_from_bytes(&locs);
         }
         raw.nostruct_nargs = fargs.len() as i64 - i64::from(locs.first() == Some(&b'R'));
-        pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(raw_slot).cast::<u8>());
+        pyre_object::gc_hook::try_gc_write_barrier_managed(
+            roots.get(raw_slot) as pyre_object::gc_hook::GCREF
+        );
         Ok(())
     }
 
@@ -548,7 +552,7 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
             ct.align = s.alignment as i64;
             ct.lazy_ffi = roots.get(ffi_slot);
             ct.lazy_sindex = sindex as i64;
-            pyre_object::gc_hook::try_gc_write_barrier_managed(x.cast::<u8>());
+            pyre_object::gc_hook::try_gc_write_barrier_managed(x as pyre_object::gc_hook::GCREF);
             lazy = true;
         } else {
             assert!(first_field < 0);
@@ -829,7 +833,9 @@ pub fn do_realize_lazy_struct(w_ctype: PyObjectRef) -> Result<(), PyError> {
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
     ct.lazy_ffi = pyre_object::PY_NULL;
     ct.lazy_sindex = -1;
-    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ctype_slot).cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(ctype_slot) as pyre_object::gc_hook::GCREF
+    );
     Ok(())
 }
 

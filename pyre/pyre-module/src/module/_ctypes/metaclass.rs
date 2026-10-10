@@ -1957,7 +1957,7 @@ fn own_dict_get(cls: PyObjectRef, key: &str) -> Option<PyObjectRef> {
 /// Store a class attribute directly and invalidate the type cache for it.
 fn set_type_attr(cls: PyObjectRef, key: &str, value: PyObjectRef) {
     if pyre_interpreter::type_dict_store(cls, key, value) {
-        pyre_object::gc_hook::try_gc_write_barrier(cls as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(cls as pyre_object::gc_hook::GCREF);
         unsafe { pyre_interpreter::baseobjspace::mutated(cls, key) };
     }
 }
@@ -2106,7 +2106,9 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
             roots.get(cache_slot),
         )
     {
-        pyre_object::gc_hook::try_gc_write_barrier(roots.get(elem_slot) as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            roots.get(elem_slot) as pyre_object::gc_hook::GCREF
+        );
     }
     if let Some(found) = unsafe { pyre_object::w_dict_getitem(roots.get(cache_slot), n as i64) } {
         return Ok(found);

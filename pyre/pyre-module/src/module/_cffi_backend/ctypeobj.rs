@@ -471,7 +471,7 @@ pub fn root_forever(obj: PyObjectRef) {
 /// object's original address.
 pub fn root_forever_slot(obj: PyObjectRef) -> *const usize {
     let mut slot = Box::new(obj as usize);
-    let root_slot = (&raw mut *slot) as *mut *mut u8;
+    let root_slot = (&raw mut *slot) as *mut pyre_object::gc_hook::GCREF;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
     let stable_slot = (&raw const *slot) as *const usize;
     ROOTED_CTYPES

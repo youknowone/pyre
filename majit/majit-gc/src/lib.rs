@@ -1,6 +1,6 @@
 pub use collector::HEAP_DUMP_EIO;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
-pub use header::GcType;
+pub use header::{GCREF, GCREFOpaque, GcType};
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:
@@ -2878,7 +2878,7 @@ pub fn gc_allocator_installed() -> bool {
 ///   missing header lets a type-id witness misread the words before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcAllocOutcome {
-    Allocated(*mut u8),
+    Allocated(GCREF),
     Failed,
     NoRoute,
 }
@@ -2887,7 +2887,7 @@ impl GcAllocOutcome {
     /// Classify a hook result: `None` is [`NoRoute`](Self::NoRoute),
     /// `Some(null)` is [`Failed`](Self::Failed).
     #[inline]
-    pub fn from_hook(result: Option<*mut u8>) -> Self {
+    pub fn from_hook(result: Option<GCREF>) -> Self {
         match result {
             Some(raw) if !raw.is_null() => Self::Allocated(raw),
             Some(_) => Self::Failed,
@@ -2901,7 +2901,7 @@ impl GcAllocOutcome {
     #[inline]
     pub fn classify(raw: GcRef) -> Self {
         if raw.0 != 0 {
-            Self::Allocated(raw.0 as *mut u8)
+            Self::Allocated(raw.0 as GCREF)
         } else if gc_allocator_installed() {
             Self::Failed
         } else {
@@ -2913,7 +2913,7 @@ impl GcAllocOutcome {
     /// caller takes its own non-GC path. A [`Failed`](Self::Failed) does not
     /// return: see [`gc_alloc_failed`].
     #[inline]
-    pub fn allocated_or_abort(self, payload_size: usize) -> Option<*mut u8> {
+    pub fn allocated_or_abort(self, payload_size: usize) -> Option<GCREF> {
         match self {
             Self::Allocated(raw) => Some(raw),
             Self::Failed => gc_alloc_failed(payload_size),

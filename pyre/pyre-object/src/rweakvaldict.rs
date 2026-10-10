@@ -102,7 +102,7 @@ impl WeakDictKey for StrKey {
     }
 }
 
-fn alloc_raw(tid: u32, bytes: usize) -> *mut u8 {
+fn alloc_raw(tid: u32, bytes: usize) -> crate::gc_hook::GCREF {
     if tid != 0 {
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, bytes);
         if !raw.is_null() {
@@ -116,7 +116,7 @@ fn alloc_raw(tid: u32, bytes: usize) -> *mut u8 {
     if raw.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
-    raw
+    raw as crate::gc_hook::GCREF
 }
 
 fn entries_bytes<K>(n: usize) -> usize {
@@ -261,7 +261,7 @@ fn ll_streq(s1: StrKey, s2: StrKey) -> bool {
 /// immortal allocation.
 fn barrier_entries<K>(entries: *mut WeakDictEntries<K>) {
     if !entries.is_null() {
-        crate::gc_hook::try_gc_write_barrier(entries as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(entries as crate::gc_hook::GCREF);
     }
 }
 
@@ -270,7 +270,7 @@ fn barrier_entries<K>(entries: *mut WeakDictEntries<K>) {
 /// and does not scan the new `entries` unless this remembers it.
 fn barrier_dict<K>(d: *mut WeakDict<K>) {
     if !d.is_null() {
-        crate::gc_hook::try_gc_write_barrier(d as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(d as crate::gc_hook::GCREF);
     }
 }
 
@@ -463,7 +463,7 @@ impl<K: WeakDictKey> WeakDict<K> {
                 }
                 let referent =
                     unsafe { crate::weakref::w_weakref_deref((*entry(self.entries, i)).value) };
-                !crate::gc_hook::try_gc_owns_object(referent as *mut u8)
+                !crate::gc_hook::try_gc_owns_object(referent as crate::gc_hook::GCREF)
             })
             .count()
     }

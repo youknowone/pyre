@@ -307,7 +307,9 @@ pub fn new_pointer_type(w_ctitem: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(weak);
     let ctitem = ctypeobj::ctype_arg(roots.get(item_slot))?;
     ctitem.pointer_type = roots.get(weak_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(item_slot).cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(item_slot) as pyre_object::gc_hook::GCREF
+    );
     Ok(roots.get(obj_slot))
 }
 
@@ -380,7 +382,9 @@ pub fn new_array_type(w_ctptr: PyObjectRef, length: i64) -> Result<PyObjectRef, 
     let ctptr = ctypeobj::ctype_arg(roots.get(pointer_slot))?;
     if ctptr.array_types.is_null() {
         ctptr.array_types = pyre_object::dictmultiobject::w_dict_new();
-        pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(pointer_slot).cast::<u8>());
+        pyre_object::gc_hook::try_gc_write_barrier_managed(
+            roots.get(pointer_slot) as pyre_object::gc_hook::GCREF
+        );
     }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem(
@@ -874,7 +878,9 @@ pub fn complete_struct_or_union(
         ct.flags |= ctypeobj::CTypeFlags::WITH_PACKED_CHANGE.bits();
     }
     // The field containers were just stored into the ctype.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ctype_slot).cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(ctype_slot) as pyre_object::gc_hook::GCREF
+    );
     Ok(())
 }
 
@@ -1006,7 +1012,9 @@ pub fn new_enum_type(
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
     ct.enumerators2values = roots.get(e2v_slot);
     ct.enumvalues2erators = roots.get(v2e_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ctype_slot).cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(ctype_slot) as pyre_object::gc_hook::GCREF
+    );
     Ok(roots.get(ctype_slot))
 }
 
@@ -1167,7 +1175,9 @@ pub fn build_function_type(
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
     ct.fargs = roots.get(fargs_tuple_slot);
     ct.abi = abi;
-    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ctype_slot).cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(ctype_slot) as pyre_object::gc_hook::GCREF
+    );
     if !ellipsis {
         // A function taking '...' is stored without a cif at all: its cif is
         // computed per call from the types actually passed.  For every other

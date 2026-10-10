@@ -43,7 +43,7 @@ static ROOTED_SLOTS: parking_lot::Mutex<Vec<Box<usize>>> = parking_lot::Mutex::n
 /// type is born old-gen and does not move.
 fn root_forever(obj: PyObjectRef) {
     let mut slot = Box::new(obj as usize);
-    let root_slot = (&raw mut *slot) as *mut *mut u8;
+    let root_slot = (&raw mut *slot) as *mut pyre_object::gc_hook::GCREF;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
     ROOTED_SLOTS.lock().push(slot);
 }

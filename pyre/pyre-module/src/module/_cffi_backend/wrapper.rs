@@ -77,7 +77,7 @@ pub fn new_function_wrapper(
     wrapper.w_rawfunctype = roots.get(base + 1);
     wrapper.w_fnname = roots.get(base + 2);
     wrapper.w_modulename = roots.get(base + 3);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     Ok(obj)
 }
 

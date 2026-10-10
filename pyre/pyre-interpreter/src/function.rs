@@ -402,7 +402,7 @@ pub type ClassMethod = pyre_object::function::ClassMethod;
 
 #[inline]
 fn function_write_barrier(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     // A Box-immortal function's children are reached only through
     // `walk_raw_function_roots`, which clean minor collections skip;
     // record every field store (gc_roots.rs prebuilt-root tracking).
@@ -1118,7 +1118,7 @@ pub fn classmethod_retag_descriptor(obj: PyObjectRef) {
         return;
     }
     unsafe {
-        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
         (*obj).w_class = w_class;
     }
 }
@@ -2605,14 +2605,15 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_name = name;
         let raw_name = name_utf8_mirror(name);
-        let raw_name = if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
-            pyre_object::gc_storage::gc_alloc_storage_box(
-                raw_name,
-                pyre_object::typeobject::name_storage_gc_type_id(),
-            ) as *const String
-        } else {
-            pyre_object::lltype::malloc_raw(raw_name) as *const String
-        };
+        let raw_name =
+            if pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF) {
+                pyre_object::gc_storage::gc_alloc_storage_box(
+                    raw_name,
+                    pyre_object::typeobject::name_storage_gc_type_id(),
+                ) as *const String
+            } else {
+                pyre_object::lltype::malloc_raw(raw_name) as *const String
+            };
         function_notify_quasi_immut(obj, QuasiImmutSlot::Name);
         (*(obj as *mut Function)).name = raw_name;
     }
@@ -3748,7 +3749,7 @@ static OBJECT_CLASS_METHODS: parking_lot::Mutex<Vec<(&'static str, Box<usize>)>>
 /// step with a moving collection.
 pub fn register_object_class_method(name: &'static str, function: PyObjectRef) {
     let mut slot = Box::new(function as usize);
-    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+    let root_slot = (&mut *slot) as *mut usize as *mut pyre_object::gc_hook::GCREF;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
     OBJECT_CLASS_METHODS.lock().push((name, slot));
 }

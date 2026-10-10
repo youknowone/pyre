@@ -67,7 +67,9 @@ impl W_BytesIO {
         let live = unsafe { crate::builtins::bytearray_check_exports(self.buffer)? };
         if live as usize != current_addr {
             self.buffer = live;
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *mut Self as pyre_object::gc_hook::GCREF,
+            );
         }
         Ok(())
     }
@@ -268,7 +270,9 @@ impl W_BytesIO {
         self.buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
         self.pos = AT_END;
         self.closed = false;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
     }
 }
 
@@ -532,7 +536,9 @@ impl W_BytesIO {
         self.buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
         self.pos = AT_END;
         self.closed = true;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(())
     }
 
