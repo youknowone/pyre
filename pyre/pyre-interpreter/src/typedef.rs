@@ -3847,6 +3847,14 @@ pub fn make_new_descr(
     crate::gateway::make_builtin_function_as_builtin("__new__", func)
 }
 
+/// [`make_new_descr`] carrying `BuiltinCodePassThroughArguments1`.
+pub fn make_new_descr_passthrough1(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    func_args: crate::gateway::BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    crate::gateway::make_builtin_function_as_builtin_passthrough1("__new__", func, func_args)
+}
+
 /// Docstring-carrying [`make_new_descr`].  PyPy's `interp2app` registration
 /// for constructors preserves the gateway function's app-visible `__doc__`;
 /// this explicit literal is the Rust equivalent for a builtin carrier.
@@ -7836,7 +7844,11 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "format",
-            make_builtin_function("format", crate::type_methods::descr_format),
+            crate::gateway::make_builtin_function_passthrough1(
+                "format",
+                crate::type_methods::descr_format,
+                crate::type_methods::descr_format_args,
+            ),
         )
     };
     unsafe {
@@ -8763,9 +8775,11 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", |args| {
-                crate::type_methods::dict_init_or_update(args, "dict")
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__init__",
+                crate::type_methods::dict_descr_init,
+                crate::type_methods::dict_descr_init_args,
+            ),
         )
     };
     unsafe {
@@ -8812,7 +8826,11 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "update",
-            make_builtin_function("update", crate::type_methods::dict_method_update),
+            crate::gateway::make_builtin_function_passthrough1(
+                "update",
+                crate::type_methods::dict_method_update,
+                crate::type_methods::dict_method_update_args,
+            ),
         )
     };
     unsafe {
@@ -13556,6 +13574,27 @@ fn type_weakrefoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(w_int_new(weakref))
 }
 
+fn type_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+    let behind_receiver = positional.len().saturating_sub(1);
+    if behind_receiver != 1 && behind_receiver != 3 {
+        return Err(crate::PyError::type_error(
+            "type.__init__() takes 1 or 3 arguments",
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn type_descr_init_args(_self: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    let behind_receiver = args.arguments_w.len();
+    if behind_receiver != 1 && behind_receiver != 3 {
+        return Err(crate::PyError::type_error(
+            "type.__init__() takes 1 or 3 arguments",
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
 fn init_type_type(ns: PyObjectRef) {
     // `type` carries the weakref capability without publishing a
     // `__weakref__` descriptor: `PyType_Type` sets `tp_weaklistoffset` but its
@@ -13570,7 +13609,10 @@ fn init_type_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(crate::builtins::type_descr_new),
+            make_new_descr_passthrough1(
+                crate::builtins::type_descr_new,
+                crate::builtins::type_descr_new_args,
+            ),
         )
     };
     unsafe {
@@ -13617,16 +13659,11 @@ fn init_type_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", |args| {
-                let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-                let behind_receiver = positional.len().saturating_sub(1);
-                if behind_receiver != 1 && behind_receiver != 3 {
-                    return Err(crate::PyError::type_error(
-                        "type.__init__() takes 1 or 3 arguments",
-                    ));
-                }
-                Ok(pyre_object::w_none())
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__init__",
+                type_descr_init,
+                type_descr_init_args,
+            ),
         )
     };
     // CPython 3.14 typeobject.c slotdefs: type has its own native

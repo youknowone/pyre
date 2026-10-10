@@ -202,7 +202,11 @@ fn sys_namespace_type() -> PyObjectRef {
                 crate::__pyre_put_new!(
                     ns_slot,
                     "__init__",
-                    crate::make_builtin_function("__init__", sys_namespace_init)
+                    crate::gateway::make_builtin_function_passthrough1(
+                        "__init__",
+                        sys_namespace_init,
+                        sys_namespace_init_args,
+                    ),
                 )
             };
         });
@@ -229,6 +233,18 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
         ));
     }
     namespace_apply_kwargs(self_obj, kwargs)
+}
+
+fn sys_namespace_init_args(
+    self_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    if !args.arguments_w.is_empty() {
+        return Err(crate::PyError::type_error(
+            "types.SimpleNamespace() takes no positional arguments",
+        ));
+    }
+    namespace_apply_kwargs(self_obj, crate::builtins::arguments_as_kwargs_dict(args)?)
 }
 
 /// Copy the keyword arguments into a namespace instance's dict, skipping the
@@ -436,6 +452,44 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
     )
 }
 
+fn simple_namespace_init_args(
+    self_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let rest = &args.arguments_w;
+    if rest.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "SimpleNamespace expected at most 1 argument, got {}",
+            rest.len()
+        )));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = _roots.pin_roots(&[self_obj]);
+    let rest_slot = _roots.pin_roots(rest);
+    let kwargs = crate::builtins::arguments_as_kwargs_dict(args)?;
+    let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    if rest.len() == 1 {
+        let temporary = w_dict_new();
+        let _ = pyre_object::gc_roots::pin_root(temporary);
+        let temporary_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        crate::type_methods::dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(temporary_slot),
+            _roots.get(rest_slot),
+        )?;
+        namespace_update_dict(
+            _roots.get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(temporary_slot),
+            false,
+        )?;
+    }
+    let w_kwargs = if kwargs.is_some() {
+        Some(_roots.get(kwargs_slot))
+    } else {
+        None
+    };
+    namespace_apply_kwargs(_roots.get(self_slot), w_kwargs)
+}
+
 fn simple_namespace_method(
     name: &'static str,
     function: fn(&[PyObjectRef]) -> crate::PyResult,
@@ -457,12 +511,14 @@ fn simple_namespace_method(
 fn simple_namespace_variadic_method(
     name: &'static str,
     function: fn(&[PyObjectRef]) -> crate::PyResult,
+    func_args: crate::gateway::BuiltinCodePassThroughFn1,
     doc: &'static str,
     text_signature: &'static str,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    let method = crate::gateway::make_builtin_function_with_doc(name, function, doc);
+    let method =
+        crate::gateway::make_builtin_function_passthrough1_with_doc(name, function, func_args, doc);
     let _ = pyre_object::gc_roots::pin_root(method);
     let signature = w_str_new(text_signature);
     let method = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -557,6 +613,7 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                     simple_namespace_variadic_method(
                         "__init__",
                         simple_namespace_init,
+                        simple_namespace_init_args,
                         "Initialize self.  See help(type(self)) for accurate signature.",
                         "($self, /, *args, **kwargs)",
                     )
@@ -636,6 +693,7 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                     simple_namespace_variadic_method(
                         "__replace__",
                         simple_namespace_replace,
+                        simple_namespace_replace_args,
                         "Return a copy of the namespace object with new values for the specified attributes.",
                         "($self, /, **changes)",
                     )
@@ -827,6 +885,18 @@ fn simple_namespace_reduce(args: &[PyObjectRef]) -> crate::PyResult {
 /// CPython 3.14 `namespace_replace`: construct `type(self)()` first, require
 /// that its actual type remains a SimpleNamespace subtype, copy the source
 /// dict, then overlay keyword changes.
+fn simple_namespace_replace_args(
+    self_obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    if !args.arguments_w.is_empty() {
+        return Err(crate::PyError::type_error(
+            "__replace__() takes no positional arguments",
+        ));
+    }
+    simple_namespace_replace_from(self_obj, crate::builtins::arguments_as_kwargs_dict(args)?)
+}
+
 fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let Some(&self_obj) = positional.first() else {
@@ -839,6 +909,13 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
             "__replace__() takes no positional arguments",
         ));
     }
+    simple_namespace_replace_from(self_obj, kwargs)
+}
+
+fn simple_namespace_replace_from(
+    self_obj: PyObjectRef,
+    kwargs: Option<PyObjectRef>,
+) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let self_obj = pyre_object::gc_roots::pin_root(self_obj);

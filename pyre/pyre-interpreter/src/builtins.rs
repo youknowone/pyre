@@ -3415,9 +3415,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "min", || {
-        make_module_builtin_function_with_doc(
+        crate::gateway::make_module_builtin_function_passthrough0_with_doc(
             "min",
             __majit_wrap_builtin_min,
+            builtin_min_args,
             "min(iterable, *[, default=obj, key=func]) -> value\n\
              min(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
@@ -3428,9 +3429,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "max", || {
-        make_module_builtin_function_with_doc(
+        crate::gateway::make_module_builtin_function_passthrough0_with_doc(
             "max",
             __majit_wrap_builtin_max,
+            builtin_max_args,
             "max(iterable, *[, default=obj, key=func]) -> value\n\
              max(arg1, arg2, *args, *[, key=func]) -> value\n\
              \n\
@@ -5750,6 +5752,26 @@ pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyO
     (args, None)
 }
 
+/// Build a real kwargs dict from `Arguments.keyword_names_w` / `keywords_w`.
+///
+/// Keyword passthrough bodies reuse the existing dict-shaped helpers
+/// (`kwarg_get`, `init_or_update`, format field lookup) without packing
+/// the `__pyre_kw__` marker.
+pub fn arguments_as_kwargs_dict(
+    args: &crate::argument::Arguments,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let dict = pyre_object::dictmultiobject::w_dict_new();
+    for (name, value) in names.iter().zip(values.iter()) {
+        crate::baseobjspace::setitem(dict, *name, *value)?;
+    }
+    Ok(Some(dict))
+}
+
 /// Whether `last` is the trailing keyword dict [`split_builtin_kwargs`]
 /// strips.
 ///
@@ -6571,12 +6593,39 @@ crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_min_target, __majit_wrap
 
 crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_max_target, __majit_wrap_builtin_max);
 
+fn builtin_min_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
+    min_max_from_parts(
+        &args.arguments_w,
+        arguments_as_kwargs_dict(args)?,
+        false,
+        "min",
+    )
+}
+
+fn builtin_max_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
+    min_max_from_parts(
+        &args.arguments_w,
+        arguments_as_kwargs_dict(args)?,
+        true,
+        "max",
+    )
+}
+
 fn min_max_dispatch(
     args: &[PyObjectRef],
     want_max: bool,
     fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
+    min_max_from_parts(positional, kwargs, want_max, fn_name)
+}
+
+fn min_max_from_parts(
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+    want_max: bool,
+    fn_name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
     // `min_max` unpacks its positionals before it looks at the keywords, so a
     // keywords-only call is reported against the missing operand.
     if positional.is_empty() {
@@ -6851,9 +6900,26 @@ pub fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             "type.__new__(): not enough arguments",
         ));
     }
+    type_descr_new_from(pos[0], &pos[1..], kwargs)
+}
 
-    let w_typetype = pos[0];
-    let arguments_w = &pos[1..];
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub fn type_descr_new_args(
+    w_typetype: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    type_descr_new_from(
+        w_typetype,
+        &args.arguments_w,
+        arguments_as_kwargs_dict(args)?,
+    )
+}
+
+fn type_descr_new_from(
+    w_typetype: PyObjectRef,
+    arguments_w: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     // `type_new` is entered only after `tp_new_wrapper` has established that
     // the first argument is a type.  This check therefore precedes parsing
     // `(name, bases, dict)`, regardless of that tuple's arity.
