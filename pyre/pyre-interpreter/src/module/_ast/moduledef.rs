@@ -873,6 +873,9 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
                 if let Some(value) =
                     crate::baseobjspace::finditem(roots.get(dict_slot), roots.get(base + index))?
                 {
+                    // The copied value is pinned only across this `setitem`.
+                    // `payload_slot` stays on `roots`.
+                    let _pyre_store_roots = pyre_object::gc_roots::push_roots();
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = roots.pin_root(value);
                     crate::baseobjspace::setitem(
@@ -1641,13 +1644,19 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
 /// matching CPython where `_ast` types are heap types. Compiler-native Ruff
 /// nodes are converted to instances of these public types by `convert.rs`.
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    // `ast_state` returns `*mut AstState`, not a GCREF. Do not pin `ns`
+    // again while that pointer is the only result: the normalize would be
+    // a safepoint with nothing of the result on the shadow stack.
     let state = pyre_object::with_roots!(ns => ast_state());
     // `module_ns_store` allocates the key, so the entry is read back out of the
     // run on each pass rather than held as a view across the stores.
     let (entries, len) = unsafe { ((*state).entries, (*state).len) };
     for index in 0..len {
         let (name, w_type) = unsafe { *entries.add(index) };
-        crate::module_ns_store(ns, name, w_type);
+        crate::__pyre_put_new!(ns_slot, name, w_type);
     }
 
     // `compile()` / `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
@@ -1663,7 +1672,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // tree necessarily requests an AST result as well.
         ("PyCF_OPTIMIZED_AST", 0x8000 | 0x0400),
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(*value));
     }
     Ok(())
 }

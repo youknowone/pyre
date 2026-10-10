@@ -2569,8 +2569,11 @@ fn except_hook_args_type() -> PyObjectRef {
             let doc_slot = pin_root_slot(doc);
             let ty = pyre_object::gc_roots::shadow_stack_get(ty_slot);
             let ns = pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef;
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
+            ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 "__doc__",
                 pyre_object::gc_roots::shadow_stack_get(doc_slot),
             );
@@ -2996,23 +2999,15 @@ crate::py_module! {
         // name the platform never stored.
         #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
-            crate::module_ns_store(ns, "_NAME_MAXLEN", w_int_new(NAME_MAXLEN as i64));
-            crate::module_ns_store(
-                ns,
-                "_get_name",
-                crate::gateway::with_module(
+            crate::__pyre_store!(ns, "_NAME_MAXLEN", w_int_new(NAME_MAXLEN as i64));
+            crate::__pyre_store!(ns, "_get_name", crate::gateway::with_module(
                     "_thread",
                     crate::py_module_fn!("_get_name", 0, get_thread_name),
-                ),
-            );
-            crate::module_ns_store(
-                ns,
-                "set_name",
-                crate::gateway::with_module(
+                ));
+            crate::__pyre_store!(ns, "set_name", crate::gateway::with_module(
                     "_thread",
                     crate::py_module_fn!("set_name", 1, set_thread_name),
-                ),
-            );
+                ));
         }
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let _ = ns;

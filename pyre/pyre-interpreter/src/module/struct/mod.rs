@@ -1543,14 +1543,34 @@ impl W_Struct {
     /// `_immutable_fields_`).
     fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
-        // The delimiters are constants, so they are interned rather than built
-        // per call: `w_str_new` allocates an immortal header and payload, and
-        // `w_str_concat` reclaims neither of its inputs, so constructing them
-        // here grew the heap on every `repr()`.  The interned objects are
-        // allocated once and rooted by the table.
+        // `ObjSpace.new_interned_str` stores into `interned_strings`, assigned
+        // with `make_weak_value_dictionary`. A weak value does not keep the
+        // string alive for a Rust local, and it does not update that local
+        // when the string moves. Pin the format before the first intern, then
+        // each delimiter before the next allocating call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let format_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.format);
         let left = pyre_object::intern_str_value("Struct('");
+        let left_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(left);
         let right = pyre_object::intern_str_value("')");
-        Ok(unsafe { w_str_concat(w_str_concat(left, self.format), right) })
+        let right_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(right);
+        let inner = unsafe {
+            w_str_concat(
+                pyre_object::gc_roots::shadow_stack_get(left_slot),
+                pyre_object::gc_roots::shadow_stack_get(format_slot),
+            )
+        };
+        let inner_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(inner);
+        Ok(unsafe {
+            w_str_concat(
+                pyre_object::gc_roots::shadow_stack_get(inner_slot),
+                pyre_object::gc_roots::shadow_stack_get(right_slot),
+            )
+        })
     }
 
     /// CPython 3.14 `_struct.c:s_sizeof` — the dynamic instance prefix plus
@@ -1803,15 +1823,18 @@ pub mod unpack_iter {
         let iter_type = type_object();
         TYPE_SETUP.call_once(|| unsafe {
             let ns = pyre_object::w_type_get_dict_ptr(iter_type) as PyObjectRef;
-            pyre_object::w_dict_setitem_str(ns, "__module__", w_str_new("_struct"));
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
+            crate::__pyre_put_new!(ns_slot, "__module__", w_str_new("_struct"));
+            crate::__pyre_put_new!(
+                ns_slot,
                 "__getattribute__",
                 crate::make_builtin_function_with_arity(
                     "__getattribute__",
                     unpack_iter_getattribute,
                     2,
-                ),
+                )
             );
             // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
             // TypeDef shape: the implementation type is returned by `type(it)`
@@ -1824,9 +1847,10 @@ pub mod unpack_iter {
         // PyPy's W_UnpackIter stores the live `self.view` lease on the
         // iterator, never an unrooted caller-local pointer.
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let format = pyre_object::gc_roots::pin_root(format);
-        let buffer = pyre_object::gc_roots::pin_root(buffer);
+        // Both operands already exist. Sequential `pin_root` would normalize
+        // after the format and leave the buffer unpublished
+        // (`RootScope::pin_roots`).
+        let sp = pyre_object::gc_roots::pin_roots(&[format, buffer]);
         let buf = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? };
         if size <= 0 {
             return Err(struct_error(format!(
@@ -1944,15 +1968,15 @@ crate::py_module! {
     extra_init: |ns| {
         // `interp_struct.py Cache` —
         // `space.new_exception_class("struct.error", space.w_Exception)`.
-        let base = crate::builtins::lookup_exc_class("Exception")
+        let mut base = crate::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _struct init");
         let mut ns = ns;
-        let error = pyre_object::with_roots!(ns => crate::builtins::new_exception_class(
+        let error = pyre_object::with_roots!(ns, base => crate::builtins::new_exception_class(
             "struct.error",
             crate::builtins::exc_exception_new,
             base,
         ));
-        crate::module_ns_store(ns, "error", error);
+        crate::__pyre_store!(ns, "error", error);
         // `interp_struct.py pack(w_format, args_w)` and
         // `interp_struct.py pack_into(w_format, w_buffer, offset, args_w)`
         // — `*args`-carrying builtins whose named parameters are all
@@ -1962,10 +1986,7 @@ crate::py_module! {
         // vararg `Signature`.  `has_vararg()` forces `HOPELESS`, routing the
         // positional path through the binder, which packs the excess
         // positionals into the tuple the body reads.
-        crate::module_ns_store(
-            ns,
-            "pack",
-            crate::gateway::with_module(
+        crate::__pyre_store!(ns, "pack", crate::gateway::with_module(
                 "_struct",
                 crate::make_module_builtin_function_with_arity_and_maybe_sig(
                     "pack",
@@ -1973,12 +1994,8 @@ crate::py_module! {
                     crate::HOPELESS,
                     Some(sig_posonly_then_varargs("pack", &["format"], "args")),
                 ),
-            ),
-        );
-        crate::module_ns_store(
-            ns,
-            "pack_into",
-            crate::gateway::with_module(
+            ));
+        crate::__pyre_store!(ns, "pack_into", crate::gateway::with_module(
                 "_struct",
                 crate::make_module_builtin_function_with_arity_and_maybe_sig(
                     "pack_into",
@@ -1990,8 +2007,7 @@ crate::py_module! {
                         "args",
                     )),
                 ),
-            ),
-        );
+            ));
         // `interp_struct.py descr_pack_into(self, w_buffer, offset, args_w)`
         // — the `*args` method form.  The `#[pyre_methods]` arm gives a
         // `&[PyObjectRef]` method a null `Signature` (raw whole-args
@@ -2001,6 +2017,7 @@ crate::py_module! {
         // `interpleveldefs` entry has already built the type.
         let struct_type = type_object();
         let struct_dict = unsafe { pyre_object::w_type_get_dict_ptr(struct_type) } as PyObjectRef;
+        let struct_dict = pyre_object::gc_roots::pin_root(struct_dict);
         unsafe {
             // [3.14-spec] PyPy's `W_Struct.typedef` installs the public
             // `make_weakref_descr(W_Struct)` descriptor, while CPython 3.14's
@@ -2013,20 +2030,20 @@ crate::py_module! {
             // spelling; `W_Struct` carries no JIT or immutability hint over
             // the weakref lifeline.
             pyre_object::w_type_set_weakrefable(struct_type, true);
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                struct_dict,
-                "pack",
-                crate::make_builtin_function("pack", __majit_wrap_struct_pack),
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                struct_dict,
-                "unpack",
-                crate::make_builtin_function("unpack", __majit_wrap_struct_unpack),
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                struct_dict,
-                "pack_into",
-                crate::make_builtin_function_maybe_sig(
+            {
+                let pack = crate::make_builtin_function("pack", __majit_wrap_struct_pack);
+                let pack = pyre_object::gc_roots::pin_root(pack);
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(struct_dict, "pack", pack);
+            }
+            {
+                let unpack = crate::make_builtin_function("unpack", __majit_wrap_struct_unpack);
+                let unpack = pyre_object::gc_roots::pin_root(unpack);
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    struct_dict, "unpack", unpack,
+                );
+            }
+            {
+                let pack_into = crate::make_builtin_function_maybe_sig(
                     "pack_into",
                     struct_pack_into,
                     Some(sig_posonly_then_varargs(
@@ -2034,8 +2051,14 @@ crate::py_module! {
                         &["self", "buffer", "offset"],
                         "args",
                     )),
-                ),
-            );
+                );
+                let pack_into = pyre_object::gc_roots::pin_root(pack_into);
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    struct_dict,
+                    "pack_into",
+                    pack_into,
+                );
+            }
         }
     },
 }
