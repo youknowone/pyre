@@ -900,7 +900,15 @@ fn descr_call_args(
     carrier: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
-    descr_call_method(carrier, &args.arguments_w, arguments_as_kwargs_dict(args)?)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    descr_call_method(
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
+    )
 }
 
 fn descr_call_method(
@@ -921,22 +929,6 @@ fn descr_call_method(
         ));
     };
     call_method_def_in_class(method, w_self, carrier_class(carrier), positional, kwargs)
-}
-
-/// Build a real kwargs dict from `Arguments.keyword_names_w` / `keywords_w`.
-pub(super) fn arguments_as_kwargs_dict(
-    args: &crate::argument::Arguments,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
-    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
-    let values = args.keywords_w.as_deref().unwrap_or(&[]);
-    if names.is_empty() {
-        return Ok(None);
-    }
-    let dict = pyre_object::dictmultiobject::w_dict_new();
-    for (name, value) in names.iter().zip(values.iter()) {
-        crate::baseobjspace::setitem(dict, *name, *value)?;
-    }
-    Ok(Some(dict))
 }
 
 /// Validate one call against its `ml_flags` and hand it to the bridge, naming

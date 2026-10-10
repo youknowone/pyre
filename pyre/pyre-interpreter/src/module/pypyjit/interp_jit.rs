@@ -19,10 +19,8 @@
 pub(super) fn set_param_args(
     args: &pyre_interpreter::argument::Arguments,
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    set_param_from(
-        &args.arguments_w,
-        pyre_interpreter::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    set_param_from(&pos, kwargs)
 }
 
 pub(super) fn set_param(

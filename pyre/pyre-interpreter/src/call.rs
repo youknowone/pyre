@@ -6149,12 +6149,8 @@ pub(crate) fn real_build_class_args(
             "__build_class__: not enough arguments",
         ));
     }
-    real_build_class_from(
-        args.arguments_w[0],
-        args.arguments_w[1],
-        &args.arguments_w[2..],
-        crate::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    real_build_class_from(pos[0], pos[1], &pos[2..], kwargs)
 }
 
 fn real_build_class_from(

@@ -1272,10 +1272,14 @@ fn cfuncptr_call_args(
     self_: PyObjectRef,
     args: &pyre_interpreter::argument::Arguments,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
     cfuncptr_call_from(
-        self_,
-        &args.arguments_w,
-        pyre_interpreter::builtins::arguments_as_kwargs_dict(args)?,
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
     )
 }
 

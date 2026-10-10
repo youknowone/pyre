@@ -103,7 +103,13 @@ fn structseq_replace_args(
             "__replace__() takes no positional arguments",
         ));
     }
-    structseq_replace_from(inst, crate::builtins::arguments_as_kwargs_dict(args)?)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(inst);
+    structseq_replace_from(
+        pyre_object::gc_roots::shadow_stack_get(inst_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
 }
 
 fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

@@ -244,7 +244,13 @@ fn sys_namespace_init_args(
             "types.SimpleNamespace() takes no positional arguments",
         ));
     }
-    namespace_apply_kwargs(self_obj, crate::builtins::arguments_as_kwargs_dict(args)?)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    namespace_apply_kwargs(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
 }
 
 /// Copy the keyword arguments into a namespace instance's dict, skipping the
@@ -456,17 +462,16 @@ fn simple_namespace_init_args(
     self_obj: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> crate::PyResult {
-    let rest = &args.arguments_w;
-    if rest.len() > 1 {
+    if args.arguments_w.len() > 1 {
         return Err(crate::PyError::type_error(format!(
             "SimpleNamespace expected at most 1 argument, got {}",
-            rest.len()
+            args.arguments_w.len()
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = _roots.pin_roots(&[self_obj]);
-    let rest_slot = _roots.pin_roots(rest);
-    let kwargs = crate::builtins::arguments_as_kwargs_dict(args)?;
+    let (rest, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    let rest_slot = _roots.pin_roots(&rest);
     let kwargs_slot = _roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
     if rest.len() == 1 {
         let temporary = w_dict_new();
@@ -894,7 +899,13 @@ fn simple_namespace_replace_args(
             "__replace__() takes no positional arguments",
         ));
     }
-    simple_namespace_replace_from(self_obj, crate::builtins::arguments_as_kwargs_dict(args)?)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    simple_namespace_replace_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
 }
 
 fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {

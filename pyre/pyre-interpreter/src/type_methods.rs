@@ -2154,10 +2154,14 @@ pub fn descr_format_args(
     self_: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
     str_method_format_core(
-        self_,
-        &args.arguments_w,
-        crate::builtins::arguments_as_kwargs_dict(args)?,
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
         None,
     )
 }
@@ -7049,10 +7053,14 @@ pub fn dict_init_or_update_args(
     args: &crate::argument::Arguments,
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
     dict_init_or_update_from(
-        self_,
-        &args.arguments_w,
-        crate::builtins::arguments_as_kwargs_dict(args)?,
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
         name,
     )
 }

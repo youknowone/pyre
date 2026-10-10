@@ -3081,27 +3081,44 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
     /// Keyword-only tail of a bound `Signature` scope, rebuilt as a dict so
     /// existing `kwarg_get` / `dir_fd_kwarg` readers keep working.
-    fn kwargs_from_bound_kwonly(
-        args: &[pyre_object::PyObjectRef],
+    ///
+    /// `w_dict_new` / `w_dict_setitem_str` collect, so the bound slice and
+    /// the dict are published first and read back at each store, matching
+    /// `collect_keyword_args`.
+    fn kwargs_from_bound_kwonly_at(
+        args_base: usize,
+        args_len: usize,
         start: usize,
         names: &[&str],
     ) -> Option<pyre_object::PyObjectRef> {
-        if names.is_empty() {
-            return None;
-        }
-        let mut w_dict = pyre_object::PY_NULL;
+        let mut dict_slot = None;
         for (index, name) in names.iter().enumerate() {
-            let Some(value) = args.get(start + index).copied().filter(|o| !o.is_null()) else {
+            let slot = start + index;
+            if slot >= args_len {
                 continue;
-            };
-            if w_dict.is_null() {
-                w_dict = pyre_object::w_dict_new();
             }
+            let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
+            if value.is_null() {
+                continue;
+            }
+            let dict = match dict_slot {
+                Some(pinned) => pyre_object::gc_roots::shadow_stack_get(pinned),
+                None => {
+                    let pinned = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+                    dict_slot = Some(pinned);
+                    pyre_object::gc_roots::shadow_stack_get(pinned)
+                }
+            };
             unsafe {
-                pyre_object::w_dict_setitem_str(w_dict, name, value);
+                pyre_object::w_dict_setitem_str(
+                    dict,
+                    name,
+                    pyre_object::gc_roots::shadow_stack_get(args_base + slot),
+                );
             }
         }
-        if w_dict.is_null() { None } else { Some(w_dict) }
+        dict_slot.map(pyre_object::gc_roots::shadow_stack_get)
     }
 
     fn posix_sig(params: &[&'static str], kwonly: &[&'static str]) -> crate::gateway::Signature {
@@ -3162,10 +3179,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         crate::PyError,
     > {
         let _ = qualname;
-        let bound: Vec<Option<pyre_object::PyObjectRef>> = (0..total)
-            .map(|index| args.get(index).copied().filter(|value| !value.is_null()))
-            .collect();
-        let given = bound.iter().filter(|slot| slot.is_some()).count();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let args_base = pyre_object::gc_roots::pin_roots(args);
+        let bound_at = |index: usize| {
+            if index >= args.len() {
+                None
+            } else {
+                let value = pyre_object::gc_roots::shadow_stack_get(args_base + index);
+                if value.is_null() { None } else { Some(value) }
+            }
+        };
+        let given = (0..total)
+            .filter(|&index| bound_at(index).is_some())
+            .count();
         if given < required {
             let plural = if total == 1 { "" } else { "s" };
             let text = if !kwonly.is_empty() {
@@ -3180,7 +3206,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             };
             return Err(crate::PyError::type_error(text));
         }
-        Ok((bound, kwargs_from_bound_kwonly(args, total, kwonly)))
+        let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), total, kwonly);
+        let bound: Vec<Option<pyre_object::PyObjectRef>> = (0..total).map(bound_at).collect();
+        Ok((bound, kwargs))
     }
 
     /// Bind the positional-or-keyword prefix of a path-taking entry point.
@@ -3216,18 +3244,28 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // one still empty, so `os.stat(other=1)` names `path` as missing
         // rather than `other` as unexpected. The PY_NULL pad fills required
         // slots the same way, so this helper still emits that clinic message.
-        let mut bound = Vec::with_capacity(params.len());
+        let _roots = pyre_object::gc_roots::push_roots();
+        let args_base = pyre_object::gc_roots::pin_roots(args);
+        let bound_at = |index: usize| {
+            if index >= args.len() {
+                None
+            } else {
+                let value = pyre_object::gc_roots::shadow_stack_get(args_base + index);
+                if value.is_null() { None } else { Some(value) }
+            }
+        };
         for (index, key) in params.iter().enumerate() {
-            let value = args.get(index).copied().filter(|o| !o.is_null());
-            if value.is_none() && index < required {
+            if bound_at(index).is_none() && index < required {
                 return Err(crate::PyError::type_error(format!(
                     "{name}() missing required argument '{key}' (pos {})",
                     index + 1
                 )));
             }
-            bound.push(value);
         }
-        Ok((bound, kwargs_from_bound_kwonly(args, params.len(), kwonly)))
+        let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), params.len(), kwonly);
+        let bound: Vec<Option<pyre_object::PyObjectRef>> =
+            (0..params.len()).map(bound_at).collect();
+        Ok((bound, kwargs))
     }
 
     // ── posix.open(path, flags, mode=0o777, *, dir_fd=None) → fd ──

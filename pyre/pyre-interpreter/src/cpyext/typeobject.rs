@@ -3050,10 +3050,14 @@ fn classmethod_descr_call_args(
     carrier: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
     classmethod_descr_call_body(
-        carrier,
-        &args.arguments_w,
-        super::methodobject::arguments_as_kwargs_dict(args)?,
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
     )
 }
 
@@ -3091,10 +3095,14 @@ fn method_descr_call_args(
     carrier: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
     method_descr_call_body(
-        carrier,
-        &args.arguments_w,
-        super::methodobject::arguments_as_kwargs_dict(args)?,
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
     )
 }
 

@@ -5761,19 +5761,58 @@ pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyO
 /// Keyword passthrough bodies reuse the existing dict-shaped helpers
 /// (`kwarg_get`, `init_or_update`, format field lookup) without packing
 /// the `__pyre_kw__` marker.
+///
+/// `w_dict_new` / `setitem` collect, so the names, values and dict sit on
+/// the shadow stack the way `collect_keyword_args` (`argument.py`
+/// `_collect_keyword_args`) publishes every pair before the first store.
 pub fn arguments_as_kwargs_dict(
     args: &crate::argument::Arguments,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
     let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let _roots = pyre_object::gc_roots::push_roots();
+    fill_kwargs_dict(names, values)
+}
+
+/// Reload `arguments_w` after building the kwargs dict, which allocates.
+///
+/// `BuiltinCodePassThroughArguments0.funcrun` hands an `Arguments` whose
+/// lists are traced upstream. The native copies are not, so a body that
+/// rebuilds a dict must read the positionals back from the same roots.
+pub fn arguments_pos_and_kwargs(
+    args: &crate::argument::Arguments,
+) -> Result<(Vec<PyObjectRef>, Option<PyObjectRef>), crate::PyError> {
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let npos = args.arguments_w.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pos_base = pyre_object::gc_roots::pin_roots(&args.arguments_w);
+    let kwargs = fill_kwargs_dict(names, values)?;
+    let mut pos = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos);
+    Ok((pos, kwargs))
+}
+
+fn fill_kwargs_dict(
+    names: &[PyObjectRef],
+    values: &[PyObjectRef],
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    debug_assert_eq!(names.len(), values.len());
     if names.is_empty() {
         return Ok(None);
     }
-    let dict = pyre_object::dictmultiobject::w_dict_new();
-    for (name, value) in names.iter().zip(values.iter()) {
-        crate::baseobjspace::setitem(dict, *name, *value)?;
+    let names_base = pyre_object::gc_roots::pin_roots(names);
+    let values_base = pyre_object::gc_roots::pin_roots(values);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
+    for i in 0..names.len() {
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(names_base + i),
+            pyre_object::gc_roots::shadow_stack_get(values_base + i),
+        )?;
     }
-    Ok(Some(dict))
+    Ok(Some(pyre_object::gc_roots::shadow_stack_get(dict_slot)))
 }
 
 /// Whether `last` is the trailing keyword dict [`split_builtin_kwargs`]
@@ -6598,21 +6637,13 @@ crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_min_target, __majit_wrap
 crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_max_target, __majit_wrap_builtin_max);
 
 fn builtin_min_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
-    min_max_from_parts(
-        &args.arguments_w,
-        arguments_as_kwargs_dict(args)?,
-        false,
-        "min",
-    )
+    let (pos, kwargs) = arguments_pos_and_kwargs(args)?;
+    min_max_from_parts(&pos, kwargs, false, "min")
 }
 
 fn builtin_max_args(args: &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError> {
-    min_max_from_parts(
-        &args.arguments_w,
-        arguments_as_kwargs_dict(args)?,
-        true,
-        "max",
-    )
+    let (pos, kwargs) = arguments_pos_and_kwargs(args)?;
+    min_max_from_parts(&pos, kwargs, true, "max")
 }
 
 fn min_max_dispatch(
@@ -6912,10 +6943,14 @@ pub fn type_descr_new_args(
     w_typetype: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ty_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_typetype);
+    let (pos, kwargs) = arguments_pos_and_kwargs(args)?;
     type_descr_new_from(
-        w_typetype,
-        &args.arguments_w,
-        arguments_as_kwargs_dict(args)?,
+        pyre_object::gc_roots::shadow_stack_get(ty_slot),
+        &pos,
+        kwargs,
     )
 }
 

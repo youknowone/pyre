@@ -523,13 +523,14 @@ fn expr_context_type() -> PyObjectRef {
 /// Keep PyPy's generated-type owner and general object-space dispatch while
 /// porting that constructor decision tree here.
 fn ast_init_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
-    let mut positional = Vec::with_capacity(args.arguments_w.len() + 1);
-    positional.push(self_);
-    positional.extend_from_slice(&args.arguments_w);
-    ast_init_from(
-        &positional,
-        crate::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    let mut positional = Vec::with_capacity(pos.len() + 1);
+    positional.push(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    positional.extend_from_slice(&pos);
+    ast_init_from(&positional, kwargs)
 }
 
 fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
@@ -729,7 +730,13 @@ fn ast_replace_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> cr
             "__replace__() takes no positional arguments",
         ));
     }
-    ast_replace_from(self_, crate::builtins::arguments_as_kwargs_dict(args)?)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    ast_replace_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        crate::builtins::arguments_as_kwargs_dict(args)?,
+    )
 }
 
 fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
