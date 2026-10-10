@@ -1934,63 +1934,51 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     module_ns_store(
         roots.get(ns_slot),
         "_getframemodulename",
-        crate::make_builtin_function("_getframemodulename", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["depth"], "_getframemodulename")?;
-            // The arity is judged on the total argument count, so supplying
-            // `depth` both ways is "takes at most 1 argument (2 given)" rather
-            // than the duplicate-binding report.
-            let supplied = positional.len() + crate::builtins::real_kwarg_count(kwargs);
-            if supplied > 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "_getframemodulename() takes at most 1 argument ({supplied} given)"
-                )));
-            }
-            let depth = match crate::builtins::bind_pos_or_kw(
-                positional,
-                kwargs,
-                0,
-                "depth",
-                "_getframemodulename",
-                1,
-            )? {
-                Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
-                None => 0,
-            };
-            let ec = current_execution_context();
-            if ec.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let mut current = unsafe { (*ec).gettopframe_nohidden() };
-            // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
-            // post-decrement test fails immediately for a negative depth, so a
-            // negative walks zero frames and reports the current module rather
-            // than `None`.
-            let mut remaining = depth.max(0);
-            while !current.is_null() && remaining > 0 {
-                current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
-                remaining -= 1;
-            }
-            if current.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // `get_w_globals` reads `pycode`, which `interp_jit.py`
-            // declares virtualizable, so the frame it is read off has to be
-            // materialized first.  The force belongs HERE, at the consumer, and
-            // not at the walk that reached the frame — see [`force_frame`]:
-            // forcing a walk escapes the traced virtualizable and
-            // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
-            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
-            crate::executioncontext::jit_force_virtualizable(anchor.live());
-            let w_globals = unsafe { (*anchor.live()).get_w_globals() };
-            if w_globals.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
-                Some(name) if !name.is_null() => Ok(name),
-                _ => Ok(pyre_object::w_none()),
-            }
-        }),
+        crate::make_builtin_function_with_signature(
+            "_getframemodulename",
+            |args| {
+                // Bound scope: optional `depth` (`PY_NULL` omitted).
+                let depth = match args.get(0).copied().filter(|value| !value.is_null()) {
+                    Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
+                    None => 0,
+                };
+                let ec = current_execution_context();
+                if ec.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                let mut current = unsafe { (*ec).gettopframe_nohidden() };
+                // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
+                // post-decrement test fails immediately for a negative depth, so a
+                // negative walks zero frames and reports the current module rather
+                // than `None`.
+                let mut remaining = depth.max(0);
+                while !current.is_null() && remaining > 0 {
+                    current =
+                        crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
+                    remaining -= 1;
+                }
+                if current.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                // `get_w_globals` reads `pycode`, which `interp_jit.py`
+                // declares virtualizable, so the frame it is read off has to be
+                // materialized first.  The force belongs HERE, at the consumer, and
+                // not at the walk that reached the frame — see [`force_frame`]:
+                // forcing a walk escapes the traced virtualizable and
+                // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
+                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
+                crate::executioncontext::jit_force_virtualizable(anchor.live());
+                let w_globals = unsafe { (*anchor.live()).get_w_globals() };
+                if w_globals.is_null() {
+                    return Ok(pyre_object::w_none());
+                }
+                match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
+                    Some(name) if !name.is_null() => Ok(name),
+                    _ => Ok(pyre_object::w_none()),
+                }
+            },
+            crate::Signature::new(vec!["depth"], None, None, 0, 0),
+        ),
     );
     // sys.exc_info() → (type, value, traceback)
     //
@@ -2804,41 +2792,28 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     module_ns_store(
         roots.get(ns_slot),
         "exit",
-        crate::make_module_builtin_function("exit", |args| {
-            // `exit(exitcode=None)` — resolve the single optional argument
-            // like the app-level signature: strip the `__pyre_kw__` trailer,
-            // reject unknown keywords, reproduce the normal function-call
-            // arity diagnostics, and reject a positional/`exitcode=`
-            // duplicate.
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["exitcode"], "exit")?;
-            if positional.len() > 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "exit() takes from 0 to 1 positional arguments but {} were given",
-                    positional.len()
-                )));
-            }
-            let kw_exitcode = crate::builtins::kwarg_get(kwargs, "exitcode");
-            if !positional.is_empty() && kw_exitcode.is_some() {
-                return Err(crate::PyError::type_error(
-                    "exit() got multiple values for argument 'exitcode'",
-                ));
-            }
-            let exitcode = positional
-                .first()
-                .copied()
-                .or(kw_exitcode)
-                .unwrap_or_else(w_none);
-            let cls = crate::builtins::lookup_exc_class("SystemExit")
-                .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
-            let ctor_args = if unsafe { is_tuple(exitcode) } {
-                unsafe { w_tuple_items_copy_as_vec(exitcode) }
-            } else {
-                vec![exitcode]
-            };
-            let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
-            Err(unsafe { crate::PyError::from_exc_object(exc) })
-        }),
+        crate::make_module_builtin_function_with_arity_and_sig(
+            "exit",
+            |args| {
+                // Bound scope: optional `exitcode` (`PY_NULL` omitted).
+                let exitcode = args
+                    .get(0)
+                    .copied()
+                    .filter(|value| !value.is_null())
+                    .unwrap_or_else(w_none);
+                let cls = crate::builtins::lookup_exc_class("SystemExit")
+                    .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
+                let ctor_args = if unsafe { is_tuple(exitcode) } {
+                    unsafe { w_tuple_items_copy_as_vec(exitcode) }
+                } else {
+                    vec![exitcode]
+                };
+                let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
+                Err(unsafe { crate::PyError::from_exc_object(exc) })
+            },
+            crate::HOPELESS,
+            crate::Signature::new(vec!["exitcode"], None, None, 0, 0),
+        ),
     );
     // `init_sys_streams`: Windows has no `sys.abiflags`; its ABI tag
     // belongs to `sys.winver`.  Absence is observable through `hasattr` and is

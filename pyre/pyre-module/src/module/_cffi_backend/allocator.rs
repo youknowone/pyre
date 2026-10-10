@@ -157,7 +157,11 @@ fn init_allocator_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            pyre_interpreter::make_builtin_function("__call__", allocator_call),
+            pyre_interpreter::make_builtin_function_with_signature(
+                "__call__",
+                allocator_call,
+                pyre_interpreter::Signature::new(vec!["self", "arg", "init"], None, None, 0, 1),
+            ),
         )
     }
 }
