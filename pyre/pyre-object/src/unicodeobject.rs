@@ -1354,15 +1354,13 @@ pub unsafe fn w_unicode_listview_ascii(
 /// `try_gc_owns_object` is the same discriminator every other mixed-allocation
 /// host path uses.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`) stands in
-/// for the `jit.conditional_call_elidable` that keeps this build off the trace
-/// upstream: [`w_str_get_index_storage`] traces the cached-pointer test and
-/// residualizes the build behind it.
+/// No JIT decorator: [`w_str_get_index_storage`] residualizes this as the
+/// miss operand of `jit.conditional_call_elidable`, and that op does not
+/// look inside its function argument.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
-#[majit_macros::dont_look_inside]
-unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
+pub unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
     unsafe {
         let str_obj = obj as *mut W_UnicodeObject;
         let storage = crate::rutf8::create_utf8_index_storage(
@@ -1384,17 +1382,64 @@ unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Ut
 /// `W_UnicodeObject._get_index_storage` (`unicodeobject.py`) — the cached
 /// index table, computing it on first use.
 ///
+/// Look-inside: `getfield index_storage` plus `jit.conditional_call_elidable`
+/// (`rlib/jit.py`). A miss residualizes [`w_str_compute_index_storage`].
+///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
 unsafe fn w_str_get_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
     unsafe {
         let cached = (*(obj as *const W_UnicodeObject)).index_storage;
-        if cached.is_null() {
-            return w_str_compute_index_storage(obj);
-        }
-        cached
+        majit_rlib::jit::conditional_call_elidable1(cached, w_str_compute_index_storage, obj)
+    }
+}
+
+/// `rutf8.codepoint_position_at_index` (`rutf8.py`) as `_index_to_byte` records it.
+///
+/// `@jit.elidable` (`effectinfo.py` `EF_ELIDABLE_CAN_RAISE`). `policy.py`
+/// `_reject_function` declines the graph, so the trace records
+/// `call_i(codepoint_position_at_index, _utf8, storage, index)` and leaves
+/// the body unentered. The arguments are the `_utf8` `STR` and the
+/// `UTF8_INDEX_STORAGE` pointer, one word each. The `&Wtf8` /
+/// `&[Utf8LocElem]` walk stays in the body: a call spelled with those
+/// arguments has no funcptr for the codewriter to bind.
+///
+/// # Safety
+/// `utf8` must be a live `STR`, `storage` the index table built for that
+/// string, and `index` must not exceed the code point count.
+#[majit_macros::elidable]
+unsafe fn traced_codepoint_position_at_index(
+    utf8: *mut Utf8Str,
+    storage: *mut crate::rutf8::Utf8IndexStorage,
+    index: usize,
+) -> usize {
+    unsafe { crate::rutf8::codepoint_position_at_index(utf8_payload_wtf8(utf8), &*storage, index) }
+}
+
+/// `rutf8.codepoint_index_at_byte_position` (`rutf8.py`) as `_byte_to_index`
+/// records it. Same one-word-arg wrapper as
+/// [`traced_codepoint_position_at_index`]: `@jit.elidable`, and the
+/// `&Wtf8` / `&[Utf8LocElem]` spelling has no funcptr for the codewriter
+/// to bind.
+///
+/// # Safety
+/// `utf8` must be a live `STR`, `storage` the index table built for that
+/// string, `bytepos` a code-point boundary, and `num_codepoints` the
+/// string's code point count.
+#[majit_macros::elidable]
+unsafe fn traced_codepoint_index_at_byte_position(
+    utf8: *mut Utf8Str,
+    storage: *mut crate::rutf8::Utf8IndexStorage,
+    bytepos: usize,
+    num_codepoints: usize,
+) -> usize {
+    unsafe {
+        crate::rutf8::codepoint_index_at_byte_position(
+            utf8_payload_wtf8(utf8),
+            &*storage,
+            bytepos,
+            num_codepoints,
+        )
     }
 }
 
@@ -1411,11 +1456,8 @@ pub unsafe fn w_str_index_to_byte(obj: PyObjectRef, index: usize) -> usize {
             return index;
         }
         let storage = w_str_get_index_storage(obj);
-        crate::rutf8::codepoint_position_at_index(
-            utf8_payload_wtf8((*(obj as *const W_UnicodeObject)).value),
-            &*storage,
-            index,
-        )
+        let utf8 = (*(obj as *const W_UnicodeObject)).value;
+        traced_codepoint_position_at_index(utf8, storage, index)
     }
 }
 
@@ -1434,12 +1476,8 @@ pub unsafe fn w_str_byte_to_index(obj: PyObjectRef, bytepos: usize) -> usize {
             return bytepos;
         }
         let storage = w_str_get_index_storage(obj);
-        crate::rutf8::codepoint_index_at_byte_position(
-            utf8_payload_wtf8((*(obj as *const W_UnicodeObject)).value),
-            &*storage,
-            bytepos,
-            w_str_len(obj),
-        )
+        let utf8 = (*(obj as *const W_UnicodeObject)).value;
+        traced_codepoint_index_at_byte_position(utf8, storage, bytepos, w_str_len(obj))
     }
 }
 
@@ -2161,6 +2199,39 @@ mod tests {
                 Some(expected[0])
             );
             assert_eq!((*str_obj).index_storage, storage);
+        }
+    }
+
+    /// `_index_to_byte` agrees with a code-point walk, including a bound at
+    /// the code point count, and an ASCII string still takes the identity.
+    #[test]
+    fn test_str_index_to_byte_matches_a_walk() {
+        let mut buf = Wtf8Buf::new();
+        for _ in 0..80 {
+            buf.push_str("a\u{e9}\u{4e00}\u{1f600}");
+        }
+        let obj = w_str_from_wtf8(buf.clone());
+        unsafe {
+            let mut byte = 0usize;
+            let len = w_str_len(obj);
+            for index in 0..len {
+                assert_eq!(w_str_index_to_byte(obj, index), byte, "index {index}");
+                byte = crate::rutf8::next_codepoint_pos(&buf, byte);
+            }
+            assert_eq!(byte, buf.len());
+            assert_eq!(w_str_index_to_byte(obj, len), buf.len());
+            let storage = (*(obj as *const W_UnicodeObject)).index_storage;
+            assert!(!storage.is_null());
+            assert_eq!(w_str_index_to_byte(obj, 0), 0);
+            assert_eq!(
+                (*(obj as *const W_UnicodeObject)).index_storage,
+                storage,
+                "a later lookup reuses the table"
+            );
+
+            let ascii = w_str_new("abc");
+            assert_eq!(w_str_index_to_byte(ascii, 2), 2);
+            assert!((*(ascii as *const W_UnicodeObject)).index_storage.is_null());
         }
     }
 

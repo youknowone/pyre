@@ -103,6 +103,29 @@ pub fn conditional_call4<A, B, C, D>(
     }
 }
 
+/// `rlib/jit.py conditional_call_elidable` residual body
+/// (`if value is NULL: value = function(*args); return value`).
+///
+/// Translated graphs rewrite a `oopspec("jit.conditional_call_value")` call
+/// to `conditional_call_value_ir_{i,r}` (`jtransform.py`
+/// `rewrite_op_jit_conditional_call_value` / `_jit_conditional_call_value`).
+/// Argument order is `(value, function, *args)`, the same as the void
+/// [`conditional_call1`] helper that reaches `rewrite_op_jit_conditional_call`.
+/// Null is a miss. One function argument is the arity unicode
+/// `_get_index_storage` needs.
+#[majit_macros::oopspec("jit.conditional_call_value")]
+pub fn conditional_call_elidable1<T, A>(
+    value: *mut T,
+    function: unsafe fn(A) -> *mut T,
+    a: A,
+) -> *mut T {
+    if value.is_null() {
+        unsafe { function(a) }
+    } else {
+        value
+    }
+}
+
 /// `rlib/jit.py loop_unrolling_heuristic`.
 ///
 /// `isvirtual(lst)` is often lying for a resizable list (it reports the
@@ -141,5 +164,22 @@ mod tests {
         let mut flag = true;
         conditional_call1(false, mark, &mut flag);
         assert!(flag);
+    }
+
+    #[test]
+    fn conditional_call_elidable1_computes_on_null() {
+        // Residual `rlib/jit.py conditional_call_elidable`: null miss calls
+        // the function; a later hit returns the cached pointer.
+        fn compute(flag: &mut i32) -> *mut i32 {
+            *flag = 1;
+            flag
+        }
+        let mut slot = 0i32;
+        let hit = conditional_call_elidable1(std::ptr::null_mut(), compute, &mut slot);
+        assert!(std::ptr::eq(hit, &mut slot));
+        assert_eq!(slot, 1);
+        let again = conditional_call_elidable1(hit, compute, &mut slot);
+        assert!(std::ptr::eq(again, hit));
+        assert_eq!(slot, 1);
     }
 }

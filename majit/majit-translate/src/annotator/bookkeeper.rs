@@ -459,7 +459,6 @@ pub(crate) struct MethodDescKey {
 /// pseudo-call identities.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EmulatedPbcCallKey {
-    #[allow(dead_code)]
     Position(PositionKey),
     Graph(GraphKey),
     ClassDef(ClassDefKey),

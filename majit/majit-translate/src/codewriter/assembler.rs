@@ -2867,6 +2867,60 @@ impl AssemblerEncode for Assembler {
                 state.code[startposition] = opnum;
             }
 
+            // jtransform.py `_rewrite_op_cond_call` (is_value=True) —
+            // `conditional_call_value_ir_{k}/{k}iIRd>{k}`. force_ir always
+            // emits both I and R lists. Decoder order matches
+            // `bhimpl_conditional_call_value_ir_{i,r}` and
+            // `pyjitpl.py _opimpl_conditional_call_value`: value, funcptr
+            // int const, I list, R list, calldescr, result.
+            OpKind::ConditionalCallValue {
+                value,
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+            } => {
+                assert!(
+                    args_f.is_empty(),
+                    "conditional_call_value does not support float args"
+                );
+                let (reg, kc) = self.lookup_reg_with_kind_var(value, regallocs);
+                assert!(
+                    kc == 'i' || kc == 'r',
+                    "conditional_call_value lead is an int or a ref"
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let fnaddr = match callcontrol {
+                    Some(cc) => cc.fnaddr_for_target(funcptr),
+                    None => crate::call::symbolic_fnaddr_for_target(funcptr),
+                };
+                let func_byte = self.emit_const_i(fnaddr, state);
+                state.code.push(func_byte);
+                argcodes.push('i');
+                self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
+                argcodes.push('I');
+                self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
+                argcodes.push('R');
+                let calldescr = descriptor.to_bh_calldescr();
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let result_key_kind = self.emit_call_result_arg(
+                    op.result.as_ref(),
+                    *result_kind,
+                    regallocs,
+                    state,
+                    &mut argcodes,
+                );
+                let key = format!("conditional_call_value_ir_{result_key_kind}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
             OpKind::LoopHeader { jitdriver_index } => {
                 let reg_byte = self.emit_const_i(*jitdriver_index as i64, state);
                 state.code.push(reg_byte);
@@ -5816,10 +5870,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RecordKnownResult { result_kind, .. } => {
             format!("record_known_result_{result_kind}")
         }
-        // jtransform.py _rewrite_op_cond_call — conditional_call ops
+        // jtransform.py `_rewrite_op_cond_call` — dump prefix. Dedicated
+        // encode_op arms emit the full `conditional_call_ir_v` /
+        // `conditional_call_value_ir_{k}` keys; this is the debug name.
         OpKind::ConditionalCall { .. } => "conditional_call".into(),
         OpKind::ConditionalCallValue { result_kind, .. } => {
-            format!("conditional_call_value_{result_kind}")
+            format!("conditional_call_value_ir_{result_kind}")
         }
         OpKind::Live => "live".into(),
         // jtransform.py:1707,1718 — jit_merge_point / loop_header markers.
@@ -7039,6 +7095,130 @@ mod tests {
         let mut state = empty_state();
         asm.encode_op(&op, &HashMap::new(), &mut state, None);
         assert!(state.code.is_empty());
+    }
+
+    /// `jtransform.py _rewrite_op_cond_call` void form: condition, funcptr
+    /// int const, I list, R list, calldescr. Canonical key
+    /// `conditional_call_ir_v/iiIRd`.
+    #[test]
+    fn assemble_conditional_call_ir_v_emits_canonical_iiird_bytes() {
+        use crate::call::CallDescriptor;
+        use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation};
+        use majit_ir::effectinfo::EffectInfo;
+        use majit_ir::value::Type;
+
+        let condition = crate::flowspace::model::Variable::new();
+        FunctionGraph::set_concretetype_of_inline(&condition, crate::model::ConcreteType::Signed);
+
+        let mut regallocs = empty_regallocs();
+        let int_ra = regallocs.get_mut(&RegKind::Int).unwrap();
+        int_ra.coloring.insert(condition.clone(), 0);
+        int_ra.num_regs = 1;
+
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConditionalCall {
+                condition: condition.clone(),
+                funcptr: CallTarget::function_path([
+                    "pyre_object",
+                    "listobject",
+                    "ll_list_int_resize_hint_really",
+                ]),
+                descriptor: CallDescriptor::from_signature(
+                    &[Type::Ref],
+                    Type::Void,
+                    EffectInfo::default(),
+                ),
+                args_i: vec![],
+                args_r: vec![],
+                args_f: vec![],
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "conditional_call_ir_v/iiIRd";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        // opcode, cond, func const, I count, R count, descr u16
+        assert_eq!(state.code.len(), 7);
+        assert_eq!(state.code[0], asm.insns[key]);
+        assert_eq!(state.code[1], 0);
+        assert_eq!(state.code[2], state.num_regs_i as u8);
+        assert_eq!(state.code[3], 0);
+        assert_eq!(state.code[4], 0);
+        assert_eq!(u16::from_le_bytes([state.code[5], state.code[6]]), 0);
+    }
+
+    /// `jtransform.py _rewrite_op_cond_call` value form /
+    /// `bhimpl_conditional_call_value_ir_r`: value, funcptr int const,
+    /// I list, R list, 2 descr bytes, result. Canonical key
+    /// `conditional_call_value_ir_r/riIRd>r`.
+    #[test]
+    fn assemble_conditional_call_value_ir_r_emits_canonical_riird_bytes() {
+        use crate::call::CallDescriptor;
+        use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation};
+        use majit_ir::effectinfo::EffectInfo;
+        use majit_ir::value::Type;
+
+        let value = crate::flowspace::model::Variable::new();
+        let arg = crate::flowspace::model::Variable::new();
+        let result = crate::flowspace::model::Variable::new();
+        FunctionGraph::set_concretetype_of_inline(&value, crate::model::ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&arg, crate::model::ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result, crate::model::ConcreteType::GcRef);
+
+        let mut regallocs = empty_regallocs();
+        let ref_ra = regallocs.get_mut(&RegKind::Ref).unwrap();
+        ref_ra.coloring.insert(value.clone(), 0);
+        ref_ra.coloring.insert(arg.clone(), 1);
+        ref_ra.coloring.insert(result.clone(), 2);
+        ref_ra.num_regs = 3;
+
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConditionalCallValue {
+                value: value.clone(),
+                funcptr: CallTarget::function_path([
+                    "pyre_object",
+                    "unicodeobject",
+                    "w_str_compute_index_storage",
+                ]),
+                descriptor: CallDescriptor::from_signature(
+                    &[Type::Ref],
+                    Type::Ref,
+                    EffectInfo::default(),
+                ),
+                args_i: vec![],
+                args_r: vec![arg.clone()],
+                args_f: vec![],
+                result_kind: 'r',
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "conditional_call_value_ir_r/riIRd>r";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        // opcode, value, func const, I count, R count, r0, descr u16, result
+        assert_eq!(state.code.len(), 9);
+        assert_eq!(state.code[0], asm.insns[key]);
+        assert_eq!(state.code[1], 0);
+        assert_eq!(state.code[2], state.num_regs_i as u8);
+        assert_eq!(state.code[3], 0);
+        assert_eq!(state.code[4], 1);
+        assert_eq!(state.code[5], 1);
+        assert_eq!(u16::from_le_bytes([state.code[6], state.code[7]]), 0);
+        assert_eq!(state.code[8], 2);
     }
 
     #[test]

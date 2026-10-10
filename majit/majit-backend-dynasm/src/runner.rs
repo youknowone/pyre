@@ -4942,7 +4942,7 @@ mod tests {
         Value,
     };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
     #[test]
     fn varsize_slowpaths_return_null_on_size_overflow() {
@@ -5812,23 +5812,27 @@ mod tests {
         arg
     }
 
+    static COND_CALL_VALUE_I_CALLS: AtomicI64 = AtomicI64::new(0);
+    static COND_CALL_VALUE_R_CALLS: AtomicI64 = AtomicI64::new(0);
+
+    extern "C" fn cond_call_value_i_helper(arg: i64) -> i64 {
+        COND_CALL_VALUE_I_CALLS.fetch_add(1, Ordering::SeqCst);
+        arg.wrapping_mul(10)
+    }
+
+    extern "C" fn cond_call_value_r_helper(arg: i64) -> i64 {
+        COND_CALL_VALUE_R_CALLS.fetch_add(1, Ordering::SeqCst);
+        let _ = arg;
+        0x5678
+    }
+
     /// A `COND_CALL_VALUE_I` argument that is an op result — not an inputarg —
     /// and is still live after the call.
     ///
-    /// `consider_raw_call_like_j2` runs `before_call` before it reads the
-    /// locations, and `spill_or_move_registers_before_call` prefers *moving* a
-    /// survivor into a free callee-saved register over spilling it.  The
-    /// argument therefore reaches the emitter as a bare `Loc::Reg` (measured:
-    /// x19 on AArch64) whose lifetime has no frame slot at that point, which is
-    /// the one shape `resolve_opref` cannot represent.
-    ///
-    /// The callee is the identity, so a wrong argument location surfaces
-    /// directly in the result.  `i2` is deliberately NOT equal to `i1`: reading
-    /// the argument from the slot that the recycled frame position happens to
-    /// name would otherwise return the right answer by accident.
-    ///
-    /// The two older cond-call fixtures pass zero call arguments, so their
-    /// argument loop is empty and neither can see this.
+    /// `consider_cond_call_value_j2` (`_prepare_op_cond_call`) places extra
+    /// args in `argument_regs`. Naming `i2` after the call keeps it live so
+    /// a wrong extra-arg location surfaces in the helper result. `i2` is
+    /// deliberately NOT equal to `i1`.
     #[test]
     fn test_cond_call_value_passes_a_register_resident_op_result_argument() {
         let mut backend = DynasmBackend::new();
@@ -5865,9 +5869,7 @@ mod tests {
                 2,
             ),
             cond_call,
-            // Naming i2 again keeps it live across the cond-call, which is what
-            // sends it down `before_call`'s move-to-callee-saved arm instead of
-            // letting it die there.
+            // Naming i2 again keeps it live across the cond-call.
             mk_op(
                 OpCode::Finish,
                 &[OpRef::int_op(3), OpRef::int_op(2)],
@@ -5881,6 +5883,181 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 14);
+    }
+
+    /// HIT: non-null IntAdd result (kept live in Finish) is the op result and
+    /// the helper is not called. MISS: null value, helper called once with the
+    /// extra arg, result is the helper word. Sequential so the call counter
+    /// is not shared with a parallel test.
+    #[test]
+    fn test_cond_call_value_i_hit_and_miss() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
+        constants.insert(200, cond_call_value_i_helper as *const () as usize as i64);
+        backend.set_constants(constants.clone());
+
+        let hit = mk_op(
+            OpCode::CondCallValueI,
+            &[
+                OpRef::int_op(2),
+                OpRef::int_op(200),
+                OpRef::input_arg_int(1),
+            ],
+            3,
+        );
+        hit.setdescr(make_plain_call_descr(vec![Type::Int], Type::Int));
+        let hit_ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+                2,
+            ),
+            hit,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::int_op(3), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let hit_token = JitCellToken::new(1620);
+        backend
+            .compile_loop(&inputargs, &hit_ops, &hit_token)
+            .unwrap();
+        COND_CALL_VALUE_I_CALLS.store(0, Ordering::SeqCst);
+        let frame = backend.execute_token(&hit_token, &[Value::Int(11), Value::Int(5)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 22);
+        assert_eq!(COND_CALL_VALUE_I_CALLS.load(Ordering::SeqCst), 0);
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_constants(constants.clone());
+        let miss = mk_op(
+            OpCode::CondCallValueI,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::int_op(200),
+                OpRef::int_op(2),
+            ],
+            3,
+        );
+        miss.setdescr(make_plain_call_descr(vec![Type::Int], Type::Int));
+        let miss_ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::input_arg_int(1)],
+                2,
+            ),
+            miss,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::int_op(3), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let miss_token = JitCellToken::new(1621);
+        backend
+            .compile_loop(&inputargs, &miss_ops, &miss_token)
+            .unwrap();
+        COND_CALL_VALUE_I_CALLS.store(0, Ordering::SeqCst);
+        let frame = backend.execute_token(&miss_token, &[Value::Int(0), Value::Int(7)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 140);
+        assert_eq!(COND_CALL_VALUE_I_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    /// HIT: non-null ref value is the result and the helper is not called.
+    /// MISS: null ref, helper called once, result is the helper word.
+    #[test]
+    fn test_cond_call_value_r_hit_and_miss() {
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
+        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
+        constants.insert(200, cond_call_value_r_helper as *const () as usize as i64);
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_constants(constants.clone());
+        let hit = mk_op(
+            OpCode::CondCallValueR,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::int_op(200),
+                OpRef::input_arg_ref(1),
+            ],
+            2,
+        );
+        hit.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        let hit_ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+                OpRef::NONE.raw(),
+            ),
+            hit,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::ref_op(2), OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let hit_token = JitCellToken::new(1622);
+        backend
+            .compile_loop(&inputargs, &hit_ops, &hit_token)
+            .unwrap();
+        COND_CALL_VALUE_R_CALLS.store(0, Ordering::SeqCst);
+        let value = GcRef(0x1234);
+        let extra = GcRef(0x9);
+        let frame = backend.execute_token(&hit_token, &[Value::Ref(value), Value::Ref(extra)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), value);
+        assert_eq!(COND_CALL_VALUE_R_CALLS.load(Ordering::SeqCst), 0);
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_constants(constants);
+        let miss = mk_op(
+            OpCode::CondCallValueR,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::int_op(200),
+                OpRef::input_arg_ref(1),
+            ],
+            2,
+        );
+        miss.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        let miss_ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+                OpRef::NONE.raw(),
+            ),
+            miss,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
+        ];
+        let miss_token = JitCellToken::new(1623);
+        backend
+            .compile_loop(&inputargs, &miss_ops, &miss_token)
+            .unwrap();
+        COND_CALL_VALUE_R_CALLS.store(0, Ordering::SeqCst);
+        let frame = backend.execute_token(&miss_token, &[Value::Ref(GcRef(0)), Value::Ref(extra)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), GcRef(0x5678));
+        assert_eq!(COND_CALL_VALUE_R_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]

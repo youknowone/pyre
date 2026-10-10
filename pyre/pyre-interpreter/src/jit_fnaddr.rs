@@ -1848,6 +1848,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_str_concat",
         w_str_concat,
     );
+    // One-word residual of `conditional_call_elidable` (`rlib/jit.py`).
+    // `W_UnicodeObject._get_index_storage` records this as the miss
+    // callee of `COND_CALL_VALUE_R`; without a row, the codewriter
+    // bakes `SYMBOLIC_FNADDR_BASE | hash` and `patch_constants_i_fnaddrs`
+    // cannot rebind it.
+    let w_str_compute_index_storage: unsafe fn(
+        pyre_object::PyObjectRef,
+    ) -> *mut pyre_object::rutf8::Utf8IndexStorage =
+        pyre_object::unicodeobject::w_str_compute_index_storage;
+    upa1(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_compute_index_storage",
+        "pyre_object::w_str_compute_index_storage",
+        w_str_compute_index_storage,
+    );
     let w_str_first_surrogate: unsafe fn(pyre_object::PyObjectRef) -> i64 =
         pyre_object::unicodeobject::w_str_first_surrogate;
     upa1(
@@ -6175,6 +6190,20 @@ mod tests {
             list_append
         );
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
+
+        let compute_index: unsafe fn(
+            pyre_object::PyObjectRef,
+        ) -> *mut pyre_object::rutf8::Utf8IndexStorage =
+            pyre_object::unicodeobject::w_str_compute_index_storage;
+        let compute_index_addr = compute_index as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::unicodeobject::w_str_compute_index_storage"],
+            compute_index_addr
+        );
+        assert_eq!(
+            bindings["pyre_object::w_str_compute_index_storage"],
+            compute_index_addr
+        );
 
         let obj_hint = pyre_object::listobject::__majit_call_target_ll_list_obj_resize_hint_really
             as *const () as usize as i64;

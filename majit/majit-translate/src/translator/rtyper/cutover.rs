@@ -2096,6 +2096,21 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     if canonical_strip == ["nonconst", "non_constant"] {
         return Some("skip-nonconst-extregistry-entry");
     }
+    // `rlib/jit.py ConditionalCallEntry` is an ExtRegistry object
+    // (`_about_ = _jit_conditional_call, _jit_conditional_call_value`),
+    // not a graph. The residual `majit_rlib::jit::conditional_call*`
+    // bodies are the interpreter fallback (`if condition: function(*args)`
+    // / `if value is NULL: function(*args)`). Lifting them lets the
+    // annotator type `function(a)` as an ll funcptr call, which rejects a
+    // high-level Instance argument. With no registry entry the callsite
+    // reaches the HOST_ENV builtin (`translate_op` Layer-3b), whose
+    // analyzer is `jit_conditional_call` / `jit_conditional_call_elidable`
+    // and whose typer emits `jit_conditional_call` /
+    // `jit_conditional_call_value`. Canonical strip is `["jit", leaf]`
+    // after `canonical_dedup_key` drops the `majit_rlib` crate root.
+    if is_jit_conditional_call_residual(canonical_strip) {
+        return Some(SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY);
+    }
     // `core::ptr::copy_nonoverlapping` is an opaque foreign decl. Layer-1
     // `call_registry.lookup` beats `host_env_callable`, so a registered
     // user graph is the callee: its empty body still `mergeinputargs`s
@@ -2114,6 +2129,33 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
 
 /// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
 const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
+
+/// [`registration_decline`] reason for `rlib/jit.py ConditionalCallEntry`.
+const SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY: &str = "skip-jit-conditional-call-extregistry";
+
+/// Residual `majit_rlib::jit::conditional_call0..4` /
+/// `conditional_call_elidable1`. `canonical_dedup_key` strips the crate
+/// root only when `majit_rlib` is a seeded local crate, so both
+/// `["jit", leaf]` and `["majit_rlib", "jit", leaf]` name the same
+/// HOST_ENV / `BUILTIN_ANALYZERS` entry.
+fn is_jit_conditional_call_residual(canonical_strip: &[String]) -> bool {
+    let leaf = match canonical_strip {
+        [crate_name, module, leaf] if crate_name == "majit_rlib" && module == "jit" => {
+            leaf.as_str()
+        }
+        [module, leaf] if module == "jit" => leaf.as_str(),
+        _ => return false,
+    };
+    matches!(
+        leaf,
+        "conditional_call0"
+            | "conditional_call1"
+            | "conditional_call2"
+            | "conditional_call3"
+            | "conditional_call4"
+            | "conditional_call_elidable1"
+    )
+}
 
 /// Publish what the source callable of `graph` declares about its result
 /// on its registry entry.
@@ -5264,6 +5306,212 @@ mod tests {
                 "unsafe stub still registered for {segments:?}"
             );
         }
+    }
+
+    /// Residual `majit_rlib::jit::conditional_call*` bodies are
+    /// `ConditionalCallEntry`, not graphs. Layer-1 would otherwise beat
+    /// HOST_ENV and the annotator would walk `function(a)` as an ll
+    /// funcptr call.
+    #[test]
+    fn conditional_call_residuals_are_declined_and_host_env_wins() {
+        let leaves = [
+            "conditional_call0",
+            "conditional_call1",
+            "conditional_call2",
+            "conditional_call3",
+            "conditional_call4",
+            "conditional_call_elidable1",
+        ];
+        for leaf in leaves {
+            assert_eq!(
+                registration_decline(&["jit".into(), leaf.into()]),
+                Some(SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY),
+                "{leaf}"
+            );
+            assert_eq!(
+                registration_decline(&["majit_rlib".into(), "jit".into(), leaf.into()]),
+                Some(SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY),
+                "majit_rlib::jit::{leaf}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["jit".into(), "we_are_jitted".into()]),
+            None
+        );
+        assert_eq!(
+            registration_decline(&["majit_rlib".into(), "jit".into(), "we_are_jitted".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for leaf in leaves {
+            let path = crate::parse::CallPath::from_segments(["majit_rlib", "jit", leaf]);
+            let mut graph = LegacyGraph::new(leaf);
+            graph.set_return(graph.startblock, None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for leaf in leaves {
+            let key = FunctionPathKey::from_segments(["majit_rlib", "jit", leaf]);
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {leaf}"
+            );
+            let host = crate::flowspace::model::host_env_callable(
+                &["majit_rlib", "jit", leaf]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| panic!("HOST_ENV must resolve majit_rlib.jit.{leaf}"));
+            assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        }
+    }
+
+    /// Annotate + rtype a caller of `conditional_call_elidable1` with a
+    /// high-level Instance callback argument and a fn-const. Walking the
+    /// residual body would reject the Instance as an ll funcptr argument;
+    /// the HOST_ENV builtin emits `jit_conditional_call_value`.
+    #[test]
+    fn conditional_call_elidable1_instance_arg_emits_value_llop() {
+        let _lock = anchor_lock();
+        use crate::flowspace::model::{ConstValue, Constant, GraphFunc, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, GCREF};
+
+        let bookkeeper = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        let registry = CallRegistry::new(bookkeeper);
+
+        let callback_key = FunctionPathKey::from_segments(["dummy_compute"]);
+        let ret = crate::flowspace::model::Variable::new();
+        ret.annotation.replace(Some(std::rc::Rc::new(
+            crate::annotator::model::SomeValue::Impossible,
+        )));
+        ret.set_concretetype(Some(GCREF.clone()));
+        let startblock = crate::flowspace::model::Block::shared(vec![]);
+        let func = GraphFunc::new(
+            "dummy_compute",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let pygraph = std::rc::Rc::new(crate::flowspace::pygraph::PyGraph {
+            graph: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::flowspace::model::FunctionGraph::with_return_var(
+                    "dummy_compute",
+                    startblock,
+                    Hlvalue::Variable(ret),
+                ),
+            )),
+            func,
+            signature: std::cell::RefCell::new(Signature::new(vec!["obj".into()], None, None)),
+            defaults: std::cell::RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        registry
+            .register_callee(
+                callback_key,
+                Signature::new(vec!["obj".into()], None, None),
+                pygraph,
+            )
+            .set_declared_funcptr_type(FuncType {
+                args: vec![GCREF.clone()],
+                result: GCREF.clone(),
+            });
+
+        let mut graph = LegacyGraph::new("get_index_storage");
+        let vars = mint_vars(&mut graph, 5);
+        let v_value = vars[1].clone();
+        let v_arg = vars[2].clone();
+        let v_fn = vars[3].clone();
+        let v_out = vars[4].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![
+                crate::model::SpaceOperation {
+                    result: Some(v_value.clone()),
+                    kind: crate::model::OpKind::Input {
+                        name: "value".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some("GCREF".into()),
+                    },
+                },
+                crate::model::SpaceOperation {
+                    result: Some(v_arg.clone()),
+                    kind: crate::model::OpKind::Input {
+                        name: "arg".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                },
+                crate::model::SpaceOperation {
+                    result: Some(v_fn.clone()),
+                    kind: crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec![
+                                crate::model::FN_CONST_HEAD.into(),
+                                "dummy_compute".into(),
+                            ],
+                            fun_decl_id: None,
+                        },
+                        args: vec![],
+                        result_ty: ValueType::Int,
+                    },
+                },
+                crate::model::SpaceOperation {
+                    result: Some(v_out.clone()),
+                    kind: crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec![
+                                "majit_rlib".into(),
+                                "jit".into(),
+                                "conditional_call_elidable1".into(),
+                            ],
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![
+                            v_value.clone(),
+                            v_fn.clone(),
+                            v_arg.clone(),
+                        ]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v_out.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let (flow, _value_to_var, _, _, _) = drive_subject(&graph, &registry, true)
+            .expect("instance-arg value helper must annotate and rtype through the builtin");
+        let opnames: Vec<String> = flow
+            .borrow()
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| block.borrow().operations.clone())
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            opnames
+                .iter()
+                .any(|name| name == "jit_conditional_call_value"),
+            "rtyper must emit jit_conditional_call_value, got {opnames:?}"
+        );
     }
 
     /// A registry whose one funcobj, `owner::flagged`, has an annotator

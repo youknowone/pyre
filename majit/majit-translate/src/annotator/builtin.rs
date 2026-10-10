@@ -65,7 +65,7 @@ use super::description::DescEntry;
 use super::model::{
     AnnotatorError, SomeBool, SomeByteArray, SomeChar, SomeDict, SomeFloat, SomeInstance,
     SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeUnicodeCodePoint,
-    SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none, union,
+    SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none, union, unionof,
 };
 use crate::flowspace::model::ConstValue;
 
@@ -460,6 +460,13 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         &mut reg,
         "majit_rlib.jit.conditional_call4",
         jit_conditional_call,
+    );
+    // `rlib/jit.py ConditionalCallEntry.compute_result_annotation` for
+    // `_jit_conditional_call_value`.
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call_elidable1",
+        jit_conditional_call_elidable,
     );
     // `rlib/jit.py` — the `hint` ExtRegistryEntry's
     // `compute_result_annotation`, the one place upstream MINTS
@@ -2176,6 +2183,56 @@ fn jit_conditional_call(
     Ok(super::model::s_none())
 }
 
+/// `rlib/jit.py ConditionalCallEntry.compute_result_annotation` for
+/// `_jit_conditional_call_value`:
+///
+/// ```python
+/// s_res = self.bookkeeper.emulate_pbc_call(self.bookkeeper.position_key,
+///                                          args_s[1], args_s[2:])
+/// return annmodel.unionof(s_res, args_s[0].nonnoneify())
+/// ```
+///
+/// Pyre's fn-const is `SomePtr(FuncType)` rather than always `SomePBC`.
+/// A `Ptr(FuncType)` takes RESULT via `lltype_to_annotation`.
+fn jit_conditional_call_elidable(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    use super::bookkeeper::EmulatedPbcCallKey;
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+    let s_value = arg_at(args_s, 0, "jit.conditional_call_elidable").clone();
+    let s_fn = arg_at(args_s, 1, "jit.conditional_call_elidable");
+    let s_res = match s_fn {
+        SomeValue::PBC(_) => {
+            let unique_key = match bk.current_position_key() {
+                Some(pk) => EmulatedPbcCallKey::Position(pk),
+                None => EmulatedPbcCallKey::Text("jit.conditional_call_elidable".to_string()),
+            };
+            let call_args: Vec<SomeValue> = (2..args_s.len())
+                .map(|i| arg_at(args_s, i, "jit.conditional_call_elidable").clone())
+                .collect();
+            bk.emulate_pbc_call(unique_key, s_fn, &call_args, &[], None)?
+        }
+        SomeValue::Ptr(sp) => match &sp.ll_ptrtype.TO {
+            PtrTarget::Func(ft) => lltype_to_annotation(ft.result.clone()),
+            other => {
+                return Err(AnnotatorError::new(format!(
+                    "conditional_call_elidable: function arg is SomePtr but not a FuncType, got {other:?}"
+                )));
+            }
+        },
+        other => {
+            return Err(AnnotatorError::new(format!(
+                "conditional_call_elidable: function arg should be SomePBC or SomePtr(FuncType), got {other:?}"
+            )));
+        }
+    };
+    unionof([&s_res, &s_value.nonnoneify()]).map_err(|e| AnnotatorError::new(e.to_string()))
+}
+
 /// Analyzer for Rust primitive type `From` / `TryFrom` impls
 /// (`u32::from`, `i64::from`, `i64::try_from`, `usize::try_from`).
 /// All return integer values (the target primitive); `TryFrom` returns
@@ -2975,6 +3032,49 @@ mod tests {
         HashMap::new()
     }
 
+    /// `ConditionalCallEntry.compute_result_annotation` for
+    /// `_jit_conditional_call` is void.
+    #[test]
+    fn jit_conditional_call_annotates_s_none() {
+        let out = jit_conditional_call(&bk(), &[], &no_kwds()).unwrap();
+        assert!(
+            matches!(out, SomeValue::None_(_)),
+            "void conditional_call must be s_None, got {out:?}"
+        );
+    }
+
+    /// `ConditionalCallEntry.compute_result_annotation` for
+    /// `_jit_conditional_call_value` unions the callee result with
+    /// `args_s[0].nonnoneify()`.
+    #[test]
+    fn jit_conditional_call_elidable_unions_callee_result_and_value() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget, SomePtr,
+        };
+
+        let s_value = SomeValue::Integer(SomeInteger::new(true, false));
+        let s_fn = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        }));
+        let s_arg = SomeValue::Integer(SomeInteger::new(false, false));
+        let out = jit_conditional_call_elidable(
+            &bk(),
+            &[Some(s_value), Some(s_fn), Some(s_arg)],
+            &no_kwds(),
+        )
+        .unwrap();
+        match out {
+            SomeValue::Integer(i) => assert!(
+                !i.nonneg,
+                "union of nonneg value and maybe-neg callee result drops nonneg"
+            ),
+            other => panic!("expected SomeInteger union, got {other:?}"),
+        }
+    }
+
     #[test]
     fn malloc_typed_rejects_classdef_less_instance() {
         // lltype.py `malloc(T)`: only `isinstance(T, Struct)` is
@@ -3017,6 +3117,8 @@ mod tests {
         assert!(is_registered("object.__init__"));
         assert!(is_registered("sys.getdefaultencoding"));
         assert!(is_registered("rarithmetic.intmask"));
+        assert!(is_registered("majit_rlib.jit.conditional_call1"));
+        assert!(is_registered("majit_rlib.jit.conditional_call_elidable1"));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
         assert!(is_registered("weakref.ref"));
         assert!(is_registered("pdb.set_trace"));

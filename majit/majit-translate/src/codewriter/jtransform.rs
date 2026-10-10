@@ -20713,6 +20713,189 @@ mod tests {
         assert_eq!(args_i, vec![x, y]);
     }
 
+    /// `rlib/jit.py conditional_call` harvested as
+    /// `oopspec("jit.conditional_call")`. Argument order is
+    /// `(condition, funcptr, args)`, matching `_rewrite_op_cond_call`.
+    #[test]
+    fn jit_conditional_call_rlib_helper_rewrites_to_conditional_call() {
+        let helper_path =
+            crate::parse::CallPath::from_segments(["majit_rlib", "jit", "conditional_call1"]);
+        let helper_target = CallTarget::function_path(["majit_rlib", "jit", "conditional_call1"]);
+        let callee_target = CallTarget::function_path([
+            crate::model::FN_CONST_HEAD,
+            "pyre_object",
+            "listobject",
+            "ll_list_int_resize_hint_really",
+        ]);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(helper_path, "jit.conditional_call".to_string());
+
+        let mut graph = FunctionGraph::new("resize_ge");
+        let cond = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&cond, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&arg, ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, cond.clone());
+        graph.push_inputarg_var(graph.startblock, arg.clone());
+
+        let startblock = graph.startblock;
+        let func_var = graph
+            .push_op_var(
+                startblock,
+                OpKind::Call {
+                    target: callee_target,
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target: helper_target,
+                args: crate::model::call_args(vec![cond.clone(), func_var, arg.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let found = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ConditionalCall {
+                    condition,
+                    funcptr,
+                    args_r,
+                    ..
+                } => Some((condition.clone(), funcptr.clone(), args_r.clone())),
+                _ => None,
+            })
+            .expect("jit.conditional_call must lower to ConditionalCall");
+        assert_eq!(found.0, cond);
+        match found.1 {
+            CallTarget::FunctionPath { segments, .. } => {
+                assert_eq!(
+                    segments,
+                    [
+                        "pyre_object",
+                        "listobject",
+                        "ll_list_int_resize_hint_really"
+                    ]
+                );
+            }
+            other => panic!("expected stripped function path, got {other:?}"),
+        }
+        assert_eq!(found.2, vec![arg]);
+    }
+
+    /// `rlib/jit.py conditional_call_elidable` harvested as
+    /// `oopspec("jit.conditional_call_value")`. Argument order is
+    /// `(value, funcptr, args)`, matching `_rewrite_op_cond_call`.
+    #[test]
+    fn jit_conditional_call_value_rlib_helper_rewrites_to_conditional_call_value() {
+        let helper_path = crate::parse::CallPath::from_segments([
+            "majit_rlib",
+            "jit",
+            "conditional_call_elidable1",
+        ]);
+        let helper_target =
+            CallTarget::function_path(["majit_rlib", "jit", "conditional_call_elidable1"]);
+        let callee_target = CallTarget::function_path([
+            crate::model::FN_CONST_HEAD,
+            "pyre_object",
+            "unicodeobject",
+            "w_str_compute_index_storage",
+        ]);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(helper_path, "jit.conditional_call_value".to_string());
+
+        let mut graph = FunctionGraph::new("get_index_storage");
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&value, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&arg, ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, value.clone());
+        graph.push_inputarg_var(graph.startblock, arg.clone());
+
+        let startblock = graph.startblock;
+        let func_var = graph
+            .push_op_var(
+                startblock,
+                OpKind::Call {
+                    target: callee_target,
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target: helper_target,
+                args: crate::model::call_args(vec![value.clone(), func_var, arg.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result_var);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let found = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ConditionalCallValue {
+                    value: v,
+                    funcptr,
+                    args_r,
+                    result_kind,
+                    ..
+                } => Some((v.clone(), funcptr.clone(), args_r.clone(), *result_kind)),
+                _ => None,
+            })
+            .expect("jit.conditional_call_value must lower to ConditionalCallValue");
+        assert_eq!(found.0, value);
+        match found.1 {
+            CallTarget::FunctionPath { segments, .. } => {
+                assert_eq!(
+                    segments,
+                    [
+                        "pyre_object",
+                        "unicodeobject",
+                        "w_str_compute_index_storage"
+                    ]
+                );
+            }
+            other => panic!("expected stripped function path, got {other:?}"),
+        }
+        assert_eq!(found.2, vec![arg]);
+        assert_eq!(found.3, 'r');
+    }
+
     /// `rpython/jit/codewriter/jtransform.py rewrite_op_hint`
     /// `promote=True` branch: emits `[-live-, <kind>_guard_value(x),
     /// None]` where the `None` sentinel aliases the result back to the

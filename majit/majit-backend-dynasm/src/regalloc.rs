@@ -746,7 +746,8 @@ use crate::x86::regalloc as arch_regalloc;
 
 use arch_regalloc::{
     MALLOC_NURSERY_CLOBBER, MALLOC_NURSERY_RESULT, all_core_regs, all_float_regs, call_result_fpr,
-    call_result_gpr, core_reg_index, frame_reg, save_around_call_core_regs,
+    call_result_gpr, cond_call_argument_regs, core_reg_index, frame_reg,
+    save_around_call_core_regs,
 };
 
 // Per-arch reghint pass.  Upstream RPython ships reghint only under
@@ -3136,7 +3137,7 @@ impl<'a> RegAlloc<'a> {
             }
             OpCode::CondCallN => self.consider_cond_call_n(args, i, output),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
+                self.consider_cond_call_value_j2(dst, args, op, i, output);
             }
             OpCode::CallMallocNursery | OpCode::CallMallocNurseryHeaderless => {
                 self.consider_call_malloc_nursery_j2(dst, args, i, output)
@@ -3655,7 +3656,8 @@ impl<'a> RegAlloc<'a> {
                 self.consider_cond_call_n(&args, i, output);
             }
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.consider_raw_call_like(op, i, output, SAVE_DEFAULT_REGS);
+                let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+                self.consider_cond_call_value_j2(Some(op.pos().get()), &args, op, i, output);
             }
 
             // ── Allocation ──
@@ -6843,6 +6845,62 @@ impl<'a> RegAlloc<'a> {
             self.preserve_for_zero_array_memset();
         }
         self.perform_discard(i, locs, output);
+    }
+
+    /// aarch64/regalloc.py `_prepare_op_cond_call` / `prepare_op_cond_call_value_i`
+    /// (`prepare_op_cond_call_value_r` is the same) and x86/regalloc.py
+    /// `consider_cond_call` (aliased as `consider_cond_call_value_i` / `_r`).
+    ///
+    /// Extra args (from index 2) go into `argument_regs`. The result shares
+    /// args[0]'s register via `force_result_in_reg` (`forbidden_vars=args[2:]`).
+    /// Arglocs are `[argloc, resloc]`; the callee address stays an Immed on
+    /// the op. The helper returns a plain word — no `before_call` / raw-call
+    /// result-in-x0 rewrite.
+    fn consider_cond_call_value_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        Self::check_cond_call_value_descr_arity(op, args.len());
+        assert!(
+            (2..=6).contains(&args.len()),
+            "COND_CALL_VALUE takes 0..=4 extra arguments (aarch64/regalloc.py _prepare_op_cond_call)"
+        );
+        let argument_regs = cond_call_argument_regs();
+        let mut args_so_far: Vec<OpRef> = Vec::new();
+        for (j, &arg) in args.iter().enumerate().skip(2) {
+            let reg = argument_regs[j - 2];
+            self.make_sure_var_in_reg(arg, self.tp(arg), &args_so_far, Some(reg), false);
+            args_so_far.push(arg);
+        }
+        let value = args[0];
+        let argloc = self.make_sure_var_in_reg(value, self.tp(value), &args_so_far, None, false);
+        let result_v = dst.unwrap_or(op.pos().get());
+        let forbidden: Vec<OpRef> = args.iter().skip(2).copied().collect();
+        let resloc = self.rm.force_result_in_reg(
+            result_v,
+            value,
+            self.tp(value),
+            &forbidden,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        let res_reg = match resloc {
+            Loc::Reg(r) => r,
+            other => panic!(
+                "force_result_in_reg must return a register (aarch64/regalloc.py _prepare_op_cond_call), got {other:?}"
+            ),
+        };
+        // aarch64/opassembler.py `_emit_op_cond_call`:
+        // `gcmap = self._regalloc.get_gcmap([res_loc])` — exclude the result
+        // register; on the miss path it is overwritten with the helper word.
+        let gcmap = self.get_gcmap(&[res_reg], false) as usize;
+        self.perform_with_gcmap_ptr(i, [argloc, resloc], Some(resloc), gcmap, output);
     }
 
     /// `aarch64/opassembler.py _emit_op_cond_call`:

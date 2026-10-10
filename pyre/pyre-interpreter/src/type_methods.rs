@@ -1776,15 +1776,12 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `__index__` arm stays on the residual because that call is a whole-body
 /// blocker. The byte window is [`prefix_byte_window`]. `_index_to_byte` is
 /// needed only for a bound strictly inside the string, and its `is_ascii()`
-/// arm is the identity. A non-ASCII receiver with such a bound is declined:
-/// the other arm builds the `rutf8` table through `dont_look_inside`, which
-/// the same whole-body scan would pull into this graph. A default window
-/// never calls `_index_to_byte` — `start` stays 0 and `end` stays
-/// `len(_utf8)` — so it is traced for every encoding.
-///
-/// Nothing here can collect, so no argument needs rooting — which is what
-/// lets the descent reach [`str_prefix_match_one`]'s `@jit.elidable` match
-/// with no un-lowered call and no executed effect before it.
+/// arm is the identity. A default window never calls `_index_to_byte` —
+/// `start` stays 0 and `end` stays `len(_utf8)` — so it is traced for every
+/// encoding. A non-ASCII interior bound goes through the same look-inside
+/// `_index_to_byte`: `getfield index_storage` plus `conditional_call_value`
+/// (miss residual `_compute_index_storage`) then the elidable
+/// `codepoint_position_at_index`.
 fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjectRef, i64, i64)> {
     // `startswith(prefix[, start[, end]])` behind the receiver.  A keyword
     // argument rides the same slice as a trailing marker dict, which is
@@ -1800,11 +1797,18 @@ fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjec
     let byte_len = unsafe { pyre_object::w_str_byte_len(w_self) } as i64;
     let start = str_traced_codepoint_bound(args, 2, 0, length)?;
     let end = str_traced_codepoint_bound(args, 3, length, length)?;
-    let needs_index = (start > 0 && start <= length) || end < length;
-    if needs_index && unsafe { !pyre_object::w_str_is_ascii(w_self) } {
-        return None;
-    }
-    let (start_index, end_index) = prefix_byte_window(length, byte_len, start, end, start, end);
+    let start_byte = if start > 0 && start <= length {
+        unsafe { pyre_object::w_str_index_to_byte(w_self, start as usize) as i64 }
+    } else {
+        0
+    };
+    let end_byte = if end < length {
+        unsafe { pyre_object::w_str_index_to_byte(w_self, end as usize) as i64 }
+    } else {
+        0
+    };
+    let (start_index, end_index) =
+        prefix_byte_window(length, byte_len, start, end, start_byte, end_byte);
     let w_needle = args[1];
     if unsafe { !pyre_object::is_str(w_needle) } {
         return None;
