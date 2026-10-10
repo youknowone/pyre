@@ -340,15 +340,30 @@ mod tests {
         }
         let pool_addr = pool_addr.expect("float bits must live in the machine data block");
         // `Assembler386.mov` consumes that `ConstFloatLoc`: `MOVSD_xj` when
-        // the address fits disp32, otherwise `MOV_ri` of the address plus
-        // `MOVSD_xm`.
+        // the address fits disp32, otherwise `_addr_as_reg_offset` plus
+        // `MOVSD_xm`. `_addr_as_reg_offset` either loads the address with
+        // `MOV_ri` or reuses an r11 value set earlier (`MOV_ri r11, base`)
+        // with the difference as disp32.
         let addr_i = pool_addr as i64;
         let referenced = if addr_i == addr_i as i32 as i64 {
             let disp = (addr_i as i32).to_le_bytes();
             code.windows(4).any(|window| window == disp)
         } else {
-            let imm = (pool_addr as u64).to_le_bytes();
-            code.windows(8).any(|window| window == imm)
+            code.windows(10).enumerate().any(|(pos, window)| {
+                // `MOV_ri r11, imm64`: REX.W+B `0x49`, `0xBB`.
+                if window[..2] != [0x49, 0xbb] {
+                    return false;
+                }
+                let base = i64::from_le_bytes(window[2..].try_into().unwrap());
+                let offset = addr_i.wrapping_sub(base);
+                if offset == 0 {
+                    return true;
+                }
+                offset == offset as i32 as i64
+                    && code[pos + 10..]
+                        .windows(4)
+                        .any(|disp| disp == (offset as i32).to_le_bytes())
+            })
         };
         assert!(
             referenced,
