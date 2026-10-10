@@ -1084,6 +1084,118 @@ pub(crate) fn fbw_obj_cell_store_journal_push(
     fbw_bump_executed_effect("cell_store_journal");
 }
 
+/// Record the word a walked `setfield_gc` / `setarrayitem_gc` is about to
+/// overwrite in an object the walk did not allocate
+/// ([`FbwCellStore::Gc`]).
+pub(crate) fn fbw_gc_store_journal_push(
+    obj: pyre_object::PyObjectRef,
+    offset: usize,
+    size: usize,
+    before: Value,
+    op_count: u32,
+) {
+    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8);
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-gc-store-journal] push obj=0x{:x} offset={offset} size={size} before={before:?} managed={managed}",
+            obj as usize
+        );
+    }
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        j.borrow_mut().push(FbwCellStore::Gc {
+            obj,
+            offset,
+            size,
+            before,
+            managed,
+            op_count,
+        })
+    });
+    fbw_bump_executed_effect("gc_store_journal");
+}
+
+/// [`majit_metainterp::trace_ctx::TraceCtx::cut_observer`] for the walker:
+/// undo every journaled [`FbwCellStore::Gc`] store whose op the cut to `pos`
+/// discarded, newest first.
+///
+/// A descent that declines is cut back and its call handed to a residual,
+/// which executes the callee's body from the top.  The stores the descent had
+/// already executed are in that body, so leaving them in place makes the
+/// residual read its own output (`length = length + 1` twice).  The odometer
+/// comes back with them: what is undone here was not applied.
+pub(crate) fn fbw_gc_store_journal_cut(pos: &majit_metainterp::recorder::TracePosition) {
+    let mut undone = 0usize;
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        let mut i = entries.len();
+        while i > 0 {
+            i -= 1;
+            if matches!(entries[i], FbwCellStore::Gc { op_count, .. } if op_count > pos._count) {
+                undo_cell_store_entry(entries.remove(i));
+                undone += 1;
+            }
+        }
+    });
+    fbw_unbump_executed_effects(undone);
+}
+
+/// Keep, without an undo entry, the journaled stores into `obj` pushed since
+/// `mark`.
+///
+/// A FOR_ITER consume is the one walked effect a non-committing walk does not
+/// put back: the consumed item is delivered to the frame instead
+/// ([`FBW_FORITER_INFLIGHT`]), which is only right while the iterator stays
+/// advanced.  The cursor stores the descended `next` body executed are that
+/// advance, so they leave the journal — and the odometer, which the delivery
+/// gate reads as "the body applied something" — the way the residual
+/// `for_iter_next` never entered them.
+pub(crate) fn fbw_gc_store_journal_keep_since(
+    mark: FbwEffectJournalMark,
+    obj: pyre_object::PyObjectRef,
+) {
+    let mut kept = 0usize;
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        let mut i = entries.len();
+        while i > mark.cells {
+            i -= 1;
+            if matches!(entries[i], FbwCellStore::Gc { obj: stored, .. } if stored == obj) {
+                entries.remove(i);
+                kept += 1;
+            }
+        }
+    });
+    fbw_unbump_executed_effects(kept);
+}
+
+/// Write `value` into the `size`-byte word at `obj + offset`, the store
+/// `bh_setfield_gc_*` / `bh_setarrayitem_gc_*` perform.  `false` for a width
+/// the value's bank has no store for.
+///
+/// # Safety
+/// `obj + offset` names a live `size`-byte field or array item of `obj`.
+pub(crate) unsafe fn fbw_gc_store_word(
+    obj: pyre_object::PyObjectRef,
+    offset: usize,
+    size: usize,
+    value: Value,
+    managed: bool,
+) -> bool {
+    let addr = unsafe { (obj as *mut u8).add(offset) };
+    match value {
+        Value::Int(v) if matches!(size, 1 | 2 | 4 | 8) => unsafe { raw_store_int(addr, size, v) },
+        Value::Float(v) if size == 8 => unsafe { addr.cast::<f64>().write_unaligned(v) },
+        Value::Ref(r) if size == std::mem::size_of::<usize>() => {
+            unsafe { addr.cast::<usize>().write_unaligned(r.0) };
+            if managed {
+                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Record the namespace binding a `*_NAME` / `*_GLOBAL` residual is about to
 /// overwrite, so a walk that hands its region back to the replay can put it
 /// back ([`FBW_NAMESPACE_STORE_JOURNAL`]).  `displaced` is null when the name is
@@ -1565,6 +1677,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
             || stack[at].body_completed
             || fbw_store_journal_len() != 0
             || FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) != 0
+            || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
             || fbw_has_unjournaled_effect()
         {
             return None;
@@ -1600,6 +1713,7 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
             && !stack[at].body_effect_since_consume
             && fbw_store_journal_len() == 0
             && FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()) == 0
+            && FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) == 0
             && !fbw_has_unjournaled_effect()
     })
 }
@@ -2412,6 +2526,22 @@ fn undo_cell_store_entry(entry: FbwCellStore) {
                 // `before` needs its own barrier.
                 pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8);
                 (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
+            }
+            FbwCellStore::Gc {
+                obj,
+                offset,
+                size,
+                before,
+                managed,
+                ..
+            } => {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-gc-store-journal] rollback obj=0x{:x} offset={offset} -> {before:?}",
+                        obj as usize
+                    );
+                }
+                let _ = fbw_gc_store_word(obj, offset, size, before, managed);
             }
         }
     }

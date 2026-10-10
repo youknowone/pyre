@@ -2925,6 +2925,9 @@ impl TraceCtx {
     /// regresses bench (tested under ).
     pub fn cut_trace(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
+        if let Some(observer) = self.cut_observer {
+            observer(&pos);
+        }
     }
 
     /// Restore both recorded operations and snapshots to a saved position.
@@ -2941,6 +2944,9 @@ impl TraceCtx {
             self.snapshots.clear();
         } else {
             self.snapshots.truncate(pos.snapshot_data_len);
+        }
+        if let Some(observer) = self.cut_observer {
+            observer(&pos);
         }
     }
 

@@ -10200,6 +10200,7 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let journal_mark = fbw_effect_journal_mark();
     let index_before = unsafe { pyre_object::w_list_iter_index(iter_obj) };
     let seq_before = unsafe { pyre_object::w_list_iter_seq(iter_obj) };
     // A new consume completes the previous in-flight iteration before this
@@ -10244,38 +10245,37 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    // `setfield_gc` into a pre-existing iterator is record-only. The helper
-    // body is the concrete `descr_next`, so the cursor has to move once here
-    // or the traced item is consumed again when the loop is closed.
+    // The walked `setfield_gc` moved the cursor as it was recorded; the
+    // stores below are for a body whose store the walk could not execute.
     let iter_now = walker_concrete_ref_object(ctx, iter_op).unwrap_or(iter_obj);
+    fbw_gc_store_journal_keep_since(journal_mark, iter_now);
     let index_after = unsafe { pyre_object::w_list_iter_index(iter_now) };
     let seq_after = unsafe { pyre_object::w_list_iter_seq(iter_now) };
     let cursor_unchanged = seq_after == seq_before && index_after == index_before;
-    if let Some(item) = walker_concrete_ref_object(ctx, result)
-        && !item.is_null()
+    let item = walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null());
+    // Exhaustion (`list_iter_stop`, index >= 0).  A negative `__setstate__`
+    // cursor stays attached; that arm returns null without the store.
+    let exhausted = item.is_none()
+        && matches!(
+            ctx.trace_ctx.concrete_of_opref(result),
+            Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+        );
+    // The store the body recorded, for a walk that could not execute it.
+    let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
+    // A kept store has no undo entry, so the bridge cursor snapshot is the
+    // only way back for a walk that aborts with its delivery refused; it is
+    // taken from the pre-walk pair whichever side moved the cursor.
+    if ctx.trace_ctx.is_bridge_trace
+        && (!cursor_unchanged || (replay && (item.is_some() || exhausted)))
     {
-        if cursor_unchanged && !seq_before.is_null() && index_before >= 0 {
-            if ctx.trace_ctx.is_bridge_trace {
-                fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
-            }
+        fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
+    }
+    if let Some(item) = item {
+        if replay {
             unsafe { pyre_object::w_list_iter_set_index(iter_now, index_before + 1) };
         }
         fbw_foriter_inflight_capture(item, body, true);
-    } else if matches!(
-        ctx.trace_ctx.concrete_of_opref(result),
-        Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
-    ) && cursor_unchanged
-        && !seq_before.is_null()
-        && index_before >= 0
-    {
-        // Exhaustion (`list_iter_stop`, index >= 0). `setfield_gc` into this
-        // pre-existing iterator is record-only, same as the index store above,
-        // so the clear the body recorded has to land on the live cursor too.
-        // A negative `__setstate__` cursor stays attached; that arm returns
-        // null without the store.
-        if ctx.trace_ctx.is_bridge_trace {
-            fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
-        }
+    } else if exhausted && replay {
         unsafe { pyre_object::w_list_iter_set_seq(iter_now, pyre_object::PY_NULL) };
     }
     Ok(Some(result))
@@ -19254,6 +19254,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         return Ok(None);
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let journal_mark = fbw_effect_journal_mark();
     ctx.trace_ctx
         .set_opref_concrete(iter_op, Value::Ref(majit_ir::GcRef(iter_obj as usize)));
     let walk = run_orthodox_helper_subwalk(
@@ -19305,9 +19306,11 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
-    // The walked body records the compare, the store and the box. The
-    // concrete field store does not reach the live iterator, so run the
-    // same step once when the cursor is still the pre-iteration value.
+    // The walked body records the compare, the store and the box, and its
+    // field stores moved the live cursor.  Run the same step once for a walk
+    // that could not execute them, i.e. while the cursor is still the
+    // pre-iteration value.
+    fbw_gc_store_journal_keep_since(journal_mark, iter_obj);
     if concrete_continues {
         let (after, _, _) = unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
         if after == concrete_current {

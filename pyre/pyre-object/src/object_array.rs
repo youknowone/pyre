@@ -724,16 +724,13 @@ pub unsafe fn grow_instance_items_block(
 ) -> *mut ItemsBlock {
     unsafe {
         let _roots = crate::gc_roots::push_roots();
+        // A null `old` is pinned too: the slot holds the null word, which no
+        // collection rewrites, and every path then leaves the bracket at one
+        // depth.
         let old_slot = crate::gc_roots::shadow_stack_len();
-        if !old.is_null() {
-            let _ = crate::gc_roots::pin_root(old as PyObjectRef);
-        }
+        let _ = crate::gc_roots::pin_root(old as PyObjectRef);
         let fresh = alloc_mapdict_storage_block(new_cap);
-        let old = if old.is_null() {
-            old
-        } else {
-            crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock
-        };
+        let old = crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock;
         let new_base = items_block_items_base(fresh);
         let copy = live_len.min(new_cap);
         if !old.is_null() && copy > 0 {
@@ -923,9 +920,48 @@ pub unsafe fn grow_list_items_block_gc(
     new_cap: usize,
     live_len: usize,
 ) -> *mut ItemsBlock {
+    // rlist.py `_ll_list_resize_really`:
+    //   newitems = malloc(LIST.items.TO, new_allocated)
+    //   rgc.ll_arraycopy(items, newitems, 0, 0, p)
+    // `items` is a livevar across the malloc.
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(old as PyObjectRef);
+    let newitems = unsafe { ll_new_items_array(new_cap as i64) };
+    if live_len > 0 {
+        let _ = roots.pin_root(newitems as PyObjectRef);
+        unsafe {
+            ll_arraycopy_items_block(
+                roots.get(base) as *mut ItemsBlock,
+                roots.get(base + 1) as *mut ItemsBlock,
+                0,
+                0,
+                live_len as i64,
+            );
+        }
+        return roots.get(base + 1) as *mut ItemsBlock;
+    }
+    newitems
+}
+
+/// `malloc(LIST.items.TO, count)` for the object `items` ARRAY: a zeroed
+/// `GcArray(OBJECTPTR)`.  A traced call is `new_array_clear`
+/// (`jtransform.py do_fixed_newlist`, as for `_ll_alloc_and_clear`); the body
+/// is the interpreter's allocation.
+///
+/// # Safety
+/// `count` is a non-negative capacity.
+#[inline(never)]
+#[majit_macros::oopspec("newlist_clear(count)")]
+unsafe fn ll_new_items_array(count: i64) -> *mut ItemsBlock {
+    let count = count as usize;
     unsafe {
-        try_grow_list_items_block_gc(old, new_cap, live_len)
-            .unwrap_or_else(|| items_block_alloc_failed(new_cap))
+        let (block, _) = alloc_items_block_gc(count);
+        let base = items_block_items_base(block);
+        for i in 0..count {
+            *base.add(i) = PY_NULL;
+        }
+        block
     }
 }
 
@@ -944,9 +980,7 @@ pub unsafe fn try_grow_list_items_block_gc(
         return unsafe { try_grow_items_block(old, new_cap, live_len) };
     }
     let _roots = crate::gc_roots::push_roots();
-    let old_slot = if old.is_null() {
-        None
-    } else {
+    let old_slot = {
         // Publish the old block before *any* GC hook.  In particular,
         // `try_gc_owns_object` is not a harmless predicate: its cross-thread
         // path can wait behind a collection.  Asking whether `old` was
@@ -956,10 +990,11 @@ pub unsafe fn try_grow_list_items_block_gc(
         //
         // The shadow-stack walker ignores non-GC addresses, so rooting the
         // std::alloc fallback unconditionally is both safe and removes the
-        // ownership-query safepoint entirely.
+        // ownership-query safepoint entirely.  A null `old` is pinned the
+        // same way, so every path publishes the same slots.
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
-        Some(slot)
+        slot
     };
     let new_block_slot = crate::gc_roots::shadow_stack_len();
     let (new_block, owns_new) = unsafe { try_alloc_items_block_gc(new_cap)? };
@@ -977,9 +1012,7 @@ pub unsafe fn try_grow_list_items_block_gc(
     // `l.items = newitems`. The copy's `copy_item` head is what writeanalyze
     // records as this ARRAY's read and write, so `force_from_effectinfo`
     // flushes lazy SETARRAYITEM_GC before the residual COND_CALL.
-    if let Some(old_slot) = old_slot
-        && live_len > 0
-    {
+    if !old.is_null() && live_len > 0 {
         unsafe {
             ll_arraycopy_items_block(
                 crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock,
@@ -1196,6 +1229,29 @@ pub fn items_block_alloc_failed(cap: usize) -> ! {
     )
 }
 
+/// `rlist.py _ll_prebuilt_empty_array` (`specialize:memo`): the one
+/// zero-length `GcArray(OBJECTPTR)` every empty resizable list's `items`
+/// points at (`ll_newemptylist`), so `len(l.items)` is readable on a list
+/// that holds nothing.  `OnceLock<usize>` is the process-global immortal
+/// owner the prebuilt objects use.
+static PREBUILT_EMPTY_ITEMS_BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The prebuilt empty `items` block.  The body reads the static, which the
+/// translator resolves to the registered prebuilt address, so a traced call
+/// is that constant.
+///
+/// The block is [`std_alloc_gc_array`]'s shape with capacity 0: a zeroed
+/// header, so no store barrier fires for it, and no slot, so nothing is ever
+/// stored.  It is never freed ([`dealloc_items_block`] passes it by).
+#[inline]
+pub fn ll_prebuilt_empty_items_block() -> *mut ItemsBlock {
+    *PREBUILT_EMPTY_ITEMS_BLOCK.get_or_init(|| {
+        // SAFETY: the layout is the bare `ItemsBlock` header.
+        unsafe { std_alloc_gc_array(items_block_layout(0), true) }
+            .unwrap_or_else(|| items_block_alloc_failed(0)) as usize
+    }) as *mut ItemsBlock
+}
+
 /// Deallocate an `ItemsBlock` previously allocated via
 /// [`alloc_items_block`] or [`grow_items_block`]. Phase L2: a
 /// GC-managed block (nursery / old-gen) is reclaimed by the collector
@@ -1203,7 +1259,7 @@ pub fn items_block_alloc_failed(cap: usize) -> ! {
 /// fallback ([`std_alloc_gc_array`]) goes back to the allocator.
 /// `try_gc_owns_object` discriminates the two block origins.
 unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
-    if block.is_null() {
+    if block.is_null() || block == ll_prebuilt_empty_items_block() {
         return;
     }
     if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
@@ -1443,16 +1499,11 @@ macro_rules! typed_items_block_grow {
                 // what writeanalyze records as this ARRAY's read and write, so
                 // `force_from_effectinfo` flushes lazy SETARRAYITEM_GC before
                 // the residual COND_CALL.
-                let old_root = if !old.is_null() {
-                    let slot = crate::gc_roots::shadow_stack_len();
-                    let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
-                    Some(slot)
-                } else {
-                    None
-                };
-                if let Some(old_root) = old_root
-                    && live_len > 0
-                {
+                // A null `old` is pinned too, so every path publishes the
+                // same slots.
+                let old_root = crate::gc_roots::shadow_stack_len();
+                let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
+                if !old.is_null() && live_len > 0 {
                     $arraycopy(
                         crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock,
                         crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock,
@@ -1461,7 +1512,7 @@ macro_rules! typed_items_block_grow {
                         live_len as i64,
                     );
                 }
-                if let Some(old_root) = old_root {
+                if !old.is_null() {
                     dealloc_typed_items_block(
                         crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
                     );

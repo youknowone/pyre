@@ -10976,6 +10976,22 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
                 &concrete_args,
                 &arg_types,
             );
+        } else {
+            // `do_conditional_call` runs `executor.execute_varargs` whenever
+            // the condition holds; the body after this op reads what the
+            // callee wrote.
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-cond-call] not executed pc={} funcptr={:?} args={:?}",
+                    op.pc,
+                    ctx.trace_ctx.box_value(funcptr),
+                    allboxes
+                        .iter()
+                        .map(|&b| (b, ctx.trace_ctx.box_value(b)))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            walker_gc_store_not_executed(ctx, op.pc)?;
         }
     }
     if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {
