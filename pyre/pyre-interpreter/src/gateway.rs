@@ -2267,6 +2267,24 @@ pub fn make_module_builtin_function_with_arity_and_sig(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Like [`make_module_builtin_function_with_arity_and_sig`], but keep
+/// `arity` as `fast_natural_arity` even when the signature has kw-only
+/// names.  A no-keyword call of exactly that many positionals stays on
+/// `fastcall_N` (`function.py` `nargs == fast_natural_arity`); keywords
+/// still bind through `parse_obj`.  `isclose(a, b, *, rel_tol, abs_tol)`
+/// is that shape: two positionals, kw-only tolerances, and the JIT wrapper
+/// folds the two-arg call.
+pub fn make_module_builtin_function_with_fast_arity_and_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Signature,
+) -> PyObjectRef {
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// Non-binding (`BuiltinFunction`) twin of
 /// `make_builtin_function_with_arity_and_maybe_sig`, used by the
 /// `py_module!` `inline_functions:` arm.  A module-level `#[pyre_function]`

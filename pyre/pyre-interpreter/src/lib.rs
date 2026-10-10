@@ -1049,7 +1049,8 @@ pub use gateway::{
     make_module_builtin_function, make_module_builtin_function_passthrough0,
     make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
     make_module_builtin_function_with_arity_and_sig, make_module_builtin_function_with_doc,
-    make_slot_wrapper, make_slot_wrapper_with_arity,
+    make_module_builtin_function_with_fast_arity_and_sig, make_slot_wrapper,
+    make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use loop_headers::*;
