@@ -397,6 +397,224 @@ pub(crate) fn build_malloc_slowpath_fixed(
     (buffer, ptr)
 }
 
+/// `aarch64/assembler.py _push_all_regs_to_jitframe` on a bare builder, for
+/// the per-CPU helpers that have no `AssemblerARM64`.
+fn push_all_regs_to_jitframe_raw(
+    mc: &mut Assembler,
+    ignored_regs: &[RegLoc],
+    withfloats: bool,
+    callee_only: bool,
+) {
+    let base_ofs = FIRST_ITEM_OFFSET as u32;
+    let regs: &[RegLoc] = if callee_only {
+        &crate::aarch64::registers::CALLER_RESP
+    } else {
+        all_gen_regs()
+    };
+    for (i, reg) in regs.iter().enumerate() {
+        if ignored_regs.contains(reg) {
+            continue;
+        }
+        let ofs = base_ofs + i as u32 * WORD as u32;
+        dynasm!(mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
+    }
+    if withfloats {
+        let float_base = base_ofs + all_gen_regs().len() as u32 * WORD as u32;
+        for reg in all_float_regs() {
+            let ofs = float_base + reg.value as u32 * WORD as u32;
+            dynasm!(mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
+        }
+    }
+}
+
+/// `aarch64/assembler.py _pop_all_regs_from_jitframe` on a bare builder.
+fn pop_all_regs_from_jitframe_raw(
+    mc: &mut Assembler,
+    ignored_regs: &[RegLoc],
+    withfloats: bool,
+    callee_only: bool,
+) {
+    let base_ofs = FIRST_ITEM_OFFSET as u32;
+    let regs: &[RegLoc] = if callee_only {
+        &crate::aarch64::registers::CALLER_RESP
+    } else {
+        all_gen_regs()
+    };
+    for (i, reg) in regs.iter().enumerate() {
+        if ignored_regs.contains(reg) {
+            continue;
+        }
+        let ofs = base_ofs + i as u32 * WORD as u32;
+        dynasm!(mc ; .arch aarch64 ; ldr X(reg.value), [x29, ofs]);
+    }
+    if withfloats {
+        let float_base = base_ofs + all_gen_regs().len() as u32 * WORD as u32;
+        for reg in all_float_regs() {
+            let ofs = float_base + reg.value as u32 * WORD as u32;
+            dynasm!(mc ; .arch aarch64 ; ldr D(reg.value), [x29, ofs]);
+        }
+    }
+}
+
+/// `aarch64/assembler.py _store_and_reset_exception(mc, excvalloc,
+/// exctploc)`: load `pos_exc_value` into `excvalloc` and `pos_exception`
+/// into `exctploc`, then clear both.
+fn store_and_reset_exception_raw(mc: &mut Assembler, excvalloc: RegLoc, exctploc: RegLoc) {
+    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+    crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, exc_value_addr);
+    dynasm!(mc ; .arch aarch64 ; ldr X(excvalloc.value), [x16]);
+    crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, exc_type_addr);
+    dynasm!(mc ; .arch aarch64 ; ldr X(exctploc.value), [x16]);
+    crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, exc_value_addr);
+    dynasm!(mc ; .arch aarch64 ; str xzr, [x16]);
+    crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, exc_type_addr);
+    dynasm!(mc ; .arch aarch64 ; str xzr, [x16]);
+}
+
+/// `aarch64/assembler.py _restore_exception(mc, excvalloc, exctploc)`.
+fn restore_exception_raw(mc: &mut Assembler, excvalloc: RegLoc, exctploc: RegLoc) {
+    crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, crate::jit_exc_value_addr() as i64);
+    dynasm!(mc ; .arch aarch64 ; str X(excvalloc.value), [x16]);
+    crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, crate::jit_exc_type_addr() as i64);
+    dynasm!(mc ; .arch aarch64 ; str X(exctploc.value), [x16]);
+}
+
+/// Load the byte at `[base + byteofs]` into w16 (ip0).
+fn ldrb_ip0_signed_offset(mc: &mut Assembler, base: RegLoc, byteofs: i32) {
+    if (0..4096).contains(&byteofs) {
+        let ofs = byteofs as u32;
+        dynasm!(mc ; .arch aarch64 ; ldrb W(16), [X(base.value), ofs]);
+    } else if (-256..0).contains(&byteofs) {
+        dynasm!(mc ; .arch aarch64 ; ldurb W(16), [X(base.value), byteofs]);
+    } else {
+        // Large negative offset: compute address in x16, then load
+        crate::aarch64::codebuilder::emit_mov_imm64_to(mc, 16, byteofs as i64);
+        dynasm!(mc ; .arch aarch64
+            ; add x16, X(base.value), x16
+            ; ldrb W(16), [x16]
+        );
+    }
+}
+
+/// `aarch64/assembler.py _build_wb_slowpath(withcards, withfloats,
+/// for_frame)`: the helper every `COND_CALL_GC_WB*` slow path `BL`s with
+/// the object in x0.  It saves what the call may clobber, and the card
+/// variant ends with the flag test its caller branches on.
+pub(crate) fn build_wb_slowpath(
+    withcards: bool,
+    withfloats: bool,
+    for_frame: bool,
+    arena: &Arc<AsmMemoryManager>,
+) -> Option<(codebuf::ArenaExecutableBuffer, usize)> {
+    use crate::aarch64::registers::{CALLER_RESP, CALLER_VFP_RESP, X19, X20};
+    let descr = crate::runner::dynasm_write_barrier_descr()?;
+    let func = if !withcards {
+        // `descr.get_write_barrier_fn(cpu)`. The frame takes the guarded
+        // entry, an ordinary store the one `gc.py get_write_barrier_fn`
+        // names.
+        if for_frame {
+            crate::runner::dynasm_write_barrier as *const () as i64
+        } else {
+            crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
+        }
+    } else {
+        if descr.jit_wb_cards_set == 0 {
+            return None;
+        }
+        crate::runner::dynasm_write_barrier_from_array as *const () as i64
+    };
+    //
+    // This builds a helper function called from the slow path of
+    // write barriers.  It must save all registers, and optionally
+    // all vfp registers.  It takes a single argument which is in x0.
+    // It must keep stack alignment accordingly.
+    let mut mc = Assembler::new(0);
+    let word = WORD as u32;
+    dynasm!(mc ; .arch aarch64
+        ; sub sp, sp, 2 * word
+        ; str x30, [sp]
+    );
+    let (exc0, exc1) = (X19, X20);
+    let frame_save = (CALLER_RESP.len() + 2 + CALLER_VFP_RESP.len()) as u32 * word;
+    if !for_frame {
+        push_all_regs_to_jitframe_raw(&mut mc, &[], withfloats, true);
+    } else {
+        // NOTE: don't save registers on the jitframe here!  It might
+        // override already-saved values that will be restored
+        // later...
+        //
+        // we're possibly called from the slowpath of malloc
+        // save the caller saved registers
+        // assuming we do not collect here
+        dynasm!(mc ; .arch aarch64 ; sub sp, sp, frame_save);
+        for i in (0..CALLER_RESP.len()).step_by(2) {
+            let ofs = i as u32 * word;
+            dynasm!(mc ; .arch aarch64
+                ; stp X(CALLER_RESP[i].value), X(CALLER_RESP[i + 1].value), [sp, ofs as i32]
+            );
+        }
+        let mut cur_stack = CALLER_RESP.len() as u32;
+        dynasm!(mc ; .arch aarch64
+            ; stp X(exc0.value), X(exc1.value), [sp, (cur_stack * word) as i32]
+        );
+        cur_stack += 2;
+        for reg in CALLER_VFP_RESP {
+            dynasm!(mc ; .arch aarch64 ; str D(reg.value), [sp, cur_stack * word]);
+            cur_stack += 1;
+        }
+        store_and_reset_exception_raw(&mut mc, exc0, exc1);
+    }
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, func);
+    dynasm!(mc ; .arch aarch64 ; blr x16);
+    //
+    if !for_frame {
+        pop_all_regs_from_jitframe_raw(&mut mc, &[], withfloats, true);
+    } else {
+        restore_exception_raw(&mut mc, exc0, exc1);
+        for i in (0..CALLER_RESP.len()).step_by(2) {
+            let ofs = i as u32 * word;
+            dynasm!(mc ; .arch aarch64
+                ; ldp X(CALLER_RESP[i].value), X(CALLER_RESP[i + 1].value), [sp, ofs as i32]
+            );
+        }
+        let mut cur_stack = CALLER_RESP.len() as u32;
+        dynasm!(mc ; .arch aarch64
+            ; ldp X(exc0.value), X(exc1.value), [sp, (cur_stack * word) as i32]
+        );
+        cur_stack += 2;
+        for reg in CALLER_VFP_RESP {
+            dynasm!(mc ; .arch aarch64 ; ldr D(reg.value), [sp, cur_stack * word]);
+            cur_stack += 1;
+        }
+        dynasm!(mc ; .arch aarch64 ; add sp, sp, frame_save);
+    }
+    //
+    if withcards {
+        // A final TEST8 before the RET, for the caller.  Careful to
+        // not follow this instruction with another one that changes
+        // the status of the CPU flags!
+        ldrb_ip0_signed_offset(
+            &mut mc,
+            crate::aarch64::registers::X0,
+            descr.jit_wb_if_flag_byteofs,
+        );
+        dynasm!(mc ; .arch aarch64
+            ; movz w17, 0x80
+            ; tst w16, w17
+        );
+    }
+    //
+    dynasm!(mc ; .arch aarch64
+        ; ldr x17, [sp]
+        ; add sp, sp, 2 * word
+        ; ret x17
+    );
+    let buffer = codebuf::finalize_executable(mc, arena).expect("wb_slowpath: finalize");
+    let ptr = codebuf::buffer_ptr(&buffer) as usize;
+    Some((buffer, ptr))
+}
+
 // ── Abstract condition codes ──
 // Architecture-independent CC values used throughout the assembler.
 // Converted to arch-specific encoding at emission time.
@@ -644,6 +862,10 @@ pub struct AssemblerARM64<'a> {
     /// `_build_malloc_slowpath('fixed')` and used by both fixed-size and
     /// varsize-frame nursery probes.
     malloc_slowpath_fixed: usize,
+    /// `AssemblerARM64.wb_slowpath`: the per-CPU `_build_wb_slowpath`
+    /// helpers, indexed `withcards + 2 * withfloats`, with `[4]` the
+    /// `for_frame` one.
+    wb_slowpath: [usize; 5],
     /// Back-edge label, bound after `LoopPins`. `ll_loop_code` stays on
     /// the entry so a bridge executes the pin moves.
     pending_loop_hot: Option<DynamicLabel>,
@@ -841,6 +1063,7 @@ impl<'a> AssemblerARM64<'a> {
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
+        wb_slowpath: [usize; 5],
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
@@ -893,6 +1116,7 @@ impl<'a> AssemblerARM64<'a> {
             cpu_handle,
             gcref_table: Vec::new(),
             malloc_slowpath_fixed,
+            wb_slowpath,
             pending_loop_hot: None,
         }
     }
@@ -1825,7 +2049,7 @@ impl<'a> AssemblerARM64<'a> {
         // already spells this gate as `if let Some(wb) = wb_descr`.
         if crate::runner::dynasm_write_barrier_descr().is_some() {
             let loc_base = crate::aarch64::registers::FP;
-            self.emit_write_barrier_fastpath_for_base(loc_base, false, true, None);
+            self.emit_write_barrier_fastpath_for_base(loc_base, false, true, false, None);
         }
     }
 
@@ -1835,21 +2059,7 @@ impl<'a> AssemblerARM64<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as u32;
-        for (i, reg) in all_gen_regs().iter().enumerate() {
-            if ignored_regs.contains(reg) {
-                continue;
-            }
-            let ofs = base_ofs + (i as u32 * WORD as u32);
-            dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
-        }
-        if withfloats {
-            let float_base = base_ofs + (all_gen_regs().len() as u32 * WORD as u32);
-            for reg in all_float_regs().iter() {
-                let ofs = float_base + (reg.value as u32 * WORD as u32);
-                dynasm!(self.mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
-            }
-        }
+        push_all_regs_to_jitframe_raw(&mut self.mc, ignored_regs, withfloats, false);
     }
 
     /// aarch64/assembler.py `_pop_all_regs_from_jitframe` parity.
@@ -1858,21 +2068,7 @@ impl<'a> AssemblerARM64<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as u32;
-        for (i, reg) in all_gen_regs().iter().enumerate() {
-            if ignored_regs.contains(reg) {
-                continue;
-            }
-            let ofs = base_ofs + (i as u32 * WORD as u32);
-            dynasm!(self.mc ; .arch aarch64 ; ldr X(reg.value), [x29, ofs]);
-        }
-        if withfloats {
-            let float_base = base_ofs + (all_gen_regs().len() as u32 * WORD as u32);
-            for reg in all_float_regs().iter() {
-                let ofs = float_base + (reg.value as u32 * WORD as u32);
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(reg.value), [x29, ofs]);
-            }
-        }
+        pop_all_regs_from_jitframe_raw(&mut self.mc, ignored_regs, withfloats, false);
     }
 
     /// `llsupport/assembler.py GuardToken.compute_gcmap`: skip the hole
@@ -6797,8 +6993,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// aarch64/opassembler.py _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
-        // opassembler.py:934 `mc.LDRB_ri(r.ip0.value, loc_base.value, ...)`
-        // indexes the base as a core register; upstream guarantees that in
+        // `mc.LDRB_ri(r.ip0.value, loc_base.value, ...)` indexes the base as
+        // a core register; upstream guarantees that in
         // `ARMRegisterManager.return_constant` (aarch64/regalloc.py), which
         // materializes every Const into a scratch register. The shared
         // `RegisterManager::return_constant` follows the llsupport spelling
@@ -6812,75 +7008,118 @@ impl<'a> AssemblerARM64<'a> {
             }
         };
         let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
-        // opassembler.py:996 `loc_index = arglocs[1]` — the location kind is
-        // discriminated at the card-marking block, not here.
-        let loc_index = arglocs.get(1).copied();
-        self.emit_write_barrier_fastpath_for_base(loc_base, is_array, false, loc_index);
+        // `loc_index = arglocs[1]` — the location kind is discriminated at
+        // the card-marking block, not here.
+        let loc_index = if is_array {
+            arglocs.get(1).copied()
+        } else {
+            None
+        };
+        // `len(self._regalloc.vfprm.reg_bindings)`, carried by regalloc as
+        // the trailing immediate (`consider_cond_call_gc_wb_j2`).
+        let withfloats = matches!(
+            arglocs.get(if is_array { 2 } else { 1 }),
+            Some(Loc::Immed(imm)) if imm.value != 0
+        );
+        self.emit_write_barrier_fastpath_for_base(loc_base, is_array, false, withfloats, loc_index);
     }
 
+    /// aarch64/opassembler.py `_write_barrier_fastpath(mc, descr, arglocs,
+    /// array, is_frame)`: test the flag byte and `BL` the
+    /// `wb_slowpath[helper_num]` helper built by `_build_wb_slowpath`.
     fn emit_write_barrier_fastpath_for_base(
         &mut self,
         loc_base: crate::regloc::RegLoc,
         is_array: bool,
         is_frame: bool,
+        withfloats: bool,
         loc_index: Option<Loc>,
     ) {
-        // opassembler.py:917-919 asserts the descriptor is the collector's
-        // write-barrier class. `COND_CALL_GC_WB` only exists because the GC
-        // rewriter emitted it, so a missing descriptor here means the two
-        // disagree; returning would drop the barrier without a trace.
+        // `assert cls is not None and isinstance(descr, cls)`.
+        // `COND_CALL_GC_WB` only exists because the GC rewriter emitted it,
+        // so a missing descriptor here means the two disagree; returning
+        // would drop the barrier without a trace.
         let wb = crate::runner::dynasm_write_barrier_descr()
             .expect("COND_CALL_GC_WB emitted without a write barrier descriptor");
-        let card_marking = is_array && wb.jit_wb_cards_set != 0;
-
-        // opassembler.py:922-929: build mask
+        //
+        let mut card_marking = false;
         let mut mask = wb.jit_wb_if_flag_singlebyte as i64;
-        if card_marking {
-            mask |= wb.jit_wb_cards_set_singlebyte as i64;
+        if is_array && wb.jit_wb_cards_set != 0 {
+            // assumptions the rest of the function depends on:
+            assert_eq!(wb.jit_wb_cards_set_byteofs, wb.jit_wb_if_flag_byteofs);
+            assert_eq!(wb.jit_wb_cards_set_singlebyte, -0x80);
+            card_marking = true;
+            mask = wb.jit_wb_if_flag_singlebyte as i64 | -0x80;
         }
+        //
+        if is_frame {
+            assert_eq!(loc_base, crate::aarch64::registers::FP);
+        }
+        ldrb_ip0_signed_offset(&mut self.mc, loc_base, wb.jit_wb_if_flag_byteofs);
         mask &= 0xFF;
-
-        // opassembler.py:934: LDRB ip0, [base, wb_byteofs]
-        let byteofs = wb.jit_wb_if_flag_byteofs;
-        self.emit_ldrb_signed_offset(&loc_base, byteofs);
-        // opassembler.py:936-937: TST ip0, mask
+        let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64
-            ; mov w17, mask as u32
+            ; movz w17, mask as u32
             ; tst w16, w17
+            ; b.eq =>done
         );
 
-        // opassembler.py:938-939: BEQ done (flag not set → skip)
-        let done = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64 ; b.eq =>done);
+        // for cond_call_gc_wb_array, also add another fast path:
+        // if GCFLAG_CARDS_SET, then we can just set one bit and be done
+        let js_location = self.mc.new_dynamic_label();
+        if card_marking {
+            // GCFLAG_CARDS_SET is in this byte at 0x80
+            dynasm!(self.mc ; .arch aarch64
+                ; movz w17, 0x80
+                ; tst w16, w17
+                ; b.ne =>js_location
+            );
+        }
+
+        // Write only a CALL to the helper prepared in advance, passing it as
+        // argument the address of the structure we are writing into
+        // (the first argument to COND_CALL_GC_WB).
+        let helper_num = if is_frame {
+            4
+        } else {
+            usize::from(card_marking) + 2 * usize::from(withfloats)
+        };
+        let helper = self.wb_slowpath[helper_num];
+        assert_ne!(helper, 0, "wb_slowpath[{helper_num}] was not built");
+        //
+        let x0 = crate::aarch64::registers::X0;
+        if loc_base != x0 {
+            // push two registers to keep stack aligned
+            dynasm!(self.mc ; .arch aarch64
+                ; sub sp, sp, 2 * WORD as u32
+                ; str x0, [sp, WORD as u32]
+                ; str X(loc_base.value), [sp]
+                ; mov x0, X(loc_base.value)
+            );
+        }
+        self.emit_mov_imm64(16, helper as i64);
+        dynasm!(self.mc ; .arch aarch64 ; blr x16);
+        if loc_base != x0 {
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x0, [sp, WORD as u32]
+                ; ldr X(loc_base.value), [sp]
+                ; add sp, sp, 2 * WORD as u32
+            );
+        }
 
         if card_marking {
-            // opassembler.py:943-949: test GCFLAG_CARDS_SET
-            let cards_mask = (wb.jit_wb_cards_set_singlebyte as u8) as u32;
+            // The helper ends again with a check of the flag in the object.  So
+            // here, we can simply write again a conditional jump, which will be
+            // taken if GCFLAG_CARDS_SET is still not set.
             dynasm!(self.mc ; .arch aarch64
-                ; mov w17, cards_mask
-                ; tst w16, w17
-            );
-            let card_mark = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch aarch64 ; b.ne =>card_mark);
-
-            // opassembler.py:953-976: array-specific helper call
-            self.emit_wb_helper_call(
-                loc_base,
-                crate::runner::dynasm_write_barrier_from_array as *const () as i64,
-            );
-
-            // opassembler.py:982-987: re-check CARDS_SET after helper
-            self.emit_ldrb_signed_offset(&loc_base, byteofs);
-            dynasm!(self.mc ; .arch aarch64
-                ; mov w17, cards_mask
-                ; tst w16, w17
                 ; b.eq =>done
+                ; =>js_location
             );
-
-            // opassembler.py:996-1015: card marking inline
-            dynasm!(self.mc ; .arch aarch64 ; =>card_mark);
+            //
+            // case GCFLAG_CARDS_SET: emit a few instructions to do
+            // directly the card flag setting
             match loc_index {
-                // opassembler.py:997 `assert loc_index.is_core_reg()`
+                // `assert loc_index.is_core_reg()`
                 Some(Loc::Reg(loc_index)) => {
                     let shift = 3 + wb.jit_wb_card_page_shift;
                     dynasm!(self.mc ; .arch aarch64
@@ -6916,44 +7155,13 @@ impl<'a> AssemblerARM64<'a> {
                         ; strb w16, [X(loc_base.value), x30]
                     );
                 }
-                // x86/assembler.py:2387-2388
+                // x86/assembler.py `_write_barrier_fastpath`
                 // `raise AssertionError("index is neither RegLoc nor ImmedLoc")`
                 _ => panic!("index is neither RegLoc nor ImmedLoc"),
             }
-        } else {
-            // opassembler.py:968-976: non-array slow path.  The frame takes the
-            // guarded entry; an ordinary store takes the one
-            // `gc.py get_write_barrier_fn` names.
-            let helper = if is_frame {
-                crate::runner::dynasm_write_barrier as *const () as i64
-            } else {
-                crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
-            };
-            self.emit_wb_helper_call(loc_base, helper);
         }
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);
-    }
-
-    /// Load byte at [base + signed_byteofs] into w16 (ip0).
-    fn emit_ldrb_signed_offset(&mut self, base: &crate::regloc::RegLoc, byteofs: i32) {
-        if (0..4096).contains(&byteofs) {
-            let ofs = byteofs as u32;
-            dynasm!(self.mc ; .arch aarch64
-                ; ldrb W(16), [X(base.value), ofs]
-            );
-        } else if (-256..0).contains(&byteofs) {
-            dynasm!(self.mc ; .arch aarch64
-                ; ldurb W(16), [X(base.value), byteofs]
-            );
-        } else {
-            // Large negative offset: compute address in x16, then load
-            self.emit_mov_imm64(16, byteofs as i64);
-            dynasm!(self.mc ; .arch aarch64
-                ; add x16, X(base.value), x16
-                ; ldrb W(16), [x16]
-            );
-        }
     }
 
     /// _push_all_regs_to_jitframe(also_push_vfp=True) parity: save x0-x15
@@ -7001,19 +7209,6 @@ impl<'a> AssemblerARM64<'a> {
             ; ldp x2, x3, [sp, 16]
             ; ldp x0, x1, [sp], 256
         );
-    }
-
-    /// _build_wb_slowpath parity: save all GPR + VFP regs, call helper, restore.
-    /// RPython: _push_all_regs_to_jitframe(also_push_vpf=True) + BL + _pop_all
-    /// opassembler.py:956-960: helper_num variant depends on live VFP bindings.
-    fn emit_wb_helper_call(&mut self, loc_base: crate::regloc::RegLoc, helper: i64) {
-        self.emit_push_all_volatile_regs();
-        if loc_base.value != 0 {
-            dynasm!(self.mc ; .arch aarch64 ; mov x0, X(loc_base.value));
-        }
-        self.emit_mov_imm64(2, helper);
-        dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        self.emit_pop_all_volatile_regs();
     }
 
     /// `_build_malloc_slowpath()` parity: preserve live state across the

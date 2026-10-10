@@ -21,7 +21,6 @@ pub(crate) const EBX: u8 = 3;
 pub(crate) const ESP: u8 = 4;
 pub(crate) const EBP: u8 = 5;
 pub(crate) const ESI: u8 = 6;
-#[cfg(test)]
 pub(crate) const EDI: u8 = 7;
 #[cfg(test)]
 pub(crate) const R8: u8 = 8;
@@ -29,7 +28,6 @@ pub(crate) const R8: u8 = 8;
 pub(crate) const R9: u8 = 9;
 pub(crate) const R10: u8 = 10;
 pub(crate) const R11: u8 = 11;
-#[cfg(test)]
 pub(crate) const R12: u8 = 12;
 #[cfg(test)]
 pub(crate) const R13: u8 = 13;
@@ -453,6 +451,11 @@ pub(crate) fn mov_rs(mc: &mut Assembler, dst: u8, offset: i32) {
 /// `MOV_sr` — `mov [rsp + ofs], r64`.
 pub(crate) fn mov_sr(mc: &mut Assembler, offset: i32, src: u8) {
     op_sp(mc, RexKind::W, 0, &[0x89], src, offset);
+}
+
+/// `LEA_rs` — `lea r64, [rsp + ofs]`.
+pub(crate) fn lea_rs(mc: &mut Assembler, dst: u8, offset: i32) {
+    op_sp(mc, RexKind::W, 0, &[0x8D], dst, offset);
 }
 
 /// `MOV32_rm` — `mov r32, [base + ofs]`.
@@ -938,6 +941,11 @@ pub(crate) fn movsd_bx(mc: &mut Assembler, offset: i32, src: u8) {
 /// `MOVSD_sx` — `movsd [rsp + ofs], xmm`.
 pub(crate) fn movsd_sx(mc: &mut Assembler, offset: i32, src: u8) {
     op_sp(mc, RexKind::Nw, 0xF2, &[0x0F, 0x11], src, offset);
+}
+
+/// `MOVSD_xs` — `movsd xmm, [rsp + ofs]`.
+pub(crate) fn movsd_xs(mc: &mut Assembler, dst: u8, offset: i32) {
+    op_sp(mc, RexKind::Nw, 0xF2, &[0x0F, 0x10], dst, offset);
 }
 
 /// `MOVSS_xm` — `movss xmm, [base + ofs]`.
