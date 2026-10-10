@@ -3,9 +3,9 @@ use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use num_traits::ToPrimitive;
 
 use crate::{
-    make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
-    make_module_builtin_function_passthrough0, make_module_builtin_function_with_arity,
-    make_module_builtin_function_with_doc,
+    make_builtin_function, make_builtin_function_passthrough0, make_builtin_function_with_arity,
+    make_module_builtin_function, make_module_builtin_function_passthrough0,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_doc,
 };
 use pyre_object::*;
 use ruff_text_size::Ranged;
@@ -3580,7 +3580,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "__build_class__", || {
-        make_module_builtin_function("__build_class__", builtin_build_class)
+        make_module_builtin_function_passthrough0(
+            "__build_class__",
+            builtin_build_class,
+            builtin_build_class_args,
+        )
     });
     // bytearrayobject.py W_BytearrayObject — register the real type
     // (callable as a constructor and usable in isinstance(x, bytearray)).
@@ -12661,9 +12665,20 @@ fn builtin_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     crate::call::real_build_class(args)
 }
 
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+fn builtin_build_class_args(
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::call::real_build_class_args(args)
+}
+
 /// Get a reference to the `__build_class__` builtin function.
 pub fn get_build_class_func() -> PyObjectRef {
-    make_builtin_function("__build_class__", builtin_build_class)
+    make_builtin_function_passthrough0(
+        "__build_class__",
+        builtin_build_class,
+        builtin_build_class_args,
+    )
 }
 
 /// Is `obj` the `__build_class__` builtin?
