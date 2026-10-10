@@ -18320,13 +18320,19 @@ fn init_code_type(ns: PyObjectRef) {
         ("__replace__", "The same as replace()."),
     ] {
         unsafe {
+            let code = crate::gateway::builtin_code_new_with_signature(
+                name,
+                |args| unsafe { crate::pycode::code_replace(args) },
+                Some(doc),
+                crate::pycode::code_replace_signature(),
+            );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                crate::gateway::make_builtin_function_with_doc(
-                    name,
-                    |args| unsafe { crate::pycode::code_replace(args) },
-                    doc,
+                crate::function_new_with_fixed_code(
+                    code as *const (),
+                    name.to_string(),
+                    pyre_object::PY_NULL,
                 ),
             );
         }

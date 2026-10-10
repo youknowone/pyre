@@ -538,9 +538,7 @@ impl CheckSignalAction {
         // A thread that blocked across `settrace_all_threads` missed the
         // process ticker store. Rearm so its next bytecode runs
         // `action_dispatcher` and applies the hook before the opcode.
-        if !ec.is_null()
-            && !crate::module::thread::all_thread_hooks_current(unsafe { &*ec })
-        {
+        if !ec.is_null() && !crate::module::thread::all_thread_hooks_current(unsafe { &*ec }) {
             majit_ir::eval_breaker_word::fire_action_ticker();
         }
     }
@@ -826,10 +824,10 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // installs stay compiled out.
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            #[cfg(feature = "host_env")]
-            use rustpython_host_env::signal as sig;
             #[cfg(not(feature = "host_env"))]
             use libc as sig;
+            #[cfg(feature = "host_env")]
+            use rustpython_host_env::signal as sig;
             let mut ign = pyre_object::w_int_new(1);
             pyre_object::with_roots!(ign => {
                 signal_ignore(sig::SIGPIPE, ign)
@@ -890,152 +888,149 @@ pub fn register_module(
     crate::module_ns_store(
         ns,
         "set_wakeup_fd",
-        crate::make_builtin_function("set_wakeup_fd", |args| {
-            // interp_signal.py — `set_wakeup_fd(fd, *,
-            // warn_on_full_buffer=True)`: the flag is keyword-only, so a
-            // second positional argument is rejected.
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(
-                kwargs,
-                &["warn_on_full_buffer"],
-                "set_wakeup_fd",
-            )?;
-            if positional.len() > 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "set_wakeup_fd() takes 1 positional argument but {} were given",
-                    positional.len()
-                )));
-            }
-            let warn_on_full_buffer = crate::builtins::kwarg_get(kwargs, "warn_on_full_buffer")
-                .map(crate::baseobjspace::is_true)
-                .transpose()?
-                .unwrap_or(true);
-            let fd = if let Some(&a) = positional.first() {
-                if !unsafe { pyre_object::is_int(a) } {
+        crate::make_builtin_function_with_signature(
+            "set_wakeup_fd",
+            |args| {
+                // Bound scope: pos-only `fd`, kw-only `warn_on_full_buffer`
+                // (`PY_NULL` omitted → True). interp_signal.py `set_wakeup_fd`.
+                let warn_on_full_buffer = args
+                    .get(1)
+                    .copied()
+                    .filter(|value| !value.is_null())
+                    .map(crate::baseobjspace::is_true)
+                    .transpose()?
+                    .unwrap_or(true);
+                let fd = if let Some(&a) = args.first().filter(|value| !value.is_null()) {
+                    if !unsafe { pyre_object::is_int(a) } {
+                        return Err(crate::PyError::type_error(
+                            "set_wakeup_fd() argument must be an int",
+                        ));
+                    }
+                    (unsafe { pyre_object::w_int_get_value(a) }) as i32
+                } else {
                     return Err(crate::PyError::type_error(
-                        "set_wakeup_fd() argument must be an int",
+                        "set_wakeup_fd() requires an argument",
                     ));
-                }
-                (unsafe { pyre_object::w_int_get_value(a) }) as i32
-            } else {
-                return Err(crate::PyError::type_error(
-                    "set_wakeup_fd() requires an argument",
-                ));
-            };
-            // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
-            // the only place a descriptor is asked whether it is a socket.
-            #[cfg_attr(not(all(windows, not(feature = "sandbox"))), expect(unused_mut))]
-            let mut use_send = false;
-            // interp_signal.py:343-360 — a real fd is validated with
-            // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
-            // and the fd must already be in non-blocking mode.
-            if fd != -1 {
-                #[cfg(all(unix, feature = "host_env"))]
-                {
-                    let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-                    let blocking = rustpython_host_env::fileutils::fstat(borrowed)
-                        .and_then(|_| rustpython_host_env::fcntl::get_blocking(borrowed.into()));
-                    let blocking = match blocking {
-                        Ok(blocking) => blocking,
-                        Err(error) => {
-                            if error.raw_os_error() == Some(libc::EBADF) {
+                };
+                // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
+                // the only place a descriptor is asked whether it is a socket.
+                #[cfg_attr(not(all(windows, not(feature = "sandbox"))), expect(unused_mut))]
+                let mut use_send = false;
+                // interp_signal.py set_wakeup_fd — a real fd is validated with
+                // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
+                // and the fd must already be in non-blocking mode.
+                if fd != -1 {
+                    #[cfg(all(unix, feature = "host_env"))]
+                    {
+                        let borrowed =
+                            unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+                        let blocking =
+                            rustpython_host_env::fileutils::fstat(borrowed).and_then(|_| {
+                                rustpython_host_env::fcntl::get_blocking(borrowed.into())
+                            });
+                        let blocking = match blocking {
+                            Ok(blocking) => blocking,
+                            Err(error) => {
+                                if error.raw_os_error() == Some(libc::EBADF) {
+                                    return Err(crate::PyError::value_error("invalid fd"));
+                                }
+                                return Err(crate::PyError::os_error_with_errno(
+                                    error.raw_os_error().unwrap_or(0),
+                                    format!("{error}"),
+                                ));
+                            }
+                        };
+                        if blocking {
+                            return Err(crate::PyError::value_error(format!(
+                                "the fd {fd} must be in non-blocking mode"
+                            )));
+                        }
+                    }
+                    #[cfg(all(unix, not(feature = "host_env")))]
+                    unsafe {
+                        let mut st: libc::stat = std::mem::zeroed();
+                        let bad_fd = libc::fstat(fd, &mut st) != 0;
+                        let flags = if bad_fd {
+                            -1
+                        } else {
+                            libc::fcntl(fd, libc::F_GETFL)
+                        };
+                        if bad_fd || flags < 0 {
+                            let e = std::io::Error::last_os_error();
+                            if e.raw_os_error() == Some(libc::EBADF) {
                                 return Err(crate::PyError::value_error("invalid fd"));
                             }
                             return Err(crate::PyError::os_error_with_errno(
-                                error.raw_os_error().unwrap_or(0),
-                                format!("{error}"),
+                                e.raw_os_error().unwrap_or(0),
+                                format!("{e}"),
                             ));
                         }
-                    };
-                    if blocking {
-                        return Err(crate::PyError::value_error(format!(
-                            "the fd {fd} must be in non-blocking mode"
-                        )));
-                    }
-                }
-                #[cfg(all(unix, not(feature = "host_env")))]
-                unsafe {
-                    let mut st: libc::stat = std::mem::zeroed();
-                    let bad_fd = libc::fstat(fd, &mut st) != 0;
-                    let flags = if bad_fd {
-                        -1
-                    } else {
-                        libc::fcntl(fd, libc::F_GETFL)
-                    };
-                    if bad_fd || flags < 0 {
-                        let e = std::io::Error::last_os_error();
-                        if e.raw_os_error() == Some(libc::EBADF) {
-                            return Err(crate::PyError::value_error("invalid fd"));
+                        if flags & libc::O_NONBLOCK == 0 {
+                            return Err(crate::PyError::value_error(format!(
+                                "the fd {fd} must be in non-blocking mode"
+                            )));
                         }
-                        return Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("{e}"),
+                    }
+                    // `getsockopt` is how the descriptor is asked whether it is
+                    // a socket (`signal_set_wakeup_fd_impl`).  WinSock answers
+                    // every call with `WSANOTINITIALISED` until `WSAStartup` has
+                    // run, which is why the import of `_socket` there is not just
+                    // for the constants. The probe itself calls `rsocket_rffi`,
+                    // which stays in this crate when the `_socket` module is absent.
+                    #[cfg(all(windows, not(feature = "sandbox")))]
+                    {
+                        use crate::rsocket_rffi as rffi;
+                        rffi::init();
+                        let mut error: libc::c_int = 0;
+                        let mut len = size_of_val(&error) as rffi::SockLen;
+                        let queried = unsafe {
+                            rffi::getsockopt(
+                                rffi::socket_from_i64(i64::from(fd)),
+                                rffi::SOL_SOCKET,
+                                rffi::SO_ERROR,
+                                (&raw mut error).cast(),
+                                &raw mut len,
+                            )
+                        };
+                        use_send = queried == 0;
+                        if queried != 0 {
+                            let code = rffi::last_error_code();
+                            // `WSAENOTSOCK` is the descriptor answering that it
+                            // is not a socket, which is not a refusal: a file
+                            // descriptor is taken as well, and `_Py_fstat` is
+                            // what answers for that one — an unopened number
+                            // has no handle behind it.  A descriptor is always
+                            // blocking here, so there is nothing else to check.
+                            if code != rffi::WSAENOTSOCK {
+                                return Err(crate::PyError::os_error_win32_syscall2(
+                                    code,
+                                    pyre_object::PY_NULL,
+                                    pyre_object::PY_NULL,
+                                ));
+                            }
+                            if crate::builtins::crt_call!(libc::get_osfhandle(fd)) == -1 {
+                                return Err(crate::PyError::os_error_syscall(
+                                    libc::EBADF,
+                                    pyre_object::PY_NULL,
+                                ));
+                            }
+                        }
+                    }
+                    #[cfg(all(not(unix), any(not(windows), feature = "sandbox")))]
+                    if fd < -1 {
+                        return Err(crate::PyError::value_error(
+                            "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
                         ));
                     }
-                    if flags & libc::O_NONBLOCK == 0 {
-                        return Err(crate::PyError::value_error(format!(
-                            "the fd {fd} must be in non-blocking mode"
-                        )));
-                    }
                 }
-                // `getsockopt` is how the descriptor is asked whether it is
-                // a socket (`signal_set_wakeup_fd_impl`).  WinSock answers
-                // every call with `WSANOTINITIALISED` until `WSAStartup` has
-                // run, which is why the import of `_socket` there is not just
-                // for the constants. The probe itself calls `rsocket_rffi`,
-                // which stays in this crate when the `_socket` module is absent.
-                #[cfg(all(windows, not(feature = "sandbox")))]
-                {
-                    use crate::rsocket_rffi as rffi;
-                    rffi::init();
-                    let mut error: libc::c_int = 0;
-                    let mut len = size_of_val(&error) as rffi::SockLen;
-                    let queried = unsafe {
-                        rffi::getsockopt(
-                            rffi::socket_from_i64(i64::from(fd)),
-                            rffi::SOL_SOCKET,
-                            rffi::SO_ERROR,
-                            (&raw mut error).cast(),
-                            &raw mut len,
-                        )
-                    };
-                    use_send = queried == 0;
-                    if queried != 0 {
-                        let code = rffi::last_error_code();
-                        // `WSAENOTSOCK` is the descriptor answering that it
-                        // is not a socket, which is not a refusal: a file
-                        // descriptor is taken as well, and `_Py_fstat` is
-                        // what answers for that one — an unopened number
-                        // has no handle behind it.  A descriptor is always
-                        // blocking here, so there is nothing else to check.
-                        if code != rffi::WSAENOTSOCK {
-                            return Err(crate::PyError::os_error_win32_syscall2(
-                                code,
-                                pyre_object::PY_NULL,
-                                pyre_object::PY_NULL,
-                            ));
-                        }
-                        if crate::builtins::crt_call!(libc::get_osfhandle(fd)) == -1 {
-                            return Err(crate::PyError::os_error_syscall(
-                                libc::EBADF,
-                                pyre_object::PY_NULL,
-                            ));
-                        }
-                    }
-                }
-                #[cfg(all(not(unix), any(not(windows), feature = "sandbox")))]
-                if fd < -1 {
-                    return Err(crate::PyError::value_error(
-                        "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
-                    ));
-                }
-            }
-            // interp_signal.py — `pypysig_set_wakeup_fd`.  The OS
-            // handler writes the signal-number byte to this fd so a
-            // select/poll loop blocked elsewhere wakes up.
-            let prev = signalstate::set_wakeup_fd(fd, warn_on_full_buffer, use_send);
-            Ok(pyre_object::w_int_new(prev as i64))
-        }),
+                // interp_signal.py — `pypysig_set_wakeup_fd`.  The OS
+                // handler writes the signal-number byte to this fd so a
+                // select/poll loop blocked elsewhere wakes up.
+                let prev = signalstate::set_wakeup_fd(fd, warn_on_full_buffer, use_send);
+                Ok(pyre_object::w_int_new(prev as i64))
+            },
+            crate::gateway::Signature::new(vec!["fd", "warn_on_full_buffer"], None, None, 1, 1),
+        ),
     );
     // ── real host_env-backed entry points ──
     crate::module_ns_store(
@@ -1203,10 +1198,9 @@ pub fn register_module(
                     }
                     #[cfg(windows)]
                     {
-                        let sigs = rustpython_host_env::signal::valid_signals(
-                            signalstate::NSIG as usize,
-                        )
-                        .unwrap_or_default();
+                        let sigs =
+                            rustpython_host_env::signal::valid_signals(signalstate::NSIG as usize)
+                                .unwrap_or_default();
                         let mut items = pyre_object::gc_roots::RootedItems::new();
                         for n in sigs {
                             items.push(pyre_object::w_int_new(n as i64));
@@ -1259,9 +1253,9 @@ pub fn register_module(
                         } else {
                             return Err(crate::PyError::type_error("alarm() missing argument"));
                         };
-                        Ok(pyre_object::w_int_new(unsafe {
-                            majit_rlib::rsignal::c_alarm(secs as _)
-                        } as i64))
+                        Ok(pyre_object::w_int_new(
+                            unsafe { majit_rlib::rsignal::c_alarm(secs as _) } as i64,
+                        ))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {
