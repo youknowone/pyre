@@ -3,6 +3,7 @@
 //! rest of the lltypesystem stays with the translator, except the C
 //! `llexternal`s of [`module`], whose addresses the JIT calls at run time.
 
+pub mod llmemory;
 pub mod module;
 pub mod rffi;
 pub mod rlist;

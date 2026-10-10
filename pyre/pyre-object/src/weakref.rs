@@ -58,7 +58,7 @@ pub unsafe fn w_weakref_lifeline_cached_weakref(obj: PyObjectRef) -> PyObjectRef
 #[inline]
 pub unsafe fn w_weakref_lifeline_set_cached_weakref(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_WeakrefLifeline)).cached_weakref = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -69,7 +69,7 @@ pub unsafe fn w_weakref_lifeline_cached_proxy(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_weakref_lifeline_set_cached_proxy(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_WeakrefLifeline)).cached_proxy = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -80,7 +80,7 @@ pub unsafe fn w_weakref_lifeline_other_refs(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_weakref_lifeline_set_other_refs(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_WeakrefLifeline)).other_refs_weak = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -219,7 +219,7 @@ pub unsafe fn w_weakref_object_obj_weak(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_weakref_object_set_obj_weak(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_Weakref)).w_obj_weak = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -230,7 +230,7 @@ pub unsafe fn w_weakref_object_callable(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_weakref_object_set_callable(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_Weakref)).w_callable = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -241,7 +241,7 @@ pub unsafe fn w_weakref_object_hash(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_weakref_object_set_hash(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_Weakref)).w_hash = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// GC type id for the WEAKREF GcStruct. Registered by
@@ -300,7 +300,7 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
         crate::gc_hook::try_gc_alloc_collecting_rooted(
             WEAKREF_GC_TYPE_ID,
             SIZEOF_WEAKREF,
-            &mut rooted_target as *mut PyObjectRef as *mut *mut u8,
+            &mut rooted_target as *mut PyObjectRef as *mut crate::gc_hook::GCREF,
             &mut needs_write_barrier,
         )
     } && !payload.is_null()
@@ -410,7 +410,7 @@ pub fn w_gc_weakref_box_new(target: PyObjectRef) -> PyObjectRef {
         },
         inner,
     };
-    let inner_slot = (&mut value.inner as *mut *mut Weakref).cast::<*mut u8>();
+    let inner_slot = (&mut value.inner as *mut *mut Weakref).cast::<crate::gc_hook::GCREF>();
     let mut needs_write_barrier = true;
     let raw = unsafe {
         crate::gc_hook::try_gc_alloc_collecting_rooted(
@@ -521,7 +521,7 @@ pub unsafe fn w_gc_weakref_box_retarget(obj: PyObjectRef, target: PyObjectRef) -
     }
     let rooted_obj = crate::gc_roots::shadow_stack_get(box_root);
     unsafe { (*(rooted_obj as *mut GcWeakrefBox)).inner = inner };
-    crate::gc_hook::try_gc_write_barrier(rooted_obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(rooted_obj as crate::gc_hook::GCREF);
     true
 }
 

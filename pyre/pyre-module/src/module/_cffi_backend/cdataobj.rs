@@ -300,7 +300,7 @@ pub fn new_cdata_callback(
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
         .w_destructor = roots.get(onerror_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     obj
 }
 
@@ -327,7 +327,7 @@ pub fn new_cdata_from_buffer(
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
         .w_destructor = roots.get(owner_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     if export_held {
         pyre_interpreter::executioncontext::register_finalizer(obj);
     }
@@ -348,7 +348,7 @@ pub fn new_cdata_gcp(
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
         .w_destructor = roots.get(destructor_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     pyre_interpreter::executioncontext::register_finalizer(obj);
     obj
 }
@@ -368,7 +368,7 @@ pub fn new_cdata_nonstd(
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
         .w_destructor = roots.get(free_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     if !roots.get(free_slot).is_null() {
         pyre_interpreter::executioncontext::register_finalizer(obj);
     }
@@ -458,7 +458,7 @@ fn new_cdata_full(
         .w_keepalive = roots.get(keepalive_slot);
     // The cdata is born old-gen; the keepalive it just took may be young, so
     // the barrier has to run again after this write.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     obj
 }
 
@@ -652,7 +652,9 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let original = cdata_arg(roots.get(cdata_slot))?.w_keepalive;
     let original_slot = destructor_slot + 1;
     let _ = roots.pin_root(original);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(cdata_slot).cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(
+        roots.get(cdata_slot) as pyre_object::gc_hook::GCREF
+    );
     pyre_interpreter::call::call_function_impl_result(
         roots.get(destructor_slot),
         &[roots.get(original_slot)],
@@ -669,7 +671,7 @@ fn release_buffer_export(mut w_cdata: PyObjectRef) -> Result<(), PyError> {
     }
     cdata.w_keepalive = pyre_object::PY_NULL;
     cdata.w_destructor = pyre_object::PY_NULL;
-    pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata as pyre_object::gc_hook::GCREF);
     Ok(())
 }
 
@@ -951,7 +953,7 @@ pub fn with_gc(
             ));
         }
         cdata.w_destructor = pyre_object::PY_NULL;
-        pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata.cast::<u8>());
+        pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata as pyre_object::gc_hook::GCREF);
         pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         add_memory_pressure(w_cdata, size);
         return Ok(pyre_object::w_none());

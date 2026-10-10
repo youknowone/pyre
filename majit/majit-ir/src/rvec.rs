@@ -36,7 +36,7 @@ pub const fn vec_word_offset(index: usize, word: usize) -> usize {
 /// Register kind of a `Vec` item, which selects the helper variant.
 ///
 /// The helper's own parameter is `&mut Vec<W>` with `W` = `usize` (`Int`),
-/// `*mut u8` (`Ref`) or `f64` (`Float`); the item size is passed separately.
+/// `GCREF` (`Ref`) or `f64` (`Float`); the item size is passed separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VecItemKind {
     Int,
@@ -96,7 +96,11 @@ pub fn vec_item_kind_for_spelling(item: &str, word: usize) -> Option<VecItemKind
         "usize" | "isize" => return Some(VecItemKind::Int),
         "u64" | "i64" if word == 8 => return Some(VecItemKind::Int),
         "f64" => return Some(VecItemKind::Float),
+        "GCREF" => return Some(VecItemKind::Ref),
         _ => {}
+    }
+    if item.ends_with("::GCREF") {
+        return Some(VecItemKind::Ref);
     }
     (item.starts_with("*mut ") || item.starts_with("*const ")).then_some(VecItemKind::Ref)
 }
@@ -142,10 +146,14 @@ fn first_generic_arg(args: &str) -> &str {
 
 /// Item kind of a `Vec` spelling (see [`vec_item_spelling`]) whose items are
 /// one word, or `None`. The `PyObjectRef` alias names
-/// `*mut pyobject::PyObject`, a reference.
+/// `*mut pyobject::PyObject`, a reference. `GCREF` is `llmemory.GCREF`.
 pub fn rust_vec_item_kind_for_spelling(ty: &str, word: usize) -> Option<VecItemKind> {
     let item = vec_item_spelling(ty)?.trim();
-    if item == "PyObjectRef" || item.ends_with("::PyObjectRef") {
+    if item == "PyObjectRef"
+        || item.ends_with("::PyObjectRef")
+        || item == "GCREF"
+        || item.ends_with("::GCREF")
+    {
         return Some(VecItemKind::Ref);
     }
     vec_item_kind_for_spelling(item, word)
@@ -181,10 +189,14 @@ pub fn slice_item_spelling(ty: &str) -> Option<&str> {
 }
 
 /// Item kind of a slice spelling (see [`slice_item_spelling`]) whose items
-/// are one word, or `None`.
+/// are one word, or `None`. `GCREF` is `llmemory.GCREF`.
 pub fn rust_slice_item_kind_for_spelling(ty: &str, word: usize) -> Option<VecItemKind> {
     let item = slice_item_spelling(ty)?.trim();
-    if item == "PyObjectRef" || item.ends_with("::PyObjectRef") {
+    if item == "PyObjectRef"
+        || item.ends_with("::PyObjectRef")
+        || item == "GCREF"
+        || item.ends_with("::GCREF")
+    {
         return Some(VecItemKind::Ref);
     }
     vec_item_kind_for_spelling(item, word)
@@ -593,6 +605,22 @@ mod tests {
             vec_item_kind_for_spelling("*mut pyobject::PyObject", 8),
             Some(VecItemKind::Ref)
         );
+        assert_eq!(
+            vec_item_kind_for_spelling("GCREF", 8),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            vec_item_kind_for_spelling("majit_gc::GCREF", 8),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            vec_item_kind_for_spelling("*mut GCREFOpaque", 8),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            vec_item_kind_for_spelling("*mut majit_gc::header::GCREFOpaque", 8),
+            Some(VecItemKind::Ref)
+        );
         for other in [
             "u8",
             "u32",
@@ -619,6 +647,10 @@ mod tests {
         );
         assert_eq!(
             rust_vec_item_kind_for_spelling("Vec<PyObjectRef, Global>", 8),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            rust_vec_item_kind_for_spelling("*mut Vec<GCREF>", 8),
             Some(VecItemKind::Ref)
         );
         assert_eq!(
@@ -649,6 +681,10 @@ mod tests {
         assert_eq!(slice_item_spelling("[usize; 4]"), None);
         assert_eq!(slice_item_spelling("[[usize; 2]]"), Some("[usize; 2]"));
         assert_eq!(slice_item_spelling("Vec<usize>"), None);
+        assert_eq!(
+            rust_slice_item_kind_for_spelling("&[GCREF]", 8),
+            Some(VecItemKind::Ref)
+        );
         assert_eq!(
             rust_slice_item_kind_for_spelling("&[PyObjectRef]", 8),
             Some(VecItemKind::Ref)

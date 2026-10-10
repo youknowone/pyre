@@ -109,7 +109,7 @@ pub unsafe fn w_super_set_fields(
         // `super().__init__(...)` re-initialises a proxy that may already
         // have been promoted, so grey it before the stores the way
         // `w_super_new` does for the freshly allocated one.
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         let super_obj = obj as *mut W_Super;
         (*super_obj).super_type = super_type;
         (*super_obj).obj_type = obj_type;
@@ -275,7 +275,7 @@ pub unsafe fn w_property_reinit(
     (*prop).w_doc = PY_NULL;
     (*prop).w_name = PY_NULL;
     (*prop).getter_doc = false;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for
@@ -340,7 +340,7 @@ pub unsafe fn w_property_set_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     (*prop).w_doc = w_doc;
     // Record the old→young edge: `w_doc` is a traced slot and the
     // property may already have been promoted out of the nursery.
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// `descriptor.py:199-204` — stamp a doc inherited from `fget.__doc__`
@@ -352,7 +352,7 @@ pub unsafe fn w_property_set_getter_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let prop = obj as *mut W_Property;
     (*prop).w_doc = w_doc;
     (*prop).getter_doc = true;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// Mark that a property subclass obtained its visible `__doc__` from the
@@ -382,7 +382,7 @@ pub unsafe fn w_property_get_name(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_property_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let prop = obj as *mut W_Property;
     (*prop).w_name = w_name;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]

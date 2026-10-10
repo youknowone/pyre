@@ -1760,9 +1760,9 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     if managed {
-        crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
     } else {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
     // Phase L2: when the block is a GC-managed array, the list-ptr forward in
     // `list_object_custom_trace` relocates a young block but does NOT re-scan an
@@ -1775,11 +1775,11 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
     let list = unsafe { &*(obj as *const W_ListObject) };
     if list.strategy == ListStrategy::Object
         && !list.items.is_null()
-        && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
+        && crate::gc_hook::try_gc_owns_object(list.items as crate::gc_hook::GCREF)
     {
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let items = unsafe { (*(obj as *const W_ListObject)).items };
-        crate::gc_hook::try_gc_write_barrier(items as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(items as crate::gc_hook::GCREF);
     }
 }
 
@@ -1803,11 +1803,11 @@ pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
     let list = unsafe { &*(obj as *const W_ListObject) };
     if list.strategy == ListStrategy::Object
         && !list.items.is_null()
-        && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
+        && crate::gc_hook::try_gc_owns_object(list.items as crate::gc_hook::GCREF)
     {
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let items = unsafe { (*(obj as *const W_ListObject)).items };
-        crate::gc_hook::try_gc_write_barrier_before_move(items as *mut u8);
+        crate::gc_hook::try_gc_write_barrier_before_move(items as crate::gc_hook::GCREF);
     }
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
@@ -1855,7 +1855,7 @@ pub fn prepare_list_ref_store(obj: *mut PyObject, value: *mut PyObject) -> *mut 
 pub fn current_gc_ref(obj: *mut PyObject) -> *mut PyObject {
     let _roots = crate::gc_roots::push_roots();
     let obj = crate::gc_roots::pin_root(obj);
-    crate::gc_hook::try_gc_current_object_address(obj as *mut u8) as *mut PyObject
+    crate::gc_hook::try_gc_current_object_address(obj as crate::gc_hook::GCREF) as *mut PyObject
 }
 
 /// Allocate a new W_ListObject from a Vec of items.
@@ -1921,7 +1921,7 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
-    let mut allocation_root: *mut u8 = std::ptr::null_mut();
+    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
     let mut needs_write_barrier = true;
     let raw = unsafe {
         crate::gc_hook::try_gc_alloc_collecting_rooted(
@@ -2283,11 +2283,13 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     }
     storage.reload_typed_blocks();
     let mut allocation_root = match strategy {
-        ListStrategy::Object => items_block as *mut u8,
-        ListStrategy::Integer | ListStrategy::IntOrFloat => storage.int_items.block as *mut u8,
-        ListStrategy::Float => storage.float_items.block as *mut u8,
-        ListStrategy::Bytes => storage.bytes_items.block as *mut u8,
-        ListStrategy::Ascii => storage.ascii_items.block as *mut u8,
+        ListStrategy::Object => items_block as crate::gc_hook::GCREF,
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            storage.int_items.block as crate::gc_hook::GCREF
+        }
+        ListStrategy::Float => storage.float_items.block as crate::gc_hook::GCREF,
+        ListStrategy::Bytes => storage.bytes_items.block as crate::gc_hook::GCREF,
+        ListStrategy::Ascii => storage.ascii_items.block as crate::gc_hook::GCREF,
         ListStrategy::Empty
         | ListStrategy::Size
         | ListStrategy::SimpleRange
@@ -2444,11 +2446,13 @@ unsafe fn w_list_from_storage_and_strategy(
     bytes_items.reload_block(bytes_slot);
     ascii_items.reload_block(ascii_slot);
     let mut allocation_root = match strategy {
-        ListStrategy::Object => items_block as *mut u8,
-        ListStrategy::Integer | ListStrategy::IntOrFloat => int_items.block as *mut u8,
-        ListStrategy::Float => float_items.block as *mut u8,
-        ListStrategy::Bytes => bytes_items.block as *mut u8,
-        ListStrategy::Ascii => ascii_items.block as *mut u8,
+        ListStrategy::Object => items_block as crate::gc_hook::GCREF,
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            int_items.block as crate::gc_hook::GCREF
+        }
+        ListStrategy::Float => float_items.block as crate::gc_hook::GCREF,
+        ListStrategy::Bytes => bytes_items.block as crate::gc_hook::GCREF,
+        ListStrategy::Ascii => ascii_items.block as crate::gc_hook::GCREF,
         ListStrategy::Empty
         | ListStrategy::Size
         | ListStrategy::SimpleRange
@@ -2775,7 +2779,9 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
         // rgc.py `ll_arrayfill`: one write barrier on the items array, then
         // `bare_setarrayitem` for every slot.
         let dest = crate::gc_roots::shadow_stack_get(dest_slot);
-        crate::gc_hook::try_gc_write_barrier((*(dest as *const W_ListObject)).items as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(
+            (*(dest as *const W_ListObject)).items as crate::gc_hook::GCREF,
+        );
         let dest = crate::gc_roots::shadow_stack_get(dest_slot);
         let item = crate::gc_roots::shadow_stack_get(item_slot);
         std::slice::from_raw_parts_mut(
@@ -5062,7 +5068,7 @@ pub unsafe fn w_list_append_stores_into_gc_block_in_place(obj: PyObjectRef) -> b
     list.strategy == ListStrategy::Object
         && ll_list_obj_length(list) < ll_list_obj_capacity(list)
         && !list.items.is_null()
-        && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
+        && crate::gc_hook::try_gc_owns_object(list.items as crate::gc_hook::GCREF)
 }
 
 /// Rebuild the list's object storage from a Vec.

@@ -123,10 +123,13 @@ fn alloc_lowlevel_string(
     let ptr = if !gc_ptr.is_null() {
         // Nursery GC allocation is not specified to clear the payload.
         // `malloc_zero_filled` is false, so only the zero-fill callers pay it.
+        // The payload is a byte block; GCREFOpaque has size 0, so the
+        // write is through `*mut u8`.
+        let ptr = gc_ptr as *mut u8;
         if zero_fill {
-            unsafe { std::ptr::write_bytes(gc_ptr, 0, total_size) };
+            unsafe { std::ptr::write_bytes(ptr, 0, total_size) };
         }
-        gc_ptr
+        ptr
     } else {
         let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
             .expect("low-level string layout");

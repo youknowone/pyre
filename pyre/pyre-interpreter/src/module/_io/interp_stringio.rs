@@ -56,7 +56,9 @@ impl W_StringIO {
     }
 
     fn publish_refs(&mut self) {
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
     }
 
     fn check_closed(&self) -> Result<(), crate::PyError> {

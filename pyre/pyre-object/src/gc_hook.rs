@@ -31,6 +31,8 @@
 
 use crate::PyObjectRef;
 
+pub use majit_gc::{GCREF, GCREFOpaque};
+
 /// Per-`#[pyre_class]`-type registry of inline `PyObjectRef` field offsets
 /// (the descriptor's `gc_ptr_offsets`), keyed by the type's static `PyType`
 /// pointer cast to `usize`.
@@ -93,7 +95,7 @@ pub unsafe fn offsets_for_pytype(
 /// pointer to managed memory of exactly that size, ready for raw
 /// field writes. On allocation failure the callback returns
 /// `std::ptr::null_mut()`.
-pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> *mut u8;
+pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> GCREF;
 
 majit_gc::global_hook!(static GC_ALLOC_HOOK: GcAllocHookFn);
 majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
@@ -101,7 +103,7 @@ majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
 /// Placement-reporting companion of [`GcAllocHookFn`] for no-collect
 /// allocations that may spill from the nursery to old-gen.
 pub type GcAllocWithPlacementHookFn =
-    unsafe fn(type_id: u32, payload_size: usize, needs_write_barrier: *mut bool) -> *mut u8;
+    unsafe fn(type_id: u32, payload_size: usize, needs_write_barrier: *mut bool) -> GCREF;
 
 majit_gc::global_hook!(
     static GC_ALLOC_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
@@ -175,7 +177,7 @@ pub fn clear_gc_alloc_hook() {
 /// when no hook is installed, or `Some(null)` when the hook itself
 /// returned null.
 #[inline]
-pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
+pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<GCREF> {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return None;
@@ -185,7 +187,7 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
 
 // The `NoRoute` / `Failed` split is the allocator's contract, not this hook
 // layer's, so it lives with the allocator (`majit_gc`). The hooks here answer
-// in `Option<*mut u8>` and classify with `GcAllocOutcome::from_hook`.
+// in `Option<GCREF>` and classify with `GcAllocOutcome::from_hook`.
 pub use majit_gc::{GcAllocOutcome, gc_alloc_failed};
 
 pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
@@ -204,7 +206,7 @@ pub fn try_gc_alloc_with_placement(
     type_id: u32,
     payload_size: usize,
     needs_write_barrier: &mut bool,
-) -> Option<*mut u8> {
+) -> Option<GCREF> {
     if let Some(f) = GC_ALLOC_WITH_PLACEMENT_HOOK.get() {
         return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
     }
@@ -233,7 +235,7 @@ pub fn clear_gc_alloc_stable_hook() {
 /// See [`register_gc_alloc_stable_hook`] for semantics. Returns
 /// `None` when no hook is installed.
 #[inline]
-pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8> {
+pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return None;
@@ -254,10 +256,10 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
 /// than at each call site, and the failure aborts (see [`gc_alloc_failed`]).
 ///
 /// Residualising this primitive (`@dont_look_inside`, `rlib/jit.py`) keeps the
-/// process-global hook dispatch out of the trace — a `*mut u8` return has no
-/// discriminant to erase, unlike the `Option<*mut u8>` accessor.
+/// process-global hook dispatch out of the trace — a `GCREF` return has no
+/// discriminant to erase, unlike the `Option<GCREF>` accessor.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> GCREF {
     GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
@@ -292,7 +294,7 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 ///
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GCREF {
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
@@ -325,7 +327,7 @@ pub fn clear_gc_alloc_young_nonmoving_no_collect_hook() {
 ///
 /// With no such hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: usize) -> GCREF {
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
@@ -362,7 +364,7 @@ pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: u
 /// twin: the hook dispatch is process-global state the trace carries nothing by
 /// recording.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> GCREF {
     GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
@@ -394,9 +396,9 @@ pub fn clear_gc_alloc_collecting_hook() {
 pub type GcAllocCollectingRootedHookFn = unsafe fn(
     type_id: u32,
     payload_size: usize,
-    root: *mut *mut u8,
+    root: *mut GCREF,
     needs_write_barrier: *mut bool,
-) -> *mut u8;
+) -> GCREF;
 
 majit_gc::global_hook!(
     static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
@@ -423,9 +425,9 @@ pub fn clear_gc_alloc_collecting_rooted_hook() {
 pub unsafe fn try_gc_alloc_collecting_rooted(
     type_id: u32,
     payload_size: usize,
-    root: *mut *mut u8,
+    root: *mut GCREF,
     needs_write_barrier: *mut bool,
-) -> Option<*mut u8> {
+) -> Option<GCREF> {
     if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
         return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
     }
@@ -681,8 +683,8 @@ pub fn try_gc_major_threshold_reached() -> bool {
 }
 
 /// Signature of the host-side root-register callbacks.
-/// `slot` is a pointer to a slot holding a `PyObjectRef`
-/// (equivalently `*mut u8`); the GC treats it as a live root until
+/// `slot` is a pointer to a slot holding a `GCREF`
+/// (equivalently a `PyObjectRef` cell); the GC treats it as a live root until
 /// [`try_gc_remove_root`] is called with the same pointer.
 ///
 /// Used around host-side allocator calls that may trigger a minor
@@ -695,8 +697,8 @@ pub fn try_gc_major_threshold_reached() -> bool {
 /// TODO: this is a known deviation from RPython.
 /// Answers `false` when the backend declined the slot, so a caller that
 /// brackets the registration knows not to unregister a root it never took.
-pub type GcAddRootHookFn = unsafe fn(slot: *mut *mut u8) -> bool;
-pub type GcRemoveRootHookFn = fn(slot: *mut *mut u8);
+pub type GcAddRootHookFn = unsafe fn(slot: *mut GCREF) -> bool;
+pub type GcRemoveRootHookFn = fn(slot: *mut GCREF);
 
 majit_gc::global_hook!(static GC_ADD_ROOT_HOOK: GcAddRootHookFn);
 majit_gc::global_hook!(static GC_REMOVE_ROOT_HOOK: GcRemoveRootHookFn);
@@ -734,7 +736,7 @@ pub fn clear_gc_root_hooks() {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
+pub unsafe fn try_gc_add_root(slot: *mut GCREF) -> bool {
     match GC_ADD_ROOT_HOOK.get() {
         Some(f) => unsafe { f(slot) },
         None => false,
@@ -747,7 +749,7 @@ pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
 // atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_add_root` twin;
 // calls residualize via the registered fnaddr (`rlib/jit.py`).
 #[majit_macros::dont_look_inside]
-pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
+pub fn try_gc_remove_root(slot: *mut GCREF) -> bool {
     match GC_REMOVE_ROOT_HOOK.get() {
         Some(f) => {
             f(slot);
@@ -812,7 +814,7 @@ pub fn clear_gc_owns_object_hook() {
 // GC ownership check (the backend GC rewrite owns that concern); calls
 // residualize via the registered fnaddr. The `try_gc_write_barrier` twin.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn try_gc_owns_object(addr: *mut u8) -> bool {
+pub extern "C" fn try_gc_owns_object(addr: GCREF) -> bool {
     match GC_OWNS_OBJECT_HOOK.get() {
         Some(f) => f(addr as usize),
         None => false,
@@ -833,8 +835,8 @@ pub extern "C" fn try_gc_owns_object(addr: *mut u8) -> bool {
 /// root reload pays it, and behind it sits a two-word range compare that
 /// wants to be inlined into the caller.
 #[inline]
-pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
-    majit_gc::gc_current_object_address(addr as usize) as *mut u8
+pub fn try_gc_current_object_address(addr: GCREF) -> GCREF {
+    majit_gc::gc_current_object_address(addr as usize) as GCREF
 }
 
 /// minimark.py `identityhash` hook.
@@ -870,7 +872,7 @@ pub fn gc_identity_hash(obj_addr: usize) -> usize {
 /// GC-managed object whose field is being updated with a possible young
 /// pointer. The backend decides whether `obj` is old enough to require
 /// remembering.
-pub type GcWriteBarrierHookFn = fn(obj: *mut u8);
+pub type GcWriteBarrierHookFn = fn(obj: GCREF);
 
 majit_gc::global_hook!(static GC_WRITE_BARRIER_HOOK: GcWriteBarrierHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_MANAGED_HOOK: GcWriteBarrierHookFn);
@@ -911,7 +913,7 @@ pub fn clear_gc_write_barrier_managed_hook() {
 // write barrier (the backend GC rewrite owns that concern); calls
 // residualize via the registered fnaddr.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
+pub extern "C" fn try_gc_write_barrier(obj: GCREF) -> bool {
     match GC_WRITE_BARRIER_HOOK.get() {
         Some(f) => {
             f(obj);
@@ -929,7 +931,7 @@ pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
 /// alone, so a young pointer shifted into a clean page is not scanned.
 // `dont_look_inside`: host hook dispatch, as for `try_gc_write_barrier`.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn try_gc_write_barrier_before_move(obj: *mut u8) -> bool {
+pub extern "C" fn try_gc_write_barrier_before_move(obj: GCREF) -> bool {
     match GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.get() {
         Some(f) => {
             f(obj);
@@ -942,7 +944,7 @@ pub extern "C" fn try_gc_write_barrier_before_move(obj: *mut u8) -> bool {
 /// Run the active barrier for a pointer returned by a managed allocation
 /// hook.  The backend may omit the general hybrid-heap ownership lookup.
 #[majit_macros::dont_look_inside]
-pub extern "C" fn try_gc_write_barrier_managed(obj: *mut u8) -> bool {
+pub extern "C" fn try_gc_write_barrier_managed(obj: GCREF) -> bool {
     match GC_WRITE_BARRIER_MANAGED_HOOK.get() {
         Some(f) => {
             f(obj);
@@ -985,7 +987,7 @@ mod tests {
     struct MockCall {
         type_id: u32,
         payload_size: usize,
-        ptr: *mut u8,
+        ptr: GCREF,
     }
 
     thread_local! {
@@ -1022,15 +1024,15 @@ mod tests {
     ///
     /// A block whose caller does not free it stays leaked for the rest of the
     /// run, which is what the collector this stands in for would do with it.
-    fn mock_alloc(payload_size: usize) -> *mut u8 {
+    fn mock_alloc(payload_size: usize) -> GCREF {
         let Ok(layout) = std::alloc::Layout::from_size_align(payload_size.max(1), MOCK_ALIGN)
         else {
             return std::ptr::null_mut();
         };
-        unsafe { std::alloc::alloc_zeroed(layout) }
+        unsafe { std::alloc::alloc_zeroed(layout) as GCREF }
     }
 
-    fn mock_hook(type_id: u32, payload_size: usize) -> *mut u8 {
+    fn mock_hook(type_id: u32, payload_size: usize) -> GCREF {
         let ptr = mock_alloc(payload_size);
         LAST_MOCK_CALL.with(|cell| {
             cell.set(Some(MockCall {
@@ -1042,16 +1044,16 @@ mod tests {
         ptr
     }
 
-    fn null_hook(_type_id: u32, _payload_size: usize) -> *mut u8 {
+    fn null_hook(_type_id: u32, _payload_size: usize) -> GCREF {
         std::ptr::null_mut()
     }
 
     unsafe fn nursery_rooted_hook(
         type_id: u32,
         payload_size: usize,
-        _root: *mut *mut u8,
+        _root: *mut GCREF,
         needs_write_barrier: *mut bool,
-    ) -> *mut u8 {
+    ) -> GCREF {
         unsafe { *needs_write_barrier = false };
         mock_hook(type_id, payload_size)
     }
@@ -1060,7 +1062,7 @@ mod tests {
         type_id: u32,
         payload_size: usize,
         needs_write_barrier: *mut bool,
-    ) -> *mut u8 {
+    ) -> GCREF {
         unsafe { *needs_write_barrier = false };
         mock_hook(type_id, payload_size)
     }
@@ -1112,8 +1114,8 @@ mod tests {
             GcAllocOutcome::Failed
         );
         assert_eq!(
-            GcAllocOutcome::from_hook(Some(&mut probe as *mut u8)),
-            GcAllocOutcome::Allocated(&mut probe as *mut u8)
+            GcAllocOutcome::from_hook(Some((&mut probe as *mut u8).cast())),
+            GcAllocOutcome::Allocated((&mut probe as *mut u8).cast())
         );
     }
 
@@ -1124,8 +1126,8 @@ mod tests {
         assert!(GcAllocOutcome::NoRoute.allocated_or_abort(24).is_none());
         let mut probe = 0u8;
         assert_eq!(
-            GcAllocOutcome::Allocated(&mut probe as *mut u8).allocated_or_abort(24),
-            Some(&mut probe as *mut u8)
+            GcAllocOutcome::Allocated((&mut probe as *mut u8).cast()).allocated_or_abort(24),
+            Some((&mut probe as *mut u8).cast())
         );
     }
 
@@ -1159,30 +1161,30 @@ mod tests {
         static REMOVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    unsafe fn mock_add_root(slot: *mut *mut u8) -> bool {
+    unsafe fn mock_add_root(slot: *mut GCREF) -> bool {
         LAST_ROOT_PTR.with(|cell| cell.set(slot as usize));
         true
     }
-    fn mock_remove_root(slot: *mut *mut u8) {
+    fn mock_remove_root(slot: *mut GCREF) {
         let _ = slot;
         REMOVE_CALLS.with(|cell| cell.set(cell.get() + 1));
     }
 
-    fn mock_write_barrier(_obj: *mut u8) {}
+    fn mock_write_barrier(_obj: GCREF) {}
 
     #[test]
     fn root_hooks_register_and_remove_round_trip() {
         let _hook_lock = hook_test_guard();
         clear_gc_root_hooks();
-        let mut slot: *mut u8 = std::ptr::null_mut();
-        assert!(!unsafe { try_gc_add_root(&mut slot as *mut *mut u8) });
-        assert!(!try_gc_remove_root(&mut slot as *mut *mut u8));
+        let mut slot: GCREF = std::ptr::null_mut();
+        assert!(!unsafe { try_gc_add_root(&mut slot as *mut GCREF) });
+        assert!(!try_gc_remove_root(&mut slot as *mut GCREF));
 
         LAST_ROOT_PTR.with(|cell| cell.set(0));
         REMOVE_CALLS.with(|cell| cell.set(0));
         register_gc_root_hooks(mock_add_root, mock_remove_root);
 
-        let slot_ptr = &mut slot as *mut *mut u8;
+        let slot_ptr = &mut slot as *mut GCREF;
         assert!(unsafe { try_gc_add_root(slot_ptr) });
         assert_eq!(LAST_ROOT_PTR.with(|cell| cell.get()), slot_ptr as usize);
         assert!(try_gc_remove_root(slot_ptr));
@@ -1268,7 +1270,7 @@ mod tests {
     fn write_barrier_hook_registers_invokes_and_clears() {
         let _hook_lock = hook_test_guard();
         clear_gc_write_barrier_hook();
-        let obj = 0x1000usize as *mut u8;
+        let obj = 0x1000usize as GCREF;
         assert!(!try_gc_write_barrier(obj));
 
         register_gc_write_barrier_hook(mock_write_barrier);

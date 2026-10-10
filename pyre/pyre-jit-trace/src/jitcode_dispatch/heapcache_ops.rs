@@ -133,7 +133,7 @@ fn walker_execute_gc_store<Sym: WalkSym>(
         return walker_gc_store_not_executed(ctx, pc);
     };
     let obj = obj_ptr as usize as pyre_object::PyObjectRef;
-    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8);
+    let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
     // SAFETY: `obj_ptr` is the live receiver the walk is executing over and
     // `offset` / `size` come from the op's own descr.
     if unsafe { fbw_gc_store_word(obj, offset, size, value, managed) } {
@@ -645,7 +645,7 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
         _ => return,
     };
     // Confirm it is one of our GC-managed materialization blocks.
-    if !pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
+    if !pyre_object::gc_hook::try_gc_owns_object(block as pyre_object::gc_hook::GCREF) {
         return;
     }
     // `new_array_clear` of `GcArray(Signed)` stamps a `TypedItemsBlock`.
@@ -692,7 +692,7 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     // Old→young barrier: the materialization block may have been promoted to
     // old-gen while `elem` is still young (the construction-barrier gap). A
     // nursery block carries no TRACK_YOUNG_PTRS so the barrier is a no-op.
-    pyre_object::gc_hook::try_gc_write_barrier(block as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(block as pyre_object::gc_hook::GCREF);
 }
 
 /// Traced-iteration fill of a cleared `GcArray(Signed)` block from
@@ -762,16 +762,20 @@ pub(crate) fn materialize_cleared_struct_gcarray(
     if raw.is_null() {
         return None;
     }
+    // GCREF is Ptr(GcOpaqueType); the byte-addressed clear is
+    // llmemory.Address (`*mut u8`). `write_bytes` on GCREFOpaque (ZST)
+    // would write zero bytes.
+    let bytes = raw.cast::<u8>();
     // The walker only calls this when `base_size` is
     // `TYPED_ITEMS_BLOCK_ITEMS_OFFSET`. Clearing from
     // `GcTypedArray.items` instead leaves the tail dirty on a 32-bit
     // target: that flat offset is 4, and an 8-aligned `Entry` starts at 8.
     unsafe {
-        std::ptr::write_bytes(raw, 0, payload);
-        let block = raw.cast::<pyre_object::GcTypedArray>();
+        std::ptr::write_bytes(bytes, 0, payload);
+        let block = bytes.cast::<pyre_object::GcTypedArray>();
         (*block).len = cap;
     }
-    Some(raw)
+    Some(bytes)
 }
 
 /// `setinteriorfield`'s type code: 0 = ref, 1 = int, 2 = float.
@@ -858,7 +862,7 @@ fn interior_field_addr(
         return None;
     }
     let block = array_ptr as usize as *mut u8;
-    if !pyre_object::gc_hook::try_gc_owns_object(block) {
+    if !pyre_object::gc_hook::try_gc_owns_object(block as pyre_object::gc_hook::GCREF) {
         return None;
     }
     let len = unsafe { block.cast::<usize>().read_unaligned() };
@@ -999,7 +1003,7 @@ fn replay_setinteriorfield<Sym: WalkSym>(
         bits,
     );
     if access.field_type == 0 {
-        pyre_object::gc_hook::try_gc_write_barrier(array_raw);
+        pyre_object::gc_hook::try_gc_write_barrier(array_raw as pyre_object::gc_hook::GCREF);
     }
 }
 

@@ -6462,7 +6462,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     crate::PyError::type_error("expected a 'posix.DirEntry' object")
                 })?;
                 de.w_lstat = result;
-                unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
+                unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF) };
                 return Ok(result);
             }
         }
@@ -6472,7 +6472,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let de = W_DirEntry::from_obj(self_obj)
             .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
         de.w_lstat = result;
-        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF) };
         Ok(result)
     }
     fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6507,7 +6507,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         de.w_stat = result;
         // `result` may be a nursery object stored into the stable entry; join
         // the remembered set so the next minor collection forwards it.
-        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF) };
         Ok(result)
     }
     fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6905,7 +6905,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         de.dir_fd = dir_fd;
         de.enum_ino = enum_ino;
         de.enum_type = enum_type as i32;
-        unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8) };
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF) };
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe { pyre_object::w_list_append(list, obj) };
         obj
@@ -7072,7 +7072,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             W_ScandirIterator::from_obj(it).expect("freshly allocated posix.ScandirIterator");
         iterator.entries = list;
         iterator.open = true;
-        unsafe { pyre_object::gc_hook::try_gc_write_barrier(it as *mut u8) };
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(it as pyre_object::gc_hook::GCREF) };
         // `StdObjSpace.allocate_instance` immediately queues instances whose
         // type has `hasuserdel`. This native allocation bypasses that helper,
         // so it must register the new iterator explicitly.

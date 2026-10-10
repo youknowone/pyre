@@ -320,10 +320,10 @@ pub unsafe fn w_tuple_adopt_fixed_items(block: *mut ItemsBlock) -> PyObjectRef {
         // returns early while `wrappeditems` is null.
         let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         let raw_slot = crate::gc_roots::shadow_stack_len() - 1;
-        let raw = crate::gc_roots::shadow_stack_get(raw_slot) as *mut u8;
+        let raw = crate::gc_roots::shadow_stack_get(raw_slot) as crate::gc_hook::GCREF;
         let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
         // Barrier, then the field. The barrier is not a collection point.
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        crate::gc_hook::try_gc_write_barrier_managed(raw as crate::gc_hook::GCREF);
         let header_now = header();
         unsafe {
             write_tuple_layout(raw, header_now.ob_type, header_now.w_class, block, false);
@@ -516,7 +516,7 @@ fn w_tuple_new_array_backed_impl(
     let items_block = unsafe { alloc_tuple_items_block_gc(save_point, len) };
     let raw = raw_slot
         .map(crate::gc_roots::shadow_stack_get)
-        .unwrap_or(std::ptr::null_mut()) as *mut u8;
+        .unwrap_or(std::ptr::null_mut()) as crate::gc_hook::GCREF;
 
     if !raw.is_null() {
         // The element pointers are stored in the off-GC `items_block`, so
@@ -538,7 +538,7 @@ fn w_tuple_new_array_backed_impl(
         // the tuple only once it does (`remember_young_pointer`), and a minor
         // landing in that window reclaims the block and poisons the nursery
         // under it, leaving `wrappeditems` dangling for good.
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        crate::gc_hook::try_gc_write_barrier_managed(raw as crate::gc_hook::GCREF);
         // The header went in before the root was published; only the items
         // block is still outstanding. The store below is the old-to-young
         // edge (`setfield_gc`: barrier, then the field). The barrier is not a
@@ -575,7 +575,7 @@ fn w_tuple_new_array_backed_impl(
 }
 
 unsafe fn write_tuple_layout(
-    raw: *mut u8,
+    raw: crate::gc_hook::GCREF,
     ob_type: *const PyType,
     w_class: PyObjectRef,
     wrappeditems: *mut ItemsBlock,

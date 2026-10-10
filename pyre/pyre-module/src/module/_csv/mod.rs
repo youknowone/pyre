@@ -389,7 +389,7 @@ fn config_to_dialect(cfg: &DialectConfig, cls: PyObjectRef) -> Result<PyObjectRe
     let _ = gc_roots::pin_root(obj);
     let obj_slot = line_slot + 1;
     let obj = gc_roots::shadow_stack_get(obj_slot);
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     let dialect = W_Dialect::from_obj(obj).expect("a fresh _csv.Dialect has the Dialect layout");
     dialect.lineterminator = gc_roots::shadow_stack_get(line_slot);
     Ok(gc_roots::shadow_stack_get(obj_slot))

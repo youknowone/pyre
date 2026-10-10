@@ -1540,7 +1540,7 @@ pub fn module_ns_get_or_insert_with(ns: PyObjectRef, name: &str, f: impl FnOnce(
     }
 }
 
-fn type_dict_ptr(cls: PyObjectRef) -> *mut u8 {
+fn type_dict_ptr(cls: PyObjectRef) -> pyre_object::gc_hook::GCREF {
     unsafe { pyre_object::w_type_get_dict_ptr(cls) }
 }
 

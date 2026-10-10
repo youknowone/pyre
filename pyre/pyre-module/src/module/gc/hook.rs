@@ -303,7 +303,9 @@ pub struct W_AppLevelHooks {
 
 impl W_AppLevelHooks {
     fn write_barrier(&mut self) {
-        pyre_object::gc_hook::try_gc_write_barrier_managed(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier_managed(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
     }
 }
 

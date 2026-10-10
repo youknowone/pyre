@@ -445,7 +445,7 @@ pub struct PyErrorObject {
     /// Nullable rstr `STR`. Null means the display text comes from
     /// `exc_object` ([`DisplayMessage::FromExcObject`]). Otherwise the
     /// pointer holds the WTF-8 bytes. The object does not own a `Wtf8Buf`.
-    pub message: *mut u8,
+    pub message: pyre_object::gc_hook::GCREF,
     /// `error.py OperationError._w_value`: the exception value, a message
     /// object, or null until [`PyError::get_w_value`] /
     /// [`PyError::normalize_exception`] instantiate `w_type(w_value)` and
@@ -592,7 +592,7 @@ impl std::fmt::Debug for PyError {
 /// The STR allocation and the byte copy are host plumbing. Callers keep
 /// the pointer result; the body is not a flow graph.
 #[majit_macros::dont_look_inside]
-fn message_str_from_wtf8(text: &rustpython_wtf8::Wtf8) -> *mut u8 {
+fn message_str_from_wtf8(text: &rustpython_wtf8::Wtf8) -> pyre_object::gc_hook::GCREF {
     use pyre_object::lowlevel_string::{
         LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, bh_alloc_lowlevel_string,
     };
@@ -608,13 +608,13 @@ fn message_str_from_wtf8(text: &rustpython_wtf8::Wtf8) -> *mut u8 {
             bytes.len(),
         );
     }
-    raw as *mut u8
+    raw as pyre_object::gc_hook::GCREF
 }
 
 /// Inverse of [`message_str_from_wtf8`]. `Wtf8::from_bytes` is not a
 /// translated operation; the bytes were written from a `Wtf8`.
 #[majit_macros::dont_look_inside]
-fn wtf8_from_message_str(ptr: *mut u8) -> rustpython_wtf8::Wtf8Buf {
+fn wtf8_from_message_str(ptr: pyre_object::gc_hook::GCREF) -> rustpython_wtf8::Wtf8Buf {
     use pyre_object::lowlevel_string::{LOWLEVEL_STRING_CHARS_OFFSET, bh_lowlevel_string_len};
     if ptr.is_null() {
         return rustpython_wtf8::Wtf8Buf::new();
@@ -696,7 +696,7 @@ impl PyError {
     }
 
     fn write_barrier(&self) {
-        pyre_object::gc_hook::try_gc_write_barrier(self.0 as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(self.0 as pyre_object::gc_hook::GCREF);
     }
 
     fn raw(&self) -> *mut PyErrorObject {
@@ -712,7 +712,7 @@ impl PyError {
         self.write_barrier();
     }
 
-    pub fn set_message_ptr(&mut self, message: *mut u8) {
+    pub fn set_message_ptr(&mut self, message: pyre_object::gc_hook::GCREF) {
         unsafe { (*self.raw()).message = message };
         self.write_barrier();
     }

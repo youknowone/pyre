@@ -146,7 +146,8 @@ impl WriterRefs {
 
     fn find(&self, obj: PyObjectRef) -> Option<(u32, bool)> {
         let obj =
-            pyre_object::gc_hook::try_gc_current_object_address(obj as *mut u8) as PyObjectRef;
+            pyre_object::gc_hook::try_gc_current_object_address(obj as pyre_object::gc_hook::GCREF)
+                as PyObjectRef;
         let bucket = self
             .by_identity
             .get(&pyre_object::gc_hook::gc_identity_hash(obj as usize))?;

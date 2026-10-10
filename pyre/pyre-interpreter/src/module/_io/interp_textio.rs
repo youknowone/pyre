@@ -527,7 +527,9 @@ impl W_TextIOWrapper {
     /// sequence that allocates and calls back into Python between the stores.
     #[inline]
     fn publish_refs(&mut self) {
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
     }
 
     /// PyPy `W_TextIOWrapper._set_encoder_decoder`.
@@ -1238,7 +1240,9 @@ impl W_TextIOWrapper {
         // reinitialization must leave all I/O operations uninitialized.
         self.state = STATE_ZERO;
         self.w_buffer = PY_NULL;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
 
         // An unspecified `encoding` reads the locale's, unless UTF-8 mode has
         // already answered the question.  `_io.text_encoding` is not on this
@@ -1539,7 +1543,9 @@ impl W_TextIOWrapper {
         let buffer = self.w_buffer;
         self.w_buffer = PY_NULL;
         self.state = STATE_DETACHED;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *mut Self as pyre_object::gc_hook::GCREF,
+        );
         Ok(buffer)
     }
 

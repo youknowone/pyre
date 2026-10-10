@@ -290,7 +290,7 @@ pub unsafe fn w_list_iter_index(obj: PyObjectRef) -> isize {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_ListIterObject)).seq = seq;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -323,7 +323,7 @@ pub unsafe fn w_list_reverse_iter_index(obj: PyObjectRef) -> isize {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_ListReverseIterObject)).seq = seq;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -356,7 +356,7 @@ pub unsafe fn w_tuple_iter_index(obj: PyObjectRef) -> isize {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_tuple_iter_set_seq(obj: PyObjectRef, seq: PyObjectRef) {
     (*(obj as *mut W_TupleIterObject)).seq = seq;
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]

@@ -1124,7 +1124,7 @@ impl ExecutionContext {
         // minor collection leaves `f_backref` pointing at the pre-copy nursery
         // address.  Same obligation as the inline-call push and the resumed
         // chain's relink.
-        pyre_object::gc_hook::try_gc_write_barrier(frame as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
         majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
         // A caller that already linked the frame -- `install_current_frame`
         // sets both ends of this pair -- would make the store below name the

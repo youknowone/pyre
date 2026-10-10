@@ -389,8 +389,8 @@ fn unroot_callee_frame(ptr: *mut PyFrame) {
     unsafe {
         pyre_interpreter::pyframe::remember_frame_locals_array((*ptr).locals_cells_stack_w);
     }
-    if pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8) {
-        pyre_object::gc_hook::try_gc_write_barrier(ptr as *mut u8);
+    if pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF) {
+        pyre_object::gc_hook::try_gc_write_barrier(ptr as pyre_object::gc_hook::GCREF);
     }
     LIVE_CALLEE_FRAMES.with(|cell| {
         let frames = unsafe { &mut *cell.get() };
@@ -2312,7 +2312,7 @@ fn jit_blackhole_resume_from_guard(
 /// `decode_ref` keys the same index), so the type gate is exact.
 #[allow(dead_code)] // resume.py decode_ref deadframe roots
 struct ResumeDeadframeRoots {
-    slots: Vec<*mut *mut u8>,
+    slots: Vec<*mut pyre_object::gc_hook::GCREF>,
     frame_roots: Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
 }
 
@@ -2322,7 +2322,7 @@ impl ResumeDeadframeRoots {
         value: i64,
         frame_roots: &mut Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
     ) {
-        let ptr = value as *mut u8;
+        let ptr = value as pyre_object::gc_hook::GCREF;
         if ptr.is_null()
             || !pyre_object::gc_hook::try_gc_owns_object(ptr)
             || majit_gc::gc_is_nursery_object(ptr as usize)
@@ -2357,7 +2357,7 @@ impl ResumeDeadframeRoots {
                 if *cell == 0 {
                     continue;
                 }
-                let slot = cell as *mut i64 as *mut *mut u8;
+                let slot = cell as *mut i64 as *mut pyre_object::gc_hook::GCREF;
                 if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
                     slots.push(slot);
                 }
@@ -2385,7 +2385,7 @@ impl Drop for ResumeDeadframeRoots {
 /// is a no-op for a null slot (non-exception guards leave `grab_exc_value` 0).
 #[cfg(target_arch = "wasm32")]
 struct BareRefRoot {
-    slot: Option<*mut *mut u8>,
+    slot: Option<*mut pyre_object::gc_hook::GCREF>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2394,7 +2394,7 @@ impl BareRefRoot {
         if *value == 0 {
             return Self { slot: None };
         }
-        let slot = value as *mut i64 as *mut *mut u8;
+        let slot = value as *mut i64 as *mut pyre_object::gc_hook::GCREF;
         let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
         Self {
             slot: registered.then_some(slot),

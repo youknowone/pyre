@@ -7,8 +7,9 @@
 //! the access leaves become `int_add`, `raw_load` and `raw_store`.
 //!
 //! Addresses are spelled `usize`, not `*mut u8`: a raw block is neither traced
-//! nor moved, so it belongs in the integer register bank, while `*mut u8` is
-//! the erased spelling of a managed object.
+//! nor moved, so it belongs in the integer register bank. `*mut u8` is
+//! `rffi.CCHARP` / `llmemory.Address`; [`super::llmemory::GCREF`] is the
+//! erased managed object.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 

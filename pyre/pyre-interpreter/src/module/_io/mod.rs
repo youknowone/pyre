@@ -167,7 +167,7 @@ pub(crate) unsafe fn iobase_getdict(obj: PyObjectRef) -> PyObjectRef {
         let w_dict = w_dict_new();
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         iobase_write_dict(obj, w_dict);
-        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
         w_dict
     }
 }

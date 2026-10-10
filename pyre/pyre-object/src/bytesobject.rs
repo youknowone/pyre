@@ -156,7 +156,7 @@ fn route_bytes_block(size: usize) -> BlockRoute {
     }
     match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(tid, size))
     {
-        crate::gc_hook::GcAllocOutcome::Allocated(raw) => BlockRoute::Managed(raw),
+        crate::gc_hook::GcAllocOutcome::Allocated(raw) => BlockRoute::Managed(raw as *mut u8),
         crate::gc_hook::GcAllocOutcome::Failed => BlockRoute::Refused,
         crate::gc_hook::GcAllocOutcome::NoRoute => BlockRoute::Raw,
     }

@@ -68,7 +68,7 @@ impl PinnedRef {
 /// references — leaving a dangling field the next mark trips over.
 #[inline]
 fn pickler_write_barrier(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
 }
 
 // CPython 3.14 Modules/_pickle.c:pickle_exec CREATE_TYPEs pickler_type_spec;
@@ -586,7 +586,7 @@ impl W_Pickler {
         current.w_pers_func = pyre_object::PY_NULL;
         pyre_object::gc_hook::try_gc_write_barrier(pyre_object::gc_roots::shadow_stack_get(
             self_slot,
-        ) as *mut u8);
+        ) as pyre_object::gc_hook::GCREF);
         Ok(())
     }
 

@@ -190,7 +190,7 @@ pub unsafe fn w_memoryview_set_view(mv: PyObjectRef, view: *const BufferView) {
     unsafe {
         (*(mv as *mut W_MemoryView)).view = view;
     }
-    crate::gc_hook::try_gc_write_barrier(mv as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(mv as crate::gc_hook::GCREF);
 }
 
 /// # Safety

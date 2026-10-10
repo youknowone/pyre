@@ -160,7 +160,9 @@ pub fn ffiobj_init(
         let cached =
             pyre_object::w_list_new((0..n).map(|_| pyre_object::w_none()).collect::<Vec<_>>());
         ffi_obj::ffi_arg(roots.get(ffi_slot))?.cached_types = cached;
-        pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(ffi_slot).cast::<u8>());
+        pyre_object::gc_hook::try_gc_write_barrier_managed(
+            roots.get(ffi_slot) as pyre_object::gc_hook::GCREF
+        );
     }
 
     if !is_none_or_null(roots.get(ffi_slot + 1)) {

@@ -7294,7 +7294,7 @@ fn type_create_new_type(
         let w_type = pyre_object::w_type_new(
             name,
             pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
-            dict_obj as *mut u8,
+            dict_obj as pyre_object::gc_hook::GCREF,
         );
         // Nothing refers to a class this young — the classcell is optional and
         // `weak_subclasses` is weak — while the passes below allocate, so a

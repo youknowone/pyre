@@ -234,6 +234,31 @@ pub trait GcType {
     const SIZE: usize;
 }
 
+/// Pointee of [`GCREF`]. `lltype.GcOpaqueType('GCREF')` (`llmemory.py`).
+///
+/// Never malloc'd and never passed to `gc.register_type`. `GcType` exists
+/// so `DeclaredGcFacts` seeds this StructId as Gc; `history.py` `getkind`
+/// of `Ptr(GcOpaqueType)` is then `'ref'`.
+#[repr(C)]
+pub struct GCREFOpaque {
+    _private: [u8; 0],
+}
+
+impl GcType for GCREFOpaque {
+    fn type_id() -> u32 {
+        // No register_type row: the private field makes the type unconstructible, so no
+        // malloc_typed call can name it.
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
+/// `llmemory.GCREF = Ptr(GcOpaqueType('GCREF'))`.
+///
+/// A thin pointer alias with the same machine ABI as `*mut u8`.
+#[allow(non_camel_case_types)]
+pub type GCREF = *mut GCREFOpaque;
+
 /// Allocate a value of type `T` behind a leading [`GcHeader`] and return the
 /// payload pointer (`block + SIZE`).
 ///

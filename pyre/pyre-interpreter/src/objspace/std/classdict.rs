@@ -39,7 +39,7 @@ impl DictStrategy for ClassDictStrategySlot {
         StrategyKind::Class
     }
 
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> pyre_object::gc_hook::GCREF {
         std::ptr::null_mut()
     }
 
@@ -442,7 +442,10 @@ pub(crate) unsafe fn uncell_type_namespace(w_type: PyObjectRef) {
 /// `W_DictObject(space, strategy, strategy.erase(self))`.
 pub fn class_dict_for_type(w_type: PyObjectRef) -> PyObjectRef {
     let space = crate::baseobjspace::object_space();
-    pyre_object::w_dict_new_with(space.class_dict_strategy().strategy_ref, w_type as *mut u8)
+    pyre_object::w_dict_new_with(
+        space.class_dict_strategy().strategy_ref,
+        w_type as pyre_object::gc_hook::GCREF,
+    )
 }
 
 #[cfg(test)]

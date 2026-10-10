@@ -187,7 +187,7 @@ pub(super) fn stginfo_of(cls: PyObjectRef) -> Option<PyObjectRef> {
 /// Store `info` as `cls`'s `StgInfo` and invalidate the type cache.
 pub(super) fn stginfo_set(cls: PyObjectRef, info: PyObjectRef) {
     if pyre_interpreter::type_dict_store(cls, STGINFO_KEY, info) {
-        pyre_object::gc_hook::try_gc_write_barrier(cls as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(cls as pyre_object::gc_hook::GCREF);
         unsafe { pyre_interpreter::baseobjspace::mutated(cls, STGINFO_KEY) };
     }
 }

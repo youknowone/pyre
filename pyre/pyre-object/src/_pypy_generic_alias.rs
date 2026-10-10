@@ -86,7 +86,7 @@ pub fn w_generic_alias_new(
                 crate::gc_roots::shadow_stack_get(save_point + 2);
             // `allocate_stable` barriers the initially-empty payload.  Record the
             // young pointers installed afterwards as well.
-            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         }
         obj
     } else {
@@ -268,7 +268,7 @@ pub fn w_union_from_parts(
         (*(obj as *mut UnionType)).unhashable_args =
             crate::gc_roots::shadow_stack_get(save_point + 1);
         (*(obj as *mut UnionType)).parameters = crate::gc_roots::shadow_stack_get(save_point + 2);
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
     obj
 }

@@ -5071,11 +5071,11 @@ pub(crate) fn frame_array_write_barrier(
     frame: *mut u8,
     arr_ptr: *mut pyre_object::FixedObjectArray,
 ) {
-    if pyre_object::gc_hook::try_gc_owns_object(arr_ptr as *mut u8) {
-        pyre_object::gc_hook::try_gc_write_barrier(arr_ptr as *mut u8);
+    if pyre_object::gc_hook::try_gc_owns_object(arr_ptr as pyre_object::gc_hook::GCREF) {
+        pyre_object::gc_hook::try_gc_write_barrier(arr_ptr as pyre_object::gc_hook::GCREF);
     }
-    if pyre_object::gc_hook::try_gc_owns_object(frame) {
-        pyre_object::gc_hook::try_gc_write_barrier(frame);
+    if pyre_object::gc_hook::try_gc_owns_object(frame as pyre_object::gc_hook::GCREF) {
+        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
     }
 }
 
@@ -5967,7 +5967,9 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, mut frame: usize) -> 
         // through the frame's current address and its current array.
         // The forwarding word is readable only until the next minor
         // collection, so carry the current address into the next slot.
-        frame = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        frame = pyre_object::gc_hook::try_gc_current_object_address(
+            frame as pyre_object::gc_hook::GCREF,
+        ) as usize;
         let arr_ptr = unsafe {
             *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
                 as *const *mut pyre_object::FixedObjectArray)
@@ -6021,10 +6023,14 @@ pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -
 /// that stores again must pass this address, not the one it started with.
 fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<usize> {
     let boxed = boxed_slot_value_for_type(Type::Ref, value);
-    let frame_now = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+    let frame_now =
+        pyre_object::gc_hook::try_gc_current_object_address(frame as pyre_object::gc_hook::GCREF)
+            as usize;
     // A reused nursery slot's forwarding word is the debug fill. That
     // address is not a live object; writing through it faults.
-    if frame_now == 0 || !pyre_object::gc_hook::try_gc_owns_object(frame_now as *mut u8) {
+    if frame_now == 0
+        || !pyre_object::gc_hook::try_gc_owns_object(frame_now as pyre_object::gc_hook::GCREF)
+    {
         return None;
     }
     let arr_ptr = unsafe {

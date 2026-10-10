@@ -113,7 +113,8 @@ pub fn w_method_new(
             let slot = if i == 3 { shell_slot } else { save_point + i };
             let root = crate::gc_roots::shadow_stack_get(slot);
             let current =
-                crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+                crate::gc_hook::try_gc_current_object_address(root as crate::gc_hook::GCREF)
+                    as PyObjectRef;
             crate::gc_roots::shadow_stack_set(slot, current);
         }
         let w_function = crate::gc_roots::shadow_stack_get(save_point);
@@ -158,7 +159,7 @@ pub fn w_method_new(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_set_public_class(obj: PyObjectRef, w_class: PyObjectRef) {
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     (*obj).w_class = w_class;
 }
 
@@ -175,7 +176,7 @@ pub unsafe fn w_method_get_module(obj: PyObjectRef) -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_method_set_module(obj: PyObjectRef, w_module: PyObjectRef) {
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     (*(obj as *mut Method)).w_module = w_module;
 }
 
@@ -324,7 +325,7 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
             );
         }
         (*(obj as *mut StaticMethod)).w_function = func;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -364,7 +365,7 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
             let obj_slot = crate::gc_roots::pin_roots(&[obj]);
             let w_dict = crate::dictmultiobject::w_dict_new_instance();
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
             (*(obj as *mut StaticMethod)).w_dict = w_dict;
             return w_dict;
         }
@@ -381,7 +382,7 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_staticmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut StaticMethod)).w_dict = w_dict;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -517,7 +518,7 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
             );
         }
         (*(obj as *mut ClassMethod)).w_function = func;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -556,7 +557,7 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
             let obj_slot = crate::gc_roots::pin_roots(&[obj]);
             let w_dict = crate::dictmultiobject::w_dict_new_instance();
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-            crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
             (*(obj as *mut ClassMethod)).w_dict = w_dict;
             return w_dict;
         }
@@ -573,7 +574,7 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut ClassMethod)).w_dict = w_dict;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 

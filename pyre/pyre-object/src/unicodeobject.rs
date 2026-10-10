@@ -595,7 +595,7 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
         index_storage: std::ptr::null_mut(),
         hash: 0,
     };
-    let value_slot = std::ptr::addr_of_mut!(unicode.value).cast::<*mut u8>();
+    let value_slot = std::ptr::addr_of_mut!(unicode.value).cast::<crate::gc_hook::GCREF>();
     let mut needs_write_barrier = true;
     let raw = unsafe {
         crate::gc_hook::try_gc_alloc_collecting_rooted(
@@ -751,7 +751,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         // Unit tests have no GC hook: `gc_alloc_storage_box` already
         // fell back to `malloc_raw`, and `try_gc_owns_object` is false.
         let value_ptr = unicode.base.value;
-        if crate::gc_hook::try_gc_owns_object(value_ptr as *mut u8) {
+        if crate::gc_hook::try_gc_owns_object(value_ptr as crate::gc_hook::GCREF) {
             let bytes = unsafe { utf8_payload_wtf8(value_ptr).as_bytes() };
             unicode.base.value = alloc_utf8_payload(bytes, false);
         }
@@ -918,7 +918,7 @@ pub fn init_interned_strings() {
 /// and `invalidate_young_weakrefs` rewrites `weakptr` (`incminimark.py`).
 pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut table = lock_intern();
-    if table.0.is_null() || !crate::gc_hook::try_gc_owns_object(table.0 as *mut u8) {
+    if table.0.is_null() || !crate::gc_hook::try_gc_owns_object(table.0 as crate::gc_hook::GCREF) {
         return;
     }
     let mut ptr = table.0 as PyObjectRef;
@@ -950,7 +950,9 @@ fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef 
     let mut table = lock_intern();
     let dict = intern_dict(&mut table);
     if let Some(existing) = dict.ll_get(key) {
-        if !replace_managed || !crate::gc_hook::try_gc_owns_object(existing as *mut u8) {
+        if !replace_managed
+            || !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF)
+        {
             return existing;
         }
     }
@@ -1107,7 +1109,7 @@ pub fn interned_size_immortal() -> usize {
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     if let Some(existing) = intern_lookup(value) {
-        if !crate::gc_hook::try_gc_owns_object(existing as *mut u8) {
+        if !crate::gc_hook::try_gc_owns_object(existing as crate::gc_hook::GCREF) {
             return existing;
         }
     }
@@ -1450,14 +1452,14 @@ pub unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8
             utf8_payload_wtf8((*str_obj).value),
             (*str_obj).len,
         );
-        let tid = if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        let tid = if crate::gc_hook::try_gc_owns_object(obj as crate::gc_hook::GCREF) {
             utf8_index_gc_type_id()
         } else {
             0
         };
         let storage = crate::gc_storage::gc_alloc_storage_box(storage, tid);
         (*str_obj).index_storage = storage;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         storage
     }
 }
@@ -2383,14 +2385,14 @@ mod tests {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    fn record_managed_alloc(_type_id: u32, payload_size: usize) -> *mut u8 {
+    fn record_managed_alloc(_type_id: u32, payload_size: usize) -> crate::gc_hook::GCREF {
         let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
             .expect("managed intern probe layout");
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if !ptr.is_null() {
             MANAGED_ALLOCS.with(|slots| slots.borrow_mut().push(ptr as usize));
         }
-        ptr
+        ptr as crate::gc_hook::GCREF
     }
 
     fn managed_alloc_is_owned(addr: usize) -> bool {
@@ -2425,14 +2427,18 @@ mod tests {
         let miss = Wtf8::new("__pyre_managed_miss_weak_slot_9c1e__");
         assert!(get_interned_wtf8(miss).is_none());
         let interned = intern_wtf8_value(miss);
-        assert!(!crate::gc_hook::try_gc_owns_object(interned as *mut u8));
+        assert!(!crate::gc_hook::try_gc_owns_object(
+            interned as crate::gc_hook::GCREF
+        ));
         assert_eq!(get_interned_wtf8(miss), Some(interned));
         assert_eq!(intern_wtf8_value(miss), interned);
         assert_eq!(box_str_constant(miss), interned);
 
         let constant = Wtf8::new("__pyre_constant_immortal_slot_9c1e__");
         let boxed = box_str_constant(constant);
-        assert!(!crate::gc_hook::try_gc_owns_object(boxed as *mut u8));
+        assert!(!crate::gc_hook::try_gc_owns_object(
+            boxed as crate::gc_hook::GCREF
+        ));
         assert_eq!(get_interned_wtf8(constant), Some(boxed));
         let again = box_str_constant(constant);
         assert_eq!(again, boxed);
@@ -2465,17 +2471,23 @@ mod tests {
 
         let live = Wtf8::new("__pyre_intern_live_managed_hit_8a1b__");
         let managed = w_str_from_wtf8_managed(live.to_owned());
-        assert!(crate::gc_hook::try_gc_owns_object(managed as *mut u8));
+        assert!(crate::gc_hook::try_gc_owns_object(
+            managed as crate::gc_hook::GCREF
+        ));
         let interned_live = unsafe { intern_exact_str(managed) };
         assert_eq!(interned_live, managed);
         assert_eq!(intern_wtf8_value(live), interned_live);
         assert_eq!(intern_str_value(live.as_str().unwrap()), interned_live);
-        assert!(crate::gc_hook::try_gc_owns_object(interned_live as *mut u8));
+        assert!(crate::gc_hook::try_gc_owns_object(
+            interned_live as crate::gc_hook::GCREF
+        ));
 
         let miss = Wtf8::new("__pyre_intern_miss_immortal_8a1b__");
         assert!(get_interned_wtf8(miss).is_none());
         let interned = intern_wtf8_value(miss);
-        assert!(!crate::gc_hook::try_gc_owns_object(interned as *mut u8));
+        assert!(!crate::gc_hook::try_gc_owns_object(
+            interned as crate::gc_hook::GCREF
+        ));
         assert_eq!(get_interned_wtf8(miss), Some(interned));
         assert_eq!(intern_wtf8_value(miss), interned);
         assert_eq!(box_str_constant(miss), interned);
@@ -2505,14 +2517,18 @@ mod tests {
 
         let live = Wtf8::new("__pyre_intern_publish_keep_managed_c3d4__");
         let managed = w_str_from_wtf8_managed(live.to_owned());
-        assert!(crate::gc_hook::try_gc_owns_object(managed as *mut u8));
+        assert!(crate::gc_hook::try_gc_owns_object(
+            managed as crate::gc_hook::GCREF
+        ));
         let interned_live = unsafe { intern_exact_str(managed) };
         assert_eq!(interned_live, managed);
 
         let immortal = w_str_from_wtf8_immortal(live.to_owned());
         let published = intern_publish_const(immortal, false);
         assert_eq!(published, interned_live);
-        assert!(crate::gc_hook::try_gc_owns_object(published as *mut u8));
+        assert!(crate::gc_hook::try_gc_owns_object(
+            published as crate::gc_hook::GCREF
+        ));
         assert_eq!(get_interned_wtf8(live), Some(interned_live));
     }
 
@@ -2594,12 +2610,13 @@ mod tests {
     unsafe fn intern_test_unicode_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
         let unicode = unsafe { &mut *(obj_addr as *mut W_UnicodeObject) };
         f(&mut unicode.ob_header.w_class as *mut PyObjectRef as *mut majit_ir::GcRef);
-        if !unicode.value.is_null() && crate::gc_hook::try_gc_owns_object(unicode.value as *mut u8)
+        if !unicode.value.is_null()
+            && crate::gc_hook::try_gc_owns_object(unicode.value as crate::gc_hook::GCREF)
         {
             f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
         }
         if !unicode.index_storage.is_null()
-            && crate::gc_hook::try_gc_owns_object(unicode.index_storage as *mut u8)
+            && crate::gc_hook::try_gc_owns_object(unicode.index_storage as crate::gc_hook::GCREF)
         {
             f(std::ptr::addr_of_mut!(unicode.index_storage) as *mut majit_ir::GcRef);
         }
@@ -2614,20 +2631,22 @@ mod tests {
         });
     }
 
-    fn intern_test_gc_alloc(type_id: u32, payload_size: usize) -> *mut u8 {
+    fn intern_test_gc_alloc(type_id: u32, payload_size: usize) -> crate::gc_hook::GCREF {
         let gc = intern_test_gc_ptr();
         if gc.is_null() {
             return std::ptr::null_mut();
         }
-        unsafe { (*gc).alloc_with_type_no_collect(type_id, payload_size).0 as *mut u8 }
+        unsafe {
+            (*gc).alloc_with_type_no_collect(type_id, payload_size).0 as crate::gc_hook::GCREF
+        }
     }
 
     unsafe fn intern_test_gc_alloc_collecting_rooted(
         type_id: u32,
         payload_size: usize,
-        _root: *mut *mut u8,
+        _root: *mut crate::gc_hook::GCREF,
         needs_write_barrier: *mut bool,
-    ) -> *mut u8 {
+    ) -> crate::gc_hook::GCREF {
         if !crate::gc_hook::hook_test_effects_visible() {
             return std::ptr::null_mut();
         }
@@ -2642,10 +2661,10 @@ mod tests {
         unsafe {
             *needs_write_barrier = !(*gc).is_in_nursery(obj.0);
         }
-        obj.0 as *mut u8
+        obj.0 as crate::gc_hook::GCREF
     }
 
-    fn intern_test_gc_write_barrier(obj: *mut u8) {
+    fn intern_test_gc_write_barrier(obj: crate::gc_hook::GCREF) {
         if !crate::gc_hook::hook_test_effects_visible() {
             return;
         }
@@ -2805,7 +2824,9 @@ mod tests {
 
         let first = Wtf8::new("__pyre_intern_gc_young_a_i2b__");
         let managed = w_str_from_wtf8_managed(first.to_owned());
-        assert!(crate::gc_hook::try_gc_owns_object(managed as *mut u8));
+        assert!(crate::gc_hook::try_gc_owns_object(
+            managed as crate::gc_hook::GCREF
+        ));
         assert!(with_intern_test_gc(|gc| gc.is_in_nursery(managed as usize)));
         let interned = unsafe { intern_exact_str(managed) };
         assert_eq!(interned, managed);

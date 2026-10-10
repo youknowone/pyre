@@ -75,7 +75,7 @@ pub fn load_library(w_filename: PyObjectRef, flags: i64) -> Result<PyObjectRef, 
         .w_name = roots.get(name_slot);
     // The library is born old-gen and the name it just took is young, so the
     // barrier has to run again after that write.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     Ok(obj)
 }
 

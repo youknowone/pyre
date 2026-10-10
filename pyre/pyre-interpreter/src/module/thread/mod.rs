@@ -1699,7 +1699,7 @@ mod local_class {
                 (*this).last_ident = ident;
                 (*this).last_dict = w_dict;
             }
-            pyre_object::gc_hook::try_gc_write_barrier(this as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(this as pyre_object::gc_hook::GCREF);
             Ok(w_dict)
         }
 
@@ -1809,7 +1809,7 @@ mod local_class {
                     .unwrap_or(PY_NULL);
                 (*this).last_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
             }
-            pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();
             let obj = pyre_object::gc_roots::pin_root(obj);
             register_local_in_current_ec(obj);
@@ -2035,7 +2035,9 @@ impl Bootstrapper {
             return;
         }
         for slot in self.slots() {
-            let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot as *mut *mut u8) };
+            let registered = unsafe {
+                pyre_object::gc_hook::try_gc_add_root(slot as *mut pyre_object::gc_hook::GCREF)
+            };
             debug_assert!(
                 registered || !pyre_object::gc_hook::add_root_hook_installed(),
                 "the collector declined a bootstrapper root"

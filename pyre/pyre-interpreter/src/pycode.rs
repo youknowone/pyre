@@ -1762,7 +1762,7 @@ fn publish_code_slot_store(obj: PyObjectRef) {
     // PyCode. The managed barrier skips the hybrid-heap ownership lookup
     // `try_gc_write_barrier` still pays, and is the one every other
     // stable allocator uses after writing a young child.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
 
@@ -4308,7 +4308,9 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
     // A collection root walk may have installed a forwarding pointer before
     // this side table itself is visited. Follow it eagerly so every reader
     // sees the live address and write the answer back for later readers.
-    *wrapper = pyre_object::gc_hook::try_gc_current_object_address(*wrapper as *mut u8) as usize;
+    *wrapper = pyre_object::gc_hook::try_gc_current_object_address(
+        *wrapper as pyre_object::gc_hook::GCREF,
+    ) as usize;
     *wrapper as PyObjectRef
 }
 
@@ -4931,7 +4933,7 @@ pub unsafe fn w_code_mapdict_caches_set(
         // `w_method` reference; register this code object so
         // `walk_mapdict_method_cache_gc` forwards the slot.
         if !entry.w_method.is_null() {
-            if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+            if !pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF) {
                 mapdict_method_cache_codes().lock().insert(obj as usize);
             }
             // The slot is reached only by `walk_mapdict_method_cache_gc`,
@@ -4986,7 +4988,7 @@ fn register_w_globals_stamped_code(obj: PyObjectRef) {
     // wrappers outside the collector need the compatibility registry; making
     // every managed code's globals an independent root would turn
     // `code -> globals -> function/generator -> code` cycles immortal.
-    if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+    if pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF) {
         return;
     }
     w_globals_stamped_codes().lock().insert(obj as usize);

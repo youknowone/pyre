@@ -16,7 +16,9 @@ pub fn hide_object(w_handle: PyObjectRef) -> *mut u8 {
 
 /// `HideRevealCast.reveal_object` for a `W_CDataHandle`.
 pub fn reveal_object(ptr: *mut u8) -> Option<PyObjectRef> {
-    if ptr.is_null() || !pyre_object::gc_hook::try_gc_owns_object(ptr) {
+    if ptr.is_null()
+        || !pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF)
+    {
         return None;
     }
     let obj = ptr.cast::<pyre_object::PyObject>();
@@ -32,7 +34,9 @@ pub fn hide_callback(w_callback: PyObjectRef) -> *mut u8 {
 
 /// `hide_reveal1.reveal_object` for a `W_CDataCallback`.
 pub fn reveal_callback(ptr: *mut u8) -> Option<PyObjectRef> {
-    if ptr.is_null() || !pyre_object::gc_hook::try_gc_owns_object(ptr) {
+    if ptr.is_null()
+        || !pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF)
+    {
         return None;
     }
     let obj = ptr.cast::<pyre_object::PyObject>();

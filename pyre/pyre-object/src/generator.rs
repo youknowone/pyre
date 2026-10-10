@@ -34,8 +34,8 @@ pub static ASYNC_GENERATOR_TYPE: PyType = crate::pyobject::new_pytype_with_weakr
 pub struct GeneratorIterator {
     pub ob: PyObject,
     /// Opaque pointer to the suspended PyFrame (Box<PyFrame>).
-    /// NULL when the generator is exhausted.
-    pub frame_ptr: *mut u8,
+    /// NULL when the generator is exhausted. `llmemory.GCREF`.
+    pub frame_ptr: crate::gc_hook::GCREF,
     /// `generator.py` `self.pycode = frame.pycode`.  This remains owned by
     /// the generator after `frame` is cleared on exhaustion.
     pub pycode: PyObjectRef,
@@ -129,7 +129,7 @@ impl crate::lltype::GcType for GeneratorIterator {
 }
 
 fn w_generator_or_coroutine_new(
-    frame_ptr: *mut u8,
+    frame_ptr: crate::gc_hook::GCREF,
     pycode: PyObjectRef,
     kind: GeneratorKind,
 ) -> PyObjectRef {
@@ -160,7 +160,7 @@ fn w_generator_or_coroutine_new(
     };
     let pycode = crate::gc_roots::shadow_stack_get(pycode_slot);
     let frame_ptr = frame_slot
-        .map(|slot| crate::gc_roots::shadow_stack_get(slot) as *mut u8)
+        .map(|slot| crate::gc_roots::shadow_stack_get(slot) as crate::gc_hook::GCREF)
         .unwrap_or(frame_ptr);
     let value = GeneratorIterator {
         ob: PyObject { ob_type, w_class },
@@ -213,15 +213,15 @@ enum GeneratorKind {
     AsyncGenerator,
 }
 
-pub fn w_generator_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
+pub fn w_generator_new(frame_ptr: crate::gc_hook::GCREF, pycode: PyObjectRef) -> PyObjectRef {
     w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::Generator)
 }
 
-pub fn w_coroutine_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
+pub fn w_coroutine_new(frame_ptr: crate::gc_hook::GCREF, pycode: PyObjectRef) -> PyObjectRef {
     w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::Coroutine)
 }
 
-pub fn w_async_generator_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjectRef {
+pub fn w_async_generator_new(frame_ptr: crate::gc_hook::GCREF, pycode: PyObjectRef) -> PyObjectRef {
     w_generator_or_coroutine_new(frame_ptr, pycode, GeneratorKind::AsyncGenerator)
 }
 
@@ -362,7 +362,7 @@ pub unsafe fn w_coroutine_wrapper_get_coroutine(obj: PyObjectRef) -> PyObjectRef
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> *mut u8 {
+pub unsafe fn w_generator_get_frame(obj: PyObjectRef) -> crate::gc_hook::GCREF {
     unsafe { (*(obj as *const GeneratorIterator)).frame_ptr }
 }
 
@@ -378,10 +378,10 @@ pub unsafe fn w_generator_get_pycode(obj: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_generator_set_frame(obj: PyObjectRef, frame_ptr: *mut u8) {
+pub unsafe fn w_generator_set_frame(obj: PyObjectRef, frame_ptr: crate::gc_hook::GCREF) {
     unsafe { (*(obj as *mut GeneratorIterator)).frame_ptr = frame_ptr };
     if !frame_ptr.is_null() {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -465,7 +465,7 @@ pub unsafe fn w_generator_get_saved_exc_value(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_saved_exc_value(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).saved_exc_value = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -482,7 +482,7 @@ pub unsafe fn w_generator_get_previous(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_previous(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).previous_gen_or_coroutine = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -499,7 +499,7 @@ pub unsafe fn w_generator_get_name(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_name(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).name = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -516,7 +516,7 @@ pub unsafe fn w_generator_get_qualname(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).qualname = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -533,7 +533,7 @@ pub unsafe fn w_coroutine_get_origin(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_coroutine_set_origin(obj: PyObjectRef, origin: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).cr_origin = origin };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[inline]
@@ -582,7 +582,7 @@ pub unsafe fn w_async_generator_get_finalizer(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_async_generator_set_finalizer(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GeneratorIterator)).w_finalizer = value };
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 #[cfg(test)]

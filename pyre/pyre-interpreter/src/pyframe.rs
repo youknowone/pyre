@@ -1705,7 +1705,7 @@ pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
             .has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
     };
     if tracks_young {
-        pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
+        pyre_object::gc_hook::try_gc_write_barrier(array as pyre_object::gc_hook::GCREF);
     }
 }
 
@@ -1718,7 +1718,9 @@ pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
     if ptr.is_null() {
         return;
     }
-    debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8));
+    debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
+        ptr as pyre_object::gc_hook::GCREF
+    ));
     unsafe {
         let len = (*ptr).len;
         let raw = (ptr as *mut u8).sub(GC_HEADER_SIZE);
@@ -1862,7 +1864,9 @@ impl FrameBox {
         // that block's own fields alongside the frame's and write them back.
         let frame_root = pyre_object::gc_roots::push_roots();
         let unscanned_debugdata = !frame.debugdata.is_null()
-            && !pyre_object::gc_hook::try_gc_owns_object(frame.debugdata as *mut u8);
+            && !pyre_object::gc_hook::try_gc_owns_object(
+                frame.debugdata as pyre_object::gc_hook::GCREF,
+            );
         let mut published = [
             frame.ob_header.w_class,
             frame.pycode as pyre_object::PyObjectRef,
@@ -1927,7 +1931,7 @@ impl FrameBox {
                 debug.hidden_operationerr = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT + 4);
             }
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
-                frame.locals_cells_stack_w as *mut u8
+                frame.locals_cells_stack_w as pyre_object::gc_hook::GCREF
             ));
             let ptr = raw as *mut PyFrame;
             unsafe {
@@ -1949,7 +1953,7 @@ impl FrameBox {
             };
         }
         debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
-            frame.locals_cells_stack_w as *mut u8
+            frame.locals_cells_stack_w as pyre_object::gc_hook::GCREF
         ));
         FrameBox::new_boxed(frame)
     }
@@ -2014,7 +2018,7 @@ impl FrameBox {
         // the slot is what a walker reads, so it has to name the frame before
         // anything consults the collector about it.
         let owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
-        if pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF) {
             FrameBox {
                 ptr,
                 owner_root: Some(owner_root),
@@ -2120,11 +2124,20 @@ impl FrameBox {
                 .flags
                 .contains(crate::CodeFlags::ASYNC_GENERATOR)
         } {
-            pyre_object::generator::w_async_generator_new(frame_ptr as *mut u8, pycode)
+            pyre_object::generator::w_async_generator_new(
+                frame_ptr as pyre_object::gc_hook::GCREF,
+                pycode,
+            )
         } else if is_coroutine {
-            pyre_object::generator::w_coroutine_new(frame_ptr as *mut u8, pycode)
+            pyre_object::generator::w_coroutine_new(
+                frame_ptr as pyre_object::gc_hook::GCREF,
+                pycode,
+            )
         } else {
-            pyre_object::generator::w_generator_new(frame_ptr as *mut u8, pycode)
+            pyre_object::generator::w_generator_new(
+                frame_ptr as pyre_object::gc_hook::GCREF,
+                pycode,
+            )
         };
         let _generator_roots = pyre_object::gc_roots::push_roots();
         let generator_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2164,8 +2177,10 @@ impl FrameBox {
             let wref = pyre_object::weakref::w_weakref_new(generator);
             let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
             (*frame_ptr).f_generator_wref = wref as PyObjectRef;
-            if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as *mut u8) {
-                pyre_object::gc_hook::try_gc_write_barrier(frame_ptr as *mut u8);
+            if pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF) {
+                pyre_object::gc_hook::try_gc_write_barrier(
+                    frame_ptr as pyre_object::gc_hook::GCREF,
+                );
             }
         }
         let generator = pyre_object::gc_roots::shadow_stack_get(generator_slot);
@@ -2304,13 +2319,19 @@ impl Drop for FrameLocalsRoot {
 /// compiled gcmap cannot mark it as a GCREF (`rewrite_op_getsubstruct`).
 #[majit_macros::dont_look_inside]
 pub unsafe fn register_frame_locals_slot(frame_ptr: *mut PyFrame) -> bool {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
+    let slot = unsafe {
+        std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w)
+            as *mut pyre_object::gc_hook::GCREF
+    };
     unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
 }
 
 #[majit_macros::dont_look_inside]
 pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
+    let slot = unsafe {
+        std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w)
+            as *mut pyre_object::gc_hook::GCREF
+    };
     pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
@@ -2328,8 +2349,8 @@ unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedO
 
 #[inline]
 fn remember_frame_debug_data(debugdata: *mut FrameDebugData) {
-    if pyre_object::gc_hook::try_gc_owns_object(debugdata as *mut u8) {
-        pyre_object::gc_hook::try_gc_write_barrier(debugdata as *mut u8);
+    if pyre_object::gc_hook::try_gc_owns_object(debugdata as pyre_object::gc_hook::GCREF) {
+        pyre_object::gc_hook::try_gc_write_barrier(debugdata as pyre_object::gc_hook::GCREF);
     }
 }
 
@@ -2365,7 +2386,7 @@ unsafe fn clone_debugdata_ptr(
 unsafe fn clear_debugdata_ptr(ptr: &mut *mut FrameDebugData) {
     unsafe {
         if !(*ptr).is_null() {
-            if !pyre_object::gc_hook::try_gc_owns_object(*ptr as *mut u8) {
+            if !pyre_object::gc_hook::try_gc_owns_object(*ptr as pyre_object::gc_hook::GCREF) {
                 drop(Box::from_raw(*ptr));
             }
             *ptr = std::ptr::null_mut();
@@ -2386,7 +2407,9 @@ impl Drop for PyFrame {
 impl PyFrame {
     #[inline]
     fn aux_allocation(&self) -> FrameLocalsArrayAllocation {
-        if pyre_object::gc_hook::try_gc_owns_object(self as *const Self as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        ) {
             FrameLocalsArrayAllocation::OldGenGc
         } else {
             FrameLocalsArrayAllocation::StdAlloc
@@ -3928,7 +3951,7 @@ impl PyFrame {
             // only the payload leaves the frame off
             // `old_objects_pointing_to_young`.
             let live_frame = frame_anchor.live() as *mut Self;
-            pyre_object::gc_hook::try_gc_write_barrier(live_frame as *mut u8);
+            pyre_object::gc_hook::try_gc_write_barrier(live_frame as pyre_object::gc_hook::GCREF);
             let debugdata = unsafe { (*live_frame).debugdata };
             remember_frame_debug_data(debugdata);
             return unsafe { &mut *debugdata };
@@ -4070,7 +4093,9 @@ impl PyFrame {
         let raw =
             unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
         if !self.locals_cells_stack_w.is_null()
-            && !pyre_object::gc_hook::try_gc_owns_object(self.locals_cells_stack_w as *mut u8)
+            && !pyre_object::gc_hook::try_gc_owns_object(
+                self.locals_cells_stack_w as pyre_object::gc_hook::GCREF,
+            )
         {
             unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
         }
@@ -4108,8 +4133,12 @@ impl PyFrame {
         // Old-gen frame → nursery locals array is an old-to-young field
         // store (`incminimark.py write_barrier`). Remembering only the
         // array leaves the frame off `old_objects_pointing_to_young`.
-        if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
-            pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+        if pyre_object::gc_hook::try_gc_owns_object(
+            self as *mut PyFrame as pyre_object::gc_hook::GCREF,
+        ) {
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *mut PyFrame as pyre_object::gc_hook::GCREF,
+            );
         }
     }
 
@@ -4705,7 +4734,7 @@ impl PyFrame {
     /// only for an address the nursery owns.
     #[inline]
     fn live_mut(&mut self) -> &mut Self {
-        let addr = self as *mut Self as *mut u8;
+        let addr = self as *mut Self as pyre_object::gc_hook::GCREF;
         unsafe { &mut *(pyre_object::gc_hook::try_gc_current_object_address(addr) as *mut Self) }
     }
 
@@ -7181,7 +7210,8 @@ pub fn report_stale_locals_array_holder(stale_addr: usize) -> bool {
     let mut found = false;
     while !frame.is_null() && depth < 64 {
         let frame_addr = frame as usize;
-        let owned = pyre_object::gc_hook::try_gc_owns_object(frame_addr as *mut u8);
+        let owned =
+            pyre_object::gc_hook::try_gc_owns_object(frame_addr as pyre_object::gc_hook::GCREF);
         if depth > 0 && !owned {
             crate::host_seam::emit_stderr(
                 format!(

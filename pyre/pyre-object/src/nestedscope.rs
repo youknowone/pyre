@@ -213,7 +213,7 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
     // possibly-nursery `value` into it needs the incminimark write barrier
     // (incminimark.py write_barrier_from_array) so the next minor collection scans the cell and
     // relocates the young value held only by `contents`.
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// Clear a cell (nestedscope.py `Cell.delete`).  Records the mutation
@@ -233,7 +233,7 @@ pub unsafe fn w_cell_delete(obj: PyObjectRef) -> bool {
         return false;
     }
     unsafe { (*cell).contents = PY_NULL }
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     true
 }
 

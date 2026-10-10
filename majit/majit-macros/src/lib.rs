@@ -857,11 +857,20 @@ fn is_gc_ref_type(ty: &Type) -> bool {
 }
 
 fn is_raw_pointer_type(ty: &Type) -> bool {
-    // `PyObjectRef` is `*mut PyObject`. The alias is a `Type::Path`, so
-    // a `Type::Ptr` match alone would skip it and `emit_helper_call_target_fn`
-    // would refuse the word-ABI adapter (`prepare_list_ref_store` had to
-    // spell `*mut PyObject` for that reason).
-    matches!(ty, Type::Ptr(_)) || path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef")
+    // A thin raw pointer is one ABI word. Named aliases (`PyObjectRef` =
+    // `*mut PyObject`, `GCREF` = `*mut GCREFOpaque` / `llmemory.GCREF`) are
+    // `Type::Path`, so a `Type::Ptr` match alone would skip them and
+    // `emit_helper_call_target_fn` would refuse the word-ABI adapter
+    // (`prepare_list_ref_store` had to spell `*mut PyObject` for that
+    // reason).
+    matches!(ty, Type::Ptr(_)) || is_pointer_alias(ty)
+}
+
+/// Path aliases of a thin pointer. The proc-macro sees tokens, not the
+/// expanded type, so these last-idents are the same one-word case as
+/// `Type::Ptr`.
+fn is_pointer_alias(ty: &Type) -> bool {
+    path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef" || id == "GCREF")
 }
 
 /// `Option<T>` whose `T` is one Ref-word pointer (`PyObjectRef`, `*mut X`,
@@ -1116,9 +1125,10 @@ fn is_fat_pointer_arg(ty: &Type) -> bool {
 /// the `(ptr, len)` pair.
 ///
 /// The item is one of: a path whose last segment is `GcRef`, a thin raw
-/// pointer `*const X` / `*mut X`, or `i64` / `u64` / `isize` / `usize`.
-/// `PyObjectRef` and `*mut PyObject` / `*const PyObject` are the
-/// length-prefixed object array, one word, so they are not pair items.
+/// pointer `*const X` / `*mut X` (or a one-word pointer alias), or
+/// `i64` / `u64` / `isize` / `usize`. `PyObjectRef` and `*mut PyObject`
+/// / `*const PyObject` are the length-prefixed object array, one word,
+/// so they are not pair items.
 /// Returns the item type and whether the slice is mutable.
 fn pair_slice_param(ty: &Type) -> Option<(&Type, bool)> {
     let Type::Reference(reference) = ty else {
@@ -1146,11 +1156,11 @@ fn is_pair_slice_item(ty: &Type) -> bool {
     if is_object_pointer_item(ty) {
         return false;
     }
-    if path_type_last_ident(ty).is_some_and(|id| id == "GcRef") {
+    if is_gc_ref_type(ty) {
         return true;
     }
-    if let Type::Ptr(ptr) = ty {
-        return !is_wide_pointee(&ptr.elem);
+    if is_raw_pointer_type(ty) {
+        return !is_fat_pointer_arg(ty);
     }
     primitive_type_ident(ty).is_some_and(|ident| {
         matches!(
@@ -4775,6 +4785,13 @@ mod tests {
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(skip("fn f(xs: &[*mut u8]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(xs: &[GCREF]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(item: GCREF) -> GCREF { item }"), None);
+        assert_eq!(
+            skip("fn f(l: &mut Vec<GCREF>, index: usize, item: GCREF) {}"),
+            None
+        );
+        assert_eq!(skip("fn f() -> Vec<GCREF> { Vec::new() }"), None);
         assert_eq!(skip("fn f(xs: &mut [i64]) -> i64 { 0 }"), None);
         assert_eq!(
             skip("fn f(p: *const [PyObjectRef]) -> i64 { 0 }"),
@@ -4848,6 +4865,41 @@ mod tests {
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
         );
+    }
+
+    #[test]
+    fn gcref_pointer_alias_emits_a_word_abi_trampoline() {
+        let func =
+            parse_fn("fn ll_vec_setitem_fast_r(l: &mut Vec<GCREF>, index: usize, item: GCREF) {}");
+        assert_eq!(trampoline_skip_reason(&func, "dont_look_inside", &[]), None);
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target_ll_vec_setitem_fast_r (__majit_arg_0 : i64 , __majit_arg_1 : i64 , __majit_arg_2 : i64)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("as * const () , 3"), "{text}");
+
+        let ret =
+            parse_fn("fn ll_vec_newlist_hint_r(lengthhint: usize) -> Vec<GCREF> { Vec::new() }");
+        assert_eq!(trampoline_skip_reason(&ret, "dont_look_inside", &[]), None);
+        let (_, _, ret_tokens) =
+            emit_helper_call_target_fn(&ret, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let ret_text = ret_tokens.to_string();
+        assert!(
+            ret_text.contains(
+                "fn __majit_call_target_ll_vec_newlist_hint_r (__majit_arg_0 : i64) -> i64"
+            ),
+            "{ret_text}"
+        );
+        assert!(ret_text.contains("raw_malloc_varsize_char"), "{ret_text}");
     }
 
     #[test]

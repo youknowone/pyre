@@ -40,7 +40,7 @@ pub fn new_glob(
     let glob = W_GlobSupport::from_obj(obj).expect("allocate_stable returns this layout");
     glob.w_name = roots.get(name_slot);
     glob.w_ctype = roots.get(ctype_slot);
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     obj
 }
 

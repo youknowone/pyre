@@ -431,7 +431,7 @@ pub fn offset_in_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .expect("allocate_stable hands back this layout")
         .w_bytes = roots.get(bytes_slot);
     // The wrapper is born old-gen and the bytes object may be young.
-    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj as pyre_object::gc_hook::GCREF);
     Ok(obj)
 }
 

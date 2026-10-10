@@ -40,7 +40,7 @@ fn a_null_means_no_route_only_while_nothing_owns_the_heap() {
 #[test]
 fn a_non_null_is_allocated_regardless_of_what_is_installed() {
     let mut probe = 0u8;
-    let raw = &mut probe as *mut u8;
+    let raw = (&mut probe as *mut u8).cast();
     assert_eq!(
         GcAllocOutcome::classify(GcRef(raw as usize)),
         GcAllocOutcome::Allocated(raw)

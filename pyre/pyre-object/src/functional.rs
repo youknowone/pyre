@@ -87,7 +87,7 @@ pub unsafe fn w_enumerate_get_iter_or_list(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_enumerate_set_iter_or_list(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Enumerate)).w_iter_or_list = value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -120,7 +120,7 @@ pub unsafe fn w_enumerate_get_w_index(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_enumerate_set_w_index(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Enumerate)).w_index = value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -214,7 +214,7 @@ pub unsafe fn w_reversed_get_sequence(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_reversed_set_sequence(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_ReversedIterator)).w_sequence = value;
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
 }
 
@@ -1573,7 +1573,7 @@ pub unsafe fn w_long_range_iter_set_index(obj: PyObjectRef, index: PyObjectRef) 
     let it = obj as *mut W_LongRangeIterator;
     unsafe {
         (*it).index = index;
-        crate::gc_hook::try_gc_write_barrier(it as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(it as crate::gc_hook::GCREF);
     }
 }
 
@@ -1621,7 +1621,7 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         let next_index = crate::gc_roots::pin_root(next_index);
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;
         (*it).index = next_index;
-        crate::gc_hook::try_gc_write_barrier(it as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(it as crate::gc_hook::GCREF);
         Some(range_bigint_to_obj(value.translated_alias()))
     }
 }

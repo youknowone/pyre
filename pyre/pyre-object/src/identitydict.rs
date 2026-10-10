@@ -280,11 +280,11 @@ impl DictStrategy for IdentityDictStrategy {
     /// `IndexMap<IdentityKey, PyObjectRef>` — identity-keyed hash
     /// bucket for O(1) lookup + insertion-order preserving iteration.
     /// GC-managed box (`setfield_gc` on reassign).
-    fn get_empty_storage(&self) -> *mut u8 {
+    fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
         crate::gc_storage::gc_alloc_young_storage_box(
             IdentityDictStorage::new(),
             identity_dict_storage_gc_type_id(),
-        ) as *mut u8
+        ) as crate::gc_hook::GCREF
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem` —
@@ -409,7 +409,10 @@ impl DictStrategy for IdentityDictStrategy {
             storage.clone(),
             identity_dict_storage_gc_type_id(),
         );
-        crate::dictmultiobject::w_dict_new_with(&IDENTITY_DICT_STRATEGY_REF, new_storage as *mut u8)
+        crate::dictmultiobject::w_dict_new_with(
+            &IDENTITY_DICT_STRATEGY_REF,
+            new_storage as crate::gc_hook::GCREF,
+        )
     }
 
     /// `pypy.objspace.std.identitydict.IdentityDictStrategy` stores
