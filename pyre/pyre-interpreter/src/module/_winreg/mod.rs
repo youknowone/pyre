@@ -423,31 +423,21 @@ mod imp {
         ))
     }
 
-    /// The wording a boundary with no keyword table gives one anyway. It
-    /// qualifies itself with the module, which the clinic's keyword binder
-    /// does not.
-    fn no_keywords(name: &str) -> pyre_interpreter::PyError {
-        pyre_interpreter::PyError::type_error(format!("winreg.{name}() takes no keyword arguments"))
-    }
-
     /// A positional-only call of fixed arity — `_PyArg_CheckPositional`
     /// reports the count it wanted against the count it got.
+    /// Bound scope: omitted slots are `PY_NULL`.
     fn exact_args<'a>(
         args: &'a [PyObjectRef],
         name: &str,
         count: usize,
     ) -> Result<&'a [PyObjectRef], pyre_interpreter::PyError> {
-        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keywords(name));
-        }
-        if pos.len() != count {
+        let given = args.iter().filter(|value| !value.is_null()).count();
+        if given != count {
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "{name} expected {count} arguments, got {}",
-                pos.len()
+                "{name} expected {count} arguments, got {given}"
             )));
         }
-        Ok(pos)
+        Ok(args)
     }
 
     /// `METH_O` — the single key the seven one-argument calls take, whose
@@ -456,17 +446,13 @@ mod imp {
         args: &[PyObjectRef],
         name: &str,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keywords(name));
-        }
-        if pos.len() != 1 {
+        let given = args.iter().filter(|value| !value.is_null()).count();
+        if given != 1 {
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "winreg.{name}() takes exactly one argument ({} given)",
-                pos.len()
+                "winreg.{name}() takes exactly one argument ({given} given)"
             )));
         }
-        Ok(pos[0])
+        Ok(args[0])
     }
 
     /// The four `key, sub_key, …` boundaries the clinic exposes by keyword.
@@ -1557,6 +1543,44 @@ mod imp {
                             None,
                             0,
                             0,
+                        ),
+                    );
+                    pyre_interpreter::function_new_with_fixed_code(
+                        code as *const (),
+                        name.to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                }
+                "CloseKey"
+                | "QueryInfoKey"
+                | "FlushKey"
+                | "ExpandEnvironmentStrings"
+                | "DisableReflectionKey"
+                | "EnableReflectionKey"
+                | "QueryReflectionKey" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 1, doc)
+                }
+                "SaveKey" | "QueryValue" | "QueryValueEx" | "EnumKey" | "EnumValue"
+                | "CreateKey" | "DeleteKey" | "DeleteValue" | "ConnectRegistry" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 2, doc)
+                }
+                "LoadKey" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 3, doc)
+                }
+                "SetValue" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 4, doc)
+                }
+                "SetValueEx" => {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        name,
+                        func,
+                        Some(doc),
+                        pyre_interpreter::Signature::new(
+                            vec!["key", "value_name", "reserved", "type", "value"],
+                            None,
+                            None,
+                            0,
+                            5,
                         ),
                     );
                     pyre_interpreter::function_new_with_fixed_code(
