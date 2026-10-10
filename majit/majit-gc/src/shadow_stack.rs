@@ -512,8 +512,7 @@ pub fn register_mutator() {
 /// never register.
 pub fn mutator_is_registered() -> bool {
     let thread_id = std::thread::current().id();
-    MUTATOR_REGISTRY
-        .lock()
+    lock_mutator_registry()
         .iter()
         .any(|entry| entry.thread_id == thread_id)
 }
