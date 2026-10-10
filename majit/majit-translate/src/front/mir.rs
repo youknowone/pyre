@@ -7668,13 +7668,14 @@ fn replace_whole_value_uses_in_kind(
             args,
             result_ty,
         } => {
+            // `FunctionReprBase.call` builds one `vlist` and passes those
+            // variables to the single `direct_call` / `indirect_call`.
+            let copy = emit_materialized_struct_copy(graph, out, owner, fields, has_vtable);
             let args = args
                 .iter()
                 .map(|arg| {
                     if arg.as_variable() == Some(result) {
-                        LinkArg::Value(emit_materialized_struct_copy(
-                            graph, out, owner, fields, has_vtable,
-                        ))
+                        LinkArg::Value(copy.clone())
                     } else {
                         arg.clone()
                     }
@@ -7697,12 +7698,15 @@ fn replace_whole_value_uses_in_kind(
             // `execute_generator_frame` builds `FrameResumeArgs` and passes
             // `&mut resume`; a stack address would be the walker's C frame.
             // Materialise one `New` so the residual sees a heap pointer, the
-            // same escape `Call` already takes.
+            // same escape `Call` already takes. `FunctionReprBase.call` builds
+            // one `vlist` and passes those variables to the single
+            // `indirect_call`; a repeated argument is the same object.
+            let copy = emit_materialized_struct_copy(graph, out, owner, fields, has_vtable);
             let args = args
                 .iter()
                 .map(|arg| {
                     if arg == result {
-                        emit_materialized_struct_copy(graph, out, owner, fields, has_vtable)
+                        copy.clone()
                     } else {
                         arg.clone()
                     }
@@ -71952,6 +71956,105 @@ mod tests {
                 _ => None,
             });
         assert_eq!(call_arg.as_ref(), Some(&news[0]));
+    }
+
+    /// `FunctionReprBase.call` builds one `vlist` for the single
+    /// `indirect_call`. The same aggregate in two argument positions is
+    /// one object; a second aggregate is a second object.
+    #[test]
+    fn aggregate_passed_twice_to_an_indirect_call_shares_one_copy() {
+        let mut graph = FunctionGraph::new("struct_ctor_indirect_dup");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let first = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("first struct ctor");
+        let first_payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("first payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: first.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(first_payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let second = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("second struct ctor");
+        let second_payload = graph
+            .push_op_var(entry, OpKind::ConstInt(2), true)
+            .expect("second payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: second.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(second_payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let funcptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("funcptr");
+        graph.push_op_var(
+            entry,
+            OpKind::IndirectCall {
+                funcptr,
+                args: vec![first.clone(), first, second],
+                graphs: None,
+                family_key: None,
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_return(entry, None);
+
+        assert_eq!(replace_struct_ctors(&mut graph), 2);
+        assert_eq!(struct_ctor_ops(&graph), (0, 2, 2));
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 2);
+        let call_args = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("indirect call");
+        assert_eq!(call_args.len(), 3);
+        assert_eq!(call_args[0], call_args[1]);
+        assert_ne!(call_args[0], call_args[2]);
+        assert!(news.contains(&call_args[0]));
+        assert!(news.contains(&call_args[2]));
+        assert_ne!(news[0], news[1]);
     }
 
     /// A phi copy plus a later field write is a distinct allocation: the
