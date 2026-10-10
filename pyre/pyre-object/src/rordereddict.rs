@@ -1196,25 +1196,30 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
     (K, V): GcEntriesType,
 {
     let mut reindexed = false;
+    let mut rc = d.resize_counter - 3;
     // `_ll_malloc_entries` may collect (`ll_dict_grow` /
     // `ll_dict_remove_deleted_items`). `key`/`value` GC words are
     // ordinary livevars (`framework.py` `push_roots`); reload them
-    // before the `setinteriorfield` stores.
-    let _roots = crate::gc_roots::push_roots();
-    let value_slot = pin_gcrefs(&_roots, &value);
-    let key_slot = pin_gcrefs(&_roots, &key);
-    d.pin_table_and_entries();
-    if d.num_ever_used_items == d.allocated_len() {
-        reindexed = ll_dict_grow(d);
-    }
-    let mut rc = d.resize_counter - 3;
-    if rc <= 0 {
-        ll_dict_resize(d);
-        reindexed = true;
+    // before the `setinteriorfield` stores. `push_roots` brackets the
+    // collecting call only: a store that neither grows nor resizes
+    // allocates nothing.
+    if d.num_ever_used_items == d.allocated_len() || rc <= 0 {
+        let _roots = crate::gc_roots::push_roots();
+        let value_slot = pin_gcrefs(&_roots, &value);
+        let key_slot = pin_gcrefs(&_roots, &key);
+        d.pin_table_and_entries();
+        if d.num_ever_used_items == d.allocated_len() {
+            reindexed = ll_dict_grow(d);
+        }
         rc = d.resize_counter - 3;
+        if rc <= 0 {
+            ll_dict_resize(d);
+            reindexed = true;
+            rc = d.resize_counter - 3;
+        }
+        reload_gcrefs(&_roots, &mut value, value_slot);
+        reload_gcrefs(&_roots, &mut key, key_slot);
     }
-    reload_gcrefs(&_roots, &mut value, value_slot);
-    reload_gcrefs(&_roots, &mut key, key_slot);
     if reindexed || i < 0 {
         let slot = d.next_slot();
         d.insert_clean(hash, slot);
