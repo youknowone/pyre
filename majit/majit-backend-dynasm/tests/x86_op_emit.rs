@@ -16,8 +16,8 @@ use majit_backend_dynasm::runner::DynasmBackend;
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, FailDescr, GcRef, InputArg, OopSpecIndex,
-    Op, OpCode, OpRc, OpRef, Type, Value,
+    CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, LoopTokenDescr,
+    OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value,
 };
 
 fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id: u64) -> i64 {
@@ -516,8 +516,8 @@ fn float_cmp_reads_const_operand_and_nan() {
     }
 }
 
-/// Test-only bridge into a `CALL_MAY_FORCE` helper. The helper is `extern "C"`
-/// and has no Rust argument for the backend that owns the force token.
+// Test-only bridge into a `CALL_MAY_FORCE` helper. The helper is `extern "C"`
+// and has no Rust argument for the backend that owns the force token.
 thread_local! {
     static FORCE_BACKEND: Cell<*const DynasmBackend> = const { Cell::new(std::ptr::null()) };
     static FORCE_SEEN: Cell<Option<i64>> = const { Cell::new(None) };
@@ -798,4 +798,363 @@ fn cond_call_guard_no_exception_checks_the_call_path() {
         "a quiet call must pass GUARD_NO_EXCEPTION"
     );
     assert!(!majit_backend_dynasm::jit_exc_is_pending());
+}
+
+fn no_collect_effect() -> EffectInfo {
+    let mut effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None);
+    effect.can_collect = false;
+    effect
+}
+
+fn call_descr(arg_types: Vec<Type>, result: Type, signed: bool, size: usize) -> DescrRef {
+    majit_ir::descr::make_call_descr_full(0, arg_types, result, signed, size, no_collect_effect())
+}
+
+fn finish_of(result: OpRef, ty: Type, pos: u32) -> Op {
+    let op = Op::new(OpCode::Finish, &[rb(result)]);
+    op.pos().set(OpRef::void_op(pos));
+    op.set_fail_arg_types(vec![ty]);
+    op.setfailargs(vec![rb(result)].into());
+    op
+}
+
+fn compile_call(
+    opcode: OpCode,
+    func: i64,
+    real_args: &[Operand],
+    arg_types: Vec<Type>,
+    result: OpRef,
+    result_type: Type,
+    signed: bool,
+    size: usize,
+) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let mut args = vec![rb(OpRef::const_int(func))];
+    args.extend_from_slice(real_args);
+    let call = Op::new(opcode, &args);
+    call.pos().set(result);
+    call.setdescr(call_descr(arg_types, result_type, signed, size));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(result, result_type, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile {opcode:?}: {err:?}"));
+    (backend, token)
+}
+
+extern "C" fn ret_i8() -> i8 {
+    -42
+}
+extern "C" fn ret_u8() -> u8 {
+    0xFE
+}
+extern "C" fn ret_i16() -> i16 {
+    -300
+}
+extern "C" fn ret_u16() -> u16 {
+    0xFFFE
+}
+extern "C" fn ret_i32() -> i32 {
+    -2
+}
+extern "C" fn ret_u32() -> u32 {
+    0xFFFF_FFFE
+}
+
+#[test]
+fn call_narrow_results_are_sign_or_zero_extended() {
+    // `CallBuilderX86.load_result` / `load_from_mem`: MOVSX/MOVZX/MOV32
+    // on eax. A 32-bit return leaves the high half of rax clear, so a
+    // missing extension is visible for every width below a word.
+    let runs: Vec<(i64, bool, usize, i64)> = vec![
+        (ret_i8 as usize as i64, true, 1, -42),
+        (ret_u8 as usize as i64, false, 1, 0xFE),
+        (ret_i16 as usize as i64, true, 2, -300),
+        (ret_u16 as usize as i64, false, 2, 0xFFFE),
+        (ret_i32 as usize as i64, true, 4, -2),
+        (ret_u32 as usize as i64, false, 4, 0xFFFF_FFFE),
+    ];
+    for (func, signed, size, expected) in runs {
+        let (backend, token) = compile_call(
+            OpCode::CallI,
+            func,
+            &[],
+            vec![],
+            OpRef::int_op(1),
+            Type::Int,
+            signed,
+            size,
+        );
+        let frame = backend.execute_token(&token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(
+            backend.get_int_value(&frame, 0),
+            expected,
+            "size={size} signed={signed}"
+        );
+    }
+}
+
+static REF_BYTE: u8 = 0x5A;
+
+extern "C" fn ref_static() -> *mut u8 {
+    &REF_BYTE as *const u8 as *mut u8
+}
+
+#[test]
+fn call_ref_result_is_the_pointer_word() {
+    // A pointer-word ref result stays in eax.
+    let (backend, token) = compile_call(
+        OpCode::CallR,
+        ref_static as usize as i64,
+        &[],
+        vec![],
+        OpRef::ref_op(1),
+        Type::Ref,
+        false,
+        8,
+    );
+    let frame = backend.execute_token(&token, &[]);
+    assert_eq!(
+        backend.get_ref_value(&frame, 0),
+        GcRef(&REF_BYTE as *const u8 as usize)
+    );
+}
+
+extern "C" fn neg_float(x: f64) -> f64 {
+    -x
+}
+
+#[test]
+fn call_float_result_is_read_from_xmm0() {
+    // `load_result` does not spill xmm0. FINISH reads the register
+    // `after_call` bound.
+    let (backend, token) = compile_call(
+        OpCode::CallF,
+        neg_float as usize as i64,
+        &[rb(OpRef::const_float(1.5))],
+        vec![Type::Float],
+        OpRef::float_op(1),
+        Type::Float,
+        false,
+        8,
+    );
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_float_bits(backend.get_float_value(&frame, 0), -1.5, "call float");
+}
+
+#[derive(Debug)]
+struct AssemblerLoopDescr {
+    token: Arc<JitCellToken>,
+}
+
+impl Descr for AssemblerLoopDescr {
+    fn as_loop_token_descr(&self) -> Option<&dyn LoopTokenDescr> {
+        Some(self)
+    }
+}
+
+impl LoopTokenDescr for AssemblerLoopDescr {
+    fn loop_token_number(&self) -> u64 {
+        self.token.number
+    }
+
+    fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.token)
+    }
+}
+
+fn compile_identity_loop(backend: &mut DynasmBackend, ty: Type) -> Arc<JitCellToken> {
+    let token = Arc::new(JitCellToken::new(next_token_id()));
+    let inputargs = vec![InputArg::from_type_rc(ty, 0)];
+    let i0 = inputargs[0].opref();
+    let ops = vec![OpRc::new(finish_of(i0, ty, 1))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile identity {ty:?}: {err:?}"));
+    assert_ne!(token.ll_function_addr(), 0, "callee entry was not baked");
+    token
+}
+
+/// `handle_call_assembler` reads `jitframe_info` and allocates the callee
+/// frame itself. The layout is process-wide and set-once; the tid has to
+/// be the one this thread's collector registered.
+fn backend_with_call_assembler_layout() -> DynasmBackend {
+    use majit_backend_dynasm::jitframe::{
+        FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS,
+        JF_FRAME_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, LENGTHOFS, SIGN_SIZE,
+    };
+    let mut gc = majit_gc::collector::MiniMarkGC::new();
+    let jitframe_tid = gc.register_type(majit_backend_dynasm::jitframe::jitframe_type_info());
+    majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    backend.set_gc_allocator(Box::new(gc));
+    majit_backend_dynasm::register_jitframe_layout(majit_backend_dynasm::JitFrameLayoutInfo {
+        jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
+            jitframe_tid,
+            jitframe_fixed_size: JITFRAME_FIXED_SIZE,
+            jf_frame_info_ofs: JF_FRAME_INFO_OFS,
+            jf_descr_ofs: JF_DESCR_OFS,
+            jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+            jf_savedata_ofs: JF_SAVEDATA_OFS,
+            jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+            jf_forward_ofs: JF_FORWARD_OFS,
+            jf_frame_ofs: JF_FRAME_OFS,
+            jf_frame_baseitemofs: FIRST_ITEM_OFFSET,
+            jf_frame_lengthofs: JF_FRAME_OFS + LENGTHOFS,
+            sign_size: SIGN_SIZE,
+            jf_frame_itemsize: SIGN_SIZE,
+        }),
+    });
+    backend
+}
+
+#[test]
+fn call_assembler_returns_int_and_float_from_the_dead_frame() {
+    // `call_assembler` / `_call_assembler_load_result`: the fast path
+    // loads value index 0. Same backend so the done-descr compare hits.
+    // `handle_call_assembler` turns the value argument into the callee
+    // frame; the callee is registered on this thread first.
+    let mut backend = backend_with_call_assembler_layout();
+    let int_callee = compile_identity_loop(&mut backend, Type::Int);
+    let float_callee = compile_identity_loop(&mut backend, Type::Float);
+
+    let int_inputs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = int_inputs[0].opref();
+    let int_token = JitCellToken::new(next_token_id());
+    let int_call = Op::new(OpCode::CallAssemblerI, &[rb(i0)]);
+    int_call.pos().set(OpRef::int_op(1));
+    int_call.setdescr(Arc::new(AssemblerLoopDescr {
+        token: Arc::clone(&int_callee),
+    }) as DescrRef);
+    let int_ops = vec![
+        OpRc::new(int_call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&int_inputs, &int_ops, &int_token)
+        .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER_I: {err:?}"));
+    let int_frame = backend.execute_token(&int_token, &[Value::Int(42)]);
+    assert!(backend.get_latest_descr(&int_frame).is_finish());
+    assert_eq!(backend.get_int_value(&int_frame, 0), 42);
+
+    let float_inputs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let f0 = float_inputs[0].opref();
+    let float_token = JitCellToken::new(next_token_id());
+    let float_call = Op::new(OpCode::CallAssemblerF, &[rb(f0)]);
+    float_call.pos().set(OpRef::float_op(1));
+    float_call.setdescr(Arc::new(AssemblerLoopDescr {
+        token: Arc::clone(&float_callee),
+    }) as DescrRef);
+    let float_ops = vec![
+        OpRc::new(float_call),
+        OpRc::new(finish_of(OpRef::float_op(1), Type::Float, 2)),
+    ];
+    backend
+        .compile_loop(&float_inputs, &float_ops, &float_token)
+        .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER_F: {err:?}"));
+    let float_frame = backend.execute_token(&float_token, &[Value::Float(-2.5)]);
+    assert!(backend.get_latest_descr(&float_frame).is_finish());
+    assert_float_bits(
+        backend.get_float_value(&float_frame, 0),
+        -2.5,
+        "call_assembler float",
+    );
+    let _keep = (int_callee, float_callee);
+}
+
+fn errno_ptr() -> *mut i32 {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        unsafe extern "C" {
+            fn _errno() -> *mut i32;
+        }
+        _errno()
+    }
+    #[cfg(not(target_os = "windows"))]
+    unsafe {
+        unsafe extern "C" {
+            fn __errno_location() -> *mut i32;
+        }
+        __errno_location()
+    }
+}
+
+extern "C" fn swap_errno(new_value: i64) -> i64 {
+    let slot = errno_ptr();
+    let old = unsafe { *slot } as i64;
+    unsafe {
+        *slot = new_value as i32;
+    }
+    old
+}
+
+fn errno_save_flags(base: i64) -> i64 {
+    // `RFFI_READSAVED_LASTERROR`: Win64 spills the used argument
+    // registers around `SetLastError`. Errno itself is unchanged.
+    #[cfg(target_os = "windows")]
+    {
+        base | 16
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        base
+    }
+}
+
+fn run_errno_swap(flags: i64, new_value: i64) -> i64 {
+    let (backend, token) = compile_release_gil(flags, new_value);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "save_err={flags:#x}"
+    );
+    backend.get_int_value(&frame, 0)
+}
+
+fn compile_release_gil(flags: i64, new_value: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallReleaseGilI,
+        &[
+            rb(OpRef::const_int(flags)),
+            rb(OpRef::const_int(swap_errno as usize as i64)),
+            rb(OpRef::const_int(new_value)),
+        ],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![Type::Int], Type::Int, true, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn call_release_gil_round_trips_errno() {
+    // `write_real_errno` / `read_real_errno`: zero, restore the saved
+    // copy, then read that copy back. The thread-local container
+    // survives across the three calls.
+    unsafe {
+        *errno_ptr() = 11;
+    }
+    assert_eq!(run_errno_swap(errno_save_flags(5), 77), 0);
+    unsafe {
+        *errno_ptr() = 5;
+    }
+    assert_eq!(run_errno_swap(errno_save_flags(3), 9), 77);
+    unsafe {
+        *errno_ptr() = 3;
+    }
+    assert_eq!(run_errno_swap(errno_save_flags(2), 0), 9);
 }

@@ -8490,29 +8490,36 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// aarch64/opassembler.py _emit_call.
-    /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
-    /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+    /// `CallBuilderX86.get_tlofs_reg`: load `THREADLOCAL_OFS` into callee-saved
+    /// r12 once. Later calls reuse it. The value is the absolute thread-local
+    /// address, so a later `add rsp` does not invalidate it.
+    fn ensure_tlofs_reg(&mut self, esp_ofs: i32, tlofs_loaded: &mut bool) {
+        if *tlofs_loaded {
+            return;
+        }
+        rx86::mov_rs(&mut self.mc, rx86::R12, SAVED_THREADLOCAL_OFS + esp_ofs);
+        *tlofs_loaded = true;
+    }
+
+    /// `CallBuilderX86.write_real_errno`, just before the raw call.
     ///
-    /// Register-bound arg moves go through `remap_frame_layout_mixed`
-    /// (a parallel-move algorithm) mirroring x86/callbuilder.py prepare_arguments
-    /// `prepare_arguments` → `remap_frame_layout`.  Emitting them naively
-    /// in source order broke Win64 where two args could map to the same
-    /// dst-then-src register (e.g. arg0 → rcx clobbering Reg(rcx) before
-    /// arg1 reads it as Gpr(rdx)).  Linux SysV escaped the same code
-    /// path because its rdi/rsi placement happened not to collide with
-    /// regalloc-chosen rcx/rdx for these traces.
-    /// callbuilder.py `write_real_errno`, just before the raw call: copy the
-    /// saved `errno` (and on Windows the saved last error) into the real one.
-    /// `esp_ofs` is how far rsp sits below the body rsp here. Only r10/r11 are
-    /// clobbered, since every argument register and rax (the callee) are
-    /// already loaded.
-    fn write_real_errno(&mut self, save_err: i64, esp_ofs: i32) {
+    /// `esp_ofs` is how far rsp sits below the body rsp. eax carries the
+    /// errno word (and Win64 `SetLastError` clobbers rax), so the caller
+    /// reloads the callee pointer afterwards. r12 keeps the thread-local
+    /// address for `read_real_errno`.
+    fn write_real_errno(
+        &mut self,
+        save_err: i64,
+        esp_ofs: i32,
+        tlofs_loaded: &mut bool,
+        win64_arg_gpr: u8,
+        win64_arg_xmm: u8,
+    ) {
         use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_READSAVED_ERRNO, RFFI_ZERO_ERRNO_BEFORE};
         use majit_rlib::rthread::{
             TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
         };
-        let tlofs = SAVED_THREADLOCAL_OFS + esp_ofs;
+        let _ = (win64_arg_gpr, win64_arg_xmm);
         let p_errno = TLFIELD_P_ERRNO_OFS as i32;
 
         #[cfg(target_os = "windows")]
@@ -8524,127 +8531,82 @@ impl<'a> Assembler386<'a> {
                 TLFIELD_RPY_LASTERROR_OFS
             } as i32;
             let set_last_error = majit_rlib::rwin32::_SetLastError as *const () as i64;
-            // `win64_save_register_args`: keep the four argument registers
-            // of both banks and the callee in rax across SetLastError(),
-            // above a fresh shadow area.  112 keeps rsp 16-byte aligned.
-            let tlofs = tlofs + 112;
-            dynasm!(self.mc ; .arch x64
-            ; sub rsp, 112
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov [rsp + 32], rcx
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov [rsp + 40], rdx
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov [rsp + 48], r8
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov [rsp + 56], r9
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov [rsp + 64], rax
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd [rsp + 72], xmm0
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd [rsp + 80], xmm1
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd [rsp + 88], xmm2
-            );
-            dynasm!(self.mc ; .arch x64
-                ; movsd [rsp + 96], xmm3
-            );
-            self.forget_if_scratch_written(rx86::R11);
-            rx86::mov_rs(&mut self.mc, rx86::R11, tlofs);
-            rx86::mov32_rm(&mut self.mc, rx86::ECX, (rx86::R11, lasterror));
+            // `get_tlofs_reg` runs before `win64_save_register_args`, which
+            // spills only the used argument registers into the existing
+            // shadow and then `sub rsp, 4*WORD` for `SetLastError`.
+            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
+            // Win64 `ARGUMENTS_GPR`: ecx, edx, r8, r9. `rx86::R8` / `R9`
+            // are test-only names; the numbers are the register ids.
+            const GPRS: [u8; 4] = [rx86::ECX, rx86::EDX, 8, 9];
+            for i in 0..4 {
+                let bit = 1u8 << i;
+                let ofs = (i * WORD) as i32;
+                if win64_arg_gpr & bit != 0 {
+                    rx86::mov_sr(&mut self.mc, ofs, GPRS[i]);
+                } else if win64_arg_xmm & bit != 0 {
+                    rx86::movsd_sx(&mut self.mc, ofs, i as u8);
+                }
+            }
+            dynasm!(self.mc ; .arch x64 ; sub rsp, 32);
+            rx86::mov32_rm(&mut self.mc, rx86::ECX, (rx86::R12, lasterror));
             rx86::mov_ri(&mut self.mc, rx86::EAX, set_last_error);
-            dynasm!(self.mc ; .arch x64
-            ; call rax
-            );
+            dynasm!(self.mc ; .arch x64 ; call rax);
             self.forget_after_call_or_jmp();
-            dynasm!(self.mc ; .arch x64
-            ; mov rcx, [rsp + 32]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov rdx, [rsp + 40]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov r8, [rsp + 48]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov r9, [rsp + 56]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; mov rax, [rsp + 64]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd xmm0, [rsp + 72]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd xmm1, [rsp + 80]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd xmm2, [rsp + 88]
-            );
-            dynasm!(self.mc ; .arch x64
-            ; movsd xmm3, [rsp + 96]
-            );
-            dynasm!(self.mc ; .arch x64
-                ; add rsp, 112
-            );
+            dynasm!(self.mc ; .arch x64 ; add rsp, 32);
+            // `CallBuilder64.win64_restore_register_args`.
+            for i in 0..4 {
+                let bit = 1u8 << i;
+                let ofs = (i * WORD) as i32;
+                if win64_arg_gpr & bit != 0 {
+                    rx86::mov_rs(&mut self.mc, GPRS[i], ofs);
+                } else if win64_arg_xmm & bit != 0 {
+                    rx86::movsd_xs(&mut self.mc, i as u8, ofs);
+                }
+            }
         }
 
         if save_err & RFFI_READSAVED_ERRNO != 0 {
             // Just before a call, read '*_errno' and write it into the
-            // real 'errno'.
+            // real 'errno'. r10 is the temporary; eax holds the 32-bit value.
             let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
                 TLFIELD_ALT_ERRNO_OFS
             } else {
                 TLFIELD_RPY_ERRNO_OFS
             } as i32;
-            self.forget_if_scratch_written(rx86::R11);
-            rx86::mov_rs(&mut self.mc, rx86::R11, tlofs);
-            rx86::mov_rm(&mut self.mc, rx86::R10, (rx86::R11, p_errno));
-            self.forget_if_scratch_written(rx86::R11);
-            rx86::mov32_rm(&mut self.mc, rx86::R11, (rx86::R11, rpy_errno));
-            dynasm!(self.mc ; .arch x64 ; mov [r10], r11d);
+            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
+            rx86::mov_rm(&mut self.mc, rx86::R10, (rx86::R12, p_errno));
+            rx86::mov32_rm(&mut self.mc, rx86::EAX, (rx86::R12, rpy_errno));
+            rx86::mov32_mr(&mut self.mc, (rx86::R10, 0), rx86::EAX);
         } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
             // Same, but write zero.
-            self.forget_if_scratch_written(rx86::R11);
-            rx86::mov_rs(&mut self.mc, rx86::R11, tlofs);
-            rx86::mov_rm(&mut self.mc, rx86::R10, (rx86::R11, p_errno));
-            dynasm!(self.mc ; .arch x64 ; mov DWORD [r10], 0);
+            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
+            rx86::mov_rm(&mut self.mc, rx86::EAX, (rx86::R12, p_errno));
+            rx86::mov32_mi(&mut self.mc, (rx86::EAX, 0), 0);
         }
     }
 
-    /// callbuilder.py `read_real_errno`, after the raw call and after the
+    /// `CallBuilderX86.read_real_errno`, after the raw call and after the
     /// stack pointer is restored: save the real `errno` (and on Windows the
     /// last error) into the thread-local copy. rax/xmm0 hold the result.
-    fn read_real_errno(&mut self, save_err: i64, esp_ofs: i32) {
+    fn read_real_errno(&mut self, save_err: i64, esp_ofs: i32, tlofs_loaded: &mut bool) {
         use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_SAVE_ERRNO};
         use majit_rlib::rthread::{
             TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
         };
-        let tlofs = SAVED_THREADLOCAL_OFS + esp_ofs;
 
         if save_err & RFFI_SAVE_ERRNO != 0 {
             // Just after a call, read the real 'errno' and save a copy of
-            // it inside our thread-local '*_errno'.
+            // it inside our thread-local '*_errno'. ecx leaves rax alone.
             let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
                 TLFIELD_ALT_ERRNO_OFS
             } else {
                 TLFIELD_RPY_ERRNO_OFS
             } as i32;
             let p_errno = TLFIELD_P_ERRNO_OFS as i32;
-            self.forget_if_scratch_written(rx86::R11);
-            rx86::mov_rs(&mut self.mc, rx86::R11, tlofs);
-            rx86::mov_rm(&mut self.mc, rx86::R10, (rx86::R11, p_errno));
-            dynasm!(self.mc ; .arch x64 ; mov r10d, [r10]);
-            rx86::mov32_mr(&mut self.mc, (rx86::R11, rpy_errno), rx86::R10);
+            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
+            rx86::mov_rm(&mut self.mc, rx86::ECX, (rx86::R12, p_errno));
+            rx86::mov32_rm(&mut self.mc, rx86::ECX, (rx86::ECX, 0));
+            rx86::mov32_mr(&mut self.mc, (rx86::R12, rpy_errno), rx86::ECX);
         }
 
         #[cfg(target_os = "windows")]
@@ -8664,9 +8626,11 @@ impl<'a> Assembler386<'a> {
                 } as i32;
                 // `save_result_value`: keep rax/xmm0 above a fresh shadow
                 // area. rsp is 8 mod 16 here (one push below the body rsp),
-                // so 56 realigns it.
+                // so 56 realigns it. r12 already names the thread-local
+                // block (`get_tlofs_reg`), so the `sub rsp` does not change
+                // the address.
+                self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
                 debug_assert_eq!(esp_ofs % 16, 8);
-                let tlofs = tlofs + 56;
                 dynasm!(self.mc ; .arch x64
                 ; sub rsp, 56
                 );
@@ -8681,9 +8645,7 @@ impl<'a> Assembler386<'a> {
                         ; call rax
                 );
                 self.forget_after_call_or_jmp();
-                self.forget_if_scratch_written(rx86::R11);
-                rx86::mov_rs(&mut self.mc, rx86::R11, tlofs);
-                rx86::mov32_mr(&mut self.mc, (rx86::R11, lasterror), rx86::EAX);
+                rx86::mov32_mr(&mut self.mc, (rx86::R12, lasterror), rx86::EAX);
                 dynasm!(self.mc ; .arch x64
                 ; mov rax, [rsp + 32]
                 );
@@ -8697,6 +8659,18 @@ impl<'a> Assembler386<'a> {
         }
     }
 
+    /// aarch64/opassembler.py _emit_call.
+    /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
+    /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+    ///
+    /// Register-bound arg moves go through `remap_frame_layout_mixed`
+    /// (a parallel-move algorithm) mirroring x86/callbuilder.py prepare_arguments
+    /// `prepare_arguments` → `remap_frame_layout`.  Emitting them naively
+    /// in source order broke Win64 where two args could map to the same
+    /// dst-then-src register (e.g. arg0 → rcx clobbering Reg(rcx) before
+    /// arg1 reads it as Gpr(rdx)).  Linux SysV escaped the same code
+    /// path because its rdi/rsi placement happened not to collide with
+    /// regalloc-chosen rcx/rdx for these traces.
     fn emit_call_from_arglocs(
         &mut self,
         op: &Op,
@@ -8717,6 +8691,18 @@ impl<'a> Assembler386<'a> {
             .filter(|classes| classes.len() == call_arg_count)
             .unwrap_or_default();
         let (placements, stack_slots) = Self::build_abi_arg_placements(&arg_types, &arg_classes);
+        // `CallBuilder64._unused_gpr` / `_unused_xmm` record which of the
+        // first four Win64 argument slots were used (`win64_arg_gpr` /
+        // `win64_arg_xmm`). SysV ignores the mask.
+        let mut win64_arg_gpr = 0u8;
+        let mut win64_arg_xmm = 0u8;
+        for (i, placement) in placements.iter().enumerate().take(4) {
+            match placement {
+                AbiArgPlacement::Gpr(_) => win64_arg_gpr |= 1 << i,
+                AbiArgPlacement::Xmm(_) => win64_arg_xmm |= 1 << i,
+                AbiArgPlacement::Stack(_) => {}
+            }
+        }
 
         dynasm!(self.mc ; .arch x64 ; push rbp);
         let call_area_adjust = self.emit_reserve_abi_call_area(1, stack_slots);
@@ -8809,29 +8795,42 @@ impl<'a> Assembler386<'a> {
             self, &int_src, &int_dst, tmpreg1, &xmm_src, &xmm_dst, tmpreg2,
         );
 
-        // Call.  For Immed/Frame targets, load rax now (parallel move
-        // never touches rax or rbp, so this is safe).  For Reg targets,
-        // the parallel move above already left the function pointer in
-        // rax.
-        if !func_in_rax_after_move {
-            match arglocs.get(func_index) {
-                Some(Loc::Frame(f)) => {
-                    let offset = f.ebp_loc.value;
-                    rx86::mov_rb(&mut self.mc, rx86::EAX, offset);
-                }
-                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                    let val = i.value;
-                    rx86::mov_ri(&mut self.mc, rx86::EAX, val);
-                }
-                // `call rax` is emitted unconditionally below, so leaving rax
-                // unwritten here would call whatever it happened to hold.
-                other => panic!("unsupported x86-64 call target {other:?}"),
-            }
+        // `write_real_errno` puts the errno word in eax and, on Win64,
+        // calls SetLastError. Both clobber rax. A register target was
+        // moved into rax above and its source may already be dead, so
+        // keep it in r13 (callee-saved, not an argument register).
+        // `CallBuilder64.emit_raw_call` calls `fnloc` directly.
+        let write_clobbers_rax = (save_err
+            & (majit_jitcode::rffi::RFFI_READSAVED_ERRNO
+                | majit_jitcode::rffi::RFFI_ZERO_ERRNO_BEFORE))
+            != 0
+            || (cfg!(target_os = "windows")
+                && (save_err & majit_jitcode::rffi::RFFI_READSAVED_LASTERROR) != 0);
+        if write_clobbers_rax && func_in_rax_after_move {
+            dynasm!(self.mc ; .arch x64 ; mov r13, rax);
+        } else if !write_clobbers_rax && !func_in_rax_after_move {
+            // Immed/Frame targets: the parallel move never touches rax or
+            // rbp. Load now when `write_real_errno` will not clobber rax.
+            self.emit_rax_call_target(arglocs, func_index);
         }
         // llsupport/callbuilder.py `emit_call_release_gil`:
         // write_real_errno(); emit_raw_call(); restore_stack_pointer();
         // read_real_errno().
-        self.write_real_errno(save_err, WORD as i32 + call_area_adjust);
+        let mut tlofs_loaded = false;
+        self.write_real_errno(
+            save_err,
+            WORD as i32 + call_area_adjust,
+            &mut tlofs_loaded,
+            win64_arg_gpr,
+            win64_arg_xmm,
+        );
+        if write_clobbers_rax {
+            if func_in_rax_after_move {
+                dynasm!(self.mc ; .arch x64 ; mov rax, r13);
+            } else {
+                self.emit_rax_call_target(arglocs, func_index);
+            }
+        }
         dynasm!(self.mc ; .arch x64 ; call rax);
         self.forget_after_call_or_jmp();
         // `Option<*mut T>` returns the discriminant in rax and the pointer
@@ -8848,39 +8847,55 @@ impl<'a> Assembler386<'a> {
         }
 
         self.emit_release_abi_call_area(call_area_adjust);
-        self.read_real_errno(save_err, WORD as i32);
+        self.read_real_errno(save_err, WORD as i32, &mut tlofs_loaded);
         dynasm!(self.mc ; .arch x64 ; pop rbp);
     }
 
+    /// Load an immediate or frame call target into rax. The register case
+    /// is the parallel move's last integer destination.
+    fn emit_rax_call_target(&mut self, arglocs: &[Loc], func_index: usize) {
+        match arglocs.get(func_index) {
+            Some(Loc::Frame(f)) => {
+                let offset = f.ebp_loc.value;
+                rx86::mov_rb(&mut self.mc, rx86::EAX, offset);
+            }
+            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
+                let val = i.value;
+                rx86::mov_ri(&mut self.mc, rx86::EAX, val);
+            }
+            // `call rax` is emitted unconditionally, so leaving rax
+            // unwritten here would call whatever it happened to hold.
+            other => panic!("unsupported x86-64 call target {other:?}"),
+        }
+    }
+
+    /// `CallBuilderX86.load_result` + `Assembler386.load_from_mem`: the
+    /// integer result is already in eax. A narrow result is extended in
+    /// place (MOVSX8 / MOVZX8 / MOVSX16 / MOVZX16 / MOVSX32 / MOV32).
+    /// A word-sized result needs no MOV.
     fn ensure_call_result_bit_extension(&mut self, arglocs: &[Loc]) {
         let size = Self::argloc_imm(arglocs, 1) as usize;
         let signed = Self::argloc_imm(arglocs, 2) != 0;
         if size >= WORD {
             return;
         }
-
-        match size {
-            4 => {
-                if signed {
-                    dynasm!(self.mc ; .arch x64 ; shl rax, 32 ; sar rax, 32);
-                } else {
-                    dynasm!(self.mc ; .arch x64 ; shl rax, 32 ; shr rax, 32);
-                }
+        match (size, signed) {
+            (1, true) => {
+                dynasm!(self.mc ; .arch x64 ; movsx Rq(0), Rb(0));
             }
-            2 => {
-                if signed {
-                    dynasm!(self.mc ; .arch x64 ; shl rax, 48 ; sar rax, 48);
-                } else {
-                    dynasm!(self.mc ; .arch x64 ; and rax, 0xFFFF);
-                }
+            (1, false) => {
+                dynasm!(self.mc ; .arch x64 ; movzx Rq(0), Rb(0));
             }
-            1 => {
-                if signed {
-                    dynasm!(self.mc ; .arch x64 ; shl rax, 56 ; sar rax, 56);
-                } else {
-                    dynasm!(self.mc ; .arch x64 ; and rax, 0xFF);
-                }
+            (2, true) => {
+                dynasm!(self.mc ; .arch x64 ; movsx Rq(0), Rw(0));
             }
+            (2, false) => {
+                dynasm!(self.mc ; .arch x64 ; movzx Rq(0), Rw(0));
+            }
+            (4, true) => {
+                dynasm!(self.mc ; .arch x64 ; movsxd Rq(0), Rd(0));
+            }
+            (4, false) => rx86::mov32_rr(&mut self.mc, 0, 0),
             _ => {}
         }
     }
@@ -8938,13 +8953,8 @@ impl<'a> Assembler386<'a> {
         if can_collect {
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         }
-        if !op.pos().get().is_none() {
-            if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos().get());
-            } else {
-                self.store_rax_to_result(op.pos().get());
-            }
-        }
+        // `CallBuilderX86.load_result`: when the result register is already
+        // eax / xmm0, emit nothing. `after_call` bound that register.
     }
 
     /// Inline nursery bump for a call tagged
@@ -9209,7 +9219,8 @@ impl<'a> Assembler386<'a> {
     /// 3. je fast_path
     /// 4. simple_call(asm_helper, [eax, vloc], result_loc)   ← slow path
     /// 5. jmp merge
-    /// 6. fast_path: mov rax, [rax + first_item_ofs]
+    /// 6. fast_path: `_call_assembler_load_result` — one MOV or MOVSD
+    ///    from the dead frame's value index 0 into eax / xmm0
     /// 7. merge:
     ///
     /// Caller's rbp is preserved by the callee's _call_header/_call_footer
@@ -9280,6 +9291,11 @@ impl<'a> Assembler386<'a> {
             } else {
                 dynasm!(self.mc ; .arch x64 ; xor eax, eax);
             }
+            if result_type == Type::Float {
+                // The force helper returns the bits in rax.
+                // `_call_assembler_load_result` leaves a float in xmm0.
+                rx86::movdq_xr(&mut self.mc, 0, rx86::EAX);
+            }
             self.move_call_assembler_result(result_type, result_loc);
             return;
         }
@@ -9345,54 +9361,44 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_call_rax_aligned();
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.forget_scratch_register();
+        if result_type == Type::Float {
+            // `call_assembler_helper_trampoline` returns the bits in rax.
+            // `_call_assembler_load_result` leaves a float in xmm0.
+            rx86::movdq_xr(&mut self.mc, 0, rx86::EAX);
+        }
         dynasm!(self.mc ; .arch x64
             ; jmp =>merge
             ; =>fast_path
         );
         self.forget_after_call_or_jmp();
 
-        // ── Path B: x86/assembler.py _call_assembler_load_result ──
-        // MOV result, [eax + first_item_ofs].
+        // x86/assembler.py `_call_assembler_load_result`: one load from the
+        // dead frame's value index 0. A float stays in xmm0; int/ref/void
+        // stay in eax (`call_assembler` asserts the int/ref result is eax).
         if result_type == Type::Float {
             rx86::movsd_xm(&mut self.mc, 0, (rx86::EAX, FIRST_ITEM_OFFSET as i32));
-            self.forget_scratch_register();
-            dynasm!(self.mc ; .arch x64
-                            ; movq rax, xmm0
-                            ; =>merge
-
-            );
         } else {
             rx86::mov_rm(
                 &mut self.mc,
                 rx86::EAX,
                 (rx86::EAX, FIRST_ITEM_OFFSET as i32),
             );
-            self.forget_scratch_register();
-            dynasm!(self.mc ; .arch x64
-                            ; =>merge
-
-            );
         }
+        self.forget_scratch_register();
+        dynasm!(self.mc ; .arch x64 ; =>merge);
         self.move_call_assembler_result(result_type, result_loc);
     }
 
-    /// Materialize a CALL_ASSEMBLER result from the raw bits both paths leave
-    /// in RAX into the regalloc-assigned location.
-    ///
-    /// The previous shape spilled RAX to a fresh JitFrame slot, which grew
-    /// `frame_depth` by one slot per call and left a `Float` result taking the
-    /// helper path in RAX while the regalloc expected XMM0.  Only the fast path
-    /// happened to leave it in XMM0 as a side effect of its `movq rax, xmm0`
-    /// normalisation.
-    ///
-    /// x86/regalloc.py `_consider_call_assembler` binds the result through
-    /// `after_call`, so it is `eax` for an int or ref and `xmm0` for a float;
-    /// the move is elided when the value already sits there.
+    /// Move the value `_call_assembler_load_result` left in eax / xmm0 into
+    /// the regalloc result register. `after_call` binds eax for an int or ref
+    /// and xmm0 for a float, so that move is usually nothing.
     fn move_call_assembler_result(&mut self, result_type: Type, result_loc: Option<&Loc>) {
         match (result_type, result_loc) {
             (Type::Void, None) => {}
             (Type::Float, Some(Loc::Reg(r))) if r.is_xmm => {
-                rx86::movdq_xr(&mut self.mc, r.value, rx86::EAX);
+                if r.value != 0 {
+                    dynasm!(self.mc ; .arch x64 ; movsd Rx(r.value), Rx(0));
+                }
             }
             (_, Some(Loc::Reg(r))) if !r.is_xmm => {
                 if r.value != crate::regloc::EAX.value {
