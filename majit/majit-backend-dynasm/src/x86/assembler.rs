@@ -74,7 +74,7 @@ use crate::jitframe::{
 };
 use crate::jump::RegallocMoves;
 use crate::regalloc::{RegAlloc, RegAllocOp};
-use crate::regloc::Loc;
+use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
 
 /// x86/assembler.py: managed general-purpose registers.
@@ -1484,6 +1484,33 @@ fn invert_cc(cc: u8) -> u8 {
     }
 }
 
+/// `codebuf.SlowPath`: a not-taken conditional jump to a body emitted after
+/// the loop or bridge, then a jump back to the fast path.
+///
+/// `saved_scratch_value_1` is the r11 cache at the `jcc`
+/// (`get_scratch_register_known_value`). `saved_scratch_value_2` is the
+/// cache at `set_continue_here`; `-1` means unknown and
+/// `load_scratch_if_known` emits nothing.
+struct SlowPath {
+    slow_label: DynamicLabel,
+    continue_label: DynamicLabel,
+    saved_scratch_value_1: i64,
+    saved_scratch_value_2: i64,
+    kind: SlowPathKind,
+}
+
+/// Body selected by `SlowPath.generate`. `WriteBarrierSlowPath` is the
+/// producer this assembler enqueues.
+enum SlowPathKind {
+    WriteBarrier {
+        loc_base: RegLoc,
+        loc_index: Option<Loc>,
+        helper_num: usize,
+        card_marking: bool,
+        card_page_shift: u32,
+    },
+}
+
 /// assembler.py Assembler386.
 /// In Rust, this is a transient builder — created per compilation,
 /// not a long-lived object like RPython's.
@@ -1631,6 +1658,11 @@ pub struct Assembler386<'a> {
     /// machine-code buffer* (i.e. pre-`rawstart`); `patch_stack_checks`
     /// adds `rawstart` to obtain the absolute address.
     frame_depth_to_patch: Vec<usize>,
+    /// `Assembler386.pending_slowpaths`, created empty in `setup`.
+    /// `flush_pending_slowpaths` is the first act of
+    /// `write_pending_failure_recoveries`: a slow-path body may append a
+    /// guard token, so recovery stubs are written after these paths.
+    pending_slowpaths: Vec<SlowPath>,
     /// assembler.py:1003-1008 `_assemble`: the frame depth of a cross-loop
     /// JUMP target (its `target_frame_depth`), or 0 when the trace has no
     /// external JUMP.  The closing `JMP` enters the target loop's body,
@@ -1890,6 +1922,7 @@ impl<'a> Assembler386<'a> {
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
+            pending_slowpaths: Vec::new(),
             jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
@@ -1910,10 +1943,13 @@ impl<'a> Assembler386<'a> {
     ///
     /// `RegAlloc.flush_loop` reaches this through
     /// `MachineCodeBlockWrapper.get_relative_pos` (`break_basic_block`).
-    /// A bound label forgets too: it is a join, and pyre has no `SlowPath`
-    /// restore, so the fallthrough's cached value does not describe the
-    /// other edge. `_addr_as_reg_offset` records a new address after its
-    /// raw `MOV_ri` instead of leaving r11 unknown.
+    /// A bound label that is a real join still forgets: the fallthrough's
+    /// cached value does not describe the other edge. A `SlowPath` continue
+    /// label does not. `set_continue_here` records the cache
+    /// (`saved_scratch_value_2`) and `SlowPath.generate` reloads it with
+    /// `load_scratch_if_known` before jumping back, so both edges agree.
+    /// `_addr_as_reg_offset` records a new address after its raw `MOV_ri`
+    /// instead of leaving r11 unknown.
     fn forget_scratch_register(&mut self) {
         self.scratch_register_value = -1;
     }
@@ -7235,9 +7271,119 @@ impl<'a> Assembler386<'a> {
         }
     }
 
+    /// `SlowPath.__init__`: emit `J_il` to `slow_label` and record the r11
+    /// cache. Conditional jumps do not forget. `continue_label` stays
+    /// unbound until `set_continue_here`.
+    fn emit_slow_jcc(&mut self, cc: u8, kind: SlowPathKind) -> SlowPath {
+        let slow_label = self.mc.new_dynamic_label();
+        let continue_label = self.mc.new_dynamic_label();
+        self.emit_jcc_to_label(cc, slow_label);
+        SlowPath {
+            slow_label,
+            continue_label,
+            saved_scratch_value_1: self.scratch_register_value,
+            saved_scratch_value_2: -1,
+            kind,
+        }
+    }
+
+    /// `SlowPath.set_continue_addr`. Binds the fast-path continue point
+    /// without `forget_scratch_register`: `get_relative_pos` is asked not
+    /// to break the block, so the not-taken edge keeps the r11 cache.
+    fn set_continue_here(&mut self, sp: &mut SlowPath) {
+        sp.saved_scratch_value_2 = self.scratch_register_value;
+        let continue_label = sp.continue_label;
+        dynasm!(self.mc ; .arch x64 ; =>continue_label);
+    }
+
+    /// `Assembler386.flush_pending_slowpaths`.
+    ///
+    /// An append during `generate_body` is emitted after the current
+    /// epilogue, which is what iterating `pending_slowpaths` does.
+    fn flush_pending_slowpaths(&mut self) {
+        loop {
+            let pending = std::mem::take(&mut self.pending_slowpaths);
+            if pending.is_empty() {
+                break;
+            }
+            for sp in pending {
+                let slow_label = sp.slow_label;
+                let continue_label = sp.continue_label;
+                dynasm!(self.mc ; .arch x64 ; =>slow_label);
+                // `restore_scratch_register_known_value` emits no code.
+                self.scratch_register_value = sp.saved_scratch_value_1;
+                self.generate_slowpath_body(sp.kind);
+                // `load_scratch_if_known`: `-1` is unknown.
+                if sp.saved_scratch_value_2 != -1 {
+                    self.load_scratch(sp.saved_scratch_value_2);
+                }
+                dynasm!(self.mc ; .arch x64 ; jmp =>continue_label);
+                self.forget_after_call_or_jmp();
+            }
+        }
+    }
+
+    /// `WriteBarrierSlowPath.generate_body`.
+    ///
+    /// Card marking tests `GCFLAG_CARDS_SET` with the sign flag of the fast
+    /// path's `TEST8` (`js`) and, after the helper, with the helper's own
+    /// trailing `TEST8` (`jns`). `jns` lands at the end of this body, so
+    /// both arms fall into `SlowPath.generate`'s `load_scratch_if_known`
+    /// and the jump back. The frame helper (`helper_num == 4`) is not
+    /// passed a stack argument; `build_wb_slowpath` returns from it with
+    /// `ret` and from the others with `ret 8`.
+    fn generate_slowpath_body(&mut self, kind: SlowPathKind) {
+        let SlowPathKind::WriteBarrier {
+            loc_base,
+            loc_index,
+            helper_num,
+            card_marking,
+            card_page_shift,
+        } = kind;
+
+        let card_mark = if card_marking {
+            let card_mark = self.mc.new_dynamic_label();
+            self.emit_jcc_to_label(CC_S, card_mark);
+            Some(card_mark)
+        } else {
+            None
+        };
+
+        if helper_num != 4 {
+            dynasm!(self.mc ; .arch x64 ; push Rq(loc_base.value));
+        }
+        let helper = self.wb_slowpath[helper_num];
+        assert!(
+            helper != 0,
+            "wb_slowpath[{helper_num}] was not built (X86CpuExt::ensure_wb_slowpath)"
+        );
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        self.load_scratch(helper as i64);
+        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
+        self.forget_after_call_or_jmp();
+
+        if let Some(card_mark) = card_mark {
+            let after_cards = self.mc.new_dynamic_label();
+            self.emit_jcc_to_label(CC_NS, after_cards);
+            dynasm!(self.mc ; .arch x64 ; =>card_mark);
+            let loc_index = loc_index.expect("card marking records loc_index");
+            // Register and frame arms copy the index into r11 and do not
+            // update `scratch_register_value`. The immediate arm is an
+            // `OR8` and leaves r11 alone.
+            if matches!(loc_index, Loc::Reg(_) | Loc::Frame(_)) {
+                self.forget_scratch_register();
+            }
+            encode_wb_array_card_mark(&mut self.mc, loc_base.value, &loc_index, card_page_shift);
+            dynasm!(self.mc ; .arch x64 ; =>after_cards);
+        }
+    }
+
     /// assembler.py:1005 write_pending_failure_recoveries.
     /// Returns recovery stub offsets for post-finalize address fixup.
     fn write_pending_failure_recoveries(&mut self) -> Vec<RecoveryStub> {
+        // `flush_pending_slowpaths` before the stub loop: a slow-path body
+        // may append a guard token to `pending_guard_tokens`.
+        self.flush_pending_slowpaths();
         // Emit a shared _push_all_regs_to_frame routine once, then let each
         // generate_quick_failure() stub call it.  Iterate `ALL_CORE_REGS`
         // / `ALL_FLOAT_REGS` (Win64-aware: R13 dropped from GPRs, XMM5..14
@@ -9489,54 +9635,21 @@ impl<'a> Assembler386<'a> {
             (loc_base.value as u8, byteofs),
             i32::from(mask),
         );
-        // `WriteBarrierSlowPath(mc, 'NZ')`. This backend has no
-        // `pending_slowpaths` queue, so the slow path is laid out in line
-        // behind the inverted condition.
-        let done = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch x64 ; jz =>done);
-
-        // for cond_call_gc_wb_array, also add another fast path:
-        // if GCFLAG_CARDS_SET, then we can just set one bit and be done
-        let js_location = if card_marking {
-            // GCFLAG_CARDS_SET is in this byte at 0x80, so this fact can
-            // been checked by the sign flags of the previous TEST8
-            let js_location = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch x64 ; js =>js_location);
-            Some(js_location)
-        } else {
-            None
-        };
-
-        // Write only a CALL to the helper prepared in advance, passing it as
-        // argument the address of the structure we are writing into
-        // (the first argument to COND_CALL_GC_WB).
-        if !is_frame {
-            dynasm!(self.mc ; .arch x64 ; push Rq(loc_base.value));
-        }
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.load_scratch(helper as i64);
-        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-        self.forget_scratch_register();
-
-        if let Some(js_location) = js_location {
-            // The helper ends again with a check of the flag in the object.
-            // So here, we can simply write again a 'JNS', which will be
-            // taken if GCFLAG_CARDS_SET is still not set.
-            dynasm!(self.mc ; .arch x64 ; jns =>done);
-            //
-            // case GCFLAG_CARDS_SET: emit a few instructions to do
-            // directly the card flag setting
-            dynasm!(self.mc ; .arch x64 ; =>js_location);
-            encode_wb_array_card_mark(
-                &mut self.mc,
-                loc_base.value as u8,
-                &loc_index.expect("card marking records loc_index"),
-                wb.jit_wb_card_page_shift,
-            );
-        }
-
-        self.forget_scratch_register();
-        dynasm!(self.mc ; .arch x64 ; =>done);
+        // `_write_barrier_fastpath`: `TEST8` then `WriteBarrierSlowPath` on
+        // `NZ`. The flag-clear edge falls through `set_continue_addr`.
+        // The helper call and the card mark live in `generate_body`.
+        let mut sp = self.emit_slow_jcc(
+            CC_NE,
+            SlowPathKind::WriteBarrier {
+                loc_base,
+                loc_index,
+                helper_num,
+                card_marking,
+                card_page_shift: wb.jit_wb_card_page_shift,
+            },
+        );
+        self.set_continue_here(&mut sp);
+        self.pending_slowpaths.push(sp);
     }
 
     /// x86/assembler.py malloc_cond parity.

@@ -13,11 +13,14 @@ use std::sync::{Arc, Mutex};
 
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
 use majit_backend_dynasm::runner::DynasmBackend;
+use majit_gc::GcFlags;
+use majit_gc::collector::MiniMarkGC;
+use majit_gc::header::{GcHeader, header_of};
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, LoopTokenDescr,
-    OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value,
+    CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, InputArgRc,
+    LoopTokenDescr, OopSpecIndex, Op, OpCode, OpRc, OpRef, Type, Value,
 };
 
 fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id: u64) -> i64 {
@@ -1157,4 +1160,345 @@ fn call_release_gil_round_trips_errno() {
         *errno_ptr() = 3;
     }
     assert_eq!(run_errno_swap(errno_save_flags(2), 0), 9);
+}
+
+fn op_at(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
+    let operands: Vec<_> = args.iter().copied().map(rb).collect();
+    let op = Op::new(opcode, &operands);
+    op.pos().set(pos);
+    op
+}
+
+fn wb_backend(mut gc: MiniMarkGC) -> DynasmBackend {
+    let mut backend = DynasmBackend::new();
+    // `setup_once` inside `attach_default_test_descrs` runs before MiniMark
+    // is installed, so the helpers are built again at `compile_loop`.
+    backend.set_gc_allocator(Box::new(majit_backend::jitframe::HostHeapGc));
+    backend.attach_default_test_descrs();
+    let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+    majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+    backend.set_gc_allocator(Box::new(gc));
+    backend
+}
+
+/// `TEST8 [base+byteofs], mask` immediately followed by a not-taken near
+/// `JNZ` (`0F 85`). `byteofs` is `-4` (`WriteBarrierDescr::extract_flag_byte`).
+fn wb_fastpath_site(code: &[u8], mask: u8) -> (usize, Vec<u8>) {
+    let mut hits = Vec::new();
+    let mut taken_jz = 0usize;
+    for i in 0..code.len() {
+        if code[i] != 0xF6 {
+            continue;
+        }
+        for len in 3..=8 {
+            let end = i + len;
+            if end + 6 > code.len() {
+                continue;
+            }
+            if code[end - 1] == mask && code[end - 2] == 0xFC && code[end] == 0x0F {
+                match code[end + 1] {
+                    0x85 => hits.push((i, code[i..end + 6].to_vec())),
+                    0x84 => taken_jz += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(
+        taken_jz, 0,
+        "write barrier fast path is still a taken JZ over an inlined body"
+    );
+    assert_eq!(
+        hits.len(),
+        1,
+        "write-barrier fast paths in the trace: {hits:x?}"
+    );
+    hits.pop().unwrap()
+}
+
+/// `call r11` (`41 FF D3`) is the helper in `WriteBarrierSlowPath.generate_body`.
+/// It must sit out of line, after the fast-path window.
+fn assert_helper_call_out_of_line(code: &[u8], site_at: usize, site: &[u8]) {
+    let call = [0x41, 0xFF, 0xD3];
+    assert!(
+        !site.windows(3).any(|window| window == call),
+        "call r11 must not sit inside the fast path"
+    );
+    let site_end = site_at + site.len();
+    let call_at = code[site_end..]
+        .windows(3)
+        .position(|window| window == call)
+        .map(|off| site_end + off)
+        .unwrap_or_else(|| {
+            let offs: Vec<usize> = code
+                .windows(2)
+                .enumerate()
+                .filter(|(_, window)| *window == [0xFF, 0xD3])
+                .map(|(index, _)| index)
+                .collect();
+            panic!("call r11 ({call:02X?}) must follow the fast path; FF D3 at {offs:?}")
+        });
+    assert!(
+        call_at - site_end > 16,
+        "helper call at {call_at} is only {} bytes after the fast path at {site_at}",
+        call_at - site_end
+    );
+}
+
+fn compiled_bytes(token: &JitCellToken) -> &[u8] {
+    let compiled = token
+        .compiled
+        .get()
+        .expect("compile_loop stores CompiledCode")
+        .downcast_ref::<majit_backend_dynasm::x86::assembler::CompiledCode>()
+        .expect("x86 CompiledCode");
+    &compiled.buffer
+}
+
+fn run_wb_trace(
+    backend: &mut DynasmBackend,
+    ops: Vec<Op>,
+    inputargs: Vec<InputArgRc>,
+    values: &[Value],
+    mask: u8,
+) -> majit_backend::DeadFrame {
+    let token = JitCellToken::new(next_token_id());
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile write barrier: {err:?}"));
+    let bytes = compiled_bytes(&token);
+    let (at, site) = wb_fastpath_site(bytes, mask);
+    assert_helper_call_out_of_line(bytes, at, &site);
+    let frame = backend.execute_token(&token, values);
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "the barrier trace must finish"
+    );
+    frame
+}
+
+/// Flag byte clear: `TEST8`/`Jcc` falls through, `remember_young_pointer`
+/// does not run, and the store completes.
+#[test]
+fn write_barrier_flag_clear_falls_through() {
+    let mut gc = MiniMarkGC::new();
+    let tid = gc.register_type(majit_gc::TypeInfo::object(16));
+    let old = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, tid, 16);
+    let young = gc.alloc_with_type(tid, 16);
+    assert!(
+        !gc.is_in_nursery(old.0),
+        "alloc_oldgen_typed must birth an old object"
+    );
+    assert!(
+        gc.is_in_nursery(young.0),
+        "a small alloc_with_type is nursery"
+    );
+    unsafe {
+        let hdr = &mut *header_of(old.0);
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        hdr.clear_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+        hdr.set_flag(GcFlags::GCFLAG_NO_HEAP_PTRS);
+    }
+    let mut backend = wb_backend(gc);
+
+    let base = OpRef::input_arg_ref(0);
+    let value = OpRef::input_arg_ref(1);
+    let loaded = OpRef::ref_op(3);
+    let ops = vec![
+        op_at(
+            OpCode::GcStore,
+            &[base, OpRef::const_int(0), value, OpRef::const_int(8)],
+            OpRef::void_op(1),
+        ),
+        op_at(OpCode::CondCallGcWb, &[base], OpRef::void_op(2)),
+        op_at(
+            OpCode::GcLoadR,
+            &[base, OpRef::const_int(0), OpRef::const_int(8)],
+            loaded,
+        ),
+        finish_of(loaded, Type::Ref, 4),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+    ];
+    let mask = majit_gc::WriteBarrierDescr::for_current_gc().jit_wb_if_flag_singlebyte;
+    let frame = run_wb_trace(
+        &mut backend,
+        ops,
+        inputargs,
+        &[Value::Ref(old), Value::Ref(young)],
+        mask,
+    );
+    assert_eq!(backend.get_ref_value(&frame, 0), young);
+    assert_eq!(unsafe { *(old.0 as *const usize) }, young.0);
+    let hdr = unsafe { &*header_of(old.0) };
+    assert!(
+        !hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
+        "the fast path must not set TRACK_YOUNG_PTRS"
+    );
+    assert!(
+        hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS),
+        "remember_young_pointer clears NO_HEAP_PTRS; the fast path must not call it"
+    );
+}
+
+/// Flag set, cards not set: the slow path calls the helper once for this object.
+#[test]
+fn write_barrier_flag_set_calls_helper() {
+    let mut gc = MiniMarkGC::new();
+    let tid = gc.register_type(majit_gc::TypeInfo::object(16));
+    let old = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, tid, 16);
+    let young = gc.alloc_with_type(tid, 16);
+    assert!(gc.is_in_nursery(young.0));
+    unsafe {
+        let hdr = &mut *header_of(old.0);
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_CARDS_SET));
+        hdr.set_flag(GcFlags::GCFLAG_NO_HEAP_PTRS);
+    }
+    let mut backend = wb_backend(gc);
+
+    let base = OpRef::input_arg_ref(0);
+    let value = OpRef::input_arg_ref(1);
+    let loaded = OpRef::ref_op(3);
+    let ops = vec![
+        op_at(
+            OpCode::GcStore,
+            &[base, OpRef::const_int(0), value, OpRef::const_int(8)],
+            OpRef::void_op(1),
+        ),
+        op_at(OpCode::CondCallGcWb, &[base], OpRef::void_op(2)),
+        op_at(
+            OpCode::GcLoadR,
+            &[base, OpRef::const_int(0), OpRef::const_int(8)],
+            loaded,
+        ),
+        finish_of(loaded, Type::Ref, 4),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+    ];
+    let mask = majit_gc::WriteBarrierDescr::for_current_gc().jit_wb_if_flag_singlebyte;
+    let frame = run_wb_trace(
+        &mut backend,
+        ops,
+        inputargs,
+        &[Value::Ref(old), Value::Ref(young)],
+        mask,
+    );
+    assert_eq!(backend.get_ref_value(&frame, 0), young);
+    assert_eq!(unsafe { *(old.0 as *const usize) }, young.0);
+    let hdr = unsafe { &*header_of(old.0) };
+    assert!(
+        !hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
+        "remember_young_pointer must have recorded the object"
+    );
+    assert!(
+        !hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS),
+        "remember_young_pointer clears NO_HEAP_PTRS when it records the object"
+    );
+}
+
+/// `GCFLAG_CARDS_SET` takes the card arm: the helper is not called, and
+/// exactly one card bit is set.
+#[test]
+fn write_barrier_cards_set_marks_one_bit() {
+    const LENGTH: usize = 17024;
+    let mut gc = MiniMarkGC::new();
+    let item_size = std::mem::size_of::<GcRef>();
+    let array_tid = gc.register_type(majit_gc::TypeInfo::varsize(
+        8,
+        item_size,
+        0,
+        true,
+        Vec::new(),
+    ));
+    let young_tid = gc.register_type(majit_gc::TypeInfo::object(16));
+    let total_size = GcHeader::SIZE + 8 + item_size * LENGTH;
+    let array = gc.alloc_in_oldgen_with_cards(array_tid, total_size, LENGTH, true);
+    unsafe { *(array.0 as *mut usize) = LENGTH };
+    let young = gc.alloc_with_type(young_tid, 16);
+    assert!(gc.is_in_nursery(young.0));
+    unsafe {
+        let hdr = &mut *header_of(array.0);
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_HAS_CARDS));
+        // `jit_remember_young_pointer_from_array` does not clear TRACK when
+        // HAS_CARDS is set, so drop HAS_CARDS: a helper call then falls
+        // through to `remember_young_pointer` and clears TRACK. The card
+        // bytes stay in front of the header. `dirty_cards` ignores an object
+        // without HAS_CARDS, so the bit is read directly.
+        hdr.clear_flag(GcFlags::GCFLAG_HAS_CARDS);
+        hdr.set_flag(GcFlags::GCFLAG_CARDS_SET);
+    }
+    let shift = majit_gc::WriteBarrierDescr::for_current_gc().jit_wb_card_page_shift;
+    let card_bytes = (LENGTH + (8 << shift) - 1) >> (shift as usize + 3);
+    for i in 0..card_bytes {
+        unsafe {
+            *((array.0 - GcHeader::SIZE - 1 - i) as *mut u8) = 0;
+        }
+    }
+    let mut backend = wb_backend(gc);
+
+    let index: i64 = 1152;
+    let base = OpRef::input_arg_ref(0);
+    let index_ref = OpRef::input_arg_int(1);
+    let value = OpRef::input_arg_ref(2);
+    let loaded = OpRef::ref_op(4);
+    let scale = OpRef::const_int(item_size as i64);
+    let item_ofs = OpRef::const_int(8);
+    let size = OpRef::const_int(8);
+    let ops = vec![
+        op_at(
+            OpCode::GcStoreIndexed,
+            &[base, index_ref, value, scale, item_ofs, size],
+            OpRef::void_op(1),
+        ),
+        op_at(
+            OpCode::CondCallGcWbArray,
+            &[base, index_ref],
+            OpRef::void_op(2),
+        ),
+        op_at(
+            OpCode::GcLoadIndexedR,
+            &[base, index_ref, scale, item_ofs, size],
+            loaded,
+        ),
+        finish_of(loaded, Type::Ref, 5),
+    ];
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
+    ];
+    let wb = majit_gc::WriteBarrierDescr::for_current_gc();
+    let frame = run_wb_trace(
+        &mut backend,
+        ops,
+        inputargs,
+        &[Value::Ref(array), Value::Int(index), Value::Ref(young)],
+        wb.jit_wb_if_flag_singlebyte | 0x80,
+    );
+    assert_eq!(backend.get_ref_value(&frame, 0), young);
+    let slot = array.0 + 8 + (index as usize) * item_size;
+    assert_eq!(unsafe { *(slot as *const usize) }, young.0);
+    let hdr = unsafe { &*header_of(array.0) };
+    assert!(
+        hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
+        "the card arm must not call the helper"
+    );
+    assert!(!hdr.has_flag(GcFlags::GCFLAG_HAS_CARDS));
+    let card = (index as usize) >> shift;
+    let mut bits = 0usize;
+    for i in 0..card_bytes {
+        let byte = unsafe { *((array.0 - GcHeader::SIZE - 1 - i) as *const u8) };
+        bits += byte.count_ones() as usize;
+        if i == card >> 3 {
+            assert_eq!(byte, 1 << (card & 7), "card {card} byte {i}");
+        }
+    }
+    assert_eq!(bits, 1, "exactly one card bit");
 }
