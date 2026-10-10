@@ -633,7 +633,12 @@ struct RegisteredLoopTarget {
     )]
     green_key: u64,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
+    /// Host-ABI wrapper (`execute_token` / `run_compiled_code`).
     code_ptr: *const u8,
+    /// `CallConv::Tail` body. RPython `_ll_function_addr`
+    /// (`assembler.py` `_call_assembler_emit_call` / aarch64
+    /// `looptoken._ll_function_addr = rawstart + functionpos`).
+    body_ptr: *const u8,
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
     /// contract (compile.py record_loop_or_bridge).  Position
     /// equals `descr.fail_index` by an invariant asserted at construction.
@@ -2821,7 +2826,11 @@ fn register_call_assembler_target(
 ) -> Result<(), BackendError> {
     invalidate_ca_thread_cache(token.number);
     let entry_code = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
-    token.set_ll_function_addr(entry_code as usize);
+    let entry_body = compiled.entry_body_ptr.load(Ordering::Acquire) as *const u8;
+    // assembler.py: `looptoken._ll_function_addr = rawstart + functionpos`
+    // — the assembler body. The host-ABI wrapper stays on `entry_code_ptr`
+    // for `execute_token`; in-code CALL_ASSEMBLER loads this slot.
+    token.set_ll_function_addr(entry_body as usize);
     let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
     // Preserve an existing registered CLT Arc when this token number is
@@ -2852,6 +2861,7 @@ fn register_call_assembler_target(
         green_key: token.green_key(),
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: entry_code,
+        body_ptr: entry_body,
         fail_descrs: compiled.fail_descrs.clone(),
         fail_descr_cells: compiled.fail_descr_cells.clone(),
         num_inputs: compiled.num_inputs,
@@ -3973,23 +3983,41 @@ fn handle_fail_propagate_exception(frame_ptr: i64) -> i64 {
     value
 }
 
+/// Follow a nursery forwarding stub on the pointer the callee returned.
+/// Cheap header walk; does not pin. `OwnerRootGuard` is only for the
+/// resume-guard arm, where subsequent host calls can collect.
+///
 /// A nursery jitframe moves, and the callee can return the corpse after
 /// popping its shadow-stack entry. [`JitFrame::resolve`](majit_backend::jitframe::JitFrame::resolve)
-/// follows the forwarding stub while that word is intact. The bridge hook
-/// allocates; pin is declined for a frame that holds GC pointers, so the
-/// owner root is what the collector updates. Re-read it after every call
-/// that can collect.
+/// follows the forwarding stub while that word is intact.
+fn resolve_call_assembler_frame(frame_ptr: i64) -> i64 {
+    if frame_ptr == 0 {
+        return 0;
+    }
+    unsafe {
+        majit_backend::jitframe::JitFrame::resolve(
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
+        ) as i64
+    }
+}
+
+/// Pin a nursery jitframe across a collecting host call.
+///
+/// The bridge hook allocates; pin is declined for a frame that holds GC
+/// pointers, so the owner root is what the collector updates. Re-read it
+/// after every call that can collect. Finish-descr `handle_fail` methods
+/// (`compile.py` `ExitFrameWithExceptionDescrRef` /
+/// `PropagateExceptionDescr`) only read deadframe slots and raise, so
+/// they must not take this pin — dynasm `handle_fail_dispatch` classifies
+/// those arms first, and RPython `assembler_call_helper` (`warmspot.py`)
+/// keeps `deadframe` as a scanned parameter rather than an extra root.
 fn rooted_call_assembler_frame(
     frame_ptr: i64,
 ) -> (i64, Option<majit_gc::shadow_stack::OwnerRootGuard>) {
     if frame_ptr == 0 {
         return (0, None);
     }
-    let resolved = unsafe {
-        majit_backend::jitframe::JitFrame::resolve(
-            frame_ptr as *mut majit_backend::jitframe::JitFrame,
-        ) as i64
-    };
+    let resolved = resolve_call_assembler_frame(frame_ptr);
     let root = majit_gc::gc_owns_object(resolved as usize)
         .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(resolved as usize)));
     let live = root
@@ -4106,26 +4134,38 @@ fn call_assembler_guard_failure_inner(
         return handle as i64;
     }
 
-    let (mut frame_ptr, frame_root) = rooted_call_assembler_frame(frame_ptr);
-    let outputs_ptr = call_assembler_frame_outputs(frame_ptr, outputs_ptr);
+    // Chase a nursery forwarding stub before reading slots. Do not pin
+    // yet: finish-descr `handle_fail` only reads deadframe and raises
+    // (`compile.py` `ExitFrameWithExceptionDescrRef` /
+    // `PropagateExceptionDescr`). Dynasm `handle_fail_dispatch` and
+    // RPython `assembler_call_helper` (`warmspot.py`) classify those
+    // arms first; every CALL_ASSEMBLER exception return takes this
+    // helper (`assembler.py` `_call_assembler_check_descr` Path A), so
+    // a GC owner-root around the cheap compare is paid per raise.
+    let frame_ptr = resolve_call_assembler_frame(frame_ptr);
 
     // compile.py ExitFrameWithExceptionDescrRef.handle_fail:
-    // FINISH descriptors are the attached singleton Arc<dyn Descr> data
-    // pointers, not the concrete FailDescrCell pointers used by guards.
-    // The normal DoneWithThisFrame descriptor was handled by the emitted
-    // fast-path comparison before entering this helper; classify the other
-    // FINISH singleton here before `recover_fail_descr_cell` below.  Its
-    // exception ref is the returned jitframe's slot 0, as staged by
-    // `run_compiled_code`'s propagate-exception handling.
+    // FINISH descriptors are the attached singleton FailDescrCell
+    // addresses (`CpuDescrAttachments::recompute_cached_ptrs` /
+    // `descr_instance_ptr`), not a different concrete cell used by
+    // resume guards. The normal DoneWithThisFrame descriptor was
+    // handled by the emitted fast-path comparison before entering this
+    // helper; classify the other FINISH singleton here before
+    // `recover_fail_descr_cell` below.  Its exception ref is the
+    // returned jitframe's slot 0, as staged by `run_compiled_code`'s
+    // propagate-exception handling.
     let attached_ptrs = attachments.descr_ptrs();
     if attached_ptrs.is_exit_frame_with_exception_descr(fail_descr_ptr as usize) {
+        let outputs_ptr = call_assembler_frame_outputs(frame_ptr, outputs_ptr);
         let exc_value = unsafe { *outputs_ptr };
         jit_exc_raise(exc_value);
         return 0;
     }
-    // `_build_propagate_exception_path` writes `Arc::as_ptr` of the
-    // singleton into `jf_descr`. That address is not a `FailDescrCell`;
-    // `recover_fail_descr_cell` on it is undefined.
+    // `_build_propagate_exception_path` writes the cpu's
+    // `propagate_exception_descr` FailDescrCell into `jf_descr`
+    // (`attached_descr_ptrs().propagate_exception_descr`). That word
+    // matches `cached_ptrs` identity; `recover_fail_descr_cell` on a
+    // non-cell bake is undefined.
     if attached_ptrs.propagate_exception_descr != 0
         && fail_descr_ptr as usize == attached_ptrs.propagate_exception_descr
     {
@@ -4143,18 +4183,28 @@ fn call_assembler_guard_failure_inner(
     // `compile.py` `PropagateExceptionDescr.handle_fail`
     // (`compile_tmp_callback`): that GUARD_NO_EXCEPTION's descr is the
     // cpu's `propagate_exception_descr` singleton and its failargs are
-    // empty. The recovery stub writes the `FailDescrCell` thin pointer
-    // into `jf_descr`, not `Arc::as_ptr` of the singleton, so the
-    // identity compare above misses it. The resume-guard path then
-    // finds no `rd_numb` and returns 0, and the caller continues as
-    // if the call returned NULL.
-    if attached_ptrs.propagate_exception_descr != 0
-        && Arc::as_ptr(&fail_descr_owned) as *const () as usize
-            == attached_ptrs.propagate_exception_descr
-    {
-        return handle_fail_propagate_exception(frame_ptr);
+    // empty. The recovery stub writes the guard's own `FailDescrCell`
+    // into `jf_descr`, so the identity compare above misses it when
+    // that cell is not the singleton cell `descr_instance_ptr` leaked.
+    // Dynasm `handle_fail_dispatch` recovers both cells and compares
+    // Arc identity (`Arc::ptr_eq`). Without that, the resume-guard
+    // path finds no `rd_numb` and returns 0, and the caller continues
+    // as if the call returned NULL.
+    if attached_ptrs.propagate_exception_descr != 0 {
+        let singleton =
+            unsafe { majit_ir::recover_fail_descr_cell(attached_ptrs.propagate_exception_descr) };
+        if Arc::ptr_eq(&fail_descr_owned, &singleton) {
+            return handle_fail_propagate_exception(frame_ptr);
+        }
     }
     let fail_descr_ref: &dyn FailDescr = as_fd(&fail_descr_owned);
+
+    // Resume-guard arm: bridge compile / `execute_bridge` / blackhole
+    // can collect. Pin the nursery jitframe — RPython keeps `deadframe`
+    // as a scanned `assembler_call_helper` parameter; this helper's
+    // Rust stack is not scanned.
+    let (mut frame_ptr, frame_root) = rooted_call_assembler_frame(frame_ptr);
+    let outputs_ptr = call_assembler_frame_outputs(frame_ptr, outputs_ptr);
 
     // Fast path: read the attached bridge directly from the fail_descr
     // (which IS jf_descr from the callee's guard exit). Skip
@@ -5765,9 +5815,9 @@ fn resolve_call_assembler_target(
     };
     if let Some(token) = descr_token {
         let descr_addr = token.ll_function_addr();
-        if descr_addr != 0 && !target.code_ptr.is_null() {
+        if descr_addr != 0 && !target.body_ptr.is_null() {
             debug_assert_eq!(
-                descr_addr, target.code_ptr as usize,
+                descr_addr, target.body_ptr as usize,
                 "CALL_ASSEMBLER descr token address disagrees with registry target"
             );
         }
@@ -10293,7 +10343,7 @@ struct CompiledLoop {
     /// function was compiled as a merged family. Empty outside merge mode.
     /// The id is the 0,1,2,… numbering the non-merge registration loop assigns.
     merged_label_targets: Vec<(DescrRef, u32)>,
-    /// Current host entry (`execute_token` and the call-assembler slot).
+    /// Current host entry (`execute_token`).
     /// Initialized to `code_ptr`. `publish_merged_entry` stores a new
     /// wrapper here with Release; readers load with Acquire.
     ///
@@ -10301,9 +10351,10 @@ struct CompiledLoop {
     /// - `execute_with_inputs_at_dispatch_key` — host entry for
     ///   `execute_token`, `execute_token_with_dispatch_key`, `execute_token_ints`
     /// - `execute_token_ints_raw` — raw host entry
-    /// - `register_call_assembler_target` — copies the current wrapper into
-    ///   `JitCellToken::set_ll_function_addr`, `RegisteredLoopTarget`, and
-    ///   `ca_dispatch_slot`
+    /// - `register_call_assembler_target` — copies the current Tail body into
+    ///   `JitCellToken::set_ll_function_addr` (`assembler.py`
+    ///   `_ll_function_addr` is the assembler body) and the current wrapper
+    ///   into `RegisteredLoopTarget.code_ptr` / `ca_dispatch_slot`
     ///
     /// Left on the plain `code_ptr` / `body_ptr` fields (the original
     /// function's own bytes):
@@ -16087,10 +16138,15 @@ impl CraneliftBackend {
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
 
                         // fn(jf_ptr, dispatch_key) → jf_ptr  (simple_call parity).
+                        // assembler.py `_call_assembler_emit_call` calls
+                        // `_ll_function_addr`, which is the assembler body.
+                        // The host-ABI wrapper exists so `execute_token` can
+                        // park the pinned register; in-code CALL_ASSEMBLER
+                        // is Tail-to-Tail like JUMP/`ll_loop_code`.
                         // CALL_ASSEMBLER enters the callee at its preamble
                         // (dispatch_key 0); the callee is a freshly entered
                         // function, not an external-JUMP LABEL re-entry.
-                        let mut sig = Signature::new(call_conv);
+                        let mut sig = Signature::new(body_call_conv);
                         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
                         sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
                         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
@@ -21588,15 +21644,17 @@ impl CraneliftBackend {
     /// same `update_frame_depth` call `compile_bridge` makes), then each
     /// `LoopTargetDescr` in `token.target_tokens` whose `ll_loop_code` is the
     /// anchor's current body — keeping that descr's `label_block_id` — then
-    /// `set_ll_function_addr`, `ca_dispatch_slot`, the call-assembler
-    /// registry, then `entry_body_ptr` and `entry_code_ptr` (Release).
+    /// `set_ll_function_addr` (Tail body), `ca_dispatch_slot` (host wrapper),
+    /// the call-assembler registry, then `entry_body_ptr` and
+    /// `entry_code_ptr` (Release).
     ///
     /// Each member retargets the LABELs of its own retained loop whose
     /// `ll_loop_code` is that member's `entry_body_ptr`, using the block id
     /// this function assigned, updates its frame depth the same way, and
     /// stores `entry_body_ptr`. Its host entry (`entry_code_ptr`,
-    /// `set_ll_function_addr`, `ca_dispatch_slot`, the call-assembler
-    /// registry) stays: the function's key-0 entry is the anchor's preamble.
+    /// `ca_dispatch_slot`, `RegisteredLoopTarget.code_ptr`) and
+    /// CALL_ASSEMBLER body (`set_ll_function_addr`) stay: the function's
+    /// key-0 entry is the anchor's preamble.
     ///
     /// Every retargeted descr's `LOOP_TARGET_REGISTRY` entry is replaced with
     /// `family_entry` (wrapper `code_ptr`, fail descrs, frame layout),
@@ -21649,11 +21707,12 @@ impl CraneliftBackend {
             target.set_dispatch_target(body_ptr, block_id, depth);
             repointed.push(descr.clone());
         }
-        token.set_ll_function_addr(code_ptr);
+        token.set_ll_function_addr(body_ptr);
         ca_dispatch_slot(token.number, code_ptr as *const u8);
         with_call_assembler_registry(|registry| {
             if let Some(target) = registry.get_mut(&token.number) {
                 target.code_ptr = code_ptr as *const u8;
+                target.body_ptr = body_ptr as *const u8;
             }
         });
         for member in members {
