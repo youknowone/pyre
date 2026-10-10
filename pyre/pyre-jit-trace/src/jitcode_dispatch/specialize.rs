@@ -9554,7 +9554,14 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
                 return None;
             }
             unsafe {
-                if !pyre_object::is_exact_type(obj, &pyre_object::INT_TYPE)
+                // `_descr_eq` (`tupleobject.py`) calls `space.eq_w` per item.
+                // `W_IntObject` (`intobject.py`) is the machine-int class;
+                // `W_LongObject` is a sibling. `is_exact_type(..., INT_TYPE)`
+                // is Python `type is int` and is true for both, so a long
+                // would be unboxed through `W_IntObject.intval`.
+                if !pyre_object::is_int(obj)
+                    || pyre_object::is_bool(obj)
+                    || pyre_object::is_long(obj)
                     || !std::ptr::eq((*obj).w_class, int_typeobj)
                 {
                     return None;
