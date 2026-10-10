@@ -1393,6 +1393,23 @@ fn tail_register_failargs(n_live: usize) -> usize {
     n_live.min(TAIL_EXTRA_INT_REGS)
 }
 
+/// A LABEL whose descr is a `LoopTargetDescr` is a JUMP target
+/// (`assembler.py fixup_target_tokens` / `set_dispatch_target`).
+///
+/// `compile.py compile_retrace` attaches such a LABEL as a bridge.
+/// `emit_loop_tail_call` then `closing_jump`s into it with the two-arg
+/// Tail signature a loop uses for `br_table` label entry
+/// (`x86/regalloc.py consider_jump` moves args into the LABEL's
+/// `_x86_arglocs` and `assembler.py closing_jump` jumps to
+/// `_ll_loop_code` — never through the bridge prologue). Extra Tail
+/// failargs would be unspecified on that path.
+fn op_is_dispatchable_label(op: &Op) -> bool {
+    op.opcode == OpCode::Label
+        && op
+            .getdescr()
+            .is_some_and(|descr| descr.as_loop_target_descr().is_some())
+}
+
 /// Live failargs in the order `compile_bridge` receives as inputargs.
 ///
 /// `rd_locs` (`rebuild_faillocs_from_descr`) is the mask
@@ -3665,6 +3682,66 @@ fn emit_call_footer_shadowstack(
 /// The host paths (`run_compiled_code`, `host_reentry_dispatch_key`) never set
 /// it, so they keep the full `_call_header_with_stack_check` prologue.
 const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
+
+/// Publish the compact inputarg-ref gcmap on dispatch_key selector 0.
+///
+/// A retrace bridge (`compile.py compile_retrace`) is a loop-like body:
+/// two-arg Tail + `br_table` on `dispatch_key`, matching how loops
+/// enter a LABEL (`x86/regalloc.py consider_jump` /
+/// `assembler.py closing_jump` jump to `_ll_loop_code` and never
+/// re-enter the bridge prologue). Key 0 is the guard HIT / host
+/// preamble; the HIT path compact-stores failargs into the frame
+/// first. Key `label_block_id + 1` is a JUMP re-entry: the source
+/// already published its gcmap over the carried slots, and replacing
+/// it with the bridge inputarg map would mark the wrong words when
+/// LABEL arity differs from the guard live list.
+fn emit_label_bridge_preamble_gcmap(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    jf_ptr: CValue,
+    raw_dispatch_key: CValue,
+    ref_slots: &[usize],
+    extra_gcmaps: &mut Vec<i64>,
+) {
+    let label_selector_mask = (!IN_CODE_ENTRY_KEY_FLAG) as i64;
+    let selector = builder
+        .ins()
+        .band_imm_u(raw_dispatch_key, label_selector_mask);
+    let zero = builder.ins().iconst(cl_types::I32, 0);
+    let is_preamble = builder.ins().icmp(IntCC::Equal, selector, zero);
+    let publish = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(is_preamble, publish, &[], done, &[]);
+    builder.switch_to_block(publish);
+    builder.seal_block(publish);
+    let entry_gcmap = if ref_slots.is_empty() {
+        0
+    } else {
+        allocate_gcmap(ref_slots)
+    };
+    if entry_gcmap != 0 {
+        extra_gcmaps.push(entry_gcmap);
+    }
+    let gcmap_val = builder.ins().iconst(cl_types::I64, entry_gcmap);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
+    if entry_gcmap != 0 {
+        emit_jitframe_write_barrier(
+            module,
+            builder,
+            ptr_type,
+            call_conv,
+            jf_ptr,
+            jitframe_write_barrier_flag(),
+        );
+    }
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    builder.seal_block(done);
+}
 
 /// `x86/assembler.py:182-184 _build_frame_realloc_slowpath` parity:
 /// `_load_shadowstack_top_in_ebx(mc, gcrootmap)` followed by
@@ -7913,6 +7990,22 @@ fn emit_attached_bridge_hit_tail(
                 );
             }
         }
+    } else {
+        // A retrace bridge with a dispatchable LABEL uses the two-arg
+        // loop signature (`op_is_dispatchable_label`): its entry loads
+        // compact slots, like a loop LABEL loader. The loop baked this
+        // extra-arg call before it knew the attached bridge would
+        // contain a LABEL, so store the Tail extras here for that
+        // two-arg body. A linear extra-arg body stores them again at
+        // entry (`prepare_bridge` / `_update_bindings`).
+        for (i, &value) in live_args.iter().enumerate() {
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                jf_ptr,
+                JF_FRAME_ITEM0_OFS + (i as i32) * 8,
+            );
+        }
     }
     for &(dense, value) in overflow_stores {
         builder.ins().store(
@@ -7924,8 +8017,9 @@ fn emit_attached_bridge_hit_tail(
     }
     let bridge_sig = attached_bridge_tail_sig(ptr_type, live_args.len());
     let bridge_sig_ref = builder.import_signature(bridge_sig);
-    // A bridge is linear (no LABELs): it always enters at its start, so the
-    // LABEL selector is 0.
+    // Guard HIT always enters at the preamble (`dispatch_key` selector 0),
+    // even when the attached bridge later contains a LABEL. A JUMP into
+    // that LABEL uses `emit_loop_tail_call` with `label_block_id + 1`.
     let bridge_dispatch_key = builder
         .ins()
         .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
@@ -12300,13 +12394,24 @@ impl CraneliftBackend {
         // at the guard (`prepare_bridge` / `_update_bindings`). Loops
         // and merged families keep the two-argument entry; their host
         // wrapper is unchanged.
+        //
+        // A retrace bridge that contains a dispatchable LABEL is a loop
+        // for `closing_jump`: `emit_loop_tail_call` calls it with only
+        // `(jf_ptr, dispatch_key)` and the entry `br_table`s onto the
+        // LABEL loader, which reads carried values from the frame
+        // (`x86/regalloc.py consider_jump` / `assembler.py closing_jump`
+        // jump to `_ll_loop_code` and never re-enter the prologue).
+        // Extra Tail failargs would be unspecified on that path, so fall
+        // back to the two-arg loop signature. The guard HIT still
+        // compact-stores extras into the frame for selector 0.
         let is_bridge = source_guard.is_some() && merge.is_none();
+        let has_dispatchable_label = is_bridge && ops.iter().any(op_is_dispatchable_label);
         let bridge_arg_types: Vec<Type> = if is_bridge {
             inputargs.iter().map(|ia| ia.tp.get()).collect()
         } else {
             Vec::new()
         };
-        let n_tail_extras = if is_bridge {
+        let n_tail_extras = if is_bridge && !has_dispatchable_label {
             tail_register_failargs(bridge_arg_types.len())
         } else {
             0
@@ -12734,6 +12839,23 @@ impl CraneliftBackend {
                     jitframe_write_barrier_flag(),
                 );
             }
+        } else if has_dispatchable_label {
+            let ref_slots: Vec<usize> = bridge_arg_types
+                .iter()
+                .enumerate()
+                .filter(|(_, tp)| **tp == Type::Ref)
+                .map(|(i, _)| i)
+                .collect();
+            emit_label_bridge_preamble_gcmap(
+                module,
+                &mut builder,
+                ptr_type,
+                call_conv,
+                initial_jf_ptr,
+                raw_dispatch_key,
+                &ref_slots,
+                &mut extra_gcmaps,
+            );
         }
         let in_code_bit = builder
             .ins()
@@ -25193,6 +25315,85 @@ mod tests {
         assert_ne!(host_ref, root);
         assert_eq!(unsafe { *(host_ref.0 as *const u64) }, 0xD30F_00C2);
         assert_eq!(backend.get_int_value(&host, 5), 50);
+    }
+
+    /// `compile.py compile_retrace` attaches a bridge that contains a
+    /// `LoopTargetDescr` LABEL. Loops enter that LABEL through
+    /// `dispatch_key` (`emit_loop_tail_call` passes only
+    /// `(jf_ptr, dispatch_key)`), matching `x86/regalloc.py
+    /// consider_jump` / `assembler.py closing_jump` jumping to
+    /// `_ll_loop_code` rather than the bridge prologue. Extra Tail
+    /// failargs would overwrite the JUMP's carried refs at the bridge
+    /// entry; a collecting op after the LABEL must still see the Ref.
+    #[test]
+    fn jump_into_bridge_label_preserves_ref_failargs() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_00D1;
+        }
+        let mut backend = backend_with_gc(gc);
+        let i = OpRef::input_arg_int(0);
+        let r = OpRef::input_arg_ref(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(i), rb(r)]);
+        guard.set_fail_arg_types(vec![Type::Int, Type::Ref]);
+        let loop_ops = vec![guard, mk_op(OpCode::Finish, &[i, r], OpRef::NONE.raw())];
+        let token_a = Arc::new(JitCellToken::new(1_500_440));
+        backend
+            .compile_loop(&inputargs, &loop_ops, &token_a)
+            .unwrap();
+        let failed = backend.execute_token(&token_a, &[Value::Int(42), Value::Ref(root)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("guard should fail");
+
+        let label_t = make_label_descr(1_500_441);
+        bind_target_owner(&label_t, &token_a);
+        let finish = mk_op(OpCode::Finish, &[i, r], OpRef::NONE.raw());
+        finish.set_fail_arg_types(vec![Type::Int, Type::Ref]);
+        let bridge_ops = vec![
+            mk_op_with_descr(OpCode::Label, &[i, r], OpRef::NONE.raw(), label_t.clone()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 2),
+            finish,
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token_a, &[], None)
+            .unwrap();
+
+        let label_b = make_label_descr(1_500_442);
+        let token_b = Arc::new(JitCellToken::new(1_500_442));
+        bind_target_owner(&label_b, &token_b);
+        let ops_b = vec![
+            mk_op_with_descr(OpCode::Label, &[i, r], OpRef::NONE.raw(), label_b),
+            mk_op_with_descr(OpCode::Jump, &[i, r], OpRef::NONE.raw(), label_t),
+        ];
+        backend.compile_loop(&inputargs, &ops_b, &token_b).unwrap();
+        let from_jump = backend.execute_token(&token_b, &[Value::Int(42), Value::Ref(root)]);
+        assert!(
+            backend.get_latest_descr(&from_jump).is_finish(),
+            "JUMP must enter the bridge LABEL and FINISH"
+        );
+        assert_eq!(backend.get_int_value(&from_jump, 0), 42);
+        let moved_j = backend.get_ref_value(&from_jump, 1);
+        assert_ne!(
+            moved_j, root,
+            "JUMP into a bridge LABEL must keep the carried Ref"
+        );
+        assert_eq!(unsafe { *(moved_j.0 as *const u64) }, 0xD30F_00D1);
+
+        let from_guard = backend.execute_token(&token_a, &[Value::Int(42), Value::Ref(moved_j)]);
+        assert_eq!(backend.get_int_value(&from_guard, 0), 42);
+        let moved_g = backend.get_ref_value(&from_guard, 1);
+        assert_eq!(unsafe { *(moved_g.0 as *const u64) }, 0xD30F_00D1);
     }
 
     /// `assemble_bridge` + `patch_jump_for_descr`: a bridge whose JUMP
