@@ -24137,7 +24137,17 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "replace",
-            make_builtin_function("replace", bytes_method_replace),
+            crate::make_builtin_function_with_signature(
+                "replace",
+                bytes_method_replace,
+                crate::gateway::Signature::new(
+                    vec!["self", "old", "new", "count"],
+                    None,
+                    None,
+                    0,
+                    4,
+                ),
+            ),
         )
     };
     unsafe {
@@ -24275,14 +24285,14 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "removeprefix",
-            make_builtin_function("removeprefix", bytes_method_removeprefix),
+            make_builtin_function_with_arity("removeprefix", bytes_method_removeprefix, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "removesuffix",
-            make_builtin_function("removesuffix", bytes_method_removesuffix),
+            make_builtin_function_with_arity("removesuffix", bytes_method_removesuffix, 2),
         )
     };
     unsafe {
@@ -25432,28 +25442,31 @@ fn bytes_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `new` (both bytes-like); optional `count` caps the replacements (a
 /// negative or absent count means "no limit").
 fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `replace` is positional-only; any keyword argument is rejected.
-    // `count` routes through `__index__` (`space_index_w`), so a
-    // non-integer raises rather than silently defaulting to "no limit".
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if kwargs.is_some() {
+    // Positional-only Signature pad fills omitted later slots with
+    // PY_NULL; count the caller-supplied args after self so a padded
+    // 4-slot slice still reports `replace expected at least 2 arguments,
+    // got 0`.  Keywords are rejected at parse_obj.
+    let given = args.iter().skip(1).filter(|a| !a.is_null()).count();
+    if given < 2 {
         return Err(crate::PyError::type_error(format!(
-            "{}.replace() takes no keyword arguments",
-            crate::error::type_name_of(pos[0])
+            "replace expected at least 2 arguments, got {given}"
         )));
     }
-    crate::type_methods::arity_at_least(pos, "replace", 2)?;
-    crate::type_methods::arity_at_most(pos, "replace", 3)?;
+    if given > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "replace expected at most 3 arguments, got {given}"
+        )));
+    }
     // `old` and `new` are rejected before `count` is coerced: the clinic
     // signature converts the two buffers ahead of the integer, so
     // `b"".replace(1, b"y", idx)` raises the TypeError without running
     // `idx.__index__`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let has_count = pos.len() > 3 && !pos[3].is_null();
+    let has_count = args.len() > 3 && !args[3].is_null();
     let src_base = if has_count {
-        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2], pos[3]])
+        pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2], args[3]])
     } else {
-        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]])
+        pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2]])
     };
     let old_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(
@@ -26012,15 +26025,6 @@ fn bytes_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `bytes.removeprefix` — drop a leading bytes-like prefix if present.
 fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "{}.removeprefix() takes exactly one argument ({} given)",
-            crate::error::type_name_of(pos[0]),
-            pos.len().saturating_sub(1)
-        )));
-    }
-    let args = pos;
     // Cuts allocate, and `require_bytes_like` can snapshot a memoryview, so
     // pin the receiver and prefix first and copy their payloads off.
     let _roots = pyre_object::gc_roots::push_roots();
@@ -26041,15 +26045,6 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// `bytes.removesuffix` — drop a trailing bytes-like suffix if present.
 fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "{}.removesuffix() takes exactly one argument ({} given)",
-            crate::error::type_name_of(pos[0]),
-            pos.len().saturating_sub(1)
-        )));
-    }
-    let args = pos;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let recv = || pyre_object::gc_roots::shadow_stack_get(base);
@@ -28494,7 +28489,17 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "replace",
-            make_builtin_function("replace", bytes_method_replace),
+            crate::make_builtin_function_with_signature(
+                "replace",
+                bytes_method_replace,
+                crate::gateway::Signature::new(
+                    vec!["self", "old", "new", "count"],
+                    None,
+                    None,
+                    0,
+                    4,
+                ),
+            ),
         )
     };
     unsafe {
@@ -28576,14 +28581,14 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "removeprefix",
-            make_builtin_function("removeprefix", bytes_method_removeprefix),
+            make_builtin_function_with_arity("removeprefix", bytes_method_removeprefix, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "removesuffix",
-            make_builtin_function("removesuffix", bytes_method_removesuffix),
+            make_builtin_function_with_arity("removesuffix", bytes_method_removesuffix, 2),
         )
     };
     unsafe {

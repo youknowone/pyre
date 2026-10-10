@@ -43,7 +43,7 @@ pyre_interpreter::py_module! {
         // Conversion. `degrees` and `radians` are installed in `extra_init`.
 
         // Multi-dimensional
-        "hypot" / * = m::hypot,
+        "hypot" / * = m::hypot; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
         "dist"  / 2 = m::dist,
 
         // Aggregation
@@ -53,10 +53,10 @@ pyre_interpreter::py_module! {
 
         // Integer math
         "factorial" / 1 = m::factorial,
-        "gcd"   / * = m::gcd,
-        "lcm"   / * = m::lcm,
+        "gcd"   / * = m::gcd; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
+        "lcm"   / * = m::lcm; pyre_interpreter::Signature::new(vec![], Some("args"), None, 0, 0),
         "comb"  / 2 = m::comb,
-        "perm"  / * = m::perm,
+        "perm"  / * = m::perm; pyre_interpreter::Signature::new(vec!["n", "k"], None, None, 0, 2),
         // `isqrt` is installed in `extra_init`.
     },
     extra_init: |ns| {
@@ -107,7 +107,12 @@ pyre_interpreter::py_module! {
         pyre_interpreter::module_ns_store(
             ns,
             "log",
-            pyre_interpreter::make_module_builtin_function("log", m::__majit_wrap_math_log),
+            pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
+                "log",
+                m::__majit_wrap_math_log,
+                pyre_interpreter::HOPELESS,
+                pyre_interpreter::Signature::new(vec!["x", "base"], None, None, 0, 2),
+            ),
         );
         pyre_interpreter::module_ns_store(
             ns,

@@ -62,25 +62,19 @@ cm1!(atanh);
 /// `wrapped_log` (interp_cmath.py) — with a base, `log(z)/log(base)`;
 /// `pymath::cmath::log` carries the `_Py_c_quot` division itself.
 pub fn log(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(pyre_interpreter::PyError::type_error(
-            "cmath.log() takes no keyword arguments",
-        ));
-    }
-    if pos.is_empty() {
+    let given = args.iter().filter(|a| !a.is_null()).count();
+    if given == 0 {
         return Err(pyre_interpreter::PyError::type_error(
             "log expected at least 1 argument, got 0",
         ));
     }
-    if pos.len() > 2 {
+    if given > 2 {
         return Err(pyre_interpreter::PyError::type_error(format!(
-            "log expected at most 2 arguments, got {}",
-            pos.len()
+            "log expected at most 2 arguments, got {given}"
         )));
     }
-    let w_z = pos[0];
-    let mut w_base = pos.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let w_z = args[0];
+    let mut w_base = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let z = pyre_object::with_roots!(w_base => unpack(w_z))?;
     let base = if w_base.is_null() {
         None

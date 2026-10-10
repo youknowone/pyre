@@ -3563,7 +3563,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     module_ns_store(
         roots.get(ns_slot),
         "audit",
-        crate::make_builtin_function("audit", sys_audit),
+        crate::gateway::with_module(
+            "sys",
+            crate::make_builtin_function_with_signature(
+                "audit",
+                sys_audit,
+                Signature::new(vec!["event"], Some("args"), None, 0, 1),
+            ),
+        ),
     );
     // sys._clear_type_descriptors(cls) — remove the descriptors owned by the
     // original class before `dataclasses._add_slots` copies its namespace into
@@ -3910,17 +3917,14 @@ pub fn audit_hooks_armed() -> bool {
 /// encode is there for the error it raises: an event name holding a lone
 /// surrogate is a `UnicodeEncodeError` at the call.
 fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "sys.audit() takes no keyword arguments",
-        ));
-    }
-    let Some(&w_event) = positional.first() else {
+    // Signature `event, *args`: omitted event is PY_NULL; extras arrive as
+    // a tuple in slot 1.  Keywords are rejected at parse_obj.
+    if args.first().is_none_or(|a| a.is_null()) {
         return Err(crate::PyError::type_error(
             "audit expected at least 1 argument, got 0",
         ));
-    };
+    }
+    let w_event = args[0];
     // `@unwrap_spec(event="text")`
     if !unsafe { pyre_object::is_str(w_event) } {
         // `_PyArg_BadArgument` names the `None` singleton itself rather than
@@ -3941,13 +3945,21 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     // only as copied pointers — the same bracket [`audit`] takes around its
     // own — and the owned copy is taken so no borrow of the event outlives
     // the unwrap.
+    let extra: Vec<pyre_object::PyObjectRef> = if args.len() > 1 && !args[1].is_null() {
+        unsafe { pyre_object::w_tuple_items_copy_as_vec(args[1]) }
+    } else {
+        Vec::new()
+    };
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_slot = _roots.pin_roots(positional);
-    let event = crate::baseobjspace::str_utf8_w(_roots.get(args_slot))?.to_string();
+    let mut live = Vec::with_capacity(1 + extra.len());
+    live.push(w_event);
+    live.extend_from_slice(&extra);
+    let base = _roots.pin_roots(&live);
+    let event = crate::baseobjspace::str_utf8_w(_roots.get(base))?.to_string();
     let w_text = _roots.pin_root(w_str_new_managed(&event));
-    let mut args_w: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(positional.len() - 1);
-    for i in 1..positional.len() {
-        args_w.push(_roots.get(args_slot + i));
+    let mut args_w: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(extra.len());
+    for i in 0..extra.len() {
+        args_w.push(_roots.get(base + 1 + i));
     }
     audit_w(w_text, &args_w)?;
     Ok(w_none())

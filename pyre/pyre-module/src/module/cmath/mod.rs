@@ -34,7 +34,7 @@ pyre_interpreter::py_module! {
         "asinh" / 1 = m::asinh,
         "acosh" / 1 = m::acosh,
         "atanh" / 1 = m::atanh,
-        "log"   / * = m::log,
+        "log"   / * = m::log; pyre_interpreter::Signature::new(vec!["z", "base"], None, None, 0, 2),
 
         "phase" / 1 = m::phase,
         "polar" / 1 = m::polar,

@@ -1019,7 +1019,7 @@ pub fn atan2(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn hypot(args: &[PyObjectRef]) -> PyResult {
-    let args = no_keywords(args, "hypot")?;
+    let args = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
     let coords: Vec<f64> = args
         .iter()
         .map(|&a| try_get_double(a))
@@ -1235,33 +1235,16 @@ fn log_of_double(x: f64, base: f64) -> f64 {
     }
 }
 
-/// A `math` entry point declared `METH_VARARGS` takes no keywords at all, so
-/// one is rejected before the arguments are read — otherwise the trailing
-/// marker dict reaches the body as one more operand.
-pub(crate) fn no_keywords<'a>(
-    args: &'a [PyObjectRef],
-    name: &str,
-) -> Result<&'a [PyObjectRef], pyre_interpreter::PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "math.{name}() takes no keyword arguments"
-        )));
-    }
-    Ok(positional)
-}
-
 pub fn log(args: &[PyObjectRef]) -> PyResult {
-    let args = no_keywords(args, "log")?;
-    if args.is_empty() {
+    let given = args.iter().filter(|a| !a.is_null()).count();
+    if given == 0 {
         return Err(pyre_interpreter::PyError::type_error(
             "log expected at least 1 argument, got 0",
         ));
     }
-    if args.len() > 2 {
+    if given > 2 {
         return Err(pyre_interpreter::PyError::type_error(format!(
-            "log expected at most 2 arguments, got {}",
-            args.len()
+            "log expected at most 2 arguments, got {given}"
         )));
     }
     // `math_log_impl` is two `loghelper` calls and a division.  So the
@@ -1572,12 +1555,12 @@ fn index_abs_machine_word(obj: PyObjectRef) -> Option<i64> {
 }
 
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
-    let args = no_keywords(args, "gcd")?;
+    let args = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
     // `interp_math.py`'s `gcd_two` reads both operands as Signed and only
     // falls back to rbigint when one overflows.  Taking the pair through
     // `get_bigint` unconditionally allocates five digit blocks and runs a
     // divmod to reduce two machine words.
-    if let [a, b] = args
+    if let [a, b] = args.as_slice()
         && let (Some(a), Some(b)) = (index_abs_machine_word(*a), index_abs_machine_word(*b))
     {
         return Ok(w_int_new(majit_rlib::rbigint::gcd_binary(a, b)));
@@ -1588,7 +1571,7 @@ pub fn gcd(args: &[PyObjectRef]) -> PyResult {
     // collection, then `set` so the owner-root slot names the new digits
     // — `*result =` through DerefMut leaves the slot on the previous array.
     let mut result = RBigIntGcRoot::new(BigInt::zero());
-    for &arg in args {
+    for &arg in &args {
         let value = RBigIntGcRoot::new(get_bigint(arg)?);
         result.set(result.gcd(&value).map_err(map_rbigint_err)?);
     }
@@ -1596,7 +1579,7 @@ pub fn gcd(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn lcm(args: &[PyObjectRef]) -> PyResult {
-    let args = no_keywords(args, "lcm")?;
+    let args = unsafe { pyre_object::w_tuple_items_copy_as_vec(args[0]) };
     if args.is_empty() {
         return Ok(w_int_new(1));
     }
@@ -1604,7 +1587,7 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
     // arbitrary Python and collect.  `args` is the gateway's native copy, so
     // each argument is read back from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_base = _roots.pin_roots(args);
+    let args_base = _roots.pin_roots(&args);
     let mut result = RBigIntGcRoot::new(get_bigint(_roots.get(args_base))?);
     for index in 1..args.len() {
         // Every argument goes through `__index__` even once the running result
@@ -1764,13 +1747,13 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn perm(args: &[PyObjectRef]) -> PyResult {
-    let args = no_keywords(args, "perm")?;
-    if args.is_empty() {
+    if args.first().is_none_or(|a| a.is_null()) {
         return Err(pyre_interpreter::PyError::type_error(
             "perm() takes at least 1 argument",
         ));
     }
-    if args.len() > 2 {
+    let given = args.iter().filter(|a| !a.is_null()).count();
+    if given > 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "perm() takes at most 2 arguments",
         ));
@@ -1782,7 +1765,7 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
     if let Some(n) = args.first().copied().and_then(machine_word_int)
         && let Some(k) = match args.get(1).copied() {
             None => Some(n),
-            Some(k) if unsafe { pyre_object::is_none(k) } => Some(n),
+            Some(k) if k.is_null() || unsafe { pyre_object::is_none(k) } => Some(n),
             Some(k) => machine_word_int(k),
         }
     {
