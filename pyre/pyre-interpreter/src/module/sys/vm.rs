@@ -194,11 +194,14 @@ fn sys_namespace_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
             unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+                crate::__pyre_put_new!(
+                    ns_slot,
                     "__init__",
-                    crate::make_builtin_function("__init__", sys_namespace_init),
+                    crate::make_builtin_function("__init__", sys_namespace_init)
                 )
             };
         });
@@ -521,6 +524,9 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
 
                 macro_rules! install {
                     ($name:literal, $value:expr) => {{
+                        // The value pin lives across this one setitem. `ns_slot`
+                        // stays on `_roots`.
+                        let _pyre_store_roots = pyre_object::gc_roots::push_roots();
                         let value = $value;
                         let value_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(value);
@@ -594,6 +600,9 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                     ("__gt__", simple_namespace_gt, "Return self>value."),
                     ("__ge__", simple_namespace_ge, "Return self>=value."),
                 ] {
+                    // The method pin lives across this one setitem. `ns_slot`
+                    // stays on `_roots`.
+                    let _pyre_store_roots = pyre_object::gc_roots::push_roots();
                     let method = simple_namespace_method(
                         name,
                         function,
@@ -1701,21 +1710,28 @@ crate::builtin_wrapper_descriptor!(
 );
 
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
-    module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_put_new!(ns_slot, "maxsize", w_int_new(i64::MAX));
+    crate::__pyre_put_new!(ns_slot, "maxunicode", w_int_new(0x10FFFF));
     #[cfg(all(
         feature = "cpyext",
         not(feature = "sandbox"),
         any(target_os = "macos", target_os = "linux")
     ))]
     crate::cpyext::register_sys_dlopenflags(ns);
-    let w_orig_argv = pyre_object::with_roots!(ns => w_list_new(
-        crate::importing::sys_orig_argv()
-            .iter()
-            .map(|arg| crate::gateway::fsdecode_os_str(arg))
-            .collect(),
-    ));
-    module_ns_store(ns, "orig_argv", w_orig_argv);
+    // Each decoded argv string is pinned before the next decode, then the
+    // list is built from those slots (`RootedItems`). `w_list_new` of a
+    // `Vec` built first would leave every element unpublished.
+    let w_orig_argv = pyre_object::with_roots!(ns => {
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for arg in crate::importing::sys_orig_argv().iter() {
+            items.push(crate::gateway::fsdecode_os_str(arg));
+        }
+        w_list_new(items.take())
+    });
+    crate::__pyre_store!(ns, "orig_argv", w_orig_argv);
     // pypy/interpreter/app_main.py:785-786:
     //   sys._xoptions = dict(x.split('=', 1) if '=' in x else (x, True)
     //                        for x in options['_xoptions'])
@@ -4687,28 +4703,25 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // the raw descriptor, which refuses once the stream is closed, and answers
     // the opposite one with a constant `False` that closing does not turn into
     // an error.  Only the matching query takes the check.
-    let (writable_fn, mut readable_fn) = match fd {
-        0 => (
-            crate::make_builtin_function("writable", |_| Ok(w_bool_from(false))),
-            crate::make_builtin_function("readable", |_| {
-                stdio_check_closed("__stdin__", CLOSED_RAW_LAYER)?;
-                Ok(w_bool_from(true))
-            }),
-        ),
-        2 => (
-            crate::make_builtin_function("writable", |_| {
-                stdio_check_closed("__stderr__", CLOSED_RAW_LAYER)?;
-                Ok(w_bool_from(true))
-            }),
-            crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
-        ),
-        _ => (
-            crate::make_builtin_function("writable", |_| {
-                stdio_check_closed("__stdout__", CLOSED_RAW_LAYER)?;
-                Ok(w_bool_from(true))
-            }),
-            crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
-        ),
+    let writable_fn = match fd {
+        0 => crate::make_builtin_function("writable", |_| Ok(w_bool_from(false))),
+        2 => crate::make_builtin_function("writable", |_| {
+            stdio_check_closed("__stderr__", CLOSED_RAW_LAYER)?;
+            Ok(w_bool_from(true))
+        }),
+        _ => crate::make_builtin_function("writable", |_| {
+            stdio_check_closed("__stdout__", CLOSED_RAW_LAYER)?;
+            Ok(w_bool_from(true))
+        }),
+    };
+    let writable_fn = pyre_object::gc_roots::pin_root(writable_fn);
+    let mut readable_fn = match fd {
+        0 => crate::make_builtin_function("readable", |_| {
+            stdio_check_closed("__stdin__", CLOSED_RAW_LAYER)?;
+            Ok(w_bool_from(true))
+        }),
+        2 => crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
+        _ => crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
     };
     pyre_object::with_roots!(readable_fn => crate::baseobjspace::setdictvalue_native(
         pyre_object::gc_roots::shadow_stack_get(stream_slot),

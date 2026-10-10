@@ -1026,11 +1026,9 @@ fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     Ok(w_view)
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
-        "is_builtin",
-        crate::make_builtin_function_with_arity(
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    crate::__pyre_store!(ns, "is_builtin", crate::make_builtin_function_with_arity(
             "is_builtin",
             |args| {
                 if args.is_empty() {
@@ -1068,12 +1066,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(pyre_object::w_int_new(result))
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "is_frozen",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "is_frozen", crate::make_builtin_function_with_arity(
             "is_frozen",
             |args| {
                 let name = frozen_name(args, "is_frozen")?;
@@ -1082,12 +1076,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 ))
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "is_frozen_package",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "is_frozen_package", crate::make_builtin_function_with_arity(
             "is_frozen_package",
             |args| {
                 let name = frozen_name(args, "is_frozen_package")?;
@@ -1096,12 +1086,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(pyre_object::w_bool_from(entry.is_package))
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "init_frozen",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "init_frozen", crate::make_builtin_function_with_arity(
             "init_frozen",
             // `import.c _imp_init_frozen_impl` — run the frozen module's code
             // in a fresh namespace registered under its name and hand the
@@ -1190,12 +1176,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "_frozen_module_names",
-        crate::make_builtin_function("_frozen_module_names", |_| {
+        ));
+    crate::__pyre_store!(ns, "_frozen_module_names", crate::make_builtin_function("_frozen_module_names", |_| {
             let mut names = pyre_object::gc_roots::RootedItems::new();
             for entry in FROZEN_MODULES
                 .iter()
@@ -1204,12 +1186,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 names.push(pyre_object::w_str_new_managed(entry.name));
             }
             Ok(pyre_object::w_list_new(names.take()))
-        }),
-    );
-    crate::module_ns_store(
-        ns,
-        "find_frozen",
-        // `withdata` is keyword-only, so no call shape fills every parameter
+        }));
+    crate::__pyre_store!(ns, "find_frozen", // `withdata` is keyword-only, so no call shape fills every parameter
         // positionally and there is no fixed natural arity to fast-path on.
         crate::make_builtin_function("find_frozen", |args| {
             let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -1248,12 +1226,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 pyre_object::w_bool_from(entry.is_package),
                 pyre_object::gc_roots::shadow_stack_get(origname_slot),
             ]))
-        }),
-    );
-    crate::module_ns_store(
-        ns,
-        "_override_frozen_modules_for_tests",
-        crate::make_builtin_function("_override_frozen_modules_for_tests", |args| {
+        }));
+    crate::__pyre_store!(ns, "_override_frozen_modules_for_tests", crate::make_builtin_function("_override_frozen_modules_for_tests", |args| {
             let Some(&value) = args.first() else {
                 return Err(crate::PyError::type_error(
                     "_override_frozen_modules_for_tests expected at least 1 argument, got 0",
@@ -1262,12 +1236,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let value = crate::baseobjspace::gateway_int_w(value)?;
             FROZEN_OVERRIDE.store(value, Ordering::Relaxed);
             Ok(pyre_object::w_none())
-        }),
-    );
-    crate::module_ns_store(
-        ns,
-        "_override_multi_interp_extensions_check",
-        // Overrides `PyInterpreterConfig.check_multi_interp_extensions` for a
+        }));
+    crate::__pyre_store!(ns, "_override_multi_interp_extensions_check", // Overrides `PyInterpreterConfig.check_multi_interp_extensions` for a
         // subinterpreter; the main interpreter is refused outright.  pyre runs
         // one interpreter, so every call takes the refusing arm — the override
         // has no state to keep.  The int conversion runs first, so a non-int
@@ -1282,12 +1252,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 ))
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "get_frozen_object",
-        // `data` is optional, so there is no fixed natural arity to fast-path
+        ));
+    crate::__pyre_store!(ns, "get_frozen_object", // `data` is optional, so there is no fixed natural arity to fast-path
         // on; registering one would declare a call shape the closure does not
         // actually require.
         crate::make_builtin_function("get_frozen_object", |args| {
@@ -1334,12 +1300,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             let entry = served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
             frozen_code(entry)
-        }),
-    );
-    crate::module_ns_store(
-        ns,
-        "create_builtin",
-        crate::make_builtin_function_with_arity(
+        }));
+    crate::__pyre_store!(ns, "create_builtin", crate::make_builtin_function_with_arity(
             "create_builtin",
             |args| {
                 // `interp_imp.py create_builtin`. `BuiltinImporter.create_module`
@@ -1386,21 +1348,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 .unwrap_or_else(pyre_object::w_none))
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "exec_builtin",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "exec_builtin", crate::make_builtin_function_with_arity(
             "exec_builtin",
             |_| Ok(pyre_object::w_int_new(0)),
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "exec_dynamic",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "exec_dynamic", crate::make_builtin_function_with_arity(
             "exec_dynamic",
             |_args| {
                 #[cfg(all(
@@ -1419,12 +1373,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(pyre_object::w_none())
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "create_dynamic",
-        // interp_imp.py create_dynamic. Without the `cpyext` feature this is
+        ));
+    crate::__pyre_store!(ns, "create_dynamic", // interp_imp.py create_dynamic. Without the `cpyext` feature this is
         // the `has_so_extension() == False` branch, which is the default build:
         // the spec's `name` and `origin` are read and rejected for an embedded
         // null before reporting the unsupported load, matching
@@ -1470,45 +1420,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
             },
             crate::Signature::new(vec!["spec", "file"], None, None, 0, 0),
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "acquire_lock",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "acquire_lock", crate::make_builtin_function_with_arity(
             "acquire_lock",
             |_| {
                 acquire_lock();
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "release_lock",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "release_lock", crate::make_builtin_function_with_arity(
             "release_lock",
             |_| {
                 release_lock()?;
                 Ok(pyre_object::w_none())
             },
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "lock_held",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "lock_held", crate::make_builtin_function_with_arity(
             "lock_held",
             |_| Ok(pyre_object::w_bool_from(lock_held())),
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "_fix_co_filename",
-        // interp_imp.py fix_co_filename(code, pathname).
+        ));
+    crate::__pyre_store!(ns, "_fix_co_filename", // interp_imp.py fix_co_filename(code, pathname).
         crate::make_builtin_function_with_arity(
             "_fix_co_filename",
             |args| {
@@ -1534,12 +1468,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(pyre_object::w_none())
             },
             2,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "extension_suffixes",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "extension_suffixes", crate::make_builtin_function_with_arity(
             "extension_suffixes",
             |_| {
                 #[cfg(all(
@@ -1570,23 +1500,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
             },
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "get_tag",
-        // PyPy `interp_imp.py:get_tag`: the cache tag for .pyc files.  Keep
+        ));
+    crate::__pyre_store!(ns, "get_tag", // PyPy `interp_imp.py:get_tag`: the cache tag for .pyc files.  Keep
         // this identical to sys.implementation.cache_tag.
         crate::make_builtin_function_with_arity(
             "get_tag",
             |_| Ok(pyre_object::w_str_new("pyre314")),
             0,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "source_hash",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "source_hash", crate::make_builtin_function_with_arity(
             "source_hash",
             |args| {
                 // `_imp_source_hash_impl` hashes the source bytes with
@@ -1617,21 +1539,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 ))
             },
             2,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "check_hash_based_pycs",
-        pyre_object::w_str_new("default"),
-    );
+        ));
+    crate::__pyre_store!(ns, "check_hash_based_pycs", pyre_object::w_str_new("default"));
     // `MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')`
     // (_bootstrap_external.py).  Cache files are already segregated by
     // `sys.implementation.cache_tag`.
-    crate::module_ns_store(
-        ns,
-        "pyc_magic_number_token",
-        pyre_object::w_int_new(i64::from(PYC_MAGIC_NUMBER_TOKEN)),
-    );
+    crate::__pyre_store!(ns, "pyc_magic_number_token", pyre_object::w_int_new(i64::from(PYC_MAGIC_NUMBER_TOKEN)));
     Ok(())
 }
 

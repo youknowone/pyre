@@ -3038,31 +3038,70 @@ fn expand_pyre_methods(
         };
         match &kind {
             MethodKind::Instance => {
-                registrations.push(quote! {
-                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name, #raw_fn) };
-                });
+                registrations.push(quote! {{
+                        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+                        let __pyre_built = #raw_fn;
+                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    #py_name,
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                ) };
+                    }});
             }
             // `__new__` is the one static entry that is not a `tp_methods`
             // entry: `add_tp_new_wrapper` stores the carrier itself, so the
             // namespace holds a `builtin_function_or_method` bound to the
             // owning type rather than a `staticmethod` around one.
             MethodKind::Static if py_name == "__new__" => {
-                registrations.push(quote! {
-                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
-                        ::pyre_interpreter::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig)) };
-                });
+                registrations.push(quote! {{
+                    let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+                    let __pyre_built = ::pyre_interpreter::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig);
+                    let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                    let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                    unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                #py_name,
+                ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+            ) };
+                }});
             }
             MethodKind::Static => {
-                registrations.push(quote! {
-                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
-                        ::pyre_object::w_staticmethod_new(#raw_fn)) };
-                });
+                registrations.push(quote! {{
+                        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+                        let __pyre_built = #raw_fn;
+                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        let __pyre_wrapped = ::pyre_object::w_staticmethod_new(
+                            ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                        );
+                        let __pyre_wrapped_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_wrapped);
+                        unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    #py_name,
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_wrapped_slot),
+                ) };
+                    }});
             }
             MethodKind::Class => {
-                registrations.push(quote! {
-                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
-                        ::pyre_object::w_classmethod_new(#raw_fn)) };
-                });
+                registrations.push(quote! {{
+                        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+                        let __pyre_built = #raw_fn;
+                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        let __pyre_wrapped = ::pyre_object::w_classmethod_new(
+                            ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                        );
+                        let __pyre_wrapped_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_wrapped);
+                        unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    #py_name,
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_wrapped_slot),
+                ) };
+                    }});
             }
             MethodKind::Getter(prop_name, doc) => {
                 record_property(
@@ -3104,32 +3143,76 @@ fn expand_pyre_methods(
     // accessor populates the `doc` slot; otherwise `PY_NULL`.
     for prop in &properties {
         let prop_name = &prop.name;
-        let accessor_expr = |slot: &Option<syn::Ident>| match slot {
-            Some(id) => quote! { ::pyre_interpreter::make_builtin_function(#prop_name, #id) },
-            None => quote! { ::pyre_object::PY_NULL },
+        let accessor_slot = |slot: &Option<syn::Ident>, idx: u32| match slot {
+            Some(id) => quote! {{
+                let __pyre_acc = ::pyre_interpreter::make_builtin_function(#prop_name, #id);
+                let __pyre_acc_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                let _ = ::pyre_object::gc_roots::pin_root(__pyre_acc);
+                let _ = #idx;
+                __pyre_acc_slot
+            }},
+            None => quote! { ::pyre_object::gc_roots::shadow_stack_len() },
         };
-        let fget_expr = accessor_expr(&prop.fget);
-        let fset_expr = accessor_expr(&prop.fset);
-        let fdel_expr = accessor_expr(&prop.fdel);
+        // `None` accessors are `PY_NULL` and must not read a slot. The index
+        // keeps each `Some` arm's locals in its own block.
+        let fget_some = prop.fget.is_some();
+        let fset_some = prop.fset.is_some();
+        let fdel_some = prop.fdel.is_some();
+        let doc_some = prop.doc.is_some();
+        let fget_slot_expr = accessor_slot(&prop.fget, 0);
+        let fset_slot_expr = accessor_slot(&prop.fset, 1);
+        let fdel_slot_expr = accessor_slot(&prop.fdel, 2);
         let doc_expr = match &prop.doc {
-            Some(doc) => quote! { ::pyre_object::w_str_new(#doc) },
-            None => quote! { ::pyre_object::PY_NULL },
+            Some(doc) => quote! {{
+                let __pyre_doc = ::pyre_object::w_str_new(#doc);
+                let __pyre_doc_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                let _ = ::pyre_object::gc_roots::pin_root(__pyre_doc);
+                __pyre_doc_slot
+            }},
+            None => quote! { 0usize },
         };
-        registrations.push(quote! {
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+        registrations.push(quote! {{
+            let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+            let __pyre_fget_slot = #fget_slot_expr;
+            let __pyre_fset_slot = #fset_slot_expr;
+            let __pyre_fdel_slot = #fdel_slot_expr;
+            let __pyre_doc_slot = #doc_expr;
+            let __pyre_name = ::pyre_object::w_str_new(#prop_name);
+            let __pyre_name_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root(__pyre_name);
+            let __pyre_prop = ::pyre_object::typedef::w_getset_property_new(
+                if #fget_some {
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_fget_slot)
+                } else {
+                    ::pyre_object::PY_NULL
+                },
+                if #fset_some {
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_fset_slot)
+                } else {
+                    ::pyre_object::PY_NULL
+                },
+                if #fdel_some {
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_fdel_slot)
+                } else {
+                    ::pyre_object::PY_NULL
+                },
+                if #doc_some {
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_doc_slot)
+                } else {
+                    ::pyre_object::PY_NULL
+                },
+                ::pyre_object::PY_NULL,
+                false,
+                ::pyre_object::gc_roots::shadow_stack_get(__pyre_name_slot),
+            );
+            let __pyre_prop_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root(__pyre_prop);
+            unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 #prop_name,
-                ::pyre_object::typedef::w_getset_property_new(
-                    #fget_expr,
-                    #fset_expr,
-                    #fdel_expr,
-                    #doc_expr,
-                    ::pyre_object::PY_NULL,
-                    false,
-                    ::pyre_object::w_str_new(#prop_name),
-                ),
+                ::pyre_object::gc_roots::shadow_stack_get(__pyre_prop_slot),
             ) };
-        });
+        }});
     }
 
     // Append declarative-slot registrations after method entries.  Order
@@ -3140,23 +3223,45 @@ fn expand_pyre_methods(
     // flips the `weakrefable` bit on the new type via
     // `w_type_set_weakrefable`.
     if let Some(lit) = attrs.doc.as_ref() {
-        registrations.push(quote! {
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__doc__", ::pyre_object::w_str_new(#lit)) };
-        });
+        registrations.push(quote! {{
+            let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+            let __pyre_doc = ::pyre_object::w_str_new(#lit);
+            let __pyre_doc_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root(__pyre_doc);
+            unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "__doc__",
+                ::pyre_object::gc_roots::shadow_stack_get(__pyre_doc_slot),
+            ) };
+        }});
     }
     if attrs.weakrefable {
-        registrations.push(quote! {
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+        registrations.push(quote! {{
+            let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+            let __pyre_weak = ::pyre_interpreter::typedef::make_weakref_descr(::pyre_object::PY_NULL);
+            let __pyre_weak_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root(__pyre_weak);
+            unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 "__weakref__",
-                ::pyre_interpreter::typedef::make_weakref_descr(::pyre_object::PY_NULL),
+                ::pyre_object::gc_roots::shadow_stack_get(__pyre_weak_slot),
             ) };
-        });
+        }});
     }
     if attrs.unhashable {
         registrations.push(quote! {
-            unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", ::pyre_object::w_none()) };
-        });
+                unsafe { {
+            let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+            let __pyre_value_now_1 = ::pyre_object::w_none();
+            let __pyre_value_slot_1 = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root(__pyre_value_now_1);
+            ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "__hash__",
+                ::pyre_object::gc_roots::shadow_stack_get(__pyre_value_slot_1),
+            )
+        } };
+            });
     }
 
     // Strip marker attrs the user placed.  `#[pyre_method]` /
@@ -3210,7 +3315,12 @@ fn expand_pyre_methods(
             *CELL.get_or_init(|| {
                     let tp = ::pyre_interpreter::typedef::make_builtin_type_with_layout(
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
-                        |ns| { #(#registrations)* },
+                        |ns| {
+                            let _root_scope = ::pyre_object::gc_roots::push_roots();
+                            let ns_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                            let ns = ::pyre_object::gc_roots::pin_root(ns);
+                            #(#registrations)*
+                        },
                         #base_expr,
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
                     );

@@ -30,38 +30,37 @@ fn socket_type() -> PyObjectRef {
 }
 
 fn init_socket_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // Allocation is separate from initialisation here as it is everywhere
     // else: `socket.py`'s subclass calls `_socket.socket.__init__` itself, so
     // `__new__` must hand back an instance without having opened anything.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            pyre_interpreter::typedef::make_new_descr(|args| {
-                let cls = args
-                    .first()
-                    .copied()
-                    .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
-                    .unwrap_or_else(socket_type);
-                Ok(pyre_object::w_instance_new(cls))
-            }),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr(|args| {
+            let cls = args
+                .first()
+                .copied()
+                .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
+                .unwrap_or_else(socket_type);
+            Ok(pyre_object::w_instance_new(cls))
+        })
+    );
     // The one call this type would have to make, and the one it cannot: there
     // is no descriptor for a socket to be, so construction reports that rather
     // than handing back an object whose every method would have to.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__init__",
-            pyre_interpreter::make_builtin_function("__init__", |_args| {
-                Err(pyre_interpreter::PyError::os_error_syscall(
-                    pyre_interpreter::builtins::wasm_errno::ENOTSUP,
-                    pyre_object::w_none(),
-                ))
-            }),
-        )
-    };
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "__init__",
+        pyre_interpreter::make_builtin_function("__init__", |_args| {
+            Err(pyre_interpreter::PyError::os_error_syscall(
+                pyre_interpreter::builtins::wasm_errno::ENOTSUP,
+                pyre_object::w_none(),
+            ))
+        })
+    );
 }
 
 /// The two families the address converters carry a parser for, as the constant
@@ -220,21 +219,24 @@ const CONSTANTS: &[(&str, i64)] = &[
 /// The names `register_module` adds where there is no host socket layer to
 /// build the rest out of.
 pub(super) fn register_names(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     for (name, value) in CONSTANTS {
-        pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(*value));
     }
     let socket_tp = socket_type();
-    pyre_interpreter::module_ns_store(ns, "socket", socket_tp);
-    pyre_interpreter::module_ns_store(ns, "SocketType", socket_tp);
+    pyre_interpreter::__pyre_put_new!(ns_slot, "socket", socket_tp);
+    pyre_interpreter::__pyre_put_new!(ns_slot, "SocketType", socket_tp);
     // `gethostname` needs no socket layer -- wasi answers it out of `uname` --
     // and `platform._node` calls it, so `platform.uname()` depends on it.
-    pyre_interpreter::module_ns_store(
-        ns,
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
         "gethostname",
         pyre_interpreter::make_builtin_function_with_arity(
             "gethostname",
             |_args| Ok(pyre_object::w_str_new_managed(NODE_NAME)),
             0,
-        ),
+        )
     );
 }

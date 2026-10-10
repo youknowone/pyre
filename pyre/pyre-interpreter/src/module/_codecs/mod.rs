@@ -2392,14 +2392,10 @@ crate::py_module! {
                 ("code_page_encode", code_page_encode),
                 ("code_page_decode", code_page_decode),
             ] {
-                crate::module_ns_store(
-                    ns,
-                    name,
-                    crate::gateway::with_module(
+                crate::__pyre_store!(ns, name, crate::gateway::with_module(
                         "_codecs",
                         crate::make_module_builtin_function(name, entry),
-                    ),
-                );
+                    ));
             }
         }
         #[cfg(not(windows))]

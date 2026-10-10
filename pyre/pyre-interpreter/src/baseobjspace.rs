@@ -6301,7 +6301,7 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
         return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
     }
     // interp_iobase.py W_IOBase.getdict
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+    if crate::module::_io::iobase_read_dict(obj).is_some() {
         return Ok(unsafe { crate::module::_io::iobase_getdict(obj) });
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -6457,7 +6457,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     }
     // W_Root.setdict — typed IO payloads have no setdict override
     // (interp_iobase.py W_IOBase uses descr_set_dict → this method).
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+    if crate::module::_io::iobase_read_dict(obj).is_some() {
         return Err(PyError::type_error(format!(
             "attribute '__dict__' of {} objects is not writable",
             object_functionstr_type_name(obj),
@@ -6616,7 +6616,7 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
     // interp_iobase.py W_IOBase.getdictvalue — a typed IO payload owns
     // `w_dict` (`typedef.hasdict`), so `_getusercls` does not mix in
     // `MapdictDictSupport`. A null `w_dict` is a miss and does not allocate.
-    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+    if crate::module::_io::iobase_read_dict(obj).is_some() {
         return unsafe { crate::module::_io::iobase_getdictvalue(obj, name) };
     }
     // mapdict.py `MapdictDictSupport.getdictvalue` overrides the
@@ -6643,8 +6643,7 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
 /// `Some(PY_NULL)` is a typed IO payload whose dictionary has not been
 /// created; `None` is every other layout.
 fn iobase_peek_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let slot = unsafe { crate::module::_io::iobase_payload_dict_slot(obj) }?;
-    Some(unsafe { *slot })
+    crate::module::_io::iobase_read_dict(obj)
 }
 
 /// `W_BaseException.w_dict` without allocating it.
