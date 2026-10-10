@@ -3164,17 +3164,26 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         make_builtin_function("index", memoryview_index),
     );
     // `__exit__(self, *exc)`, `__release_buffer__(self, view)`,
-    // `__delitem__(self, *args)`, `hex(self, sep=, bytes_per_sep=)`, and
-    // `cast(format[, shape])` take variable / optional trailing arguments,
-    // so they register as plain (non-arity-pinned) builtins.
+    // `__delitem__(self, *args)`, and `cast(format[, shape])` take variable
+    // / optional trailing arguments, so they register as plain
+    // (non-arity-pinned) builtins.  `hex` shares bytes.hex's Signature so a
+    // keyword call binds `sep` / `bytes_per_sep` before the forwarder runs.
     for (name, f) in [
         ("__exit__", memoryview_exit as MvFn),
         ("__release_buffer__", memoryview_release_buffer),
         ("__delitem__", memoryview_delitem),
-        ("hex", memoryview_hex),
     ] {
         type_ns_store(ns_slot, name, make_builtin_function(name, f));
     }
+    type_ns_store(
+        ns_slot,
+        "hex",
+        crate::make_builtin_function_with_signature(
+            "hex",
+            memoryview_hex,
+            crate::gateway::Signature::new(vec!["self", "sep", "bytes_per_sep"], None, None, 0, 1),
+        ),
+    );
     type_ns_store(
         ns_slot,
         "tobytes",

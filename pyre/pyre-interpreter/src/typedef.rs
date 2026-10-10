@@ -5402,7 +5402,8 @@ pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef,
     // call sits after an effect on every red join, so the whole wrapper
     // was declined.  Exact `tuple` and one positional stay here; keywords,
     // a surplus positional, and a subclass `cls` are the residual.
-    if args.len() != 2 || args[0].is_null() {
+    if args.len() != 2 || args[0].is_null() || crate::builtins::builtin_kwargs_marker_tail(args[1])
+    {
         return tuple_new_slow(args);
     }
     let cls = args[0];
@@ -5764,7 +5765,10 @@ fn init_super_type(ns: PyObjectRef) {
             ),
         )
     };
-    let new_descr = make_new_descr_posonly(super_descr_new, vec!["cls", "type", "obj"]);
+    // `__new__` allocates and ignores extras; `__init__` validates the
+    // zero-to-two user arguments.  A pos-only Signature here would reject
+    // `super(int, int, int)` before `descr_init` can say `expected at most 2`.
+    let new_descr = make_new_descr(super_descr_new);
     unsafe {
         crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
@@ -6243,11 +6247,7 @@ fn init_filter_type(ns: PyObjectRef) {
             "filter(function or None, iterable) --> filter object\n\nReturn an iterator yielding those items of iterable for which function(item)\nis true. If function is None, return the items that are true.",
         ),
     );
-    install_functional_entry(
-        ns,
-        "__new__",
-        make_functional_new_descr_posonly(filter_descr_new, vec!["cls", "function", "iterable"]),
-    );
+    install_functional_entry(ns, "__new__", make_functional_new_descr(filter_descr_new));
     for (name, function) in [
         (
             "__iter__",
@@ -33511,10 +33511,7 @@ fn init_takewhile_type(ns: PyObjectRef) {
     // W_TakeWhile.typedef, in source order (minus the 3.14-removed pickle
     // entries between __next__ and __doc__).
     let entries = [
-        (
-            "__new__",
-            make_new_descr_posonly(takewhile_descr_new, vec!["cls", "predicate", "iterable"]),
-        ),
+        ("__new__", make_new_descr(takewhile_descr_new)),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -33538,10 +33535,7 @@ fn init_takewhile_type(ns: PyObjectRef) {
 fn init_dropwhile_type(ns: PyObjectRef) {
     // W_DropWhile.typedef, in source order.
     let entries = [
-        (
-            "__new__",
-            make_new_descr_posonly(dropwhile_descr_new, vec!["cls", "predicate", "iterable"]),
-        ),
+        ("__new__", make_new_descr(dropwhile_descr_new)),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -33565,10 +33559,7 @@ fn init_dropwhile_type(ns: PyObjectRef) {
 fn init_filterfalse_type(ns: PyObjectRef) {
     // W_FilterFalse.typedef, in source order.
     let entries = [
-        (
-            "__new__",
-            make_new_descr_posonly(filterfalse_descr_new, vec!["cls", "function", "iterable"]),
-        ),
+        ("__new__", make_new_descr(filterfalse_descr_new)),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -34650,10 +34641,7 @@ fn init_compress_type(ns: PyObjectRef) {
 fn init_starmap_type(ns: PyObjectRef) {
     // interp_itertools.py W_StarMap.typedef, with Python 3.14's public doc.
     let entries = [
-        (
-            "__new__",
-            make_new_descr_posonly(starmap_descr_new, vec!["cls", "function", "iterable"]),
-        ),
+        ("__new__", make_new_descr(starmap_descr_new)),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", starmap_iter_self, 1),

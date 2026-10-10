@@ -3247,18 +3247,18 @@ pub fn parse_builtin_signature(
             "{fname}() takes at most {n} {argword} ({m} given)"
         )));
     }
-    let mut scope_w =
-        match arguments.parse_obj(pyre_object::PY_NULL, fname, sig, defaults, w_kw_defs, 0) {
-            Ok(scope) => scope,
-            Err(err) => {
-                return Err(rewrite_builtin_keyword_error(
-                    sig,
-                    fname,
-                    keyword_names_w,
-                    err,
-                ));
-            }
-        };
+    let mut scope_w = match arguments._parse(pyre_object::PY_NULL, sig, defaults, w_kw_defs, 0) {
+        Ok(scope) => scope,
+        Err(crate::argument::MatchSignatureError::Shape(err)) => {
+            return Err(rewrite_builtin_keyword_error(
+                sig,
+                fname,
+                keyword_names_w,
+                err,
+            ));
+        }
+        Err(crate::argument::MatchSignatureError::Py(err)) => return Err(err),
+    };
     if synthesized {
         rewrite_omitted_kwonly_none_to_null(sig, &mut scope_w, keyword_names_w);
     }
@@ -3276,36 +3276,66 @@ fn signature_cls_constructor(sig: &crate::Signature) -> bool {
     sig.argnames.first().copied() == Some("cls")
 }
 
-/// [3.14-spec] `parse_obj` says `takes no keyword arguments` when there
-/// is no `**` and no kw-only (`argument.py`), and names a posonly-as-kw
-/// as `got some positional-only arguments passed as keyword arguments`.
-/// 3.14.6 names the extra key once the signature already accepts some
-/// keywords (`round(1.5, **{K:0})`, `int(x=5)`, `sum([1,2], **{K:0})`).
+/// [3.14-spec] overlay on `ArgErr` variants while they are still known.
+/// `parse_obj` (`argument.py`) reports `ArgErrUnknownKwds` as
+/// `takes no keyword arguments` when there is no `**` and no kw-only, and
+/// `ArgErrPosonlyAsKwds` as `got some positional-only arguments passed as
+/// keyword arguments`.  3.14.6 names the extra key once the signature
+/// already accepts some keywords (`round(1.5, **{K:0})`, `int(x=5)`,
+/// `sum([1,2], **{K:0})`).  `ArgErrMultipleValues` is clinic's
+/// `argument for fname() given by name ('x') and position (n)`
+/// (`str(b"x", "utf-8", encoding="ascii")`, hashlib `data=` + positional).
 fn rewrite_builtin_keyword_error(
     sig: &crate::Signature,
     fname: &str,
     keyword_names_w: &[PyObjectRef],
-    err: crate::PyError,
+    err: crate::argument::ArgErr,
 ) -> crate::PyError {
-    if err.kind != crate::PyErrorKind::TypeError {
-        return err;
+    match &err {
+        crate::argument::ArgErr::MultipleValues { argname } if signature_accepts_keywords(sig) => {
+            let skip = usize::from(signature_cls_constructor(sig));
+            let idx = sig.find_argname(argname);
+            let pos = if idx >= 0 {
+                (idx as usize + 1).saturating_sub(skip)
+            } else {
+                1
+            };
+            crate::PyError::type_error(format!(
+                "argument for {fname}() given by name ('{argname}') and position ({pos})"
+            ))
+        }
+        crate::argument::ArgErr::UnknownKwds { .. }
+        | crate::argument::ArgErr::PosonlyAsKwds { .. }
+            if signature_accepts_keywords(sig) =>
+        {
+            match first_unexpected_keyword_name(sig, keyword_names_w) {
+                Some(name) => crate::PyError::type_error(crate::display::wtf8_format!(
+                    format!("{fname}() got an unexpected keyword argument '"),
+                    name,
+                    "'",
+                )),
+                None => format_parse_obj_argerr(fname, sig, err),
+            }
+        }
+        _ => format_parse_obj_argerr(fname, sig, err),
     }
-    if !signature_accepts_keywords(sig) {
-        return err;
+}
+
+/// `Arguments.parse_obj` TypeError text for an `ArgErr`.
+fn format_parse_obj_argerr(
+    fname: &str,
+    sig: &crate::Signature,
+    err: crate::argument::ArgErr,
+) -> crate::PyError {
+    if let crate::argument::ArgErr::UnknownKwds { .. } = &err
+        && !sig.has_kwarg()
+        && sig.num_kwonlyargnames() == 0
+    {
+        return crate::PyError::type_error(format!("{fname}() takes no keyword arguments"));
     }
-    let msg = err.message_text();
-    let rewrite = msg.ends_with("takes no keyword arguments")
-        || msg.contains("got some positional-only arguments passed as keyword arguments");
-    if !rewrite {
-        return err;
-    }
-    let Some(name) = first_unexpected_keyword_name(sig, keyword_names_w) else {
-        return err;
-    };
     crate::PyError::type_error(crate::display::wtf8_format!(
-        format!("{fname}() got an unexpected keyword argument '"),
-        name,
-        "'",
+        format!("{fname}() "),
+        err.getmsg_wtf8()
     ))
 }
 
