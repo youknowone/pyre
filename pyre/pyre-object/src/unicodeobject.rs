@@ -2690,7 +2690,7 @@ mod tests {
         fn drop(&mut self) {
             WALK_INTERN_TABLE.with(|flag| flag.set(false));
             {
-                let mut table = WEAK_INTERN.lock();
+                let mut table = lock_intern();
                 table.0 = self.saved_table;
             }
             let gc = INTERN_TEST_GC.with(|cell| cell.replace(std::ptr::null_mut()));
@@ -2792,7 +2792,7 @@ mod tests {
         WALK_INTERN_TABLE.with(|flag| flag.set(true));
 
         let saved_table = {
-            let mut table = WEAK_INTERN.lock();
+            let mut table = lock_intern();
             let old = table.0;
             table.0 = std::ptr::null_mut();
             old
