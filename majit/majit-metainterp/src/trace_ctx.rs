@@ -2907,7 +2907,7 @@ impl TraceCtx {
     pub fn dump_trace_ops_diag(&self, label: &str) {
         use majit_ir::operand::Operand;
         eprintln!("[p2-ir] {label} num_ops={}", self.recorder.num_ops());
-        for op in self.recorder.ops() {
+        for op in &self.recorder.materialize_ops() {
             let args: Vec<String> = op
                 .args_slice()
                 .iter()

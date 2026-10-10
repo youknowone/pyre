@@ -146,7 +146,8 @@ fn walker_execute_gc_store<Sym: WalkSym>(
     }
 }
 
-/// A recorded store the walk could not execute.
+/// A recorded store — or a recorded `COND_CALL` whose condition held — the
+/// walk could not execute.
 ///
 /// Inside a helper descent the body goes on to read what it wrote, so the
 /// walk does not continue past the lost write (the `setfield_raw_i` rule):
@@ -154,7 +155,7 @@ fn walker_execute_gc_store<Sym: WalkSym>(
 /// ([`fbw_gc_store_journal_cut`]) and the call runs as a residual.  The
 /// top-level walk has no call to hand the region to; there the store is one
 /// only the replay applies.
-fn walker_gc_store_not_executed<Sym: WalkSym>(
+pub(crate) fn walker_gc_store_not_executed<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Result<(), DispatchError> {
@@ -541,6 +542,15 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
             || headerless_const_index(index, i, descr)
             || headerless_index(i)
     });
+    if slot.is_none() && fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-gc-store] no slot pc={} array={array:?} array_op={:?} array_ptr={array_ptr:?} index={index:?} index_value={index_value:?} len={:?} has_len_descr={} base_size={base_size} item_size={item_size} ty={ty:?} fresh={fresh}",
+            op.pc,
+            ctx.trace_ctx.opcode_of(array),
+            array_ptr.and_then(|ptr| ctx.trace_ctx.arraylen_sanity_load(ptr, descr)),
+            ad.len_descr().is_some(),
+        );
+    }
     let before = slot.and_then(|(ptr, i)| ctx.trace_ctx.array_sanity_load(ptr, i, descr, ty));
     let offset = slot.map_or(0, |(_, i)| base_size + i as usize * item_size);
     let value = concrete_store_value_operand(code, op, 2, value_bank, value, ctx);
