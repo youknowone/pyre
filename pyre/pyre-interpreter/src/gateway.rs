@@ -1338,12 +1338,25 @@ pub unsafe fn builtin_code_call(
         return Err(no_keyword_arguments(unsafe { &*code }, receiver));
     }
     if arity <= 4 && positional.len() != arity {
-        return Err(arity_mismatch(
-            unsafe { &*code },
-            receiver,
-            arity,
-            positional.len(),
-        ));
+        // A keyword call binds through `parse_obj` first and then hands this
+        // function the filled scope (`scope_length` slots, omitted kw-only as
+        // `PY_NULL`).  `fast_natural_arity` is the no-keyword `fastcall_N`
+        // count, so it does not match that bound slice; the binder already
+        // rejected a surplus positional.
+        let already_bound = unsafe {
+            (*code)
+                .sig
+                .as_ref()
+                .is_some_and(|sig| positional.len() == sig.scope_length())
+        };
+        if !already_bound {
+            return Err(arity_mismatch(
+                unsafe { &*code },
+                receiver,
+                arity,
+                positional.len(),
+            ));
+        }
     }
     // `get_func_to_call`: a wrapper answers with the slot it was published
     // with, and every other builtin with the body it was registered with.
