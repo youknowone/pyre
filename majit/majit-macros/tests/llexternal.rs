@@ -9,6 +9,8 @@ llexternal! {
     c_my_strlen = "my_strlen",
     [*const core::ffi::c_char],
     usize,
+    sandboxsafe = true,
+    releasegil = true,
 }
 
 llexternal! {
@@ -16,6 +18,8 @@ llexternal! {
     c_plain_strlen = "strlen",
     [*const core::ffi::c_char],
     usize,
+    sandboxsafe = true,
+    releasegil = true,
 }
 
 llexternal! {
@@ -23,6 +27,8 @@ llexternal! {
     c_cfg_strlen = "does_not_exist",
     [*const core::ffi::c_char],
     usize,
+    sandboxsafe = true,
+    releasegil = true,
 }
 
 fn strlen_of_hi(len: usize) {

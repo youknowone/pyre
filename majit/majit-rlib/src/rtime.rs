@@ -187,7 +187,7 @@ pub fn time() -> f64 {
     unsafe { c_time(std::ptr::null_mut()) as f64 }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
 

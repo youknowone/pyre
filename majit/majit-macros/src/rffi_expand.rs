@@ -263,6 +263,24 @@ fn parse_signed_int(input: ParseStream) -> syn::Result<i64> {
     Ok(if neg { -value } else { value })
 }
 
+fn cfg_gate(pred: &TokenStream, items: TokenStream) -> TokenStream {
+    if items.is_empty() {
+        return items;
+    }
+    let file: syn::File = match syn::parse2(items) {
+        Ok(file) => file,
+        Err(err) => return err.to_compile_error(),
+    };
+    let mut out = TokenStream::new();
+    for item in file.items {
+        out.extend(quote! {
+            #[cfg(#pred)]
+            #item
+        });
+    }
+    out
+}
+
 fn type_is_fn(ty: &Type) -> bool {
     match ty {
         Type::BareFn(_) => true,
@@ -329,6 +347,7 @@ impl LlexternalInput {
         };
         let save_err_value = rffi_flag(&self.save_err);
         let save_err_nonzero = save_err_value.unwrap_or(1) != 0;
+        let register_funcptr = invoke && self.macro_path.is_none() && self.natural_arity == -1;
 
         let name = &self.name;
         let deriv = self.derivation_consts(has_callback);
@@ -343,17 +362,62 @@ impl LlexternalInput {
             }
         });
 
-        if self.nowrapper {
-            let funcptr = self.funcptr_item(true);
-            let save_err = &self.save_err;
+        let real = match self.expand_real(invoke, save_err_value, save_err_nonzero) {
+            Ok(tokens) => tokens,
+            Err(tokens) => return tokens,
+        };
+        // `sandboxsafe = true` keeps one shape in every feature combination so
+        // LLBC extracted under one feature set still matches the rustc body
+        // (`rffi.py` `_safe_not_sandboxed`). `_nowrapper=True` returns the C
+        // funcptr (`rffi.py` `llexternal`); a Rust stub body is Transparent in
+        // LLBC and `CallControl.getcalldescr` then disagrees with the host_env
+        // caller. Keep that opaque `extern "C"` shape everywhere too.
+        if self.sandboxsafe || self.nowrapper {
             return quote! {
                 #deriv
                 #eci
-                const _: () = assert!(#save_err == ::majit_rlib::rffi::RFFI_ERR_NONE);
-                #funcptr
+                #real
             };
         }
+        let stub = self.expand_stub(register_funcptr);
+        let (stub_cfg, real_cfg) = self.variant_cfgs();
+        let real = cfg_gate(&real_cfg, real);
+        let stub = cfg_gate(&stub_cfg, stub);
+        quote! {
+            #deriv
+            #eci
+            #real
+            #stub
+        }
+    }
 
+    /// Non-sandboxsafe only. Stub under `any(not(feature = "host_env"),
+    /// feature = "sandbox")`; real under `all(feature = "host_env",
+    /// not(feature = "sandbox"))` (`rffi.py` `_safe_not_sandboxed`,
+    /// `node.py` `db.sandbox`). Evaluated in the invoking crate.
+    fn variant_cfgs(&self) -> (TokenStream, TokenStream) {
+        (
+            quote! { any(not(feature = "host_env"), feature = "sandbox") },
+            quote! { all(feature = "host_env", not(feature = "sandbox")) },
+        )
+    }
+
+    fn expand_real(
+        &self,
+        invoke: bool,
+        save_err_value: Option<i64>,
+        save_err_nonzero: bool,
+    ) -> Result<TokenStream, TokenStream> {
+        if self.nowrapper {
+            let funcptr = self.funcptr_item(true);
+            let save_err = &self.save_err;
+            return Ok(quote! {
+                const _: () = assert!(#save_err == ::majit_rlib::rffi::RFFI_ERR_NONE);
+                #funcptr
+            });
+        }
+
+        let name = &self.name;
         let funcptr = self.funcptr_item(false);
         let call_name = format_ident!("ccall_{}", name);
         let (params, arg_names) = self.params();
@@ -366,11 +430,11 @@ impl LlexternalInput {
             && self.natural_arity == -1
         {
             let Some(lit) = save_err_value else {
-                return syn::Error::new_spanned(
+                return Err(syn::Error::new_spanned(
                         &self.save_err,
                         "save_err must be an integer literal or an RFFI_* const so call_aroundstate_target can take an integer literal",
                     )
-                    .to_compile_error();
+                    .to_compile_error());
             };
             let fp = self.funcptr_path();
             (
@@ -442,9 +506,7 @@ impl LlexternalInput {
             // symbolic hash and the tracer cannot run the wrapper.
             let ccall_fnaddr = self.ccall_fnaddr_registration();
             let identity = crate::icf_identity_tokens(&call_name);
-            quote! {
-                #deriv
-                #eci
+            Ok(quote! {
                 #around_assert
                 #funcptr
                 #funcptr_fnaddr
@@ -457,7 +519,7 @@ impl LlexternalInput {
                 #vis unsafe fn #name(#(#params),*) -> #result {
                     unsafe { #call_name(#(#arg_names),*) }
                 }
-            }
+            })
         } else if direct_on_c && self.calling_conv.is_none() {
             // unix: calling_conv "c" and no errno → call the funcptr.
             // windows: calling_conv "unknown" → wrapper (`need_wrapper`).
@@ -465,9 +527,7 @@ impl LlexternalInput {
             // attribute is expanded before cfg-elimination and would emit the
             // wrapper on every target.
             let vis = &self.vis;
-            quote! {
-                #deriv
-                #eci
+            Ok(quote! {
                 #funcptr
                 #[cfg(not(windows))]
                 #vis unsafe fn #name(#(#params),*) -> #result {
@@ -482,17 +542,62 @@ impl LlexternalInput {
                 #vis unsafe fn #name(#(#params),*) -> #result {
                     unsafe { #call_name(#(#arg_names),*) }
                 }
-            }
+            })
         } else {
             let vis = &self.vis;
-            quote! {
-                #deriv
-                #eci
+            Ok(quote! {
                 #funcptr
                 #vis unsafe fn #name(#(#params),*) -> #result {
                     unsafe { #call_expr }
                 }
+            })
+        }
+    }
+
+    /// `rsandbox.py` `get_sandbox_stub`: rustc path panics; residual `ccall_`
+    /// publishes and returns the zero of `R`. `fnname` is `fnobj._name`.
+    /// `_nowrapper=True` real expansion is `extern "C" { fn name }`; the stub
+    /// uses that ABI so `CallControl.getcalldescr` sees one `FUNC.ARGS`.
+    fn expand_stub(&self, register_funcptr: bool) -> TokenStream {
+        let vis = &self.vis;
+        let name = &self.name;
+        let call_name = format_ident!("ccall_{}", name);
+        let (params, _arg_names) = self.params();
+        let result = &self.result;
+        let fnname = &self.c_name;
+        let save_err = &self.save_err;
+        let look_name = format_ident!("_jit_look_inside_{}", name);
+        let look_call = format_ident!("_jit_look_inside_{}", call_name);
+        let ccall_fnaddr = self.ccall_fnaddr_registration();
+        let funcptr_fnaddr = if register_funcptr {
+            self.funcptr_fnaddr_registration_targeting(&call_name)
+        } else {
+            quote! {}
+        };
+        let abi = if self.nowrapper && self.macro_path.is_none() {
+            quote! { extern "C" }
+        } else {
+            quote! {}
+        };
+        quote! {
+            #[allow(unused_variables)]
+            #vis unsafe #abi fn #name(#(#params),*) -> #result {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #look_name: bool = false;
+                let _ = #save_err;
+                ::majit_rlib::rffi::sandbox_stub_panic(#fnname)
             }
+            #[allow(unused_variables)]
+            #vis unsafe fn #call_name(#(#params),*) -> #result {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                const #look_call: bool = false;
+                ::majit_rlib::rffi::sandbox_stub_publish(#fnname);
+                unsafe { ::core::mem::zeroed() }
+            }
+            #ccall_fnaddr
+            #funcptr_fnaddr
         }
     }
 
@@ -575,6 +680,19 @@ impl LlexternalInput {
         let fp = format_ident!("__rffi_fp_{}", self.name);
         self.helper_fnaddr_registration(
             &fp,
+            &fp,
+            &format_ident!("__RFFI_FP_FNADDR_{}", self.name),
+            &format_ident!("__rffi_register_fnaddr_{}", self.name),
+        )
+    }
+
+    /// Same lookup path as [`Self::funcptr_fnaddr_registration`], pointing at
+    /// the publishing `ccall_` so a host-extracted residual never panics.
+    fn funcptr_fnaddr_registration_targeting(&self, target: &Ident) -> TokenStream {
+        let fp = format_ident!("__rffi_fp_{}", self.name);
+        self.helper_fnaddr_registration(
+            &fp,
+            target,
             &format_ident!("__RFFI_FP_FNADDR_{}", self.name),
             &format_ident!("__rffi_register_fnaddr_{}", self.name),
         )
@@ -587,6 +705,7 @@ impl LlexternalInput {
         let call_name = format_ident!("ccall_{}", self.name);
         self.helper_fnaddr_registration(
             &call_name,
+            &call_name,
             &format_ident!("__RFFI_CCALL_FNADDR_{}", self.name),
             &format_ident!("__rffi_register_ccall_fnaddr_{}", self.name),
         )
@@ -594,7 +713,8 @@ impl LlexternalInput {
 
     fn helper_fnaddr_registration(
         &self,
-        func: &Ident,
+        path_func: &Ident,
+        target_func: &Ident,
         static_name: &Ident,
         ctor_name: &Ident,
     ) -> TokenStream {
@@ -606,16 +726,16 @@ impl LlexternalInput {
             #[allow(non_upper_case_globals)]
             static #static_name: ::majit_ir::helper_fnaddr::HelperFnAddr =
                 ::majit_ir::helper_fnaddr::HelperFnAddr::new(
-                    ::core::concat!(::core::module_path!(), "::", stringify!(#func)),
-                    #func as *const (),
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#path_func)),
+                    #target_func as *const (),
                     #arity,
                 );
             #[cfg(target_arch = "wasm32")]
             #[::ctor::ctor(unsafe)]
             fn #ctor_name() {
                 ::majit_ir::helper_fnaddr::register(
-                    ::core::concat!(::core::module_path!(), "::", stringify!(#func)),
-                    #func as *const (),
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#path_func)),
+                    #target_func as *const (),
                     #arity,
                 );
             }
@@ -848,6 +968,13 @@ pub fn expand_jit_close_stack(item: TokenStream) -> TokenStream {
     }
 }
 
+fn item_cfg_attrs(func: &syn::ItemFn) -> Vec<&syn::Attribute> {
+    func.attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg"))
+        .collect()
+}
+
 fn close_stack_marker(item: TokenStream) -> syn::Result<TokenStream> {
     let file = syn::parse2::<syn::File>(item)?;
     let func = file.items.iter().find_map(|item| match item {
@@ -861,9 +988,11 @@ fn close_stack_marker(item: TokenStream) -> syn::Result<TokenStream> {
         ));
     };
     let vis = &func.vis;
+    let cfg_attrs = item_cfg_attrs(func);
     let marker = format_ident!("_gctransformer_hint_close_stack_{}", func.sig.ident);
     Ok(quote! {
         #file
+        #(#cfg_attrs)*
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
         #vis const #marker: bool = true;
@@ -940,8 +1069,10 @@ fn aroundstate_marker(attr: TokenStream, item: TokenStream) -> syn::Result<Token
     };
     let funcptr = &args.funcptr;
     let save_err = &args.save_err;
+    let cfg_attrs = item_cfg_attrs(func);
     Ok(quote! {
         #file
+        #(#cfg_attrs)*
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
         #vis const #marker: (unsafe extern "C" fn(#(#tys),*) -> #ret, i64) =

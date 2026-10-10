@@ -212,7 +212,7 @@ pub fn unsetenv_llimpl(name: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
 

@@ -145,7 +145,7 @@ pub fn page_size() -> usize {
     if n < 0 { 0 } else { n as usize }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
 

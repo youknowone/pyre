@@ -1293,10 +1293,10 @@ pub unsafe fn builtin_code_call(
     // with, and every other builtin with the body it was registered with.
     let wrapper = unsafe { (*code).wrapper };
     if wrapper.is_null() {
-        return unsafe { ((*code).func)(args) };
+        return crate::host_seam::catch_sandbox_stub(|| unsafe { ((*code).func)(args) });
     }
     let wrapper = unsafe { &*wrapper };
-    (wrapper.call)(wrapper.slot, args)
+    crate::host_seam::catch_sandbox_stub(|| (wrapper.call)(wrapper.slot, args))
 }
 
 /// The `BuiltinCodeFn` a builtin function object was registered with, when

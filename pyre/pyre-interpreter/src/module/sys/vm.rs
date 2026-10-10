@@ -4394,7 +4394,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // Any other `_io.open` failure keeps the stream with its buffer absent:
     // the instance-override methods reach the descriptor without the buffer,
     // and the sandbox controller mounts no real files to open.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "sandbox")))]
     {
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
             return w_none();

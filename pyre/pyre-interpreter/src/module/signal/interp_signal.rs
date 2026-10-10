@@ -821,8 +821,10 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // `signal.signal(SIGXFSZ, SIG_IGN)` (`hasattr` each).  Same
         // interp_signal.signal SIG_IGN arm as the Python-visible call:
         // `pypysig_ignore` then `handlers_w` store.  Numbers come from the
-        // same `sig` source `register_module` publishes.
-        #[cfg(unix)]
+        // same `sig` source `register_module` publishes.  Under sandbox the
+        // controller owns process signal disposition, so these `sigaction`
+        // installs stay compiled out.
+        #[cfg(all(unix, not(feature = "sandbox")))]
         {
             #[cfg(feature = "host_env")]
             use rustpython_host_env::signal as sig;
@@ -1042,7 +1044,12 @@ pub fn register_module(
         crate::make_builtin_function_with_arity(
             "raise_signal",
             |args| {
-                #[cfg(feature = "host_env")]
+                #[cfg(feature = "sandbox")]
+                {
+                    let _ = args;
+                    return Err(crate::host_seam::stub("signal.raise_signal"));
+                }
+                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
                     let signum = if let Some(&a) = args.first() {
                         unsafe { pyre_object::w_int_get_value(a) as i32 }
@@ -1240,7 +1247,12 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "alarm",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.alarm"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         let secs = if let Some(&a) = args.first() {
                             unsafe { pyre_object::w_int_get_value(a) as u32 }
@@ -1268,7 +1280,11 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "pause",
                 |_| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        return Err(crate::host_seam::stub("signal.pause"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         // interp_signal.pause — `rsignal.c_pause` (`releasegil=True`).
                         let _ = unsafe { majit_rlib::rsignal::c_pause() };
@@ -1289,7 +1305,12 @@ pub fn register_module(
             ns,
             "setitimer",
             crate::make_builtin_function("setitimer", |args| {
-                #[cfg(feature = "host_env")]
+                #[cfg(feature = "sandbox")]
+                {
+                    let _ = args;
+                    return Err(crate::host_seam::stub("signal.setitimer"));
+                }
+                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(
@@ -1349,7 +1370,12 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "getitimer",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.getitimer"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         if args.is_empty() {
                             return Err(crate::PyError::type_error(
@@ -1544,7 +1570,12 @@ pub fn register_module(
             crate::make_builtin_function_with_arity(
                 "pthread_sigmask",
                 |args| {
-                    #[cfg(feature = "host_env")]
+                    #[cfg(feature = "sandbox")]
+                    {
+                        let _ = args;
+                        return Err(crate::host_seam::stub("signal.pthread_sigmask"));
+                    }
+                    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
                         if args.len() < 2 {
                             return Err(crate::PyError::type_error(

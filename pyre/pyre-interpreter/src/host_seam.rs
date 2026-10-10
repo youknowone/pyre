@@ -266,14 +266,9 @@ pub fn seam_os_err_with_filename(
     }
 }
 
-/// The not-implemented stub for OS surface that the sandbox controller does not
-/// service (signal/socket/dup/ftruncate/…). Port of `rsandbox.py`'s
-/// `get_sandbox_stub`/`not_implemented_stub`: raise `RuntimeError` rather than
-/// touch the OS (`not_implemented_stub` does `raise RuntimeError(msg)`).
-#[cfg(feature = "sandbox")]
-pub fn stub(fnname: &str) -> crate::PyError {
-    crate::PyError::runtime_error(format!("{fnname} is not available in the sandbox"))
-}
+pub use crate::host_seam_stub::catch_sandbox_stub;
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+pub use crate::host_seam_stub::stub;
 
 /// The raw stat fields `make_stat_result` consumes. `RealHost` fills every field
 /// from a `libc::stat`; under sandbox the wire `os.stat_result` carries only the

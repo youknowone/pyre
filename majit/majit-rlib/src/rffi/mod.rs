@@ -76,6 +76,42 @@ pub use crate::setintfield;
 pub use buffer::*;
 pub use convert::*;
 
+use std::sync::OnceLock;
+
+/// Panic payload for a rustc-path sandbox stub (`rsandbox.py`
+/// `not_implemented_stub`).
+#[derive(Debug)]
+pub struct SandboxStub {
+    pub fnname: &'static str,
+}
+
+fn sandbox_stub_message(fnname: &'static str) -> String {
+    format!("Not implemented: sandboxing for external function '{fnname}'")
+}
+
+/// Write the `not_implemented_stub` stderr line and panic with [`SandboxStub`].
+pub fn sandbox_stub_panic(fnname: &'static str) -> ! {
+    eprintln!("{}", sandbox_stub_message(fnname));
+    std::panic::panic_any(SandboxStub { fnname })
+}
+
+type SandboxStubPublisher = fn(&'static str);
+
+static SANDBOX_STUB_PUBLISHER: OnceLock<SandboxStubPublisher> = OnceLock::new();
+
+/// Register the process-global publisher the JIT residual `ccall_` path uses.
+pub fn register_sandbox_stub_publisher(publisher: SandboxStubPublisher) {
+    let _ = SANDBOX_STUB_PUBLISHER.set(publisher);
+}
+
+/// Write the `not_implemented_stub` stderr line and invoke the publisher hook.
+pub fn sandbox_stub_publish(fnname: &'static str) {
+    eprintln!("{}", sandbox_stub_message(fnname));
+    if let Some(publisher) = SANDBOX_STUB_PUBLISHER.get() {
+        publisher(fnname);
+    }
+}
+
 // `rffi.c_memcpy` / `rffi.c_memset`: `releasegil=False`, `calling_conv='c'`.
 // Upstream declares `lltype.Void` and an `lltype.Signed` fill byte and the C
 // compiler converts at the call through `<string.h>`'s prototype. A Rust
@@ -146,7 +182,7 @@ impl Default for ExternalCompilationInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -536,7 +572,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 #[test]
 fn pub_wrapper_is_visible_from_the_parent() {
     let _probe: unsafe fn() -> i32 = tests::pub_gil_probe;

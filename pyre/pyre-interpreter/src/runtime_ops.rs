@@ -16,6 +16,8 @@ use crate::{
     w_code_get_ptr,
 };
 
+pub use majit_rlib::rffi::SandboxStub;
+
 /// `pypy/interpreter/pyopcode.py MAKE_FUNCTION` stamps the new
 /// function's `w_func_globals = self.w_globals` directly from the
 /// running frame's dict object.  This entry point accepts the canonical
@@ -231,6 +233,20 @@ static JIT_EXC_CLEARER: OnceLock<JitExcClearer> = OnceLock::new();
 
 pub fn register_jit_exc_clearer(clearer: JitExcClearer) {
     let _ = JIT_EXC_CLEARER.set(clearer);
+}
+
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+fn publish_sandbox_stub(fnname: &'static str) {
+    let _ = jit_publish_residual_error(crate::host_seam::stub(fnname));
+}
+
+/// Install the residual publisher `sandbox_stub_publish` calls
+/// (`jit_publish_residual_error` of `host_seam::stub`).
+pub fn register_sandbox_stub_publisher() {
+    #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+    {
+        majit_rlib::rffi::register_sandbox_stub_publisher(publish_sandbox_stub);
+    }
 }
 
 /// Drop `BH_LAST_EXC_VALUE` and the backend pos_exception / pos_exc_value cells

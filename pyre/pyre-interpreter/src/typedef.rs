@@ -416,6 +416,7 @@ pub fn init_subclass_ranges() {
 ///
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
+    crate::runtime_ops::register_sandbox_stub_publisher();
     // The object-space store site can see that a `locals_cells_stack_w` array
     // has already moved, but not who still points at it; this crate owns the
     // frame chain, so it supplies the holder scan.
@@ -12677,7 +12678,7 @@ fn call_getset_fget_direct(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[w_self, w_obj]);
-    func(&[roots.get(base), roots.get(base + 1)])
+    crate::host_seam::catch_sandbox_stub(|| func(&[roots.get(base), roots.get(base + 1)]))
 }
 
 /// Invoke a getset setter's registered function with the three words
@@ -12696,7 +12697,9 @@ fn call_getset_fset_direct(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[w_self, w_obj, w_value]);
-    func(&[roots.get(base), roots.get(base + 1), roots.get(base + 2)])
+    crate::host_seam::catch_sandbox_stub(|| {
+        func(&[roots.get(base), roots.get(base + 1), roots.get(base + 2)])
+    })
 }
 
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
