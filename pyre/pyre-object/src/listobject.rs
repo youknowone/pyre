@@ -3558,18 +3558,21 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 ///
 /// Supports negative indexing. Returns None if out of bounds.
 ///
-/// Same wrapper/inner split as `w_list_setitem`: the getitem fold descends
-/// the lock-free body. A `w_list_lock` pair inside that body declines the
-/// sub-walk, and a `dont_look_inside` wrapper would hide the inner graph
-/// from `grab_initial_jitcodes`. The stripe acquire and its release both
-/// finish inside this call. `getitem_list` calls the inner while `gil_ready`
-/// is still 0. The locked iterator arm (`list_iter_getitem_locked`) stays a
-/// separate opaque residual so a guard there cannot keep the stripe.
+/// Opaque to the tracer: the stripe acquire and its release both finish
+/// inside this one residual call. A walked body records the acquire, then the
+/// strategy and bounds guards of [`w_list_getitem_inner`], then the release;
+/// a guard failing between the two resumes at the opcode boundary, which runs
+/// the whole subscript again and leaves the traced acquire unreleased.
+/// `getitem_list` calls the inner while `gil_ready` is still 0, and the
+/// getitem fold descends that lock-free body by name
+/// (`list_getitem_jitcode`). The locked iterator arm
+/// (`list_iter_getitem_locked`) is a separate opaque residual for the same
+/// reason.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
-    // The getitem fold descends the lock-free body by name.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);

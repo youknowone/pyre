@@ -617,7 +617,6 @@ two-phase-annotate-skipped	pyre_interpreter::module::_collections::__majit_wrap_
 two-phase-annotate-skipped	pyre_interpreter::module::_collections::__majit_wrap_rotate
 two-phase-annotate-skipped	pyre_interpreter::module::_collections::append_left
 two-phase-annotate-skipped	pyre_interpreter::module::_collections::append_right
-two-phase-annotate-skipped	pyre_interpreter::module::_collections::block_get
 two-phase-annotate-skipped	pyre_interpreter::module::_collections::block_set
 two-phase-annotate-skipped	pyre_interpreter::module::_collections::deque_index
 two-phase-annotate-skipped	pyre_interpreter::module::_collections::deque_iter::<Impl>::__new__
@@ -2059,7 +2058,6 @@ two-phase-annotate-skipped	pyre_object::listobject::switch_to_correct_strategy
 two-phase-annotate-skipped	pyre_object::listobject::w_list_append
 two-phase-annotate-skipped	pyre_object::listobject::w_list_append_inner
 two-phase-annotate-skipped	pyre_object::listobject::w_list_append_preallocated
-two-phase-annotate-skipped	pyre_object::listobject::w_list_getitem
 two-phase-annotate-skipped	pyre_object::listobject::w_list_getitem_inner
 two-phase-annotate-skipped	pyre_object::listobject::w_list_iter_item
 two-phase-annotate-skipped	pyre_object::listobject::w_list_len
