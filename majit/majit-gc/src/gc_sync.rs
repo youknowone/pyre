@@ -257,8 +257,10 @@ static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// single-mutator process therefore needs no forwarding query at every root
 /// pin.  Once a second mutator appears the race becomes possible forever
 /// (that thread may collect and unregister before the pin observes the live
-/// census), so this deliberately never clears.  This is the same sticky 1→2
-/// boundary that permanently disables shared-nursery inline allocation in
+/// census), so this is not cleared on unregister.  [`after_fork_child`] is
+/// the exception: `shadowstack.py thread_after_fork` drops `thread_stacks`
+/// because only the surviving thread exists in the child.  This is the same
+/// 1→2 boundary that permanently disables shared-nursery inline allocation in
 /// [`register_thread`].
 static FOREIGN_MUTATOR_SEEN: AtomicBool = AtomicBool::new(false);
 
@@ -310,6 +312,22 @@ pub fn register_thread_parked() {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
     }
     GC_THREAD.with(|t| t.registered.set(true));
+}
+
+/// `rpython.rlib.rthread.gc_thread_die` / `shadowstack.py thread_die`.
+///
+/// Drop this thread from the mutator registry and the RUNNING census, then
+/// release the GIL.  `Bootstrapper.bootstrap` calls it after
+/// `leave_thread` and `nbthreads -= 1`, before the rffi wrapper's final GIL
+/// release and before the thread function returns.  A second call is a
+/// no-op: TLS `Drop` still runs after an explicit die, and
+/// `thread_die` ignores a call on the surviving main thread after `fork()`.
+pub fn gc_thread_die() {
+    if !GC_THREAD.with(|t| t.registered.get()) {
+        return;
+    }
+    crate::shadow_stack::unregister_mutator();
+    unregister_thread();
 }
 
 /// Unregister the current thread. It stops running pyre code, so it gives the
@@ -525,7 +543,8 @@ pub fn registered_threads() -> usize {
 ///
 /// Unlike [`stw_required`], this is sticky across unregister: a foreign
 /// nursery collection may already have left a forwarding stub in a raw host
-/// local copied before its next root pin.
+/// local copied before its next root pin.  [`after_fork_child`] clears it
+/// because the child is again a single-mutator process.
 #[inline]
 pub fn foreign_mutator_seen() -> bool {
     FOREIGN_MUTATOR_SEEN.load(Ordering::Acquire)
@@ -556,6 +575,12 @@ pub fn after_fork_child() {
     GC_SYNC.stw_generation.fetch_add(1, Ordering::SeqCst);
     GC_SYNC.resumed.notify_all();
     GC_SYNC.quiesced.notify_all();
+    // `shadowstack.py thread_after_fork` sets `gcdata.thread_stacks = None`
+    // in the child: only the surviving thread exists, so the 1→2 mutator
+    // boundary has not been crossed in this process.  Parent-side sticky
+    // state would otherwise keep the child's pin path on the foreign-mutator
+    // forwarding query even before it starts a thread of its own.
+    FOREIGN_MUTATOR_SEEN.store(false, Ordering::Release);
 }
 
 /// Whether a stop-the-world pause is required for a collection driven by the
@@ -911,8 +936,7 @@ mod tests {
     }
 
     fn unregister_test_mutator() {
-        crate::shadow_stack::unregister_mutator();
-        unregister_thread();
+        gc_thread_die();
     }
 
     /// A mutator that blocks lets go of the GIL first — every

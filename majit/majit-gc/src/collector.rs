@@ -4603,6 +4603,27 @@ impl MiniMarkGC {
         self.drain_gray_stack();
     }
 
+    /// A non-moving major has no leading minor, so a young object can already
+    /// sit on `old_objects_with_finalizers` (a pinned identity copy from
+    /// `deal_with_young_objects_with_finalizers`). incminimark never sees that:
+    /// the MARKING seam asserts `probably_young_objects_with_finalizers` empty
+    /// and then runs `deal_with_objects_with_finalizers` over old objects only.
+    /// Move those young entries back so this pass leaves them for the next
+    /// minor's `deal_with_young_objects_with_finalizers`.
+    fn repark_young_finalizer_registrations(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        let mut kept = VecDeque::new();
+        while let Some((addr, fq_index)) = self.old_objects_with_finalizers.pop_front() {
+            if self.is_in_nursery(addr) || self.is_young_rawmalloced(addr) {
+                self.probably_young_objects_with_finalizers
+                    .push_back((addr, fq_index));
+            } else {
+                kept.push_back((addr, fq_index));
+            }
+        }
+        self.old_objects_with_finalizers = kept;
+    }
+
     /// incminimark.py `deal_with_young_objects_with_finalizers`: a young object
     /// registered with a finalizer survives the next minor whatever reaches it
     /// ("they all survive"), so upstream's major meets it only once it is on
@@ -8201,7 +8222,11 @@ impl MiniMarkGC {
         // finalizers, weakrefs, and sweep inspect VISITED.
         self.rescan_major_nonstack_roots_and_drain();
         // A young finalizer object survives the minor this cycle skips.
+        // Repark first so the seed below covers a young leftover already on
+        // `old_objects_with_finalizers`; `deal_with_objects_with_finalizers`
+        // then sees only old objects, as incminimark does after a minor.
         if self.oldgen_nonmoving_active {
+            self.repark_young_finalizer_registrations();
             self.nonmoving_major_trace_young_finalizers();
         }
         // incminimark.py:2486-2487 — the P list is a root source like any
@@ -8717,6 +8742,19 @@ impl MiniMarkGC {
         let mut marked = VecDeque::new();
 
         while let Some((obj_addr, fq_index)) = self.old_objects_with_finalizers.pop_front() {
+            // The non-moving pass has no leading minor. A young leftover on
+            // this deque belongs on `probably_young_objects_with_finalizers`
+            // for `deal_with_young_objects_with_finalizers`, not on a death
+            // queue as a nursery address. `repark_young_finalizer_registrations`
+            // already moved these before the young-finalizer seed; keep the
+            // same rule here so this pass cannot reintroduce one.
+            if self.oldgen_nonmoving_active
+                && (self.is_in_nursery(obj_addr) || self.is_young_rawmalloced(obj_addr))
+            {
+                self.probably_young_objects_with_finalizers
+                    .push_back((obj_addr, fq_index));
+                continue;
+            }
             let hdr = unsafe { header_of(obj_addr) };
             if unsafe { (*hdr).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER) } {
                 continue;
@@ -17699,6 +17737,70 @@ cache size\t: 8192 kB\n";
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
         assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    /// After `do_collect_oldgen_nonmoving` with a young finalizer object, no
+    /// death-queue or `old_objects_with_finalizers` entry is a nursery address.
+    /// incminimark only runs `deal_with_objects_with_finalizers` over old
+    /// objects after a minor emptied the nursery; the non-moving pass leaves
+    /// young registrations for `deal_with_young_objects_with_finalizers`.
+    #[test]
+    fn nonmoving_major_leaves_young_finalizer_objects_off_the_old_deques() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(obj.0));
+        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+
+        // A young leftover already on the old deque, as a pinned identity copy
+        // from `deal_with_young_objects_with_finalizers` would leave.
+        let leftover = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(leftover.0));
+        GcAllocator::register_finalizer(&mut gc, 0, leftover, trigger);
+        gc.probably_young_objects_with_finalizers
+            .retain(|&(addr, _)| addr != leftover.0);
+        gc.old_objects_with_finalizers
+            .retain(|&(addr, _)| addr != leftover.0);
+        gc.old_objects_with_finalizers.push_back((leftover.0, 0));
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert!(
+            gc.finalizer_handlers[0]
+                .deque
+                .iter()
+                .all(|&addr| !gc.is_in_nursery(addr)),
+            "death queue must not hold a nursery address"
+        );
+        assert!(
+            gc.run_old_style_finalizers
+                .iter()
+                .all(|&addr| !gc.is_in_nursery(addr)),
+            "old-style death queue must not hold a nursery address"
+        );
+        assert!(
+            gc.old_objects_with_finalizers
+                .iter()
+                .all(|&(addr, _)| !gc.is_in_nursery(addr)),
+            "old_objects_with_finalizers must not hold a nursery address"
+        );
+        assert!(
+            gc.probably_young_objects_with_finalizers
+                .iter()
+                .any(|&(addr, _)| addr == obj.0),
+            "a young registration stays on probably_young"
+        );
+        assert!(
+            gc.probably_young_objects_with_finalizers
+                .iter()
+                .any(|&(addr, _)| addr == leftover.0),
+            "a young leftover is reparked onto probably_young"
+        );
+        assert!(gc.is_in_nursery(obj.0));
+        assert!(gc.is_in_nursery(leftover.0));
     }
 
     /// incminimark.py `malloc_fixedsize(..., is_finalizer_light=False)` and
