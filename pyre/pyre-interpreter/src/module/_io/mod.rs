@@ -1750,7 +1750,13 @@ crate::py_module! {
         "DEFAULT_BUFFER_SIZE" => w_int_new(DEFAULT_BUFFER_SIZE),
     },
     functions: {
-        "open"            / * = crate::builtins::builtin_open,
+        "open"            / * = crate::builtins::builtin_open; crate::gateway::Signature::new(
+            vec!["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"],
+            None,
+            None,
+            0,
+            0,
+        ),
         // `io.open_code(path)` — `_PyIO_open_code` opens the path in binary
         // read mode ("rb"); pyre has no audit hooks so it is just `open`.
         "open_code"       / * = |args| {
