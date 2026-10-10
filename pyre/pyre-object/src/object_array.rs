@@ -1443,19 +1443,82 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
     }
 }
 
+/// `Ptr(GcArray(Float))` as a result type: the layout of [`TypedItemsBlock`]
+/// with `f64` items. A malloc's ARRAY is its result's `concretetype.TO`
+/// (jtransform.py `do_fixed_newlist`), and `TypedItemsBlock` names
+/// `GcArray(Signed)`, so the Float malloc leaf returns this.
+#[repr(C)]
+pub struct FloatItemsBlock {
+    pub capacity: usize,
+    items: [f64; 0],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<FloatItemsBlock>() == std::mem::size_of::<TypedItemsBlock>()
+        && std::mem::offset_of!(FloatItemsBlock, items) == TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
+    "FloatItemsBlock and TypedItemsBlock are one layout",
+);
+
+/// rlist.py `_ll_list_resize_hint_really` `newitems = malloc(ITEMS, some)` for
+/// `GcArray(Signed)`; `do_fixed_newlist` rewrites the call to `new_array`.
+///
+/// The body allocates the block old and non-moving, so the owner store that
+/// follows needs no remembered-set barrier outside the JIT.
+#[inline(never)]
+#[majit_macros::oopspec("newlist(length)")]
+pub(crate) unsafe fn ll_new_int_items(count: i64) -> *mut TypedItemsBlock {
+    unsafe { alloc_typed_items_block(count as usize, gc_int_array_gc_type_id()) }
+}
+
+/// [`ll_new_int_items`] for `GcArray(Float)`.
+#[inline(never)]
+#[majit_macros::oopspec("newlist(length)")]
+pub(crate) unsafe fn ll_new_float_items(count: i64) -> *mut FloatItemsBlock {
+    unsafe {
+        alloc_typed_items_block(count as usize, gc_float_array_gc_type_id()) as *mut FloatItemsBlock
+    }
+}
+
+static PREBUILT_EMPTY_INT_ITEMS_BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PREBUILT_EMPTY_FLOAT_ITEMS_BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn alloc_prebuilt_empty_typed_items_block() -> usize {
+    unsafe {
+        let block = alloc_typed_items_block_immortal(0);
+        (*block).capacity = 0;
+        block as usize
+    }
+}
+
+/// rlist.py `_ll_prebuilt_empty_array(GcArray(Signed))` (`specialize:memo`):
+/// the zero-length items array an empty Integer list holds, so
+/// `len(l.items)` reads a real header.
+#[inline]
+pub fn ll_prebuilt_empty_int_items_block() -> *mut TypedItemsBlock {
+    *PREBUILT_EMPTY_INT_ITEMS_BLOCK.get_or_init(|| alloc_prebuilt_empty_typed_items_block())
+        as *mut TypedItemsBlock
+}
+
+/// [`ll_prebuilt_empty_int_items_block`] for `GcArray(Float)`.
+#[inline]
+pub fn ll_prebuilt_empty_float_items_block() -> *mut TypedItemsBlock {
+    *PREBUILT_EMPTY_FLOAT_ITEMS_BLOCK.get_or_init(|| alloc_prebuilt_empty_typed_items_block())
+        as *mut TypedItemsBlock
+}
+
 // rlist.py `_ll_list_resize_hint_really` is specialized per LIST type, so the
 // int and float grows are two graphs, each copying through its own ARRAY's
 // `ll_arraycopy`.
 macro_rules! typed_items_block_grow {
-    ($grow:ident, $try_grow:ident, $tid:path, $arraycopy:ident) => {
-        /// Grow a `TypedItemsBlock` to `new_cap`, copying `live_len` words from
-        /// `old`, zero-filling the rest, and deallocating `old`. `old` may be
-        /// null. rlist.py `_ll_list_resize_hint_really` parity. `old` is
-        /// allocated `stable` (old-gen, non-moving), so it keeps its address
-        /// across the (possibly collecting) allocation of `fresh` and the live
-        /// words are copied directly; it also stays reachable through its
-        /// owner's `block` field for that whole span, since the caller only
-        /// overwrites that field with the returned value.
+    ($grow:ident, $try_grow:ident, $new:ident, $tid:path, $arraycopy:ident) => {
+        /// rlist.py `_ll_list_resize_hint_really`: `newitems = malloc(...)`,
+        /// `rgc.ll_arraycopy(items, newitems, 0, 0, p)`, and the caller's
+        /// `l.items = newitems`. `old` may be null or the prebuilt empty
+        /// block; the collector reclaims it once the owner stops naming it.
+        ///
+        /// `old` is a livevar across the malloc, so it is pinned and reloaded
+        /// (`framework.py gct_fv_gc_malloc`); the copy's `copy_item` head is
+        /// what writeanalyze records as this ARRAY's read and write.
         /// # Safety
         /// The caller must uphold every validity, runtime-type, aliasing, and
         /// lifetime invariant required by the object and pointer arguments for
@@ -1466,9 +1529,22 @@ macro_rules! typed_items_block_grow {
             live_len: usize,
         ) -> *mut TypedItemsBlock {
             unsafe {
-                $try_grow(old, new_cap, live_len).unwrap_or_else(|| {
-                    std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>())
-                })
+                let roots = crate::gc_roots::push_roots();
+                let base = roots.base();
+                let _ = roots.pin_root(old as crate::PyObjectRef);
+                let newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
+                if live_len > 0 {
+                    let _ = roots.pin_root(newitems as crate::PyObjectRef);
+                    $arraycopy(
+                        roots.get(base) as *mut TypedItemsBlock,
+                        roots.get(base + 1) as *mut TypedItemsBlock,
+                        0,
+                        0,
+                        live_len as i64,
+                    );
+                    return roots.get(base + 1) as *mut TypedItemsBlock;
+                }
+                newitems
             }
         }
 
@@ -1527,12 +1603,14 @@ macro_rules! typed_items_block_grow {
 typed_items_block_grow!(
     grow_int_items_block,
     try_grow_int_items_block,
+    ll_new_int_items,
     gc_int_array_gc_type_id,
     ll_arraycopy_int_items_block
 );
 typed_items_block_grow!(
     grow_float_items_block,
     try_grow_float_items_block,
+    ll_new_float_items,
     gc_float_array_gc_type_id,
     ll_arraycopy_float_items_block
 );
@@ -1545,7 +1623,10 @@ typed_items_block_grow!(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
-    if block.is_null() {
+    if block.is_null()
+        || block == ll_prebuilt_empty_int_items_block()
+        || block == ll_prebuilt_empty_float_items_block()
+    {
         return;
     }
     if crate::gc_hook::try_gc_owns_object(block as crate::gc_hook::GCREF) {
