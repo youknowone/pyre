@@ -8,7 +8,7 @@
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
@@ -1501,4 +1501,629 @@ fn write_barrier_cards_set_marks_one_bit() {
         }
     }
     assert_eq!(bits, 1, "exactly one card bit");
+}
+
+/// `genop_discard_check_memory_error`: `TEST reg, reg` plus a not-taken
+/// `jz` (`Conditions['Z']`) to the in-buffer trampoline. A null value
+/// reaches `propagate_exception_path`; a non-null value falls through.
+fn compile_check_memory_error() -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let check = Op::new(OpCode::CheckMemoryError, &[rb(i0)]);
+    check.pos().set(OpRef::void_op(1));
+    let ops = vec![OpRc::new(check), OpRc::new(finish_of(i0, Type::Int, 2))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CHECK_MEMORY_ERROR: {err:?}"));
+    let code = compiled_bytes(&token);
+    let (jz, jnz) = count_test_rr_jcc(code);
+    assert_eq!(jz, 1, "fast path is one not-taken jz");
+    assert_eq!(
+        jnz, 0,
+        "CHECK_MEMORY_ERROR must not jnz over an inlined body"
+    );
+    (backend, token)
+}
+
+fn count_test_rr_jcc(code: &[u8]) -> (usize, usize) {
+    let mut jz = 0usize;
+    let mut jnz = 0usize;
+    let mut i = 0;
+    while i + 3 < code.len() {
+        let start = i;
+        let (rex, op_at) = if (0x40..0x50).contains(&code[i]) {
+            (code[i], i + 1)
+        } else if i > 0 && (0x40..0x50).contains(&code[i - 1]) {
+            i += 1;
+            continue;
+        } else {
+            (0, i)
+        };
+        if op_at + 1 >= code.len() || code[op_at] != 0x85 {
+            i = start + 1;
+            continue;
+        }
+        let modrm = code[op_at + 1];
+        let reg = (((rex >> 2) & 1) << 3) | ((modrm >> 3) & 7);
+        let rm = ((rex & 1) << 3) | (modrm & 7);
+        if modrm & 0xC0 != 0xC0 || reg != rm {
+            i = start + 1;
+            continue;
+        }
+        let jcc = op_at + 2;
+        if jcc + 1 < code.len() && code[jcc] == 0x0F {
+            match code[jcc + 1] {
+                0x84 => jz += 1,
+                0x85 => jnz += 1,
+                _ => {}
+            }
+        }
+        i = jcc;
+    }
+    (jz, jnz)
+}
+
+fn assert_propagate(backend: &DynasmBackend, frame: &majit_backend::DeadFrame) {
+    assert!(
+        !backend.get_latest_descr(frame).is_finish(),
+        "propagate must not finish"
+    );
+    let descr = backend.get_latest_descr_arc(frame);
+    assert!(
+        descr
+            .as_any()
+            .is_some_and(|any| any.is::<majit_backend::PropagateExceptionDescr>()),
+        "latest descr is PropagateExceptionDescr"
+    );
+}
+
+fn shadow_top() -> usize {
+    let addr = majit_gc::shadow_stack::get_root_stack_top_addr();
+    unsafe { *(addr as *const usize) }
+}
+
+#[test]
+fn check_memory_error_nonzero_falls_through() {
+    let (backend, token) = compile_check_memory_error();
+    let top = shadow_top();
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 7);
+    assert_eq!(shadow_top(), top, "finish pushes and pops the shadow stack");
+}
+
+#[test]
+fn check_memory_error_null_propagates() {
+    let (backend, token) = compile_check_memory_error();
+    // `generate_propagate_error_64` clears the process-wide exception cells.
+    let _lock = COND_CALL_EXC_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let top = shadow_top();
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert_propagate(&backend, &frame);
+    assert!(
+        !majit_backend_dynasm::jit_exc_is_pending(),
+        "generate_propagate_error_64 clears both exception cells"
+    );
+    assert_eq!(
+        shadow_top(),
+        top,
+        "the propagate footer pops the prologue push"
+    );
+}
+
+const BRIDGE_LIVE_INTS: u32 = 48;
+
+thread_local! {
+    static SEEN_FRAME: Cell<usize> = const { Cell::new(0) };
+    static STACK_CALLS: Cell<u32> = const { Cell::new(0) };
+    static STACK_MODE: Cell<u8> = const { Cell::new(0) };
+}
+
+/// `insert_stack_check` cells. `register_stack_check_addresses` keeps the
+/// raw addresses for the process, so they have to outlive every compile.
+static STACK_END: AtomicUsize = AtomicUsize::new(0);
+static STACK_LENGTH: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+struct StackProbeGuard;
+
+impl Drop for StackProbeGuard {
+    fn drop(&mut self) {
+        STACK_LENGTH.store(usize::MAX, Ordering::Release);
+        STACK_END.store(0, Ordering::Release);
+        STACK_MODE.with(|mode| mode.set(0));
+    }
+}
+
+extern "C" fn stack_check_probe(_current: usize) -> u8 {
+    STACK_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    match STACK_MODE.with(|mode| mode.get()) {
+        2 => {
+            majit_backend_dynasm::jit_exc_raise(EXC_OBJ.as_ptr() as i64);
+            1
+        }
+        1 => 1,
+        _ => 0,
+    }
+}
+
+extern "C" fn snapshot_shadow_frame() -> i64 {
+    let top = shadow_top();
+    let jf = if top >= 8 {
+        unsafe { *((top - 8) as *const usize) }
+    } else {
+        0
+    };
+    SEEN_FRAME.with(|cell| cell.set(jf));
+    0
+}
+
+fn live_int_adds(i0: OpRef, count: u32) -> (Vec<Op>, Vec<Operand>) {
+    let mut ops = Vec::with_capacity(count as usize);
+    let mut finished = vec![rb(i0)];
+    for n in 0..count {
+        let pos = 10 + n;
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(i0), rb(OpRef::const_int(i64::from(n) + 1))],
+        );
+        add.pos().set(OpRef::int_op(pos));
+        ops.push(add);
+        finished.push(rb(OpRef::int_op(pos)));
+    }
+    (ops, finished)
+}
+
+fn finish_many(args: &[Operand], pos: u32) -> Op {
+    let op = Op::new(OpCode::Finish, args);
+    op.pos().set(OpRef::void_op(pos));
+    op.set_fail_arg_types(vec![Type::Int; args.len()]);
+    op.setfailargs(args.to_vec().into());
+    op
+}
+
+fn tip_addr(frame: &majit_backend::DeadFrame) -> usize {
+    if let Some(libc) = frame.as_libc_jitframe() {
+        libc.frame_addr()
+    } else if let Some(jf) = frame.as_jitframe() {
+        jf.jf_gcref().0
+    } else {
+        panic!("deadframe has no jitframe");
+    }
+}
+
+fn frame_info_words(token: &JitCellToken) -> (isize, isize) {
+    let clt = token.compiled_loop_token().expect("compiled loop token");
+    let info = clt.frame_info.lock();
+    (info.depth(), info.size())
+}
+
+fn store_frame_info(token: &JitCellToken, depth: isize, size: isize) {
+    let clt = token.compiled_loop_token().expect("compiled loop token");
+    let info = clt.frame_info.lock();
+    // Shrink depth before size so a reader cannot observe a deep depth
+    // with a short allocation.
+    info.jfi_frame_depth.store(depth, Ordering::Relaxed);
+    info.jfi_frame_size.store(size, Ordering::Relaxed);
+}
+
+fn bridge_code(token: &JitCellToken) -> (Vec<u8>, usize) {
+    let clt = token.compiled_loop_token().expect("compiled loop token");
+    let blocks = clt.asmmemmgr_blocks.lock();
+    for block in blocks.iter().rev() {
+        if let Some(code) =
+            block.downcast_ref::<majit_backend_dynasm::x86::assembler::CompiledCode>()
+        {
+            if code.source_guard.is_some() {
+                return (
+                    code.buffer.to_vec(),
+                    code.frame_depth.load(Ordering::Acquire),
+                );
+            }
+        }
+    }
+    panic!("bridge CompiledCode missing");
+}
+
+/// `_check_frame_depth`: `CMP` immediate then not-taken `jl`. Both
+/// `0xffffff` sites are patched to the bridge depth.
+fn assert_frame_depth_sites(code: &[u8], depth: usize) {
+    // `cmp qword [rbp+disp32], imm32` (`48 81 /7`) then `jl`.
+    let cmp_at = unique_bytes(code, &[0x48, 0x81, 0xBD, 0x38, 0x00, 0x00, 0x00]);
+    let mov_at = unique_bytes(code, &[0x48, 0xC7, 0x44, 0x24, 0x08]);
+    let cmp_imm = u32::from_le_bytes(code[cmp_at + 7..cmp_at + 11].try_into().unwrap());
+    let mov_imm = u32::from_le_bytes(code[mov_at + 5..mov_at + 9].try_into().unwrap());
+    assert_eq!(
+        cmp_imm, depth as u32,
+        "cmp immediate {cmp_imm:#x} depth {depth}"
+    );
+    assert_eq!(mov_imm, cmp_imm, "mov_si immediate {mov_imm:#x}");
+    assert_ne!(cmp_imm, 0x00ff_ffff, "placeholder left in the bridge");
+    assert_eq!(
+        &code[cmp_at + 11..cmp_at + 13],
+        &[0x0F, 0x8C],
+        "fast path is jl, not jge"
+    );
+}
+
+fn unique_bytes(code: &[u8], needle: &[u8]) -> usize {
+    let mut found = None;
+    for (index, window) in code.windows(needle.len()).enumerate() {
+        if window == needle {
+            assert!(found.is_none(), "{needle:02x?} appears twice");
+            found = Some(index);
+        }
+    }
+    found.unwrap_or_else(|| panic!("{needle:02x?} missing"))
+}
+
+/// Loop finish always lists `i0` first, then `live_across` int adds, so
+/// those adds stay live across the failing guard and widen the loop frame.
+fn compile_guarded_loop(live_across: u32) -> (DynasmBackend, JitCellToken, Vec<InputArgRc>) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let call = Op::new(
+        OpCode::CallI,
+        &[rb(OpRef::const_int(
+            snapshot_shadow_frame as *const () as usize as i64,
+        ))],
+    );
+    call.pos().set(OpRef::int_op(1));
+    call.setdescr(call_descr(vec![], Type::Int, true, 8));
+    let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(1))]);
+    eq.pos().set(OpRef::int_op(2));
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
+    guard.pos().set(OpRef::void_op(3));
+    guard.set_fail_arg_types(vec![Type::Int]);
+    guard.setfailargs(vec![rb(i0)].into());
+    let label = Op::new(OpCode::Label, &[rb(i0)]);
+    label.pos().set(OpRef::void_op(0));
+    let (adds, finished) = live_int_adds(i0, live_across);
+    let mut ops = vec![label, call];
+    ops.extend(adds);
+    ops.push(eq);
+    ops.push(guard);
+    ops.push(finish_many(&finished, 4));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile guarded loop: {err:?}"));
+    (backend, token, inputargs)
+}
+
+fn bridge_with_live_ints(i0: OpRef, count: u32) -> Vec<Op> {
+    let (adds, finished) = live_int_adds(i0, count);
+    let label = Op::new(OpCode::Label, &[rb(i0)]);
+    label.pos().set(OpRef::void_op(0));
+    let mut ops = Vec::with_capacity(adds.len() + 2);
+    ops.push(label);
+    ops.extend(adds);
+    ops.push(finish_many(&finished, 100));
+    ops
+}
+
+fn attach_bridge(
+    backend: &mut DynasmBackend,
+    token: &JitCellToken,
+    inputargs: &[InputArgRc],
+    bridge_ops: Vec<Op>,
+) -> (Vec<u8>, usize) {
+    SEEN_FRAME.with(|cell| cell.set(0));
+    let failed = backend.execute_token(token, &[Value::Int(7)]);
+    assert!(!backend.get_latest_descr(&failed).is_finish());
+    assert_eq!(backend.get_int_value(&failed, 0), 7);
+    let guard_descr = backend.get_latest_descr_arc(&failed);
+    assert_ne!(guard_descr.as_fail_descr().unwrap().adr_jump_offset(), 0);
+    drop(failed);
+    SEEN_FRAME.with(|cell| cell.set(0));
+    let bridge_ops: Vec<OpRc> = bridge_ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_bridge(
+            guard_descr.as_fail_descr().unwrap(),
+            inputargs,
+            &bridge_ops,
+            token,
+            &[],
+            None,
+        )
+        .unwrap_or_else(|err| panic!("compile bridge: {err:?}"));
+    bridge_code(token)
+}
+
+fn run_bridged(backend: &mut DynasmBackend, token: &JitCellToken) -> (usize, usize) {
+    SEEN_FRAME.with(|cell| cell.set(0));
+    let frame = backend.execute_token(token, &[Value::Int(7)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 7);
+    let seen = SEEN_FRAME.with(|cell| cell.get());
+    assert_ne!(seen, 0, "CallI must read the shadow-stack frame");
+    let tip = tip_addr(&frame);
+    (seen, tip)
+}
+
+/// `[rsp+8]` is a prologue spill (`_call_header` has no `PASS_ON_MY_FRAME`
+/// scratch). The realloc body parks that word; these callee-saves come
+/// back only when the park is restored before the footer.
+fn call_entry_check_spills(token: &JitCellToken, depth: usize, input: i64) {
+    let clt = token.compiled_loop_token().expect("compiled loop token");
+    let bytes = majit_backend::jitframe::JitFrame::alloc_size(depth);
+    let head = majit_backend::llmodel::take_or_alloc_parked_entry_frame(token, bytes);
+    let info = clt.frame_info.data_ptr();
+    unsafe {
+        majit_backend::jitframe::JitFrame::init(head, info, depth);
+        majit_backend::llmodel::set_int_value(
+            head,
+            majit_backend_dynasm::arch::JITFRAME_FIXED_SIZE,
+            input as isize,
+        );
+    }
+    struct FreeHead<'a> {
+        token: &'a JitCellToken,
+        head: *mut majit_backend::jitframe::JitFrame,
+    }
+    impl Drop for FreeHead<'_> {
+        fn drop(&mut self) {
+            if self.head.is_null() {
+                return;
+            }
+            majit_backend::llmodel::park_or_free_done_entry_frame(
+                self.token,
+                self.head,
+                std::ptr::null_mut(),
+                false,
+            );
+            self.head = std::ptr::null_mut();
+        }
+    }
+    let _free = FreeHead { token, head };
+    let entry = token.ll_function_addr();
+    let head_addr = head as usize;
+    // LLVM reserves rbx as an asm operand on this target. Save and restore
+    // the prologue spills around the call and read them back from memory.
+    // slots: saved rbx, saved [rsp+8] reg, saved r12, got rbx, got [rsp+8], got r12.
+    let mut slots = [0u64; 6];
+    let slots_ptr = slots.as_mut_ptr() as usize;
+    unsafe {
+        #[cfg(target_os = "windows")]
+        std::arch::asm!(
+            "mov rax, rbx",
+            "mov [r15], rax",
+            "mov rax, rsi",
+            "mov [r15 + 8], rax",
+            "mov rax, r12",
+            "mov [r15 + 16], rax",
+            "mov rbx, 0x1111111111111111",
+            "mov rsi, 0x2222222222222222",
+            "mov r12, 0x3333333333333333",
+            "mov rcx, r13",
+            "xor edx, edx",
+            "call r14",
+            "mov rax, rbx",
+            "mov [r15 + 24], rax",
+            "mov rax, rsi",
+            "mov [r15 + 32], rax",
+            "mov rax, r12",
+            "mov [r15 + 40], rax",
+            "mov rax, [r15]",
+            "mov rbx, rax",
+            "mov rax, [r15 + 8]",
+            "mov rsi, rax",
+            "mov rax, [r15 + 16]",
+            "mov r12, rax",
+            in("r13") head_addr,
+            in("r14") entry,
+            in("r15") slots_ptr,
+            clobber_abi("win64"),
+        );
+        #[cfg(not(target_os = "windows"))]
+        std::arch::asm!(
+            "mov rax, rbx",
+            "mov [r15], rax",
+            "mov rax, r12",
+            "mov [r15 + 8], rax",
+            "mov rbx, 0x1111111111111111",
+            "mov r12, 0x3333333333333333",
+            "mov rdi, r13",
+            "xor esi, esi",
+            "call r14",
+            "mov rax, rbx",
+            "mov [r15 + 24], rax",
+            "mov rax, r12",
+            "mov [r15 + 32], rax",
+            "mov rax, [r15]",
+            "mov rbx, rax",
+            "mov rax, [r15 + 8]",
+            "mov r12, rax",
+            in("r13") head_addr,
+            in("r14") entry,
+            in("r15") slots_ptr,
+            clobber_abi("sysv64"),
+        );
+    }
+    assert_eq!(slots[3], 0x1111_1111_1111_1111, "rbx prologue spill");
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(slots[4], 0x2222_2222_2222_2222, "rsi at [rsp+8]");
+        assert_eq!(slots[5], 0x3333_3333_3333_3333, "r12");
+    }
+    #[cfg(not(target_os = "windows"))]
+    assert_eq!(slots[4], 0x3333_3333_3333_3333, "r12 at [rsp+8]");
+}
+
+#[test]
+fn bridge_frame_depth_reallocates_when_short() {
+    let (mut backend, token, inputargs) = compile_guarded_loop(0);
+    let (loop_depth, loop_size) = frame_info_words(&token);
+    let i0 = inputargs[0].opref();
+    let (code, bridge_frame_depth) = attach_bridge(
+        &mut backend,
+        &token,
+        &inputargs,
+        bridge_with_live_ints(i0, BRIDGE_LIVE_INTS),
+    );
+    assert_frame_depth_sites(&code, bridge_frame_depth);
+    let (bridge_depth, _) = frame_info_words(&token);
+    assert!(
+        bridge_depth > loop_depth,
+        "bridge frame {bridge_depth} must exceed the loop frame {loop_depth}"
+    );
+    // `execute_token` sizes from `jfi_frame_depth`. Put the loop's depth
+    // back so the bridge's `jl` is taken and `realloc_frame` runs.
+    store_frame_info(&token, loop_depth, loop_size);
+    let (seen, tip) = run_bridged(&mut backend, &token);
+    assert_ne!(seen, tip, "realloc_frame forwards the jitframe");
+    store_frame_info(&token, loop_depth, loop_size);
+    call_entry_check_spills(&token, loop_depth as usize, 7);
+}
+
+#[test]
+fn bridge_frame_depth_skips_when_deep() {
+    let (mut backend, token, inputargs) = compile_guarded_loop(BRIDGE_LIVE_INTS);
+    let (loop_depth, _) = frame_info_words(&token);
+    let i0 = inputargs[0].opref();
+    let (code, bridge_frame_depth) = attach_bridge(
+        &mut backend,
+        &token,
+        &inputargs,
+        bridge_with_live_ints(i0, 0),
+    );
+    assert_frame_depth_sites(&code, bridge_frame_depth);
+    assert!(
+        loop_depth >= bridge_frame_depth as isize,
+        "loop frame {loop_depth} must cover the bridge frame {bridge_frame_depth}"
+    );
+    let (seen, tip) = run_bridged(&mut backend, &token);
+    assert_eq!(
+        seen, tip,
+        "jl is not taken when the entry frame is already deep enough"
+    );
+    call_entry_check_spills(&token, loop_depth as usize, 7);
+}
+
+fn compile_input_finish(backend: &mut DynasmBackend) -> JitCellToken {
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let ops = vec![OpRc::new(finish_of(i0, Type::Int, 1))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile finish loop: {err:?}"));
+    token
+}
+
+fn count_bytes(code: &[u8], needle: &[u8]) -> usize {
+    code.windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn assert_stack_probe(code: &[u8]) {
+    // `sub rax, rsp` is `48 29 E0` (r/m, reg), then `ja`.
+    assert_eq!(
+        count_bytes(code, &[0x48, 0x29, 0xE0]),
+        1,
+        "one `sub rax, rsp`"
+    );
+    let at = unique_bytes(code, &[0x48, 0x29, 0xE0]);
+    let end = (at + 3 + 32).min(code.len());
+    let window = &code[at + 3..end];
+    let jcc = window
+        .windows(2)
+        .find(|bytes| bytes[0] == 0x0F && (bytes[1] == 0x86 || bytes[1] == 0x87));
+    assert_eq!(jcc, Some(&[0x0F, 0x87][..]), "not-taken ja, not jbe");
+}
+
+fn shadow_words() -> (usize, usize, usize) {
+    let top = shadow_top();
+    if top == 0 {
+        return (0, 0, 0);
+    }
+    unsafe { (top, *(top as *const usize), *((top + 8) as *const usize)) }
+}
+
+/// `_call_header_with_stack_check`. `STACK_CHECK_ADDRS` is a process-wide
+/// `OnceLock`, so the unregistered probe and the three slow-path behaviours
+/// share this one test.
+#[test]
+fn stack_check_slowpath_once_per_process() {
+    STACK_END.store(0, Ordering::Release);
+    STACK_LENGTH.store(usize::MAX, Ordering::Release);
+    let _restore = StackProbeGuard;
+    let mut backend = fresh_backend();
+    if majit_backend_dynasm::stack_check_addresses().is_none() {
+        let token = compile_input_finish(&mut backend);
+        assert_eq!(
+            count_bytes(compiled_bytes(&token), &[0x48, 0x29, 0xE0]),
+            0,
+            "no probe before insert_stack_check"
+        );
+    }
+    majit_backend_dynasm::register_stack_check_addresses(
+        STACK_END.as_ptr() as usize,
+        STACK_LENGTH.as_ptr() as usize,
+        stack_check_probe as *const () as usize,
+    );
+    let installed = majit_backend_dynasm::stack_check_addresses().expect("stack check registered");
+    assert_eq!(
+        installed.slowpath_addr,
+        stack_check_probe as *const () as usize
+    );
+    assert_eq!(installed.end_adr, STACK_END.as_ptr() as usize);
+    assert_eq!(installed.length_adr, STACK_LENGTH.as_ptr() as usize);
+
+    // Same CPU: the first compile left the helper uncached, so this
+    // compile must retry `ensure_stack_check_slowpath`.
+    let token = compile_input_finish(&mut backend);
+    assert_stack_probe(compiled_bytes(&token));
+
+    let _lock = COND_CALL_EXC_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearExc;
+    STACK_END.store(0, Ordering::Release);
+    STACK_LENGTH.store(0, Ordering::Release);
+    STACK_MODE.with(|mode| mode.set(2));
+    STACK_CALLS.with(|calls| calls.set(0));
+    let before = shadow_words();
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert_propagate(&backend, &frame);
+    assert!(
+        !majit_backend_dynasm::jit_exc_is_pending(),
+        "the overflow footer clears both exception cells"
+    );
+    assert_eq!(
+        shadow_words(),
+        before,
+        "overflow runs before gen_shadowstack_header and must not pop"
+    );
+    assert!(
+        STACK_CALLS.with(|calls| calls.get()) >= 1,
+        "the ja was taken"
+    );
+    drop(frame);
+    STACK_MODE.with(|mode| mode.set(0));
+    majit_backend_dynasm::jit_exc_clear();
+
+    // Returning 1 without publishing must fall through: the helper tests
+    // `pos_exception`, not `al`.
+    STACK_MODE.with(|mode| mode.set(1));
+    STACK_CALLS.with(|calls| calls.set(0));
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 7);
+    assert!(STACK_CALLS.with(|calls| calls.get()) >= 1);
+    drop(frame);
+    STACK_MODE.with(|mode| mode.set(0));
+    STACK_LENGTH.store(usize::MAX, Ordering::Release);
+
+    STACK_CALLS.with(|calls| calls.set(0));
+    let frame = backend.execute_token(&token, &[Value::Int(7)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 7);
+    assert_eq!(STACK_CALLS.with(|calls| calls.get()), 0);
 }

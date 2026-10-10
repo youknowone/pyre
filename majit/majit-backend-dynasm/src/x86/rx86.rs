@@ -535,6 +535,15 @@ pub(crate) fn mov_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     writeimm32(mc, immed);
 }
 
+/// `MOV_si` — `mov qword [rsp + ofs], imm32`. `rex_w`, opcode `C7 /0`.
+/// The immediate is the last four bytes (`IncreaseStackSlowPath.generate_body`).
+pub(crate) fn mov_si(mc: &mut Assembler, offset: i32, immed: i32) {
+    encode_rex(mc, 0, REX_W);
+    DynasmApi::push(mc, 0xC7);
+    encode_stack_sp(mc, offset, 0);
+    writeimm32(mc, immed);
+}
+
 /// `MOV32_bi` — `mov dword [rbp + ofs], imm32`. `rex_nw`, no `REX.W`.
 pub(crate) fn mov32_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     DynasmApi::push(mc, 0xC7);

@@ -41,10 +41,21 @@ pub(crate) struct X86CpuExt {
     malloc_slowpath_headerless: Option<usize>,
     _malloc_slowpath_headerless_buffer: Option<ArenaExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
-    /// Standalone trampoline that the malloc slowpath (and, in PyPy,
-    /// the stack check slowpath) JMPs to on OOM / propagate.
+    /// Standalone trampoline that the malloc slowpath JMPs to on OOM.
+    /// The stack-check helper does not: its overflow footer runs before
+    /// `gen_shadowstack_header` and must not pop a shadow entry.
     propagate_exception_path: Option<usize>,
     _propagate_exception_path_buffer: Option<ArenaExecutableBuffer>,
+    /// `build_frame_realloc_slowpath`: once per CPU. The per-bridge
+    /// `IncreaseStackSlowPath` calls this address.
+    frame_realloc_slowpath: Option<usize>,
+    _frame_realloc_slowpath_buffer: Option<ArenaExecutableBuffer>,
+    /// `_build_stack_check_slowpath` plus the no-pop overflow footer.
+    /// `None` until `stack_check_addresses` is registered and
+    /// `propagate_exception_descr` is installed; a failed attempt is not
+    /// cached, so the next `ensure_stack_check_slowpath` retries.
+    stack_check_slowpath: Option<usize>,
+    _stack_check_slowpath_buffer: Option<ArenaExecutableBuffer>,
     /// `assembler.py self.wb_slowpath` parity: entries `0..4` indexed by
     /// `withcards + 2 * withfloats`, entry `4` the `for_frame` helper, `0`
     /// where no helper is built yet.
@@ -62,9 +73,60 @@ impl X86CpuExt {
             _malloc_slowpath_headerless_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
+            frame_realloc_slowpath: None,
+            _frame_realloc_slowpath_buffer: None,
+            stack_check_slowpath: None,
+            _stack_check_slowpath_buffer: None,
             wb_slowpath: [0; 5],
             _wb_slowpath_buffers: Vec::new(),
         }
+    }
+
+    /// `build_frame_realloc_slowpath`, memoised once per CPU.
+    pub(crate) fn ensure_frame_realloc_slowpath(&mut self) -> usize {
+        if let Some(addr) = self.frame_realloc_slowpath {
+            return addr;
+        }
+        let (buffer, addr) =
+            super::assembler::build_frame_realloc_slowpath(&self.asm_memory_manager);
+        debug_assert!(
+            addr != 0,
+            "build_frame_realloc_slowpath returned a null entry"
+        );
+        self._frame_realloc_slowpath_buffer = Some(buffer);
+        self.frame_realloc_slowpath = Some(addr);
+        addr
+    }
+
+    /// `_build_stack_check_slowpath`. Returns 0 while the three
+    /// `insert_stack_check` addresses or `propagate_exception_descr` are
+    /// missing; a failed attempt is not cached, so the next compile retries.
+    pub(crate) fn ensure_stack_check_slowpath(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
+        if let Some(addr) = self.stack_check_slowpath {
+            return addr;
+        }
+        let Some(addrs) = crate::stack_check_addresses() else {
+            return 0;
+        };
+        if addrs.slowpath_addr == 0 {
+            return 0;
+        }
+        let propagate_descr = cpu_handle.read().descr_ptrs().propagate_exception_descr;
+        if propagate_descr == 0 {
+            return 0;
+        }
+        let (buffer, addr) = super::assembler::build_stack_check_slowpath(
+            addrs.slowpath_addr,
+            propagate_descr,
+            &self.asm_memory_manager,
+        );
+        debug_assert!(
+            addr != 0,
+            "build_stack_check_slowpath returned a null entry"
+        );
+        self._stack_check_slowpath_buffer = Some(buffer);
+        self.stack_check_slowpath = Some(addr);
+        addr
     }
 
     /// `llsupport/assembler.py setup_once` parity: build every
@@ -109,10 +171,9 @@ impl X86CpuExt {
     /// `assembler.py:328 _build_propagate_exception_path` parity:
     /// materialise the standalone propagate trampoline that
     /// `_store_and_reset_exception`s, writes `jf_guard_exc` / `jf_descr`,
-    /// and tail-calls `_call_footer`.  The malloc slowpath (and, in
-    /// PyPy, the stack check slowpath) JMP into this single entry
-    /// point.  Materialised lazily; the address is then memoised here
-    /// so every slowpath built on this CPU shares the same propagate
+    /// and tail-calls `_call_footer`.  The malloc slowpath JMPs to this
+    /// single entry.  Materialised lazily; the address is then memoised
+    /// here so every slowpath built on this CPU shares the same propagate
     /// path (matches PyPy's `self.propagate_exception_path` attribute).
     pub(crate) fn ensure_propagate_exception_path(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
         if let Some(addr) = self.propagate_exception_path {
@@ -141,46 +202,46 @@ impl X86CpuExt {
     /// OOM branch can `JMP` to it (matches PyPy's `setup_once` ordering:
     /// `_build_propagate_exception_path` then `_build_malloc_slowpath`).
     pub(crate) fn ensure_malloc_slowpath_fixed(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
-        if let Some(addr) = self.malloc_slowpath_fixed {
-            return addr;
+        if self.malloc_slowpath_fixed.is_none() {
+            let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
+            let (buffer, addr) = super::assembler::build_malloc_slowpath_fixed(
+                cpu_handle,
+                propagate_path,
+                &self.asm_memory_manager,
+            );
+            debug_assert!(
+                addr != 0,
+                "build_malloc_slowpath_fixed returned NULL entry address — \
+                 dynasm finalize is expected to yield a non-zero buffer_ptr"
+            );
+            self._malloc_slowpath_fixed_buffer = Some(buffer);
+            self.malloc_slowpath_fixed = Some(addr);
         }
-        let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-        let (buffer, addr) = super::assembler::build_malloc_slowpath_fixed(
-            cpu_handle,
-            propagate_path,
-            &self.asm_memory_manager,
-        );
-        debug_assert!(
-            addr != 0,
-            "build_malloc_slowpath_fixed returned NULL entry address — \
-             dynasm finalize is expected to yield a non-zero buffer_ptr"
-        );
-        self._malloc_slowpath_fixed_buffer = Some(buffer);
-        self.malloc_slowpath_fixed = Some(addr);
-        addr
+        self.malloc_slowpath_fixed
+            .expect("malloc_slowpath_fixed was just ensured")
     }
 
     pub(crate) fn ensure_malloc_slowpath_headerless(
         &mut self,
         cpu_handle: &CpuDescrHandle,
     ) -> usize {
-        if let Some(addr) = self.malloc_slowpath_headerless {
-            return addr;
+        if self.malloc_slowpath_headerless.is_none() {
+            let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
+            let (buffer, addr) = super::assembler::build_malloc_slowpath_headerless(
+                cpu_handle,
+                propagate_path,
+                &self.asm_memory_manager,
+            );
+            debug_assert!(
+                addr != 0,
+                "build_malloc_slowpath_headerless returned NULL entry address — \
+                 dynasm finalize is expected to yield a non-zero buffer_ptr"
+            );
+            self._malloc_slowpath_headerless_buffer = Some(buffer);
+            self.malloc_slowpath_headerless = Some(addr);
         }
-        let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-        let (buffer, addr) = super::assembler::build_malloc_slowpath_headerless(
-            cpu_handle,
-            propagate_path,
-            &self.asm_memory_manager,
-        );
-        debug_assert!(
-            addr != 0,
-            "build_malloc_slowpath_headerless returned NULL entry address — \
-             dynasm finalize is expected to yield a non-zero buffer_ptr"
-        );
-        self._malloc_slowpath_headerless_buffer = Some(buffer);
-        self.malloc_slowpath_headerless = Some(addr);
-        addr
+        self.malloc_slowpath_headerless
+            .expect("malloc_slowpath_headerless was just ensured")
     }
 
     /// Whether either trampoline that bakes `propagate_exception_descr`
@@ -199,5 +260,6 @@ impl X86CpuExt {
         self.malloc_slowpath_fixed.is_some()
             || self.malloc_slowpath_headerless.is_some()
             || self.propagate_exception_path.is_some()
+            || self.stack_check_slowpath.is_some()
     }
 }
