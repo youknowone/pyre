@@ -325,6 +325,7 @@ jobs:
           # The sandbox denies the model's shell commands network access, which
           # is what stops an injected prompt from exfiltrating the credential.
           codex exec -s workspace-write -m gpt-6.1-sol \
+            -c 'model_reasoning_effort="medium"' \
             --output-last-message report.md \
             "$PROMPT" </dev/null > codex.log 2>&1
           status=$?
