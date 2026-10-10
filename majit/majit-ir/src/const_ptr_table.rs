@@ -217,7 +217,9 @@ pub fn intern(addr: GcRef) -> u32 {
     if addr.is_null() {
         return 0;
     }
+    crate::gcref_diag(addr.0, "intern-before-hash");
     let hash = gc_id_or_identityhash(addr.0) as u64;
+    crate::gcref_diag(addr.0, "intern-after-hash");
     let mut guard = table();
     if let Some(idx) = find(&guard, hash, addr.0) {
         stamp_reuse(&mut guard, idx, addr, hash);

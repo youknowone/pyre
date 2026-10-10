@@ -3474,24 +3474,30 @@ impl MiniMarkGC {
         // root, so the list cannot move under the walk, and copying it first
         // was one allocation and one pass over every registered root per minor
         // collection.
-        let mut i = 0;
-        while i < self.roots.roots.len() {
-            let root_ptr = self.roots.roots[i];
-            let gcref = unsafe { &mut *root_ptr };
-            self.drag_out_root(gcref);
-            i += 1;
+        {
+            let _label = crate::shadow_stack::extra_area_scope("registered_roots");
+            let mut i = 0;
+            while i < self.roots.roots.len() {
+                let root_ptr = self.roots.roots[i];
+                let gcref = unsafe { &mut *root_ptr };
+                self.drag_out_root(gcref);
+                i += 1;
+            }
         }
 
         // Phase 1b: Process shadow stack roots.
         // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
         // shadow stack to find GC refs pushed by compiled JIT code.
-        let mut visit_shadow_root = |gcref: &mut GcRef| {
-            self.drag_out_root(gcref);
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
-        } else {
-            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+        {
+            let _label = crate::shadow_stack::extra_area_scope("shadow_stack");
+            let mut visit_shadow_root = |gcref: &mut GcRef| {
+                self.drag_out_root(gcref);
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+            } else {
+                crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+            }
         }
 
         // Phase 1c: Process jitframe shadow stack roots.
@@ -3505,44 +3511,47 @@ impl MiniMarkGC {
         // after the walk finishes without reborrowing `self` inside the
         // tracer callback.
         let mut libc_jf_slots: Vec<*mut majit_ir::GcRef> = Vec::new();
-        let mut visit_jf_root = |gcref: &mut GcRef| {
-            if self.is_nursery_object_start(gcref.0) {
-                self.drag_out_root(gcref);
-            } else if self.is_young_rawmalloced(gcref.0) {
-                // `_trace_drag_out` on a young rawmalloced frame: flag it
-                // GCFLAG_VISITED_RMY so it survives, and queue it for the
-                // remembered walk that traces its slots.
-                self.visit_young_rawmalloced_object(gcref.0);
-            } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
-                // pyre dynasm extension: jitframes allocated via
-                // `libc::calloc` in execute_token are neither in the
-                // nursery nor the old gen. The registered libc-jitframe
-                // tracer walks `jf_gcmap` bits to expose ref slots.
-                crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+        {
+            let _jf_label = crate::shadow_stack::extra_area_scope("jitframe");
+            let mut visit_jf_root = |gcref: &mut GcRef| {
+                if self.is_nursery_object_start(gcref.0) {
+                    self.drag_out_root(gcref);
+                } else if self.is_young_rawmalloced(gcref.0) {
+                    // `_trace_drag_out` on a young rawmalloced frame: flag it
+                    // GCFLAG_VISITED_RMY so it survives, and queue it for the
+                    // remembered walk that traces its slots.
+                    self.visit_young_rawmalloced_object(gcref.0);
+                } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
+                    // pyre dynasm extension: jitframes allocated via
+                    // `libc::calloc` in execute_token are neither in the
+                    // nursery nor the old gen. The registered libc-jitframe
+                    // tracer walks `jf_gcmap` bits to expose ref slots.
+                    crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+                        libc_jf_slots.push(slot_ptr);
+                    });
+                }
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+            } else {
+                crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+            }
+            // The jitframes the backend is still holding as DEADFRAMES. A frame
+            // reaches this walk exactly when it has left the shadow stack — the
+            // compiled epilogue pops it before returning — and has not yet been
+            // freed, which is the window in which the frontend reads its slots.
+            // `llmodel.py grab_exc_value` reads those slots straight out of the frame, so
+            // the interior refs are live for the whole window and nothing else in
+            // this phase can see them. See `ActiveGcDeadFrameHooks`.
+            crate::walk_active_live_deadframes(&mut |addr| {
+                crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
                     libc_jf_slots.push(slot_ptr);
                 });
-            }
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
-        } else {
-            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
-        }
-        // The jitframes the backend is still holding as DEADFRAMES. A frame
-        // reaches this walk exactly when it has left the shadow stack — the
-        // compiled epilogue pops it before returning — and has not yet been
-        // freed, which is the window in which the frontend reads its slots.
-        // `llmodel.py grab_exc_value` reads those slots straight out of the frame, so
-        // the interior refs are live for the whole window and nothing else in
-        // this phase can see them. See `ActiveGcDeadFrameHooks`.
-        crate::walk_active_live_deadframes(&mut |addr| {
-            crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
-                libc_jf_slots.push(slot_ptr);
             });
-        });
-        for slot_ptr in libc_jf_slots {
-            let field_ref = unsafe { &mut *slot_ptr };
-            self.drag_out_root(field_ref);
+            for slot_ptr in libc_jf_slots {
+                let field_ref = unsafe { &mut *slot_ptr };
+                self.drag_out_root(field_ref);
+            }
         }
 
         // Phase 1d: Process blackhole interpreter register banks.
@@ -3551,13 +3560,16 @@ impl MiniMarkGC {
         // root set. RPython traces these via the RPython object graph
         // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
         // explicit thread-local stack of register banks.
-        let mut visit_bh_root = |gcref: &mut GcRef| {
-            self.drag_out_root(gcref);
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
-        } else {
-            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+        {
+            let _bh_label = crate::shadow_stack::extra_area_scope("bh_regs");
+            let mut visit_bh_root = |gcref: &mut GcRef| {
+                self.drag_out_root(gcref);
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+            } else {
+                crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+            }
         }
 
         // blackhole resume construction roots (`resume.py blackhole_from_resumedata`): the
@@ -3565,13 +3577,16 @@ impl MiniMarkGC {
         // materializing virtuals before `run()` re-roots them via
         // `push_bh_regs`; forward any already-materialized nursery refs so a
         // later materialization's collection does not strand them.
-        let mut visit_resume_root = |gcref: &mut GcRef| {
-            self.drag_out_root(gcref);
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
-        } else {
-            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        {
+            let _resume_label = crate::shadow_stack::extra_area_scope("resume_ref_roots");
+            let mut visit_resume_root = |gcref: &mut GcRef| {
+                self.drag_out_root(gcref);
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+            } else {
+                crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+            }
         }
 
         // Phase 1e: framework.py `root_walker.walk_roots` parity — the
@@ -3619,9 +3634,12 @@ impl MiniMarkGC {
         // Always this minor, even when a pinned object announced a Major
         // extra-root walk. Before the nursery reset and before
         // `free_young_rawmalloced_objects`.
-        majit_ir::resumecode::collect_young_numberings(&mut |gcref| {
-            self.drag_out_root(gcref);
-        });
+        {
+            let _numb_label = crate::shadow_stack::extra_area_scope("young_numberings");
+            majit_ir::resumecode::collect_young_numberings(&mut |gcref| {
+                self.drag_out_root(gcref);
+            });
+        }
         crate::shadow_stack::set_extra_root_walk_kind(
             crate::shadow_stack::ExtraRootWalkKind::Major,
         );
@@ -5295,6 +5313,56 @@ impl MiniMarkGC {
         }
     }
 
+    /// P92 intern/ConstPtr diagnostic. Panics at the first stale GC word.
+    pub(crate) fn diag_stale_gcref(&self, addr: usize, site: &'static str) {
+        let owns = self.is_managed_heap_object(addr);
+        let nursery = self.is_in_nursery(addr);
+        let retired = self.nursery.contains_retired(addr);
+        if !owns && !nursery && !retired {
+            return;
+        }
+        let mut forwarded = false;
+        let mut type_id = 0u32;
+        let mut header_valid = false;
+        let mut chased = 0usize;
+        let mut object_start = false;
+        if nursery {
+            object_start = self.is_nursery_object_start(addr);
+        } else if owns {
+            object_start = true;
+        }
+        let mut past_free = false;
+        if object_start {
+            let hdr = unsafe { *header_of(addr) };
+            forwarded = hdr.is_forwarded();
+            type_id = hdr.type_id();
+            header_valid = !forwarded && (type_id as usize) < self.types.len();
+            if forwarded {
+                chased = unsafe { GcHeader::forwarding_address(header_of(addr)) };
+            }
+            if nursery {
+                let free = self.nursery.free_ptr() as usize;
+                past_free = addr >= free && !hdr.has_flag(GcFlags::GCFLAG_PINNED);
+            }
+        }
+        let stale = forwarded
+            || retired
+            || past_free
+            || (nursery && !object_start)
+            || (nursery && !header_valid);
+        if !stale {
+            return;
+        }
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        panic!(
+            "STALE_GCREF site={site} addr={addr:#x} owns={owns} nursery={nursery} \
+             object_start={object_start} forwarded={forwarded} retired={retired} \
+             type_id={type_id} header_valid={header_valid} chased={chased:#x} \
+             minors={} majors={}\n{backtrace}",
+            self.minor_collections, self.major_collections
+        );
+    }
+
     /// `get_possibly_forwarded_type_id`: follow a nursery corpse before
     /// reading its size. `set_forwarding_address` writes the live address
     /// at payload offset 0, which is `length_offset` for a varsize type
@@ -5558,7 +5626,8 @@ impl MiniMarkGC {
                  child_nursery_offset={:#x}, child_gen={}, holder_gen={}, \
                  holder_tid_and_flags={:#x}, holder_in_remembered={}, \
                  store_sites={:#x}, \
-                 enclosing={}, extra_area={}, gc_state={:?}, minors={}, majors={})",
+                 enclosing={}, extra_area={}, gc_state={:?}, minors={}, majors={}, \
+                 root_slot={})",
                 type_id,
                 obj_addr,
                 self.minor_collections,
@@ -5590,6 +5659,7 @@ impl MiniMarkGC {
                 self.gc_state,
                 self.minor_collections,
                 self.major_collections,
+                crate::shadow_stack::describe_root_slot(slot_addr),
             );
         }
         // Compute the actual payload size (for varsize objects, read the length).

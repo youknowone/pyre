@@ -230,6 +230,7 @@ pub enum SnapshotTagged {
 impl SnapshotTagged {
     /// Intern `addr` and store the table index. Null stays 0.
     pub fn const_ref(addr: usize) -> Self {
+        majit_gc::diag_stale_gcref(addr, "snapshot_const_ref");
         let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(addr));
         SnapshotTagged::Const(i64::from(index), majit_ir::Type::Ref)
     }
@@ -714,6 +715,29 @@ impl Trace {
             let (jc, pc) = it.unpack_jitcode_pc(snap);
             headers.push((Self::decode_jitcode_index(jc) as i32, pc as i32, nboxes));
         }
+        if majit_gc::diag_p92_enabled() && headers.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
+            let arrs: SmallVec<[(usize, i64, i64); 16]> = snaps
+                .iter()
+                .map(|&snap| {
+                    let arr = crate::opencoder::varint_only_decode(&trb._snapshot_data, snap, 2);
+                    let n = if arr == 0 {
+                        0
+                    } else {
+                        crate::opencoder::varint_only_decode(
+                            &trb._snapshot_array_data,
+                            arr as usize,
+                            0,
+                        )
+                    };
+                    (snap, arr, n)
+                })
+                .collect();
+            eprintln!(
+                "P92_NUMB_HEADERS resume_pos={resume_pos} headers={headers:?} \
+                 arrs={arrs:?} vable_len={vable_len} vref_len={vref_len}"
+            );
+            crate::opencoder::p92_dump_enc_log();
+        }
 
         let mut vable = it.iter_vable_array();
         let mut vref = it.iter_vref_array();
@@ -796,6 +820,17 @@ impl Trace {
     /// structured `Snapshot`. Returns the `_snapshot_data` byte offset
     /// (`create_top_snapshot`); that offset is `rd_resume_position`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
+        if majit_gc::diag_p92_enabled() {
+            let hdrs: Vec<(u32, u32, usize)> = snapshot
+                .frames
+                .iter()
+                .map(|f| (f.jitcode_index, f.pc, f.boxes.len()))
+                .collect();
+            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
+                eprintln!("P92_ENCODE_SNAP frames={hdrs:?}");
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
         // `create_top_snapshot` patches the last op's descr slot when that
         // op is the guard just recorded (`opencoder.py` `_pos -= 2`).
         // A later non-guard must not be rewritten as if it were the
