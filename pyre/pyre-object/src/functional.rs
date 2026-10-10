@@ -323,6 +323,14 @@ pub unsafe fn w_map_set_strict(obj: PyObjectRef, value: bool) {
     }
 }
 
+/// `functional.py W_Map.iter_w` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Map`.
+pub unsafe fn w_map_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 // ── functional.rs ─────────────────────────────────────────────
 
 // `pypy/module/__builtin__/functional.py W_Filter` line-by-line
@@ -396,6 +404,14 @@ pub unsafe fn w_filter_get_iterable(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Filter)).w_iterable }
 }
 
+/// `functional.py W_Filter.iter_w` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Filter`.
+pub unsafe fn w_filter_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 // ── functional.rs ─────────────────────────────────────────────
 
 // `pypy/module/__builtin__/functional.py W_Zip` line-by-line port.
@@ -450,6 +466,14 @@ pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool, w_subtype: PyObjectRef)
 #[inline]
 pub unsafe fn is_zip(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &ZIP_TYPE) || py_type_check(obj, &ZIP_USER_TYPE) }
+}
+
+/// `functional.py W_Zip.iter_w` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Zip`.
+pub unsafe fn w_zip_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
 }
 
 /// # Safety

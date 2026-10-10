@@ -8124,14 +8124,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // Range GET_ITER: virtualize exact machine-word `range` into the same
-    // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
+    // GET_ITER records `W_Range.descr_iter` (`RANGE_ITER_DESCENT`) for
+    // exact `range`, `iter_w` for exact `zip` / `map` / `filter`, and
+    // `descr_iter` for exact sequence iterators. Not a spec-fold row —
+    // HelperDescent, the `newdict` twin.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
     {
-        if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
-            try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)
-        })? {
+        if let Some(iter_op) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }

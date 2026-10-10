@@ -376,7 +376,6 @@ spec_folds! {
     BinaryOpDescent      => ("binary_op_descent",        "residual_call,inline_call", "-"),
     CompareOpDescent     => ("compare_op_descent",       "residual_call", "-"),
     Setslice             => ("setslice",                 "residual_call", "-"),
-    GetIter              => ("get_iter",                 "residual_call", "-"),
     ForIterNext          => ("for_iter_next",            "residual_call", "-"),
     MakeFunction         => ("make_function",            "residual_call", "-"),
     Newtuple             => ("newtuple",                 "residual_call", "-"),

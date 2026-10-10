@@ -5349,6 +5349,59 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
     );
 }
 
+fn assert_identity_iter_w_leaf(path: &str) {
+    let jc = crate::jitcode_runtime::pathed_jitcode(path)
+        .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+    let body = jc
+        .try_body()
+        .unwrap_or_else(|| panic!("{path} body must be assembled"));
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(body.calldescr.arg_classes, "r", "{path} ops={ops:?}");
+    assert_eq!(body.calldescr.result_type, 'r', "{path} ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| *op == "ref_return"),
+        "{path} must return the receiver; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.contains("residual")),
+        "{path} must not residualise; ops={ops:?}"
+    );
+}
+
+#[test]
+fn zip_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Zip.iter_w` is `return self`. Own graph so GET_ITER
+    // records that body (`specialize.rs ZIP_ITER_DESCENT`) instead of a
+    // hand identity.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_zip_iter");
+}
+
+#[test]
+fn map_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Map.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_map_iter");
+}
+
+#[test]
+fn filter_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Filter.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_filter_iter");
+}
+
+#[test]
+fn seqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_AbstractSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_seqiter_iter");
+}
+
+#[test]
+fn reverseseqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_ReverseSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_reverseseqiter_iter");
+}
+
 #[test]
 fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
     // `functional.py` `W_Zip.next_w` arity two, specialised to

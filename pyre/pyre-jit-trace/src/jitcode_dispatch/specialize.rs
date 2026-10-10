@@ -6815,6 +6815,46 @@ const RANGE_ITER_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "RANGE-ITER-SUBWALK",
 };
 
+/// `functional.py W_Zip.iter_w` — `return self`.
+const ZIP_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_zip_iter",
+    commit_label: "zip_iter_commit",
+    call_site_label: "zip_iter_call_site",
+    decline_tag: "ZIP-ITER-SUBWALK",
+};
+
+/// `functional.py W_Map.iter_w` — `return self`.
+const MAP_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_map_iter",
+    commit_label: "map_iter_commit",
+    call_site_label: "map_iter_call_site",
+    decline_tag: "MAP-ITER-SUBWALK",
+};
+
+/// `functional.py W_Filter.iter_w` — `return self`.
+const FILTER_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_filter_iter",
+    commit_label: "filter_iter_commit",
+    call_site_label: "filter_iter_call_site",
+    decline_tag: "FILTER-ITER-SUBWALK",
+};
+
+/// `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
+const SEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::iterobject::w_seqiter_iter",
+    commit_label: "seqiter_iter_commit",
+    call_site_label: "seqiter_iter_call_site",
+    decline_tag: "SEQITER-ITER-SUBWALK",
+};
+
+/// `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
+const REVERSESEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::iterobject::w_reverseseqiter_iter",
+    commit_label: "reverseseqiter_iter_commit",
+    call_site_label: "reverseseqiter_iter_call_site",
+    decline_tag: "REVERSESEQITER-ITER-SUBWALK",
+};
+
 /// Descend a generated cell helper (`write_cell` / `unwrap_cell`) the way
 /// [`try_walker_orthodox_descent`] enters `binary_value_from_tag`.  The
 /// IR comes from the helper's jitcode, not a hand-written getfield/setfield.
@@ -18699,11 +18739,16 @@ pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
     )
 }
 
-/// Walker-native `GetIter` for an exact machine-word `range`.
+/// GET_ITER of exact `range` / `zip` / `map` / `filter` / sequence iterators.
 ///
-/// Records `W_Range.descr_iter` (`w_range_iter`) so a locally consumed
-/// iterator is the same virtual `New` PyPy traces.
-pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
+/// Records `W_Range.descr_iter` (`w_range_iter`); the body chooses
+/// OneArg / StepOne / IntRange / LongRange via `space.int_w`. Exact
+/// `zip` / `map` / `filter` record `iter_w`. Exact sequence iterators
+/// record `W_AbstractSeqIterObject.descr_iter` (`w_seqiter_iter`) or
+/// `W_ReverseSeqIterObject.descr_iter` (`w_reverseseqiter_iter`).
+/// Admission is the instance typeptr, so a `_getusercls` subclass is
+/// excluded. Not a spec-fold row.
+pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
@@ -18718,37 +18763,119 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let range_op = r_args[0];
-    let Some(range_obj) = walker_concrete_ref_object(ctx, range_op) else {
+    let obj_op = r_args[0];
+    let Some(obj) = walker_concrete_ref_object(ctx, obj_op) else {
         return Ok(None);
     };
+    if obj.is_null() {
+        return Ok(None);
+    }
 
-    // `W_Zip.iter_w` is identity; exact-class guards preserve overrides.
     let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
-    let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
+    if unsafe { std::ptr::eq((*obj).ob_type, zip_type) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &ZIP_ITER_DESCENT,
+            zip_type as i64,
+        );
+    }
+
+    let map_type = &pyre_object::functional::MAP_TYPE as *const pyre_object::PyType;
+    if unsafe { std::ptr::eq((*obj).ob_type, map_type) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &MAP_ITER_DESCENT,
+            map_type as i64,
+        );
+    }
+
+    let filter_type = &pyre_object::functional::FILTER_TYPE as *const pyre_object::PyType;
+    if unsafe { std::ptr::eq((*obj).ob_type, filter_type) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &FILTER_ITER_DESCENT,
+            filter_type as i64,
+        );
+    }
+
     if unsafe {
-        !range_obj.is_null()
-            && std::ptr::eq((*range_obj).ob_type, zip_type)
-            && std::ptr::eq((*range_obj).w_class, zip_class)
+        pyre_object::is_seq_iter(obj)
+            || pyre_object::is_list_iter(obj)
+            || pyre_object::is_tuple_iter(obj)
     } {
-        walker_guard_exact_instance(ctx, op_pc, range_op, zip_type as i64, zip_class)?;
-        ctx.frame_state.borrow_mut().vstack_last_ref = range_op;
-        return Ok(Some(range_op));
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &SEQITER_ITER_DESCENT,
+            unsafe { (*obj).ob_type as i64 },
+        );
+    }
+
+    if unsafe { pyre_object::is_list_reverse_iter(obj) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &REVERSESEQITER_ITER_DESCENT,
+            &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const _ as i64,
+        );
     }
 
     // `W_Range.descr_iter` itself chooses the iterator shape; the class
     // guard is the only admission (`typedef.acceptable_as_base_class = False`).
-    if unsafe { !pyre_object::functional::is_w_range(range_obj) } {
+    if unsafe { !pyre_object::functional::is_w_range(obj) } {
         return Ok(None);
     }
+    run_get_iter_helper_descent(
+        ctx,
+        op_pc,
+        obj_op,
+        obj,
+        dst,
+        dst_bank,
+        &RANGE_ITER_DESCENT,
+        &pyre_object::functional::RANGE_TYPE as *const _ as i64,
+    )
+}
 
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &RANGE_ITER_DESCENT) else {
+fn run_get_iter_helper_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj_op: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+    type_addr: i64,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
         return Ok(None);
     };
 
     let pre_guard = ctx.trace_ctx.get_trace_position();
-    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
+    walker_guard_fold_class(ctx, op_pc, obj_op, type_addr)?;
 
     let mut produced = None;
     let outcome = run_prepared_orthodox_descent(
@@ -18756,11 +18883,11 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         op_pc,
         prep,
         &[],
-        &[(range_op, range_obj)],
+        &[(obj_op, obj)],
         &[],
         dst,
         dst_bank,
-        &RANGE_ITER_DESCENT,
+        descent,
         Some(&mut produced),
         false,
     )?;

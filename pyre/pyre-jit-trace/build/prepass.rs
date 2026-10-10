@@ -1173,6 +1173,38 @@ fn real_main() {
                     "functional",
                     "w_range_iter",
                 ]),
+                // `W_Zip.iter_w`. `space.iter` stays residual, so the
+                // descent looks the body up by this graph key
+                // (`specialize.rs ZIP_ITER_DESCENT`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_zip_iter",
+                ]),
+                // `W_Map.iter_w` / `W_Filter.iter_w` (`specialize.rs`
+                // `MAP_ITER_DESCENT` / `FILTER_ITER_DESCENT`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_map_iter",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_filter_iter",
+                ]),
+                // `W_AbstractSeqIterObject.descr_iter` /
+                // `W_ReverseSeqIterObject.descr_iter`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "iterobject",
+                    "w_seqiter_iter",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "iterobject",
+                    "w_reverseseqiter_iter",
+                ]),
                 // Step-1 range `FOR_ITER` descends this body. `space.next`
                 // calls it, and that call stays residual, so the graph is
                 // seeded here for the path lookup.
