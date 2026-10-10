@@ -9290,24 +9290,6 @@ fn decode_graph_jit_shape(raw: u8) -> UnsupportedJitShape {
     }
 }
 
-fn store_pycode_jit_shape(w_code: pyre_object::PyObjectRef, shape: UnsupportedJitShape) {
-    if w_code.is_null() {
-        return;
-    }
-    let encoded = JIT_SHAPE_STORED_BIAS + shape as u8;
-    unsafe {
-        (*(w_code as *const pyre_interpreter::pycode::PyCode))
-            .jit_shape
-            .compare_exchange(
-                pyre_interpreter::pycode::JIT_SHAPE_UNCOMPUTED,
-                encoded,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .ok();
-    }
-}
-
 /// Return the immutable frame-shape classification for an immortal user-code
 /// graph.  RPython decides the analogous graph facts once while populating
 /// `CallControl.jitcodes`; pyre's temporary runtime gate must have the same
@@ -9335,15 +9317,27 @@ fn cached_unsupported_jit_shape(
     // Assembler overflow is recorded on the writer after a drain fails.
     // Reading it must not construct the writer: `CodeWriter::new` decodes
     // the build-time liveness stream, and this gate runs on cold frames.
-    if let Some(raw) = crate::jit::codewriter::CodeWriter::existing()
+    let shape = if let Some(raw) = crate::jit::codewriter::CodeWriter::existing()
         .and_then(|writer| writer.callcontrol().graph_jit_shapes.get(&key).copied())
     {
-        let shape = decode_graph_jit_shape(raw);
-        store_pycode_jit_shape(w_code, shape);
-        return shape;
+        decode_graph_jit_shape(raw)
+    } else {
+        unsupported_jit_shape_uncached(code).0
+    };
+    if !w_code.is_null() {
+        let encoded = JIT_SHAPE_STORED_BIAS + shape as u8;
+        unsafe {
+            (*(w_code as *const pyre_interpreter::pycode::PyCode))
+                .jit_shape
+                .compare_exchange(
+                    pyre_interpreter::pycode::JIT_SHAPE_UNCOMPUTED,
+                    encoded,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .ok();
+        }
     }
-    let shape = unsupported_jit_shape_uncached(code).0;
-    store_pycode_jit_shape(w_code, shape);
     shape
 }
 
