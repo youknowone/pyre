@@ -530,13 +530,17 @@ pub unsafe fn ll_arraycopy_int_items_block(
 
 /// [`ll_arraycopy_items_block`] for the `GcArray(Float)` ARRAY.
 ///
+/// `source` and `dest` are [`FloatItemsBlock`] pointers: `do_fixed_list_ll_arraycopy`
+/// names the copy's ARRAY from `dest`'s type, and a `TypedItemsBlock` there
+/// names `GcArray(Signed)`.
+///
 /// # Safety
-/// `source` and `dest` are live float `TypedItemsBlock`s and both ranges are
-/// in bounds.
+/// `source` and `dest` are live float items blocks and both ranges are in
+/// bounds.
 #[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub unsafe fn ll_arraycopy_float_items_block(
-    source: *mut TypedItemsBlock,
-    dest: *mut TypedItemsBlock,
+    source: *mut FloatItemsBlock,
+    dest: *mut FloatItemsBlock,
     source_start: i64,
     dest_start: i64,
     length: i64,
@@ -545,10 +549,12 @@ pub unsafe fn ll_arraycopy_float_items_block(
         if length == 1 {
             // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
             let item = unsafe {
-                *(typed_items_block_items_base(source) as *const f64).add(source_start as usize)
+                *(typed_items_block_items_base(source as *mut TypedItemsBlock) as *const f64)
+                    .add(source_start as usize)
             };
             unsafe {
-                *(typed_items_block_items_base(dest) as *mut f64).add(dest_start as usize) = item
+                *(typed_items_block_items_base(dest as *mut TypedItemsBlock) as *mut f64)
+                    .add(dest_start as usize) = item
             };
         }
         return;
@@ -1510,7 +1516,7 @@ pub fn ll_prebuilt_empty_float_items_block() -> *mut TypedItemsBlock {
 // int and float grows are two graphs, each copying through its own ARRAY's
 // `ll_arraycopy`.
 macro_rules! typed_items_block_grow {
-    ($grow:ident, $try_grow:ident, $new:ident, $tid:path, $arraycopy:ident) => {
+    ($grow:ident, $try_grow:ident, $new:ident, $block:ty, $tid:path, $arraycopy:ident) => {
         /// rlist.py `_ll_list_resize_hint_really`: `newitems = malloc(...)`,
         /// `rgc.ll_arraycopy(items, newitems, 0, 0, p)`, and the caller's
         /// `l.items = newitems`. `old` may be null or the prebuilt empty
@@ -1532,17 +1538,24 @@ macro_rules! typed_items_block_grow {
                 let roots = crate::gc_roots::push_roots();
                 let base = roots.base();
                 let _ = roots.pin_root(old as crate::PyObjectRef);
-                let newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
+                let mut newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
                 if live_len > 0 {
                     let _ = roots.pin_root(newitems as crate::PyObjectRef);
                     $arraycopy(
-                        roots.get(base) as *mut TypedItemsBlock,
-                        roots.get(base + 1) as *mut TypedItemsBlock,
+                        roots.get(base) as *mut $block,
+                        roots.get(base + 1) as *mut $block,
                         0,
                         0,
                         live_len as i64,
                     );
-                    return roots.get(base + 1) as *mut TypedItemsBlock;
+                    newitems = roots.get(base + 1) as *mut TypedItemsBlock;
+                }
+                // A block outside the collector's heap (no GC installed, or
+                // the items-block gate off) has no other owner to free it.
+                // Traced code allocates its blocks from the collector, so
+                // this arm is the interpreter's alone.
+                if !majit_rlib::jit::we_are_jitted() {
+                    dealloc_typed_items_block(roots.get(base) as *mut TypedItemsBlock);
                 }
                 newitems
             }
@@ -1582,8 +1595,8 @@ macro_rules! typed_items_block_grow {
                 let _ = crate::gc_roots::pin_root(old as crate::PyObjectRef);
                 if !old.is_null() && live_len > 0 {
                     $arraycopy(
-                        crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock,
-                        crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock,
+                        crate::gc_roots::shadow_stack_get(old_root) as *mut $block,
+                        crate::gc_roots::shadow_stack_get(fresh_root) as *mut $block,
                         0,
                         0,
                         live_len as i64,
@@ -1604,6 +1617,7 @@ typed_items_block_grow!(
     grow_int_items_block,
     try_grow_int_items_block,
     ll_new_int_items,
+    TypedItemsBlock,
     gc_int_array_gc_type_id,
     ll_arraycopy_int_items_block
 );
@@ -1611,6 +1625,7 @@ typed_items_block_grow!(
     grow_float_items_block,
     try_grow_float_items_block,
     ll_new_float_items,
+    FloatItemsBlock,
     gc_float_array_gc_type_id,
     ll_arraycopy_float_items_block
 );
