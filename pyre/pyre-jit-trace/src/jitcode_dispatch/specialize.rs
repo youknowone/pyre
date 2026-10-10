@@ -10252,30 +10252,30 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     let index_after = unsafe { pyre_object::w_list_iter_index(iter_now) };
     let seq_after = unsafe { pyre_object::w_list_iter_seq(iter_now) };
     let cursor_unchanged = seq_after == seq_before && index_after == index_before;
-    if let Some(item) = walker_concrete_ref_object(ctx, result)
-        && !item.is_null()
+    let item = walker_concrete_ref_object(ctx, result).filter(|item| !item.is_null());
+    // Exhaustion (`list_iter_stop`, index >= 0).  A negative `__setstate__`
+    // cursor stays attached; that arm returns null without the store.
+    let exhausted = item.is_none()
+        && matches!(
+            ctx.trace_ctx.concrete_of_opref(result),
+            Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+        );
+    // The store the body recorded, for a walk that could not execute it.
+    let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
+    // A kept store has no undo entry, so the bridge cursor snapshot is the
+    // only way back for a walk that aborts with its delivery refused; it is
+    // taken from the pre-walk pair whichever side moved the cursor.
+    if ctx.trace_ctx.is_bridge_trace
+        && (!cursor_unchanged || (replay && (item.is_some() || exhausted)))
     {
-        if cursor_unchanged && !seq_before.is_null() && index_before >= 0 {
-            if ctx.trace_ctx.is_bridge_trace {
-                fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
-            }
+        fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
+    }
+    if let Some(item) = item {
+        if replay {
             unsafe { pyre_object::w_list_iter_set_index(iter_now, index_before + 1) };
         }
         fbw_foriter_inflight_capture(item, body, true);
-    } else if matches!(
-        ctx.trace_ctx.concrete_of_opref(result),
-        Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
-    ) && cursor_unchanged
-        && !seq_before.is_null()
-        && index_before >= 0
-    {
-        // Exhaustion (`list_iter_stop`, index >= 0): the clear the body
-        // recorded, for a walk that could not execute it.
-        // A negative `__setstate__` cursor stays attached; that arm returns
-        // null without the store.
-        if ctx.trace_ctx.is_bridge_trace {
-            fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
-        }
+    } else if exhausted && replay {
         unsafe { pyre_object::w_list_iter_set_seq(iter_now, pyre_object::PY_NULL) };
     }
     Ok(Some(result))
