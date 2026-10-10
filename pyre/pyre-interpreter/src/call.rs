@@ -3438,6 +3438,26 @@ pub fn call_with_kwargs(
     call_with_kwargs_in_ctx(getexecutioncontext(), callable, pos_args, kwargs)
 }
 
+/// `space.call_args(w_func, args)` — keywords stay on `Arguments`
+/// (`keyword_names_w` / `keywords_w`) instead of a trailing marker dict.
+pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
+    let pos = args.arguments_w.as_slice();
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    if names.is_empty() {
+        return call_function_impl_result(callable, pos);
+    }
+    call_with_kwargs_in_ctx_impl(
+        getexecutioncontext(),
+        callable,
+        pos,
+        names,
+        values,
+        true,
+        std::ptr::null_mut(),
+    )
+}
+
 /// Call a user function with positional args + keyword args from a dict.
 ///
 /// PyPy: `Arguments._match_signature` with keyword handling.

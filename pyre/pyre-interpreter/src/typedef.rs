@@ -15415,7 +15415,11 @@ fn init_function_type_common(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", function_descr_call),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                function_descr_call,
+                function_descr_call_args,
+            ),
         )
     };
 }
@@ -15429,6 +15433,137 @@ fn function_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
         "__call__",
     )?;
     function_descr_call_impl(positional, kwargs, function)
+}
+
+fn function_descr_call_args(
+    function: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let function = function_receiver(function, "__call__")?;
+    crate::call::call_args(function, args)
+}
+
+fn builtin_function_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let function = builtin_function_receiver(
+        positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__call__",
+    )?;
+    if is_bound_builtin_method(function) {
+        crate::function::descr_method_call(args)
+    } else {
+        function_descr_call_impl(positional, kwargs, function)
+    }
+}
+
+fn builtin_function_descr_call_args(
+    function: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let function = builtin_function_receiver(function, "__call__")?;
+    if is_bound_builtin_method(function) {
+        crate::function::descr_method_call_args(function, args)
+    } else {
+        crate::call::call_args(function, args)
+    }
+}
+
+fn slot_wrapper_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let descr = slot_wrapper_receiver(
+        positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__call__",
+    )?;
+    if let Some(&obj) = positional.get(1) {
+        slot_wrapper_check_instance(descr, obj)?;
+    }
+    function_descr_call_impl(positional, kwargs, descr)
+}
+
+fn slot_wrapper_descr_call_args(
+    descr: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let descr = slot_wrapper_receiver(descr, "__call__")?;
+    if let Some(&obj) = args.arguments_w.first() {
+        slot_wrapper_check_instance(descr, obj)?;
+    }
+    crate::call::call_args(descr, args)
+}
+
+fn method_wrapper_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    method_wrapper_receiver(
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__call__",
+    )?;
+    crate::function::descr_method_call(args)
+}
+
+fn method_wrapper_descr_call_args(
+    obj: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    method_wrapper_receiver(obj, "__call__")?;
+    crate::function::descr_method_call_args(obj, args)
+}
+
+fn method_descriptor_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let descr = method_descriptor_receiver(
+        positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__call__",
+    )?;
+    if let Some(&obj) = positional.get(1) {
+        method_descriptor_check_instance(descr, obj)?;
+    }
+    function_descr_call_impl(positional, kwargs, descr)
+}
+
+fn method_descriptor_descr_call_args(
+    descr: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let descr = method_descriptor_receiver(descr, "__call__")?;
+    if let Some(&obj) = args.arguments_w.first() {
+        method_descriptor_check_instance(descr, obj)?;
+    }
+    crate::call::call_args(descr, args)
+}
+
+fn classmethod_descriptor_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let descr = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let function = classmethod_descriptor_function(descr, "__call__")?;
+    // `descrobject.c classmethoddescr_call` — the receiver is the
+    // class itself, and it is validated by binding it through
+    // `classmethod_get` before the wrapped callable runs.
+    let Some(&cls) = positional.get(1) else {
+        let name = unsafe { crate::function::function_get_name(function) };
+        let owner_name =
+            unsafe { pyre_object::w_type_get_name(crate::function::fget_func_objclass(function)?) };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of '{owner_name}' object needs an argument"
+        )));
+    };
+    classmethod_descriptor_check_owner(function, cls)?;
+    function_descr_call_impl(positional, kwargs, function)
+}
+
+fn classmethod_descriptor_descr_call_args(
+    descr: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let function = classmethod_descriptor_function(descr, "__call__")?;
+    let Some(&cls) = args.arguments_w.first() else {
+        let name = unsafe { crate::function::function_get_name(function) };
+        let owner_name =
+            unsafe { pyre_object::w_type_get_name(crate::function::fget_func_objclass(function)?) };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of '{owner_name}' object needs an argument"
+        )));
+    };
+    classmethod_descriptor_check_owner(function, cls)?;
+    crate::call::call_args(function, args)
 }
 
 fn function_descr_call_impl(
@@ -16733,18 +16868,11 @@ fn init_builtin_function_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", |args| {
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                let function = builtin_function_receiver(
-                    positional.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    "__call__",
-                )?;
-                if is_bound_builtin_method(function) {
-                    crate::function::descr_method_call(args)
-                } else {
-                    function_descr_call_impl(positional, kwargs, function)
-                }
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                builtin_function_descr_call,
+                builtin_function_descr_call_args,
+            ),
         )
     };
 
@@ -17308,17 +17436,11 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", |args| {
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                let descr = slot_wrapper_receiver(
-                    positional.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    "__call__",
-                )?;
-                if let Some(&obj) = positional.get(1) {
-                    slot_wrapper_check_instance(descr, obj)?;
-                }
-                function_descr_call_impl(positional, kwargs, descr)
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                slot_wrapper_descr_call,
+                slot_wrapper_descr_call_args,
+            ),
         );
         // [3.14-spec] PyPy keeps slot functions as
         // `FunctionWithFixedCode`, while CPython's `PyWrapperDescr_Type`
@@ -17559,13 +17681,11 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", |args| {
-                method_wrapper_receiver(
-                    args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    "__call__",
-                )?;
-                crate::function::descr_method_call(args)
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                method_wrapper_descr_call,
+                method_wrapper_descr_call_args,
+            ),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -17733,17 +17853,11 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", |args| {
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                let descr = method_descriptor_receiver(
-                    positional.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    "__call__",
-                )?;
-                if let Some(&obj) = positional.get(1) {
-                    method_descriptor_check_instance(descr, obj)?;
-                }
-                function_descr_call_impl(positional, kwargs, descr)
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                method_descriptor_descr_call,
+                method_descriptor_descr_call_args,
+            ),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -17894,25 +18008,11 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", |args| {
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                let descr = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let function = classmethod_descriptor_function(descr, "__call__")?;
-                // `descrobject.c classmethoddescr_call` — the receiver is the
-                // class itself, and it is validated by binding it through
-                // `classmethod_get` before the wrapped callable runs.
-                let Some(&cls) = positional.get(1) else {
-                    let name = crate::function::function_get_name(function);
-                    let owner_name = pyre_object::w_type_get_name(
-                        crate::function::fget_func_objclass(function)?,
-                    );
-                    return Err(crate::PyError::type_error(format!(
-                        "descriptor '{name}' of '{owner_name}' object needs an argument"
-                    )));
-                };
-                classmethod_descriptor_check_owner(function, cls)?;
-                function_descr_call_impl(positional, kwargs, function)
-            }),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                classmethod_descriptor_descr_call,
+                classmethod_descriptor_descr_call_args,
+            ),
         );
         // No `__reduce__`: `PyClassMethodDescr_Type` has none, so pickling one
         // falls through to `copyreg._reduce_ex` and is rejected.
@@ -17981,10 +18081,10 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            crate::gateway::make_builtin_function_with_doc(
+            crate::gateway::make_builtin_function_passthrough1(
                 "__call__",
                 crate::function::descr_method_call,
-                "Call self as a function.",
+                crate::function::descr_method_call_args,
             ),
         )
     };
@@ -19165,6 +19265,12 @@ fn descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     })
 }
 
+fn descr_call_args(sm: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    let sm = staticmethod_require(sm, "__call__")?;
+    let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    crate::call::call_args(function, args)
+}
+
 fn staticmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
     let sm = staticmethod_require(
         args.get(1).copied().unwrap_or(PY_NULL),
@@ -19330,7 +19436,14 @@ fn init_staticmethod_type(ns: PyObjectRef) {
                 crate::gateway::Signature::new(vec!["self", "function"], None, None, 0, 2),
             ),
         ),
-        ("__call__", make_builtin_function("__call__", descr_call)),
+        (
+            "__call__",
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                descr_call,
+                descr_call_args,
+            ),
+        ),
         (
             "__func__",
             pyre_object::w_member_new_direct(
@@ -19501,6 +19614,15 @@ fn instancemethod_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     })
 }
 
+fn instancemethod_descr_call_args(
+    im: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let im = instancemethod_require(im, "__call__")?;
+    let function = unsafe { pyre_object::instancemethod::w_instancemethod_get_func(im) };
+    crate::call::call_args(function, args)
+}
+
 /// `classobject.py InstanceMethod.descr_repr` via `W_Root.getrepr`.
 fn instancemethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let im = instancemethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
@@ -19547,7 +19669,11 @@ fn init_instancemethod_type(ns: PyObjectRef) {
         ),
         (
             "__call__",
-            make_builtin_function("__call__", instancemethod_descr_call),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                instancemethod_descr_call,
+                instancemethod_descr_call_args,
+            ),
         ),
         (
             "__get__",
