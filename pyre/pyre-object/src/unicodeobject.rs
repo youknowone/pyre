@@ -819,21 +819,54 @@ fn intern_dict(
     unsafe { &mut *table.0 }
 }
 
+/// Characters that fit in this many bytes probe from a stack STR; longer
+/// values still heap-allocate the temporary key.
+const INTERN_LOOKUP_STACK_BYTES: usize = 256;
+
+/// 8-aligned rstr `STR` header plus room for [`INTERN_LOOKUP_STACK_BYTES`]
+/// characters and the trailing NUL `LOWLEVEL_STR_BASE_SIZE` already counts.
+#[repr(C, align(8))]
+struct InternLookupProbe([u8; LOWLEVEL_STR_BASE_SIZE + INTERN_LOOKUP_STACK_BYTES]);
+
+fn intern_lookup_key(storage: *mut UnicodeValueStorage) -> Option<PyObjectRef> {
+    let key = crate::celldict::StrKey(storage);
+    let mut table = WEAK_INTERN.lock();
+    intern_dict(&mut table).ll_get(key)
+}
+
+/// Fill `buf` as an rstr `STR` whose `chars` are `bytes`, then `ll_get`.
+///
+/// # Safety
+/// `buf` is aligned for [`Utf8Str`], `buf_len` is `LOWLEVEL_STR_BASE_SIZE +
+/// bytes.len()`, and the `buf_len` bytes are writable. `ll_strhash` may
+/// write `STR.hash`.
+unsafe fn intern_lookup_in(bytes: &[u8], buf: *mut u8, buf_len: usize) -> Option<PyObjectRef> {
+    debug_assert_eq!(buf_len, LOWLEVEL_STR_BASE_SIZE + bytes.len());
+    unsafe {
+        (buf as *mut usize).write(0);
+        (buf.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(bytes.len());
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            buf.add(LOWLEVEL_STRING_CHARS_OFFSET),
+            bytes.len(),
+        );
+        buf.add(LOWLEVEL_STRING_CHARS_OFFSET + bytes.len()).write(0);
+        intern_lookup_key(buf as *mut UnicodeValueStorage)
+    }
+}
+
 /// Probe with a stack STR so `ll_get` takes `r_key`'s STR (`ll_get(d, llkey)`).
 fn intern_lookup(value: &Wtf8) -> Option<PyObjectRef> {
     let bytes = value.as_bytes();
-    let total = LOWLEVEL_STR_BASE_SIZE + bytes.len();
-    let mut buf = vec![0u8; total];
-    unsafe {
-        (buf.as_mut_ptr().add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(bytes.len());
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            buf.as_mut_ptr().add(LOWLEVEL_STRING_CHARS_OFFSET),
-            bytes.len(),
-        );
-        let key = crate::celldict::StrKey(buf.as_mut_ptr() as *mut UnicodeValueStorage);
-        let mut table = WEAK_INTERN.lock();
-        intern_dict(&mut table).ll_get(key)
+    let Some(total) = LOWLEVEL_STR_BASE_SIZE.checked_add(bytes.len()) else {
+        return None;
+    };
+    if bytes.len() <= INTERN_LOOKUP_STACK_BYTES {
+        let mut probe = std::mem::MaybeUninit::<InternLookupProbe>::uninit();
+        unsafe { intern_lookup_in(bytes, probe.as_mut_ptr() as *mut u8, total) }
+    } else {
+        let mut buf = vec![0u8; total];
+        unsafe { intern_lookup_in(bytes, buf.as_mut_ptr(), total) }
     }
 }
 
@@ -932,10 +965,29 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    if let Some(existing) = intern_lookup(unsafe { w_str_get_wtf8(obj) }) {
+    if let Some(existing) = intern_lookup_key(unsafe { w_str_storage(obj) }) {
         return existing;
     }
     intern_publish(obj)
+}
+
+/// Canonical interned exact `str` for `obj`'s value, one intern-table lookup.
+///
+/// A live interned identity is returned as-is. A miss is the immortal
+/// [`intern_wtf8_value`] publish.
+///
+/// # Safety
+/// `obj` must be an exact `str`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn intern_existing_str(obj: PyObjectRef) -> PyObjectRef {
+    debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
+    if let Some(existing) = intern_lookup_key(unsafe { w_str_storage(obj) }) {
+        return existing;
+    }
+    intern_publish_const(
+        w_str_from_wtf8_immortal(unsafe { w_str_get_wtf8(obj) }.to_owned()),
+        false,
+    )
 }
 
 /// `ObjSpace.new_interned_str(s)` — the process-wide canonical exact `str` for
@@ -986,7 +1038,7 @@ pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
 #[majit_macros::dont_look_inside]
 pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    intern_lookup(unsafe { w_str_get_wtf8(obj) }).is_some_and(|existing| existing == obj)
+    intern_lookup_key(unsafe { w_str_storage(obj) }).is_some_and(|existing| existing == obj)
 }
 
 /// Number of canonical strings owned by the process-wide intern table.
@@ -2019,7 +2071,9 @@ mod tests {
             // intern_str_value_returns_one_object
             let first = intern_str_value("startup-name");
             let second = intern_str_value("startup-name");
+            let from_obj = unsafe { intern_existing_str(w_str_new("startup-name")) };
             assert!(std::ptr::eq(first, second));
+            assert!(std::ptr::eq(first, from_obj));
             unsafe {
                 assert_eq!(w_str_get_wtf8(first), "startup-name");
                 assert_eq!(w_str_len(first), 12);
@@ -2035,6 +2089,16 @@ mod tests {
             unsafe {
                 assert_eq!(w_str_get_wtf8(hit), "fresh-key");
                 assert_eq!(w_str_len(hit), 9);
+            }
+        }
+        {
+            // intern_lookup_heap_probe_above_stack_threshold
+            let long = "L".repeat(INTERN_LOOKUP_STACK_BYTES + 1);
+            let first = intern_str_value(&long);
+            let second = intern_str_value(&long);
+            assert!(std::ptr::eq(first, second));
+            unsafe {
+                assert_eq!(w_str_len(first), INTERN_LOOKUP_STACK_BYTES + 1);
             }
         }
     }

@@ -1024,6 +1024,10 @@ pub struct MiniMarkGC {
     /// stale bit is not merely inherited, it is the same header the next major
     /// reads. See [`Self::note_nonmoving_young_mark`].
     oldgen_nonmoving_active: bool,
+    /// Set while `do_collect_full` drives a cycle it seeded itself. No
+    /// mutator runs between that seed and the end of MARKING, so every
+    /// extra-root slot still holds the value the seed already marked.
+    full_collect_owns_cycle: bool,
     /// The cycle now in sweep had its mark seam run with
     /// [`Self::oldgen_nonmoving_active`] set. Only that cycle may release
     /// unvisited young rawmallocs: a non-moving entry that first finishes a
@@ -1309,6 +1313,7 @@ impl MiniMarkGC {
             finalizer_lock: false,
             enabled: true,
             oldgen_nonmoving_active: false,
+            full_collect_owns_cycle: false,
             oldgen_nonmoving_marked: false,
             oldgen_nonmoving_young_marks: Vec::new(),
             rrc: rawrefcount::RawRefCount::default(),
@@ -5777,6 +5782,24 @@ impl MiniMarkGC {
     }
 
     fn seed_major_root(&mut self, gcref: GcRef, site: &str) {
+        self.seed_major_root_arming(gcref, site, true);
+    }
+
+    /// [`Self::seed_major_root`] for a value read out of the extra-root
+    /// walker. Those slots are process tables (type dicts, module dict cells,
+    /// builtin carriers), re-enumerated by every collection that needs them,
+    /// and none of them is a JITFRAME, so an object that already carried
+    /// `GCFLAG_TRACK_YOUNG_PTRS` is not armed into
+    /// `old_objects_pointing_to_young`: `IncrementalMiniMarkGC.visit` leaves
+    /// that list to the write barrier. One seeded without the flag (a young
+    /// non-moving object, or one the barrier already recorded) is still armed,
+    /// because the flag set here would otherwise hide its young pointers from
+    /// the next minor.
+    fn seed_major_extra_root(&mut self, gcref: GcRef, site: &str) {
+        self.seed_major_root_arming(gcref, site, false);
+    }
+
+    fn seed_major_root_arming(&mut self, gcref: GcRef, site: &str, arm_remembered: bool) {
         // `incminimark.py _collect_obj` performs NO probe on the root
         // word — the type system guarantees every `Ptr(GcStruct)` reaching
         // `_collect_ref_stk` is a real GC object, so the only tests are non-null
@@ -5837,7 +5860,7 @@ impl MiniMarkGC {
             // mutator barrier. Arm this newly seeded old root in the
             // existing old_objects_pointing_to_young shape once, so that
             // minor forwards any such spill before resetting nursery.
-            if !self.is_in_nursery(gcref.0) {
+            if (arm_remembered || !track_was_set) && !self.is_in_nursery(gcref.0) {
                 self.old_objects_pointing_to_young.push(gcref.0);
                 if crate::gc_lifetime_log_enabled() {
                     eprintln!(
@@ -6087,20 +6110,24 @@ impl MiniMarkGC {
         // root, so the list cannot move under the walk.
         let mut n_roots = 0usize;
         let mut census = RootCensus::new();
-        let mut seed = |gc: &mut Self, gcref: GcRef, site: &'static str| {
+        let mut seed = |gc: &mut Self, gcref: GcRef, site: &'static str, extra: bool| {
             n_roots += 1;
             census.note(site, gcref);
-            gc.seed_major_root(gcref, site);
+            if extra {
+                gc.seed_major_extra_root(gcref, site);
+            } else {
+                gc.seed_major_root(gcref, site);
+            }
         };
         let mut i = 0;
         while i < self.roots.roots.len() {
             let slot = self.roots.roots[i];
-            seed(self, unsafe { *slot }, "registered_root");
+            seed(self, unsafe { *slot }, "registered_root", false);
             i += 1;
         }
-        Self::walk_stack_shaped_roots(|gcref, site| seed(self, gcref, site));
+        Self::walk_stack_shaped_roots(|gcref, site| seed(self, gcref, site, false));
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
-            seed(self, *gcref, label);
+            seed(self, *gcref, label, true);
         });
         // Objects already moved to a death queue remain ordinary roots until
         // app-level code pops them. Registered live finalizers are deliberately
@@ -6111,7 +6138,7 @@ impl MiniMarkGC {
             let mut j = 0;
             while j < self.finalizer_handlers[h].deque.len() {
                 let addr = self.finalizer_handlers[h].deque[j];
-                seed(self, GcRef(addr), "finalizer_death_queue");
+                seed(self, GcRef(addr), "finalizer_death_queue", false);
                 j += 1;
             }
             h += 1;
@@ -6119,7 +6146,7 @@ impl MiniMarkGC {
         let mut k = 0;
         while k < self.run_old_style_finalizers.len() {
             let addr = self.run_old_style_finalizers[k];
-            seed(self, GcRef(addr), "old_style_finalizer_death_queue");
+            seed(self, GcRef(addr), "old_style_finalizer_death_queue", false);
             k += 1;
         }
         census.report(self.major_collections, self.prebuilt_root_objects.len());
@@ -6733,9 +6760,16 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
             i += 1;
         }
-        crate::shadow_stack::walk_extra_roots(|gcref| {
-            self.seed_major_root(*gcref, "rescan_extra_root");
-        });
+        // `collect_nonstack_roots` repeats the static roots because the
+        // mutator may have written them since `collect_roots`. A cycle that
+        // `do_collect_full` seeded and is finishing in the same call has had
+        // no mutator step, so the extra-root tables are the ones the seed
+        // walked and every value in them is already `GCFLAG_VISITED`.
+        if !self.full_collect_owns_cycle {
+            crate::shadow_stack::walk_extra_roots(|gcref| {
+                self.seed_major_extra_root(*gcref, "rescan_extra_root");
+            });
+        }
         // TLS exception cells live on the per-mutator frame area for the
         // first pass. Upstream's second `collect_nonstack_roots` still
         // repeats the non-stack carriers that can be written after the
@@ -8918,8 +8952,10 @@ impl MiniMarkGC {
         // the cycle with the finishing cycle's counters still in place.
         if self.gc_state == GcState::Scanning {
             self.major_collection_step();
+            self.full_collect_owns_cycle = self.gc_state == GcState::Marking;
         }
         self.gc_step_until_scanning_with_minors();
+        self.full_collect_owns_cycle = false;
 
         // incminimark.py:808.
         self.rrc_invoke_callback();
@@ -9181,6 +9217,15 @@ impl MiniMarkGC {
         // safe `write_barrier`/`gc_write_barrier` entry points, so guard null
         // before reading `header_of(obj)`; the card variant guards it likewise.
         if obj.is_null() || self.is_in_nursery(obj.0) {
+            return;
+        }
+        // incminimark `write_barrier` is the flag test alone. Both arms below
+        // act only when this same word has `TRACK_YOUNG_PTRS` set, so a clear
+        // bit answers for every family before the ownership question is
+        // asked; a set bit still has to be owned or witnessed.
+        if obj.0.is_multiple_of(GcHeader::ALIGN)
+            && unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
+        {
             return;
         }
         if self.is_managed_heap_object(obj.0) {

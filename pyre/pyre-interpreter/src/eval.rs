@@ -6213,55 +6213,63 @@ impl OpcodeStepExecutor for PyFrame {
         // bracket at the callee's activation, not from this dispatch.  The
         // test reads the raw callable, before the `_Method` unwrap below,
         // because upstream tests `w_func` at that same point.
-        let profiled_builtin = stack_items >= nargs + 2 && self.get_is_being_profiled() && {
-            let w_func = self.peekvalue_maybe_none(nargs + 1);
-            crate::function::is_builtin_code(w_func)
-        };
-        if stack_items >= nargs + 2 && !profiled_builtin {
-            let mut null_or_self = self.peekvalue_maybe_none(nargs);
-            let mut callable = self.peekvalue_maybe_none(nargs + 1);
-            // baseobjspace.py: `_Method` is not a generic callable
-            // here.  Reuse its null/self stack slot for `w_instance`, unwrap
-            // `w_function`, and continue through the identical Function
-            // valuestack path.  Module aliases such as `random.gauss =
-            // _inst.gauss` depend on this just as direct `obj.method()` calls
-            // do; allocating an Arguments Vec for every alias call diverges
-            // from PyPy's meta-traced interpreter shape.
-            if !callable.is_null()
-                && null_or_self.is_null()
-                && unsafe { pyre_object::is_method(callable) }
-            {
-                let receiver = unsafe { pyre_object::w_method_get_self(callable) };
-                let function = unsafe { pyre_object::w_method_get_func(callable) };
-                if !receiver.is_null()
-                    && !function.is_null()
-                    && unsafe { crate::is_function(function) }
+        if stack_items >= nargs + 2 {
+            // `stack_items >= nargs + 2` already proves both slots sit above
+            // `stack_base`, so `peekvalue` is the same read as
+            // `peekvalue_maybe_none` without the bounds re-check.
+            let mut callable = self.peekvalue(nargs + 1);
+            // `call_valuestack` tests `w_func` before the `_Method` unwrap
+            // below. The peek above is that same raw callable.
+            let profiled_builtin =
+                self.get_is_being_profiled() && crate::function::is_builtin_code(callable);
+            if !profiled_builtin {
+                let mut null_or_self = self.peekvalue(nargs);
+                // baseobjspace.py: `_Method` is not a generic callable
+                // here.  Reuse its null/self stack slot for `w_instance`, unwrap
+                // `w_function`, and continue through the identical Function
+                // valuestack path.  Module aliases such as `random.gauss =
+                // _inst.gauss` depend on this just as direct `obj.method()` calls
+                // do; allocating an Arguments Vec for every alias call diverges
+                // from PyPy's meta-traced interpreter shape.
+                let mut is_func = !callable.is_null() && unsafe { crate::is_function(callable) };
+                if !is_func
+                    && !callable.is_null()
+                    && null_or_self.is_null()
+                    && unsafe { pyre_object::is_method(callable) }
                 {
-                    self.settopvalue(receiver, nargs);
-                    null_or_self = receiver;
-                    callable = function;
+                    let receiver = unsafe { pyre_object::w_method_get_self(callable) };
+                    let function = unsafe { pyre_object::w_method_get_func(callable) };
+                    if !receiver.is_null()
+                        && !function.is_null()
+                        && unsafe { crate::is_function(function) }
+                    {
+                        self.settopvalue(receiver, nargs);
+                        null_or_self = receiver;
+                        callable = function;
+                        is_func = true;
+                    }
                 }
-            }
-            if !callable.is_null() && unsafe { crate::is_function(callable) } {
-                let methodcall = !null_or_self.is_null();
-                let call_nargs = nargs + usize::from(methodcall);
-                let anchor = FrameAnchor::new(self);
-                let result = crate::function::funccall_valuestack(
-                    callable,
-                    call_nargs,
-                    self,
-                    nargs + 2,
-                    methodcall,
-                );
-                if result.is_null() {
-                    return Err(crate::call::take_call_error()
-                        .unwrap_or_else(|| crate::PyError::type_error("call failed")));
+                if is_func {
+                    let methodcall = !null_or_self.is_null();
+                    let call_nargs = nargs + usize::from(methodcall);
+                    let anchor = FrameAnchor::new(self);
+                    let result = crate::function::funccall_valuestack(
+                        callable,
+                        call_nargs,
+                        self,
+                        nargs + 2,
+                        methodcall,
+                    );
+                    if result.is_null() {
+                        return Err(crate::call::take_call_error()
+                            .unwrap_or_else(|| crate::PyError::type_error("call failed")));
+                    }
+                    // baseobjspace.py `call_valuestack` self.pushvalue(w_result). The callee may
+                    // have relocated this frame via a minor collection, so push
+                    // onto the forwarded live frame, not the pre-call pointer.
+                    unsafe { &mut *anchor.live() }.push(result);
+                    return Ok(());
                 }
-                // baseobjspace.py:1256 self.pushvalue(w_result). The callee may
-                // have relocated this frame via a minor collection, so push
-                // onto the forwarded live frame, not the pre-call pointer.
-                unsafe { &mut *anchor.live() }.push(result);
-                return Ok(());
             }
         }
 

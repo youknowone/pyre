@@ -16293,6 +16293,7 @@ impl CodeWriter {
                     code_ptr as usize,
                     super::call::JIT_SHAPE_CONST_ENCODING_OVERFLOW,
                 );
+                pyre_interpreter::pycode::store_wrapper_jit_shape_overflow(code_ptr as *const ());
                 continue;
             };
             let key = code_ptr as usize;

@@ -795,6 +795,12 @@ pub struct PyCode {
     /// this address. The collector runs no `Drop`, so [`pycode_destructor`]
     /// reclaims the instance.
     pub w_globals_watchers: pyre_object::quasiimmut::QuasiImmutField,
+    /// Per-code result of the runtime frame-shape gate.
+    ///
+    /// 0 is uncomputed; a later fill stores `1 +` the shape discriminant.
+    /// `pycode.py` keeps per-code JIT state on `PyCode` (`jit_cells`); this
+    /// is the same owner for the pyre-only shape latch.
+    pub jit_shape: std::sync::atomic::AtomicU8,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -821,6 +827,11 @@ pub const ADDR2LINE_MEMO_EMPTY: i64 = i64::MIN;
 pub const CODE_CO_FIRSTLINENO_RAW_OFFSET: usize = std::mem::offset_of!(PyCode, co_firstlineno_raw);
 /// Field offset of `hidden_applevel` within `PyCode`.
 pub const CODE_HIDDEN_APPLEVEL_OFFSET: usize = std::mem::offset_of!(PyCode, hidden_applevel);
+
+/// `PyCode.jit_shape` before the first classification.
+pub const JIT_SHAPE_UNCOMPUTED: u8 = 0;
+/// Stored `jit_shape` for assembler overflow: `1 + ConstEncodingOverflow`.
+pub const JIT_SHAPE_STORED_CONST_ENCODING_OVERFLOW: u8 = 4;
 
 /// The `co_firstlineno` slot, exactly as [`code_get_field`] reads it.
 ///
@@ -1116,7 +1127,7 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     // Zero owner: this entry point's contract is that the body is never
     // released, so the wrapper takes no part in `CodeUnit` retirement.
-    w_code_new_owned(code_ptr, hidden_applevel, 0, &[])
+    w_code_new_owned(code_ptr, hidden_applevel, 0, &[], true)
 }
 
 /// [`w_code_new_with_hidden_applevel`] naming the `box_code_object` allocation
@@ -1178,6 +1189,7 @@ fn w_code_new_owned(
     hidden_applevel: bool,
     owner: usize,
     interned_name_slots: &[usize],
+    realize_consts: bool,
 ) -> PyObjectRef {
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
     // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
@@ -1332,6 +1344,7 @@ fn w_code_new_owned(
         }),
         loop_header_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         w_globals_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+        jit_shape: std::sync::atomic::AtomicU8::new(JIT_SHAPE_UNCOMPUTED),
     };
     // The raw-address JIT compatibility seam described above requires a
     // stable wrapper address. `malloc_typed_stable` is still a managed
@@ -1366,20 +1379,17 @@ fn w_code_new_owned(
             let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
             for index in 0..names_len {
                 // `pycode.py` `PyCode.__init__` stores `new_interned_str`.
-                // Marshal already interned `co_names` (`unmarshal_interned`).
-                // The shadow-stack slot is that object; interning the copied
-                // `String` again looks the same value up a second time.
+                // Marshal already produced the `str` (`str_from_value`); one
+                // intern-table lookup keeps a live interned identity or
+                // publishes the immortal miss. Interning the copied `String`
+                // after a separate interned-ness probe looked the same value
+                // up a second time.
                 let prebuilt = (interned_name_slots.len() == names_len)
                     .then(|| pyre_object::gc_roots::shadow_stack_get(interned_name_slots[index]));
                 let realized = match prebuilt {
-                    Some(obj)
-                        if !obj.is_null()
-                            && unsafe {
-                                pyre_object::unicodeobject::is_interned_exact_str(obj)
-                            } =>
-                    {
-                        obj
-                    }
+                    Some(obj) if !obj.is_null() => unsafe {
+                        pyre_object::unicodeobject::intern_existing_str(obj)
+                    },
                     _ => {
                         pyre_object::unicodeobject::intern_str_value(code_ref.names[index].as_ref())
                     }
@@ -1392,11 +1402,17 @@ fn w_code_new_owned(
         let table = unsafe { alloc_co_consts_array(consts_len) };
         let table_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(table as pyre_object::PyObjectRef);
-        for index in 0..consts_len {
-            let realized = unsafe { realize_code_constant(obj_slot, index) };
-            let table =
-                pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
-            unsafe { (*table).set_ref(index, realized) };
+        // Marshal fills `co_consts_w` from the decoded objects
+        // (`w_code_fill_wrapped_consts`); realizing compiler-boundary
+        // placeholders here would intern each string constant again and
+        // then throw the wrappers away.
+        if realize_consts {
+            for index in 0..consts_len {
+                let realized = unsafe { realize_code_constant(obj_slot, index) };
+                let table =
+                    pyre_object::gc_roots::shadow_stack_get(table_slot) as *mut FixedObjectArray;
+                unsafe { (*table).set_ref(index, realized) };
+            }
         }
         publish_code_slot_store(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let owner = pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut PyCode;
@@ -1464,13 +1480,14 @@ pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
 /// `name_slots` are shadow-stack indices of those interned strings, in
 /// `co_names` order. `pycode.py` `PyCode.__init__` would call
 /// `new_interned_str` on the same characters; a slot that is already that
-/// interned object is stored as-is.
+/// interned object is stored as-is. Compiler-boundary constants stay empty
+/// so the caller can store the decoded objects (`w_code_fill_wrapped_consts`).
 pub fn box_code_object_with_interned_name_slots(
     code: crate::CodeObject,
     name_slots: &[usize],
 ) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    w_code_new_owned(code_ptr, false, code_ptr as usize, name_slots)
+    w_code_new_owned(code_ptr, false, code_ptr as usize, name_slots, false)
 }
 
 /// [`box_code_object`] for the unit `gateway.py`'s `ApplevelClass` compiles,
@@ -1481,7 +1498,7 @@ pub fn box_code_object_with_hidden_applevel(
     hidden_applevel: bool,
 ) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    w_code_new_owned(code_ptr, hidden_applevel, code_ptr as usize, &[])
+    w_code_new_owned(code_ptr, hidden_applevel, code_ptr as usize, &[], true)
 }
 
 /// [`box_code_object`] for a caller that only has a borrow, which has to copy.
@@ -1527,7 +1544,7 @@ unsafe fn box_code_constant_in_place(
     hidden_applevel: bool,
     owner: usize,
 ) -> PyObjectRef {
-    w_code_new_owned(code as *const (), hidden_applevel, owner, &[])
+    w_code_new_owned(code as *const (), hidden_applevel, owner, &[], true)
 }
 
 /// Wrap a nested compiler constant and inherit the two things the enclosing
@@ -4260,6 +4277,21 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
         None => {
             wrappers.insert(code_ptr as usize, wrapper);
         }
+    }
+}
+
+/// Latch assembler overflow onto the live wrapper so the per-frame shape
+/// gate agrees with `CallControl.graph_jit_shapes` without a map probe.
+pub fn store_wrapper_jit_shape_overflow(code_ptr: *const ()) {
+    let w = live_code_wrapper(code_ptr);
+    if w.is_null() {
+        return;
+    }
+    unsafe {
+        (*(w as *const PyCode)).jit_shape.store(
+            JIT_SHAPE_STORED_CONST_ENCODING_OVERFLOW,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
