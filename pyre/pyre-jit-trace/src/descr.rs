@@ -10096,6 +10096,7 @@ mod tests {
         assert_ne!(owner_id, 0);
         assert_ne!(array_id, 0);
         let owner = BhSizeSpec {
+            owner: String::new(),
             size: 32,
             type_id: owner_id,
             vtable: 0,
