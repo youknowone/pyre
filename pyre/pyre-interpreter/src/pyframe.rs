@@ -6322,17 +6322,23 @@ impl PyFrame {
         // values here; after a collection only the gcmap/shadow slots are
         // forwarded, so never carry the original slice across that call.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure]);
-        let args_src = _roots.publish(args);
-        _roots.normalize(root_base, 3 + args.len());
+        let mut live = Vec::with_capacity(3 + args.len());
+        live.push(code as PyObjectRef);
+        live.push(w_globals);
+        live.push(closure);
+        live.extend_from_slice(args);
+        let root_base = _roots.pin_roots(&live);
         let w_builtin = crate::baseobjspace::frame_builtin_obj_checked(
             _roots.get(root_base + 1),
             execution_context,
         )?;
+        let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            current_args.push(_roots.get(root_base + 3 + i));
+        }
         Ok(Self::finish_for_call_with_globals_obj(
             _roots.get(root_base) as *const (),
-            args_src,
-            args.len(),
+            &current_args,
             _roots.get(root_base + 1),
             execution_context,
             _roots.get(root_base + 2),
@@ -6358,15 +6364,21 @@ impl PyFrame {
         allocation: FrameLocalsArrayAllocation,
     ) -> Self {
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure]);
-        let args_src = _roots.publish(args);
-        _roots.normalize(root_base, 3 + args.len());
+        let mut live = Vec::with_capacity(3 + args.len());
+        live.push(code as PyObjectRef);
+        live.push(w_globals);
+        live.push(closure);
+        live.extend_from_slice(args);
+        let root_base = _roots.pin_roots(&live);
         let w_builtin =
             crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context);
+        let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            current_args.push(_roots.get(root_base + 3 + i));
+        }
         Self::finish_for_call_with_globals_obj(
             _roots.get(root_base) as *const (),
-            args_src,
-            args.len(),
+            &current_args,
             _roots.get(root_base + 1),
             execution_context,
             _roots.get(root_base + 2),
@@ -6380,8 +6392,7 @@ impl PyFrame {
     /// so the fallible variant can propagate its error.
     fn finish_for_call_with_globals_obj(
         code: *const (),
-        args_src: usize,
-        args_len: usize,
+        args: &[PyObjectRef],
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
@@ -6399,15 +6410,10 @@ impl PyFrame {
         // theirs.
         //
         // Through the bracket's own cell rather than the free functions, which
-        // re-resolve the thread local on every call. Args are re-published
-        // from the outer bracket's already-forwarded slots, one word at a
-        // time, so this constructor allocates no heap Vec for rooting.
+        // re-resolve the thread local on every call.
         let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
-        let args_base = root_base + 4;
-        for i in 0..args_len {
-            let _ = _roots.publish(&[_roots.get(args_src + i)]);
-        }
-        _roots.normalize(root_base, 4 + args_len);
+        let args_base = _roots.publish(args);
+        _roots.normalize(root_base, 4 + args.len());
         let code_ref =
             unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
         let num_locals = code_ref.varnames.len();
@@ -6431,7 +6437,7 @@ impl PyFrame {
             // Reload the array after each collecting call (`w_cell_new`);
             // `set_ref` is `setarrayitem_gc` so an old spill remembers young
             // children.
-            let nargs = args_len.min(num_locals);
+            let nargs = args.len().min(num_locals);
             for i in 0..nargs {
                 let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
                 arr.set_ref(i, _roots.get(args_base + i));
