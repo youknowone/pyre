@@ -10163,6 +10163,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // still pending; `OperatorTail::Format` is the resume
                     // level that runs the same check when a guard inside the
                     // inlined body fails (`crate::operator_continuation`).
+                    // This GuardClass itself resumes at `op.pc`, so a deopt
+                    // re-runs FORMAT_WITH_SPEC. Emit it only over a body that
+                    // committed nothing, as the `Len` tail does.
+                    if fbw_executed_effect_count() != executed_effects_before {
+                        return resolved_inline_decline(op.pc, line!());
+                    }
                     let concrete = match concrete_for_shadow {
                         ConcreteValue::Ref(obj) if !obj.is_null() => obj,
                         _ => return resolved_inline_decline(op.pc, line!()),

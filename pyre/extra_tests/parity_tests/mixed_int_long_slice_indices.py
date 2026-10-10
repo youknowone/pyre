@@ -20,6 +20,30 @@ vals = (None, 2**100, -(2**100), 2**30, -(2**30), 2, -2, 0)
 lengths = (0, 50, 2**100)
 
 
+def indices_ref(start, stop, step, length):
+    if step is None:
+        step = 1
+    if step > 0:
+        defstart, defstop = 0, length
+        lo, hi = 0, length
+    else:
+        defstart, defstop = length - 1, -1
+        lo, hi = -1, length - 1
+
+    def conv(value, default):
+        if value is None:
+            return default
+        if value < 0:
+            value += length
+        if value < lo:
+            return lo
+        if value > hi:
+            return hi
+        return value
+
+    return (conv(start, defstart), conv(stop, defstop), step)
+
+
 def main():
     acc = 0
     n = 0
@@ -32,6 +56,9 @@ def main():
                     for length in lengths:
                         a = slice(start, stop, step).indices(length)
                         b = slice(start, stop, step).indices(length)
+                        expect = indices_ref(start, stop, step, length)
+                        if a != expect or b != expect:
+                            raise AssertionError((a, b, expect, start, stop, step, length))
                         acc += int(a == b)
                         acc += a[0] + a[1] + a[2]
         n += 1

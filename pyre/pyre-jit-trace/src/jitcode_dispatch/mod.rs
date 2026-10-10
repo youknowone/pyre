@@ -3598,6 +3598,11 @@ impl DispatchError {
     /// (`blackhole.py`) instead of falling to entry replay.  Missing-value
     /// classes stay false — converting those resumes on the hole the walker
     /// refused to read.
+    ///
+    /// `SubWalkClosedLoop`, `UnexpectedVoidSubReturn` and
+    /// `UnexpectedNonVoidSubReturn` fire in the caller's `inline_call`
+    /// handler after the callee residuals have already run. The latch
+    /// coordinate is that CALL, so converting would re-enter the body.
     pub(crate) fn can_convert_seeded_inline(&self) -> bool {
         if self.leaves_complete_image() {
             return true;
@@ -3606,10 +3611,7 @@ impl DispatchError {
             self,
             Self::AbortMarkerReached { .. }
                 | Self::AbortPermanentMarkerReached { .. }
-                | Self::SubWalkClosedLoop { .. }
                 | Self::PortalFrameTracerArmed { .. }
-                | Self::UnexpectedVoidSubReturn { .. }
-                | Self::UnexpectedNonVoidSubReturn { .. }
                 | Self::NotInTraceRequiresConcreteExecution { .. }
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
                 | Self::ConcreteShadowAllocationFailed { .. }
@@ -12719,7 +12721,13 @@ fn guarded_branch_core<Sym: WalkSym>(
                 // keeps only in an Int register, and replaying from the trace
                 // entry when it is absent double-applies prior residuals.
                 latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
-                ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+                // Stamp only at the root: a sub-walk raise must leave
+                // `abort_in_subwalk` clear so `claim_abort_coordinate` can
+                // own this pc. Overwrite a leftover true from a recovered
+                // nested walk when this is the portal.
+                if !ctx.fbw_mode.inline_subwalk {
+                    ctx.session.borrow_mut().abort_in_subwalk = false;
+                }
                 return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { pc: op.pc });
             }
         }
@@ -13847,9 +13855,12 @@ fn handle<Sym: WalkSym>(
             // inside an inlined callee is a callee coordinate the outer
             // walk's py_pc→jitcode tables cannot resolve, so the abort-point
             // flush must
-            // decline. Latch the value at the marker because the sub-walk's
-            // context is gone when the top-level driver reads the out-channel.
-            ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+            // decline. A sub-walk raise leaves `abort_in_subwalk` for
+            // `claim_abort_coordinate`; the root overwrites a leftover true
+            // so the driver cannot inherit a nested walk's flag.
+            if !ctx.fbw_mode.inline_subwalk {
+                ctx.session.borrow_mut().abort_in_subwalk = false;
+            }
             Err(DispatchError::AbortPermanentMarkerReached { pc: op.pc })
         }
         // `pyjitpl.py opimpl_getfield_raw_i`: `execute_with_descr(

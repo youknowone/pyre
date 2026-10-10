@@ -1348,15 +1348,19 @@ fn parent_resume_pc(
     if let Some(concrete) = parent.blackhole.as_ref() {
         return Some(concrete.resume_pc);
     }
+    if parent.call_jitcode_pc.is_none() {
+        return parent.resume_marker_jit_pc;
+    }
     let call_jit_pc = parent.call_jitcode_pc?;
     decode_op_at(&pjc.jitcode.code, call_jit_pc).map(|call| call.next_pc)
 }
 
 /// One paused caller as an `MIFrame`. Prefer the CALL-site blackhole capture;
 /// if that capture missed, reconstruct from the live banks `attach_live_caller`
-/// stored. Continuation tails (`descr_call`, operator) own no banks and stay
-/// declined — a chain with a missing level would deliver the callee return
-/// into the wrong caller's slot.
+/// stored. Continuation tails (`descr_call`, operator) own no banks: they
+/// still become their own `MIFrame` at `resume_marker_jit_pc`, which is what
+/// `_setup_return_value_r` (`blackhole.py`) needs so the dunder return lands
+/// in the tail rather than the caller's result slot.
 fn build_parent_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     parent: &InlineParentFrame,
@@ -1376,7 +1380,69 @@ fn build_parent_miframe<Sym: WalkSym>(
     if let Some(concrete) = parent.blackhole.as_ref() {
         return copy_captured_parent_blackhole(ctx, &pjc, concrete, origin, index);
     }
+    if parent.call_jitcode_pc.is_none()
+        && parent.registers_i.is_none()
+        && parent.registers_r.is_none()
+        && parent.registers_f.is_none()
+    {
+        return build_codeless_continuation_parent(ctx, parent, &pjc, origin, index);
+    }
     build_parent_miframe_from_live_banks(ctx, parent, &pjc, origin, index)
+}
+
+/// `descr_call` / operator tails: jitcode and resume pc only, no live banks.
+/// `ctor_continuation` keeps the instance in `INSTANCE_REG`; operator tails
+/// have nothing live (`get_list_of_active_boxes(in_a_call=True)`).
+fn build_codeless_continuation_parent<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent: &InlineParentFrame,
+    pjc: &crate::pyjitcode::PyJitCode,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let Some(resume_pc) = parent.resume_marker_jit_pc else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: continuation tail \
+                 has no resume_marker_jit_pc"
+            );
+        }
+        return None;
+    };
+    if !instruction_starts_at(&pjc.jitcode, resume_pc) {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: continuation \
+                 resume_pc={resume_pc} is not an instruction start"
+            );
+        }
+        return None;
+    }
+    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    if let Some(&instance) = parent.boxes.first() {
+        let color = crate::ctor_continuation::INSTANCE_REG as usize;
+        let Some(majit_ir::Value::Ref(gc)) = ctx.trace_ctx.concrete_of_opref(instance) else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: continuation \
+                     instance box has no concrete Ref"
+                );
+            }
+            return None;
+        };
+        if color >= miframe.ref_regs.len() {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[s2-build-decline] origin={origin} frame {index}: continuation \
+                     INSTANCE_REG {color} out of range (len {})",
+                    miframe.ref_regs.len()
+                );
+            }
+            return None;
+        }
+        miframe.ref_regs[color] = Some(OpRef::const_ptr(gc));
+    }
+    Some(miframe)
 }
 
 fn copy_captured_parent_blackhole<Sym: WalkSym>(
