@@ -5941,6 +5941,13 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "boolobject::FALSE_SINGLETON",
             pyre_object::w_bool_from(false) as usize as i64,
         ),
+        // `rlist.py _ll_prebuilt_empty_array`: the empty `items` block, read
+        // through `ll_prebuilt_empty_items_block` the way the singletons
+        // above are read through their accessors.
+        (
+            "object_array::PREBUILT_EMPTY_ITEMS_BLOCK",
+            pyre_object::object_array::ll_prebuilt_empty_items_block() as usize as i64,
+        ),
         // Process-wide StdObjSpace prebuilt (`baseobjspace.py` space).
         (
             "baseobjspace::OBJECT_SPACE",

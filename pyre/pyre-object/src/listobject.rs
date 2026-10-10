@@ -567,7 +567,7 @@ impl W_ListObject {
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
             let list = &mut *(obj as *mut W_ListObject);
             let old = list.items;
-            list.items = std::ptr::null_mut();
+            list.items = crate::object_array::ll_prebuilt_empty_items_block();
             dealloc_list_items_block(old);
             return Some(crate::gc_roots::shadow_stack_get(obj_slot));
         }
@@ -1680,7 +1680,8 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         list.set_length_relaxed(0);
-        list.items = std::ptr::null_mut();
+        // `ll_newemptylist`: `l.items = _ll_prebuilt_empty_array(...)`.
+        list.items = crate::object_array::ll_prebuilt_empty_items_block();
         list.strategy = ListStrategy::Object;
         let _ = W_ListObject::object_resize_capacity(obj, sizehint);
     }
