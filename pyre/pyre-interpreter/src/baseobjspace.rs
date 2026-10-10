@@ -22244,7 +22244,7 @@ pub unsafe fn generator_invoke_execute_frame(
     gen_obj: PyObjectRef,
     frame: &mut crate::pyframe::PyFrame,
     w_inputvalue: Option<PyObjectRef>,
-    operr: Option<PyError>,
+    mut operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
     prompt_finalization: bool,
 ) -> PyResult {
@@ -22261,13 +22261,28 @@ pub unsafe fn generator_invoke_execute_frame(
     let _ = pyre_object::gc_roots::pin_root(gen_obj);
     // No closure: `and_then` lowers to `target:closure.call`, a symbolic
     // hash the portal walk cannot execute.
-    let input_slot = match w_inputvalue {
-        Some(v) if !v.is_null() => {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(v);
-            Some(slot)
-        }
-        _ => None,
+    // `w_arg_or_err` is one GC local in `_invoke_execute_frame` /
+    // `execute_frame`. The sent value and a thrown `OperationError`
+    // (`error.py`) both occupy that local; publish them together on the
+    // caller bracket and reload both immediately before `execute_frame`.
+    let input_word = match w_inputvalue {
+        Some(v) if !v.is_null() => v,
+        _ => pyre_object::PY_NULL,
+    };
+    let operr_word = match operr.as_ref() {
+        Some(err) => err.as_raw() as PyObjectRef,
+        None => pyre_object::PY_NULL,
+    };
+    let payload_base = pyre_object::gc_roots::pin_roots(&[input_word, operr_word]);
+    let input_slot = if input_word.is_null() {
+        None
+    } else {
+        Some(payload_base)
+    };
+    let operr_slot = if operr_word.is_null() {
+        None
+    } else {
+        Some(payload_base + 1)
     };
     // `FrameAnchor::live` residualizes `&self` as a Ref. The anchor is one
     // word (the depth), so that Ref is the depth itself and the walk
@@ -22295,6 +22310,11 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
         None => None,
     };
+    if let Some(slot) = operr_slot
+        && let Some(err) = operr.as_mut()
+    {
+        *err = PyError::from_raw(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
     // `execute_generator_frame` is look-inside and dispatches through
     // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver

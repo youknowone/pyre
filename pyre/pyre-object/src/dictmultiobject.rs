@@ -1673,20 +1673,24 @@ pub fn w_dict_new_instance() -> PyObjectRef {
 /// this allocator so the first unicode setitem promotes the dict
 /// directly to `KwargsDictStrategy` (skipping the regular
 /// `UnicodeDictStrategy` intermediate).
+///
+/// Own graph so `fuse_boxing_alloc` rewrites the young
+/// `malloc_typed_managed` cluster to `new_with_vtable` + field stores
+/// (`allocate_and_init_instance` traces as plain malloc + setfields).
+/// `alloc_dict_object` stays `@dont_look_inside` for every other
+/// caller.
+#[inline(never)]
 pub fn w_dict_new_kwargs() -> PyObjectRef {
-    alloc_dict_object(
-        W_DictObject {
-            ob_header: PyObject {
-                ob_type: &DICT_TYPE as *const PyType,
-                w_class: get_instantiate(&DICT_TYPE),
-            },
-            dstorage: std::ptr::null_mut(),
-            dstrategy: &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF,
-            keys_version: 0,
-            clear_gen: 0,
+    crate::lltype::malloc_typed_managed(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &DICT_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_TYPE),
         },
-        false,
-    )
+        dstorage: std::ptr::null_mut(),
+        dstrategy: &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF,
+        keys_version: 0,
+        clear_gen: 0,
+    }) as PyObjectRef
 }
 
 /// `dictmultiobject.py W_DictObject(space, strategy, storage)` —

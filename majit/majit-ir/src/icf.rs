@@ -19,6 +19,11 @@
 //! shape as `black_box`) rather than an `asm!` terminator the ULLBC reader
 //! maps to `TermKind::Unknown`. wasm32 has no stable inline `asm!`; a
 //! volatile read of the const local is a single-location load.
+//!
+//! The translator erases that Call (`Lowering::is_icf_identity_token`):
+//! upstream `dont_look_inside` (`rpython/rlib/jit.py`) is metadata only, and
+//! `Transformer.rewrite_op_debug_assert` (`jtransform.py`) returns `[]` for
+//! an op with no effect on the traced program.
 
 /// FNV-1a of the helper path, used as the unique `const` asm immediate.
 pub const fn icf_path_hash(s: &str) -> u64 {

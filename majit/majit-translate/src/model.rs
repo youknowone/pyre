@@ -13507,6 +13507,183 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_lowers_young_alloc_dict_object() {
+        // `w_dict_new_kwargs` builds a `W_DictObject` aggregate and calls
+        // `malloc_typed_managed(agg)`.  The flavor match is the same
+        // `gc_malloc_flavor` path as `w_float_new`; this pass rewrites it
+        // to `NewWithVtable` plus the non-header setfields so the
+        // constructor's jitcode records (`allocate_and_init_instance`).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let dstorage = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let dstrategy = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        let keys_version = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let clear_gen = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_DictObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_DictObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_DictObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "dstorage",
+                LinkArg::Value(dstorage),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "dstrategy",
+                LinkArg::Value(dstrategy),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "keys_version",
+                LinkArg::Value(keys_version),
+                ValueType::Int,
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "clear_gen", LinkArg::Value(clear_gen), ValueType::Int),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_DictObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_DictObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("dstorage".to_string(), ValueType::Ref(None)),
+                    ("dstrategy".to_string(), ValueType::Ref(None)),
+                    ("keys_version".to_string(), ValueType::Int),
+                    ("clear_gen".to_string(), ValueType::Int),
+                ],
+            ),
+        ]);
+        let fused = fuse_boxing_alloc(&mut graph, &attrs);
+        assert_eq!(
+            fused, 1,
+            "young malloc_typed_managed W_DictObject must fuse"
+        );
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_DictObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must replace young malloc_typed_managed");
+        assert_eq!(ops[nwv_pos].result.as_ref(), Some(&ret));
+        let mut got: Vec<(String, ValueType)> = Vec::new();
+        for off in 1..=4 {
+            match &ops[nwv_pos + off].kind {
+                OpKind::FieldWrite {
+                    base, field, ty, ..
+                } => {
+                    assert_eq!(base, &ret);
+                    got.push((field.name.clone(), ty.clone()));
+                }
+                other => panic!("expected payload FieldWrite, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("dstorage".to_string(), ValueType::Ref(None)),
+                ("dstrategy".to_string(), ValueType::Ref(None)),
+                ("keys_version".to_string(), ValueType::Int),
+                ("clear_gen".to_string(), ValueType::Int),
+            ],
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed_managed")
+            )),
+            "young malloc_typed_managed must not survive the fusion"
+        );
+    }
+
+    #[test]
     fn fuse_boxing_alloc_lowers_a_header_that_declares_no_class_word() {
         // Fusion normally proves that the per-instance `w_class` agrees with
         // `ob_type`. A layout without that field has no class word to compare,

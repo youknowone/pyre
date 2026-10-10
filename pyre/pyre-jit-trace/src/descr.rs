@@ -2369,21 +2369,21 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 /// Dict storage descriptors, read after a trace has pinned the live strategy.
 ///
-/// `dstrategy_word`, `dstorage_lookup_ns` and `dstorage_as_gcref` are the
-/// raw-word views. `gc_cache().get_field_descr` is keyed by
-/// `(struct_key, field_name)` and a cache hit returns that descriptor with
-/// the caller's declared type ignored, so each view keeps its own key and
-/// its own type.
+/// Positional `all_fielddescrs` is the heaptracker walk (`heaptracker.py
+/// all_fielddescrs`): the struct's own field names in offset order
+/// (`dstorage`, `dstrategy`, `keys_version`, `clear_gen`), with the
+/// inherited class word prepended by the group factory. `newdict_empty` and
+/// `w_dict_new_kwargs` store those fields, and `force_box` writes a virtual
+/// field back through the slot `derive_index_in_parent` finds for its name.
 ///
-/// `newdict_empty` stores the struct's own fields (`dstorage`, `dstrategy`,
-/// `keys_version`, `clear_gen`). `force_box` writes a virtual field back
-/// through `all_fielddescrs[index]`, and that index is the slot
-/// `derive_index_in_parent` finds for the field's name. Those four names
-/// therefore occupy slots in this list, after the three views, so
-/// `dict_strategy_word_descr`, `dict_lookup_namespace_descr` and
-/// `dict_dstorage_descr` keep census indices 0, 1 and 2. `dstorage` and
-/// `dstrategy` are `Ref`, matching `newdict_empty`'s `setfield_gc_r`;
-/// `keys_version` and `clear_gen` are unsigned `Int`.
+/// `dstorage` is the GC storage box (`Type::Ref`, FLAG_POINTER from
+/// `runtime_array_flag`). `dstrategy` is the static singleton pointer
+/// (`kwargsdict.py` immortal strategy): constructors write it as a `Ref`
+/// (`setfield_gc_r`) and the group field uses the same FLAG_POINTER, one
+/// coherent pointer descr. `dstrategy_word` / `dstorage_lookup_ns` are
+/// distinct Int cache keys minted outside the group by
+/// `mint_w_dict_int_alias`, so `getfield_gc_i` folds and the `dict.lookup`
+/// oopspec keep their identity without occupying a virtual slot.
 static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE,
@@ -2391,39 +2391,9 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_object::pyobject::DICT_TYPE as *const _ as usize,
         &[
             (
-                "dstrategy_word",
-                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstrategy),
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "dstorage_lookup_ns",
-                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            // Fold read of the storage word as a `Ref`. The key stays off the
-            // Rust field name: that name is the constructor entry below, and
-            // one `(struct_key, field_name)` slot holds one type.
-            (
-                "dstorage_as_gcref",
-                std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
-                std::mem::size_of::<usize>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
                 "dstorage",
                 std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
-                std::mem::size_of::<usize>(),
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2432,7 +2402,7 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "dstrategy",
                 std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstrategy),
-                std::mem::size_of::<usize>(),
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2459,6 +2429,48 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         ],
         "W_DictObject",
         "dictmultiobject::W_DictObject",
+    )
+});
+
+fn mint_w_dict_int_alias(field_key: &str, display: &str, offset: usize) -> DescrRef {
+    let _ = &*W_DICT_DESCR_GROUP;
+    let struct_key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(
+        "dictmultiobject::W_DictObject",
+    ));
+    let mut gc = majit_ir::descr::gc_cache().lock();
+    gc.get_field_descr(
+        struct_key,
+        field_key,
+        Some(display),
+        offset,
+        WORD,
+        Type::Int,
+        false,
+        false,
+        runtime_array_flag(Type::Int, false),
+        stable_field_index(offset, WORD, Type::Int, false),
+        false,
+        None,
+    ) as DescrRef
+}
+
+/// `dict.lookup` oopspec `extradescrs[0]` (`heap.py descrs[0]`).  A
+/// distinct `(STRUCT, fieldname)` slot from positional `dstorage` so the
+/// oopspec's identity is not the GC-ref view the constructor writes.
+static W_DICT_LOOKUP_NS_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    mint_w_dict_int_alias(
+        "dstorage_lookup_ns",
+        "W_DictObject.dstorage_lookup_ns",
+        std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstorage),
+    )
+});
+
+/// Int view of `dstrategy` for `getfield_gc_i` / `GuardValue` folds.
+static W_DICT_STRATEGY_WORD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    mint_w_dict_int_alias(
+        "dstrategy_word",
+        "W_DictObject.dstrategy_word",
+        std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, dstrategy),
     )
 });
 
@@ -4147,30 +4159,25 @@ pub fn w_function_size_descr() -> DescrRef {
 /// (`dictmultiobject.py`). Read as a `Ref` only after the trace has pinned
 /// the strategy through [`dict_strategy_word_descr`], because what the pointer
 /// addresses is whatever the live strategy erased into it.
-/// Reached by census index rather than by offset: `dstorage_lookup_ns` covers
-/// the same word as an `Int`, and `field_descr_from_parent_by_offset` returns
-/// the first descr at an offset, so the offset form would hand back the `Int`
-/// view and silently mis-type the read.
 pub fn dict_dstorage_descr() -> DescrRef {
-    field_descr_from_group(&W_DICT_DESCR_GROUP, 2)
+    field_descr_from_group(&W_DICT_DESCR_GROUP, 0)
 }
 
 /// `W_DictObject.dstrategy` as a raw word, for the `GuardValue` that pins a
-/// dict to one strategy singleton.  The census key is deliberately not the
-/// struct field name — see the group's doc comment.
+/// dict to one strategy singleton.
 ///
 /// `keys_version` is not an alternative for that guard — `MapDictStrategy`
 /// never bumps it, which is why the `dict.get` fold declines a Map-backed
 /// dictionary outright.
 pub fn dict_strategy_word_descr() -> DescrRef {
-    field_descr_from_group(&W_DICT_DESCR_GROUP, 0)
+    W_DICT_STRATEGY_WORD_DESCR.clone()
 }
 
 /// The cache-namespace half of the `dict.lookup` oopspec's `extradescrs`
 /// (`heap.py descrs[0]`), naming the entry table a lookup probes.
 /// Only its identity is read; the slot is never loaded.
 pub fn dict_lookup_namespace_descr() -> DescrRef {
-    field_descr_from_group(&W_DICT_DESCR_GROUP, 1)
+    W_DICT_LOOKUP_NS_DESCR.clone()
 }
 
 /// `extradescrs[1]` — the entry-array descr `_optimize_CALL_DICT_LOOKUP`
@@ -11062,6 +11069,8 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("dictmultiobject::W_DictObject", || {
         LazyLock::force(&W_DICT_DESCR_GROUP);
+        LazyLock::force(&W_DICT_LOOKUP_NS_DESCR);
+        LazyLock::force(&W_DICT_STRATEGY_WORD_DESCR);
     }),
     ("celldict::ObjectMutableCell", || {
         LazyLock::force(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP);

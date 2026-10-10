@@ -2056,6 +2056,7 @@ mod tests {
 
     #[test]
     fn string_length_uses_ascii_byte_count() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
         {
             // managed_string_length_uses_ascii_byte_count
             let ascii = w_str_from_wtf8_managed(Wtf8Buf::from("stat_result"));
@@ -2098,6 +2099,7 @@ mod tests {
 
     #[test]
     fn intern_str_value_and_table_key() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
         {
             // intern_str_value_returns_one_object
             let first = intern_str_value("startup-name");
@@ -2345,6 +2347,7 @@ mod tests {
 
     #[test]
     fn test_box_str_constant_reuses_same_object() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
         let a = box_str_constant(Wtf8::new("pyre"));
         let b = box_str_constant(Wtf8::new("pyre"));
         assert_eq!(a, b);
@@ -2352,6 +2355,7 @@ mod tests {
 
     #[test]
     fn interned_str_from_const_ptr_finds_wrapper_by_str_key() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
         let value = Wtf8::new("__pyre_const_ptr_immortal_9c1e__");
         let wrapper = box_str_constant(value);
         let storage = unsafe { w_str_storage(wrapper) as usize };
@@ -2362,6 +2366,7 @@ mod tests {
 
     #[test]
     fn test_get_interned_wtf8_is_lookup_only_and_returns_canonical_object() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
         let missing = Wtf8::new("__pyre_lookup_only_missing_4f52d7d0__");
         assert!(get_interned_wtf8(missing).is_none());
         assert!(get_interned_wtf8(missing).is_none());
@@ -2572,5 +2577,292 @@ mod tests {
                 "-9223372036854775808",
             );
         }
+    }
+
+    thread_local! {
+        static INTERN_TEST_GC: std::cell::Cell<*mut majit_gc::collector::MiniMarkGC> =
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
+        static WALK_INTERN_TABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn intern_test_gc_ptr() -> *mut majit_gc::collector::MiniMarkGC {
+        INTERN_TEST_GC.with(|cell| cell.get())
+    }
+
+    /// `unicode_object_custom_trace` analogue for this collector: grey a
+    /// managed `_utf8` / index table, skip immortal `malloc_raw` payloads.
+    unsafe fn intern_test_unicode_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+        let unicode = unsafe { &mut *(obj_addr as *mut W_UnicodeObject) };
+        f(&mut unicode.ob_header.w_class as *mut PyObjectRef as *mut majit_ir::GcRef);
+        if !unicode.value.is_null() && crate::gc_hook::try_gc_owns_object(unicode.value as *mut u8)
+        {
+            f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
+        }
+        if !unicode.index_storage.is_null()
+            && crate::gc_hook::try_gc_owns_object(unicode.index_storage as *mut u8)
+        {
+            f(std::ptr::addr_of_mut!(unicode.index_storage) as *mut majit_ir::GcRef);
+        }
+    }
+
+    fn intern_table_extra_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !WALK_INTERN_TABLE.with(|flag| flag.get()) {
+            return;
+        }
+        walk_interned_strings_gc(&mut |slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        });
+    }
+
+    fn intern_test_gc_alloc(type_id: u32, payload_size: usize) -> *mut u8 {
+        let gc = intern_test_gc_ptr();
+        if gc.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { (*gc).alloc_with_type_no_collect(type_id, payload_size).0 as *mut u8 }
+    }
+
+    unsafe fn intern_test_gc_alloc_collecting_rooted(
+        type_id: u32,
+        payload_size: usize,
+        _root: *mut *mut u8,
+        needs_write_barrier: *mut bool,
+    ) -> *mut u8 {
+        if !crate::gc_hook::hook_test_effects_visible() {
+            return std::ptr::null_mut();
+        }
+        let gc = intern_test_gc_ptr();
+        if gc.is_null() {
+            return std::ptr::null_mut();
+        }
+        let obj = unsafe { (*gc).alloc_with_type_no_collect(type_id, payload_size) };
+        if obj.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe {
+            *needs_write_barrier = !(*gc).is_in_nursery(obj.0);
+        }
+        obj.0 as *mut u8
+    }
+
+    fn intern_test_gc_write_barrier(obj: *mut u8) {
+        if !crate::gc_hook::hook_test_effects_visible() {
+            return;
+        }
+        let gc = intern_test_gc_ptr();
+        if gc.is_null() {
+            return;
+        }
+        unsafe { (*gc).do_write_barrier(majit_ir::GcRef(obj as usize)) };
+    }
+
+    fn intern_test_gc_owns_object(addr: usize) -> bool {
+        if !crate::gc_hook::hook_test_effects_visible() {
+            return false;
+        }
+        let gc = intern_test_gc_ptr();
+        if gc.is_null() {
+            return false;
+        }
+        unsafe { (*gc).is_managed_heap_object(addr) }
+    }
+
+    fn pad_type_ids_until(gc: &mut majit_gc::collector::MiniMarkGC, target: u32) {
+        loop {
+            let id = gc.register_type(majit_gc::TypeInfo::simple(8));
+            if id + 1 >= target {
+                break;
+            }
+        }
+    }
+
+    fn with_intern_test_gc<R>(f: impl FnOnce(&mut majit_gc::collector::MiniMarkGC) -> R) -> R {
+        let gc = intern_test_gc_ptr();
+        assert!(!gc.is_null(), "intern test MiniMarkGC");
+        f(unsafe { &mut *gc })
+    }
+
+    struct InternGcGuard {
+        saved_table: *mut crate::rweakvaldict::WeakDict<crate::celldict::StrKey>,
+    }
+
+    impl Drop for InternGcGuard {
+        fn drop(&mut self) {
+            WALK_INTERN_TABLE.with(|flag| flag.set(false));
+            {
+                let mut table = WEAK_INTERN.lock();
+                table.0 = self.saved_table;
+            }
+            let gc = INTERN_TEST_GC.with(|cell| cell.replace(std::ptr::null_mut()));
+            if !gc.is_null() {
+                unsafe { drop(Box::from_raw(gc)) };
+            }
+            crate::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+            crate::gc_hook::clear_gc_write_barrier_hook();
+            crate::gc_hook::clear_gc_write_barrier_managed_hook();
+            crate::gc_hook::clear_gc_owns_object_hook();
+            crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
+            crate::rweakvaldict::set_weakdict_gc_type_id(0);
+            crate::rweakvaldict::set_weakdict_entries_gc_type_id(0);
+        }
+    }
+
+    /// Drive `intern_exact_str` / `intern_publish` on a young exact str through
+    /// a real MiniMark minor: `ll_set_nonnull_valueref` write-barriers the
+    /// intern `WEAKDICTENTRYARRAY`, `collect_oldrefs_to_nursery` copies the
+    /// young WEAKREF, and `invalidate_young_weakrefs` rewrites `weakptr`.
+    /// After the root is dropped, minor + major leave `ll_get` returning null.
+    #[test]
+    fn intern_exact_str_young_survives_minor_then_drops_after_major() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        assert!(
+            crate::gc_interp::enabled(),
+            "managed intern falls back to immortal while gc_interp is off"
+        );
+
+        let mut gc = majit_gc::collector::MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+            nursery_size: 64 * 1024,
+            large_object_threshold: 32 * 1024,
+            ..majit_gc::collector::GcConfig::default()
+        });
+        pad_type_ids_until(&mut gc, W_UNICODE_GC_TYPE_ID);
+        let unicode_tid = gc.register_type(majit_gc::TypeInfo::with_custom_trace(
+            W_UNICODE_OBJECT_SIZE,
+            intern_test_unicode_trace,
+        ));
+        assert_eq!(unicode_tid, W_UNICODE_GC_TYPE_ID);
+        pad_type_ids_until(&mut gc, crate::weakref::WEAKREF_GC_TYPE_ID);
+        let weakref_tid = gc.register_type(majit_gc::TypeInfo::weakref());
+        assert_eq!(weakref_tid, crate::weakref::WEAKREF_GC_TYPE_ID);
+        let str_tid = gc.register_type(majit_gc::TypeInfo::varsize(
+            LOWLEVEL_STR_BASE_SIZE,
+            1,
+            LOWLEVEL_STRING_LEN_OFFSET,
+            false,
+            Vec::new(),
+        ));
+        crate::lowlevel_string::set_lowlevel_str_gc_type_id(str_tid);
+        let weakdict_tid = gc.register_type(majit_gc::TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<crate::rweakvaldict::WeakDict<crate::celldict::StrKey>>(),
+            vec![std::mem::offset_of!(
+                crate::rweakvaldict::WeakDict<crate::celldict::StrKey>,
+                entries
+            )],
+        ));
+        crate::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
+        let entries_tid = gc.register_type(majit_gc::TypeInfo::varsize_with_gc_ptr_offsets(
+            std::mem::offset_of!(
+                crate::rweakvaldict::WeakDictEntries<crate::celldict::StrKey>,
+                items
+            ),
+            std::mem::size_of::<crate::rweakvaldict::WeakDictEntry<crate::celldict::StrKey>>(),
+            std::mem::offset_of!(
+                crate::rweakvaldict::WeakDictEntries<crate::celldict::StrKey>,
+                length
+            ),
+            vec![
+                std::mem::offset_of!(
+                    crate::rweakvaldict::WeakDictEntry<crate::celldict::StrKey>,
+                    key
+                ),
+                std::mem::offset_of!(
+                    crate::rweakvaldict::WeakDictEntry<crate::celldict::StrKey>,
+                    value
+                ),
+            ],
+            vec![],
+        ));
+        crate::rweakvaldict::set_weakdict_entries_gc_type_id(entries_tid);
+
+        INTERN_TEST_GC.with(|cell| {
+            cell.set(Box::into_raw(Box::new(gc)));
+        });
+        crate::gc_hook::register_gc_alloc_hook(intern_test_gc_alloc);
+        crate::gc_hook::register_gc_alloc_stable_hook(intern_test_gc_alloc);
+        crate::gc_hook::register_gc_alloc_collecting_rooted_hook(
+            intern_test_gc_alloc_collecting_rooted,
+        );
+        crate::gc_hook::register_gc_write_barrier_hook(intern_test_gc_write_barrier);
+        crate::gc_hook::register_gc_write_barrier_managed_hook(intern_test_gc_write_barrier);
+        crate::gc_hook::register_gc_owns_object_hook(intern_test_gc_owns_object);
+        majit_gc::shadow_stack::register_extra_root_walker(
+            intern_table_extra_root_walker,
+            "intern_test_weak_intern",
+        );
+        WALK_INTERN_TABLE.with(|flag| flag.set(true));
+
+        let saved_table = {
+            let mut table = WEAK_INTERN.lock();
+            let old = table.0;
+            table.0 = std::ptr::null_mut();
+            old
+        };
+        let _guard = InternGcGuard { saved_table };
+        init_interned_strings();
+        // Promote the intern WEAKDICT / entries so `intern_publish` stores a
+        // young WEAKREF into an old array (`setarrayitem_gc` / `barrier_entries`).
+        with_intern_test_gc(|gc| gc.do_collect_nursery());
+
+        let first = Wtf8::new("__pyre_intern_gc_young_a_i2b__");
+        let managed = w_str_from_wtf8_managed(first.to_owned());
+        assert!(crate::gc_hook::try_gc_owns_object(managed as *mut u8));
+        assert!(with_intern_test_gc(|gc| gc.is_in_nursery(managed as usize)));
+        let interned = unsafe { intern_exact_str(managed) };
+        assert_eq!(interned, managed);
+        assert!(with_intern_test_gc(|gc| gc.is_in_nursery(interned as usize)));
+
+        let mut interned_root = majit_ir::GcRef(interned as usize);
+        with_intern_test_gc(|gc| {
+            unsafe { gc.roots.add(&mut interned_root) };
+            gc.do_collect_nursery();
+        });
+        assert_ne!(
+            interned_root.0, interned as usize,
+            "rooted interned str must move out of the nursery"
+        );
+        assert!(!with_intern_test_gc(|gc| gc.is_in_nursery(interned_root.0)));
+        assert_eq!(
+            get_interned_wtf8(first).map(|obj| obj as usize),
+            Some(interned_root.0),
+            "invalidate_young_weakrefs must rewrite the intern weakptr"
+        );
+        let again = unsafe { intern_exact_str(w_str_from_wtf8_managed(first.to_owned())) };
+        assert_eq!(again as usize, interned_root.0);
+
+        // Repeated minor after the remembered-set reset: a second young
+        // WEAKREF stored into the now-old entries array.
+        let second = Wtf8::new("__pyre_intern_gc_young_b_i2b__");
+        let managed_b = w_str_from_wtf8_managed(second.to_owned());
+        assert!(with_intern_test_gc(
+            |gc| gc.is_in_nursery(managed_b as usize)
+        ));
+        let interned_b = unsafe { intern_exact_str(managed_b) };
+        assert_eq!(interned_b, managed_b);
+        let mut interned_b_root = majit_ir::GcRef(interned_b as usize);
+        with_intern_test_gc(|gc| {
+            unsafe { gc.roots.add(&mut interned_b_root) };
+            gc.do_collect_nursery();
+        });
+        assert_ne!(interned_b_root.0, interned_b as usize);
+        assert_eq!(
+            get_interned_wtf8(second).map(|obj| obj as usize),
+            Some(interned_b_root.0)
+        );
+        assert_eq!(
+            get_interned_wtf8(first).map(|obj| obj as usize),
+            Some(interned_root.0)
+        );
+
+        with_intern_test_gc(|gc| {
+            gc.roots.remove(&mut interned_root);
+            gc.roots.remove(&mut interned_b_root);
+            gc.do_collect_nursery();
+            gc.do_collect_full();
+        });
+        assert!(
+            get_interned_wtf8(first).is_none(),
+            "ll_get must miss a dead intern weakref"
+        );
+        assert!(get_interned_wtf8(second).is_none());
     }
 }

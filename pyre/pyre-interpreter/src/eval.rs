@@ -2590,11 +2590,102 @@ pub fn prepare_frame_resume_for_dispatch(
     }
 }
 
+/// Shadow-stack stand-in for `pyframe.py execute_frame`'s live `w_arg_or_err`.
+///
+/// RPython keeps that local rooted from graph entry through `call_trace` and
+/// `resume_execute_frame` (`execute_frame.insert_stack_check_here`;
+/// `shadowstack.py` inserts the root at every collection). One bracket covers
+/// the whole span; each allocating call is followed by a reload from the slot.
+///
+/// Construction and reload are macros (`pin_resume_args!` /
+/// `reload_resume_args!`) so they expand into the already-translated caller
+/// (`execute_frame`, `eval_with_jit_inner`) rather than becoming their own
+/// graphs. Upstream has no helper type: the local is a GC pointer and the
+/// transformer writes the root.
+pub struct ResumeArgPins {
+    pub roots: pyre_object::gc_roots::RootScope,
+    pub input_slot: Option<usize>,
+    pub operr_slot: Option<usize>,
+}
+
+/// Open the `w_arg_or_err` bracket on `resume` and reload the locals from
+/// the slots. Expands in the caller so `try_pin` is not a FunDecl.
+#[macro_export]
+macro_rules! pin_resume_args {
+    ($resume:expr) => {{
+        let input_word = match $resume.w_inputvalue {
+            Some(v) if !v.is_null() => v,
+            _ => pyre_object::PY_NULL,
+        };
+        let operr_word = match $resume.operr.as_ref() {
+            Some(err) => err.as_raw() as pyre_object::PyObjectRef,
+            None => pyre_object::PY_NULL,
+        };
+        if input_word.is_null() && operr_word.is_null() {
+            None
+        } else {
+            let roots = pyre_object::gc_roots::push_roots();
+            // One publish+normalize for the whole live set: sequential
+            // `pin_root` would query after the first write and leave the
+            // later value invisible to a foreign collection
+            // (`RootScope::pin_roots`).
+            let base = roots.pin_roots(&[input_word, operr_word]);
+            let pins = $crate::eval::ResumeArgPins {
+                roots,
+                input_slot: if input_word.is_null() {
+                    None
+                } else {
+                    Some(base)
+                },
+                operr_slot: if operr_word.is_null() {
+                    None
+                } else {
+                    Some(base + 1)
+                },
+            };
+            $crate::reload_resume_args!(Some(&pins), $resume);
+            Some(pins)
+        }
+    }};
+}
+
+/// `shadowstack.py expand_pop_roots`: the local after a collecting call is
+/// the slot, not the word from before the call.
+#[macro_export]
+macro_rules! reload_resume_args {
+    ($pins:expr, $resume:expr) => {{
+        if let Some(pins) = $pins {
+            if let Some(slot) = pins.input_slot {
+                let current = pins.roots.get(slot);
+                $resume.w_inputvalue = if current.is_null() {
+                    None
+                } else {
+                    Some(current)
+                };
+            }
+            if let Some(slot) = pins.operr_slot
+                && let Some(err) = $resume.operr.as_mut()
+            {
+                err.reload(&pins.roots, slot);
+            }
+        }
+    }};
+}
+
+/// [`reload_resume_args!`] when the resume payload itself is `Option`.
+#[macro_export]
+macro_rules! reload_resume_args_opt {
+    ($pins:expr, $resume_opt:expr) => {{
+        if let Some(resume) = ($resume_opt).as_mut() {
+            $crate::reload_resume_args!($pins, resume);
+        }
+    }};
+}
+
 pub(crate) fn eval_frame_plain_with_resume(
     frame: &mut PyFrame,
-    w_inputvalue: Option<PyObjectRef>,
-    operr: Option<PyError>,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
+    resume: &mut crate::call::FrameResumeArgs,
+    pins: Option<&ResumeArgPins>,
 ) -> PyResult {
     // Spend one unit of the recursion budget on this frame's activation and
     // give it back when it returns.  Every Python frame costs the same unit —
@@ -2602,14 +2693,11 @@ pub(crate) fn eval_frame_plain_with_resume(
     // depth `stack_check()` reads is the number of live Python frames.
     let _recursion_depth = crate::call::enter_recursive_frame(frame);
     frame.fix_array_ptrs();
-    let mut resume = crate::call::FrameResumeArgs {
-        w_inputvalue,
-        operr,
-        throw_args,
-    };
+    crate::reload_resume_args!(pins, resume);
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {
-        if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
+        crate::reload_resume_args!(pins, resume);
+        if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
             return Ok(value);
         }
         return eval_loop(frame, ec);
@@ -2627,6 +2715,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     // abandoned copy after the first callback; the JIT portal re-reads through
     // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`.
     let frame_anchor = FrameAnchor::new(frame);
+    crate::reload_resume_args!(pins, resume);
     let mut got_exception = true;
     // pyframe.py PyFrame.execute_frame parity:
     //   try:
@@ -2646,44 +2735,18 @@ pub(crate) fn eval_frame_plain_with_resume(
     // overrides eval-body, leave overrides everything).
     let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
-        // The sent `OperationError` is a GC object there (`error.py`). Pin
-        // the handle across the hook and write it back before the resume
-        // reads it. `w_inputvalue` is `resume_execute_frame`'s `w_arg_or_err`
-        // (`pyframe.py`); the hook can move it, so the shadow-stack slot is
-        // the live word after `call_trace`.
-        let input_pin = resume.w_inputvalue.map(|value| {
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = roots.base();
-            let _ = roots.pin_root(value);
-            (roots, slot)
-        });
-        if let Some(err) = resume.operr.take() {
-            let roots = pyre_object::gc_roots::push_roots();
-            let mut err = err;
-            let slot = err.pin(&roots);
-            let trace = execution_context.call_trace(frame_anchor.live());
-            err.reload(&roots, slot);
-            resume.operr = Some(err);
-            drop(roots);
-            if let Err(e) = trace {
-                drop(input_pin);
-                return (Err(e), pyre_object::w_none());
-            }
-        } else if let Err(e) = execution_context.call_trace(frame_anchor.live()) {
-            drop(input_pin);
+        // The sent value and `OperationError` (`error.py`) are GC locals
+        // there (`w_arg_or_err`). The caller's `ResumeArgPins` already
+        // roots them from `stack_check` through this hook and the resume.
+        let trace = execution_context.call_trace(frame_anchor.live());
+        crate::reload_resume_args!(pins, resume);
+        if let Err(e) = trace {
             return (Err(e), pyre_object::w_none());
-        }
-        if let Some((roots, slot)) = &input_pin {
-            let current = roots.get(*slot);
-            resume.w_inputvalue = if current.is_null() {
-                None
-            } else {
-                Some(current)
-            };
         }
         let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };
-            if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
+            crate::reload_resume_args!(pins, resume);
+            if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
                 return Ok(value);
             }
             let frame = unsafe { &mut *frame_anchor.live() };

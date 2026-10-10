@@ -14,7 +14,7 @@ use majit_translate::{
     front::mir::{
         build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, lower_function,
     },
-    model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType},
+    model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
 };
 
 const OBJECT_LLBC: &str = concat!(
@@ -294,5 +294,137 @@ fn scalar_pointer_params_match_int_callers() {
             .map(|function| format!("{} {:?}", function.name, input_types(function.graph())))
             .collect::<Vec<_>>()
             .join("; ")
+    );
+}
+
+fn call_segments(target: &CallTarget) -> Option<&[String]> {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => Some(segments.as_slice()),
+        _ => None,
+    }
+}
+
+fn residual_named(graph: &FunctionGraph, owner: &str, leaf: &str) -> bool {
+    ops(graph).any(|op| match &op.kind {
+        OpKind::Call { target, .. } => call_segments(target).is_some_and(|segments| {
+            segments.last().map(String::as_str) == Some(leaf)
+                && segments
+                    .get(segments.len().wrapping_sub(2))
+                    .map(String::as_str)
+                    == Some(owner)
+        }),
+        _ => false,
+    })
+}
+
+/// `Layout::new::<T>()` in the grow `unwrap_or_else` abort closure used
+/// to residualise as `["alloc", "layout", "Layout", "new"]`.
+#[test]
+fn grow_int_items_block_call_once_has_no_layout_new_residual() {
+    let llbc = load_object();
+    let graph = lower_function(&llbc, "object_array::grow_int_items_block")
+        .expect("lower grow_int_items_block");
+    assert!(
+        !residual_named(&graph, "Layout", "new"),
+        "Layout::new must fold to the virtualized {{size, align}} aggregate"
+    );
+}
+
+/// `ll_list_int_length` is `l.int_items.len()` — `rlist.py` LIST
+/// `("length", Signed)`, `jtransform.py` `_handle_list_call` `list.int_len`
+/// → `getfield_gc_i(l, int_items.len)`. A residual `__len` was
+/// `getattr(__len__)` on the nested `IntArray`.
+#[test]
+fn ll_list_int_length_reads_int_array_len_field() {
+    let llbc = load_object();
+    let graph =
+        lower_function(&llbc, "listobject::ll_list_int_length").expect("lower ll_list_int_length");
+    assert!(
+        ops(&graph).any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                field,
+                ty: ValueType::Int,
+                ..
+            } if field.name == "len"
+                && field.owner_root.as_deref() == Some("IntArray")
+        )),
+        "ll_list_int_length must getfield IntArray.len, ops {:?}",
+        ops(&graph)
+            .map(|op| {
+                let rendered = format!("{:?}", op.kind);
+                rendered.chars().take(90).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ops(&graph).all(|op| !matches!(
+            &op.kind,
+            OpKind::Call { target, .. } if call_leaf(target) == Some("__len")
+        )),
+        "IntArray::len must not residualise as __len"
+    );
+}
+
+/// `_orig_extend_from_tuple` is a cyclic `for` + `if let Some`. Pass 2
+/// None-kills the header seed; `finish` must not reintroduce a Link.arg
+/// that is not an inputarg or op result of its source block
+/// (`flowspace_adapter` `undefined operand`).
+#[test]
+fn orig_extend_from_tuple_has_no_undefined_link_args() {
+    const INTERPRETER_LLBC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(INTERPRETER_LLBC).expect("pyre-interpreter.ullbc is already extracted");
+    let graph =
+        lower_function(&llbc, "_orig_extend_from_tuple").expect("lower _orig_extend_from_tuple");
+    let mut holes = Vec::new();
+    for block in &graph.blocks {
+        if block.dead {
+            continue;
+        }
+        let mut defined: std::collections::HashSet<u64> =
+            block.inputargs.iter().map(|v| v.id()).collect();
+        for op in &block.operations {
+            if let Some(result) = &op.result {
+                defined.insert(result.id());
+            }
+        }
+        for (ei, exit) in block.exits.iter().enumerate() {
+            for (ai, arg) in exit.args.iter().enumerate() {
+                let LinkArg::Value(var) = arg else {
+                    continue;
+                };
+                if defined.contains(&var.id()) {
+                    continue;
+                }
+                holes.push((block.id, ei, ai, var.id(), exit.target));
+                eprintln!(
+                    "HOLE BlockId({}) exit[{ei}] args[{ai}] var={} -> BlockId({})",
+                    block.id.0,
+                    var.id(),
+                    exit.target.0
+                );
+                eprintln!(
+                    "  src inputargs={:?}",
+                    block.inputargs.iter().map(|v| v.id()).collect::<Vec<_>>()
+                );
+                for (i, op) in block.operations.iter().enumerate() {
+                    eprintln!(
+                        "    op[{i}] result={:?} kind={:?}",
+                        op.result.as_ref().map(|v| v.id()),
+                        op.kind
+                    );
+                }
+                for (i, e) in block.exits.iter().enumerate() {
+                    eprintln!("    exit[{i}] -> BlockId({}) args={:?}", e.target.0, e.args);
+                }
+            }
+        }
+    }
+    assert!(
+        holes.is_empty(),
+        "_orig_extend_from_tuple has undefined Link.args: {holes:?}"
     );
 }

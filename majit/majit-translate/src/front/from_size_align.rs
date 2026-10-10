@@ -174,6 +174,33 @@ pub(crate) fn is_layout_adt_owner(path: &str) -> bool {
     path == "core::alloc::layout::Layout" || path == "alloc::layout::Layout"
 }
 
+/// `true` iff `segments` names `Layout::new`.
+///
+/// Same two Charon spellings as [`is_layout_from_size_align`]: the associated
+/// function `[.., "layout", "Layout", "new"]` and the FunDecl
+/// `[.., "layout", "<Impl>", "new"]`.  `new::<T>()` is `size_of::<T>()` plus
+/// `align_of::<T>()` (`Layout::from_size_align` with those constants, which
+/// always succeeds for a sized `T`); the grow `unwrap_or_else` abort closure
+/// is the measured caller (`object_array::grow_*_items_block` `call_once`).
+pub(crate) fn is_layout_new(segments: &[String]) -> bool {
+    if segments.last().map(String::as_str) != Some("new") {
+        return false;
+    }
+    match segments
+        .get(segments.len().wrapping_sub(2))
+        .map(String::as_str)
+    {
+        Some("Layout") => true,
+        Some("<Impl>") => {
+            segments
+                .get(segments.len().wrapping_sub(3))
+                .map(String::as_str)
+                == Some("layout")
+        }
+        _ => false,
+    }
+}
+
 /// `true` iff `segments` names `Layout::from_size_align`.
 ///
 /// Two Charon spellings reach the residual:
@@ -1001,7 +1028,7 @@ fn rewire_one_from_size_align_expect_site(
 /// to SSA), so nothing materializes a real `Layout`.  `result` is a fresh var
 /// for the `.ok()` `Some` payload, or the reused `from_size_align` result var
 /// for the by-value `.expect()` shape.
-fn build_layout_aggregate(
+pub(crate) fn build_layout_aggregate(
     graph: &mut FunctionGraph,
     block: BlockId,
     layout_owner: &str,
@@ -1790,6 +1817,21 @@ mod tests {
         assert!(is_layout_adt_owner("core::alloc::layout::Layout"));
         assert!(is_layout_adt_owner("alloc::layout::Layout"));
         assert!(!is_layout_adt_owner("core::result::Result"));
+        let layout_new: Vec<String> = ["alloc", "layout", "Layout", "new"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let impl_new: Vec<String> = ["core", "alloc", "layout", "<Impl>", "new"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let from_size: Vec<String> = ["alloc", "layout", "Layout", "from_size_align"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_layout_new(&layout_new));
+        assert!(is_layout_new(&impl_new));
+        assert!(!is_layout_new(&from_size));
     }
 
     #[test]
