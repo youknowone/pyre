@@ -43,6 +43,6 @@ pyre_interpreter::py_module! {
         "isfinite" / 1 = m::isfinite,
         "isinf"    / 1 = m::isinf,
         "isnan"    / 1 = m::isnan,
-        "isclose"  / * = m::isclose,
+        "isclose"  / * = m::isclose; pyre_interpreter::Signature::new(vec!["a", "b", "rel_tol", "abs_tol"], None, None, 2, 2),
     },
 }

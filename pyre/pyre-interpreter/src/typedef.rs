@@ -21177,146 +21177,118 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "to_bytes",
-            make_builtin_function("to_bytes", |args| {
-                let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                crate::builtins::kwarg_reject_unknown(
-                    kwargs,
-                    &["length", "byteorder", "signed"],
-                    "to_bytes",
-                )?;
-                crate::builtins::kwarg_reject_duplicate(
-                    kwargs,
-                    "to_bytes",
-                    "length",
-                    pos.get(1).is_some(),
-                )?;
-                crate::builtins::kwarg_reject_duplicate(
-                    kwargs,
-                    "to_bytes",
-                    "byteorder",
-                    pos.get(2).is_some(),
-                )?;
-                if pos.len() > 3 {
-                    let given = pos.len() - 1;
-                    // `_PyArg_UnpackKeywords` names the total parameter count
-                    // once the call passes every parameter, and the positional
-                    // limit while it is only past the positional ones —
-                    // `signed` is keyword-only.
-                    let limit = if given > 3 {
-                        "at most 3 arguments"
+            crate::make_builtin_function_with_signature(
+                "to_bytes",
+                |args| {
+                    // Bound scope: pos-only `self`, `length`/`byteorder`, kw-only
+                    // `signed` (`PY_NULL` omitted).
+                    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+                    let w_self = bound(0);
+                    let owned_val;
+                    let val = if let Some(o) =
+                        w_self.filter(|&o| unsafe { pyre_object::is_bool(o) })
+                    {
+                        owned_val =
+                            BigInt::from(unsafe { pyre_object::w_bool_get_value(o) as i64 });
+                        &owned_val
+                    } else if let Some(o) = w_self.filter(|&o| unsafe { pyre_object::is_int(o) }) {
+                        owned_val = BigInt::from(unsafe { pyre_object::w_int_get_value(o) });
+                        &owned_val
+                    } else if let Some(o) = w_self.filter(|&o| unsafe { pyre_object::is_long(o) }) {
+                        unsafe { pyre_object::w_long_get_value(o) }
                     } else {
-                        "at most 2 positional arguments"
+                        owned_val = BigInt::from(0);
+                        &owned_val
                     };
-                    return Err(crate::PyError::type_error(format!(
-                        "to_bytes() takes {limit} ({given} given)"
-                    )));
-                }
-                let owned_val;
-                let val = if !pos.is_empty() && unsafe { pyre_object::is_bool(pos[0]) } {
-                    owned_val =
-                        BigInt::from(unsafe { pyre_object::w_bool_get_value(pos[0]) as i64 });
-                    &owned_val
-                } else if !pos.is_empty() && unsafe { pyre_object::is_int(pos[0]) } {
-                    owned_val = BigInt::from(unsafe { pyre_object::w_int_get_value(pos[0]) });
-                    &owned_val
-                } else if !pos.is_empty() && unsafe { pyre_object::is_long(pos[0]) } {
-                    unsafe { pyre_object::w_long_get_value(pos[0]) }
-                } else {
-                    owned_val = BigInt::from(0);
-                    &owned_val
-                };
-                // `space_index_w` and `is_true` run Python code, which collects.
-                let val = live_rbigint(val);
-                // `pos` and `kwargs` are the gateway's native copies, so the
-                // arguments read after `space_index_w` are rooted before it.
-                let _arg_roots = pyre_object::gc_roots::push_roots();
-                let byteorder_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(
-                    pos.get(2)
-                        .copied()
-                        .or_else(|| crate::builtins::kwarg_get(kwargs, "byteorder"))
-                        .unwrap_or(pyre_object::PY_NULL),
-                );
-                let signed_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(
-                    crate::builtins::kwarg_get(kwargs, "signed").unwrap_or(pyre_object::PY_NULL),
-                );
-                let length_obj = pos
-                    .get(1)
-                    .copied()
-                    .or_else(|| crate::builtins::kwarg_get(kwargs, "length"));
-                let length_i = match length_obj {
-                    Some(o) => crate::builtins::space_index_w(o)?,
-                    None => 1,
-                };
-                if length_i < 0 {
-                    return Err(crate::PyError::value_error(
-                        "length argument must be non-negative",
-                    ));
-                }
-                let w_byteorder = pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
-                let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
-                    None => "big",
-                    Some(o) if unsafe { pyre_object::is_str(o) } => {
-                        match unsafe { pyre_object::w_str_get_value_opt(o) } {
-                            Some("little") => "little",
-                            Some("big") => "big",
-                            _ => {
-                                return Err(crate::PyError::value_error(
-                                    "byteorder must be either 'little' or 'big'",
-                                ));
+                    // `space_index_w` and `is_true` run Python code, which collects.
+                    let val = live_rbigint(val);
+                    let _arg_roots = pyre_object::gc_roots::push_roots();
+                    let byteorder_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ =
+                        pyre_object::gc_roots::pin_root(bound(2).unwrap_or(pyre_object::PY_NULL));
+                    let signed_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ =
+                        pyre_object::gc_roots::pin_root(bound(3).unwrap_or(pyre_object::PY_NULL));
+                    let length_i = match bound(1) {
+                        Some(o) => crate::builtins::space_index_w(o)?,
+                        None => 1,
+                    };
+                    if length_i < 0 {
+                        return Err(crate::PyError::value_error(
+                            "length argument must be non-negative",
+                        ));
+                    }
+                    let w_byteorder = pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
+                    let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
+                        None => "big",
+                        Some(o) if unsafe { pyre_object::is_str(o) } => {
+                            match unsafe { pyre_object::w_str_get_value_opt(o) } {
+                                Some("little") => "little",
+                                Some("big") => "big",
+                                _ => {
+                                    return Err(crate::PyError::value_error(
+                                        "byteorder must be either 'little' or 'big'",
+                                    ));
+                                }
                             }
                         }
+                        Some(o) => {
+                            return Err(crate::PyError::type_error(format!(
+                                "expected str, got {} object",
+                                crate::error::type_name_of(o)
+                            )));
+                        }
+                    };
+                    let w_signed = pyre_object::gc_roots::shadow_stack_get(signed_slot);
+                    let signed = (!w_signed.is_null())
+                        .then_some(w_signed)
+                        .map(crate::baseobjspace::is_true)
+                        .transpose()?
+                        .unwrap_or(false);
+                    // `rbigint.tobytes` skips its final sign-fit check when
+                    // `nbytes == 0` (rbigint.py), and `-1` is the one value
+                    // whose two's complement emits no bytes at all, so it falls
+                    // through as `b''`.  `_PyLong_AsByteArray` rejects every
+                    // nonzero value that does not fit the requested width.
+                    if length_i == 0 && signed && val.get_sign() == -1 {
+                        return Err(crate::PyError::overflow_error("int too big to convert"));
                     }
-                    Some(o) => {
-                        return Err(crate::PyError::type_error(format!(
-                            "expected str, got {} object",
-                            crate::error::type_name_of(o)
-                        )));
-                    }
-                };
-                let w_signed = pyre_object::gc_roots::shadow_stack_get(signed_slot);
-                let signed = (!w_signed.is_null())
-                    .then_some(w_signed)
-                    .map(crate::baseobjspace::is_true)
-                    .transpose()?
-                    .unwrap_or(false);
-                // `rbigint.tobytes` skips its final sign-fit check when
-                // `nbytes == 0` (rbigint.py), and `-1` is the one value
-                // whose two's complement emits no bytes at all, so it falls
-                // through as `b''`.  `_PyLong_AsByteArray` rejects every
-                // nonzero value that does not fit the requested width.
-                if length_i == 0 && signed && val.get_sign() == -1 {
-                    return Err(crate::PyError::overflow_error("int too big to convert"));
-                }
-                // intobject.py `descr_to_bytes`: route directly through
-                // rbigint.tobytes.  Besides preserving its exact exception
-                // contract, this is linear in the output length; shifting the
-                // whole bigint once per output byte is quadratic.
-                let bytes =
-                    val.tobytes(length_i, byteorder, signed)
-                        .map_err(|error| match error {
-                            majit_rlib::rbigint::RBigIntError::InvalidEndianness => {
-                                crate::PyError::value_error(
-                                    "byteorder must be either 'little' or 'big'",
-                                )
-                            }
-                            majit_rlib::rbigint::RBigIntError::InvalidSignedness
-                            | majit_rlib::rbigint::RBigIntError::NegativeToUnsigned => {
-                                crate::PyError::overflow_error(
-                                    "can't convert negative int to unsigned",
-                                )
-                            }
-                            majit_rlib::rbigint::RBigIntError::Overflow => {
-                                crate::PyError::overflow_error("int too big to convert")
-                            }
-                            majit_rlib::rbigint::RBigIntError::Memory => {
-                                crate::PyError::memory_error("")
-                            }
-                            _ => unreachable!("rbigint.tobytes returned an unrelated error"),
-                        })?;
-                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
-            }),
+                    // intobject.py `descr_to_bytes`: route directly through
+                    // rbigint.tobytes.  Besides preserving its exact exception
+                    // contract, this is linear in the output length; shifting the
+                    // whole bigint once per output byte is quadratic.
+                    let bytes =
+                        val.tobytes(length_i, byteorder, signed)
+                            .map_err(|error| match error {
+                                majit_rlib::rbigint::RBigIntError::InvalidEndianness => {
+                                    crate::PyError::value_error(
+                                        "byteorder must be either 'little' or 'big'",
+                                    )
+                                }
+                                majit_rlib::rbigint::RBigIntError::InvalidSignedness
+                                | majit_rlib::rbigint::RBigIntError::NegativeToUnsigned => {
+                                    crate::PyError::overflow_error(
+                                        "can't convert negative int to unsigned",
+                                    )
+                                }
+                                majit_rlib::rbigint::RBigIntError::Overflow => {
+                                    crate::PyError::overflow_error("int too big to convert")
+                                }
+                                majit_rlib::rbigint::RBigIntError::Memory => {
+                                    crate::PyError::memory_error("")
+                                }
+                                _ => unreachable!("rbigint.tobytes returned an unrelated error"),
+                            })?;
+                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+                },
+                crate::gateway::Signature::new(
+                    vec!["self", "length", "byteorder", "signed"],
+                    None,
+                    None,
+                    1,
+                    1,
+                ),
+            ),
         )
     };
     // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod.
@@ -21325,10 +21297,17 @@ fn init_int_type(ns: PyObjectRef) {
             ns,
             "from_bytes",
             pyre_object::function::w_classmethod_new(
-                crate::gateway::make_builtin_function_with_text_signature(
+                crate::gateway::make_builtin_function_with_text_signature_and_sig(
                     "from_bytes",
                     int_from_bytes,
                     "($type, /, bytes, byteorder='big', *, signed=False)",
+                    Some(crate::gateway::Signature::new(
+                        vec!["cls", "bytes", "byteorder", "signed"],
+                        None,
+                        None,
+                        1,
+                        1,
+                    )),
                 ),
             ),
         )
@@ -26404,51 +26383,17 @@ fn parse_hex_bytes(bytes: &[u8]) -> Result<Vec<u8>, crate::PyError> {
 // at `args[0]`; the base type returns a plain int, a subclass routes
 // through `cls(value)`.
 fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let mut cls = pos.first().copied().unwrap_or(pyre_object::PY_NULL);
-    // `bytes` and `byteorder` are the only positional parameters; `signed`
-    // is keyword-only, so a third positional is an error.
-    if pos.len() > 3 {
-        let given = pos.len() - 1;
-        // `_PyArg_UnpackKeywords` — see `to_bytes`; `signed` is keyword-only,
-        // so the total is one past the positional limit.
-        let limit = if given > 3 {
-            "at most 3 arguments"
-        } else {
-            "at most 2 positional arguments"
-        };
-        return Err(crate::PyError::type_error(format!(
-            "from_bytes() takes {limit} ({given} given)"
-        )));
-    }
-    // `bytes` and `byteorder` are positional-or-keyword; supplying one both
-    // ways is an error rather than the keyword silently winning.
-    let bytes_kw = crate::builtins::kwarg_get(kwargs, "bytes");
-    let byteorder_kw = crate::builtins::kwarg_get(kwargs, "byteorder");
-    if bytes_kw.is_some() && pos.len() > 1 {
-        return Err(crate::PyError::type_error(
-            "argument for from_bytes() given by name ('bytes') and position (1)",
-        ));
-    }
-    if byteorder_kw.is_some() && pos.len() > 2 {
-        return Err(crate::PyError::type_error(
-            "argument for from_bytes() given by name ('byteorder') and position (2)",
-        ));
-    }
-    // Every declared slot is filled before the unrecognized keywords are
-    // reported, so a call missing `bytes` is reported against `bytes`.
-    let data_obj = pos.get(1).copied().or(bytes_kw).ok_or_else(|| {
+    // Bound scope: pos-only `cls`, `bytes`/`byteorder`, kw-only `signed`
+    // (`PY_NULL` omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let mut cls = bound(0).unwrap_or(pyre_object::PY_NULL);
+    let data_obj = bound(1).ok_or_else(|| {
         crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
     })?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["bytes", "byteorder", "signed"], "from_bytes")?;
-    let has_kwargs = kwargs.is_some();
-    let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
-    let kw_roots = pyre_object::gc_roots::push_roots();
-    let kwargs_slot = kw_roots.pin_roots(&[kwargs_word]);
     // The clinic `str byteorder` converter runs before `PyBytes_FromObject`
     // touches the payload, so a bad byte order is reported even when the
     // payload could not have been converted either.
-    let byteorder = match pos.get(2).copied().or(byteorder_kw) {
+    let byteorder = match bound(2) {
         None => "big",
         Some(b) if unsafe { pyre_object::is_str(b) } => {
             match unsafe { pyre_object::w_str_get_value_opt(b) } {
@@ -26468,8 +26413,11 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             )));
         }
     };
+    let signed_obj = bound(3).unwrap_or(pyre_object::PY_NULL);
     // `makebytesdata_w` — `__bytes__` takes precedence over the buffer /
     // iterable conversion and must itself return a bytes instance.
+    let signed_roots = pyre_object::gc_roots::push_roots();
+    let signed_slot = signed_roots.pin_roots(&[signed_obj]);
     let bytes_method = unsafe { crate::baseobjspace::lookup(data_obj, "__bytes__") };
     // `_convert_from_buffer_or_iterable` — the buffer protocol, else an
     // iterable of ints.  A str is iterable but never a byte source, and
@@ -26513,11 +26461,13 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         v
     };
-    let signed =
-        crate::builtins::kwarg_get(has_kwargs.then(|| kw_roots.get(kwargs_slot)), "signed")
-            .map(crate::baseobjspace::is_true)
-            .transpose()?
-            .unwrap_or(false);
+    let w_signed = signed_roots.get(signed_slot);
+    drop(signed_roots);
+    let signed = (!w_signed.is_null())
+        .then_some(w_signed)
+        .map(crate::baseobjspace::is_true)
+        .transpose()?
+        .unwrap_or(false);
     // intobject.py:81-91 first tries the machine-word helper, then falls back
     // to the same linear rbigint.frombytes implementation for large input.
     let mut w_result = match majit_rlib::rbigint::frombytes_int(&bytes, byteorder, signed) {

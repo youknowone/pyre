@@ -32,7 +32,7 @@ pyre_interpreter::py_module! {
         // Floating-point manipulation. `fabs`, `ulp`, `frexp`, `ldexp`,
         // `fmod`, `copysign` and `remainder` are installed in `extra_init`.
         "modf"      / 1 = m::modf,
-        "nextafter" / * = m::nextafter,
+        "nextafter" / * = m::nextafter; pyre_interpreter::Signature::new(vec!["x", "y", "steps"], None, None, 1, 2),
         "fma"       / 3 = m::fma,
 
         // Classification. `isclose` is installed in `extra_init`.
@@ -48,7 +48,7 @@ pyre_interpreter::py_module! {
 
         // Aggregation
         "fsum"    / 1 = m::fsum,
-        "prod"    / * = m::prod,
+        "prod"    / * = m::prod; pyre_interpreter::Signature::new(vec!["iterable", "start"], None, None, 1, 1),
         "sumprod" / 2 = m::sumprod,
 
         // Integer math
@@ -112,7 +112,18 @@ pyre_interpreter::py_module! {
         pyre_interpreter::module_ns_store(
             ns,
             "isclose",
-            pyre_interpreter::make_module_builtin_function("isclose", m::__majit_wrap_math_isclose),
+            pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+                "isclose",
+                m::__majit_wrap_math_isclose,
+                pyre_interpreter::HOPELESS,
+                pyre_interpreter::Signature::new(
+                    vec!["a", "b", "rel_tol", "abs_tol"],
+                    None,
+                    None,
+                    2,
+                    2,
+                ),
+            ),
         );
         let install2 = |name: &'static str, func: pyre_interpreter::BuiltinCodeFn| {
             pyre_interpreter::module_ns_store(

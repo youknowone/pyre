@@ -3596,7 +3596,19 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         make_module_builtin_function_with_arity("locals", __majit_wrap_builtin_locals, 0)
     });
     crate::module_ns_get_or_insert_with(ns, "exec", || {
-        make_module_builtin_function("exec", builtin_exec)
+        // `exec(source, /, globals=None, locals=None, *, closure=None)`.
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "exec",
+            builtin_exec,
+            crate::HOPELESS,
+            crate::gateway::Signature::new(
+                vec!["source", "globals", "locals", "closure"],
+                None,
+                None,
+                1,
+                1,
+            ),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "eval", || {
         // `eval(source, /, globals=None, locals=None)` — Signature bind.
@@ -18302,38 +18314,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
 pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
-    // positional-only; globals/locals are positional-or-keyword; `closure` is
-    // keyword-only.  `closure` supplies the cell objects that bind a code
-    // object's free variables (bltinmodule.c builtin_exec_impl); a None
-    // closure normalises to "absent" (PY_NULL).
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    // The positional-only `source` is bound before the unrecognized keywords
-    // are reported, so a keywords-only call is reported against `source`.
-    if pos.is_empty() {
-        return Err(crate::PyError::type_error(
-            "exec() takes at least 1 positional argument (0 given)",
-        ));
-    }
-    if pos.len() > 3 {
-        // A fourth positional is refused for landing on the keyword-only
-        // `closure`; past that the count exceeds the four parameters the
-        // signature has at all, and the total is what gets reported.
-        let message = if pos.len() == 4 {
-            "exec() takes at most 3 positional arguments (4 given)".to_string()
-        } else {
-            format!("exec() takes at most 4 arguments ({} given)", pos.len())
-        };
-        return Err(crate::PyError::type_error(message));
-    }
-    kwarg_reject_unknown(kwargs, &["globals", "locals", "closure"], "exec")?;
-    let source = pos[0];
-    let globals_arg =
-        bind_pos_or_kw(pos, kwargs, 1, "globals", "exec", 2)?.unwrap_or(pyre_object::PY_NULL);
-    let locals_arg =
-        bind_pos_or_kw(pos, kwargs, 2, "locals", "exec", 3)?.unwrap_or(pyre_object::PY_NULL);
-    // `if closure is None: closure = NULL` — treat None as unset.
-    let closure = match kwarg_get(kwargs, "closure") {
+    // Bound scope: pos-only `source`, `globals`/`locals`, kw-only `closure`
+    // (`PY_NULL` omitted).  `closure` supplies the cell objects that bind a
+    // code object's free variables; a None closure normalises to "absent"
+    // (PY_NULL).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let source = bound(0).ok_or_else(|| {
+        crate::PyError::type_error("exec() takes at least 1 positional argument (0 given)")
+    })?;
+    let globals_arg = bound(1).unwrap_or(pyre_object::PY_NULL);
+    let locals_arg = bound(2).unwrap_or(pyre_object::PY_NULL);
+    let closure = match bound(3) {
         Some(c) if !unsafe { pyre_object::is_none(c) } => c,
         _ => pyre_object::PY_NULL,
     };

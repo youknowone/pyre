@@ -3250,29 +3250,23 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     module_ns_store(
         roots.get(ns_slot),
         "getunicodeinternedsize",
-        crate::make_builtin_function("getunicodeinternedsize", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(
-                kwargs,
-                &["_only_immortal"],
-                "getunicodeinternedsize",
-            )?;
-            if !positional.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "getunicodeinternedsize() takes no positional arguments",
-                ));
-            }
-            let only_immortal = match crate::builtins::kwarg_get(kwargs, "_only_immortal") {
-                Some(value) => crate::baseobjspace::is_true(value)?,
-                None => false,
-            };
-            let size = if only_immortal {
-                pyre_object::unicodeobject::interned_size_immortal()
-            } else {
-                pyre_object::unicodeobject::interned_size()
-            };
-            Ok(w_int_new(size as i64))
-        }),
+        crate::make_builtin_function_with_signature(
+            "getunicodeinternedsize",
+            |args| {
+                // Bound scope: kw-only `_only_immortal` (`PY_NULL` omitted).
+                let only_immortal = match args.get(0).copied().filter(|value| !value.is_null()) {
+                    Some(value) => crate::baseobjspace::is_true(value)?,
+                    None => false,
+                };
+                let size = if only_immortal {
+                    pyre_object::unicodeobject::interned_size_immortal()
+                } else {
+                    pyre_object::unicodeobject::interned_size()
+                };
+                Ok(w_int_new(size as i64))
+            },
+            crate::Signature::new(vec!["_only_immortal"], None, None, 1, 0),
+        ),
     );
     module_ns_store(
         roots.get(ns_slot),

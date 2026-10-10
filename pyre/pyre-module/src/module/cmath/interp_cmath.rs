@@ -133,48 +133,50 @@ pub fn isnan(args: &[PyObjectRef]) -> PyResult {
 /// `cmath.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)` — complex
 /// `_Py_c_isclose` equivalent over the two operands' components.
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    let (pos, mut kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
-    if pos.len() < 2 {
+    // Bound scope: pos-only `a`/`b`, kw-only `rel_tol`/`abs_tol` (`PY_NULL`
+    // omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let (Some(w_a), Some(w_b)) = (bound(0), bound(1)) else {
         return Err(pyre_interpreter::PyError::type_error(
             "isclose() missing required argument",
         ));
-    }
-    // `b` and the keywords are read back after `a`'s `__complex__` ran.
+    };
+    // `b` and the tolerances are read back after `a`'s `__complex__` ran.
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[pos[0], pos[1], kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let base = roots.pin_roots(&[
+        w_a,
+        w_b,
+        bound(2).unwrap_or(pyre_object::PY_NULL),
+        bound(3).unwrap_or(pyre_object::PY_NULL),
+    ]);
     let a = pyre_interpreter::builtins::complex_coerce(roots.get(base));
     let w_b = roots.get(base + 1);
-    let w = roots.get(base + 2);
-    kwargs = if w.is_null() { None } else { Some(w) };
+    let w_rel = roots.get(base + 2);
+    let w_abs = roots.get(base + 3);
     drop(roots);
     let (ar, ai) = a?;
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[w_b, kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let base = roots.pin_roots(&[w_b, w_rel, w_abs]);
     let b = pyre_interpreter::builtins::complex_coerce(roots.get(base));
-    let w = roots.get(base + 1);
-    kwargs = if w.is_null() { None } else { Some(w) };
+    let w_rel = roots.get(base + 1);
+    let w_abs = roots.get(base + 2);
     drop(roots);
     let (br, bi) = b?;
-    let tol = |kwargs: Option<PyObjectRef>,
-               name: &str,
-               default: f64|
-     -> Result<f64, pyre_interpreter::PyError> {
-        match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
-            Some(v) => pyre_interpreter::baseobjspace::float_w(v),
-            None => Ok(default),
+    let tol = |value: PyObjectRef, default: f64| -> Result<f64, pyre_interpreter::PyError> {
+        if value.is_null() {
+            Ok(default)
+        } else {
+            pyre_interpreter::baseobjspace::float_w(value)
         }
     };
     // `abs_tol` is looked up after `rel_tol`'s `__float__` ran.
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let w = roots.get(base);
-    let rel_tol = tol(if w.is_null() { None } else { Some(w) }, "rel_tol", 1e-9);
-    let w = roots.get(base);
-    kwargs = if w.is_null() { None } else { Some(w) };
+    let base = roots.pin_roots(&[w_rel, w_abs]);
+    let rel_tol = tol(roots.get(base), 1e-9);
+    let w_abs = roots.get(base + 1);
     drop(roots);
     let rel_tol = rel_tol?;
-    let abs_tol = tol(kwargs, "abs_tol", 0.0)?;
+    let abs_tol = tol(w_abs, 0.0)?;
     if rel_tol < 0.0 || abs_tol < 0.0 {
         return Err(pyre_interpreter::PyError::value_error(
             "tolerances must be non-negative",

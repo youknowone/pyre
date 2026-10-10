@@ -837,7 +837,8 @@ fn isclose_slow(args: &[PyObjectRef]) -> PyResult {
 /// interp_math.py `isclose` with both tolerances defaulted, on two finite
 /// exact floats or machine ints.
 pub fn __majit_wrap_math_isclose(args: &[PyObjectRef]) -> PyResult {
-    if args.len() == 2 {
+    let omitted = |i: usize| args.get(i).is_none_or(|value| value.is_null());
+    if args.len() >= 2 && omitted(2) && omitted(3) {
         let w_a = args[0];
         let w_b = args[1];
         let a =
@@ -1351,67 +1352,61 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pos.len() < 2 {
-        // `_PyArg_ParseStackAndKeywords` names the first slot it could not
-        // fill; both are positional-only, so a keyword never fills one.
-        let missing = if pos.is_empty() {
-            "a' (pos 1"
-        } else {
-            "b' (pos 2"
-        };
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "isclose() missing required argument '{missing})"
-        )));
-    }
-    if pos.len() > 2 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "isclose() takes exactly 2 positional arguments ({} given)",
-            pos.len()
-        )));
-    }
-    // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
+    // Bound scope: pos-only `a`/`b`, kw-only `rel_tol`/`abs_tol` (`PY_NULL`
+    // omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let Some(w_a) = bound(0) else {
+        return Err(pyre_interpreter::PyError::type_error(
+            "isclose() missing required argument 'a' (pos 1)",
+        ));
+    };
+    let Some(w_b) = bound(1) else {
+        return Err(pyre_interpreter::PyError::type_error(
+            "isclose() missing required argument 'b' (pos 2)",
+        ));
+    };
     // `interp_math.py`'s `isclose` — all four operands are converted, in this
     // order, before anything about them is checked, so a non-numeric `a` is
     // reported even when a tolerance is negative.  An omitted tolerance
     // arrives upstream as an already-wrapped float, so converting it can
     // neither raise nor reach `__float__`; `None` stands in for that here and
     // `pymath` supplies the same defaults.
-    // `b` and the keywords are read back after `a`'s `__float__` ran.
+    // `b` and the tolerances are read back after `a`'s `__float__` ran.
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[pos[0], pos[1], kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let base = roots.pin_roots(&[
+        w_a,
+        w_b,
+        bound(2).unwrap_or(pyre_object::PY_NULL),
+        bound(3).unwrap_or(pyre_object::PY_NULL),
+    ]);
     let a = try_get_double(roots.get(base));
     let w_b = roots.get(base + 1);
-    let w = roots.get(base + 2);
-    let kwargs = if w.is_null() { None } else { Some(w) };
+    let w_rel = roots.get(base + 2);
+    let w_abs = roots.get(base + 3);
     drop(roots);
     let a = a?;
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[w_b, kwargs.unwrap_or(pyre_object::PY_NULL)]);
+    let base = roots.pin_roots(&[w_b, w_rel, w_abs]);
     let b = try_get_double(roots.get(base));
-    let w = roots.get(base + 1);
-    let kwargs = if w.is_null() { None } else { Some(w) };
+    let w_rel = roots.get(base + 1);
+    let w_abs = roots.get(base + 2);
     drop(roots);
     let b = b?;
-    let read = |kwargs: Option<PyObjectRef>,
-                name: &str|
-     -> Result<Option<f64>, pyre_interpreter::PyError> {
-        match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
-            Some(v) => Ok(Some(try_get_double(v)?)),
-            None => Ok(None),
+    let read = |value: PyObjectRef| -> Result<Option<f64>, pyre_interpreter::PyError> {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(try_get_double(value)?))
         }
     };
     // `abs_tol` is looked up after `rel_tol`'s `__float__` ran.
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let w = roots.get(base);
-    let rel_tol = read(if w.is_null() { None } else { Some(w) }, "rel_tol");
-    let w = roots.get(base);
-    let kwargs = if w.is_null() { None } else { Some(w) };
+    let base = roots.pin_roots(&[w_rel, w_abs]);
+    let rel_tol = read(roots.get(base));
+    let w_abs = roots.get(base + 1);
     drop(roots);
     let rel_tol = rel_tol?;
-    let abs_tol = read(kwargs, "abs_tol")?;
+    let abs_tol = read(w_abs)?;
     // `isclose` — the sanity check on the tolerances runs
     // after those conversions and before the comparison, and names them.
     // `pymath` reports the same rejection as EDOM, which `map_int_err`
@@ -2000,57 +1995,14 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn prod(args: &[PyObjectRef]) -> PyResult {
-    // math.prod(iterable, *, start=1) — PyPy: pypy/module/math/interp_math.py
-    // prod iterates with `space.mul` and returns the accumulated product.
-    // `start` is keyword-only; positional `start` raises TypeError.
-    if args.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
-            "prod() takes at least 1 argument",
-        ));
-    }
-    // Detect the __pyre_kw__ dict tail used by CALL_KW for builtin
-    // functions with keyword arguments. PyPy: Arguments.parse_into_scope
-    // splits positional from keyword before the call; pyre's dispatch
-    // leaves them combined, so we unpack here.
-    let is_kwargs = unsafe {
-        let last = *args.last().unwrap();
-        pyre_object::is_dict(last)
-            && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-    };
-    let (positional, start) = if is_kwargs {
-        let kwargs = *args.last().unwrap();
-        // `prod(iterable, /, *, start=1)` — `start` is the only accepted
-        // keyword; any other is an unexpected-keyword TypeError.
-        for (k, _) in unsafe { pyre_object::w_dict_items(kwargs) } {
-            let name = unsafe { pyre_object::w_str_get_wtf8(k) };
-            match name.as_str() {
-                Ok("__pyre_kw__") | Ok("start") => {}
-                _ => {
-                    return Err(pyre_interpreter::PyError::type_error(format!(
-                        "prod() got an unexpected keyword argument '{name}'"
-                    )));
-                }
-            }
-        }
-        let start_key = pyre_object::unicodeobject::intern_str_value("start");
-        let start =
-            unsafe { pyre_object::w_dict_lookup(kwargs, start_key) }.unwrap_or(w_int_new(1));
-        (&args[..args.len() - 1], start)
-    } else if args.len() >= 2 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "prod() takes only one positional argument (the iterable)",
-        ));
-    } else {
-        (&args[..1], w_int_new(1))
-    };
-    if positional.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
-            "prod() takes at least 1 argument",
-        ));
-    }
+    // math.prod(iterable, /, *, start=1) — PyPy: interp_math.py `prod`.
+    // Bound scope: pos-only `iterable`, kw-only `start` (`PY_NULL` omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let iterable = bound(0)
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("prod() takes at least 1 argument"))?;
+    let start = bound(1).unwrap_or_else(|| w_int_new(1));
     let _roots = pyre_object::gc_roots::push_roots();
-    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, positional[0]]);
+    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, iterable]);
     let items = pyre_interpreter::builtins::collect_iterable(
         pyre_object::gc_roots::shadow_stack_get(acc_slot + 1),
     )?;
@@ -2234,27 +2186,14 @@ pub fn modf(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
-    let is_kwargs = !args.is_empty()
-        && unsafe {
-            let last = *args.last().unwrap();
-            pyre_object::is_dict(last)
-                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-        };
-    let (pos, kwargs) = if is_kwargs {
-        (&args[..args.len() - 1], Some(*args.last().unwrap()))
-    } else {
-        (args, None)
-    };
-    if pos.len() != 2 {
+    // Bound scope: pos-only `x`/`y`, kw-only `steps` (`PY_NULL` omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let (Some(mut w_x), Some(mut w_y)) = (bound(0), bound(1)) else {
         return Err(pyre_interpreter::PyError::type_error(
             "nextafter() takes exactly 2 positional arguments",
         ));
-    }
-    let mut w_x = pos[0];
-    let mut w_y = pos[1];
-    let steps = match kwargs.and_then(|kw| unsafe { pyre_object::w_dict_getitem_str(kw, "steps") })
-    {
+    };
+    let steps = match bound(2) {
         Some(s) => {
             let b = RBigIntGcRoot::new(pyre_object::with_roots!(w_x, w_y => get_bigint(s))?);
             if pyre_object::with_roots!(w_x, w_y => b.int_lt(0)) {
