@@ -3816,7 +3816,7 @@ macro_rules! replay_unscannable {
         if fbw_inline_diag_enabled() {
             eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
         }
-        return CalleeReplayScan::unscannable();
+        return (CalleeReplayScan::unscannable(), false);
     }};
 }
 
@@ -3844,22 +3844,6 @@ fn inline_call_jitcode_name(
     callee_pool
         .inline_callee_name(descr_index)
         .map(str::to_owned)
-}
-
-/// BUILD_MAP 0 `{}` used to residual as `NewEmptyDict` (`flatten.rs`
-/// `build_map_from_empty_array`).  When `w_dict_new` and
-/// `dict_display_setitem` are both fully bound, the same site emits
-/// `inline_call_r_r` of `w_dict_new` (`codewriter.rs` BUILD_MAP
-/// `display_bound`).  `w_dict_new` is `newdict_empty` (`dictmultiobject.rs`):
-/// a fresh empty dict, no user code.  The residual helper-kind admission
-/// (`RuntimeHelperKind::NewEmptyDict`) already treated that as replay-safe;
-/// this is the same fact on the inline_call form.
-///
-/// Leaf names only: `JitCode.name` is the graph leaf (`w_dict_new`,
-/// `newdict_empty`).  `w_dict_new_kwargs` is a different helper.
-pub(crate) fn jitcode_is_empty_dict_alloc(name: &str) -> bool {
-    let leaf = name.rsplit("::").next().unwrap_or(name);
-    leaf == "w_dict_new" || leaf == "newdict_empty"
 }
 
 /// The `pc` a `[replay-dirty]` line names is an offset into the scanned
@@ -3907,6 +3891,151 @@ fn replay_safety_dump_body(
     }
 }
 
+/// Recursion bound for callee-effect replay scans.
+///
+/// `analyze_direct_call` follows the callee graph with a `seen` set
+/// (`DependencyTracker.enter`) rather than a numeric cutoff;
+/// `writeanalyze.py` `CUTOFF` is disabled. A finite depth plus the
+/// on-stack `seen` set fails closed past either.
+const FBW_CALLEE_EFFECT_RECURSION_LIMIT: usize = 8;
+
+/// Resolve an `inline_call` operand to its jitcode. `analyze_direct_call`
+/// / `DependencyTracker.enter`: a graph already on the stack is a cycle;
+/// fail closed instead of joining a partial result (`seen.get_cached_result`).
+fn resolve_inline_callee(
+    body_code: &[u8],
+    d: &crate::jitcode_runtime::DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    depth: usize,
+    visited: &[usize],
+) -> Option<(std::sync::Arc<majit_metainterp::jitcode::JitCode>, usize)> {
+    if depth >= FBW_CALLEE_EFFECT_RECURSION_LIMIT {
+        return None;
+    }
+    if !d.argcodes.starts_with('d') {
+        return None;
+    }
+    let descr_index = decode_descr_index(body_code, d, 0);
+    // Same join `binary_op_tag_for_helper_index` uses: `as_jitcode_descr`
+    // then the pool-aware index. A per-fn pool numbers its own slots
+    // (`state.rs` `sub_descr_pool_for_payload` stores the slot index on
+    // the adapter).
+    let jc_index = callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_jitcode_descr())
+        .map(|jc| jc.jitcode_index())?;
+    if visited.contains(&jc_index) {
+        return None;
+    }
+    let jc = callee_pool.inline_callee_jitcode(jc_index)?;
+    Some((jc, jc_index))
+}
+
+/// Process-lifetime view of the global descr table for nested scans.
+///
+/// `scan_inline_callee_body` used to `filter_map(descr_ref_at)` into a
+/// fresh `Vec` on every nested call. Each `descr_ref_at` runs
+/// `rehydrate_build_descr_raw_sets`; MATCH_CLASS walks hundreds of
+/// helpers, so that collect ran on the order of `all_descrs` (~5000)
+/// times the helper tree. The table itself is already process-global
+/// (`descr.py` cache); this is that table, not a per-op side map.
+fn global_descr_refs_for_nested_scan() -> &'static [DescrRef] {
+    static REFS: std::sync::OnceLock<Vec<DescrRef>> = std::sync::OnceLock::new();
+    REFS.get_or_init(|| {
+        (0..crate::jitcode_runtime::descr_ref_table().len())
+            .filter_map(crate::jitcode_runtime::descr_ref_at)
+            .collect()
+    })
+    .as_slice()
+}
+
+/// Scan a resolved callee body. Canonical helpers resolve `d`/`j` through
+/// `descr_ref_at` (the production table `all_descr_refs` materializes only
+/// under `cfg(test)`). A per-fn body carries its own `exec.descrs`; an
+/// empty adapter slice still lets `setfield` on a fresh malloc through
+/// (`fresh_malloc_stores_ok`), and nested `inline_call` indices that miss
+/// fail closed.
+fn scan_inline_callee_body(
+    jc: &majit_metainterp::jitcode::JitCode,
+    depth: usize,
+    visited: &mut Vec<usize>,
+    fresh_malloc_stores_ok: bool,
+) -> (CalleeReplayScan, bool) {
+    let (nested_refs, nested_pool): (&[DescrRef], super::RawDescrPool<'_>) =
+        if jc.uses_global_descr_pool() {
+            (
+                global_descr_refs_for_nested_scan(),
+                super::RawDescrPool::Global,
+            )
+        } else {
+            (&[], super::RawDescrPool::PerFn(jc.exec.descrs.as_slice()))
+        };
+    // Nested helper `constants_r` are GCREF slots, not the Python
+    // constant pool the outer scan classifies with `is_plain_int1`.
+    // Passing them here SIGSEGV'd in `match_sequence_of_class_patterns`
+    // (`fbw_callee_body_replay_scan_rec` EXC_BAD_ACCESS while scanning
+    // `_orig_w_module_dict_lookup_object_entries`). Freshness of mallocs
+    // does not read that pool (`FreshMallocs` tracks `malloc`/`new`).
+    fbw_callee_body_replay_scan_rec(
+        jc.code.as_slice(),
+        &[],
+        jc.num_regs_i(),
+        jc.constants_i.as_slice(),
+        jc.num_regs_r(),
+        &[],
+        nested_refs,
+        nested_pool,
+        false,
+        depth,
+        visited,
+        fresh_malloc_stores_ok,
+    )
+}
+
+/// `WriteAnalyzer.analyze` / `GraphAnalyzer.analyze_direct_call` for one
+/// nested `inline_call`. Computed once per jitcode (`_analyzed_calls`
+/// / `effectinfo_from_writeanalyze`) and stored on that jitcode.
+///
+/// `fresh_malloc_stores_ok` is always true: `analyze_simple_operation`
+/// ignores a `setfield` whose target `FreshMallocs.is_fresh_malloc`.
+/// `(clean, returned_fresh)` then distinguishes a constructor from a
+/// write-free wrapper; the caller dst stays unproven either way.
+fn nested_callee_writeanalyze(
+    body_code: &[u8],
+    d: &crate::jitcode_runtime::DecodedOp,
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    depth: usize,
+    visited: &mut Vec<usize>,
+) -> Option<(bool, bool)> {
+    let (jc, jc_index) =
+        resolve_inline_callee(body_code, d, callee_descr_refs, callee_pool, depth, visited)?;
+    // `DependencyTracker.enter`: a graph already on the stack is a
+    // cycle. Fail closed rather than re-entering the OnceLock.
+    if visited.contains(&jc_index) {
+        return None;
+    }
+    if let Some(cached) = jc.nested_replay_scan() {
+        return Some(cached);
+    }
+    visited.push(jc_index);
+    let (scan, returned_fresh) = scan_inline_callee_body(&jc, depth + 1, visited, true);
+    visited.pop();
+    let clean = matches!(scan.verdict(), CalleeReplaySafety::Clean);
+    jc.set_nested_replay_scan(clean, returned_fresh);
+    if fbw_inline_diag_enabled() && clean {
+        eprintln!(
+            "[fresh-alloc] name={} op={}/{} admitted={clean} returned_fresh={returned_fresh} poison={:?}",
+            jc.name(),
+            d.opname,
+            d.argcodes,
+            scan.poison
+        );
+    }
+    Some((clean, returned_fresh))
+}
+
 pub(crate) fn fbw_callee_body_replay_scan(
     body_code: &[u8],
     arg_facts: &[CalleeArgFact],
@@ -3918,6 +4047,38 @@ pub(crate) fn fbw_callee_body_replay_scan(
     callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {
+    let mut visited = Vec::new();
+    fbw_callee_body_replay_scan_rec(
+        body_code,
+        arg_facts,
+        num_regs_i,
+        constants_i,
+        num_regs_r,
+        constants_r,
+        callee_descr_refs,
+        callee_pool,
+        method_form_deferred_helpers,
+        0,
+        &mut visited,
+        false,
+    )
+    .0
+}
+
+fn fbw_callee_body_replay_scan_rec(
+    body_code: &[u8],
+    arg_facts: &[CalleeArgFact],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    num_regs_r: usize,
+    constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    method_form_deferred_helpers: bool,
+    depth: usize,
+    visited: &mut Vec<usize>,
+    fresh_malloc_stores_ok: bool,
+) -> (CalleeReplayScan, bool) {
     replay_safety_dump_body(body_code, callee_descr_refs, callee_pool);
     let mut poison: Vec<usize> = Vec::new();
     let mut protected: Vec<usize> = Vec::new();
@@ -4021,6 +4182,10 @@ pub(crate) fn fbw_callee_body_replay_scan(
     // `(frame register, int register)`.
     let mut flags_get: Option<(u8, u8)> = None;
     let mut finished_or: Option<(u8, u8)> = None;
+    // Every `ref_return` must name a ref this body allocated.  `None`
+    // until the first one; a body that never returns a ref is not a
+    // fresh-alloc constructor.
+    let mut returned_fresh_ref: Option<bool> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         if branch_targets.contains(&pc) {
@@ -4237,7 +4402,9 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     // DELETE_FAST, so without the first every handler that
                     // binds its exception poisons the body it sits in.
                     | majit_ir::RuntimeHelperKind::UnboundLocalError
-                    | majit_ir::RuntimeHelperKind::NewEmptyDict
+                    | majit_ir::RuntimeHelperKind::NewEmptyDict // BUILD_MAP 0's bound path is `inline_call_r_r` of a
+                                                                // fused constructor; [`nested_callee_writeanalyze`]
+                                                                // is that sibling.
             );
             // `box_int` is the only generic replay-safe helper here whose
             // result is necessarily numeric.  `load_const` may return a str,
@@ -4535,9 +4702,16 @@ pub(crate) fn fbw_callee_body_replay_scan(
                         && crate::jitcode_runtime::decode_op_at(body_code, d.next_pc)
                             .is_some_and(|next| next.key == "ref_return/r")
                 });
+                // `WriteAnalyzer.analyze_simple_operation` does not count a
+                // `setfield` whose target `FreshMallocs.is_fresh_malloc`.
+                // The outer scan still requires an immutable field
+                // (`wrapint` / `W_IntObject.intval`); a callee-effect
+                // scan (`fresh_malloc_stores_ok`) treats any store into
+                // a ref this body allocated as initialization.
                 if !finished_return
                     && !callee_owned_frame
-                    && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
+                    && (!fresh_ref_regs[target_reg as usize]
+                        || !(immutable_field || fresh_malloc_stores_ok))
                 {
                     replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
                 }
@@ -4581,17 +4755,26 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 Some(SpecializedBinop::Compare) => {
                     dst_exact_bool = true;
                 }
+                None if nested_callee_writeanalyze(
+                    body_code,
+                    &d,
+                    callee_descr_refs,
+                    callee_pool,
+                    depth,
+                    visited,
+                )
+                .is_some_and(|(clean, _)| clean) =>
+                {
+                    // Empty write set (`analyze_direct_call`). A constructor
+                    // (`newdict_empty`) returns a fresh malloc of its own
+                    // graph; a wrapper (`w_dict_new` → `newdict_empty`) is
+                    // also write-free, but `FreshMallocs.__init__` adds the
+                    // `direct_call` result to `nonfresh`. Do not mark dst
+                    // fresh either way. The residual `NewEmptyDict` arm
+                    // leaves dst unproven the same way.
+                }
                 None => {
-                    // Same allocation BUILD_MAP 0 residualled as NewEmptyDict:
-                    // a fully-bound `w_dict_new` / `newdict_empty` is that
-                    // constructor, now reached as `inline_call_r_r`.  Leave
-                    // dst provenance unproven — the residual NewEmptyDict
-                    // arm does the same, it is not numeric.
-                    if !inline_call_jitcode_name(body_code, &d, callee_pool)
-                        .is_some_and(|name| jitcode_is_empty_dict_alloc(&name))
-                    {
-                        replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
-                    }
+                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
                 }
             }
         } else if d.opname.starts_with("setinteriorfield_gc")
@@ -4704,18 +4887,27 @@ pub(crate) fn fbw_callee_body_replay_scan(
         }
         flags_get = next_get;
         finished_or = next_or;
+        if d.key == "ref_return/r" {
+            let this_fresh = body_code
+                .get(d.pc + 1)
+                .is_some_and(|reg| fresh_ref_regs[*reg as usize]);
+            returned_fresh_ref = Some(returned_fresh_ref.unwrap_or(true) && this_fresh);
+        }
         pc = d.next_pc;
     }
-    CalleeReplayScan {
-        safety: if deferred_call {
-            CalleeReplaySafety::DeferredCall
-        } else {
-            CalleeReplaySafety::Clean
+    (
+        CalleeReplayScan {
+            safety: if deferred_call {
+                CalleeReplaySafety::DeferredCall
+            } else {
+                CalleeReplaySafety::Clean
+            },
+            poison,
+            protected,
+            unscannable: false,
         },
-        poison,
-        protected,
-        unscannable: false,
-    }
+        returned_fresh_ref == Some(true),
+    )
 }
 
 /// True iff the body carries a residual that pushes a two-entry method form.

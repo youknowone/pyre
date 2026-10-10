@@ -1733,6 +1733,317 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
     ));
 }
 
+/// A synthetic callee whose body is `new_with_vtable` plus setfields on
+/// that fresh ref, then `ref_return` of it. The scan admits by effect
+/// (`FreshMallocs.is_fresh_malloc` / `analyze_direct_call`), not by the
+/// callee's name. BUILD_MAP 0's bound path is this shape; #2245 tagged
+/// the residual `NewEmptyDict` fallback and the bound call was still
+/// `UnprovableStoreOrCallForm`.
+fn synthetic_fresh_alloc_jitcode(
+    code: Vec<u8>,
+    num_regs_r: u8,
+    num_regs_i: u8,
+) -> std::sync::Arc<majit_metainterp::jitcode::JitCode> {
+    let jc = majit_metainterp::jitcode::JitCode::new("synthetic_fresh_alloc");
+    jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        c_num_regs_r: num_regs_r,
+        c_num_regs_i: num_regs_i,
+        ..Default::default()
+    });
+    std::sync::Arc::new(jc)
+}
+
+#[test]
+fn except_as_return_scan_admits_fresh_alloc_inline_call() {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let new_vt = insns["new_with_vtable/d>r"];
+    let setfield = insns["setfield_gc_i/rid"];
+    let ret = insns["ref_return/r"];
+    let callee =
+        synthetic_fresh_alloc_jitcode(vec![new_vt, 0, 0, 0, setfield, 0, 0, 1, 0, ret, 0], 1, 1);
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
+        callee.clone(),
+    )];
+    let inline_call = insns["inline_call_r_r/dR>r"];
+    let catch_exception = insns["catch_exception/L"];
+    let void_return = insns["void_return/"];
+    // Happy path: 0-arg `inline_call_r_r` then catch fall-through return.
+    // Handler at pc=9 returns. `inline_call` is 5 bytes (descr + empty R + dst).
+    let body = [
+        inline_call,
+        0,
+        0,
+        0,
+        0,
+        catch_exception,
+        9,
+        0,
+        void_return,
+        void_return,
+    ];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let scan = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        0,
+        &[],
+        1,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert!(
+        scan.poison.is_empty(),
+        "fresh-alloc inline_call must not poison, got {:?}",
+        scan.poison
+    );
+    assert_eq!(
+        callee.nested_replay_scan(),
+        Some((true, true)),
+        "GraphAnalyzer._analyzed_calls lives on the jitcode after the first scan"
+    );
+    assert!(body_has_returning_handler(&body));
+    assert!(handler_except_as_return_scan_admits(&scan, &body));
+
+    let other = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        0,
+        &[],
+        1,
+        &[],
+        &[make_fail_descr(0)],
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert_eq!(other.poison, vec![0]);
+    assert!(!handler_except_as_return_scan_admits(&other, &body));
+}
+
+#[test]
+fn replay_scan_poisons_inline_call_that_stores_to_arg() {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let setfield = insns["setfield_gc_i/rid"];
+    let ret = insns["ref_return/r"];
+    let callee = synthetic_fresh_alloc_jitcode(vec![setfield, 0, 0, 0, 0, ret, 0], 1, 1);
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
+    let inline_call = insns["inline_call_r_r/dR>r"];
+    // 1-arg `inline_call_r_r`: descr 0, R=[r0], dst r1.
+    let body = [inline_call, 0, 0, 1, 0, 1];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let scan = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        0,
+        &[],
+        2,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert_eq!(scan.poison, vec![0]);
+}
+
+#[test]
+fn except_as_return_scan_admits_boxer_shaped_inline_call_ir_r() {
+    // `w_int_new` / `newfloat` call-site shape: `inline_call_ir_r/dIR>r`
+    // with a one-int I list. `WriteAnalyzer.analyze_simple_operation`
+    // ignores a `setfield` whose target `FreshMallocs.is_fresh_malloc`
+    // regardless of argument count or kind.
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let new_vt = insns["new_with_vtable/d>r"];
+    let setfield = insns["setfield_gc_i/rid"];
+    let ret = insns["ref_return/r"];
+    let callee =
+        synthetic_fresh_alloc_jitcode(vec![new_vt, 0, 0, 0, setfield, 0, 0, 1, 0, ret, 0], 1, 1);
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
+    let inline_call = insns["inline_call_ir_r/dIR>r"];
+    let catch_exception = insns["catch_exception/L"];
+    let void_return = insns["void_return/"];
+    // descr 0, I=[i0], R=[], dst r0. `inline_call` is 7 bytes; handler at pc=11.
+    let body = [
+        inline_call,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        catch_exception,
+        11,
+        0,
+        void_return,
+        void_return,
+    ];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let scan = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        1,
+        &[],
+        1,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert!(
+        scan.poison.is_empty(),
+        "boxer-shaped inline_call_ir_r must not poison, got {:?}",
+        scan.poison
+    );
+    assert!(body_has_returning_handler(&body));
+    assert!(handler_except_as_return_scan_admits(&scan, &body));
+}
+
+#[test]
+fn replay_scan_admits_empty_write_set_even_if_a_return_is_nonfresh() {
+    // One path mallocs; the other `ref_return`s an argument. Arguments
+    // start nonfresh (`FreshMallocs.__init__` `nonfresh = set(graph.getargs())`),
+    // so the caller's dst is not a fresh malloc. The write set is still
+    // empty (`analyze_simple_operation` ignores the setfield on the
+    // fresh path), so the call itself is replay-safe.
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let goto_if_not = insns["goto_if_not/iL"];
+    let new_vt = insns["new_with_vtable/d>r"];
+    let setfield = insns["setfield_gc_i/rid"];
+    let ret = insns["ref_return/r"];
+    // pc=0 goto_if_not i0 → 15; pc=4 new_with_vtable r1; pc=8 setfield;
+    // pc=13 ref_return r1; pc=15 ref_return r0.
+    let callee = synthetic_fresh_alloc_jitcode(
+        vec![
+            goto_if_not,
+            0,
+            15,
+            0,
+            new_vt,
+            0,
+            0,
+            1,
+            setfield,
+            1,
+            0,
+            0,
+            0,
+            ret,
+            1,
+            ret,
+            0,
+        ],
+        2,
+        1,
+    );
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
+    let inline_call = insns["inline_call_ir_r/dIR>r"];
+    let setarray = insns["setarrayitem_gc_r/rird"];
+    // descr 0, I=[i0], R=[r0], dst r1 (8 bytes). Then setarrayitem on r1.
+    let body = [inline_call, 0, 0, 1, 0, 1, 0, 1, setarray, 1, 0, 0, 0, 0];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let scan = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        1,
+        &[],
+        2,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert!(
+        !scan.poison.contains(&0),
+        "empty write set must stay write-free, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(scan.poison, vec![8]);
+}
+
+#[test]
+fn replay_scan_does_not_mark_fresh_alloc_call_result_fresh() {
+    // `WriteAnalyzer.analyze_simple_operation` ignores stores into a
+    // `FreshMallocs.is_fresh_malloc` of THAT graph; `FreshMallocs.__init__`
+    // adds a `direct_call` result to `nonfresh`. The call is write-free,
+    // the result in the caller is not a fresh malloc. A later
+    // `setarrayitem_gc` on dst must still poison — marking dst fresh
+    // skipped that store (and its write barrier) and SIGSEGV'd
+    // `match_sequence_of_class_patterns` once the nested scan itself
+    // stopped crashing.
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let new_vt = insns["new_with_vtable/d>r"];
+    let setfield = insns["setfield_gc_i/rid"];
+    let ret = insns["ref_return/r"];
+    let callee =
+        synthetic_fresh_alloc_jitcode(vec![new_vt, 0, 0, 0, setfield, 0, 0, 1, 0, ret, 0], 1, 1);
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
+    let inline_call = insns["inline_call_r_r/dR>r"];
+    let setarray = insns["setarrayitem_gc_r/rird"];
+    // pc=0: 0-arg inline_call dst r0 (5 bytes). pc=5: setarrayitem array=r0.
+    let body = [inline_call, 0, 0, 0, 0, setarray, 0, 0, 0, 0, 0];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let scan = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        1,
+        &[],
+        1,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert!(
+        !scan.poison.contains(&0),
+        "fresh-alloc call must stay write-free, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(scan.poison, vec![5]);
+}
+
+#[test]
+fn replay_scan_nested_callee_constants_r_are_not_live_python_objects() {
+    // Nested helper `constants_r` are GCREF slots. Classifying them with
+    // `is_plain_int1` SIGSEGV'd `fbw_callee_body_replay_scan_rec` at
+    // EXC_BAD_ACCESS 0x5941698a3b0 while scanning
+    // `_orig_w_module_dict_lookup_object_entries` for MATCH_CLASS.
+    // `FreshMallocs` does not read that pool.
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let new_vt = insns["new_with_vtable/d>r"];
+    let ret = insns["ref_return/r"];
+    let jc = majit_metainterp::jitcode::JitCode::new("synthetic_fresh_alloc");
+    jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![new_vt, 0, 0, 0, ret, 0],
+        c_num_regs_r: 1,
+        constants_r: vec![majit_jitcode::codewriter::jitcode::ConstSlotR::new(
+            0x0594_1698_a3b0,
+        )],
+        ..Default::default()
+    });
+    let callee = std::sync::Arc::new(jc);
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(callee)];
+    let inline_call = insns["inline_call_r_r/dR>r"];
+    let body = [inline_call, 0, 0, 0, 0];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let scan = fbw_callee_body_replay_scan(
+        &body,
+        &[],
+        0,
+        &[],
+        1,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    );
+    assert!(
+        scan.poison.is_empty(),
+        "nested helper constants_r must not crash the scan, poison={:?}",
+        scan.poison
+    );
+}
+
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard
@@ -5784,21 +6095,6 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         "a child push must restore the parent's pre-CALL heap-cache knowledge"
     );
     assert_eq!(finish_payload_of(&outcome), Some((expected, Type::Ref)));
-}
-
-#[test]
-fn empty_dict_alloc_jitcode_names_match_build_map_zero_helpers() {
-    // BUILD_MAP 0 residualled as NewEmptyDict; the fully-bound form is
-    // `inline_call_r_r` of these two leaves.  `w_dict_new_kwargs` is a
-    // different helper.
-    assert!(jitcode_is_empty_dict_alloc("w_dict_new"));
-    assert!(jitcode_is_empty_dict_alloc("newdict_empty"));
-    assert!(jitcode_is_empty_dict_alloc(
-        "pyre_object::dictmultiobject::w_dict_new"
-    ));
-    assert!(!jitcode_is_empty_dict_alloc("w_dict_new_kwargs"));
-    assert!(!jitcode_is_empty_dict_alloc("dict_display_setitem"));
-    assert!(!jitcode_is_empty_dict_alloc(""));
 }
 
 #[test]
