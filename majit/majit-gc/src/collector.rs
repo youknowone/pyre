@@ -9219,6 +9219,15 @@ impl MiniMarkGC {
         if obj.is_null() || self.is_in_nursery(obj.0) {
             return;
         }
+        // incminimark `write_barrier` is the flag test alone. Both arms below
+        // act only when this same word has `TRACK_YOUNG_PTRS` set, so a clear
+        // bit answers for every family before the ownership question is
+        // asked; a set bit still has to be owned or witnessed.
+        if obj.0.is_multiple_of(GcHeader::ALIGN)
+            && unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
+        {
+            return;
+        }
         if self.is_managed_heap_object(obj.0) {
             let hdr = unsafe { header_of(obj.0) };
             if unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
