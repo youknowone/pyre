@@ -10155,7 +10155,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // loop's trace, which `callee_inline_unsupported` would.
                     return resolved_inline_decline(op.pc, line!());
                 }
-                if operator_tail == Some(crate::operator_continuation::OperatorTail::Format) {
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::Format)
+                    && fbw_executed_effect_count() == executed_effects_before
+                {
                     // `descroperation.py format` checks `isinstance_w(w_res,
                     // w_unicode)` after `__format__` returns. Pin the observed
                     // str class before the destination write so a later
@@ -10165,10 +10167,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // inlined body fails (`crate::operator_continuation`).
                     // This GuardClass itself resumes at `op.pc`, so a deopt
                     // re-runs FORMAT_WITH_SPEC. Emit it only over a body that
-                    // committed nothing, as the `Len` tail does.
-                    if fbw_executed_effect_count() != executed_effects_before {
-                        return resolved_inline_decline(op.pc, line!());
-                    }
+                    // committed nothing. An effectful body cannot decline
+                    // here: `cut_declined_subwalk` drops recorded ops and
+                    // does not undo the effect, so the FORMAT_WITH_SPEC
+                    // residual would run `__format__` again. Skip the pin
+                    // and keep the recorded prefix.
                     let concrete = match concrete_for_shadow {
                         ConcreteValue::Ref(obj) if !obj.is_null() => obj,
                         _ => return resolved_inline_decline(op.pc, line!()),
