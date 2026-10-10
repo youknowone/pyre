@@ -75,6 +75,7 @@ The following is the shared CI review prompt; keep its four-section output.
 BRIEF
 cat .github/codex-review-prompt.md >> "$review_dir/brief.md"
 codex exec --dangerously-bypass-approvals-and-sandbox -m "$review_model" \
+  -c 'model_reasoning_effort="medium"' \
   -C "$review_root" \
   --output-last-message "$review_dir/report.md" \
   "Read $review_dir/brief.md and carry out that read-only review exactly." </dev/null
@@ -87,7 +88,9 @@ status and only consume the report when the command succeeds and all four
 headings are present. Missing/truncated output is an incomplete review.
 
 `gpt-6.1-sol` preserves the source skill's reviewer default; honor a user
-`--model`/`-m` override. The repository requires both
+`--model`/`-m` override. Keep reasoning effort at `medium` for every review
+invocation, including retries; do not inherit or raise it from local settings.
+The repository requires both
 `--dangerously-bypass-approvals-and-sandbox` and `</dev/null` for noninteractive
 CLI delegation. This flag does not enforce read-only access: the brief defines
 the child's scope. Inspect the worktree after it finishes; any unexpected
