@@ -1701,10 +1701,16 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
     );
     assert!(body_has_returning_handler(&mismatch_body));
 
-    // except-as-return does not install `inline_poison_pcs`, so a Dirty
-    // happy path plus an unrelated returning handler must decline.
-    // `fbw_callee_body_replay_scan` keeps `safety` Clean and reports the
-    // ops in `poison`; `verdict()` is the value this admit must read.
+    // except-as-return does not install `inline_poison_pcs`. A Dirty
+    // try-body residual (classify's `type(name, (), {})` CallFn, or
+    // `log.append` then that CallFn) is the taken path `perform_call`
+    // traces into the returning handler, so this admit keeps the body.
+    // Abort-during-tracing cannot re-execute the outer CALL after a
+    // live-heap residual: the executed-effect odometer blackholes
+    // forward (`except_as_return_mutate_once`). Seeded deopt resumes at
+    // the callee's own guard. `fbw_callee_body_replay_scan` keeps
+    // `safety` Clean and reports the ops in `poison`; `verdict()` stays
+    // Dirty.
     let happy_poison = CalleeReplayScan {
         safety: CalleeReplaySafety::Clean,
         poison: vec![0],
@@ -1717,7 +1723,7 @@ fn poison_confined_to_handler_shape_splits_reraise_from_except_as_return() {
         &returns_body,
         &happy_poison.poison
     ));
-    assert!(!handler_except_as_return_scan_admits(
+    assert!(handler_except_as_return_scan_admits(
         &happy_poison,
         &returns_body
     ));
@@ -1819,7 +1825,102 @@ fn except_as_return_scan_admits_fresh_alloc_inline_call() {
         false,
     );
     assert_eq!(other.poison, vec![0]);
-    assert!(!handler_except_as_return_scan_admits(&other, &body));
+    // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline`
+    // and `JC_DONT_TRACE_HERE`. `perform_call` (`pyjitpl.py`) traces the
+    // taken path, so a Dirty happy-path poison that raises into
+    // `except E as e: return` is admitted rather than residualized.
+    assert!(handler_except_as_return_scan_admits(&other, &body));
+}
+
+/// A Dirty happy-path residual that already wrote live heap must blackhole
+/// forward: `fbw_bump_executed_effect` moves the odometer and
+/// [`fbw_decline_inline_callee`] sets `blackhole_required` when the
+/// innermost frame's `entry_executed_effects` lags. The Entry carrier
+/// rewind to the CALL is the zero-delta gate. `blackhole_if_trace_too_long`
+/// (`pyjitpl.py`) continues from the aborting frame.
+#[test]
+fn except_as_return_effect_delta_blackholes_forward() {
+    use crate::state::PyreSym;
+
+    fbw_store_journal_reset();
+    fbw_abort_outer_resume_reset();
+
+    let mut tc = fresh_trace_ctx();
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = true;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
+        w_code: 0,
+        recursion_greenkey: true,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents: Vec::new(),
+        entry_executed_effects: 0,
+        live: None,
+    });
+    let regs_r = Vec::new();
+    let regs_i = Vec::new();
+    let regs_f = Vec::new();
+    let concrete_r = Vec::new();
+    let mut concrete_i = Vec::new();
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    match fbw_decline_inline_callee(&wc, 0, None) {
+        DispatchError::LoopBearingCalleeInlineUnsupported {
+            blackhole_required, ..
+        } => assert!(!blackhole_required, "zero-delta abort rewinds to the CALL"),
+        other => panic!("unexpected decline {other:?}"),
+    }
+
+    fbw_bump_executed_effect("except_as_return_test");
+    match fbw_decline_inline_callee(&wc, 0, None) {
+        DispatchError::LoopBearingCalleeInlineUnsupported {
+            blackhole_required, ..
+        } => assert!(blackhole_required, "nonzero delta must blackhole forward"),
+        other => panic!("unexpected decline {other:?}"),
+    }
+
+    fbw_store_journal_reset();
+    fbw_abort_outer_resume_reset();
+    std::hint::black_box(&mut snapshot_sym);
 }
 
 #[test]
@@ -5030,6 +5131,36 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
 }
 
 #[test]
+fn newdict_is_the_pypy_empty_dict_leaf() {
+    // `dictmultiobject.py allocate_and_init_instance` empty-dict arm /
+    // `pyopcode.py BUILD_MAP` itemcount 0 is `space.newdict()`.  Own graph
+    // so `fuse_boxing_alloc` rewrites `malloc_typed_managed` to
+    // `new_with_vtable` + `dstorage` / `dstrategy` setfields, the shape
+    // PyPy traces.
+    let newdict =
+        crate::jitcode_runtime::pathed_jitcode("pyre_object::dictmultiobject::newdict_empty")
+            .expect("newdict_empty must be a discovered jitcode");
+    let newdict_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&newdict.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        newdict_ops.iter().any(|op| *op == "new_with_vtable"),
+        "newdict_empty must lower to new_with_vtable; ops={newdict_ops:?}"
+    );
+    assert!(
+        !newdict_ops
+            .iter()
+            .any(|op| op.contains("residual") || *op == "residual_call"),
+        "fused newdict_empty must not residualise malloc; ops={newdict_ops:?}"
+    );
+    assert!(
+        newdict_ops.len() < 32,
+        "fused newdict_empty is New+setfields, not malloc_typed; ops={newdict_ops:?}"
+    );
+    eprintln!("newdict_empty {} ops: {newdict_ops:?}", newdict_ops.len());
+}
+
+#[test]
 fn newcomplex_and_lane_getters_are_the_pypy_leaf() {
     // complexobject.py `descr__new__` allocates `W_ComplexObject(real, imag)`.
     // `complexwprop` then boxes one lane with `space.newfloat`. Both leaves
@@ -5216,6 +5347,59 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
             .any(|op| op.contains("cast_uint_to_int") || op.contains("cast_int_to_uint")),
         "usize/i64 length casts must erase; ops={ops:?}"
     );
+}
+
+fn assert_identity_iter_w_leaf(path: &str) {
+    let jc = crate::jitcode_runtime::pathed_jitcode(path)
+        .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+    let body = jc
+        .try_body()
+        .unwrap_or_else(|| panic!("{path} body must be assembled"));
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(body.calldescr.arg_classes, "r", "{path} ops={ops:?}");
+    assert_eq!(body.calldescr.result_type, 'r', "{path} ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| *op == "ref_return"),
+        "{path} must return the receiver; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.contains("residual")),
+        "{path} must not residualise; ops={ops:?}"
+    );
+}
+
+#[test]
+fn zip_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Zip.iter_w` is `return self`. Own graph so GET_ITER
+    // records that body (`specialize.rs ZIP_ITER_DESCENT`) instead of a
+    // hand identity.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_zip_iter");
+}
+
+#[test]
+fn map_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Map.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_map_iter");
+}
+
+#[test]
+fn filter_iter_jitcode_is_the_iter_w_leaf() {
+    // `functional.py W_Filter.iter_w` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_filter_iter");
+}
+
+#[test]
+fn seqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_AbstractSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_seqiter_iter");
+}
+
+#[test]
+fn reverseseqiter_iter_jitcode_is_the_descr_iter_leaf() {
+    // `iterobject.py W_ReverseSeqIterObject.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::iterobject::w_reverseseqiter_iter");
 }
 
 #[test]

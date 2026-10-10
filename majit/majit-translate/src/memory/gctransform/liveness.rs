@@ -801,7 +801,7 @@ fn address_bearing_locals(blocks: &[BasicBlock]) -> HashSet<u64> {
     let mut out = HashSet::new();
     for blk in blocks {
         for st in &blk.statements {
-            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind_ref() else {
                 continue;
             };
             let Some(dest) = bare_local(&place) else {
@@ -958,7 +958,7 @@ fn operand_address_roots(
 /// successors, so the call's own arguments are the pre-call word.
 fn pyerror_stale_after_collect(
     blocks: &[BasicBlock],
-    terms: &[Option<TermKind>],
+    terms: &[Option<&TermKind>],
     names: &HashMap<u64, String>,
     mut_borrow_of: &HashMap<u64, u64>,
     defs: &HashMap<u64, PinSrc>,
@@ -987,7 +987,7 @@ fn pyerror_stale_after_collect(
         queued[block] = false;
         let mut stale = stale_in[block].clone();
         for st in &blocks[block].statements {
-            let Ok(kind) = st.stmt_kind() else {
+            let Ok(kind) = st.stmt_kind_ref() else {
                 continue;
             };
             note_stmt_loads(
@@ -1353,7 +1353,7 @@ struct PinAssignIndex {
 /// A local assigned twice is not a chain worth following. Call destinations
 /// are marked assigned so a later statement does not alias them, and they are
 /// not given a [`PinSrc`]: the value came from the callee.
-fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAssignIndex {
+fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<&TermKind>]) -> PinAssignIndex {
     let mut defs: HashMap<u64, PinSrc> = HashMap::new();
     let mut defined: HashSet<u64> = HashSet::new();
     // `_t = &mut _l`: a callee handed `_t` owns keeping `_l` current, the
@@ -1363,7 +1363,7 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
     let mut call_dests: HashSet<u64> = HashSet::new();
     for (b, blk) in blocks.iter().enumerate() {
         for st in &blk.statements {
-            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind_ref() else {
                 continue;
             };
             let Some(d) = bare_local(&place) else {
@@ -1878,7 +1878,11 @@ fn helper_body_fact(
     names: &HashMap<u64, String>,
 ) -> Option<HelperBodyFact> {
     let body = fd.unstructured()?;
-    let terms: Vec<Option<TermKind>> = body.body.iter().map(|blk| blk.term(llbc).ok()).collect();
+    let terms: Vec<Option<&TermKind>> = body
+        .body
+        .iter()
+        .map(|blk| blk.term_ref(llbc).ok())
+        .collect();
     // A terminator this reader cannot classify may be the `push_roots` that
     // disqualifies the helper, or the only pin. Either misread is worse than
     // leaving the caller unread.
@@ -2167,7 +2171,8 @@ pub fn scan(
 
         stats.bodies_scanned += 1;
         let n = body.body.len();
-        let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term(llbc).ok()).collect();
+        let terms: Vec<Option<&TermKind>> =
+            body.body.iter().map(|b| b.term_ref(llbc).ok()).collect();
         let unparsed_terms = terms
             .iter()
             .any(|t| t.is_none() || matches!(t, Some(TermKind::Unknown)));
@@ -2180,7 +2185,7 @@ pub fn scan(
         let unparsed_stmts = body.body.iter().any(|blk| {
             blk.statements
                 .iter()
-                .any(|st| matches!(st.stmt_kind(), Err(_) | Ok(StmtKind::Unknown)))
+                .any(|st| matches!(st.stmt_kind_ref(), Err(_) | Ok(StmtKind::Unknown)))
         });
         if unparsed_stmts {
             // `transfer_stmt` reads no uses out of either shape, so the live
@@ -2572,14 +2577,14 @@ pub fn scan(
         let mut stmt_kills: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         for (b, blk) in body.body.iter().enumerate() {
             for st in &blk.statements {
-                match st.stmt_kind() {
+                match st.stmt_kind_ref() {
                     Ok(StmtKind::Assign(place, _)) => {
                         if let Some(d) = bare_local(&place) {
                             stmt_kills[b].insert(d);
                         }
                     }
                     Ok(StmtKind::StorageLive(i)) | Ok(StmtKind::StorageDead(i)) => {
-                        stmt_kills[b].insert(i);
+                        stmt_kills[b].insert(*i);
                     }
                     _ => {}
                 }
@@ -2793,7 +2798,7 @@ pub fn scan(
                     &mut drop_memo,
                 );
                 for st in body.body[b].statements.iter().rev() {
-                    if let Ok(k) = st.stmt_kind() {
+                    if let Ok(k) = st.stmt_kind_ref() {
                         transfer_stmt(&k, &mut live, &gc_locals);
                     }
                 }
@@ -2811,7 +2816,7 @@ pub fn scan(
         // body is in the set for every call the body makes.
         let mut movable_args: HashSet<u64> = HashSet::new();
         for other in &body.body {
-            let Ok(TermKind::Call { call: c2, .. }) = other.term(llbc) else {
+            let Ok(TermKind::Call { call: c2, .. }) = other.term_ref(llbc) else {
                 continue;
             };
             let CallFunc::Regular(r2) = &c2.func else {
@@ -3543,8 +3548,8 @@ mod tests {
             3,
             pin_src(&Rvalue::Ref {
                 place: local(2),
-                kind: serde_json::Value::Null,
-                ptr_metadata: serde_json::Value::Null,
+                kind: serde_json::Value::Null.into(),
+                ptr_metadata: serde_json::Value::Null.into(),
             })
             .expect("a borrow is a followable alias"),
         );
@@ -3560,7 +3565,7 @@ mod tests {
         defs.insert(3, PinSrc::Alias(2));
         defs.insert(
             4,
-            pin_src(&Rvalue::Cast(serde_json::Value::Null, mv(3), ty()))
+            pin_src(&Rvalue::Cast(serde_json::Value::Null.into(), mv(3), ty()))
                 .expect("a cast is a followable alias"),
         );
         assert_eq!(chased(4, &defs), vec![2, 3, 4, 10]);
@@ -3574,7 +3579,8 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             1,
-            pin_src(&Rvalue::Use(mv(0), serde_json::Value::Null)).expect("a use is an alias"),
+            pin_src(&Rvalue::Use(mv(0), serde_json::Value::Null.into()))
+                .expect("a use is an alias"),
         );
         assert_eq!(chased(1, &defs), vec![0, 1]);
     }

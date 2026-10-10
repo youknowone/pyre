@@ -8582,9 +8582,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `LoopBearingCalleeInlineUnsupported` inside the handler re-executes
     // the outer CALL.
     //
-    // A Dirty happy path with an unrelated `except E: return` could abort
-    // after a mutation and re-execute the outer CALL, so Dirty is admitted
-    // only when poison is confined to returning handlers.
+    // A try-body residual that raises into that arm (classify's 3-arg
+    // `type()` `CallFn`) poisons `verdict()` Dirty. Residualizing the
+    // callee then compiles it as a function-entry whose `record_context`
+    // `guard_isnull` on `sys_exc_value` fails every iteration. A Dirty
+    // happy-path residual that already wrote live heap does not re-run
+    // on abort: the executed-effect odometer makes
+    // `fbw_decline_inline_callee` blackhole forward, and
+    // `blackhole_if_trace_too_long` (`pyjitpl.py`) continues from the
+    // aborting frame. Seeded deopt resumes at the callee's own guard.
     let handler_except_as_return_admit = seeded_inline
         && !branchy_poison_admit
         && !pyre_interpreter::code_has_for_iter(callee_code)

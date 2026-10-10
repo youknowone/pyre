@@ -4769,7 +4769,8 @@ fn filter_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyEr
 }
 
 pub(crate) fn filter_iter_method(args: &[PyObjectRef]) -> PyResult {
-    filter_receiver(args, "__iter__")
+    let self_ = filter_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_filter_iter(self_) })
 }
 
 pub(crate) fn filter_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -5007,7 +5008,8 @@ fn map_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError
 }
 
 pub(crate) fn map_iter_method(args: &[PyObjectRef]) -> PyResult {
-    map_receiver(args, "__iter__")
+    let self_ = map_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_map_iter(self_) })
 }
 
 pub(crate) fn map_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -5096,7 +5098,8 @@ fn zip_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError
 }
 
 pub(crate) fn zip_iter_method(args: &[PyObjectRef]) -> PyResult {
-    zip_receiver(args, "__iter__")
+    let self_ = zip_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_zip_iter(self_) })
 }
 
 pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -18661,13 +18664,17 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // Already an iterator
         if is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
-            || is_seq_iter(obj)
-            || pyre_object::is_list_iter(obj)
-            || pyre_object::is_list_reverse_iter(obj)
-            || pyre_object::is_tuple_iter(obj)
             || pyre_object::generator::is_generator(obj)
         {
             return Ok(obj);
+        }
+        // `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
+        if is_seq_iter(obj) || pyre_object::is_list_iter(obj) || pyre_object::is_tuple_iter(obj) {
+            return Ok(pyre_object::w_seqiter_iter(obj));
+        }
+        // `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
+        if pyre_object::is_list_reverse_iter(obj) {
+            return Ok(pyre_object::w_reverseseqiter_iter(obj));
         }
         // W_ISlice.iter_w returns self, but a heap subtype can replace
         // `__iter__`; dispatch that override before taking the native fast
@@ -18776,12 +18783,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `pypy/module/__builtin__/functional.py W_Filter.iter_w` —
         // `return self`.
         if pyre_object::functional::is_filter(obj) {
-            return Ok(obj);
+            return Ok(pyre_object::functional::w_filter_iter(obj));
         }
-        // `functional.py W_Map.iter_w` / `:1019-1020 W_Zip.iter_w` —
-        // `return self`.
-        if pyre_object::functional::is_map(obj) || pyre_object::functional::is_zip(obj) {
-            return Ok(obj);
+        // `functional.py W_Map.iter_w` — `return self`.
+        if pyre_object::functional::is_map(obj) {
+            return Ok(pyre_object::functional::w_map_iter(obj));
+        }
+        // `functional.py W_Zip.iter_w` — `return self`.
+        if pyre_object::functional::is_zip(obj) {
+            return Ok(pyre_object::functional::w_zip_iter(obj));
         }
         // `pypy/module/_sre/interp_sre.py W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
@@ -23161,6 +23171,26 @@ pub(crate) fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     Ok(obj)
+}
+
+/// `iterobject.py W_AbstractSeqIterObject.descr_iter` gateway.
+pub(crate) fn seqiter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(unsafe { pyre_object::w_seqiter_iter(obj) })
+}
+
+/// `iterobject.py W_ReverseSeqIterObject.descr_iter` gateway.
+pub(crate) fn reverseseqiter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(unsafe { pyre_object::w_reverseseqiter_iter(obj) })
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)
