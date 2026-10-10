@@ -47,6 +47,10 @@ fn cond_call_gc_wb_slowpath_reaches_the_gc_and_keeps_live_registers() {
     let array = alloc_old(&mut gc);
 
     let mut backend = DynasmBackend::new();
+    // A collector without a write barrier first: the `setup_once` in
+    // `attach_default_test_descrs` builds no helper for it, and they must
+    // still be built once MiniMark is in.
+    backend.set_gc_allocator(Box::new(majit_backend::jitframe::HostHeapGc));
     backend.attach_default_test_descrs();
     // jitframe.py — a collector with a type table carries JITFRAME before install.
     let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());

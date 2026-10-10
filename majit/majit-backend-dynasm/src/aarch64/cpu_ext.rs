@@ -16,8 +16,8 @@ pub(crate) struct Aarch64CpuExt {
     _malloc_slowpath_fixed_buffer: Option<ArenaExecutableBuffer>,
     propagate_exception_path: Option<usize>,
     _propagate_exception_path_buffer: Option<ArenaExecutableBuffer>,
-    /// `AssemblerARM64.wb_slowpath`.
-    wb_slowpath: Option<[usize; 5]>,
+    /// `AssemblerARM64.wb_slowpath`; `0` where no helper is built yet.
+    wb_slowpath: [usize; 5],
     _wb_slowpath_buffers: Vec<ArenaExecutableBuffer>,
 }
 
@@ -29,7 +29,7 @@ impl Aarch64CpuExt {
             _malloc_slowpath_fixed_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
-            wb_slowpath: None,
+            wb_slowpath: [0; 5],
             _wb_slowpath_buffers: Vec::new(),
         }
     }
@@ -64,10 +64,6 @@ impl Aarch64CpuExt {
     /// `aarch64/assembler.py setup_once`: `_build_wb_slowpath` for every
     /// `withcards`/`withfloats` pair and the `for_frame` helper.
     pub(crate) fn ensure_wb_slowpath(&mut self) -> [usize; 5] {
-        if let Some(wb_slowpath) = self.wb_slowpath {
-            return wb_slowpath;
-        }
-        let mut wb_slowpath = [0usize; 5];
         // `_build_wb_slowpath(False)`, `(True)`, `(False, for_frame=True)`,
         // then the `withfloats=True` pair.
         for (withcards, withfloats, for_frame) in [
@@ -77,6 +73,18 @@ impl Aarch64CpuExt {
             (false, true, false),
             (true, true, false),
         ] {
+            let helper_num = if for_frame {
+                4
+            } else {
+                usize::from(withcards) + 2 * usize::from(withfloats)
+            };
+            // `_write_barrier_fastpath`: `if self.wb_slowpath[helper_num] ==
+            // 0` builds it there. A collector installed after the first
+            // build (`set_gc_allocator`) can be the first with a write
+            // barrier, so an entry left at 0 is retried, never cached.
+            if self.wb_slowpath[helper_num] != 0 {
+                continue;
+            }
             let Some((buffer, addr)) = super::assembler::build_wb_slowpath(
                 withcards,
                 withfloats,
@@ -85,16 +93,10 @@ impl Aarch64CpuExt {
             ) else {
                 continue;
             };
-            let helper_num = if for_frame {
-                4
-            } else {
-                usize::from(withcards) + 2 * usize::from(withfloats)
-            };
-            wb_slowpath[helper_num] = addr;
+            self.wb_slowpath[helper_num] = addr;
             self._wb_slowpath_buffers.push(buffer);
         }
-        self.wb_slowpath = Some(wb_slowpath);
-        wb_slowpath
+        self.wb_slowpath
     }
 
     pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
