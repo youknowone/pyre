@@ -474,7 +474,7 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
                 "__call__",
                 callable_proxy_descr__call__,
                 callable_proxy_descr__call_args,
-            ),
+            )
         )
     };
     // **callable_proxy_typedef_dict — interp__weakref.py, plus the

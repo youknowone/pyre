@@ -206,7 +206,7 @@ fn sys_namespace_type() -> PyObjectRef {
                         "__init__",
                         sys_namespace_init,
                         sys_namespace_init_args,
-                    ),
+                    )
                 )
             };
         });

@@ -5082,7 +5082,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     0,
                     1,
                 ),
-            ),
+            )
         )
     };
 
