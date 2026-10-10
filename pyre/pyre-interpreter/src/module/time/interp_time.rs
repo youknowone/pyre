@@ -156,7 +156,7 @@ fn monotonic_seconds() -> f64 {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        #[cfg(all(unix, feature = "host_env"))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         {
             if let Ok(ts) = clock_gettime_timespec(libc::CLOCK_MONOTONIC) {
                 return timespec_to_seconds(&ts);
@@ -428,7 +428,7 @@ pub(crate) fn monotonic_nanos() -> i128 {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        #[cfg(all(unix, feature = "host_env"))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         {
             if let Ok(ts) = clock_gettime_timespec(libc::CLOCK_MONOTONIC) {
                 return timespec_to_nanos_i128(&ts);
@@ -1027,7 +1027,7 @@ struct c_tm {
 #[allow(non_camel_case_types)]
 type time_t = i64;
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut t = seconds as majit_rlib::rtime::TIME_T;
     let p = unsafe { majit_rlib::rtime::c_gmtime(&mut t) };
@@ -1355,10 +1355,9 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
         .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
 }
 
-// `interp_time.py c_gmtime` libc backend, used when the host_env
-// abstraction layer is disabled.  Mirrors PyPy's rffi.llexternal call
-// to libc gmtime_r (Unix) / _gmtime64_s (Windows CRT).
-#[cfg(all(unix, not(feature = "host_env")))]
+/// `interp_time.c_gmtime` is not sandboxsafe; `gmtime_r` converts a
+/// caller-supplied timestamp. Unix negation of the `rtime::c_gmtime` arm.
+#[cfg(all(unix, any(not(feature = "host_env"), feature = "sandbox")))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let t = seconds as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

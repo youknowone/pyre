@@ -440,6 +440,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     );
 
     // localeconv() — numeric/monetary parameters of the current locale.
+    #[cfg(not(feature = "sandbox"))]
     crate::module_ns_store(
         ns,
         "localeconv",
@@ -499,6 +500,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ),
     );
     // setlocale() mutates/reads the host locale (and $LANG/$LC_*).
+    #[cfg(not(feature = "sandbox"))]
     crate::module_ns_store(
         ns,
         "setlocale",
@@ -580,6 +582,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // publishes the name only where the host has langinfo, which is the
     // condition its `nl_item` constants are registered under above.
     #[cfg(all(
+        not(feature = "sandbox"),
         unix,
         not(any(target_os = "ios", target_os = "android", target_os = "redox"))
     ))]
@@ -736,5 +739,32 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             0,
         ),
     );
+    // Upstream's sandbox module set (`pypyoption.py` `default_modules`) has
+    // no `_locale`, so its entry points raise here.
+    #[cfg(feature = "sandbox")]
+    {
+        fn locale_unavailable(
+            _: &[pyre_object::PyObjectRef],
+        ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+            Err(crate::host_seam::stub("this locale function"))
+        }
+        #[cfg(all(
+            unix,
+            not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+        ))]
+        let stubbed: &[&str] = &["setlocale", "localeconv", "nl_langinfo"];
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+        )))]
+        let stubbed: &[&str] = &["setlocale", "localeconv"];
+        for &name in stubbed {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function(name, locale_unavailable),
+            );
+        }
+    }
     Ok(())
 }
