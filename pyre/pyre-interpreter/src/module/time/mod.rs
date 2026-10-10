@@ -117,8 +117,8 @@ crate::py_module! {
         // /etc/localtime) outside the controller, so under sandbox the four
         // timezone attributes stay at the UTC interplevel defaults and tzset
         // is not exposed — matching the tz-dependent stubs installed below.
-        // `init_timezone` still allocates the four module objects, so `ns`
-        // stays rooted across that call.
+        // `init_timezone` roots `ns` itself; the wrapper stays because this
+        // block still stores `tzset` on `ns` after the call.
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let mut ns = ns;
@@ -132,6 +132,9 @@ crate::py_module! {
         // Windows `_init_timezone` calls `_tzset` then `_get_timezone` /
         // `_get_daylight` / `_get_tzname` from the same CRT.  `tzset` stays
         // absent: it is the POSIX call that rereads `$TZ`.
+        // `init_timezone` roots `ns` itself; the wrapper stays because this
+        // block still stores `thread_time` / `thread_time_ns` on `ns` after
+        // the call.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             let mut ns = ns;

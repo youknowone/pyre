@@ -1393,6 +1393,23 @@ fn tail_register_failargs(n_live: usize) -> usize {
     n_live.min(TAIL_EXTRA_INT_REGS)
 }
 
+/// A LABEL whose descr is a `LoopTargetDescr` is a JUMP target
+/// (`assembler.py fixup_target_tokens` / `set_dispatch_target`).
+///
+/// `compile.py compile_retrace` attaches such a LABEL as a bridge.
+/// `emit_loop_tail_call` then `closing_jump`s into it with the two-arg
+/// Tail signature a loop uses for `br_table` label entry
+/// (`x86/regalloc.py consider_jump` moves args into the LABEL's
+/// `_x86_arglocs` and `assembler.py closing_jump` jumps to
+/// `_ll_loop_code` — never through the bridge prologue). Extra Tail
+/// failargs would be unspecified on that path.
+fn op_is_dispatchable_label(op: &Op) -> bool {
+    op.opcode == OpCode::Label
+        && op
+            .getdescr()
+            .is_some_and(|descr| descr.as_loop_target_descr().is_some())
+}
+
 /// Live failargs in the order `compile_bridge` receives as inputargs.
 ///
 /// `rd_locs` (`rebuild_faillocs_from_descr`) is the mask
@@ -3666,6 +3683,66 @@ fn emit_call_footer_shadowstack(
 /// it, so they keep the full `_call_header_with_stack_check` prologue.
 const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
 
+/// Publish the compact inputarg-ref gcmap on dispatch_key selector 0.
+///
+/// A retrace bridge (`compile.py compile_retrace`) is a loop-like body:
+/// two-arg Tail + `br_table` on `dispatch_key`, matching how loops
+/// enter a LABEL (`x86/regalloc.py consider_jump` /
+/// `assembler.py closing_jump` jump to `_ll_loop_code` and never
+/// re-enter the bridge prologue). Key 0 is the guard HIT / host
+/// preamble; the HIT path compact-stores failargs into the frame
+/// first. Key `label_block_id + 1` is a JUMP re-entry: the source
+/// already published its gcmap over the carried slots, and replacing
+/// it with the bridge inputarg map would mark the wrong words when
+/// LABEL arity differs from the guard live list.
+fn emit_label_bridge_preamble_gcmap(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    jf_ptr: CValue,
+    raw_dispatch_key: CValue,
+    ref_slots: &[usize],
+    extra_gcmaps: &mut Vec<i64>,
+) {
+    let label_selector_mask = (!IN_CODE_ENTRY_KEY_FLAG) as i64;
+    let selector = builder
+        .ins()
+        .band_imm_u(raw_dispatch_key, label_selector_mask);
+    let zero = builder.ins().iconst(cl_types::I32, 0);
+    let is_preamble = builder.ins().icmp(IntCC::Equal, selector, zero);
+    let publish = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(is_preamble, publish, &[], done, &[]);
+    builder.switch_to_block(publish);
+    builder.seal_block(publish);
+    let entry_gcmap = if ref_slots.is_empty() {
+        0
+    } else {
+        allocate_gcmap(ref_slots)
+    };
+    if entry_gcmap != 0 {
+        extra_gcmaps.push(entry_gcmap);
+    }
+    let gcmap_val = builder.ins().iconst(cl_types::I64, entry_gcmap);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
+    if entry_gcmap != 0 {
+        emit_jitframe_write_barrier(
+            module,
+            builder,
+            ptr_type,
+            call_conv,
+            jf_ptr,
+            jitframe_write_barrier_flag(),
+        );
+    }
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    builder.seal_block(done);
+}
+
 /// `x86/assembler.py:182-184 _build_frame_realloc_slowpath` parity:
 /// `_load_shadowstack_top_in_ebx(mc, gcrootmap)` followed by
 /// `MOV_mr((ebx.value, -WORD), eax.value)`.
@@ -5098,13 +5175,41 @@ fn invert_condition(cc: IntCC) -> IntCC {
     cc.complement()
 }
 
+/// `llsupport/regalloc.py` `compute_vars_longevity` — `Lifetime.last_usage`
+/// for every non-constant box used as an op arg or guard failarg.
+/// Iteration is monotonic in `i`, so a later visit supersedes any earlier
+/// `last_usage`. Missing entries behave as `0` for the
+/// `last_usage > i + 1` test (`next_op_can_accept_cc`).
+fn compute_vars_longevity(ops: &[Op]) -> IndexMap<u32, usize> {
+    let mut longevity: IndexMap<u32, usize> = IndexMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for arg in op
+            .args_slice()
+            .iter()
+            .chain(op.guard_fail_args().into_iter().flatten())
+        {
+            // Const operands carry value inline (history.py/268/314);
+            // failarg holes (`None`) are not boxes (`regalloc.py` skip).
+            if arg.is_constant() || arg.is_none() {
+                continue;
+            }
+            longevity.insert(arg.to_opref().raw(), i);
+        }
+    }
+    longevity
+}
+
 /// `llsupport/regalloc.py` `next_op_can_accept_cc`: the comparison at
 /// `i` may leave its condition in `guard_success_cc` instead of
 /// materialising a boolean, when `operations[i + 1]` is a
 /// `GUARD_TRUE` / `GUARD_FALSE` / `COND_CALL` whose only use of the
-/// result is that predicate (`longevity[op].last_usage > i + 1` is
-/// scanned from the remaining trace ops).
-fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
+/// result is that predicate (`longevity[op].last_usage > i + 1`).
+fn next_op_can_accept_cc(
+    ops: &[Op],
+    i: usize,
+    result: OpRef,
+    longevity: &IndexMap<u32, usize>,
+) -> bool {
     if i + 1 >= ops.len() {
         return false;
     }
@@ -5127,7 +5232,8 @@ fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
     {
         return false;
     }
-    if result_last_usage(ops, result) > i + 1 {
+    // regalloc.py: `self.longevity[op].last_usage > i + 1`
+    if longevity.get(&result.raw()).copied().unwrap_or(0) > i + 1 {
         return false;
     }
     if opnum != OpCode::CondCallN {
@@ -5148,24 +5254,87 @@ fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
     true
 }
 
-/// `regalloc.py` `Lifetime.last_usage` for `result`: last op index that
-/// reads it as an arg or fail arg. `0` when nothing reads it, matching
-/// a missing longevity entry for the `last_usage > i + 1` test.
-fn result_last_usage(ops: &[Op], result: OpRef) -> usize {
-    let mut last = 0;
-    for (idx, op) in ops.iter().enumerate() {
-        if op
-            .args_slice()
-            .iter()
-            .any(|a| !a.is_constant() && !a.is_none() && a.to_opref() == result)
-            || op
-                .guard_fail_args()
-                .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
-        {
-            last = idx;
-        }
+#[cfg(test)]
+mod longevity_last_usage_tests {
+    use super::*;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
+    use majit_ir::operand::Operand;
+
+    fn mk(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let bx: Vec<Operand> = args.iter().map(|&a| rb(a)).collect();
+        let o = Op::new(opcode, &bx);
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        o
     }
-    last
+
+    /// The retired per-call walk: last op index that reads `result` as an
+    /// arg or failarg. The table must match this for `next_op_can_accept_cc`.
+    fn walk_last_usage(ops: &[Op], result: OpRef) -> usize {
+        let mut last = 0;
+        for (idx, op) in ops.iter().enumerate() {
+            if op
+                .args_slice()
+                .iter()
+                .any(|a| !a.is_constant() && !a.is_none() && a.to_opref() == result)
+                || op
+                    .guard_fail_args()
+                    .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+            {
+                last = idx;
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn last_usage_table_matches_arg_and_failarg_walk() {
+        let cmp = mk(
+            OpCode::IntLt,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            2,
+        );
+        let result = cmp.pos().get();
+        let guard = mk(OpCode::GuardTrue, &[result], 3);
+        guard.setfailargs(vec![].into());
+        let finish = mk(OpCode::Finish, &[], 4);
+
+        let ops = [cmp.clone(), guard, finish.clone()];
+        let longevity = compute_vars_longevity(&ops);
+        assert_eq!(
+            longevity.get(&result.raw()).copied().unwrap_or(0),
+            walk_last_usage(&ops, result)
+        );
+        assert_eq!(longevity.get(&result.raw()).copied(), Some(1));
+        assert!(next_op_can_accept_cc(&ops, 0, result, &longevity));
+
+        let guard_fa = mk(OpCode::GuardTrue, &[result], 3);
+        guard_fa.setfailargs(smallvec::smallvec![rb(result)]);
+        let ops_fa = [cmp.clone(), guard_fa, finish];
+        let longevity_fa = compute_vars_longevity(&ops_fa);
+        assert_eq!(
+            longevity_fa.get(&result.raw()).copied().unwrap_or(0),
+            walk_last_usage(&ops_fa, result)
+        );
+        assert_eq!(longevity_fa.get(&result.raw()).copied(), Some(1));
+        assert!(!next_op_can_accept_cc(&ops_fa, 0, result, &longevity_fa));
+
+        let add = mk(OpCode::IntAdd, &[result, OpRef::input_arg_int(0)], 5);
+        let guard_only = mk(OpCode::GuardTrue, &[result], 3);
+        guard_only.setfailargs(vec![].into());
+        let ops_later = [cmp, guard_only, add];
+        let longevity_later = compute_vars_longevity(&ops_later);
+        assert_eq!(
+            longevity_later.get(&result.raw()).copied().unwrap_or(0),
+            walk_last_usage(&ops_later, result)
+        );
+        assert_eq!(longevity_later.get(&result.raw()).copied(), Some(2));
+        assert!(!next_op_can_accept_cc(
+            &ops_later,
+            0,
+            result,
+            &longevity_later
+        ));
+    }
 }
 
 /// `x86/regalloc.py` `_consider_compop` + `force_allocate_reg_or_cc` /
@@ -5180,6 +5349,7 @@ fn emit_icmp(
     vi: u32,
     ops: &[Op],
     op_idx: usize,
+    longevity: &IndexMap<u32, usize>,
     guard_success_cc: &mut Option<GuardSuccessCc>,
 ) {
     let (a, b) = resolve_binop(builder, opref_vars, constants, op);
@@ -5189,7 +5359,7 @@ fn emit_icmp(
         guard_success_cc.is_none(),
         "flush_cc: guard_success_cc already set"
     );
-    if next_op_can_accept_cc(ops, op_idx, op.pos().get()) {
+    if next_op_can_accept_cc(ops, op_idx, op.pos().get(), longevity) {
         *guard_success_cc = Some(GuardSuccessCc { cc, lhs: a, rhs: b });
         return;
     }
@@ -7820,6 +7990,22 @@ fn emit_attached_bridge_hit_tail(
                 );
             }
         }
+    } else {
+        // A retrace bridge with a dispatchable LABEL uses the two-arg
+        // loop signature (`op_is_dispatchable_label`): its entry loads
+        // compact slots, like a loop LABEL loader. The loop baked this
+        // extra-arg call before it knew the attached bridge would
+        // contain a LABEL, so store the Tail extras here for that
+        // two-arg body. A linear extra-arg body stores them again at
+        // entry (`prepare_bridge` / `_update_bindings`).
+        for (i, &value) in live_args.iter().enumerate() {
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                jf_ptr,
+                JF_FRAME_ITEM0_OFS + (i as i32) * 8,
+            );
+        }
     }
     for &(dense, value) in overflow_stores {
         builder.ins().store(
@@ -7831,8 +8017,9 @@ fn emit_attached_bridge_hit_tail(
     }
     let bridge_sig = attached_bridge_tail_sig(ptr_type, live_args.len());
     let bridge_sig_ref = builder.import_signature(bridge_sig);
-    // A bridge is linear (no LABELs): it always enters at its start, so the
-    // LABEL selector is 0.
+    // Guard HIT always enters at the preamble (`dispatch_key` selector 0),
+    // even when the attached bridge later contains a LABEL. A JUMP into
+    // that LABEL uses `emit_loop_tail_call` with `label_block_id + 1`.
     let bridge_dispatch_key = builder
         .ins()
         .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
@@ -12207,13 +12394,24 @@ impl CraneliftBackend {
         // at the guard (`prepare_bridge` / `_update_bindings`). Loops
         // and merged families keep the two-argument entry; their host
         // wrapper is unchanged.
+        //
+        // A retrace bridge that contains a dispatchable LABEL is a loop
+        // for `closing_jump`: `emit_loop_tail_call` calls it with only
+        // `(jf_ptr, dispatch_key)` and the entry `br_table`s onto the
+        // LABEL loader, which reads carried values from the frame
+        // (`x86/regalloc.py consider_jump` / `assembler.py closing_jump`
+        // jump to `_ll_loop_code` and never re-enter the prologue).
+        // Extra Tail failargs would be unspecified on that path, so fall
+        // back to the two-arg loop signature. The guard HIT still
+        // compact-stores extras into the frame for selector 0.
         let is_bridge = source_guard.is_some() && merge.is_none();
+        let has_dispatchable_label = is_bridge && ops.iter().any(op_is_dispatchable_label);
         let bridge_arg_types: Vec<Type> = if is_bridge {
             inputargs.iter().map(|ia| ia.tp.get()).collect()
         } else {
             Vec::new()
         };
-        let n_tail_extras = if is_bridge {
+        let n_tail_extras = if is_bridge && !has_dispatchable_label {
             tail_register_failargs(bridge_arg_types.len())
         } else {
             0
@@ -12534,36 +12732,10 @@ impl CraneliftBackend {
         // as `is_still_alive` holds, not only across the call that wrote them.
         let mut dense_ref_bindings: IndexMap<usize, u32> = IndexMap::new();
 
-        // regalloc.py compute_vars_longevity
-        // Compute last_usage for each ref root variable. Used by get_gcmap
-        // to build per-call-site gcmaps (only alive refs are marked).
-        let longevity: IndexMap<u32, usize> = {
-            let mut m: IndexMap<u32, usize> = IndexMap::new();
-            for (i, op) in ops.iter().enumerate() {
-                for arg in op.getarglist().iter().chain(
-                    op.getfailargs()
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .iter(),
-                ) {
-                    // Const operands carry value inline (history.py/268/314)
-                    // — they're not ref-root slot keys, which live in the
-                    // body-namespace (`ref_root_slots` entries from
-                    // `var(opref.raw())` slot allocations).
-                    if arg.is_constant() {
-                        continue;
-                    }
-                    let idx = arg.to_opref().raw();
-                    if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
-                        // iteration order is monotonic in `i`, so a later
-                        // visit always supersedes any earlier `last_usage`.
-                        m.insert(idx, i);
-                    }
-                }
-            }
-            m
-        };
+        // regalloc.py compute_vars_longevity — last_usage for every
+        // non-constant box. get_gcmap reads the Ref-root subset;
+        // next_op_can_accept_cc looks up the comparison result in O(1).
+        let longevity = compute_vars_longevity(ops);
 
         // pyjitpl.py `cpu.propagate_exception_descr` — snapshot the
         // attached descr pointer at compile time so the OpCode::CheckMemoryError
@@ -12667,6 +12839,23 @@ impl CraneliftBackend {
                     jitframe_write_barrier_flag(),
                 );
             }
+        } else if has_dispatchable_label {
+            let ref_slots: Vec<usize> = bridge_arg_types
+                .iter()
+                .enumerate()
+                .filter(|(_, tp)| **tp == Type::Ref)
+                .map(|(i, _)| i)
+                .collect();
+            emit_label_bridge_preamble_gcmap(
+                module,
+                &mut builder,
+                ptr_type,
+                call_conv,
+                initial_jf_ptr,
+                raw_dispatch_key,
+                &ref_slots,
+                &mut extra_gcmaps,
+            );
         }
         let in_code_bit = builder
             .ins()
@@ -14142,6 +14331,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntLe => emit_icmp(
@@ -14153,6 +14343,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntEq => emit_icmp(
@@ -14164,6 +14355,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntNe => emit_icmp(
@@ -14175,6 +14367,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntGt => emit_icmp(
@@ -14186,6 +14379,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntGe => emit_icmp(
@@ -14197,6 +14391,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintLt => emit_icmp(
@@ -14208,6 +14403,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintLe => emit_icmp(
@@ -14219,6 +14415,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintGt => emit_icmp(
@@ -14230,6 +14427,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintGe => emit_icmp(
@@ -14241,6 +14439,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
 
@@ -14254,6 +14453,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::PtrNe | OpCode::InstancePtrNe => emit_icmp(
@@ -14265,6 +14465,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
 
@@ -25114,6 +25315,85 @@ mod tests {
         assert_ne!(host_ref, root);
         assert_eq!(unsafe { *(host_ref.0 as *const u64) }, 0xD30F_00C2);
         assert_eq!(backend.get_int_value(&host, 5), 50);
+    }
+
+    /// `compile.py compile_retrace` attaches a bridge that contains a
+    /// `LoopTargetDescr` LABEL. Loops enter that LABEL through
+    /// `dispatch_key` (`emit_loop_tail_call` passes only
+    /// `(jf_ptr, dispatch_key)`), matching `x86/regalloc.py
+    /// consider_jump` / `assembler.py closing_jump` jumping to
+    /// `_ll_loop_code` rather than the bridge prologue. Extra Tail
+    /// failargs would overwrite the JUMP's carried refs at the bridge
+    /// entry; a collecting op after the LABEL must still see the Ref.
+    #[test]
+    fn jump_into_bridge_label_preserves_ref_failargs() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_00D1;
+        }
+        let mut backend = backend_with_gc(gc);
+        let i = OpRef::input_arg_int(0);
+        let r = OpRef::input_arg_ref(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(i), rb(r)]);
+        guard.set_fail_arg_types(vec![Type::Int, Type::Ref]);
+        let loop_ops = vec![guard, mk_op(OpCode::Finish, &[i, r], OpRef::NONE.raw())];
+        let token_a = Arc::new(JitCellToken::new(1_500_440));
+        backend
+            .compile_loop(&inputargs, &loop_ops, &token_a)
+            .unwrap();
+        let failed = backend.execute_token(&token_a, &[Value::Int(42), Value::Ref(root)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("guard should fail");
+
+        let label_t = make_label_descr(1_500_441);
+        bind_target_owner(&label_t, &token_a);
+        let finish = mk_op(OpCode::Finish, &[i, r], OpRef::NONE.raw());
+        finish.set_fail_arg_types(vec![Type::Int, Type::Ref]);
+        let bridge_ops = vec![
+            mk_op_with_descr(OpCode::Label, &[i, r], OpRef::NONE.raw(), label_t.clone()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 2),
+            finish,
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token_a, &[], None)
+            .unwrap();
+
+        let label_b = make_label_descr(1_500_442);
+        let token_b = Arc::new(JitCellToken::new(1_500_442));
+        bind_target_owner(&label_b, &token_b);
+        let ops_b = vec![
+            mk_op_with_descr(OpCode::Label, &[i, r], OpRef::NONE.raw(), label_b),
+            mk_op_with_descr(OpCode::Jump, &[i, r], OpRef::NONE.raw(), label_t),
+        ];
+        backend.compile_loop(&inputargs, &ops_b, &token_b).unwrap();
+        let from_jump = backend.execute_token(&token_b, &[Value::Int(42), Value::Ref(root)]);
+        assert!(
+            backend.get_latest_descr(&from_jump).is_finish(),
+            "JUMP must enter the bridge LABEL and FINISH"
+        );
+        assert_eq!(backend.get_int_value(&from_jump, 0), 42);
+        let moved_j = backend.get_ref_value(&from_jump, 1);
+        assert_ne!(
+            moved_j, root,
+            "JUMP into a bridge LABEL must keep the carried Ref"
+        );
+        assert_eq!(unsafe { *(moved_j.0 as *const u64) }, 0xD30F_00D1);
+
+        let from_guard = backend.execute_token(&token_a, &[Value::Int(42), Value::Ref(moved_j)]);
+        assert_eq!(backend.get_int_value(&from_guard, 0), 42);
+        let moved_g = backend.get_ref_value(&from_guard, 1);
+        assert_eq!(unsafe { *(moved_g.0 as *const u64) }, 0xD30F_00D1);
     }
 
     /// `assemble_bridge` + `patch_jump_for_descr`: a bridge whose JUMP
