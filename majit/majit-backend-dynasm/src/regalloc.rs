@@ -4775,19 +4775,29 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, [loc], Some(loc), output);
     }
 
+    /// `_consider_float_cmp`: UCOMISD's first operand is a register. When
+    /// neither `loc` is a `RegLoc`, force the non-constant side through
+    /// `xrm.make_sure_var_in_reg`.
+    fn float_cmp_ensure_reg(&mut self, vx: OpRef, vy: OpRef, arglocs: &mut [Loc; 2]) {
+        if arglocs[0].is_reg() || arglocs[1].is_reg() {
+            return;
+        }
+        if vx.is_constant() {
+            arglocs[1] = self.make_sure_var_in_reg(vy, Type::Float, &[], None, false);
+        } else {
+            arglocs[0] = self.make_sure_var_in_reg(vx, Type::Float, &[], None, false);
+        }
+    }
+
     /// x86/regalloc.py _consider_float_cmp
     #[allow(dead_code)] // x86/regalloc.py consider_float_cmp
     fn consider_float_cmp(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let vx = op.arg(0).to_opref();
         let vy = op.arg(1).to_opref();
         let mut arglocs = [self.loc(vx, Type::Float), self.loc(vy, Type::Float)];
-        let vx_in_reg = self.xrm.reg_bindings_contains(vx, &self.longevity);
-        let vy_in_reg = self.xrm.reg_bindings_contains(vy, &self.longevity);
-        if !vx_in_reg && !vy_in_reg && !vx.is_constant() {
-            arglocs[0] = self.make_sure_var_in_reg(vx, Type::Float, &[], None, false);
-        }
-        // x86/regalloc.py:682 — a float comparison whose only consumer is the
-        // next guard leaves its answer in the flags, like the integer one.
+        self.float_cmp_ensure_reg(vx, vy, &mut arglocs);
+        // `_consider_float_cmp`: a comparison whose only consumer is the next
+        // guard leaves its answer in the flags.
         let ops_ref: &[OpRc] = self.operations;
         let result_loc = self.force_allocate_reg_or_cc(op.pos().get(), ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
@@ -4802,11 +4812,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let mut arglocs = [self.loc(lhs, Type::Float), self.loc(rhs, Type::Float)];
-        let lhs_in_reg = self.xrm.reg_bindings_contains(lhs, &self.longevity);
-        let rhs_in_reg = self.xrm.reg_bindings_contains(rhs, &self.longevity);
-        if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() {
-            arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Float, &[], None, false);
-        }
+        self.float_cmp_ensure_reg(lhs, rhs, &mut arglocs);
         let ops_ref: &[OpRc] = self.operations;
         let result_loc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);

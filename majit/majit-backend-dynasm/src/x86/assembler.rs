@@ -1596,6 +1596,12 @@ pub struct Assembler386<'a> {
     /// The same cell is consumed by `append_guard_token_with_faillocs`
     /// so jf_force_descr and jf_descr resolve to the same identity.
     pending_force_cell: Option<usize>,
+    /// `CondCallSlowPath` continue label. Set when `COND_CALL` /
+    /// `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R` is followed by
+    /// `GUARD_NO_EXCEPTION`: `genop_guard_guard_no_exception` emits no
+    /// check on the fast path, and `generate_guard_no_exception` runs on
+    /// the call path before this label is bound.
+    pending_cond_call_skip: Option<DynamicLabel>,
     /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
     /// snapshot of the six descr pointers attached to the owning cpu
     /// instance.  Retained for constructor signature stability across
@@ -1880,6 +1886,7 @@ impl<'a> Assembler386<'a> {
             },
             pending_force_descr: None,
             pending_force_cell: None,
+            pending_cond_call_skip: None,
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
@@ -1974,6 +1981,38 @@ impl<'a> Assembler386<'a> {
         } else {
             let (reg, offset) = self.addr_as_reg_offset(addr);
             rx86::movsd_xm(&mut self.mc, dst, (reg, offset));
+        }
+    }
+
+    /// `_binaryop` / `_cmpop_float`: the second SSE operand keeps its
+    /// location code. `'x'` is `*_xx`, `'b'` is `*_xb`, a `ConstFloatLoc`
+    /// (`'j'`) that fits a signed disp32 is `*_xj`, and one that does not
+    /// is `_addr_as_reg_offset` then `*_xm`.
+    fn emit_sd_src(
+        &mut self,
+        dst: u8,
+        src: &Loc,
+        xx: fn(&mut Assembler, u8, u8),
+        xb: fn(&mut Assembler, u8, i32),
+        xm: fn(&mut Assembler, u8, (u8, i32)),
+        xj: fn(&mut Assembler, u8, i32),
+    ) {
+        match src {
+            Loc::Reg(s) => xx(&mut self.mc, dst, s.value),
+            ebp_loc_pat!(slot) => xb(&mut self.mc, dst, slot.value),
+            Loc::ConstFloat(c) => {
+                let addr = c.value as i64;
+                if rx86::fits_in_32bits(addr) {
+                    xj(&mut self.mc, dst, addr as i32);
+                } else {
+                    let (reg, offset) = self.addr_as_reg_offset(addr);
+                    xm(&mut self.mc, dst, (reg, offset));
+                }
+            }
+            other => panic!(
+                "SSE source must be a register, frame slot, or ConstFloatLoc \
+                 (_binaryop / convert_to_imm), got {other:?}"
+            ),
         }
     }
 
@@ -3940,6 +3979,13 @@ impl<'a> Assembler386<'a> {
         // so no adjustment is needed.  Zero (no external JUMP) is a no-op.
         self.frame_depth = self.frame_depth.max(self.jump_target_frame_depth);
 
+        if self.pending_cond_call_skip.is_some() {
+            panic!(
+                "GUARD_NO_EXCEPTION did not bind the COND_CALL skip label \
+                 (genop_guard_guard_no_exception)"
+            );
+        }
+
         Ok(())
     }
 
@@ -4347,38 +4393,50 @@ impl<'a> Assembler386<'a> {
             }
             // ── Float binary ──
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
-                if let Some(Loc::Reg(dst)) = result_loc {
-                    // Ensure second arg is in an XMM register
-                    let src_reg = if let Some(Loc::Reg(s)) = arglocs.get(1) {
-                        *s
-                    } else if let Some(src_loc) = arglocs.get(1) {
-                        // Immed or Frame — load to X86_64_XMM_SCRATCH_REG
-                        // (regloc.py:357-359), which sits OUTSIDE the XMM
-                        // allocation pool. xmm14 is IN the SysV pool
-                        // (regalloc.py:125), so loading the constant there
-                        // clobbered the first operand whenever the allocator
-                        // had placed `dst` in xmm14 (high-pressure bridge
-                        // entries restore all of xmm0..xmm14), turning
-                        // `x - C` into `C' - C'` = 0.
-                        let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG;
-                        self.regalloc_mov(src_loc, &Loc::Reg(scratch));
-                        scratch
-                    } else {
-                        return; // shouldn't happen
+                // `_binaryop("ADDSD"|"SUBSD"|"MULSD"|"DIVSD")`: the instruction
+                // reads `arglocs[1]` in place. `_consider_float_op` leaves that
+                // operand as `xrm.loc` (register, frame, or `ConstFloatLoc`).
+                if let (Some(dst_loc), Some(src_loc)) = (arglocs.first(), arglocs.get(1)) {
+                    let Loc::Reg(dst) = *dst_loc else {
+                        panic!(
+                            "float binop arglocs[0] must be a register \
+                             (_consider_float_op force_result_in_reg), got {dst_loc:?}"
+                        );
                     };
+                    let src = *src_loc;
                     match op.opcode {
-                        OpCode::FloatAdd => {
-                            rx86::addsd_xx(&mut self.mc, dst.value, src_reg.value);
-                        }
-                        OpCode::FloatSub => {
-                            rx86::subsd_xx(&mut self.mc, dst.value, src_reg.value);
-                        }
-                        OpCode::FloatMul => {
-                            rx86::mulsd_xx(&mut self.mc, dst.value, src_reg.value);
-                        }
-                        OpCode::FloatTrueDiv => {
-                            rx86::divsd_xx(&mut self.mc, dst.value, src_reg.value);
-                        }
+                        OpCode::FloatAdd => self.emit_sd_src(
+                            dst.value,
+                            &src,
+                            rx86::addsd_xx,
+                            rx86::addsd_xb,
+                            rx86::addsd_xm,
+                            rx86::addsd_xj,
+                        ),
+                        OpCode::FloatSub => self.emit_sd_src(
+                            dst.value,
+                            &src,
+                            rx86::subsd_xx,
+                            rx86::subsd_xb,
+                            rx86::subsd_xm,
+                            rx86::subsd_xj,
+                        ),
+                        OpCode::FloatMul => self.emit_sd_src(
+                            dst.value,
+                            &src,
+                            rx86::mulsd_xx,
+                            rx86::mulsd_xb,
+                            rx86::mulsd_xm,
+                            rx86::mulsd_xj,
+                        ),
+                        OpCode::FloatTrueDiv => self.emit_sd_src(
+                            dst.value,
+                            &src,
+                            rx86::divsd_xx,
+                            rx86::divsd_xb,
+                            rx86::divsd_xm,
+                            rx86::divsd_xj,
+                        ),
                         _ => {}
                     }
                 }
@@ -4407,57 +4465,51 @@ impl<'a> Assembler386<'a> {
             | OpCode::FloatGt
             | OpCode::FloatGe => {
                 if let (Some(a_loc), Some(b_loc)) = (arglocs.first(), arglocs.get(1)) {
-                    let b_reg = match b_loc {
-                        Loc::Reg(b) => Some(*b),
-                        _ => None,
+                    // `_cmpop_float`: `need_direct_p = 'A' not in cond` and
+                    // `need_rev_p = 'A' not in rev_cond` (substring, so 'BE'
+                    // does not contain 'A' and 'AE' does). The chosen UCOMISD
+                    // keeps a non-register source; `_if_parity_clear_zero_and_carry`
+                    // runs only when `need_p` is set.
+                    let (cond, rev_cond, need_direct_p, need_rev_p) = match op.opcode {
+                        OpCode::FloatLt => (CC_B, CC_A, true, false),
+                        OpCode::FloatLe => (CC_BE, CC_AE, true, false),
+                        OpCode::FloatEq => (CC_E, CC_E, true, true),
+                        OpCode::FloatNe => (CC_NE, CC_NE, true, true),
+                        OpCode::FloatGt => (CC_A, CC_B, false, true),
+                        OpCode::FloatGe => (CC_AE, CC_BE, false, true),
+                        _ => unreachable!("float compare opcode"),
                     };
-                    let a = if let Loc::Reg(a) = a_loc {
-                        *a
+                    let direct_case = if need_direct_p {
+                        !b_loc.is_reg()
                     } else {
-                        let scratch = if b_reg
-                            .map_or(false, |b| b.value == crate::regloc::XMM15.value && b.is_xmm)
-                        {
-                            crate::regloc::XMM14
-                        } else {
-                            crate::regloc::XMM15
-                        };
-                        self.regalloc_mov(a_loc, &Loc::Reg(scratch));
-                        scratch
+                        a_loc.is_reg()
                     };
-                    let b = if let Loc::Reg(b) = b_loc {
-                        *b
+                    let (lhs, rhs, checkcond, need_p) = if direct_case {
+                        (*a_loc, *b_loc, cond, need_direct_p)
                     } else {
-                        let scratch = if a.value == crate::regloc::XMM15.value && a.is_xmm {
-                            crate::regloc::XMM14
-                        } else {
-                            crate::regloc::XMM15
-                        };
-                        self.regalloc_mov(b_loc, &Loc::Reg(scratch));
-                        scratch
+                        (*b_loc, *a_loc, rev_cond, need_rev_p)
                     };
-                    // `assembler.py _cmpop_float`: UCOMISD sets
-                    // ZF = PF = CF = 1 when either operand is NaN, so only the
-                    // `A` / `AE` forms are already false on an unordered
-                    // compare.  FLOAT_LT / FLOAT_LE reach them by comparing in
-                    // the reverse order (`rev_cond`); FLOAT_EQ / FLOAT_NE have
-                    // no such form and take the parity fixup instead.
-                    let (lhs, rhs, cc, need_parity) = match op.opcode {
-                        OpCode::FloatLt => (b, a, CC_A, false),
-                        OpCode::FloatLe => (b, a, CC_AE, false),
-                        OpCode::FloatGt => (a, b, CC_A, false),
-                        OpCode::FloatGe => (a, b, CC_AE, false),
-                        OpCode::FloatEq => (a, b, CC_E, true),
-                        _ => (a, b, CC_NE, true),
+                    let Loc::Reg(dst) = lhs else {
+                        panic!(
+                            "UCOMISD first operand must be RegLoc (_cmpop_float / \
+                             _consider_float_cmp), got {lhs:?}"
+                        );
                     };
-                    rx86::ucomisd_xx(&mut self.mc, lhs.value, rhs.value);
-                    if need_parity {
+                    self.emit_sd_src(
+                        dst.value,
+                        &rhs,
+                        rx86::ucomisd_xx,
+                        rx86::ucomisd_xb,
+                        rx86::ucomisd_xm,
+                        rx86::ucomisd_xj,
+                    );
+                    if need_p {
                         self.emit_if_parity_clear_zero_and_carry();
                     }
-                    // `assembler.py:1345 genop_cmp_float` ends in `flush_cc`, so
-                    // a comparison whose only consumer is the next guard keeps
-                    // its answer in the flags instead of materialising a
-                    // boolean the guard would immediately re-test.
-                    self.flush_cc(cc, result_loc);
+                    // `genop_cmp_float` ends in `flush_cc`, so a comparison
+                    // whose only consumer is the next guard keeps its answer
+                    // in the flags.
+                    self.flush_cc(checkcond, result_loc);
                 }
             }
             // ── Casts ──
@@ -5523,9 +5575,9 @@ impl<'a> Assembler386<'a> {
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 self.genop_call_assembler(op, arglocs, result_loc);
             }
-            OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
+            OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs, op_index),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.genop_cond_call_value(op, arglocs);
+                self.genop_cond_call_value(op, arglocs, op_index);
             }
             // ── Allocation (raw, when GC rewriter is not active) ──
             OpCode::New => self.genop_new(op),
@@ -6183,6 +6235,11 @@ impl<'a> Assembler386<'a> {
                 }
             }
             OpCode::GuardNoException => {
+                // `genop_guard_guard_no_exception`: after COND_CALL /
+                // COND_CALL_VALUE_I / COND_CALL_VALUE_R the fast path emits
+                // nothing. `generate_guard_no_exception` runs on the call
+                // path, then both paths continue at the cond-call skip label.
+                let fused_skip = self.pending_cond_call_skip.take();
                 self.emit_guard_no_exception_check();
                 self.implement_guard_with_faillocs(
                     op,
@@ -6191,6 +6248,12 @@ impl<'a> Assembler386<'a> {
                     guard_argloc,
                     faillocs,
                 );
+                if let Some(skip_label) = fused_skip {
+                    // The don't-call edge jumped over the check, so r11's
+                    // address is not live on both sides of this join.
+                    self.forget_scratch_register();
+                    dynasm!(self.mc ; .arch x64 ; =>skip_label);
+                }
             }
             OpCode::GuardNoOverflow => {
                 self.implement_guard_with_faillocs(
@@ -7097,6 +7160,7 @@ impl<'a> Assembler386<'a> {
             self.load_scratch(value);
             rx86::mov_br(&mut self.mc, ofs, scratch);
         }
+        // `store_force_descr`: `mov r11, descr`, `mov [jf_force_descr], r11`.
         let descr_ptr = token.fail_cell_ptr as i64;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         self.load_scratch(descr_ptr);
@@ -7777,9 +7841,10 @@ impl<'a> Assembler386<'a> {
         self.guard_success_cc = Some(CC_E);
     }
 
-    /// assembler.py _store_force_index: before a call that may force,
-    /// store the next GUARD_NOT_FORCED's fail descr ptr to jf_force_descr,
-    /// and zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
+    /// `_store_force_index`: before a call that may force, store the next
+    /// GUARD_NOT_FORCED / GUARD_NOT_FORCED_2 fail descr into `jf_force_descr`.
+    /// Does not write `jf_descr` (`genop_guard_guard_not_forced` compares that
+    /// field with zero; a fresh frame already holds zero).
     fn _store_force_index_if_next_guard(&mut self, ops: &[OpRc], op_idx: usize, fail_index: u32) {
         // assembler.py _find_nearby_operation(+1)
         let next_idx = op_idx + 1;
@@ -7829,18 +7894,16 @@ impl<'a> Assembler386<'a> {
         self.pending_force_descr = Some(descr);
         self.pending_force_cell = Some(descr_ptr as usize);
 
-        // x86/assembler.py:2210-2222: store descr to jf_force_descr,
-        // zero jf_descr.  The 64-bit descr pointer needs a register to reach
-        // memory; route it through `X86_64_SCRATCH_REG` as
-        // assembler.py:2219-2223 does, never through an allocatable one.
-        // This runs just before the call it guards, and that call's arguments
-        // are still sitting in their allocated registers — EAX is in
-        // `ALL_CORE_REGS`, so materializing the pointer there would overwrite
-        // an argument.  R11 is reserved as the scratch and holds nothing live.
+        // `_store_force_index`: `forget_scratch_register`, load the descr
+        // into `X86_64_SCRATCH_REG`, then `mov [jf_force_descr], r11`.
+        // R11 is outside the allocatable set, so the call's arguments stay
+        // put. The load is a cell pointer rather than a gc-table slot: fail
+        // descrs are `FailDescrCell`s, and `recover_fail_descr_cell` reads
+        // that thin pointer back.
+        self.forget_scratch_register();
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         self.load_scratch(descr_ptr);
         rx86::mov_br(&mut self.mc, JF_FORCE_DESCR_OFS, scratch);
-        rx86::mov_bi(&mut self.mc, JF_DESCR_OFS, 0);
     }
 
     // genop_* — control flow
@@ -10052,7 +10115,7 @@ impl<'a> Assembler386<'a> {
     /// a register/slot — so we must branch off the CC directly instead
     /// of issuing `load_arg_to_rax; test rax, rax`, which would read
     /// `rbp` (the frame_reg sentinel) and miss the comparison result.
-    fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
+    fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
         let skip_label = self.mc.new_dynamic_label();
         if let Some(cc) = self.guard_success_cc.take() {
             self.emit_jcc_to_label(invert_cc(cc), skip_label);
@@ -10096,8 +10159,7 @@ impl<'a> Assembler386<'a> {
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true, false);
 
-        self.forget_scratch_register();
-        dynasm!(self.mc ; .arch x64 ; =>skip_label);
+        self.finish_cond_call_fast_path(op_index, skip_label);
     }
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
@@ -10108,7 +10170,7 @@ impl<'a> Assembler386<'a> {
     /// `cond_call_register_arguments`. Test `argloc`, skip when nonzero; on
     /// miss the helper returns a plain word moved into `resloc`. No Option
     /// rewrite and no `store_rax_to_result`.
-    fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
+    fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
         let (argloc, resloc) = match arglocs {
             [argloc, resloc, ..] => (*argloc, *resloc),
             other => panic!(
@@ -10135,8 +10197,25 @@ impl<'a> Assembler386<'a> {
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true, false);
         self.regalloc_mov(&Loc::Reg(crate::regloc::X86_64_SCRATCH_REG), &resloc);
 
+        self.finish_cond_call_fast_path(op_index, skip_label);
+    }
+
+    /// `genop_guard_guard_no_exception`: when the next op is
+    /// `GUARD_NO_EXCEPTION`, leave the fast-path continue label for that
+    /// guard. `generate_guard_no_exception` is emitted on this call path
+    /// (`CondCallSlowPath.generate_body`) and then binds the label, so the
+    /// don't-call edge skips both the call and the exception check.
+    fn finish_cond_call_fast_path(&mut self, op_index: usize, skip_label: DynamicLabel) {
         self.forget_scratch_register();
-        dynasm!(self.mc ; .arch x64 ; =>skip_label);
+        if self
+            .operations
+            .get(op_index + 1)
+            .is_some_and(|next| next.opcode == OpCode::GuardNoException)
+        {
+            self.pending_cond_call_skip = Some(skip_label);
+        } else {
+            dynasm!(self.mc ; .arch x64 ; =>skip_label);
+        }
     }
 
     /// Inline `cond_call_slowpath` body: extra args already in
