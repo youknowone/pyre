@@ -23,18 +23,19 @@
 //! `pyre-jit-trace/build.rs` serialises the `(path, build_fnaddr)` table
 //! that `pyre_interpreter::jit_trace_fnaddrs()` returned for the
 //! codewriter.  At runtime [`patch_constants_i_fnaddrs`] re-queries
-//! `jit_trace_fnaddrs()` (now reading the runtime process's addresses),
-//! builds a `build_fnaddr → runtime_fnaddr` correspondence keyed by the
-//! shared `path`, and rewrites every stale value in
-//! `JitCode.constants_i` and `JitCode.fnaddr`.  After the patch the
-//! walker's `call_int_function(funcptr, args)` invokes the correct
-//! runtime entry point, matching the upstream linker-resolved
+//! `jit_trace_fnaddrs()` (now reading the runtime process's addresses)
+//! and rewrites only slots that carry a provenance record: `JitCode.fnaddr`
+//! via `fnaddr_reloc`, and `constants_i` via `reloc_consts_i`
+//! (`assembler.py emit_const` stores the symbolic object itself;
+//! `call.py get_jitcode` stores `getfunctionptr(graph)`).  After the
+//! patch the walker's `call_int_function(funcptr, args)` invokes the
+//! correct runtime entry point, matching the upstream linker-resolved
 //! invariant.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use majit_jitcode::jitcode::JitCode;
+use majit_jitcode::jitcode::{ConstIRelocKind, JitCode};
 
 /// Path recorded for a `symbolic_fnaddr_for_path` / `symbolic_fnaddr_for_target`
 /// hash. The codewriter's registry lives in the build-script process; this is
@@ -85,25 +86,21 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 /// recorded in `CallControl::get_jitcode` (`codewriter/call.rs`); the per-
 /// instruction funcptr operands the residual_call dispatcher reads
 /// land in `JitCodeBody.constants_i` via the assembler's
-/// `emit_const_i_from_const` path (`codewriter/assembler.rs`).  Both
-/// surfaces are patched so the walker sees the same address regardless
-/// of which lookup it routes through.
+/// `emit_const_i_reloc` path (`codewriter/assembler.rs`). Both are
+/// rewritten only through the `{ path, symbolic }` record written at
+/// that decision — matching `assembler.py emit_const` storing the
+/// symbolic object itself rather than inferring a funcptr from integer
+/// bits.
 pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
-    let correspondence = &*FNADDR_CORRESPONDENCE;
-
-    // An empty correspondence still leaves symbolic shell fnaddrs and
-    // symbolic `constants_i` entries to resolve by path below. Shells
-    // without a body keep the previous early return.
-    if correspondence.is_empty()
-        && !jitcodes.iter().any(|jc| {
-            majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr)
-                || jc.try_body().is_some_and(|body| {
-                    body.constants_i
-                        .iter()
-                        .any(|c| majit_jitcode::codewriter::call::is_symbolic_fnaddr(*c))
-                })
-        })
-    {
+    let has_fnaddr_reloc = jitcodes.iter().any(|jc| {
+        matches!(jc.fnaddr_reloc, Some(ConstIRelocKind::FnAddr { .. }))
+            || jc.try_body().is_some_and(|body| {
+                body.reloc_consts_i
+                    .iter()
+                    .any(|d| matches!(d.kind, ConstIRelocKind::FnAddr { .. }))
+            })
+    });
+    if !has_fnaddr_reloc {
         return;
     }
 
@@ -112,45 +109,63 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
             "patch_constants_i_fnaddrs: Arc<JitCode> already shared before patch — \
              every caller must run this before publishing the table to consumers",
         );
-        if let Some(&runtime) = correspondence.get(&jc.fnaddr) {
+        if let Some(ConstIRelocKind::FnAddr { path, .. }) = &jc.fnaddr_reloc
+            && let Some(runtime) = runtime_fnaddr_by_path(path)
+        {
             jc.fnaddr = runtime;
-        } else if majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr) {
-            // `get_jitcode` stores `symbolic_fnaddr_for_path` when the helper
-            // had no bound address in the build-script process. The runtime
-            // process publishes the real address under the same path.
-            if let Some(path) = symbolic_fnaddr_path(jc.fnaddr) {
-                if let Some(runtime) = runtime_fnaddr_by_path(path) {
-                    jc.fnaddr = runtime;
-                }
-            }
         }
         // Some shells reach the persisted table without a committed body
         // (e.g. `Default::default()` placeholders kept for `Arc<JitCode>::
         // default()` consumers in `BlackholeInterpreter::new`); they carry
         // empty `constants_i` so skipping the body-mut access is safe.
         if jc.try_body().is_some() {
-            for c in jc.body_mut().constants_i.iter_mut() {
-                if let Some(&runtime) = correspondence.get(c) {
-                    *c = runtime;
-                } else if majit_jitcode::codewriter::call::is_symbolic_fnaddr(*c) {
-                    // Same path resolution as the shell `fnaddr` above. A
-                    // `dont_look_inside` residual that never had a build
-                    // address stays a symbolic hash in `constants_i`, and the
-                    // descent scan treats that hash as an un-lowered helper.
-                    if let Some(path) = symbolic_fnaddr_path(*c) {
-                        if let Some(runtime) = runtime_fnaddr_by_path(path) {
-                            *c = runtime;
-                        }
-                    }
-                }
+            let body = jc.body_mut();
+            let updates: Vec<(usize, i64)> = body
+                .reloc_consts_i
+                .iter()
+                .filter_map(|desc| {
+                    let ConstIRelocKind::FnAddr { path, .. } = &desc.kind else {
+                        return None;
+                    };
+                    runtime_fnaddr_for_reloc_path(path)
+                        .map(|runtime| (desc.constants_i_index, runtime))
+                })
+                .collect();
+            for (index, runtime) in updates {
+                body.constants_i[index] = runtime;
             }
         }
     }
 }
 
+/// Resolve a reloc-descriptor path to this process's function address.
+///
+/// The descriptor stores the `jit_trace_fnaddrs` key the codewriter
+/// bound (`assembler.py emit_const` carrying the symbolic object).
+/// Exact match only: a suffix/`crate::` fallback can bind a different
+/// function that shares a leaf.
+fn runtime_fnaddr_for_reloc_path(path: &str) -> Option<i64> {
+    runtime_fnaddr_by_path(path)
+}
+
+fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
+    static MAP: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+        let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
+        runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
+        runtime_map.extend(pyre_interpreter::jit_static_ref_addrs());
+        runtime_map
+    });
+    MAP.get(name).copied()
+}
+
 /// The runtime address published for `path` in `jit_trace_fnaddrs`, or
 /// `None` when the path is not published.  A walker fold that recognises a
 /// residual by its callee compares the call's funcbox against this.
+///
+/// Tagged reloc lookup uses this same set as the old value-based
+/// correspondence / disarm: `fnaddr_bindings.bin` also serialises
+/// `generatorentry_fnaddrs`, but those names were never in the runtime
+/// map, so the old pipeline zeroed their slots.
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
@@ -160,7 +175,6 @@ pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
     let build_bindings = build_time_fnaddr_bindings();
     let runtime_bindings = pyre_interpreter::jit_trace_fnaddrs();
-
     let runtime_map: HashMap<&'static str, i64> = runtime_bindings.into_iter().collect();
 
     // `correspondence[build_fnaddr] = runtime_fnaddr` — only entries
@@ -287,6 +301,7 @@ fn runtime_addr_for_path(path: &str) -> Option<i64> {
 /// pointers the codewriter baked into `constants_i` (supplied through
 /// `HostStaticAddrs.pytypes`). Same ASLR hazard + bincode round-trip as
 /// [`build_time_fnaddr_bindings`].
+#[cfg(test)]
 fn build_time_pytype_bindings() -> Vec<(String, i64)> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/static_pytype_bindings.bin"));
     bincode::deserialize(BYTES).unwrap_or_else(|e| {
@@ -299,6 +314,7 @@ fn build_time_pytype_bindings() -> Vec<(String, i64)> {
 
 /// Build-time `(name, build_addr)` snapshot for the prebuilt ref singletons
 /// (`HostStaticAddrs.refs`).
+#[cfg(test)]
 fn build_time_ref_bindings() -> Vec<(String, i64)> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/static_ref_bindings.bin"));
     bincode::deserialize(BYTES).unwrap_or_else(|e| {
@@ -315,17 +331,26 @@ fn build_time_ref_bindings() -> Vec<(String, i64)> {
 /// references directly — e.g. `is_int`'s `ptr::eq((*obj).ob_type, &INT_TYPE)`
 /// inlined into the `w_list_append` body, whose `&INT_TYPE` const was captured
 /// in the build-script process and ASLR-invalidated at runtime.  Re-pairs each
-/// build address with the runtime address from `jit_static_pytype_addrs` /
-/// `jit_static_ref_addrs`, keyed by the shared name.  Both pools are scanned:
-/// a host static used as a pointer-`eq` operand materializes as a `GcRef`
-/// constant in `constants_r`, while one consumed as an integer lands in
-/// `constants_i`.  `JitCode.fnaddr` is left untouched (these are data, not
-/// call targets).
+/// named slot with the runtime address from `jit_static_pytype_addrs` /
+/// `jit_static_ref_addrs`.  A host static consumed as an integer lands in
+/// `constants_i` (`reloc_consts_i` StaticAddr); one used as a pointer-`eq`
+/// operand materializes as a `GcRef` in `constants_r` (`reloc_consts_r`).
+/// `JitCode.fnaddr` is left untouched (these are data, not call targets).
 pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
-    let correspondence = &*STATIC_ADDR_CORRESPONDENCE;
     disarm_unpaired_build_addrs(jitcodes);
 
-    if correspondence.is_empty() {
+    let has_static_reloc = jitcodes.iter().any(|jc| {
+        jc.try_body().is_some_and(|body| {
+            body.reloc_consts_i
+                .iter()
+                .any(|d| matches!(d.kind, ConstIRelocKind::StaticAddr { .. }))
+                || body
+                    .reloc_consts_r
+                    .iter()
+                    .any(|d| matches!(d.kind, ConstIRelocKind::StaticAddr { .. }))
+        })
+    });
+    if !has_static_reloc {
         return;
     }
 
@@ -336,19 +361,39 @@ pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
         );
         if jc.try_body().is_some() {
             let body = jc.body_mut();
-            for c in body
-                .constants_i
-                .iter_mut()
-                .chain(body.constants_r.iter_mut().map(|slot| slot.get_mut()))
-            {
-                if let Some(&runtime) = correspondence.get(c) {
-                    *c = runtime;
-                }
+            let updates_i: Vec<(usize, i64)> = body
+                .reloc_consts_i
+                .iter()
+                .filter_map(|desc| {
+                    let ConstIRelocKind::StaticAddr { name } = &desc.kind else {
+                        return None;
+                    };
+                    runtime_static_addr_by_name(name)
+                        .map(|runtime| (desc.constants_i_index, runtime))
+                })
+                .collect();
+            for (index, runtime) in updates_i {
+                body.constants_i[index] = runtime;
+            }
+            let updates_r: Vec<(usize, i64)> = body
+                .reloc_consts_r
+                .iter()
+                .filter_map(|desc| {
+                    let ConstIRelocKind::StaticAddr { name } = &desc.kind else {
+                        return None;
+                    };
+                    runtime_static_addr_by_name(name)
+                        .map(|runtime| (desc.constants_r_index, runtime))
+                })
+                .collect();
+            for (index, runtime) in updates_r {
+                *body.constants_r[index].get_mut() = runtime;
             }
         }
     }
 }
 
+#[cfg(test)]
 static STATIC_ADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
     let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
     runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
@@ -389,6 +434,7 @@ static STATIC_ADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|
 /// An address the correspondences do know is excluded: the build binary's
 /// identical-code folding can put a re-pairable name and an unmatched one on
 /// one address, and the constant then belongs to the name that re-pairs.
+#[cfg(test)]
 static UNPAIRED_BUILD_ADDRS: LazyLock<HashMap<i64, String>> = LazyLock::new(|| {
     let mut runtime_names: std::collections::HashSet<&'static str> =
         pyre_interpreter::jit_trace_fnaddrs()
@@ -441,37 +487,62 @@ static UNPAIRED_BUILD_ADDRS: LazyLock<HashMap<i64, String>> = LazyLock::new(|| {
 /// and the path leaves the JIT before anything can dereference it.  That is
 /// what makes zero an answer here rather than a trap laid for later.
 ///
-/// All three pools are cleared, `constants_r` included: that pool already
-/// carries words that are not gcrefs — patched host statics and pre-patch
-/// string sentinels — and the collector's `drag_out_root` / `seed_major_root`
-/// gates reject a non-object word before any deref, so a zero there is read the
-/// same way the address it replaces was.
+/// `constants_i` / `constants_r` / `jc.fnaddr` are provenance-based: only
+/// slots whose recorded name is unpaired become 0, and only when the
+/// descriptor recorded a build address. A tagged slot that stored a
+/// symbolic hash keeps it (the old value-based scan never saw that hash
+/// in the unpaired-address set). Untagged words are never touched, so an
+/// ordinary integer that collides with an unpaired build address stays.
+///
+/// That pool already carries words that are not gcrefs — patched host
+/// statics and pre-patch string sentinels — and the collector's
+/// `drag_out_root` / `seed_major_root` gates reject a non-object word
+/// before any deref, so a zero there is read the same way the address it
+/// replaces was.
 fn disarm_unpaired_build_addrs(jitcodes: &mut [Arc<JitCode>]) {
-    let unpaired = &*UNPAIRED_BUILD_ADDRS;
-    if unpaired.is_empty() {
-        return;
-    }
-
     for arc in jitcodes.iter_mut() {
         let jc = Arc::get_mut(arc).expect(
             "disarm_unpaired_build_addrs: Arc<JitCode> already shared before patch — \
              every caller must run this before publishing the table to consumers",
         );
-        if unpaired.contains_key(&jc.fnaddr) {
+        if let Some(ConstIRelocKind::FnAddr { path, symbolic }) = &jc.fnaddr_reloc
+            && !*symbolic
+            && runtime_fnaddr_by_path(path).is_none()
+        {
             jc.fnaddr = 0;
         }
         if jc.try_body().is_some() {
             let body = jc.body_mut();
-            for c in body
-                .constants_i
-                .iter_mut()
-                .chain(body.constants_r.iter_mut().map(|slot| slot.get_mut()))
-            {
-                if unpaired.contains_key(c) {
-                    *c = 0;
-                }
+            let zeros_i: Vec<usize> = body
+                .reloc_consts_i
+                .iter()
+                .filter_map(|desc| {
+                    reloc_kind_is_unpaired_build(&desc.kind).then_some(desc.constants_i_index)
+                })
+                .collect();
+            for idx in zeros_i {
+                body.constants_i[idx] = 0;
+            }
+            let zeros_r: Vec<usize> = body
+                .reloc_consts_r
+                .iter()
+                .filter_map(|desc| {
+                    reloc_kind_is_unpaired_build(&desc.kind).then_some(desc.constants_r_index)
+                })
+                .collect();
+            for idx in zeros_r {
+                *body.constants_r[idx].get_mut() = 0;
             }
         }
+    }
+}
+
+fn reloc_kind_is_unpaired_build(kind: &ConstIRelocKind) -> bool {
+    match kind {
+        ConstIRelocKind::FnAddr { path, symbolic } => {
+            !*symbolic && runtime_fnaddr_by_path(path).is_none()
+        }
+        ConstIRelocKind::StaticAddr { name } => runtime_static_addr_by_name(name).is_none(),
     }
 }
 
@@ -490,12 +561,10 @@ fn disarm_unpaired_build_addrs(jitcodes: &mut [Arc<JitCode>]) {
 /// whole-table loader had, when the first `all_jitcodes()` decoded everything
 /// against one consistent view.
 pub fn prime_address_correspondences() {
+    // `FNADDR_CORRESPONDENCE` still feeds `release_gil_runtime_addr` and
+    // the lazy indirect-call-target index (`runtime_fnaddr`); force it
+    // at the same instant the whole-table loader used to.
     LazyLock::force(&FNADDR_CORRESPONDENCE);
-    LazyLock::force(&STATIC_ADDR_CORRESPONDENCE);
-    // Keyed by name rather than by address, so the instant it is taken does
-    // not change what it holds; forced here so no jitcode load pays to build
-    // it mid-trace.
-    LazyLock::force(&UNPAIRED_BUILD_ADDRS);
     LazyLock::force(&TYPE_STATIC_RUNTIME_MAP);
 }
 
@@ -790,7 +859,7 @@ pub fn materialize_type_static_consts(jitcodes: &mut [Arc<JitCode>]) {
 mod tests {
     use super::*;
     use majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE;
-    use majit_jitcode::jitcode::{JitCode, JitCodeBody, StrConstDescriptor};
+    use majit_jitcode::jitcode::{ConstIRelocKind, JitCode, JitCodeBody, StrConstDescriptor};
 
     fn sentinel(ordinal: i64) -> i64 {
         STR_CONST_SENTINEL_BASE | ordinal
@@ -1064,10 +1133,746 @@ mod tests {
     /// map. An unpublished path would silently disable the fold on wasm32
     /// (and, without the raw-cast fallback, on native too).
     #[test]
+    fn patch_constants_i_rewrites_only_provenance_tagged_slots() {
+        use majit_jitcode::jitcode::{ConstIRelocDescriptor, ConstIRelocKind};
+
+        let (path, build_fnaddr) = build_time_fnaddr_bindings()
+            .into_iter()
+            .find(|(p, build)| runtime_fnaddr_by_path(p).is_some_and(|runtime| runtime != *build))
+            .expect(
+                "need a registered fnaddr whose runtime address differs from the build snapshot",
+            );
+        let runtime = runtime_fnaddr_by_path(&path).expect("path published at runtime");
+        let symbolic = {
+            const BYTES: &[u8] =
+                include_bytes!(concat!(env!("OUT_DIR"), "/symbolic_fnaddr_paths.bin"));
+            let entries: Vec<(i64, String)> = bincode::deserialize(BYTES).unwrap();
+            entries
+                .into_iter()
+                .map(|(hash, _)| hash)
+                .find(|hash| *hash != build_fnaddr)
+                .expect("need a registered symbolic fnaddr hash")
+        };
+
+        let jc = JitCode::new("ordinary_int_alias");
+        jc.set_body(JitCodeBody {
+            constants_i: vec![build_fnaddr, symbolic, build_fnaddr],
+            reloc_consts_i: vec![ConstIRelocDescriptor {
+                constants_i_index: 2,
+                kind: ConstIRelocKind::FnAddr {
+                    path: path.clone(),
+                    symbolic: false,
+                },
+            }],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        patch_constants_i_fnaddrs(&mut jcs);
+        patch_static_addr_constants(&mut jcs);
+        let body = jcs[0].body();
+        assert_eq!(
+            body.constants_i[0], build_fnaddr,
+            "ordinary integer equal to a registered build fnaddr must be kept"
+        );
+        assert_eq!(
+            body.constants_i[1], symbolic,
+            "ordinary integer equal to a registered symbolic hash must be kept"
+        );
+        assert_eq!(
+            body.constants_i[2], runtime,
+            "provenance-tagged slot must be rewritten to the runtime address"
+        );
+    }
+
+    #[test]
+    fn patch_static_addr_constants_rewrites_only_provenance_tagged_slots() {
+        use majit_jitcode::jitcode::{ConstIRelocDescriptor, ConstIRelocKind};
+
+        let (name, build_addr) = build_time_pytype_bindings()
+            .into_iter()
+            .find(|(n, build)| runtime_static_addr_by_name(n).is_some_and(|runtime| runtime != *build))
+            .expect(
+                "need a registered static addr whose runtime address differs from the build snapshot",
+            );
+        let runtime = runtime_static_addr_by_name(&name).expect("name published at runtime");
+
+        let jc = JitCode::new("ordinary_static_alias");
+        jc.set_body(JitCodeBody {
+            constants_i: vec![build_addr, build_addr],
+            reloc_consts_i: vec![ConstIRelocDescriptor {
+                constants_i_index: 1,
+                kind: ConstIRelocKind::StaticAddr { name: name.clone() },
+            }],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        patch_static_addr_constants(&mut jcs);
+        let body = jcs[0].body();
+        assert_eq!(
+            body.constants_i[0], build_addr,
+            "ordinary integer equal to a registered build static addr must be kept"
+        );
+        assert_eq!(
+            body.constants_i[1], runtime,
+            "provenance-tagged static-addr slot must be rewritten to the runtime address"
+        );
+    }
+
+    #[test]
+    fn patch_static_addr_constants_rewrites_only_provenance_tagged_constants_r() {
+        use majit_jitcode::jitcode::{ConstIRelocKind, ConstRRelocDescriptor};
+
+        let (name, build_addr) = build_time_ref_bindings()
+            .into_iter()
+            .find(|(n, build)| runtime_static_addr_by_name(n).is_some_and(|runtime| runtime != *build))
+            .expect(
+                "need a registered static ref whose runtime address differs from the build snapshot",
+            );
+        let runtime = runtime_static_addr_by_name(&name).expect("name published at runtime");
+
+        let jc = JitCode::new("ordinary_ref_alias");
+        jc.set_body(JitCodeBody {
+            constants_r: vec![build_addr.into(), build_addr.into()],
+            reloc_consts_r: vec![ConstRRelocDescriptor {
+                constants_r_index: 1,
+                kind: ConstIRelocKind::StaticAddr { name: name.clone() },
+            }],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        patch_static_addr_constants(&mut jcs);
+        let body = jcs[0].body();
+        assert_eq!(
+            body.constants_r[0].get(),
+            build_addr,
+            "ordinary ref equal to a registered build static addr must be kept"
+        );
+        assert_eq!(
+            body.constants_r[1].get(),
+            runtime,
+            "provenance-tagged constants_r slot must be rewritten to the runtime address"
+        );
+    }
+
+    #[test]
+    fn recorded_nonsymbolic_fnaddr_resolves_or_is_disarmed() {
+        let mut jcs = unpatched_production_jitcodes();
+        new_provenance_patch_pipeline(&mut jcs);
+
+        let mut live_unresolved = Vec::new();
+        for jc in &jcs {
+            let Some(ConstIRelocKind::FnAddr { path, symbolic }) = &jc.fnaddr_reloc else {
+                continue;
+            };
+            if *symbolic {
+                continue;
+            }
+            match runtime_fnaddr_by_path(path) {
+                Some(runtime) => assert_eq!(
+                    jc.fnaddr, runtime,
+                    "non-symbolic fnaddr_reloc {path} in {} must resolve via runtime_fnaddr_by_path",
+                    jc.name
+                ),
+                None if jc.fnaddr != 0 => {
+                    live_unresolved.push(format!("{path} in {} val={:#x}", jc.name, jc.fnaddr));
+                }
+                None => {}
+            }
+        }
+        live_unresolved.sort();
+        live_unresolved.dedup();
+        assert!(
+            live_unresolved.is_empty(),
+            "non-symbolic fnaddr_reloc did not resolve and was not disarmed: {live_unresolved:?}"
+        );
+    }
+
+    #[test]
     fn runtime_fnaddr_by_path_resolves_walker_residual_fold_callees() {
         assert!(
             runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
+        );
+    }
+
+    /// An untagged `constants_i` word that equals a build-process fnaddr
+    /// used to be rewritten by value. After provenance tagging, only
+    /// `reloc_consts_i` slots move; an untagged hit is a missed
+    /// `ConstFnAddr` / `emit_const_i_reloc` site (ordinary ints colliding
+    /// with a 64-bit ASLR address are not realistic).
+    #[test]
+    fn untagged_constants_i_do_not_equal_a_build_fnaddr() {
+        use majit_jitcode::jitcode::ConstIRelocKind;
+        use std::collections::HashSet;
+
+        let build_fnaddrs: HashSet<i64> = build_time_fnaddr_bindings()
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .filter(|addr| *addr != 0)
+            .collect();
+        let build_statics: HashSet<i64> = build_time_pytype_bindings()
+            .into_iter()
+            .chain(build_time_ref_bindings())
+            .map(|(_, addr)| addr)
+            .filter(|addr| *addr != 0)
+            .collect();
+
+        let mut hits = Vec::new();
+        for jc in crate::jitcode_runtime::all_jitcodes() {
+            let Some(body) = jc.try_body() else {
+                continue;
+            };
+            let tagged: HashSet<usize> = body
+                .reloc_consts_i
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.kind,
+                        ConstIRelocKind::FnAddr { .. } | ConstIRelocKind::StaticAddr { .. }
+                    )
+                })
+                .map(|d| d.constants_i_index)
+                .collect();
+            for (index, &c) in body.constants_i.iter().enumerate() {
+                if tagged.contains(&index) {
+                    continue;
+                }
+                if build_fnaddrs.contains(&c) {
+                    hits.push(format!("fnaddr {c:#x} at {} constants_i[{index}]", jc.name));
+                }
+                if build_statics.contains(&c) {
+                    hits.push(format!("static {c:#x} at {} constants_i[{index}]", jc.name));
+                }
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        assert!(
+            hits.is_empty(),
+            "untagged constants_i equal a build address: {hits:?}"
+        );
+
+        let mut r_hits = Vec::new();
+        for jc in crate::jitcode_runtime::all_jitcodes() {
+            let Some(body) = jc.try_body() else {
+                continue;
+            };
+            let tagged: HashSet<usize> = body
+                .reloc_consts_r
+                .iter()
+                .map(|d| d.constants_r_index)
+                .collect();
+            for (index, slot) in body.constants_r.iter().enumerate() {
+                if tagged.contains(&index) {
+                    continue;
+                }
+                let c = slot.get();
+                if build_statics.contains(&c) {
+                    r_hits.push(format!("static {c:#x} at {} constants_r[{index}]", jc.name));
+                }
+            }
+        }
+        r_hits.sort();
+        r_hits.dedup();
+        assert!(
+            r_hits.is_empty(),
+            "untagged constants_r equal a build static addr: {r_hits:?}"
+        );
+    }
+
+    /// An untagged `constants_i` word equal to an unpaired build address
+    /// used to be zeroed by the value scan. Provenance disarm leaves it.
+    #[test]
+    fn untagged_constants_i_equal_to_unpaired_build_addr_survives_disarm() {
+        let (&unpaired_addr, _) = UNPAIRED_BUILD_ADDRS
+            .iter()
+            .find(|(addr, _)| **addr != 0)
+            .expect("need a nonzero unpaired build address");
+
+        let jc = JitCode::new("untagged_unpaired_collision");
+        jc.set_body(JitCodeBody {
+            constants_i: vec![unpaired_addr],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        disarm_unpaired_build_addrs(&mut jcs);
+        assert_eq!(
+            jcs[0].body().constants_i[0],
+            unpaired_addr,
+            "untagged integer equal to an unpaired build address must survive disarm"
+        );
+    }
+
+    /// A tagged FnAddr whose path does not exact-match a published
+    /// `jit_trace_fnaddrs` key must not keep a build-process pointer.
+    #[test]
+    fn unresolved_tagged_fnaddr_slots_are_not_live_pointers() {
+        use majit_jitcode::jitcode::ConstIRelocKind;
+
+        let mut live = Vec::new();
+        for jc in crate::jitcode_runtime::all_jitcodes() {
+            let Some(body) = jc.try_body() else {
+                continue;
+            };
+            for desc in &body.reloc_consts_i {
+                let ConstIRelocKind::FnAddr { path, symbolic } = &desc.kind else {
+                    continue;
+                };
+                if runtime_fnaddr_for_reloc_path(path).is_some() {
+                    continue;
+                }
+                let val = body.constants_i[desc.constants_i_index];
+                if val != 0 && !*symbolic {
+                    live.push(format!("{path} in {} val={val:#x}", jc.name));
+                }
+            }
+        }
+        live.sort();
+        live.dedup();
+        assert!(
+            live.is_empty(),
+            "unresolved tagged fnaddr slots still hold a pointer: {live:?}"
+        );
+    }
+
+    /// Oracle only: the descriptor flag the codewriter recorded must equal
+    /// `is_symbolic_fnaddr` of the stored word. Production never consults
+    /// the bits of a tagged slot.
+    fn assert_tagged_fnaddr_symbolic_flag_matches_bit_test(jcs: &[Arc<JitCode>]) {
+        use majit_jitcode::codewriter::call::is_symbolic_fnaddr;
+
+        let mut mismatches = Vec::new();
+        for jc in jcs {
+            let Some(body) = jc.try_body() else {
+                continue;
+            };
+            for desc in &body.reloc_consts_i {
+                let ConstIRelocKind::FnAddr { path, symbolic } = &desc.kind else {
+                    continue;
+                };
+                let value = body.constants_i[desc.constants_i_index];
+                let bits = is_symbolic_fnaddr(value);
+                if *symbolic != bits {
+                    mismatches.push(format!(
+                        "{path} in {} constants_i[{}] val={value:#x} flag={symbolic} bits={bits}",
+                        jc.name, desc.constants_i_index
+                    ));
+                }
+            }
+        }
+        mismatches.sort();
+        mismatches.dedup();
+        assert!(
+            mismatches.is_empty(),
+            "tagged FnAddr symbolic flag disagrees with the bit test: {mismatches:?}"
+        );
+    }
+
+    fn unpatched_production_jitcodes() -> Vec<Arc<JitCode>> {
+        use majit_jitcode::artifacts::JitCodeIndex;
+        const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
+        let index = JitCodeIndex::decode(INDEX_BYTES, BODY_BYTES).expect("JitCode index");
+        (0..index.offsets.len().saturating_sub(1))
+            .map(|i| {
+                index
+                    .load(BODY_BYTES, i)
+                    .unwrap_or_else(|e| panic!("deserialize jitcodes.bin entry {i}: {e}"))
+            })
+            .collect()
+    }
+
+    /// Test-only oracle: HEAD's value-based `patch_constants_i_fnaddrs`.
+    /// Rewrites every `constants_i` word (and the shell `fnaddr`) whose bits
+    /// appear in `FNADDR_CORRESPONDENCE`, then resolves leftover symbolic
+    /// hashes through `runtime_fnaddr_by_path`.
+    fn old_value_based_patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
+        let correspondence = &*FNADDR_CORRESPONDENCE;
+        for arc in jitcodes.iter_mut() {
+            let jc = Arc::get_mut(arc).expect("old-value oracle: Arc already shared");
+            if let Some(&runtime) = correspondence.get(&jc.fnaddr) {
+                jc.fnaddr = runtime;
+            } else if majit_jitcode::codewriter::call::is_symbolic_fnaddr(jc.fnaddr)
+                && let Some(path) = symbolic_fnaddr_path(jc.fnaddr)
+                && let Some(runtime) = runtime_fnaddr_by_path(path)
+            {
+                jc.fnaddr = runtime;
+            }
+            if jc.try_body().is_some() {
+                for c in jc.body_mut().constants_i.iter_mut() {
+                    if let Some(&runtime) = correspondence.get(c) {
+                        *c = runtime;
+                    } else if majit_jitcode::codewriter::call::is_symbolic_fnaddr(*c)
+                        && let Some(path) = symbolic_fnaddr_path(*c)
+                        && let Some(runtime) = runtime_fnaddr_by_path(path)
+                    {
+                        *c = runtime;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test-only oracle: HEAD's value-based `disarm_unpaired_build_addrs`.
+    /// Zeros every `constants_i` / `constants_r` word whose bits are an
+    /// unpaired build address, tagged or not.
+    fn old_value_based_disarm_unpaired_build_addrs(jitcodes: &mut [Arc<JitCode>]) {
+        let unpaired = &*UNPAIRED_BUILD_ADDRS;
+        if unpaired.is_empty() {
+            return;
+        }
+        for arc in jitcodes.iter_mut() {
+            let jc = Arc::get_mut(arc).expect("old-value oracle: Arc already shared");
+            if unpaired.contains_key(&jc.fnaddr) {
+                jc.fnaddr = 0;
+            }
+            if jc.try_body().is_some() {
+                let body = jc.body_mut();
+                for c in body
+                    .constants_i
+                    .iter_mut()
+                    .chain(body.constants_r.iter_mut().map(|slot| slot.get_mut()))
+                {
+                    if unpaired.contains_key(c) {
+                        *c = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test-only oracle: HEAD's `patch_static_addr_constants`. Disarm first,
+    /// then rewrite every remaining word in both pools by
+    /// `STATIC_ADDR_CORRESPONDENCE`.
+    fn old_value_based_patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
+        let correspondence = &*STATIC_ADDR_CORRESPONDENCE;
+        old_value_based_disarm_unpaired_build_addrs(jitcodes);
+        if correspondence.is_empty() {
+            return;
+        }
+        for arc in jitcodes.iter_mut() {
+            let jc = Arc::get_mut(arc).expect("old-value oracle: Arc already shared");
+            if jc.try_body().is_some() {
+                let body = jc.body_mut();
+                for c in body
+                    .constants_i
+                    .iter_mut()
+                    .chain(body.constants_r.iter_mut().map(|slot| slot.get_mut()))
+                {
+                    if let Some(&runtime) = correspondence.get(c) {
+                        *c = runtime;
+                    }
+                }
+            }
+        }
+    }
+
+    fn old_value_based_patch_pipeline(jitcodes: &mut [Arc<JitCode>]) {
+        old_value_based_patch_constants_i_fnaddrs(jitcodes);
+        old_value_based_patch_static_addr_constants(jitcodes);
+    }
+
+    fn new_provenance_patch_pipeline(jitcodes: &mut [Arc<JitCode>]) {
+        patch_constants_i_fnaddrs(jitcodes);
+        patch_static_addr_constants(jitcodes);
+    }
+
+    /// Build words bound to more than one distinct path/name in the
+    /// build-time binding tables. Optimized MSVC links pass `/OPT:REF,ICF`
+    /// to link.exe, so identical-COMDAT folding can give several distinct
+    /// functions one build address; the value-based oracle then maps that
+    /// word to whichever binding it last inserted.
+    fn colliding_build_words_from<S: AsRef<str>>(
+        bindings: impl IntoIterator<Item = (S, i64)>,
+    ) -> std::collections::HashSet<i64> {
+        use std::collections::{HashMap, HashSet};
+        let mut names_by_word: HashMap<i64, HashSet<String>> = HashMap::new();
+        for (name, word) in bindings {
+            names_by_word
+                .entry(word)
+                .or_default()
+                .insert(name.as_ref().to_owned());
+        }
+        names_by_word
+            .into_iter()
+            .filter(|(_, names)| names.len() > 1)
+            .map(|(word, _)| word)
+            .collect()
+    }
+
+    fn production_colliding_build_words() -> std::collections::HashSet<i64> {
+        colliding_build_words_from(
+            build_time_fnaddr_bindings()
+                .into_iter()
+                .chain(build_time_pytype_bindings())
+                .chain(build_time_ref_bindings()),
+        )
+    }
+
+    /// Same lookup the provenance pipeline uses for a tagged slot.
+    fn runtime_lookup_for_reloc_kind(kind: &ConstIRelocKind) -> Option<i64> {
+        match kind {
+            ConstIRelocKind::FnAddr { path, .. } => runtime_fnaddr_for_reloc_path(path),
+            ConstIRelocKind::StaticAddr { name } => runtime_static_addr_by_name(name),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TaggedRelocMismatchClass {
+        /// `build` is bound to more than one path/name, and `new` is the
+        /// runtime address of the slot's own recorded path.
+        IcfCollision,
+        Unexpected,
+    }
+
+    fn classify_tagged_reloc_mismatch(
+        build: i64,
+        new: i64,
+        slot_runtime: Option<i64>,
+        colliding: &std::collections::HashSet<i64>,
+    ) -> TaggedRelocMismatchClass {
+        if colliding.contains(&build) && slot_runtime == Some(new) {
+            TaggedRelocMismatchClass::IcfCollision
+        } else {
+            TaggedRelocMismatchClass::Unexpected
+        }
+    }
+
+    fn note_tagged_reloc_mismatch(
+        tag: String,
+        location: String,
+        build: i64,
+        old: i64,
+        new: i64,
+        slot_runtime: Option<i64>,
+        colliding: &std::collections::HashSet<i64>,
+        unexpected: &mut Vec<String>,
+    ) {
+        match classify_tagged_reloc_mismatch(build, new, slot_runtime, colliding) {
+            TaggedRelocMismatchClass::IcfCollision => {
+                assert!(
+                    colliding.contains(&build),
+                    "collision branch taken for a build word bound to one path/name: \
+                     {tag} in {location} build={build:#x}"
+                );
+                assert_eq!(
+                    Some(new),
+                    slot_runtime,
+                    "provenance pipeline must write the runtime address of the slot's \
+                     own recorded path: {tag} in {location} new={new:#x}"
+                );
+            }
+            TaggedRelocMismatchClass::Unexpected => {
+                unexpected.push(format!(
+                    "{tag} in {location} build={build:#x} old={old:#x} new={new:#x}"
+                ));
+            }
+        }
+    }
+
+    /// Every tagged FnAddr / StaticAddr slot's final value after the
+    /// provenance pipeline must equal the final value HEAD's value-based
+    /// pipeline writes for the same build word — including slots that
+    /// pipeline zeroed.
+    ///
+    /// Optimized MSVC links pass `/OPT:REF,ICF` to link.exe, so identical-
+    /// COMDAT folding can give several distinct functions one build address
+    /// in `fnaddr_bindings.bin` (and the static-address tables). The
+    /// value-based oracle maps that word to whichever binding it last
+    /// inserted; the provenance pipeline relocates by the `{ path, symbolic }`
+    /// record. A mismatch is allowed only when the build word is bound to
+    /// more than one distinct path/name and the new pipeline wrote the
+    /// runtime address of the slot's own recorded path.
+    #[test]
+    fn tagged_reloc_path_matches_old_value_correspondence() {
+        let orig = unpatched_production_jitcodes();
+        assert_tagged_fnaddr_symbolic_flag_matches_bit_test(&orig);
+        let mut old_jcs = unpatched_production_jitcodes();
+        let mut new_jcs = unpatched_production_jitcodes();
+        old_value_based_patch_pipeline(&mut old_jcs);
+        new_provenance_patch_pipeline(&mut new_jcs);
+
+        let colliding = production_colliding_build_words();
+        let mut unexpected = Vec::new();
+        for ((orig_jc, old_jc), new_jc) in orig.iter().zip(&old_jcs).zip(&new_jcs) {
+            let Some(orig_body) = orig_jc.try_body() else {
+                continue;
+            };
+            let old_body = old_jc.try_body().expect("old oracle kept the body");
+            let new_body = new_jc.try_body().expect("new pipeline kept the body");
+            if let Some(kind) = &orig_jc.fnaddr_reloc
+                && old_jc.fnaddr != new_jc.fnaddr
+            {
+                let tag = match kind {
+                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
+                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
+                };
+                note_tagged_reloc_mismatch(
+                    tag,
+                    format!("fnaddr in {}", orig_jc.name),
+                    orig_jc.fnaddr,
+                    old_jc.fnaddr,
+                    new_jc.fnaddr,
+                    runtime_lookup_for_reloc_kind(kind),
+                    &colliding,
+                    &mut unexpected,
+                );
+            }
+            for desc in &orig_body.reloc_consts_i {
+                let idx = desc.constants_i_index;
+                let build = orig_body.constants_i[idx];
+                let old = old_body.constants_i[idx];
+                let new = new_body.constants_i[idx];
+                if old == new {
+                    continue;
+                }
+                let tag = match &desc.kind {
+                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
+                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
+                };
+                note_tagged_reloc_mismatch(
+                    tag,
+                    format!("{} constants_i[{idx}]", orig_jc.name),
+                    build,
+                    old,
+                    new,
+                    runtime_lookup_for_reloc_kind(&desc.kind),
+                    &colliding,
+                    &mut unexpected,
+                );
+            }
+            for desc in &orig_body.reloc_consts_r {
+                let idx = desc.constants_r_index;
+                let build = orig_body.constants_r[idx].get();
+                let old = old_body.constants_r[idx].get();
+                let new = new_body.constants_r[idx].get();
+                if old == new {
+                    continue;
+                }
+                let tag = match &desc.kind {
+                    ConstIRelocKind::FnAddr { path, .. } => format!("FnAddr {path}"),
+                    ConstIRelocKind::StaticAddr { name } => format!("StaticAddr {name}"),
+                };
+                note_tagged_reloc_mismatch(
+                    tag,
+                    format!("{} constants_r[{idx}]", orig_jc.name),
+                    build,
+                    old,
+                    new,
+                    runtime_lookup_for_reloc_kind(&desc.kind),
+                    &colliding,
+                    &mut unexpected,
+                );
+            }
+        }
+        unexpected.sort();
+        unexpected.dedup();
+        assert!(
+            unexpected.is_empty(),
+            "tagged reloc final value disagrees with the old value-based pipeline: {unexpected:?}"
+        );
+    }
+
+    /// Two registered paths can share one build word when the host link
+    /// folds identical COMDATs (`/OPT:REF,ICF`). The value-based oracle then
+    /// relocates that word to whichever binding it last inserted; the
+    /// provenance pipeline uses the slot's own path.
+    #[test]
+    fn tagged_reloc_icf_collision_classifies_oracle_disagreement() {
+        let build = 0x1000;
+        let runtime_a = 0x2000;
+        let runtime_b = 0x3000;
+        let unique_build = 0x4000;
+        let unique_runtime = 0x5000;
+        let colliding = colliding_build_words_from([
+            ("path_a", build),
+            ("path_b", build),
+            ("path_c", unique_build),
+        ]);
+        assert!(colliding.contains(&build));
+        assert!(
+            !colliding.contains(&unique_build),
+            "a word bound to one path is not an ICF collision"
+        );
+
+        let lookup = |path: &str| -> Option<i64> {
+            match path {
+                "path_a" => Some(runtime_a),
+                "path_b" => Some(runtime_b),
+                "path_c" => Some(unique_runtime),
+                _ => None,
+            }
+        };
+        let slot_path = "path_a";
+        let slot_runtime = lookup(slot_path);
+        assert_eq!(
+            slot_runtime,
+            Some(runtime_a),
+            "provenance picks the slot's own path"
+        );
+
+        // Value-based oracle last-wrote path_b, so old != new.
+        let old = runtime_b;
+        let new = slot_runtime.expect("slot path published");
+        assert_ne!(old, new);
+        assert_eq!(
+            classify_tagged_reloc_mismatch(build, new, slot_runtime, &colliding),
+            TaggedRelocMismatchClass::IcfCollision,
+            "value-based disagreement on an ICF-folded word is a collision"
+        );
+
+        assert_eq!(
+            classify_tagged_reloc_mismatch(
+                unique_build,
+                unique_runtime.wrapping_add(1),
+                Some(unique_runtime),
+                &colliding,
+            ),
+            TaggedRelocMismatchClass::Unexpected,
+            "a non-colliding disagreement is reported"
+        );
+    }
+
+    /// A tagged FnAddr the old pipeline would leave live must exact-match a
+    /// published `jit_trace_fnaddrs` key. Slots that pipeline zeroed are
+    /// unpaired names (`generatorentry_fnaddrs` residuals) and stay unresolved.
+    #[test]
+    fn tagged_live_fnaddr_paths_resolve_exactly() {
+        let orig = unpatched_production_jitcodes();
+        let mut old_jcs = unpatched_production_jitcodes();
+        old_value_based_patch_pipeline(&mut old_jcs);
+
+        let mut unresolved_live = Vec::new();
+        for (orig_jc, old_jc) in orig.iter().zip(&old_jcs) {
+            let Some(orig_body) = orig_jc.try_body() else {
+                continue;
+            };
+            let old_body = old_jc.try_body().expect("old oracle kept the body");
+            for desc in &orig_body.reloc_consts_i {
+                let ConstIRelocKind::FnAddr { path, symbolic } = &desc.kind else {
+                    continue;
+                };
+                let idx = desc.constants_i_index;
+                let value = orig_body.constants_i[idx];
+                if value == 0 || *symbolic {
+                    continue;
+                }
+                if old_body.constants_i[idx] == 0 {
+                    continue;
+                }
+                if runtime_fnaddr_for_reloc_path(path).is_none() {
+                    unresolved_live.push(format!(
+                        "{path} in {} constants_i[{idx}] val={value:#x}",
+                        orig_jc.name
+                    ));
+                }
+            }
+        }
+        unresolved_live.sort();
+        unresolved_live.dedup();
+        assert!(
+            unresolved_live.is_empty(),
+            "live tagged fnaddr path is not a published registry key: {unresolved_live:?}"
         );
     }
 

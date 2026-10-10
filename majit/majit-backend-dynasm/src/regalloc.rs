@@ -794,11 +794,11 @@ pub struct RegisterManager {
     /// RPython calls self.assembler.regalloc_mov() directly; in Rust we
     /// collect moves here and flush them to the assembler's output.
     pub spill_moves: Vec<(Loc, Loc)>,
-    /// `X86XMMRegisterManager.assembler.datablockwrapper`. `0` on the GPR
-    /// manager and on aarch64. The x86 assembler installs the pointer on
-    /// the XMM manager after `prepare_loop` / `prepare_bridge` (those
-    /// rebuild this manager) and after `emit_check_frame_depth`, immediately
-    /// before `walk_operations`.
+    /// `X86XMMRegisterManager` / `VFPRegisterManager`
+    /// `assembler.datablockwrapper`. `0` on the GPR manager. The assembler
+    /// installs the pointer on the XMM / VFP manager after `prepare_loop` /
+    /// `prepare_bridge` (those rebuild this manager) and after
+    /// `emit_check_frame_depth`, immediately before `walk_operations`.
     datablockwrapper: usize,
     /// First `MachineDataBlockWrapper.malloc_aligned` failure.
     /// `open_malloc` raises `MemoryError`; `walk_operations` returns it as
@@ -883,6 +883,20 @@ fn box_type_or_temp(known: Option<Type>, v: OpRef) -> Type {
     }
 }
 
+/// `X86XMMRegisterManager.convert_to_imm` / `VFPRegisterManager.convert_to_imm`:
+/// `malloc_aligned(8, 8)`, write `getfloatstorage()`, return `ConstFloatLoc(adr)`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn park_float_const(
+    wrapper: &mut majit_backend::MachineDataBlockWrapper,
+    bits: u64,
+) -> Result<ConstFloatLoc, std::io::Error> {
+    let adr = wrapper.malloc_aligned(8, 8)?;
+    // `compile_loop` / `compile_bridge` hold `AssemblerWriting::enter`
+    // across the walk, so this store is inside the write window.
+    unsafe { (adr as *mut u64).write(bits) };
+    Ok(ConstFloatLoc { value: adr })
+}
+
 impl RegisterManager {
     /// regalloc.py:368
     pub fn new(
@@ -914,7 +928,8 @@ impl RegisterManager {
         }
     }
 
-    /// Attach `X86XMMRegisterManager.assembler.datablockwrapper` for this walk.
+    /// Attach `X86XMMRegisterManager` / `VFPRegisterManager`
+    /// `assembler.datablockwrapper` for this walk.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_datablockwrapper(&mut self, wrapper: &mut majit_backend::MachineDataBlockWrapper) {
         self.datablockwrapper = wrapper as *mut majit_backend::MachineDataBlockWrapper as usize;
@@ -1322,7 +1337,8 @@ impl RegisterManager {
         if v.is_constant() {
             // `RegisterManager.loc`: a Const goes through `convert_to_imm`.
             // With `datablockwrapper` set this is
-            // `X86XMMRegisterManager.convert_to_imm` (`ConstFloatLoc`).
+            // `X86XMMRegisterManager.convert_to_imm` /
+            // `VFPRegisterManager.convert_to_imm` (`ConstFloatLoc`).
             // The GPR manager has no wrapper and keeps an `ImmedLoc`.
             if self.datablockwrapper != 0 {
                 return self.convert_to_imm(v, constants);
@@ -1646,9 +1662,10 @@ impl RegisterManager {
 
     // ── x86-specific methods ──
 
-    /// `X86RegisterManager.convert_to_imm` / `X86XMMRegisterManager.convert_to_imm`.
+    /// `X86RegisterManager.convert_to_imm` / `X86XMMRegisterManager.convert_to_imm`
+    /// / `VFPRegisterManager.convert_to_imm`.
     ///
-    /// The XMM manager (`datablockwrapper` installed) does
+    /// The XMM / VFP manager (`datablockwrapper` installed) does
     /// `malloc_aligned(8, 8)`, writes `getfloatstorage()`, and returns
     /// `ConstFloatLoc`. A `MemoryError` from `open_malloc` is kept in
     /// `pool_error` and surfaced by `walk_operations`. The GPR manager
@@ -1679,9 +1696,10 @@ impl RegisterManager {
         }
     }
 
-    /// `X86XMMRegisterManager.convert_to_imm` when this manager owns the
-    /// data block; otherwise the bit pattern stays an `ImmedFloat`.
-    fn float_const_loc(&mut self, bits: u64) -> Loc {
+    /// `X86XMMRegisterManager.convert_to_imm` / `VFPRegisterManager.convert_to_imm`
+    /// when this manager owns the data block; otherwise the bit pattern stays
+    /// an `ImmedFloat`.
+    pub(crate) fn float_const_loc(&mut self, bits: u64) -> Loc {
         if self.datablockwrapper == 0 {
             return Loc::immed_float(bits as i64);
         }
@@ -1690,13 +1708,8 @@ impl RegisterManager {
             let wrapper = unsafe {
                 &mut *(self.datablockwrapper as *mut majit_backend::MachineDataBlockWrapper)
             };
-            match wrapper.malloc_aligned(8, 8) {
-                Ok(adr) => {
-                    // `compile_loop` / `compile_bridge` hold `AssemblerWriting::enter`
-                    // across the walk, so this store is inside the write window.
-                    unsafe { (adr as *mut u64).write(bits) };
-                    Loc::ConstFloat(ConstFloatLoc { value: adr })
-                }
+            match park_float_const(wrapper, bits) {
+                Ok(loc) => Loc::ConstFloat(loc),
                 Err(err) => {
                     if self.pool_error.is_none() {
                         self.pool_error = Some(err);
@@ -1800,10 +1813,6 @@ pub enum RegAllocOp {
     },
     /// Register move: src → dst (from spill/reload/register-register moves)
     Move { src: Loc, dst: Loc },
-    /// Materialise loop constants after the label entry and before the
-    /// back-edge target. `ll_loop_code` stays on the entry so a bridge
-    /// runs these moves; the in-trace jump lands after them.
-    LoopPins { moves: Vec<(Loc, Loc)> },
     /// Skip (dead operation, no-op)
     Skip,
 }
@@ -1868,19 +1877,6 @@ pub struct RegAlloc<'a> {
     /// is a 2-element list upstream; a per-op `Vec<Loc>` was 32 B on the
     /// regex and/or compile path (`push_perform` / `consider_int_ri_j2`).
     arglocs_arena: Vec<Loc>,
-    /// Float immediate parked in `d8` for the trace body after a loop
-    /// label. `d8` is outside `all_vfp_regs` (`vfpregisters[:8]`), so the
-    /// allocator and a bridge that jumps back to the label leave it alone.
-    /// The load is emitted once, in front of the label.
-    pinned_float: Option<i64>,
-    /// Wide integer immediates parked in `x21` then `x22` (outside
-    /// `all_regs`). A bridge must not rewrite them: it jumps back to the
-    /// loop label, which still reads the values the loop trace loaded.
-    pinned_ints: [Option<i64>; 2],
-    compiling_bridge: bool,
-    /// Pin moves for the label just considered. Flushed after the label
-    /// op, not with `spill_moves`, so they sit after `ll_loop_code`.
-    loop_pin_moves: Vec<(Loc, Loc)>,
 }
 
 fn is_math_sqrt_call(op: &Op) -> bool {
@@ -1920,10 +1916,6 @@ impl<'a> RegAlloc<'a> {
             temp_var_counter: 0,
             faillocs_arena: Vec::new(),
             arglocs_arena: Vec::new(),
-            pinned_float: None,
-            pinned_ints: [None, None],
-            compiling_bridge: false,
-            loop_pin_moves: Vec::new(),
         }
     }
 
@@ -2061,7 +2053,6 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py prepare_bridge
     pub fn prepare_bridge(&mut self, arglocs: &[Loc]) {
-        self.compiling_bridge = true;
         self._prepare();
         let inputargs = self.inputargs;
         self._update_bindings(arglocs, inputargs);
@@ -2123,9 +2114,9 @@ impl<'a> RegAlloc<'a> {
             jump_args.len(),
             target_arglocs.len(),
         );
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         let position = self.final_jump_op_position;
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         let mut hinted: Vec<OpRef> = Vec::new();
         for (arg, target) in jump_args.iter().zip(target_arglocs.iter()) {
             if arg.is_constant() {
@@ -2145,17 +2136,6 @@ impl<'a> RegAlloc<'a> {
                     if !hinted.contains(arg) {
                         hinted.push(*arg);
                         let r = crate::regloc::RegLoc::new(regnum, is_xmm);
-                        self.longevity.fixed_register(position, r, Some(*arg));
-                    }
-                }
-                #[cfg(target_arch = "aarch64")]
-                TargetArgLoc::Reg {
-                    regnum,
-                    is_xmm: true,
-                } => {
-                    if !hinted.contains(arg) {
-                        hinted.push(*arg);
-                        let r = crate::regloc::RegLoc::new(regnum, true);
                         self.longevity.fixed_register(position, r, Some(*arg));
                     }
                 }
@@ -2245,12 +2225,6 @@ impl<'a> RegAlloc<'a> {
     }
 
     fn loc_with_mode(&mut self, v: OpRef, tp: Type, must_exist: bool) -> Loc {
-        if let Some(loc) = self.pinned_float_loc(v, tp) {
-            return loc;
-        }
-        if let Some(loc) = self.pinned_int_loc(v, tp) {
-            return loc;
-        }
         if tp == Type::Float {
             self.xrm.loc(
                 v,
@@ -2306,21 +2280,15 @@ impl<'a> RegAlloc<'a> {
         selected_reg: Option<RegLoc>,
         need_lower_byte: bool,
     ) -> Loc {
-        if selected_reg.is_none()
-            && let Some(loc) = self
-                .pinned_float_loc(v, tp)
-                .or_else(|| self.pinned_int_loc(v, tp))
-        {
-            return loc;
-        }
         // x86/regalloc.py `RegAlloc.make_sure_var_in_reg`: a `ConstFloat` is
         // `FloatImmedLoc(getfloatstorage())` before `xrm.make_sure_var_in_reg`,
         // so `save_into_mem` stores the bits and never a `ConstFloatLoc`.
         // `selected_reg` / `need_lower_byte` do not apply on that path.
         // aarch64/regalloc.py `Regalloc.make_sure_var_in_reg` has no such
         // short-circuit: `ARMRegisterManager.return_constant` loads
-        // `ConstFloatLoc` into a VFP scratch, and with no data block that
-        // load is still `convert_to_imm`'s `ImmedFloat`.
+        // `VFPRegisterManager.convert_to_imm`'s `ConstFloatLoc` into a VFP
+        // scratch (`AssemblerARM64.load`). The walk installs the data block
+        // on `xrm`, so that immediate is `Loc::ConstFloat`.
         #[cfg(target_arch = "x86_64")]
         if tp == Type::Float && v.is_constant() {
             return Loc::immed_float(self.const_value(v));
@@ -4676,6 +4644,8 @@ impl<'a> RegAlloc<'a> {
             let loc1 = self.make_sure_var_in_reg(rhs, Type::Float, &boxes, None, false);
             self.possibly_free_var(lhs, Type::Float);
             self.possibly_free_var(rhs, Type::Float);
+            // aarch64/regalloc.py `Regalloc.free_temp_vars` / `prepare_two_regs_op`
+            self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
             self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
             let res = self.force_allocate_reg(dst, Type::Float, &[], None, false);
             self.perform(i, [loc0, loc1], Some(Loc::Reg(res)), output);
@@ -6429,9 +6399,9 @@ impl<'a> RegAlloc<'a> {
                 .is_some_and(|(jump_id, _)| *jump_id == label_id)
         {
             let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             let position = self.final_jump_op_position;
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             let mut hinted: Vec<OpRef> = Vec::new();
             for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
                 if iarg.is_constant() {
@@ -6442,20 +6412,8 @@ impl<'a> RegAlloc<'a> {
                         self.fm
                             .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
                     }
-                    // x86 hints every register (`_compute_hint_locations_from_descr`).
-                    // aarch64's `_compute_hint_frame_locations_from_descr` hints
-                    // only stack slots. A float label input still has to be the
-                    // register the back-edge value is allocated in, or the
-                    // jump repairs it with an `fmov` on the accumulator chain.
                     #[cfg(target_arch = "x86_64")]
                     Loc::Reg(r) => {
-                        if !hinted.contains(iarg) {
-                            hinted.push(*iarg);
-                            self.longevity.fixed_register(position, r, Some(*iarg));
-                        }
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    Loc::Reg(r) if r.is_xmm => {
                         if !hinted.contains(iarg) {
                             hinted.push(*iarg);
                             self.longevity.fixed_register(position, r, Some(*iarg));
@@ -6465,9 +6423,7 @@ impl<'a> RegAlloc<'a> {
                 }
             }
         }
-        self.pin_loop_consts(i);
         self.perform(i, locs, None, output);
-        self.finish_loop_pins(output);
     }
 
     fn consider_label_j2(
@@ -6506,9 +6462,9 @@ impl<'a> RegAlloc<'a> {
                 .is_some_and(|(jump_id, _)| *jump_id == label_id)
         {
             let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             let position = self.final_jump_op_position;
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             let mut hinted: Vec<OpRef> = Vec::new();
             for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
                 if iarg.is_constant() {
@@ -6526,233 +6482,11 @@ impl<'a> RegAlloc<'a> {
                             self.longevity.fixed_register(position, r, Some(*iarg));
                         }
                     }
-                    #[cfg(target_arch = "aarch64")]
-                    Loc::Reg(r) if r.is_xmm => {
-                        if !hinted.contains(iarg) {
-                            hinted.push(*iarg);
-                            self.longevity.fixed_register(position, r, Some(*iarg));
-                        }
-                    }
                     _ => {}
                 }
             }
         }
-        self.pin_loop_consts(i);
         self.perform(i, locs, None, output);
-        self.finish_loop_pins(output);
-    }
-
-    /// Park the first float immediate of the hot loop in `d8`. The load
-    /// is `LoopPins`, emitted after the label entry. Later uses of the
-    /// same bits read `d8` instead of a per-iteration literal load.
-    fn pin_loop_consts(&mut self, label_index: usize) {
-        if self.compiling_bridge {
-            return;
-        }
-        let Some(hot) = self
-            .operations
-            .iter()
-            .rposition(|op| op.opcode == OpCode::Label)
-        else {
-            return;
-        };
-        if label_index != hot {
-            return;
-        }
-        self.pin_loop_float_const(label_index);
-        self.pin_loop_int_consts(label_index);
-    }
-
-    fn finish_loop_pins(&mut self, output: &mut Vec<RegAllocOp>) {
-        if self.loop_pin_moves.is_empty() {
-            return;
-        }
-        let moves = std::mem::take(&mut self.loop_pin_moves);
-        output.push(RegAllocOp::LoopPins { moves });
-    }
-
-    fn pin_loop_float_const(&mut self, label_index: usize) {
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = label_index;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if self.pinned_float.is_some() {
-                return;
-            }
-            let Some(bits) = self.operations.iter().skip(label_index + 1).find_map(|op| {
-                if op.opcode == OpCode::Label {
-                    return Some(None);
-                }
-                for arg in op.getarglist() {
-                    let r = arg.to_opref();
-                    if r.is_constant() && matches!(r.ty(), Some(Type::Float)) {
-                        return Some(Some(const_bits_or_panic(
-                            r,
-                            &self.constants,
-                            "pin_loop_float_const",
-                        )));
-                    }
-                }
-                None
-            }) else {
-                return;
-            };
-            let Some(bits) = bits else {
-                return;
-            };
-            self.pinned_float = Some(bits);
-            self.loop_pin_moves.push((
-                Loc::immed_float(bits),
-                Loc::Reg(crate::aarch64::registers::D8),
-            ));
-        }
-    }
-
-    /// Park up to two wide integer immediates in `x21`/`x22`. The loads
-    /// are `LoopPins`, emitted after the label entry. A compare bound and
-    /// the eval-breaker address otherwise rebuild with `movz`/`movk` or a
-    /// literal load on every iteration.
-    fn pin_loop_int_consts(&mut self, label_index: usize) {
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = label_index;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if self.pinned_ints[0].is_some() {
-                return;
-            }
-            // `emit_guard_subclass` and the class compares require
-            // `Loc::Immed`. A class pointer is a wide constant, and pinning
-            // it makes those emitters panic.
-            let mut forbidden: Vec<i64> = Vec::new();
-            for op in self.operations.iter().skip(label_index + 1) {
-                if op.opcode == OpCode::Label {
-                    break;
-                }
-                if !matches!(
-                    op.opcode,
-                    OpCode::GuardSubclass
-                        | OpCode::GuardClass
-                        | OpCode::GuardNonnullClass
-                        | OpCode::GuardException
-                        | OpCode::GuardValue
-                ) {
-                    continue;
-                }
-                for arg in op.getarglist() {
-                    let r = arg.to_opref();
-                    if r.is_constant() && !matches!(r.ty(), Some(Type::Float)) {
-                        forbidden.push(const_bits_or_panic(
-                            r,
-                            &self.constants,
-                            "pin_loop_int_consts",
-                        ));
-                    }
-                }
-            }
-            let mut found: [Option<i64>; 2] = [None, None];
-            let mut n = 0usize;
-            for op in self.operations.iter().skip(label_index + 1) {
-                if op.opcode == OpCode::Label {
-                    break;
-                }
-                if matches!(
-                    op.opcode,
-                    OpCode::GuardSubclass
-                        | OpCode::GuardClass
-                        | OpCode::GuardNonnullClass
-                        | OpCode::GuardException
-                        | OpCode::GuardValue
-                ) {
-                    continue;
-                }
-                for arg in op.getarglist() {
-                    let r = arg.to_opref();
-                    if !r.is_constant() || matches!(r.ty(), Some(Type::Float)) {
-                        continue;
-                    }
-                    let bits = const_bits_or_panic(r, &self.constants, "pin_loop_int_consts");
-                    if forbidden.contains(&bits)
-                        || crate::aarch64::assembler::imm_mov_count(bits) < 2
-                    {
-                        continue;
-                    }
-                    if found[..n].contains(&Some(bits)) {
-                        continue;
-                    }
-                    found[n] = Some(bits);
-                    n += 1;
-                    if n == 2 {
-                        break;
-                    }
-                }
-                if n == 2 {
-                    break;
-                }
-            }
-            let regs = [
-                crate::aarch64::registers::X21,
-                crate::aarch64::registers::X22,
-            ];
-            for i in 0..n {
-                let bits = found[i].unwrap();
-                self.pinned_ints[i] = Some(bits);
-                // x21/x22 are outside `all_regs`. Jump remap scratches x16,
-                // and the literal load writes the destination, so a pin is
-                // only read.
-                self.loop_pin_moves
-                    .push((Loc::immed(bits), Loc::Reg(regs[i])));
-            }
-        }
-    }
-
-    fn pinned_int_loc(&self, v: OpRef, tp: Type) -> Option<Loc> {
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (v, tp);
-            None
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if tp == Type::Float || !v.is_constant() {
-                return None;
-            }
-            let val = const_bits_or_panic(v, &self.constants, "pinned_int_loc");
-            let regs = [
-                crate::aarch64::registers::X21,
-                crate::aarch64::registers::X22,
-            ];
-            for (bits, reg) in self.pinned_ints.iter().zip(regs) {
-                if *bits == Some(val) {
-                    return Some(Loc::Reg(reg));
-                }
-            }
-            None
-        }
-    }
-
-    fn pinned_float_loc(&self, v: OpRef, tp: Type) -> Option<Loc> {
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = (v, tp);
-            None
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let bits = self.pinned_float?;
-            if tp != Type::Float || !v.is_constant() {
-                return None;
-            }
-            let val = const_bits_or_panic(v, &self.constants, "pinned_float_loc");
-            if val == bits {
-                Some(Loc::Reg(crate::aarch64::registers::D8))
-            } else {
-                None
-            }
-        }
     }
 
     /// force_token: result = frame pointer (EBP)
@@ -8025,12 +7759,6 @@ mod tests {
                             note(result);
                         }
                     }
-                    RegAllocOp::LoopPins { moves } => {
-                        for (src, dst) in moves {
-                            note(src);
-                            note(dst);
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -8069,12 +7797,6 @@ mod tests {
                         }
                         if let Some(result) = result_loc {
                             note(result);
-                        }
-                    }
-                    RegAllocOp::LoopPins { moves } => {
-                        for (src, dst) in moves {
-                            note(src);
-                            note(dst);
                         }
                     }
                     _ => {}

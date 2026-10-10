@@ -370,7 +370,7 @@ fn producer_input_type(
                 | OpKind::IndirectCall { result_ty, .. }
                 | OpKind::BinOp { result_ty, .. }
                 | OpKind::UnaryOp { result_ty, .. } => Some((result_ty.clone(), None)),
-                OpKind::ConstInt(_) => Some((ValueType::Int, None)),
+                OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some((ValueType::Int, None)),
                 OpKind::ConstUInt(_) => Some((ValueType::Unsigned, None)),
                 OpKind::ConstBool(_) => Some((ValueType::Bool, None)),
                 OpKind::ConstFloat(_) => Some((ValueType::Float, None)),

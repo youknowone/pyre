@@ -3672,6 +3672,9 @@ where
         // `pyjitpl.py reached_loop_header` builds `live_arg_boxes` from the
         // live framestack. Snapshot portal reds here so a walk that then
         // drains its frames still has jump args and writeback values.
+        // Drop any earlier header's JUMP list so CloseLoop cannot consume
+        // a stale `close_jump_boxes` from a previous visit.
+        ctx.close_jump_boxes = None;
         self.stash_portal_reds(ctx, sym);
         // blackhole.py bhimpl_jit_merge_point parity.
         // Portal merge point: close the loop if at the traced header.
@@ -3740,13 +3743,9 @@ where
              (registered drivers: {registered_drivers}) — \
              pyjitpl.py:1540 staticdata.jitdrivers_sd[jdindex] parity",
         );
-        // Resolve the per-driver static data (currently
-        // unused by dispatch — the frame's JitCode already
-        // encodes its owning driver — but the lookup pins
-        // multi-driver correctness so a future per-driver
-        // routing change reads the same descriptor RPython
-        // would).
-        let _jitdriver_sd = &ctx.metainterp_sd().jitdrivers_sd[jdindex];
+        // `pyjitpl.py MIFrame.opimpl_jit_merge_point`:
+        // `jitdriver_sd = staticdata.jitdrivers_sd[jdindex]`.
+        let no_loop_header_jd = ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header;
         // 5 — register-byte bounds.  Each of the six
         // register lists encodes `[len:u8][reg:u8 * N]` with
         // greens/reds split by kind in `(I, R, F, I, R, F)`
@@ -3801,6 +3800,7 @@ where
         // tracing walk only — off the compiled hot path.
         let mut live_arg_boxes: SmallVec<[crate::trace_ctx::GreenBox; CALL_INLINE]> =
             SmallVec::new();
+        let mut put_back_reds = false;
         // pyjitpl.py opimpl_jit_merge_point `redboxes`.
         let mut redboxes: SmallVec<[(OpRef, majit_ir::Type); CALL_INLINE]> = SmallVec::new();
         // Single-pass: accumulate the walk-final concrete RED values from
@@ -3812,6 +3812,9 @@ where
         let mut green_i_regs: Vec<u8> = Vec::new();
         let mut green_r_regs: Vec<u8> = Vec::new();
         let mut green_f_regs: Vec<u8> = Vec::new();
+        let mut red_i_regs: Vec<u8> = Vec::new();
+        let mut red_r_regs: Vec<u8> = Vec::new();
+        let mut red_f_regs: Vec<u8> = Vec::new();
         for (slot, &max) in max_regs.iter().enumerate().take(6) {
             let count = frame.next_u8() as usize;
             let is_green_slot = slot < 3;
@@ -3823,6 +3826,13 @@ where
                         0 => green_i_regs.push(reg),
                         1 => green_r_regs.push(reg),
                         2 => green_f_regs.push(reg),
+                        _ => {}
+                    }
+                } else {
+                    match slot {
+                        3 => red_i_regs.push(reg),
+                        4 => red_r_regs.push(reg),
+                        5 => red_f_regs.push(reg),
                         _ => {}
                     }
                 }
@@ -3845,19 +3855,19 @@ where
                         }
                     }
                 }
-                if inner_close {
-                    // The merge point's live arg boxes (only the green
-                    // slots are populated for the state-field dispatch
-                    // model; reds are state fields restored separately).
-                    // These become the inner loop's `original_boxes` —
-                    // the promoted-green constants — for the cross-loop
-                    // cut remap (compile.py compile_loop `cut_trace_from`).
+                if inner_close && !is_green_slot {
+                    // `prepare_list_of_boxes`: every listed red register is
+                    // copied. Greens stay in the green-constant capture
+                    // below (`verify_green_args`); they are not redboxes.
+                    // A listed red that is empty is a producer bug
+                    // (`handle_jit_marker__jit_merge_point` listed a live
+                    // Variable).
                     let (opref_opt, ty) = match slot {
-                        0 | 3 => (
+                        3 => (
                             frame.int_regs.get(reg_idx).copied().flatten(),
                             majit_ir::Type::Int,
                         ),
-                        1 | 4 => (
+                        4 => (
                             frame.ref_regs.get(reg_idx).copied().flatten(),
                             majit_ir::Type::Ref,
                         ),
@@ -3866,12 +3876,14 @@ where
                             majit_ir::Type::Float,
                         ),
                     };
-                    if let Some(opref) = opref_opt {
-                        live_arg_boxes.push(crate::trace_ctx::GreenBox::new(opref, ty));
-                        if !is_green_slot {
-                            redboxes.push((opref, ty));
-                        }
-                    }
+                    let opref = opref_opt.unwrap_or_else(|| {
+                        panic!(
+                            "jit_merge_point listed red register {reg} is empty \
+                             (`handle_jit_marker__jit_merge_point` / \
+                             `prepare_list_of_boxes` copy every declared red)"
+                        )
+                    });
+                    redboxes.push((opref, ty));
                 }
                 if slot == 0
                     && let Some(majit_ir::OpRef::ConstInt(v)) =
@@ -3937,17 +3949,32 @@ where
                 }
             }
         }
-        self.last_mp_green_i = green_i_regs;
-        self.last_mp_green_r = green_r_regs;
-        self.last_mp_green_f = green_f_regs;
-        ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
-        ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
-        ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
-        ctx.live_portal_greens = Some((
-            mp_green_ints.to_vec(),
-            mp_green_refs.to_vec(),
-            mp_green_floats.to_vec(),
-        ));
+        // pyjitpl.py MIFrame.opimpl_jit_merge_point: `redboxes` reach
+        // `reached_loop_header` / `put_back_list_of_boxes3` only under
+        // `if not self.metainterp.portal_call_depth`. This walker uses
+        // `inline_depth()` for that root-portal test (same predicate as
+        // the recursive-cut else-branch and `last_mp_green_pc` below).
+        // Snapshot helpers re-read these register numbers from
+        // `frames.first()` (the root portal frame).
+        if ctx.inline_depth() == 0 {
+            self.last_mp_green_i = green_i_regs;
+            self.last_mp_green_r = green_r_regs;
+            self.last_mp_green_f = green_f_regs;
+            self.last_mp_red_i.clone_from(&red_i_regs);
+            self.last_mp_red_r.clone_from(&red_r_regs);
+            self.last_mp_red_f.clone_from(&red_f_regs);
+            ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
+            ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
+            ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
+            ctx.portal_red_regs_i.clone_from(&self.last_mp_red_i);
+            ctx.portal_red_regs_r.clone_from(&self.last_mp_red_r);
+            ctx.portal_red_regs_f.clone_from(&self.last_mp_red_f);
+            ctx.live_portal_greens = Some((
+                mp_green_ints.to_vec(),
+                mp_green_refs.to_vec(),
+                mp_green_floats.to_vec(),
+            ));
+        }
         // pyjitpl.py MIFrame.opimpl_jit_merge_point — a jit_merge_point reached INSIDE an
         // inline recursive-portal callee, while no loop_header has been
         // seen yet (`seen_loop_header_for_jdindex < 0`), is a pure
@@ -4002,24 +4029,9 @@ where
             // `_create_segmented_trace_and_blackhole` does.
             return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
         }
-        // pyjitpl.py MIFrame.opimpl_jit_merge_point `jitdriver_sd =
-        // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
-        // owning driver's `no_loop_header`.  Upstream this is the same
-        // object as the elected `self.metainterp.jitdriver_sd` because
-        // the op's `jdindex` indexes `jitdrivers_sd` directly.  Pyre's
-        // production setup pushes an empty `ensure_default_driver_sd`
-        // placeholder at `jitdrivers_sd[0]`, shifting the real drivers to
-        // 1+, so a merge-point op whose build-time `jdindex` predates the
-        // placeholder can land on a neighbouring slot (the second portal
-        // driver's op carries `jdindex` = its build index, one slot below
-        // its runtime position).  Prefer the elected trace-owner
-        // descriptor (`ctx.driver_descriptor()` = `metainterp.jitdriver_sd`)
-        // so `no_loop_header` reflects the driver actually being traced;
-        // fall back to the op-indexed slot when no descriptor was elected.
-        let no_loop_header = ctx
-            .driver_descriptor()
-            .map(|d| d.no_loop_header)
-            .unwrap_or_else(|| ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header);
+        // `opimpl_jit_merge_point` takes its driver from
+        // `staticdata.jitdrivers_sd[jdindex]`.
+        let no_loop_header = no_loop_header_jd;
         // pyjitpl.py `_handle_guard_failure` pre-arms the
         // flag when the source guard is a `ResumeAtPositionDescr` (the
         // descr `inline_short_preamble` stamps onto the guards it
@@ -4288,53 +4300,22 @@ where
             // only `remove_consts_and_duplicates` and the virtualizable
             // box handling in between, neither of which reads the
             // heapcache, so reset-then-guard is the faithful order.
-            ctx.heap_cache_mut().reset();
+            // `reached_loop_header`: one `duplicates` dict; reds first,
+            // then `virtualizable_boxes[:-1]`. `live_arg_boxes =
+            // greenboxes + redboxes` then `+= virtualizable_boxes; pop()`.
+            // The jit_interp recorder LABEL is the setup_call InputArgs
+            // (reds), so the JUMP/registration list is reds + vable
+            // elements — greens stay in `greenboxes` for same_greenkey /
+            // procedure tokens.
+            let boxes = ctx.reached_loop_header_live_arg_boxes(&mut redboxes, None);
             sym.set_redboxes(&redboxes);
-            // pyjitpl.py reached_loop_header, its second statement:
-            //
-            //     self.remove_consts_and_duplicates(
-            //         self.virtualizable_boxes,
-            //         len(self.virtualizable_boxes) - 1, duplicates)
-            //     live_arg_boxes += self.virtualizable_boxes
-            //
-            // The normalization is IN PLACE on `virtualizable_boxes`
-            // and runs on EVERY visit, before the list is spliced into
-            // the loop-carried args — so the args a merge point carries
-            // never hold a constant and never repeat a box.  The two
-            // merge-point registration sites below normalize their own
-            // COPY, which leaves the closing JUMP — built by
-            // `collect_jump_args_with_boxes` out of `sym` plus a fresh
-            // splice of `virtualizable_boxes` — splicing the raw list.
-            // A guard-origin bridge reaches here with that list still
-            // holding whatever `seed_bridge_virtualizable_boxes`
-            // decoded, and a `TAGCONST` element decodes to a constant
-            // `OpRef`, so the JUMP into the parent loop carried a bare
-            // literal in an element position: a value read off ONE
-            // guard failure, frozen into an edge every later entry
-            // takes.  Normalizing here, and handing the result back so
-            // the splice sees it, is what upstream's in-place rewrite
-            // does.
-            //
-            // The identity sits outside the `endindex = len - 1`
-            // window and is never rewritten: it is a live red input box
-            // that `standard_virtualizable_jitcode_argbox` and the
-            // resume reader both index by position.
-            //
-            // Upstream shares one `duplicates` set with the reds it
-            // normalized first; the reds here live in `sym`'s scalar
-            // fields, which this expansion cannot rewrite, so the
-            // element block gets its own set.  The registration sites
-            // below still run the combined pass over their copy, and
-            // `remove_consts_and_duplicates` is idempotent on an
-            // already-normalized list.
-            if let Some(mut typed) = ctx.collect_virtualizable_typed_boxes() {
-                if let Some(end) = typed.len().checked_sub(1) {
-                    ctx.remove_consts_and_duplicates(&mut typed[..end]);
-                    let elements: Vec<OpRef> =
-                        typed[..end].iter().map(|(opref, _)| *opref).collect();
-                    ctx.adopt_normalized_virtualizable_elements(&elements);
-                }
-            }
+            live_arg_boxes.clear();
+            live_arg_boxes.extend(
+                boxes
+                    .iter()
+                    .map(|&(op, ty)| crate::trace_ctx::GreenBox::new(op, ty)),
+            );
+            put_back_reds = true;
             // pyjitpl.py reached_loop_header: generate a dummy
             // GUARD_FUTURE_CONDITION just before the implicit JUMP so
             // unroll's `jump_to_existing_trace` has a `patchguardop`
@@ -4483,20 +4464,7 @@ where
                             .find_merge_point_same_greenkey(close_key, close_key_typed.as_ref())
                             .is_none()
                     {
-                        let vable_boxes =
-                            ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                        let original_boxes = match sym
-                            .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
-                        {
-                            Some(mut boxes) => {
-                                ctx.remove_consts_and_duplicates(&mut boxes);
-                                boxes
-                                    .into_iter()
-                                    .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                    .collect()
-                            }
-                            None => live_arg_boxes.to_vec(),
-                        };
+                        let original_boxes = live_arg_boxes.to_vec();
                         if crate::mptrace_enabled() {
                             eprintln!(
                                 "@@@MPTRACE bridge-add-mp key={close_key} header_pc={} num_ops={}",
@@ -4519,6 +4487,12 @@ where
                             close_key_typed,
                             original_boxes,
                             recorded_pc,
+                        );
+                        self.put_back_list_of_boxes3(
+                            &red_i_regs,
+                            &red_r_regs,
+                            &red_f_regs,
+                            &redboxes,
                         );
                         return TraceAction::Continue;
                     }
@@ -4770,23 +4744,7 @@ where
                     // the greens plus one unexpanded vable ref while its
                     // close expanded to one box per element — the arity
                     // mismatch that made every nested loop decline.
-                    let vable_boxes = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                    let original_boxes = match sym
-                        .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
-                    {
-                        Some(mut boxes) => {
-                            // pyjitpl.py MetaInterp.remove_consts_and_duplicates normalizes the list
-                            // before it becomes anything — the LABEL
-                            // this registration turns into cannot carry
-                            // a constant or a repeated box.
-                            ctx.remove_consts_and_duplicates(&mut boxes);
-                            boxes
-                                .into_iter()
-                                .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                .collect()
-                        }
-                        None => live_arg_boxes.into_vec(),
-                    };
+                    let original_boxes = live_arg_boxes.to_vec();
                     if crate::mptrace_enabled() {
                         eprintln!(
                             "@@@MPTRACE add-mp pc={pc} inner_key={inner_key} num_ops={}",
@@ -4802,7 +4760,43 @@ where
                 }
             }
         }
+        if put_back_reds {
+            // `put_back_list_of_boxes3`: reached_loop_header returned
+            // without closing; write the (possibly SAME_AS-rewritten)
+            // reds back to the operand registers.
+            self.put_back_list_of_boxes3(&red_i_regs, &red_r_regs, &red_f_regs, &redboxes);
+        }
         TraceAction::Continue
+    }
+
+    /// `pyjitpl.py put_back_list_of_boxes3`: write `redboxes` back to the
+    /// operand registers listed on the marker.
+    fn put_back_list_of_boxes3(
+        &mut self,
+        red_i_regs: &[u8],
+        red_r_regs: &[u8],
+        red_f_regs: &[u8],
+        redboxes: &[(OpRef, majit_ir::Type)],
+    ) {
+        assert_eq!(
+            redboxes.len(),
+            red_i_regs.len() + red_r_regs.len() + red_f_regs.len(),
+            "put_back_list_of_boxes3: redboxes length must equal the three operand lists"
+        );
+        let frame = self.frames.current_mut();
+        let mut i = 0;
+        for &reg in red_i_regs {
+            frame.int_regs[reg as usize] = Some(redboxes[i].0);
+            i += 1;
+        }
+        for &reg in red_r_regs {
+            frame.ref_regs[reg as usize] = Some(redboxes[i].0);
+            i += 1;
+        }
+        for &reg in red_f_regs {
+            frame.float_regs[reg as usize] = Some(redboxes[i].0);
+            i += 1;
+        }
     }
 
     #[inline(never)]

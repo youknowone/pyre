@@ -7045,7 +7045,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Header-revisit CloseLoop: publish the greens `bhimpl_jit_merge_point`
-    /// would read at this merge point.
+    /// would read at this merge point, and build `live_arg_boxes` the way
+    /// `opimpl_jit_merge_point` → `reached_loop_header` does.
     ///
     /// Re-reads declaration-order slots off the live portal frame when
     /// `framestack` still holds one. A `#[jit_interp]` Continue walk has
@@ -7058,8 +7059,11 @@ impl<M: Clone> MetaInterp<M> {
         ctx.walk_final_pc = Some(pc);
         if let Some(root) = self.framestack.frames.first() {
             ctx.snapshot_portal_greens_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
+            ctx.snapshot_portal_reds_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
         }
         ctx.adopt_live_greens_as_close();
+        let mut redboxes = ctx.live_portal_reds.clone().unwrap_or_default();
+        ctx.reached_loop_header_live_arg_boxes(&mut redboxes, None);
     }
 
     /// Split-borrow helper that lets a

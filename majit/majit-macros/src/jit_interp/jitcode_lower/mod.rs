@@ -53,8 +53,10 @@ mod reexports {
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
-        liveness_prebuild_tokens, liveness_triple, liveness_triple_from_reads, maybe_dump_liveness,
-        remove_repeated_live, rewrite_live_marker_statements_with_triples,
+        liveness_prebuild_tokens, liveness_prebuild_tokens_ex, liveness_triple,
+        liveness_triple_from_reads, maybe_dump_liveness, remove_repeated_live,
+        rewrite_live_marker_statements_with_triples,
+        rewrite_live_marker_statements_with_triples_ex,
     };
     pub(super) use super::lowerer::Lowerer;
 }
@@ -360,8 +362,31 @@ impl LowererConfig {
             .unwrap_or(0)
     }
 
-    fn is_state_vable_field(&self, name: &str) -> bool {
+    pub(super) fn is_state_vable_field(&self, name: &str) -> bool {
         self.vable_var.as_deref() == Some("state") && self.vable_fields.contains_key(name)
+    }
+
+    /// Int scalars that keep an independent identity slot (not redirected
+    /// onto the virtualizable). Dense `0..n` indices, so `max(index)+1`
+    /// is the slot count (`typed_array_parts` then places `[int]` cells).
+    pub(super) fn plain_int_scalar_count(&self) -> u16 {
+        self.state_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, index)| *index as u16 + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Flattened `[int]` arrays in `state_arrays` index order.
+    pub(super) fn state_array_names_in_order(&self) -> Vec<&str> {
+        let mut names: Vec<(&str, usize)> = self
+            .state_arrays
+            .iter()
+            .map(|(name, idx)| (name.as_str(), *idx))
+            .collect();
+        names.sort_by_key(|(_, idx)| *idx);
+        names.into_iter().map(|(name, _)| name).collect()
     }
 
     /// Exclusive end of the int-bank and ref-bank identity-slot ranges
@@ -383,14 +408,19 @@ impl LowererConfig {
         // not independent identity slots. Counting them here would
         // reserve registers the split arm never uses and can overflow
         // the 256-register JitCode ceiling.
-        let int_scalars = self
-            .state_scalars
-            .iter()
-            .filter(|(name, _)| !self.is_state_vable_field(name))
-            .map(|(_, index)| *index as u16 + 1)
-            .max()
-            .unwrap_or(0);
-        let int_end = self.int_identity_base() + int_scalars;
+        let int_scalars = self.plain_int_scalar_count();
+        // Flattened `[int]` cell count is Meta's runtime length
+        // (`typed_array_parts`). Pin a prefix per array so `alloc_reg`
+        // cannot land on a cell `handle_jit_marker__jit_merge_point`
+        // will list as a red. Live markers list only the runtime-length
+        // prefix of this range (`identity_slot_registers_with_array_lens`).
+        let array_reserve =
+            (self.state_arrays.len() as u16).saturating_mul(FLAT_INT_ARRAY_IDENTITY_RESERVE);
+        let int_end = self
+            .int_identity_base()
+            .saturating_add(int_scalars)
+            .saturating_add(array_reserve)
+            .min(256);
         let ref_scalars = self
             .state_ref_scalars
             .iter()
@@ -414,32 +444,95 @@ impl LowererConfig {
     /// prefix must be force-alive there. A later `load_state_field` already
     /// keeps a slot live; a working-register reuse of the same value does
     /// not, and the slot would drop from the parent snapshot.
+    ///
+    /// Flattened `[int]` cells follow the int scalars (`typed_array_parts`).
+    /// Compile-time callers have no Meta length, so this lists the scalar
+    /// prefix; `identity_slot_registers_with_array_lens` adds the cells.
     pub(super) fn identity_slot_registers(&self) -> Vec<Register> {
+        self.identity_slot_registers_with_array_lens(&[])
+    }
+
+    /// Per-kind counts of the identity-slot reds `resolve_reds` appends
+    /// after the named portal reds (`identity_slot_registers`). Flattened
+    /// `[int]` cells join at JitCode-build from Meta lengths.
+    pub(super) fn identity_scalar_red_kind_counts(&self) -> (usize, usize, usize) {
+        let mut counts = (0usize, 0usize, 0usize);
+        for reg in self.identity_slot_registers() {
+            match reg.kind {
+                BindingKind::Int => counts.0 += 1,
+                BindingKind::Ref => counts.1 += 1,
+                BindingKind::Float => counts.2 += 1,
+            }
+        }
+        counts
+    }
+
+    /// `identity_slot_registers` plus flattened `[int]` cells whose lengths
+    /// are known (`Meta.{name}_len`, `handle_jit_marker__jit_merge_point` /
+    /// `make_three_lists`). Empty `array_lens` lists the scalar prefix only.
+    pub(super) fn identity_slot_registers_with_array_lens(
+        &self,
+        array_lens: &[usize],
+    ) -> Vec<Register> {
         let mut regs = Vec::new();
         let int_base = self.int_identity_base();
-        for (name, index) in &self.state_scalars {
-            if self.is_state_vable_field(name) {
-                continue;
-            }
+        let mut int_scalars: Vec<(usize, &str)> = self
+            .state_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(name, index)| (*index, name.as_str()))
+            .collect();
+        int_scalars.sort_by_key(|(index, _)| *index);
+        for (index, _) in &int_scalars {
             regs.push(Register::int(int_base + *index as u16));
         }
-        let ref_base = self.ref_identity_base();
-        for (name, (index, _)) in &self.state_ref_scalars {
-            if self.is_state_vable_field(name) {
-                continue;
+        if !array_lens.is_empty() {
+            let mut offset = self.plain_int_scalar_count();
+            for (i, _) in self.state_array_names_in_order().iter().enumerate() {
+                let n = array_lens.get(i).copied().unwrap_or(0);
+                for k in 0..n {
+                    regs.push(Register::int(int_base + offset + k as u16));
+                }
+                offset = offset.saturating_add(n as u16);
             }
+        }
+        let ref_base = self.ref_identity_base();
+        let mut ref_scalars: Vec<(usize, &str)> = self
+            .state_ref_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(name, (index, _))| (*index, name.as_str()))
+            .collect();
+        ref_scalars.sort_by_key(|(index, _)| *index);
+        for (index, _) in &ref_scalars {
             regs.push(Register::ref_(ref_base + *index as u16));
         }
         let float_base = self.float_identity_base();
-        for (name, index) in &self.state_float_scalars {
-            if self.is_state_vable_field(name) {
-                continue;
-            }
+        let mut float_scalars: Vec<(usize, &str)> = self
+            .state_float_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(name, index)| (*index, name.as_str()))
+            .collect();
+        float_scalars.sort_by_key(|(index, _)| *index);
+        for (index, _) in &float_scalars {
             regs.push(Register::float(float_base + *index as u16));
         }
         regs
     }
 }
+
+/// Slots pinned per flattened `[int]` array so `alloc_reg` stays past
+/// `cells[i]` when the runtime length is not visible at lowering.
+/// Live markers and `jit_merge_point` list only Meta's live prefix of
+/// that range (`handle_jit_marker__jit_merge_point`).
+///
+/// The runtime builders in `codegen_trace` refuse a Meta length that
+/// exceeds this prefix: `assembler.py` `emit_const` asserts
+/// `0 <= val < 256`, and the codewriter's regalloc has already assigned
+/// every red a register. Lowering here is fixed at proc-macro time, so a
+/// runtime layout that does not fit cannot be encoded.
+pub(crate) const FLAT_INT_ARRAY_IDENTITY_RESERVE: u16 = 16;
 
 pub(super) const MAX_HELPER_CALL_ARITY: usize = 16;
 
@@ -2485,6 +2578,24 @@ mod tests {
                 Register::ref_(config.ref_identity_base() + 1),
                 Register::float(config.float_identity_base()),
             ]
+        );
+    }
+
+    #[test]
+    fn identity_slot_registers_list_flattened_int_cells() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_arrays.insert("cells".into(), 0);
+        let mut regs = config.identity_slot_registers_with_array_lens(&[2]);
+        regs.sort();
+        let base = config.int_identity_base();
+        assert_eq!(
+            regs,
+            vec![Register::int(base), Register::int(base + 1)],
+            "typed_array_parts cells occupy int_identity_base + plain_scalars + i"
+        );
+        assert!(
+            config.identity_slot_registers().is_empty(),
+            "compile-time form has no Meta length, so it lists no cells"
         );
     }
 

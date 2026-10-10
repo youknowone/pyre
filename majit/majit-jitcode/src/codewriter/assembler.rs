@@ -206,6 +206,10 @@ pub struct Assembler {
     /// `assembler.py` `Assembler` keeps `constants_r` on the assembler;
     /// these rows name the sentinel that pool writes into that vector.
     type_static_by_addr: Vec<(i64, String)>,
+    /// `(address, name)` rows for host-static refs (`HostStaticAddrs.refs`).
+    /// Parallel to [`Self::type_static_by_addr`]: these rows name the
+    /// `reloc_consts_r` descriptor the pool writes for a prebuilt GCREF.
+    static_ref_by_addr: Vec<(i64, String)>,
 }
 
 impl Assembler {
@@ -232,6 +236,7 @@ impl Assembler {
             inline_jitcodes: indexmap::IndexMap::new(),
             inline_prebuild_seen: indexmap::IndexSet::new(),
             type_static_by_addr: Vec::new(),
+            static_ref_by_addr: Vec::new(),
         }
     }
 
@@ -259,6 +264,35 @@ impl Assembler {
             return None;
         }
         self.type_static_by_addr
+            .iter()
+            .find(|(existing, _)| *existing == addr)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// Record host-static ref addresses so `emit_const_r` can emit a
+    /// named reloc descriptor instead of an untagged translator-local
+    /// pointer. Duplicate addresses keep the first name.
+    pub fn intern_static_ref_addrs(&mut self, rows: &[(&str, i64)]) {
+        for (name, addr) in rows {
+            if *addr == 0 {
+                continue;
+            }
+            if !self
+                .static_ref_by_addr
+                .iter()
+                .any(|(existing, _)| *existing == *addr)
+            {
+                self.static_ref_by_addr.push((*addr, (*name).to_string()));
+            }
+        }
+    }
+
+    /// The name [`Self::intern_static_ref_addrs`] recorded for `addr`.
+    pub fn static_ref_by_addr(&self, addr: i64) -> Option<&str> {
+        if addr == 0 {
+            return None;
+        }
+        self.static_ref_by_addr
             .iter()
             .find(|(existing, _)| *existing == addr)
             .map(|(_, name)| name.as_str())

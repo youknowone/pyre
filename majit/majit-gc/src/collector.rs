@@ -10030,6 +10030,24 @@ impl GcAllocator for MiniMarkGC {
         MiniMarkGC::writebarrier_before_move(self, obj.0);
     }
 
+    fn writebarrier_before_copy(
+        &mut self,
+        source: GcRef,
+        dest: GcRef,
+        source_start: usize,
+        dest_start: usize,
+        length: usize,
+    ) -> bool {
+        MiniMarkGC::writebarrier_before_copy(
+            self,
+            source.0,
+            dest.0,
+            source_start,
+            dest_start,
+            length,
+        )
+    }
+
     fn shrink_array(&mut self, addr: usize, smaller_length: usize) -> bool {
         MiniMarkGC::shrink_array(self, addr, smaller_length)
     }
@@ -10329,8 +10347,22 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
-        let shift = self.card_page_shift();
-        self.do_write_barrier_card(obj, index, shift);
+        // A non-GC (`Box::into_raw`) PyObject can reach the barrier here too;
+        // ignore any address the GC does not own (see `do_write_barrier`).
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        // incminimark.py `write_barrier_from_array`: TRACK_YOUNG_PTRS, then
+        // `card_page_indices > 0` → `remember_young_pointer_from_array2`,
+        // else `remember_young_pointer`.
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
+            if self.config.card_page_indices > 0 {
+                self.remember_young_pointer_from_array2(obj, index, self.card_page_shift);
+            } else {
+                self.remember_young_pointer(obj);
+            }
+        }
     }
 
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
@@ -14504,6 +14536,35 @@ mod tests {
             *(obj.0 as *mut usize) = array_length;
         }
         (obj, array_length)
+    }
+
+    /// incminimark.py `write_barrier_from_array`: with cards configured, only
+    /// the card for `index` is marked. TRACK_YOUNG_PTRS stays set.
+    #[test]
+    fn write_barrier_from_array_marks_only_the_card_for_the_index() {
+        let mut gc = test_gc(4096);
+        assert!(gc.config.card_page_indices > 0);
+        let (obj, _) = alloc_card_array(&mut gc, 512);
+        let hdr = unsafe { header_of(obj.0) };
+        assert!(unsafe { (*hdr).has_flag(GcFlags::GCFLAG_HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) });
+
+        crate::GcAllocator::write_barrier_from_array(&mut gc, obj, 200);
+
+        let card_idx = 200 >> DEFAULT_CARD_PAGE_SHIFT;
+        assert!(
+            gc.is_card_dirty(obj, card_idx as usize),
+            "card for index 200 should be dirty"
+        );
+        assert!(!gc.is_card_dirty(obj, 0), "card 0 should stay clean");
+        assert!(
+            unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) },
+            "card path leaves TRACK_YOUNG_PTRS set"
+        );
+        assert!(
+            gc.old_objects_pointing_to_young.is_empty(),
+            "card path does not whole-object-remember"
+        );
     }
 
     #[test]

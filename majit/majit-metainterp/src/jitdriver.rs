@@ -1007,7 +1007,11 @@ where
     let mut q = payload_start + 1;
     let (gi, gr, gf) = descriptor.green_kind_counts();
     let (ri, rr, rf) = descriptor.red_kind_counts();
-    let expected = [gi, gr, gf, ri, rr, rf];
+    let (ei, er, ef) = driver.merge_point_identity_reds;
+    // Greens are the portal-runner arguments. Reds on the marker are
+    // those plus the identity/cell registers `resolve_reds` lists
+    // (`identity_slot_registers` / `__flat_array_identity_slots`).
+    let expected = [gi, gr, gf, ri + ei, rr + er, rf + ef];
     for (slot, expect) in expected.iter().enumerate() {
         assert!(
             q < body_len,
@@ -1020,8 +1024,9 @@ where
         assert_eq!(
             count, *expect,
             "register_dispatch_jitcode: BC_JIT_MERGE_POINT payload \
-             slot {slot} count {count} disagrees with driver schema {expect} \
-             (greens=({gi}, {gr}, {gf}) reds=({ri}, {rr}, {rf})). \
+             slot {slot} count {count} disagrees with expected {expect} \
+             (greens=({gi}, {gr}, {gf}) reds=({ri}, {rr}, {rf}) \
+             identity=({ei}, {er}, {ef})). \
              Codegen / declare_schema mismatch.",
         );
         q += 1 + count;
@@ -1834,6 +1839,12 @@ pub struct JitDriver<S: JitState> {
     /// `register_descriptor` (each of which clears this cache), and no
     /// `JitState::driver_descriptor` implementation reads its `meta` argument.
     descriptor_cache: Option<Option<std::sync::Arc<JitDriverStaticData>>>,
+    /// Identity/cell reds the lowerer lists on `jit_merge_point` after the
+    /// named portal reds (`identity_slot_registers` plus Meta-length
+    /// flattened `[int]` cells). Not `JitDriverStaticData::vars`: those
+    /// are the portal-runner arguments (`warmspot.py`
+    /// `cpu.calldescrof(portal_runner)`). `(int, ref, float)`.
+    merge_point_identity_reds: (usize, usize, usize),
     /// Whether the live bridge trace was entered at a guard's own jitcode
     /// position rather than at a merge point the blackhole walked to.
     ///
@@ -2225,6 +2236,7 @@ impl<S: JitState> JitDriver<S> {
             continue_running_normally_payload: None,
             descriptor: None,
             descriptor_cache: None,
+            merge_point_identity_reds: (0, 0, 0),
             bridge_entered_at_guard_resume: false,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
@@ -2573,6 +2585,16 @@ impl<S: JitState> JitDriver<S> {
         }
         self.descriptor = Some(JitDriverStaticData::with_green_types(greens, reds));
         self.descriptor_cache = None;
+    }
+
+    /// Identity/cell reds the lowerer lists on `jit_merge_point` after the
+    /// named portal reds. `register_dispatch_jitcode` adds these to
+    /// `red_kind_counts` so the payload length is exact.
+    ///
+    /// `(int, ref, float)` from `identity_slot_registers` plus Meta-length
+    /// flattened `[int]` cells (`__flat_array_identity_slots`).
+    pub fn declare_merge_point_identity_reds(&mut self, counts: (usize, usize, usize)) {
+        self.merge_point_identity_reds = counts;
     }
 
     /// Name the descriptor's virtualizable and state its flat entry contract.
@@ -4358,102 +4380,24 @@ impl<S: JitState> JitDriver<S> {
                         self.sym.is_some(),
                         "reached_loop_header: sym must be live on the CloseLoop arm",
                     );
-                    let mut portal_slot_missing = false;
-                    let live_arg_boxes: Vec<OpRef> = match self.sym.as_ref() {
-                        Some(sym) => {
-                            // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
-                            // into the list as well (owned clone releases the
-                            // trace-ctx borrow before the consumers below).
-                            let (vable_boxes, stashed) = match self.meta.trace_ctx() {
-                                Some(ctx) => (
-                                    ctx.collect_virtualizable_typed_boxes(),
-                                    ctx.close_jump_boxes.take(),
-                                ),
-                                None => (None, None),
-                            };
-                            // `reached_loop_header` / `compile_trace` build
-                            // JUMP from the live portal boxes
-                            // (`original_boxes`-shaped), never the vable-only
-                            // subset `collect_jump_args_with_boxes` emits.
-                            let mut boxes = if let Some(typed) = stashed {
-                                typed.into_iter().map(|(o, _)| o).collect()
-                            } else if let Some(root) = self.meta.framestack.frames.first() {
-                                match S::collect_jump_args_from_portal(
-                                    sym,
-                                    root,
-                                    vable_boxes.as_deref().unwrap_or(&[]),
-                                ) {
-                                    Some(boxes) => boxes,
-                                    None => {
-                                        // A declared portal identity slot had no
-                                        // redbox. pyjitpl.py never skips those
-                                        // slots; emitting a short JUMP panics in
-                                        // x86/regalloc.py
-                                        // `assert len(arglocs) == jump_op.numargs()`.
-                                        portal_slot_missing = true;
-                                        Vec::new()
-                                    }
-                                }
-                            } else {
-                                S::collect_jump_args(sym)
-                            };
-                            if portal_slot_missing {
-                                Vec::new()
-                            } else {
-                                if let Some(ctx) = self.meta.trace_ctx() {
-                                    ctx.remove_consts_and_duplicates_untyped(&mut boxes);
-                                    // pyjitpl.py:2985-2988 normalizes
-                                    // `self.virtualizable_boxes` IN PLACE and appends
-                                    // the mutated list, so the rewrite reaches every
-                                    // later reader. The element block is a strict
-                                    // SUFFIX of the loop-carried list
-                                    // (`collect_jump_args_from_portal` /
-                                    // `loop_carried_boxes_from_portal`), so its tail is
-                                    // what goes back.
-                                    if let Some(n) =
-                                        vable_boxes.as_ref().map(|b| b.len().saturating_sub(1))
-                                    {
-                                        // Asserted, not filtered. Upstream has no
-                                        // partial state to fall back to — it rewrites
-                                        // the list in place — and skipping here would
-                                        // leave the ctx copy unnormalized, so a later
-                                        // cut mints a LABEL with the collapsed slots
-                                        // missing. `adopt_normalized_virtualizable_
-                                        // elements` asserts the same invariant from
-                                        // the other side.
-                                        //
-                                        // It holds by construction:
-                                        // `collect_jump_args_from_portal` appends the
-                                        // element block, and
-                                        // `remove_consts_and_duplicates_untyped` takes
-                                        // `&mut [OpRef]`, so it substitutes SameAs ops
-                                        // in place and cannot shorten the list
-                                        // (pyjitpl.py remove_consts_and_duplicates assigns `boxes[i]`).
-                                        assert!(
-                                            n <= boxes.len(),
-                                            "virtualizable element block ({n}) is not a suffix \
-                                             of live_arg_boxes ({})",
-                                            boxes.len(),
-                                        );
-                                        if n > 0 {
-                                            let tail = boxes[boxes.len() - n..].to_vec();
-                                            ctx.adopt_normalized_virtualizable_elements(&tail);
-                                        }
-                                    }
-                                }
-                                boxes
-                            }
-                        }
-                        None => Vec::new(),
-                    };
-                    if portal_slot_missing {
-                        self.meta
-                            .stage_abort_reason(crate::pyjitpl::counters::ABORT_BAD_LOOP);
-                        self.meta.abort_trace(false);
-                        self.sym = None;
-                        self.meta.clear_trace_session();
-                        return;
-                    }
+                    // `reached_loop_header` built this list from the marker
+                    // operands (`prepare_list_of_boxes`) and already ran
+                    // `remove_consts_and_duplicates`. Both close routes
+                    // (`opimpl_jit_merge_point` and header-revisit
+                    // `close_header_revisit`) stash it on `close_jump_boxes`.
+                    let live_arg_boxes: Vec<OpRef> = self
+                        .meta
+                        .trace_ctx()
+                        .expect("reached_loop_header: CloseLoop requires a live TraceCtx")
+                        .close_jump_boxes
+                        .take()
+                        .expect(
+                            "reached_loop_header: close_jump_boxes must be built at this \
+                             merge point (`opimpl_jit_merge_point` / `close_header_revisit`)",
+                        )
+                        .into_iter()
+                        .map(|(o, _)| o)
+                        .collect();
                     // pyjitpl.py reached_loop_header:
                     //
                     //     if not self.partial_trace:
@@ -5294,6 +5238,11 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                     self.meta.single_pass_finish = true;
+                    // `virtualizable.py write_from_resume_data_partial` writes
+                    // every static field before the portal runner continues.
+                    // A `void_return` Finish has no resultbox; the native
+                    // suffix reads these reds (`compile_done_with_this_frame`
+                    // then `DoneWithThisFrameVoid`).
                     if let Some(scalars) = self
                         .meta
                         .trace_ctx()
@@ -5304,6 +5253,18 @@ impl<S: JitState> JitDriver<S> {
                         let scalars = S::collect_scalar_state_field_values(sym);
                         if !scalars.is_empty() {
                             self.meta.single_pass_scalar_values = Some(scalars);
+                        }
+                    }
+                    if let Some(ref_scalars) = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.close_ref_scalar_values.take())
+                    {
+                        self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
+                    } else if let Some(sym) = self.sym.as_ref() {
+                        let ref_scalars = S::collect_ref_scalar_state_field_values(sym);
+                        if !ref_scalars.is_empty() {
+                            self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
                         }
                     }
                     let virt_elems = self
@@ -13852,6 +13813,9 @@ mod tests {
             sym.selected = 9;
             if let Some(ctx) = meta.trace_ctx() {
                 ctx.walk_final_pc = Some(target_pc);
+                // `reached_loop_header` stashes JUMP boxes; this fixture
+                // has no merge-point reds.
+                ctx.close_jump_boxes = Some(Vec::new());
             }
             TraceAction::CloseLoop
         });
@@ -15630,6 +15594,7 @@ mod cross_loop_cut_close_tests {
             }
             ctx.close_greens = Some(inner_greens());
             ctx.close_jump_into_key = Some(target);
+            ctx.close_jump_boxes = Some(vec![(OpRef::input_arg_int(0), Type::Int)]);
             TraceAction::CloseLoop
         });
     }
@@ -15736,6 +15701,7 @@ mod cross_loop_cut_close_tests {
             ctx.close_greens = Some(inner_greens());
             ctx.close_green_pc = close_pc;
             ctx.close_jump_into_key = Some(target);
+            ctx.close_jump_boxes = Some(vec![(OpRef::input_arg_int(0), Type::Int)]);
             TraceAction::CloseLoop
         });
         observed

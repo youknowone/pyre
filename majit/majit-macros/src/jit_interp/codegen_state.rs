@@ -184,9 +184,14 @@ pub fn generate_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let state_type = &config.state_type;
     let env_type = &config.env_type;
-    let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", func.sig.ident);
-    let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", func.sig.ident);
-    let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", func.sig.ident);
+    let prebuild_fn_name_with_lens = format_ident!(
+        "__prebuild_jitcode_liveness_{}_with_array_lens",
+        func.sig.ident
+    );
+    let dispatch_jitcode_fn_name_with_lens =
+        format_ident!("__dispatch_jitcode_{}_with_array_lens", func.sig.ident);
+    let declare_schema_fn_name_with_lens =
+        format_ident!("__declare_jit_schema_{}_with_array_lens", func.sig.ident);
     // Every module-level item this macro emits is suffixed with the annotated
     // function's name, because the expansion lands in the CALLER's module and two
     // machines in one module would otherwise collide (E0428).  These five were
@@ -197,9 +202,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // naming scheme can fix.
     let meta_ty = format_ident!("__JitMeta_{}", func.sig.ident);
     let sym_ty = format_ident!("__JitSym_{}", func.sig.ident);
-    // `_name` because `loop_carried_boxes_fn` is already taken further down by the
-    // TokenStream holding the whole function definition; this is only its ident.
-    let loop_carried_boxes_fn_name = format_ident!("__jit_loop_carried_boxes_{}", func.sig.ident);
     let fresh_alloc_fn = format_ident!("__majit_recursive_fresh_alloc_{}", func.sig.ident);
     let fresh_free_fn = format_ident!("__majit_recursive_fresh_free_{}", func.sig.ident);
     let sf = config.state_fields.as_ref().unwrap();
@@ -1059,140 +1061,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { self.#fname = ref_values[#slot] as usize; }
         })
         .collect();
-    // pyjitpl.py:2981-2989 `live_arg_boxes` — THE loop-carried box list, built
-    // in exactly one place because it has two consumers that must agree:
-    // `JitState::collect_jump_args_with_boxes` (the closing JUMP) and
-    // `JitCodeSym::loop_carried_boxes` (the merge-point registration, i.e. a
-    // later cross-loop cut's LABEL). RPython gets that agreement for free —
-    // `reached_loop_header` builds one list and passes it to both — and
-    // asserts it at pyjitpl.py. Two independent constructions here is
-    // what made every purely-virt-array interpreter's nested loop decline on
-    // `jump.numargs() != label.numargs()` (compile.py:334).
-    //
-    // The list must be slot-for-slot identical to the trace-entry Label:
-    // int scalars (Int), each fixed `[int]` array's cells (Int), the
-    // vable identity (Ref), then ref scalars (Ref), then float scalars
-    // (Float) — after which `JitDriver::extend_compiled_live_values` appends
-    // the element block with `live_values.extend(extra_values)`.
-    //
-    // So the element block is a strict SUFFIX of the reds, exactly as upstream
-    // builds it: `live_arg_boxes = greenboxes + redboxes` and then
-    // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
-    // (pyjitpl.py) — `+=` appends, so no element can precede a red.
-    // Splicing the elements before the ref/float scalars (as this did until
-    // the order was unified) leaves the JUMP and the Label at the SAME arity
-    // with different slot meanings, so `jump.numargs() == label.numargs()`
-    // (compile.py:334) still passes and nothing downstream catches it.
-    //
-    // `__boxes` = `TraceCtx::collect_virtualizable_typed_boxes()` =
-    // `[arr0_elem0.., arr1_elem0.., .., identity]` (`num_static_extra_boxes==0`
-    // for state-field; `initialize_virtualizable` concatenates the arrays in
-    // declaration order; identity LAST), so one contiguous splice of
-    // `__boxes[..len-1]` reproduces the Label's element tail for any number of
-    // arrays. Pushing it once-per-array would interleave the arrays and shift
-    // every later slot.
-    //
-    // With 0 virt arrays (tlr/tinyframe) there is no element shadow to splice,
-    // so the body degenerates to `collect_jump_args` and `__boxes` is unused —
-    // which is why the `collect_jump_args_with_boxes` override below stays
-    // gated on `num_virt_arrays >= 1` (the trait default already delegates to
-    // `collect_jump_args` there).
-    let vable_ref_reg: usize = ref_identity_base.saturating_sub(usize::from(has_vable_identity));
-    // pyjitpl.py `reached_loop_header` always has a redbox per declared
-    // portal slot (`greenboxes + redboxes`). Skipping an empty identity
-    // slot shortens JUMP against the LABEL that recorded the slot as live,
-    // which then panics in x86/regalloc.py `assert len(arglocs) == jump_op.numargs()`.
-    // A missing slot is SwitchToBlackhole, not a shorter JUMP.
-    let typed_scalar_parts: Vec<TokenStream> = (0..num_scalars)
-        .map(|k| {
-            let slot = int_identity_base + k;
-            quote! {
-                let __op = __frame.int_regs.get(#slot).copied().flatten()?;
-                args.push((__op, majit_ir::Type::Int));
-            }
-        })
-        .collect();
-    let typed_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .enumerate()
-        .map(|(array_idx, (_, f))| {
-            let len_name = quote::format_ident!("{}_len", f.name);
-            let prev: Vec<TokenStream> = arrays[..array_idx]
-                .iter()
-                .map(|(_, prev)| {
-                    let prev_len = quote::format_ident!("{}_len", prev.name);
-                    quote! { + __sym.#prev_len }
-                })
-                .collect();
-            quote! {
-                {
-                    let __base = #int_identity_base + #num_scalars #(#prev)*;
-                    for __i in 0..__sym.#len_name {
-                        let __op = __frame.int_regs.get(__base + __i).copied().flatten()?;
-                        args.push((__op, majit_ir::Type::Int));
-                    }
-                }
-            }
-        })
-        .collect();
-    let typed_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! {
-            if let Some((__op, __ty)) = __boxes.last() {
-                args.push((*__op, *__ty));
-            } else {
-                let __op = __frame.ref_regs.get(#vable_ref_reg).copied().flatten()?;
-                args.push((__op, majit_ir::Type::Ref));
-            }
-        }
-    } else {
-        quote! {}
-    };
-    let typed_ref_scalar_parts: Vec<TokenStream> = (0..num_ref_scalars)
-        .map(|j| {
-            let slot = ref_identity_base + j;
-            quote! {
-                let __op = __frame.ref_regs.get(#slot).copied().flatten()?;
-                args.push((__op, majit_ir::Type::Ref));
-            }
-        })
-        .collect();
-    let typed_float_scalar_parts: Vec<TokenStream> = (0..num_float_scalars)
-        .map(|k| {
-            let slot = float_identity_base + k;
-            quote! {
-                let __op = __frame.float_regs.get(#slot).copied().flatten()?;
-                args.push((__op, majit_ir::Type::Float));
-            }
-        })
-        .collect();
-    let typed_element_splice: TokenStream = if carry_vable_boxes {
-        quote! {
-            let __elem_count = __boxes.len().saturating_sub(1);
-            args.extend_from_slice(&__boxes[..__elem_count]);
-        }
-    } else {
-        quote! {}
-    };
-    let loop_carried_boxes_fn: TokenStream = quote! {
-        /// pyjitpl.py `reached_loop_header` `live_arg_boxes`, typed.
-        /// Reds come from the portal frame's identity slots; vable
-        /// fields from `virtualizable_boxes`.
-        #[allow(unused_variables)]
-        fn #loop_carried_boxes_fn_name(
-            __sym: &#sym_ty,
-            __frame: &majit_metainterp::MIFrame,
-            __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
-        ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
-            let mut args: Vec<(majit_ir::OpRef, majit_ir::Type)> = Vec::new();
-            #(#typed_scalar_parts)*
-            #(#typed_array_parts)*
-            #typed_vable_identity_part
-            #(#typed_ref_scalar_parts)*
-            #(#typed_float_scalar_parts)*
-            #typed_element_splice
-            Some(args)
-        }
-    };
+    // `reached_loop_header` builds one `live_arg_boxes` from the
+    // `jit_merge_point` operands (`prepare_list_of_boxes`); the generated
+    // identity-slot walk is no longer a second construction of that list.
     let collect_jump_args_with_boxes_method: TokenStream = if carry_vable_boxes {
         quote! {
             fn collect_jump_args_with_boxes(
@@ -1210,22 +1081,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
     } else {
         quote! {}
-    };
-    // `reached_loop_header` builds JUMP from the live portal boxes
-    // (`original_boxes`-shaped), never the vable-only subset.
-    let collect_jump_args_from_portal_method: TokenStream = quote! {
-        fn collect_jump_args_from_portal(
-            __sym: &#sym_ty,
-            __frame: &majit_metainterp::MIFrame,
-            __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
-        ) -> Option<Vec<majit_ir::OpRef>> {
-            Some(
-                #loop_carried_boxes_fn_name(__sym, __frame, __boxes)?
-                    .into_iter()
-                    .map(|(__op, _)| __op)
-                    .collect(),
-            )
-        }
     };
     let writeback_live_ref_scalar_arms: Vec<TokenStream> = ref_scalars
         .iter()
@@ -2116,7 +1971,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // JitCode body's `BC_JIT_MERGE_POINT` rather than the
                 // empty stub.  `green_kind_counts` / `red_kind_counts`
                 // then reflect the actual payload partition.
-                #declare_schema_fn_name(driver);
+                #declare_schema_fn_name_with_lens(
+                    driver,
+                    &[#(self.#create_sym_array_len_names),*],
+                );
                 // `warmspot.py make_virtualizable_infos` names the
                 // virtualizable on the jitdriver static data during setup, i.e.
                 // before the driver is registered. Order matters here for the
@@ -2202,7 +2060,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // `JitCodeBuilder::finalize_liveness` only dedups —
                     // the table never grows past this point (asserted in
                     // `__trace_*`).
-                    #prebuild_fn_name(&mut __asm);
+                    #prebuild_fn_name_with_lens(
+                        &mut __asm,
+                        &[#(self.#create_sym_array_len_names),*],
+                    );
                     // Build the dispatch JitCode singleton against the
                     // same shared assembler. `__prebuild_jitcode_liveness_*`
                     // registers per-marker triples for both the dispatch
@@ -2229,7 +2090,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         "register_descriptor must run before install_canonical_liveness — \
                          RPython call.py:46-47 / codewriter.py:23-24 lifecycle invariant"
                     ) as i64;
-                    let __dispatch_jc_opt = #dispatch_jitcode_fn_name(&mut __asm, __jdindex);
+                    let __dispatch_jc_opt = #dispatch_jitcode_fn_name_with_lens(
+                        &mut __asm,
+                        __jdindex,
+                        &[#(self.#create_sym_array_len_names),*],
+                    );
                     // Safety net: ensure the canonical entry has a
                     // registered offset before the snapshot, even if no
                     // per-pc factory has run a `finalize_liveness` yet
@@ -2268,8 +2133,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             trace_started: bool,
         }
 
-        #loop_carried_boxes_fn
-
         impl majit_metainterp::JitCodeSym for #sym_ty {
             fn total_slots(&self) -> usize {
                 #num_scalars #(#total_slots_array_parts)*
@@ -2281,14 +2144,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
                 let _ = __boxes;
                 None
-            }
-
-            fn loop_carried_boxes_from_portal(
-                &self,
-                __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
-                __frame: &majit_metainterp::MIFrame,
-            ) -> Option<Vec<(majit_ir::OpRef, majit_ir::Type)>> {
-                #loop_carried_boxes_fn_name(self, __frame, __boxes)
             }
 
             #[allow(clippy::reversed_empty_ranges)]
@@ -2517,22 +2372,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             //    loop state (without this a guard-exit bridge re-traces
             //    un-seeded). ──
             //
-            // STATUS: this seeds int/ref SCALAR slots only.  No available
-            // workload has been observed to reach this path (setup_bridge_sym
-            // emits no MAJIT_BRIDGE_DEBUG lines for any of them), so part B is
-            // present-but-unexercised; treat the
-            // seeding as unverified on real traces.  Latent gaps once it IS
-            // exercised by a consumer:
-            //   * flattened `[int]` arrays + virt-array ptr/len slots are NOT
-            //     seeded — they keep `create_sym`'s positional InputArg indices,
-            //     which need not equal the decoded failarg index; seed them from
-            //     `reg_indices` like the scalars below (consume_boxes fills all
-            //     live int/ref/float registers, not just selected scalars);
-            //   * a multi-frame resume (inlined sub-frames) is decoded as a
-            //     single frame by `rebuild_from_resumedata` (None
-            //     frame_value_count) — later frame headers would be read as
-            //     values.  Both bite only for macro states that declare
-            //     arrays or inline sub-frames.
+            // Flattened `[int]` cell identity slots are seeded from resume
+            // the way scalars are: `bridge_reg_indices` names the live
+            // register of each cell (`identity_slot_registers` /
+            // `handle_jit_marker__jit_merge_point`), and `consume_boxes`
+            // copies those live int registers into the portal frame.
             //
             // `frame.values` is laid out by liveness bank: [int-bank, then
             // ref-bank, then float], greens/loop-invariants decoded as `Const`,
@@ -2740,13 +2584,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 #state_field_layout_ctor
             }
 
-            fn collect_jump_args(_sym: &#sym_ty) -> Vec<majit_ir::OpRef> {
-                Vec::new()
-            }
-
             #collect_jump_args_with_boxes_method
-
-            #collect_jump_args_from_portal_method
 
             fn validate_close(sym: &#sym_ty, meta: &#meta_ty) -> bool {
                 true #(#validate_array_checks)*

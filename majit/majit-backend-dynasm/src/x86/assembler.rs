@@ -3706,11 +3706,6 @@ impl<'a> Assembler386<'a> {
                     // Dead operation — skip.
                     continue;
                 }
-                RegAllocOp::LoopPins { moves } => {
-                    for (src, dst) in moves {
-                        self.regalloc_mov(src, dst);
-                    }
-                }
                 RegAllocOp::Move { src, dst } => {
                     if majit_ir::debug::have_debug_prints() {
                         majit_ir::debug::log_one(

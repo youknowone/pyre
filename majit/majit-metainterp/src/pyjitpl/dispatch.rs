@@ -800,16 +800,6 @@ pub trait JitCodeSym {
         None
     }
 
-    /// `pyjitpl.py reached_loop_header`: loop-carried boxes from the live
-    /// portal frame's identity slots plus `virtualizable_boxes`.
-    fn loop_carried_boxes_from_portal(
-        &self,
-        vable_boxes: &[(OpRef, majit_ir::Type)],
-        _portal: &MIFrame,
-    ) -> Option<Vec<(OpRef, majit_ir::Type)>> {
-        self.loop_carried_boxes(vable_boxes)
-    }
-
     /// Walk-final int+float scalar values in `collect_scalar_state_field_values`
     /// order, read off the portal frame (`IntOp.getint` / `FloatOp.getfloat_storage`).
     fn collect_portal_scalar_values(&self, _portal: &MIFrame, _ctx: &TraceCtx) -> Vec<i64> {
@@ -1568,6 +1558,11 @@ pub struct JitCodeMachine<'mi, S, R> {
     last_mp_green_i: Vec<u8>,
     last_mp_green_r: Vec<u8>,
     last_mp_green_f: Vec<u8>,
+    /// Red register bytes from the last `BC_JIT_MERGE_POINT` decode.
+    /// Header-revisit CloseLoop re-reads those slots (`prepare_list_of_boxes`).
+    last_mp_red_i: Vec<u8>,
+    last_mp_red_r: Vec<u8>,
+    last_mp_red_f: Vec<u8>,
     marker: PhantomData<(S, R)>,
 }
 
@@ -2758,6 +2753,9 @@ where
             last_mp_green_i: Vec::new(),
             last_mp_green_r: Vec::new(),
             last_mp_green_f: Vec::new(),
+            last_mp_red_i: Vec::new(),
+            last_mp_red_r: Vec::new(),
+            last_mp_red_f: Vec::new(),
             marker: PhantomData,
         }
     }
@@ -2827,19 +2825,49 @@ where
     /// re-read the same slots: the previous merge-point *values* would
     /// otherwise overwrite a later write.
     fn snapshot_live_portal_greens(&mut self, ctx: &mut TraceCtx) {
-        if self.last_mp_green_i.is_empty()
+        if !(self.last_mp_green_i.is_empty()
             && self.last_mp_green_r.is_empty()
-            && self.last_mp_green_f.is_empty()
+            && self.last_mp_green_f.is_empty())
         {
-            return;
+            ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
+            ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
+            ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
+            if let Some(frame) = self.frames.frames.first() {
+                ctx.snapshot_portal_greens_from_frame(
+                    &frame.int_regs,
+                    &frame.ref_regs,
+                    &frame.float_regs,
+                );
+            }
         }
-        ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
-        ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
-        ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
-        let Some(frame) = self.frames.frames.first() else {
-            return;
-        };
-        ctx.snapshot_portal_greens_from_frame(&frame.int_regs, &frame.ref_regs, &frame.float_regs);
+        self.snapshot_live_portal_reds(ctx);
+    }
+
+    /// Re-read merge-point red registers off the live portal frame.
+    ///
+    /// `opimpl_jit_merge_point` feeds `redboxes` into `reached_loop_header`
+    /// (`prepare_list_of_boxes`) only at a merge point. Abort / too-long /
+    /// Continue before that first merge point still have empty
+    /// `last_mp_red_*`, and copying them would replace a valid earlier
+    /// snapshot with an empty one. Skip the re-read until a merge point
+    /// has listed reds, matching `snapshot_live_portal_greens`.
+    fn snapshot_live_portal_reds(&mut self, ctx: &mut TraceCtx) {
+        if !(self.last_mp_red_i.is_empty()
+            && self.last_mp_red_r.is_empty()
+            && self.last_mp_red_f.is_empty())
+        {
+            ctx.portal_red_regs_i.clone_from(&self.last_mp_red_i);
+            ctx.portal_red_regs_r.clone_from(&self.last_mp_red_r);
+            ctx.portal_red_regs_f.clone_from(&self.last_mp_red_f);
+            let Some(frame) = self.frames.frames.first() else {
+                return;
+            };
+            ctx.snapshot_portal_reds_from_frame(
+                &frame.int_regs,
+                &frame.ref_regs,
+                &frame.float_regs,
+            );
+        }
     }
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
@@ -3225,13 +3253,23 @@ where
     }
 
     fn stash_portal_reds(&self, ctx: &mut TraceCtx, sym: &S) {
+        // `reached_loop_header` builds a fresh `live_arg_boxes` each visit
+        // from the `jit_merge_point` operands (`prepare_list_of_boxes`).
+        // Scalar writeback values still come off the portal frame.
+        //
+        // `pyjitpl.py finishframe` compiles with the portal frame's boxes
+        // still live (`compile_done_with_this_frame`); `virtualizable.py`
+        // `write_from_resume_data_partial` then writes every static field
+        // back. The typed-return opimpls stash those identity-slot values
+        // before popping the frame. `run_to_end` restashes on every
+        // non-Continue; with the stack already drained that restash must
+        // not clear the return snapshot, or a `void_return` Finish writes
+        // nothing and the native suffix reads the trace-start reds.
         let Some(root) = self.frames.frames.first() else {
             return;
         };
-        let vable = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-        if let Some(boxes) = sym.loop_carried_boxes_from_portal(&vable, root) {
-            ctx.close_jump_boxes = Some(boxes);
-        }
+        ctx.close_scalar_values = None;
+        ctx.close_ref_scalar_values = None;
         let scalars = sym.collect_portal_scalar_values(root, ctx);
         if !scalars.is_empty() {
             ctx.close_scalar_values = Some(scalars);
@@ -6426,6 +6464,131 @@ mod tests {
         fn loop_header_pc(&self) -> usize {
             0
         }
+    }
+
+    fn portal_red_snapshot_machine(
+        stack: &mut MIFrameStack,
+    ) -> JitCodeMachine<'_, DummySym, ClosureRuntime<fn(usize) -> usize>> {
+        JitCodeMachine::with_framestack(stack, &[], &[])
+    }
+
+    /// Abort / too-long / Continue before the first merge point still have
+    /// empty `last_mp_red_*`. Copying them must not replace a snapshot
+    /// already on the ctx (`opimpl_jit_merge_point` / `reached_loop_header`).
+    #[test]
+    fn snapshot_live_portal_reds_leaves_earlier_snapshot_when_no_merge_point_reds() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(MIFrame::new(jitcode, 0));
+
+        let mut ctx = TraceCtx::for_test(0);
+        let earlier = vec![(OpRef::int_op(42), Type::Int)];
+        ctx.portal_red_regs_i = vec![3];
+        ctx.portal_red_regs_r = vec![1];
+        ctx.portal_red_regs_f = vec![2];
+        ctx.live_portal_reds = Some(earlier.clone());
+
+        let mut machine = portal_red_snapshot_machine(&mut stack);
+        machine.snapshot_live_portal_reds(&mut ctx);
+
+        assert_eq!(ctx.portal_red_regs_i, vec![3]);
+        assert_eq!(ctx.portal_red_regs_r, vec![1]);
+        assert_eq!(ctx.portal_red_regs_f, vec![2]);
+        assert_eq!(ctx.live_portal_reds, Some(earlier));
+    }
+
+    #[test]
+    fn snapshot_live_portal_reds_rereads_when_merge_point_listed_reds() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = MIFrame::new(jitcode, 0);
+        let live = OpRef::int_op(99);
+        frame.int_regs[0] = Some(live);
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(frame);
+
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.portal_red_regs_i = vec![7];
+        ctx.live_portal_reds = Some(vec![(OpRef::int_op(1), Type::Int)]);
+
+        let mut machine = portal_red_snapshot_machine(&mut stack);
+        machine.last_mp_red_i = vec![0];
+        machine.snapshot_live_portal_reds(&mut ctx);
+
+        assert_eq!(ctx.portal_red_regs_i, vec![0]);
+        assert_eq!(ctx.live_portal_reds, Some(vec![(live, Type::Int)]));
+    }
+
+    /// pyjitpl.py `MIFrame.opimpl_jit_merge_point`: `redboxes` become the
+    /// loop-header live state only at `portal_call_depth == 0`. This walker
+    /// uses `inline_depth()` for that test. A merge point reached inside an
+    /// inlined portal must leave `last_mp_red_*` / `portal_red_regs_*` as
+    /// the root merge point set them.
+    #[test]
+    fn merge_point_at_inline_depth_leaves_root_last_mp_reds() {
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("x", Type::Int)]);
+        jd.index = Some(0);
+        staticdata.jitdrivers_sd.push(jd);
+
+        let mut root_builder = JitCodeBuilder::new();
+        root_builder.load_const_i_value(0, 10);
+        root_builder.jit_merge_point(0, &[], &[], &[], &[0], &[], &[]);
+        let root = std::sync::Arc::new(root_builder.finish());
+
+        let mut callee_builder = JitCodeBuilder::new();
+        callee_builder.load_const_i_value(1, 99);
+        callee_builder.jit_merge_point(0, &[], &[], &[], &[1], &[], &[]);
+        let callee = std::sync::Arc::new(callee_builder.finish());
+
+        let mut ctx = TraceCtx::new(
+            crate::recorder::Trace::new(),
+            0,
+            std::sync::Arc::new(staticdata),
+        );
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(MIFrame::new(root, 0));
+        let mut machine = portal_red_snapshot_machine(&mut stack);
+        let runtime: ClosureRuntime<fn(usize) -> usize> = ClosureRuntime::new(|_pc| 0);
+        let mut sym = DummySym;
+
+        assert!(matches!(
+            machine.execute_one_instruction(&mut ctx, &mut sym, &runtime),
+            TraceAction::Continue
+        ));
+        assert!(matches!(
+            machine.execute_one_instruction(&mut ctx, &mut sym, &runtime),
+            TraceAction::Continue
+        ));
+        let root_red = machine.frames.frames[0].int_regs[0].expect("root red i0");
+        assert_eq!(machine.last_mp_red_i, vec![0]);
+        assert_eq!(ctx.portal_red_regs_i, vec![0]);
+        assert!(machine.last_mp_red_r.is_empty());
+        assert!(machine.last_mp_red_f.is_empty());
+
+        assert!(ctx.push_inline_frame((0, 0), u32::MAX));
+        assert!(ctx.inline_depth() > 0);
+        machine.frames.frames.push(MIFrame::new(callee, 0));
+        assert!(matches!(
+            machine.execute_one_instruction(&mut ctx, &mut sym, &runtime),
+            TraceAction::Continue
+        ));
+        assert!(matches!(
+            machine.execute_one_instruction(&mut ctx, &mut sym, &runtime),
+            TraceAction::Continue
+        ));
+
+        assert_eq!(machine.last_mp_red_i, vec![0]);
+        assert_eq!(machine.last_mp_red_r, Vec::<u8>::new());
+        assert_eq!(machine.last_mp_red_f, Vec::<u8>::new());
+        assert_eq!(ctx.portal_red_regs_i, vec![0]);
+        assert!(ctx.portal_red_regs_r.is_empty());
+        assert!(ctx.portal_red_regs_f.is_empty());
+        machine.snapshot_live_portal_reds(&mut ctx);
+        assert_eq!(ctx.live_portal_reds, Some(vec![(root_red, Type::Int)]));
     }
 
     #[test]

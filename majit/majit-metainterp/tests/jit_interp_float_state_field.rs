@@ -402,7 +402,7 @@ mod scalar_float_slot_reserve {
 mod virt_array_with_float_scalar {
     use super::Bytecode;
     use majit_metainterp::virt_array::VirtArray;
-    use majit_metainterp::{JitDriver, JitState};
+    use majit_metainterp::{JitDriver, JitState, decode_jit_merge_point_banks};
 
     struct MixedState {
         sp: i64,
@@ -500,10 +500,10 @@ mod virt_array_with_float_scalar {
 
     #[test]
     fn closing_jump_from_portal_includes_scalar_reds() {
-        // Header-revisit CloseLoop without `close_jump_boxes` must still
-        // emit the portal-shaped JUMP (`reached_loop_header`
-        // `live_arg_boxes`). `collect_jump_args_with_boxes` is identity
-        // plus elements only, which is fewer args than LABEL.
+        // Without a portal frame, `collect_jump_args_with_boxes` is the
+        // vable identity plus the element suffix (`live_arg_boxes +=
+        // virtualizable_boxes; pop`). Marker reds (cells) come from the
+        // `jit_merge_point` operands.
         let state = MixedState {
             sp: 0,
             cells: vec![0; 2],
@@ -514,8 +514,6 @@ mod virt_array_with_float_scalar {
         let meta = state.build_meta(0, program);
         let sym = <MixedState as JitState>::create_sym(&meta, 0);
 
-        let c0 = majit_ir::OpRef::input_arg_typed(11, majit_ir::Type::Int);
-        let c1 = majit_ir::OpRef::input_arg_typed(12, majit_ir::Type::Int);
         let e0 = majit_ir::OpRef::input_arg_typed(90, majit_ir::Type::Int);
         let e1 = majit_ir::OpRef::input_arg_typed(91, majit_ir::Type::Int);
         let identity = majit_ir::OpRef::input_arg_typed(92, majit_ir::Type::Ref);
@@ -525,29 +523,15 @@ mod virt_array_with_float_scalar {
             (identity, majit_ir::Type::Ref),
         ];
 
-        let mut builder = majit_metainterp::JitCodeBuilder::new();
-        builder.load_const_i_value(2, 0);
-        builder.load_const_r_value(1, 0);
-        let jitcode = std::sync::Arc::new(builder.finish());
-        let mut frame = majit_metainterp::MIFrame::new(jitcode, 0);
-        // `sp`/`acc` sit on the virtualizable; portal reds are the fixed
-        // `[int]` cells plus the identity, then the element suffix.
-        frame.int_regs[1] = Some(c0);
-        frame.int_regs[2] = Some(c1);
-        frame.ref_regs[1] = Some(identity);
-
         let close = <MixedState as JitState>::collect_jump_args_with_boxes(&sym, &boxes);
-        let portal = <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes)
-            .expect("portal identity slots are populated");
         assert_eq!(close, vec![identity, e0, e1]);
-        assert_eq!(portal, vec![c0, c1, identity, e0, e1]);
     }
 
     #[test]
-    fn missing_portal_slot_with_vable_elements_is_none() {
-        // CloseLoop must see None before it normalizes live_arg_boxes and
-        // asserts that the virtualizable element block is a suffix. An empty
-        // JUMP list with a nonempty vable_boxes would panic there.
+    fn merge_point_marker_lists_flattened_int_cells_as_reds() {
+        // Marker lists both flattened `[int]` cells (`handle_jit_marker__jit_merge_point`
+        // / `make_three_lists`). The `-live-` before the merge point keeps
+        // `cells[1]` so a guard resume restores it.
         let state = MixedState {
             sp: 0,
             cells: vec![0; 2],
@@ -555,31 +539,46 @@ mod virt_array_with_float_scalar {
             stack: VirtArray::filled(0, 2),
         };
         let program: &Bytecode = &[OP_NOP, OP_STEP];
-        let meta = state.build_meta(0, program);
-        let sym = <MixedState as JitState>::create_sym(&meta, 0);
-
-        let c0 = majit_ir::OpRef::input_arg_typed(11, majit_ir::Type::Int);
-        let e0 = majit_ir::OpRef::input_arg_typed(90, majit_ir::Type::Int);
-        let e1 = majit_ir::OpRef::input_arg_typed(91, majit_ir::Type::Int);
-        let identity = majit_ir::OpRef::input_arg_typed(92, majit_ir::Type::Ref);
-        let boxes = [
-            (e0, majit_ir::Type::Int),
-            (e1, majit_ir::Type::Int),
-            (identity, majit_ir::Type::Ref),
-        ];
-
-        let mut builder = majit_metainterp::JitCodeBuilder::new();
-        builder.load_const_i_value(2, 0);
-        builder.load_const_r_value(1, 0);
-        let jitcode = std::sync::Arc::new(builder.finish());
-        let mut frame = majit_metainterp::MIFrame::new(jitcode, 0);
-        frame.int_regs[1] = Some(c0);
-        // cells[1] (int_regs[2]) left empty; vable identity and elements stay.
-        frame.ref_regs[1] = Some(identity);
-
+        let mut driver: JitDriver<MixedState> = JitDriver::new(1);
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+        let jc = driver
+            .dispatch_jitcode()
+            .expect("install_canonical_liveness registers the dispatch JitCode");
+        let mp = jc
+            .exec
+            .jit_merge_point_offset
+            .expect("dispatch JitCode has a jit_merge_point");
+        let banks = decode_jit_merge_point_banks(&jc.code, mp);
         assert!(
-            <MixedState as JitState>::collect_jump_args_from_portal(&sym, &frame, &boxes).is_none(),
-            "a missing declared identity slot must not emit a short JUMP"
+            banks.red_i.contains(&1),
+            "marker lists cells[0] at int_identity_base; reds_i={:?}",
+            banks.red_i
+        );
+        assert!(
+            banks.red_i.contains(&2),
+            "marker lists cells[1]; reds_i={:?}",
+            banks.red_i
+        );
+
+        const SIZE_LIVE_OP: usize = 3;
+        let live_pc = mp
+            .checked_sub(SIZE_LIVE_OP)
+            .expect("op3 -live- precedes jit_merge_point");
+        let meta = driver.meta_interp();
+        let all_liveness = meta.staticdata.liveness_info.snapshot_vec();
+        let op_live = meta.staticdata.op_live as u8;
+        let indices = majit_metainterp::resume::read_frame_liveness_reg_indices(
+            jc,
+            live_pc,
+            op_live,
+            &all_liveness,
+        );
+        assert!(
+            indices.int.iter().any(|&r| r == 2),
+            "guard resume live set includes cells[1] (int_regs[2]); live_i={:?}",
+            indices.int
         );
     }
 

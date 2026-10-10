@@ -184,7 +184,10 @@ fn use_c_form(opname: &str) -> bool {
 // kind-search, no fallback — exactly mirroring RPython's
 // `Register(kind, index)` invariant from `flatten.py`.
 use crate::flowspace::model::ConstValue;
-use crate::jitcode::{BhCallDescr, JitCodeBody, StrConstDescriptor};
+use crate::jitcode::{
+    BhCallDescr, ConstIRelocDescriptor, ConstIRelocKind, ConstRRelocDescriptor, JitCodeBody,
+    StrConstDescriptor,
+};
 use crate::regalloc::RegAllocator;
 
 pub use majit_jitcode::codewriter::assembler::*;
@@ -201,8 +204,24 @@ fn compact_exc_name(name: &str) -> String {
 /// `StopIteration` matches `EXC_STOP_ITERATION_TYPE` by dropping underscores.
 /// `BaseException` is the one static spelled `EXCEPTION_TYPE`.
 fn lookup_exc_static_row(rows: &[(String, i64)], class_name: &str, suffix: &str) -> Option<i64> {
+    lookup_exc_static_row_named(rows, class_name, suffix).map(|(_, addr)| addr)
+}
+
+fn lookup_exc_static_row_name(
+    rows: &[(String, i64)],
+    class_name: &str,
+    suffix: &str,
+) -> Option<String> {
+    lookup_exc_static_row_named(rows, class_name, suffix).map(|(name, _)| name)
+}
+
+fn lookup_exc_static_row_named(
+    rows: &[(String, i64)],
+    class_name: &str,
+    suffix: &str,
+) -> Option<(String, i64)> {
     let compact = compact_exc_name(class_name);
-    let mut found: Option<i64> = None;
+    let mut found: Option<(String, i64)> = None;
     for (key, addr) in rows {
         if !key.contains("interp_exceptions::") {
             continue;
@@ -225,7 +244,7 @@ fn lookup_exc_static_row(rows: &[(String, i64)], class_name: &str, suffix: &str)
         if found.is_some() {
             panic!("exception class {class_name} matches more than one {suffix} static row");
         }
-        found = Some(*addr);
+        found = Some((key.clone(), *addr));
     }
     found
 }
@@ -402,6 +421,27 @@ trait AssemblerEncode {
 
     fn emit_const_i(&mut self, value: i64, state: &mut AssemblyState) -> u8;
 
+    fn emit_const_i_reloc(
+        &mut self,
+        value: i64,
+        kind: ConstIRelocKind,
+        state: &mut AssemblyState,
+    ) -> u8;
+
+    fn emit_fnaddr_const(
+        &mut self,
+        funcptr: &crate::model::CallTarget,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8;
+
+    fn emit_const_r_reloc(
+        &mut self,
+        value: i64,
+        kind: ConstIRelocKind,
+        state: &mut AssemblyState,
+    ) -> u8;
+
     fn emit_const_i_allow_short(
         &mut self,
         value: i64,
@@ -530,6 +570,8 @@ impl AssemblerExt for Assembler {
             unit_variant_consts: Vec::new(),
             exc_instance_consts: Vec::new(),
             type_static_consts: Vec::new(),
+            reloc_consts_i: Vec::new(),
+            reloc_consts_r: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -653,6 +695,8 @@ impl AssemblerExt for Assembler {
             unit_variant_consts: state.unit_variant_consts,
             exc_instance_consts: state.exc_instance_consts,
             type_static_consts: state.type_static_consts,
+            reloc_consts_i: state.reloc_consts_i,
+            reloc_consts_r: state.reloc_consts_r,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -1353,7 +1397,7 @@ impl AssemblerEncode for Assembler {
                 // RPython `jtransform.py` `rewrite_call` emits args
                 // by kind (I, R, F) first, then the calldescr, producing
                 // keys like `residual_call_ir_r/iIRd>r`. jtransform now
-                // materializes direct-call funcptrs as `ConstInt` values,
+                // materializes direct-call funcptrs as `ConstFnAddr` values,
                 // so every post-jtransform call op reaches the assembler
                 // as `CallFuncPtr::Value(...)` and encodes the orthodox
                 // leading `i` operand.
@@ -1437,6 +1481,34 @@ impl AssemblerEncode for Assembler {
                     self.emit_const_i_allow_short(*val, use_c_form("int_copy"), state);
                 state.code.push(idx);
                 argcodes.push(src_argcode);
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("int_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::ConstFnAddr {
+                value,
+                path,
+                symbolic,
+            } => {
+                // `assembler.py emit_const`: a function pointer is a
+                // symbolic (`AddressAsInt` / `lltype` funcptr), never the
+                // short `c` form (`"Symbolics cannot be compared!"`).
+                let idx = self.emit_const_i_reloc(
+                    *value,
+                    ConstIRelocKind::FnAddr {
+                        path: path.clone(),
+                        symbolic: *symbolic,
+                    },
+                    state,
+                );
+                state.code.push(idx);
+                argcodes.push('i');
                 if let Some(result) = op.result.as_ref() {
                     argcodes.push('>');
                     let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
@@ -2846,11 +2918,9 @@ impl AssemblerEncode for Assembler {
                 assert_eq!(kc, 'i', "conditional_call condition is an int");
                 state.code.push(reg);
                 argcodes.push(kc);
-                let fnaddr = match callcontrol {
-                    Some(cc) => cc.fnaddr_for_target(funcptr),
-                    None => crate::call::symbolic_fnaddr_for_target(funcptr),
-                };
-                let func_byte = self.emit_const_i(fnaddr, state);
+                // `assembler.py emit_const` on the funcptr Constant from
+                // `_rewrite_op_cond_call` / `handle_residual_call`.
+                let func_byte = self.emit_fnaddr_const(funcptr, state, callcontrol);
                 state.code.push(func_byte);
                 argcodes.push('i');
                 self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
@@ -2893,11 +2963,9 @@ impl AssemblerEncode for Assembler {
                 );
                 state.code.push(reg);
                 argcodes.push(kc);
-                let fnaddr = match callcontrol {
-                    Some(cc) => cc.fnaddr_for_target(funcptr),
-                    None => crate::call::symbolic_fnaddr_for_target(funcptr),
-                };
-                let func_byte = self.emit_const_i(fnaddr, state);
+                // Same funcptr Constant channel as `conditional_call_ir_v`
+                // and residual_call (`assembler.py emit_const`).
+                let func_byte = self.emit_fnaddr_const(funcptr, state, callcontrol);
                 state.code.push(func_byte);
                 argcodes.push('i');
                 self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
@@ -3288,6 +3356,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::RawLoad { .. } => "RawLoad",
                 OpKind::RawStore { .. } => "RawStore",
                 OpKind::ConstInt(_) => "ConstInt",
+                OpKind::ConstFnAddr { .. } => "ConstFnAddr",
                 OpKind::ConstUInt(_) => "ConstUInt",
                 OpKind::ConstInt128(_) => "ConstInt128",
                 OpKind::ConstUInt128(_) => "ConstUInt128",
@@ -3556,15 +3625,97 @@ impl AssemblerEncode for Assembler {
     }
 
     fn emit_const_i(&mut self, value: i64, state: &mut AssemblyState) -> u8 {
-        // Check if already in pool
+        // Check if already in pool. Relocatable slots keep their own
+        // identity (`assembler.py emit_const` keys on the Constant
+        // object, not the integer bits), so an ordinary int that
+        // happens to equal a funcptr/static address does not share a
+        // slot with it.
         for (i, &existing) in state.constants_i.iter().enumerate() {
-            if existing == value {
+            if existing == value && !state.slot_i_is_reloc(i) {
                 return const_pool_slot(state.num_regs_i, i);
             }
         }
         // Add to pool: index = num_regs + pool_position
         state.constants_i.push(value);
         const_pool_slot(state.num_regs_i, state.constants_i.len() - 1)
+    }
+
+    fn emit_const_i_reloc(
+        &mut self,
+        value: i64,
+        kind: ConstIRelocKind,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        // `assembler.py Assembler.emit_const` keys `constants_dict` on
+        // `(kind, Constant(value_key))` where `value_key` is the
+        // symbolic address object, so one symbol owns one slot. The
+        // incoming `value` is the build-time word for that symbol; a
+        // hit must reuse the stored word.
+        if let Some(existing) = state.reloc_consts_i.iter().find(|d| d.kind == kind) {
+            debug_assert_eq!(
+                state.constants_i[existing.constants_i_index], value,
+                "one symbol must bind one build address"
+            );
+            return const_pool_slot(state.num_regs_i, existing.constants_i_index);
+        }
+        let constants_i_index = state.constants_i.len();
+        state.constants_i.push(value);
+        state.reloc_consts_i.push(ConstIRelocDescriptor {
+            constants_i_index,
+            kind,
+        });
+        const_pool_slot(state.num_regs_i, constants_i_index)
+    }
+
+    /// Funcptr Constant of `residual_call` / `conditional_call*` /
+    /// `conditional_call_value*`. `_rewrite_op_cond_call` and
+    /// `handle_residual_call` pass the same `Constant`; `assembler.py
+    /// emit_const` stores the symbolic object. `ConstFnAddr` is the
+    /// materialized spelling of that object; this is the in-operand
+    /// spelling. Both write `{ path, symbolic }` via `emit_const_i_reloc`.
+    fn emit_fnaddr_const(
+        &mut self,
+        funcptr: &crate::model::CallTarget,
+        state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
+    ) -> u8 {
+        let (fnaddr, path, symbolic) = match callcontrol {
+            Some(cc) => {
+                let binding = cc.fnaddr_binding_for_target(funcptr);
+                (binding.addr, binding.path, binding.symbolic)
+            }
+            None => (
+                crate::call::symbolic_fnaddr_for_target(funcptr),
+                crate::call::symbolic_fnaddr_path_for_target(funcptr),
+                true,
+            ),
+        };
+        self.emit_const_i_reloc(fnaddr, ConstIRelocKind::FnAddr { path, symbolic }, state)
+    }
+
+    fn emit_const_r_reloc(
+        &mut self,
+        value: i64,
+        kind: ConstIRelocKind,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        // Same reuse as `emit_const_i_reloc`: `Assembler.emit_const`
+        // keys `constants_dict` on the symbolic address, so one
+        // symbol owns one slot.
+        if let Some(existing) = state.reloc_consts_r.iter().find(|d| d.kind == kind) {
+            debug_assert_eq!(
+                state.constants_r[existing.constants_r_index], value,
+                "one symbol must bind one build address"
+            );
+            return const_pool_slot(state.num_regs_r, existing.constants_r_index);
+        }
+        let constants_r_index = state.constants_r.len();
+        state.constants_r.push(value);
+        state.reloc_consts_r.push(ConstRRelocDescriptor {
+            constants_r_index,
+            kind,
+        });
+        const_pool_slot(state.num_regs_r, constants_r_index)
     }
 
     /// `assembler.py` — the `allow_short` branch of `emit_const`.
@@ -3600,7 +3751,15 @@ impl AssemblerEncode for Assembler {
                     .unwrap_or_else(|| {
                         panic!("goto_if_exception_mismatch: llexitcase {obj:?} is not an exception class")
                     });
-                self.emit_const_i(bits, state)
+                let name = exception_class_of(obj).expect("exception class llexitcase");
+                let pytypes = callcontrol.map_or(&[][..], CallControl::exc_pytype_rows);
+                let row_name =
+                    lookup_exc_static_row_name(pytypes, &name, "_TYPE").unwrap_or_else(|| {
+                        panic!(
+                            "goto_if_exception_mismatch: no interp_exceptions pytype row for {name}"
+                        )
+                    });
+                self.emit_const_i_reloc(bits, ConstIRelocKind::StaticAddr { name: row_name }, state)
             }
             other => {
                 panic!("goto_if_exception_mismatch: unsupported llexitcase constant {other:?}")
@@ -3784,11 +3943,20 @@ impl AssemblerEncode for Assembler {
     }
 
     /// Pool a type-static sentinel when `bits` names an interned
-    /// `PyType` singleton; otherwise pool the raw bits.
+    /// `PyType` singleton; a named reloc when it names a host-static
+    /// ref; otherwise pool the raw bits.
     fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
-        let type_name = self.type_static_const_by_addr(bits).map(str::to_string);
-        if let Some(name) = type_name {
-            return self.emit_type_static_const_r(name, state);
+        if let Some(name) = self.type_static_const_by_addr(bits) {
+            return self.emit_type_static_const_r(name.to_string(), state);
+        }
+        if let Some(name) = self.static_ref_by_addr(bits) {
+            return self.emit_const_r_reloc(
+                bits,
+                ConstIRelocKind::StaticAddr {
+                    name: name.to_string(),
+                },
+                state,
+            );
         }
         self.emit_const_r_bits(bits, state)
     }
@@ -3818,12 +3986,10 @@ impl AssemblerEncode for Assembler {
     }
 
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
-        if let Some(index) = state
-            .constants_r
-            .iter()
-            .position(|&existing| existing == bits)
-        {
-            return const_pool_slot(state.num_regs_r, index);
+        for (i, &existing) in state.constants_r.iter().enumerate() {
+            if existing == bits && !state.slot_r_is_reloc(i) {
+                return const_pool_slot(state.num_regs_r, i);
+            }
         }
         state.constants_r.push(bits);
         const_pool_slot(state.num_regs_r, state.constants_r.len() - 1)
@@ -3955,6 +4121,12 @@ struct AssemblyState {
     /// Host `PyType` singleton constants recorded while assembling,
     /// committed to [`JitCodeBody::type_static_consts`].
     type_static_consts: Vec<super::jitcode::TypeStaticConstDescriptor>,
+    /// Relocatable `constants_i` slots, committed to
+    /// [`JitCodeBody::reloc_consts_i`].
+    reloc_consts_i: Vec<ConstIRelocDescriptor>,
+    /// Relocatable `constants_r` slots, committed to
+    /// [`JitCodeBody::reloc_consts_r`].
+    reloc_consts_r: Vec<ConstRRelocDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -3972,6 +4144,20 @@ struct AssemblyState {
     /// RPython assembler.py:217-219: map from bytecode offset (after `->`)
     /// to result kind character. Recorded when encoding result registers.
     resulttypes: indexmap::IndexMap<usize, char>,
+}
+
+impl AssemblyState {
+    fn slot_i_is_reloc(&self, index: usize) -> bool {
+        self.reloc_consts_i
+            .iter()
+            .any(|d| d.constants_i_index == index)
+    }
+
+    fn slot_r_is_reloc(&self, index: usize) -> bool {
+        self.reloc_consts_r
+            .iter()
+            .any(|d| d.constants_r_index == index)
+    }
 }
 
 /// RPython: getkind(v.concretetype)[0] → 'i', 'r', 'f', 'v'.
@@ -5663,7 +5849,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         },
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
-        OpKind::ConstInt(_) | OpKind::ConstUInt(_) => "int_copy".into(),
+        OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstUInt(_) => {
+            "int_copy".into()
+        }
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }
@@ -7030,6 +7218,8 @@ mod tests {
             unit_variant_consts: Vec::new(),
             exc_instance_consts: Vec::new(),
             type_static_consts: Vec::new(),
+            reloc_consts_i: Vec::new(),
+            reloc_consts_r: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -7152,6 +7342,16 @@ mod tests {
         assert_eq!(state.code[3], 0);
         assert_eq!(state.code[4], 0);
         assert_eq!(u16::from_le_bytes([state.code[5], state.code[6]]), 0);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(state.reloc_consts_i[0].constants_i_index, 0);
+        assert!(
+            matches!(
+                &state.reloc_consts_i[0].kind,
+                ConstIRelocKind::FnAddr { symbolic: true, .. }
+            ),
+            "conditional_call funcptr must take the FnAddr constant channel, got {:?}",
+            state.reloc_consts_i[0].kind
+        );
     }
 
     /// `jtransform.py _rewrite_op_cond_call` value form /
@@ -7219,6 +7419,82 @@ mod tests {
         assert_eq!(state.code[5], 1);
         assert_eq!(u16::from_le_bytes([state.code[6], state.code[7]]), 0);
         assert_eq!(state.code[8], 2);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(state.reloc_consts_i[0].constants_i_index, 0);
+        assert!(
+            matches!(
+                &state.reloc_consts_i[0].kind,
+                ConstIRelocKind::FnAddr { symbolic: true, .. }
+            ),
+            "conditional_call_value funcptr must take the FnAddr constant channel, got {:?}",
+            state.reloc_consts_i[0].kind
+        );
+    }
+
+    /// Int-result twin of `assemble_conditional_call_value_ir_r_*`.
+    /// Canonical key `conditional_call_value_ir_i/iiIRd>i`.
+    #[test]
+    fn assemble_conditional_call_value_ir_i_emits_canonical_iiird_bytes() {
+        use crate::call::CallDescriptor;
+        use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation};
+        use majit_ir::effectinfo::EffectInfo;
+        use majit_ir::value::Type;
+
+        let value = crate::flowspace::model::Variable::new();
+        let arg = crate::flowspace::model::Variable::new();
+        let result = crate::flowspace::model::Variable::new();
+        FunctionGraph::set_concretetype_of_inline(&value, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&arg, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, crate::model::ConcreteType::Signed);
+
+        let mut regallocs = empty_regallocs();
+        let int_ra = regallocs.get_mut(&RegKind::Int).unwrap();
+        int_ra.coloring.insert(value.clone(), 0);
+        int_ra.coloring.insert(arg.clone(), 1);
+        int_ra.coloring.insert(result.clone(), 2);
+        int_ra.num_regs = 3;
+
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConditionalCallValue {
+                value: value.clone(),
+                funcptr: CallTarget::function_path(["rstr", "ll_strhash"]),
+                descriptor: CallDescriptor::from_signature(
+                    &[Type::Int],
+                    Type::Int,
+                    EffectInfo::default(),
+                ),
+                args_i: vec![arg.clone()],
+                args_r: vec![],
+                args_f: vec![],
+                result_kind: 'i',
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "conditional_call_value_ir_i/iiIRd>i";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        // opcode, value, func const, I count, i1, R count, descr u16, result
+        assert_eq!(state.code.len(), 9);
+        assert_eq!(state.code[0], asm.insns[key]);
+        assert_eq!(state.code[1], 0);
+        assert_eq!(state.code[2], state.num_regs_i as u8);
+        assert_eq!(state.code[3], 1);
+        assert_eq!(state.code[4], 1);
+        assert_eq!(state.code[5], 0);
+        assert_eq!(u16::from_le_bytes([state.code[6], state.code[7]]), 0);
+        assert_eq!(state.code[8], 2);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert!(matches!(
+            &state.reloc_consts_i[0].kind,
+            ConstIRelocKind::FnAddr { symbolic: true, .. }
+        ));
     }
 
     #[test]
@@ -7258,6 +7534,64 @@ mod tests {
         assert_eq!(argcode, 'i');
         assert_eq!(byte, (state.num_regs_i + 1) as u8);
         assert_eq!(state.constants_i, vec![128, 5]);
+    }
+
+    #[test]
+    fn emit_const_i_does_not_share_a_slot_with_a_relocatable_fnaddr() {
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let fnaddr = 0x1000_i64;
+        let reloc = asm.emit_const_i_reloc(
+            fnaddr,
+            ConstIRelocKind::FnAddr {
+                path: "helpers::foo".into(),
+                symbolic: false,
+            },
+            &mut state,
+        );
+        let ordinary = asm.emit_const_i(fnaddr, &mut state);
+        assert_ne!(
+            reloc, ordinary,
+            "an ordinary integer equal to a funcptr must keep its own slot"
+        );
+        assert_eq!(state.constants_i, vec![fnaddr, fnaddr]);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(state.reloc_consts_i[0].constants_i_index, 0);
+        let reloc_again = asm.emit_const_i_reloc(
+            fnaddr,
+            ConstIRelocKind::FnAddr {
+                path: "helpers::foo".into(),
+                symbolic: false,
+            },
+            &mut state,
+        );
+        assert_eq!(reloc_again, reloc, "same path reuses the reloc slot");
+        assert_eq!(state.constants_i.len(), 2);
+    }
+
+    #[test]
+    fn emit_const_r_does_not_share_a_slot_with_a_relocatable_static() {
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        asm.intern_static_ref_addrs(&[("dictstrategy::EMPTY", 0x1000)]);
+        let reloc = asm.emit_type_static_or_bits(0x1000, &mut state);
+        let ordinary = asm.emit_const_r_bits(0x1000, &mut state);
+        assert_ne!(
+            reloc, ordinary,
+            "an ordinary ref equal to a host-static addr must keep its own slot"
+        );
+        assert_eq!(state.constants_r, vec![0x1000, 0x1000]);
+        assert_eq!(state.reloc_consts_r.len(), 1);
+        assert_eq!(state.reloc_consts_r[0].constants_r_index, 0);
+        assert_eq!(
+            state.reloc_consts_r[0].kind,
+            ConstIRelocKind::StaticAddr {
+                name: "dictstrategy::EMPTY".into()
+            }
+        );
+        let reloc_again = asm.emit_type_static_or_bits(0x1000, &mut state);
+        assert_eq!(reloc_again, reloc, "same name reuses the reloc slot");
+        assert_eq!(state.constants_r.len(), 2);
     }
 
     #[test]

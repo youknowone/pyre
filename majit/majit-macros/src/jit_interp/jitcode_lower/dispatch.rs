@@ -3621,6 +3621,18 @@ pub(super) fn resolve_reds(
         }
     }
 
+    // `handle_jit_marker__jit_merge_point` / `make_three_lists`: every
+    // declared red is a live Variable on the marker. State-field identity
+    // slots (plain scalars; flattened `[int]` cells join at JitCode-build
+    // from Meta lengths) are those reds.
+    for reg in config.identity_slot_registers() {
+        match reg.kind {
+            BindingKind::Int => reds_i.push(reg.index),
+            BindingKind::Ref => reds_r.push(reg.index),
+            BindingKind::Float => reds_f.push(reg.index),
+        }
+    }
+
     // Validate uniqueness within each bucket (jtransform.py:1701).
     for (label, bucket) in [
         ("reds_i", &reds_i),
@@ -3846,6 +3858,13 @@ pub(super) fn red_schema(lowerer: &Lowerer, config: &LowererConfig) -> Vec<(Stri
         }
     }
     assert_kind_sorted("reds", &out);
+    // Identity slots are listed on the `jit_merge_point` marker
+    // (`resolve_reds` / `handle_jit_marker__jit_merge_point`) and in
+    // `-live-` (`identity_slot_registers`). They are not JitDriver reds:
+    // `warmspot.py` `jd.portal_calldescr = cpu.calldescrof(portal_runner)`
+    // describes the original function, whose arguments are the named
+    // greens/reds. State-field identity lives in those reds the way
+    // frame fields live in the portal frame, not as extra runner args.
     out.into_iter().map(|(_, n, t)| (n, t)).collect()
 }
 
@@ -4115,12 +4134,20 @@ pub(crate) fn lower_dispatch_body(
         OpMeta::linear(OpKind::JitMergePoint, merge_reads, vec![]),
         quote::quote! {
             // __jdindex: jtransform.py:1704 portal_jd.index threaded as runtime param.
+            // Flattened `[int]` cells join here from Meta lengths
+            // (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
+            let mut __reds_i: Vec<u8> = vec![#(#reds_i_lit),*];
+            for &__s in __flat_array_identity_slots.iter() {
+                if !__reds_i.contains(&__s) {
+                    __reds_i.push(__s);
+                }
+            }
             __builder.jit_merge_point(
                 __jdindex,
                 &[#(#greens_i_lit),*],
                 &[#(#greens_r_lit),*],
                 &[#(#greens_f_lit),*],
-                &[#(#reds_i_lit),*],
+                &__reds_i,
                 &[#(#reds_r_lit),*],
                 &[#(#reds_f_lit),*],
             );
@@ -4279,6 +4306,15 @@ pub(crate) fn lower_dispatch_body(
     // committed prefix would leave the prefix in the JitCode and still
     // terminate in `void_return`, so the native suffix -- the prefix included
     // -- would run a second time once the `Finish` breaks the dispatch loop.
+    // Lowering the tail alone when the prefix refuses would emit `int_return`
+    // (`flatten.py GraphFlattener.make_return`) while dropping the prefix from
+    // the JitCode; the Finish drain then returns without running the native
+    // suffix, so prefix side effects vanish on the JIT path.  The native
+    // suffix is the prefix's owner when it cannot be represented.  A
+    // `void_return` Finish still has to write every live red back first
+    // (`pyjitpl.py compile_done_with_this_frame` /
+    // `virtualizable.py write_from_resume_data_partial`), or the suffix reads
+    // the trace-start `state`.
     //
     // A portal whose declared return type has no finish projection lowers no
     // epilogue at all.  The two drains that make a lowered epilogue run once --
@@ -4344,18 +4380,34 @@ pub(crate) fn lower_dispatch_body(
             .floats
             .max(portal_f_regs)
             .max(config.float_identity_end());
+        let int_identity_base = config.int_identity_base() as usize;
+        let plain_int_scalars = config.plain_int_scalar_count() as usize;
         lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
             __builder.ensure_r_regs(#final_r_regs);
-            __builder.ensure_i_regs(#final_i_regs);
+            // Span flattened `[int]` cells the marker lists from Meta
+            // lengths (`typed_array_parts` / `make_three_lists`).
+            let __i_regs = (#final_i_regs as usize).max(
+                #int_identity_base
+                    + #plain_int_scalars
+                    + __flat_array_lens.iter().copied().sum::<usize>(),
+            );
+            __builder.ensure_i_regs(__i_regs as u16);
             __builder.ensure_f_regs(#final_f_regs);
         };
     }
 
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
-    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
-    let liveness_prebuild =
-        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
+    rewrite_live_marker_statements_with_triples_ex(
+        &lowerer.op_metadata,
+        &mut lowerer.statements,
+        true,
+    );
+    let liveness_prebuild = liveness_prebuild_tokens_ex(
+        &lowerer.op_metadata,
+        &lowerer.inline_liveness_prebuild,
+        true,
+    );
     // Slice (audit Issue #5) — surface the dispatch JitCode's
     // (name, IR Type) green / red schemas to the install path so it
     // can populate `JitDriverStaticData::vars` via
@@ -4442,6 +4494,80 @@ mod insn_op_fetch_tests {
         assert!(
             !text.contains("goto_if_not_int_eq"),
             "no opcode binding must emit no dispatch arms:\n{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod suffix_loop_int_return_tests {
+    use super::*;
+
+    fn config() -> LowererConfig {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_type_name = "Machine".to_string();
+        config.env_type_name = "Program".to_string();
+        config.state_scalars.insert("pos".to_string(), 0);
+        config.state_scalars.insert("n".to_string(), 1);
+        config.state_scalars.insert("a".to_string(), 2);
+        config
+    }
+
+    /// An iterator `for` after the portal loop is unlowerable
+    /// (`lower_for_loop` only unrolls a literal range). The prefix stays
+    /// with the native suffix, so the walk must end in `void_return`
+    /// (`pyjitpl.py finishframe` with `result_type == VOID` when the
+    /// epilogue is not in the graph). Lowering the tail alone would drop
+    /// the prefix from the JitCode.
+    #[test]
+    fn unlowerable_suffix_loop_emits_void_return() {
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Program) -> i64 {
+                while state.pos < state.n {
+                    jit_merge_point!(driver, program, pc; state);
+                    state.pos = state.pos + 1i64;
+                }
+                for _ in [0].iter() {}
+                state.a
+            }
+        };
+        let generated = lower_dispatch_body(&config(), &func.block, &[], &func.sig.output)
+            .expect("dispatch lowering must produce a body");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("void_return"),
+            "an unlowerable suffix prefix must leave void_return so the \
+             native suffix runs that prefix: {body}"
+        );
+        assert!(
+            !body.contains("int_return"),
+            "lowering only the tail would drop the prefix: {body}"
+        );
+    }
+
+    /// A suffix that is only `return state.a` still follows
+    /// `GraphFlattener.make_return` / `getkind`.
+    #[test]
+    fn lowerable_suffix_still_emits_int_return() {
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Program) -> i64 {
+                while state.pos < state.n {
+                    jit_merge_point!(driver, program, pc; state);
+                    state.pos = state.pos + 1i64;
+                }
+                state.a
+            }
+        };
+        let generated = lower_dispatch_body(&config(), &func.block, &[], &func.sig.output)
+            .expect("dispatch lowering must produce a body");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("int_return"),
+            "a lowerable int tail must emit int_return \
+             (flatten.py GraphFlattener.make_return / getkind): {body}"
+        );
+        assert!(
+            !body.contains("void_return"),
+            "a lowerable int tail must not emit void_return: {body}"
         );
     }
 }

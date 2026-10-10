@@ -21,7 +21,9 @@ use std::sync::Arc;
 pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::aarch64::Aarch64Relocation>;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
-use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
+use majit_backend::{
+    AsmMemoryBlock, AsmMemoryManager, BackendError, JitCellToken, MachineDataBlockWrapper,
+};
 use majit_ir::{
     FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
 };
@@ -34,7 +36,7 @@ use crate::jitframe::{
     JF_GUARD_EXC_OFS,
 };
 use crate::jump::RegallocMoves;
-use crate::regalloc::{RegAlloc, RegAllocOp};
+use crate::regalloc::{RegAlloc, RegAllocOp, park_float_const};
 use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
 
@@ -49,10 +51,13 @@ const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers
 /// repaired later.
 const MIN_RELOCATED_JUMP_TARGET: usize = 4096;
 
-/// Bytes the trace entry frame reserves: the frame-pointer/link pair, the
-/// callee-saved registers the trace body clobbers, and the thread-local base
-/// slot. The prologue, the stack-overflow early return and the epilogue must
-/// all agree on this, or the return unwinds a corrupt SP.
+/// Bytes the trace entry frame reserves. Layout after `_call_header`:
+/// `[sp,#0]` x29/x30, `[sp,#16]` x19/x20 (`r.callee_saved_registers`),
+/// `[sp,#32]` unused 16-byte hole, `[sp,#48]` thread-local base,
+/// `[sp,#56]` unused 8-byte pad. The holes held x21/x22 and d8 when
+/// loops pinned constants; they stay so `SAVED_THREADLOCAL_OFS` and every
+/// unwind keep the same 64-byte SP delta. The prologue, the stack-overflow
+/// early return and the epilogue must all agree on this size.
 const CALL_FRAME_SIZE: u32 = 64;
 
 /// Frame offset of the thread-local base a compiled entry receives in `x1`.
@@ -62,9 +67,9 @@ const CALL_FRAME_SIZE: u32 = 64;
 /// trace can reach `pypy_threadlocal_s` without the caller keeping a register
 /// live across the body. The upstream constant is `3 * WORD` because its frame
 /// reserves eight scratch words below the callee-saved area
-/// (`_call_header`: `STP_rri(..., (i + 8) * WORD)`); this frame packs its three
-/// register pairs from offset 0, so the slot lands above them instead. The
-/// offset differs, the mechanism does not.
+/// (`_call_header`: `STP_rri(..., (i + 8) * WORD)`); this frame packs fp/lr
+/// and `r.callee_saved_registers` from offset 0, so the slot lands above
+/// them instead. The offset differs, the mechanism does not.
 ///
 /// Reads must add any `sub sp, sp, #n` in effect at the read point, the way
 /// `aarch64/callbuilder.py` `write_real_errno` adds `self.current_sp`.
@@ -130,8 +135,7 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             value: i.value,
             is_float: true,
         },
-        // Not produced here: aarch64 keeps float bits in `ImmedFloat`.
-        // The variant exists so an x86 `ConstFloatLoc` still matches.
+        // `ConstFloatLoc` is an absolute address (`is_imm_float()`).
         Loc::ConstFloat(c) => TargetArgLoc::Immed {
             value: c.value as i64,
             is_float: true,
@@ -164,7 +168,10 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
         } => Loc::Frame(crate::regloc::FrameLoc::new(position, ebp_offset, is_float)),
         TargetArgLoc::Immed { value, is_float } => {
             if is_float {
-                Loc::immed_float(value)
+                // Written by `target_argloc_from_loc` for `ConstFloatLoc`.
+                Loc::ConstFloat(crate::regloc::ConstFloatLoc {
+                    value: value as usize,
+                })
             } else {
                 Loc::immed(value)
             }
@@ -256,8 +263,6 @@ pub(crate) fn build_propagate_exception_path(
         ; str x17, [x16]
         ; mov x0, x29
         ; ldp x19, x20, [sp, #16]
-        ; ldp x21, x22, [sp, #32]
-        ; ldr d8, [sp, #56]
         ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
         ; ret
     );
@@ -866,56 +871,10 @@ pub struct AssemblerARM64<'a> {
     /// helpers, indexed `withcards + 2 * withfloats`, with `[4]` the
     /// `for_frame` one.
     wb_slowpath: [usize; 5],
-    /// Back-edge label, bound after `LoopPins`. `ll_loop_code` stays on
-    /// the entry so a bridge executes the pin moves.
-    pending_loop_hot: Option<DynamicLabel>,
-}
-
-/// imm8 for `fmov Dd, #imm`, or `None` when `bits` is outside that set.
-/// `expand(imm8) = sign | (0x3fc or 0x400) | ((imm8 & 0x3f) << 48)`.
-fn fmov64_imm8(bits: u64) -> Option<u8> {
-    if bits & ((1 << 48) - 1) != 0 {
-        return None;
-    }
-    let sign = (bits >> 63) as u8;
-    let top = bits & !((0x3f_u64) << 48) & !(1_u64 << 63);
-    let b = if top == 0x3fc0_0000_0000_0000 {
-        1u8
-    } else if top == 0x4000_0000_0000_0000 {
-        0
-    } else {
-        return None;
-    };
-    let payload = ((bits >> 48) & 0x3f) as u8;
-    Some((sign << 7) | (b << 6) | payload)
-}
-
-/// How many `movz`/`movk` words `codebuilder.py gen_load_int` emits.
-pub(crate) fn imm_mov_count(val: i64) -> u32 {
-    if val < 0 {
-        if val >= -65536 {
-            return 1;
-        }
-        let mut value = (val as u64) >> 16;
-        let mut n = 1u32;
-        let mut shift = 16;
-        while shift < 64 {
-            if (value & 0xFFFF) != 0xFFFF {
-                n += 1;
-            }
-            shift += 16;
-            value >>= 16;
-        }
-        return n;
-    }
-    let mut value = val as u64;
-    let mut n = 1u32;
-    value >>= 16;
-    while value != 0 {
-        n += 1;
-        value >>= 16;
-    }
-    n
+    /// `assembler.py` `datablockwrapper`. Float constants live here
+    /// (`VFPRegisterManager.convert_to_imm` → `ConstFloatLoc`), not in
+    /// the instruction stream.
+    datablockwrapper: MachineDataBlockWrapper,
 }
 
 /// `NOP` (`HINT #0`), the placeholder `_emit_guard` leaves at a
@@ -1016,6 +975,9 @@ pub struct CompiledCode {
     /// `assembler.py process_pending_guards` — the `GUARD_NOT_INVALIDATED`
     /// sites this trace left for `clt.invalidate_positions`.
     pub invalidate_positions: Vec<majit_backend::InvalidatePosition>,
+    /// `MachineDataBlockWrapper.done`: the ranges that hold `ConstFloatLoc`
+    /// bytes. They stay mapped for as long as this code does.
+    pub data_blocks: Vec<AsmMemoryBlock>,
 }
 
 impl CompiledCode {
@@ -1069,6 +1031,7 @@ impl<'a> AssemblerARM64<'a> {
     ) -> Self {
         let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
         let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
+        let datablockwrapper = MachineDataBlockWrapper::new(Arc::clone(&asm_memory_manager));
         AssemblerARM64 {
             mc: Assembler::new(0),
             asm_memory_manager,
@@ -1117,7 +1080,7 @@ impl<'a> AssemblerARM64<'a> {
             gcref_table: Vec::new(),
             malloc_slowpath_fixed,
             wb_slowpath,
-            pending_loop_hot: None,
+            datablockwrapper,
         }
     }
 
@@ -1143,23 +1106,24 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Materialise a float immediate. `+0.0` is `fmov Dd, xzr`. Values in
-    /// the 8-bit fmov-immediate set (`±m/16 * 2^e`) are one `fmov`. Other
-    /// bit patterns use `gen_load_int` into ip0 and `fmov` into the VFP
-    /// register. A PC-relative `ldr` is an imm19 displacement, ±1 MiB, and
-    /// cannot reach a pool placed after the recovery stubs.
-    fn emit_ldr_float_literal(&mut self, dst: u8, bits: u64) {
-        if bits == 0 {
-            dynasm!(self.mc ; .arch aarch64 ; fmov D(dst), xzr);
-            return;
-        }
-        if let Some(imm8) = fmov64_imm8(bits) {
-            let word = 0x1E60_1000 | (u32::from(imm8) << 13) | u32::from(dst);
-            dynasm!(self.mc ; .arch aarch64 ; .u32 word);
-            return;
-        }
-        self.emit_mov_imm64(16, bits as i64);
-        dynasm!(self.mc ; .arch aarch64 ; fmov D(dst), X(16));
+    /// `AssemblerARM64.load` for an `is_imm_float()` value:
+    /// `gen_load_int(r.ip0, adr)` then `LDR_di(loc, r.ip0, 0)`.
+    /// The pool slot was allocated by `VFPRegisterManager.convert_to_imm`.
+    fn load_imm_float(&mut self, loc: u8, value: crate::regloc::ConstFloatLoc) {
+        self.emit_mov_imm64(16, value.value as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr D(loc), [x16]);
+    }
+
+    /// Panics on allocation failure because `load_float_arg_to_d0/d1` (`#[allow(dead_code)]` `genop_float_*`) have no error channel.
+    fn const_float_from_bits(&mut self, bits: u64) -> crate::regloc::ConstFloatLoc {
+        park_float_const(&mut self.datablockwrapper, bits).unwrap_or_else(|err| {
+            panic!("MachineDataBlockWrapper.malloc_aligned failed parking float constant: {err}")
+        })
+    }
+
+    /// Bit pattern stored by `VFPRegisterManager.convert_to_imm`.
+    fn const_float_bits(from: crate::regloc::ConstFloatLoc) -> i64 {
+        unsafe { (from.value as *const i64).read_unaligned() }
     }
 
     /// `compile.py:665` parity: heap-pinned address of `self.cpu`'s
@@ -1685,13 +1649,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
-            // x21/x22 are outside all_regs. A loop parks wide integer
-            // immediates there. The overflow return already reloads this pair.
-            ; stp x21, x22, [sp, #32]
-            // d8 is outside all_vfp_regs. A loop parks one float immediate
-            // there so the body does not reload it. The byte at [sp,#56]
-            // sits above the thread-local slot.
-            ; str d8, [sp, #56]
             // assembler.py:1128-1129: spill the thread-local base the entry
             // received in x1, then take the jitframe out of x0.
             ; str x1, [sp, #SAVED_THREADLOCAL_OFS]
@@ -1742,10 +1699,11 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64
                 ; str x0, [x29, JF_DESCR_OFS as u32]
                 // Overflow fallthrough: return x29 as jf_ptr.
+                // Restore the same set `_call_header` saved and
+                // `_call_footer` / `gen_func_epilog` restore:
+                // `r.callee_saved_registers` (x19, x20) plus fp/lr.
                 ; mov x0, x29
                 ; ldp x19, x20, [sp, #16]
-                ; ldp x21, x22, [sp, #32]
-                ; ldr d8, [sp, #56]
                 ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
                 ; ret
                 ; =>continue_label
@@ -1765,8 +1723,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mov x0, x29
             ; ldp x19, x20, [sp, #16]   // restore callee-saved regs
-            ; ldp x21, x22, [sp, #32]
-            ; ldr d8, [sp, #56]
             ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
             ; ret
         );
@@ -2181,6 +2137,9 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
         self.check_guard_reach()?;
+        // `materialize_loop` calls `datablockwrapper.done()` before the
+        // code block is copied out. The constants are not in that stream.
+        let data_blocks = self.datablockwrapper.done();
 
         // assembler.py:556 materialize_loop — finalize to executable memory
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
@@ -2224,6 +2183,7 @@ impl<'a> AssemblerARM64<'a> {
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             source_guard: None,
             invalidate_positions,
+            data_blocks,
         })
     }
 
@@ -2323,6 +2283,7 @@ impl<'a> AssemblerARM64<'a> {
         self.check_unrelocated_jump_target()?;
         let stub_offsets = self.write_pending_failure_recoveries();
         self.check_guard_reach()?;
+        let data_blocks = self.datablockwrapper.done();
 
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
@@ -2382,6 +2343,7 @@ impl<'a> AssemblerARM64<'a> {
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             source_guard: Some((fail_descr.trace_id(), fail_descr.fail_index_per_trace())),
             invalidate_positions,
+            data_blocks,
         })
     }
 
@@ -2446,6 +2408,10 @@ impl<'a> AssemblerARM64<'a> {
             let gcmap = ra.get_gcmap(&[], false);
             self.emit_check_frame_depth(gcmap);
         }
+        // `VFPRegisterManager.assembler.datablockwrapper`. `prepare_*`
+        // rebuilds `xrm`, and `emit_check_frame_depth` borrows this assembler,
+        // so the pointer is installed immediately before the walk.
+        ra.xrm.set_datablockwrapper(&mut self.datablockwrapper);
         // assembler.py:374 walk_operations — get allocation decisions.
         let ra_ops = ra.walk_operations()?;
         self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
@@ -2493,22 +2459,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Emit code from regalloc decisions ──
         for ra_op in &ra_ops {
-            if let RegAllocOp::LoopPins { moves } = ra_op {
-                for (src, dst) in moves {
-                    self.regalloc_mov(src, dst);
-                }
-                if let Some(hot) = self.pending_loop_hot.take() {
-                    dynasm!(self.mc ; =>hot);
-                }
-                continue;
-            }
-            if let Some(hot) = self.pending_loop_hot.take() {
-                dynasm!(self.mc ; =>hot);
-            }
             match ra_op {
-                RegAllocOp::LoopPins { .. } => {
-                    continue;
-                }
                 RegAllocOp::Skip => {
                     // Dead operation — skip.
                     continue;
@@ -3465,6 +3416,10 @@ impl<'a> AssemblerARM64<'a> {
                         self.emit_mov_imm64(16, i.value);
                         crate::regloc::RegLoc::new(16, false)
                     }
+                    Loc::ConstFloat(c) => {
+                        self.load_imm_float(14, *c);
+                        crate::regloc::RegLoc::new(14, true)
+                    }
                     other => {
                         panic!("GcStore value_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
                     }
@@ -3554,6 +3509,10 @@ impl<'a> AssemblerARM64<'a> {
                         Loc::Immed(i) | Loc::ImmedFloat(i) => {
                             self.emit_mov_imm64(17, i.value);
                             crate::regloc::RegLoc::new(17, false)
+                        }
+                        Loc::ConstFloat(c) => {
+                            self.load_imm_float(14, *c);
+                            crate::regloc::RegLoc::new(14, true)
                         }
                         _ => crate::regloc::RegLoc::new(17, false),
                     };
@@ -3758,8 +3717,6 @@ impl<'a> AssemblerARM64<'a> {
                     );
                 }
                 dynasm!(self.mc ; =>label);
-                let hot = self.mc.new_dynamic_label();
-                self.pending_loop_hot = Some(hot);
                 if let Some(descr) = label_descr {
                     let stored_arglocs = arglocs
                         .iter()
@@ -3775,7 +3732,7 @@ impl<'a> AssemblerARM64<'a> {
                     descr.set_target_arglocs(stored_arglocs);
                     descr.set_ll_loop_code(self.mc.offset().0);
                     if let Some(id) = loop_target_id(op) {
-                        self.target_tokens_currently_compiling.insert(id, hot);
+                        self.target_tokens_currently_compiling.insert(id, label);
                     }
                     if let Some(descr_ref) = op.getdescr() {
                         self.compiled_target_tokens.push(descr_ref.clone());
@@ -5091,6 +5048,12 @@ impl<'a> AssemblerARM64<'a> {
                     const_stores.push((slot, i.value));
                     slot as u16
                 }
+                Some(Loc::ConstFloat(c)) => {
+                    let slot = self.frame_depth;
+                    self.frame_depth += 1;
+                    const_stores.push((slot, Self::const_float_bits(*c)));
+                    slot as u16
+                }
                 Some(loc) => deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
             })
             .collect();
@@ -6119,11 +6082,8 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp_d(0, offset);
             }
             ResolvedArg::Const(val) => {
-                // Load constant via integer register, then move to float register.
-                self.emit_mov_imm64(0, val);
-                dynasm!(self.mc ; .arch aarch64
-                    ; fmov d0, x0
-                );
+                let c = self.const_float_from_bits(val as u64);
+                self.load_imm_float(0, c);
             }
         }
     }
@@ -6136,10 +6096,8 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp_d(1, offset);
             }
             ResolvedArg::Const(val) => {
-                self.emit_mov_imm64(1, val);
-                dynasm!(self.mc ; .arch aarch64
-                    ; fmov d1, x1
-                );
+                let c = self.const_float_from_bits(val as u64);
+                self.load_imm_float(1, c);
             }
         }
     }
@@ -6349,7 +6307,7 @@ impl<'a> AssemblerARM64<'a> {
         let mut non_float_dst: Vec<Loc> = Vec::new();
         let mut float_src: Vec<Loc> = Vec::new();
         let mut float_dst: Vec<Loc> = Vec::new();
-        let mut immed_args: Vec<(u8, i64, bool)> = Vec::new(); // (abi_idx, value, is_float)
+        let mut immed_args: Vec<(u8, i64)> = Vec::new(); // (abi_idx, value)
         let mut stack_args: Vec<Loc> = Vec::new();
         let mut next_core = 0u8;
         let mut next_float = 0u8;
@@ -6409,10 +6367,21 @@ impl<'a> AssemblerARM64<'a> {
                     non_float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, false)));
                 }
                 Loc::Immed(im) => {
-                    immed_args.push((abi_idx, im.value, false));
+                    immed_args.push((abi_idx, im.value));
                 }
-                Loc::ImmedFloat(im) => {
-                    immed_args.push((abi_idx, im.value, true));
+                Loc::ImmedFloat(_) => {
+                    // An aarch64 walk installs the data block on `xrm`, so
+                    // `VFPRegisterManager.convert_to_imm` yields `ConstFloatLoc`
+                    // and remaps above. `ImmedFloat` is the no-wrapper arm;
+                    // no aarch64 walk produces it as a call argument.
+                    panic!(
+                        "call argument {abi_idx} is ImmedFloat; aarch64 walk \
+                         float constants are ConstFloatLoc"
+                    );
+                }
+                Loc::ConstFloat(_) => {
+                    float_src.push(arg);
+                    float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, true)));
                 }
                 // See the x86 twin: Reg/Frame/Immed is the whole range the
                 // regalloc produces, and silently skipping anything else
@@ -6448,6 +6417,10 @@ impl<'a> AssemblerARM64<'a> {
                         self.emit_mov_imm64(16, im.value);
                         dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
                     }
+                    Loc::ConstFloat(c) => {
+                        self.load_imm_float(15, c);
+                        dynasm!(self.mc ; .arch aarch64 ; str d15, [sp, offset]);
+                    }
                     other => panic!("unsupported AArch64 stack call argument {other:?}"),
                 }
             }
@@ -6481,13 +6454,11 @@ impl<'a> AssemblerARM64<'a> {
         crate::jump::remap_frame_layout(self, &non_float_src, &non_float_dst, tmp_nf);
         crate::jump::remap_frame_layout(self, &float_src, &float_dst, tmp_fp);
 
-        // Immediate args after remap (each targets a distinct ABI reg).
-        for (abi_idx, val, is_float) in immed_args {
-            if is_float {
-                self.emit_ldr_float_literal(abi_idx, val as u64);
-            } else {
-                self.emit_mov_imm64(abi_idx as u32, val);
-            }
+        // Immediate args after remap (each targets a distinct ABI GPR).
+        // A float constant from `VFPRegisterManager.convert_to_imm` is
+        // `Loc::ConstFloat` and remaps above (`AssemblerARM64.load`).
+        for (abi_idx, val) in immed_args {
+            self.emit_mov_imm64(abi_idx as u32, val);
         }
 
         // llsupport/callbuilder.py `emit_call_release_gil`:
@@ -8207,6 +8178,99 @@ mod tests {
     };
 
     use crate::runner::DynasmBackend;
+    use dynasmrt::{DynasmApi, dynasm};
+
+    /// Encode a 32-bit aarch64 instruction with the same dynasm path the
+    /// prologue uses, so a search through the compiled buffer matches the
+    /// word `_call_header` would have emitted.
+    fn aarch64_insn_bytes(emit: impl FnOnce(&mut super::Assembler)) -> [u8; 4] {
+        let mut mc = super::Assembler::new(0);
+        emit(&mut mc);
+        let buf = mc.finalize().unwrap();
+        assert_eq!(buf.len(), 4, "expected a single 32-bit instruction");
+        [buf[0], buf[1], buf[2], buf[3]]
+    }
+
+    /// `_call_header` saves fp/lr and `r.callee_saved_registers` (x19, x20).
+    /// The overflow fallthrough and `_call_footer` must restore that same
+    /// set (`gen_func_epilog`). Reloading x21/x22 or d8 from slots the
+    /// prologue no longer writes would return to native code with those
+    /// callee-saved registers overwritten.
+    #[test]
+    fn call_header_overflow_return_restores_only_saved_callee_regs() {
+        static STACK_END: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static STACK_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        extern "C" fn dummy_slowpath(_sp: usize) -> u8 {
+            0
+        }
+        crate::register_stack_check_addresses(
+            &STACK_END as *const AtomicUsize as usize,
+            &STACK_LEN as *const AtomicUsize as usize,
+            dummy_slowpath as *const () as usize,
+        );
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(0));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+        let token = JitCellToken::new(530);
+        backend
+            .compile_loop(&[], &[OpRc::new(finish)], &token)
+            .expect("compile a loop whose prologue includes the stack check");
+
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled code")
+            .downcast_ref::<super::CompiledCode>()
+            .expect("dynasm compiled code");
+        let code = unsafe {
+            std::slice::from_raw_parts(
+                compiled.buffer.ptr(dynasmrt::AssemblyOffset(0)),
+                compiled.buffer.len(),
+            )
+        };
+
+        let restore_x19_x20 = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldp x19, x20, [sp, #16]);
+        });
+        let restore_fp_lr = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldp x29, x30, [sp], super::CALL_FRAME_SIZE as i32);
+        });
+        let forbidden_x21_x22 = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldp x21, x22, [sp, #32]);
+        });
+        let forbidden_d8 = aarch64_insn_bytes(|mc| {
+            dynasm!(mc ; .arch aarch64 ; ldr d8, [sp, #56]);
+        });
+
+        assert!(
+            code.windows(4).any(|w| w == restore_x19_x20),
+            "overflow return / epilogue must restore x19/x20"
+        );
+        assert!(
+            code.windows(4).any(|w| w == restore_fp_lr),
+            "overflow return / epilogue must restore fp/lr with CALL_FRAME_SIZE"
+        );
+        assert!(
+            !code.windows(4).any(|w| w == forbidden_x21_x22),
+            "must not LDP x21, x22 from a slot _call_header no longer writes"
+        );
+        assert!(
+            !code.windows(4).any(|w| w == forbidden_d8),
+            "must not LDR d8 from a slot _call_header no longer writes"
+        );
+
+        let mut restore_pair = [0u8; 8];
+        restore_pair[..4].copy_from_slice(&restore_x19_x20);
+        restore_pair[4..].copy_from_slice(&restore_fp_lr);
+        assert!(
+            code.windows(8).any(|w| w == restore_pair),
+            "each x19/x20 restore must be followed by the fp/lr pop, matching _call_footer"
+        );
+    }
 
     /// aarch64/regalloc.py prepare_op_call_malloc_nursery keeps CALL_MALLOC_NURSERY's result in x0;
     /// only FrameManager may decide to spill it later.  The old hybrid emitter
@@ -8244,6 +8308,64 @@ mod tests {
             super::JITFRAME_FIXED_SIZE,
             "a register-resident nursery result must not allocate a shadow frame slot",
         );
+    }
+
+    /// `VFPRegisterManager.convert_to_imm` parks the bits in the machine
+    /// data block (`ConstFloatLoc`) and `AssemblerARM64.load` does
+    /// `gen_load_int(ip0, adr)` then `LDR_di`. The eight bytes of the
+    /// constant are not in the instruction stream.
+    #[test]
+    fn float_constant_loads_from_literal_pool() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let inputargs = vec![InputArg::new_float_rc(0)];
+        let add = OpRc::new(Op::new(
+            OpCode::FloatAdd,
+            &[
+                bound_operand_from_opref(OpRef::input_arg_float(0)),
+                Operand::from_opref(OpRef::const_float(1.5)),
+            ],
+        ));
+        add.pos().set(OpRef::float_op(1));
+        let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&add)]);
+        finish.pos().set(OpRef::void_op(2));
+        finish.set_fail_arg_types(vec![Type::Float]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(522);
+        backend
+            .compile_loop(&inputargs, &[add, OpRc::new(finish)], &token)
+            .expect("compile float-add constant");
+
+        let frame = backend.execute_token(&token, &[Value::Float(2.0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(
+            backend.get_float_value(&frame, 0).to_bits(),
+            3.5f64.to_bits()
+        );
+
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled code")
+            .downcast_ref::<super::CompiledCode>()
+            .expect("dynasm compiled code");
+        let code = unsafe {
+            std::slice::from_raw_parts(
+                compiled.buffer.ptr(dynasmrt::AssemblyOffset(0)),
+                compiled.buffer.len(),
+            )
+        };
+        let bits = 1.5f64.to_le_bytes();
+        assert!(
+            !code.windows(8).any(|window| window == bits),
+            "float bits must not sit in the code stream"
+        );
+        let parked = compiled.data_blocks.iter().any(|block| {
+            let bytes = unsafe { std::slice::from_raw_parts(block.ptr(), block.len()) };
+            bytes.windows(8).any(|window| window == bits)
+        });
+        assert!(parked, "float bits must live in the machine data block");
     }
 
     fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (OpRc, OpRc, OpRc) {
@@ -8687,8 +8809,13 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_ldr_fp(d.value, ofs);
                 }
             }
-            (Loc::ImmedFloat(i), Loc::Reg(d)) if d.is_xmm => {
-                self.emit_ldr_float_literal(d.value, i.value as u64);
+            (Loc::ConstFloat(c), Loc::Reg(d)) if d.is_xmm => {
+                self.load_imm_float(d.value, *c);
+            }
+            (Loc::ConstFloat(c), ebp_loc_pat!(e)) => {
+                // `_mov_imm_float_to_loc`: load into `vfp_ip` (d15) then store.
+                self.load_imm_float(15, *c);
+                self.emit_str_fp_d(15, e.value);
             }
             (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) => {
                 if d.is_xmm {

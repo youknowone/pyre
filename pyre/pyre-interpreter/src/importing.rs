@@ -163,11 +163,11 @@ pub trait SourceProvider: Send + Sync {
     fn cwd(&self) -> Option<Vec<u8>> {
         None
     }
-    /// Whether a marshalcache hit may skip `read_to_bytes`.
+    /// Whether the frozen marshal cache may be used for this provider.
     ///
-    /// Only the host filesystem provider answers true: its mtime/size
-    /// match the bytes it would read.  A custom provider can serve
-    /// different content at the same path, so the cache stays off.
+    /// Only the host filesystem provider answers true: the cache file lives
+    /// next to the stdlib sources that provider reads. A custom provider can
+    /// serve different content at the same path, so the cache stays off.
     fn frozen_marshal_cache_ok(&self) -> bool {
         false
     }
@@ -192,7 +192,7 @@ pub fn install_source_provider(provider: Arc<dyn SourceProvider>) {
 /// path. PyPy owns this provider through its shared object space, not through
 /// an execution context or OS thread.
 #[cfg(feature = "host_env")]
-fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
+pub(crate) fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
     let provider = {
         let mut slot = SOURCE_PROVIDER.lock();
         slot.get_or_insert_with(default_source_provider).clone()
@@ -4820,14 +4820,14 @@ fn load_source_module(
     // The two importlib bootstrap sources and `zipimport` are imported by the
     // native importer before `SourceFileLoader` exists, so they never reach the
     // `.pyc` cache and otherwise recompile on every startup.
-    // `_frozen_importlib._cached_compile` (which `zipimport`'s moduledef also
-    // goes through): reload a marshalled code object when this binary and the
-    // source file's mtime and size match, recompiling only on a miss. A hit
-    // does not read the source. PyPy's frozen image does not either.
+    // `Module._cached_compile` (which `zipimport`'s moduledef also goes
+    // through): reload a marshalled, source-validated code object when the
+    // cache holds one for this binary, recompiling only on a miss.
     // Startup loads the bootstrap sources under their frozen names; a source
     // copy still loads the public submodule names. Both share one cache entry.
-    // `zipimport` stays keyed by its own name.  A hit stats mtime/size and
-    // skips reading the source bytes.
+    // `zipimport` stays keyed by its own name.  A hit still reads the source
+    // so `Module._cached_compile` can compare it with the bytes stored in the
+    // cache (`previous != source + '\x00'`).
     let cache_key = match modulename {
         "_frozen_importlib" | "importlib._bootstrap" => Some("importlib._bootstrap"),
         "_frozen_importlib_external" | "importlib._bootstrap_external" => {
@@ -4837,41 +4837,7 @@ fn load_source_module(
         _ => None,
     };
     let cache_ok = with_source_provider(|p| p.frozen_marshal_cache_ok());
-    let store_meta = if cache_ok {
-        crate::module::imp::interp_imp::source_mtime_size(pathname)
-    } else {
-        None
-    };
-    // `_bootstrap_external._validate_timestamp_pyc` / `check_compiled_module`:
-    // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path
-    // and `__cached__` is the `.pyc` (`importing.py` `exec_code_module`).
-    #[cfg(not(feature = "sandbox"))]
-    let mut timestamp_cpathname: Option<rustpython_wtf8::Wtf8Buf> = None;
-    #[cfg(not(feature = "sandbox"))]
-    let cached = if cache_ok {
-        let frozen = cache_key
-            .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname));
-        match frozen {
-            Some(code) => Some(code),
-            None => crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?.map(
-                |(code, cpathname)| {
-                    // `space.newfilename(cpathname)`: filesystem-decoded like
-                    // `pathname`, so undecodable bytes round-trip.
-                    timestamp_cpathname = Some(crate::gateway::fsdecode_filename_wtf8(
-                        &crate::gateway::fsencode_os_str(cpathname.as_os_str()),
-                    ));
-                    code
-                },
-            ),
-        }
-    } else {
-        None
-    };
-    #[cfg(feature = "sandbox")]
-    let cached: Option<PyObjectRef> = None;
-    let (w_code, store) = if let Some(w_code) = cached {
-        (w_code, false)
-    } else {
+    let read_decoded_source = || -> Result<String, crate::PyError> {
         let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
             let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
             message.push_wtf8(&path_text);
@@ -4885,35 +4851,83 @@ fn load_source_module(
         // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
         // observable while its command-line file path retains PyPy's located
         // tokenizer boundary through `decode_file_source_bytes`.
-        let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
-        let code = parse_source_module(&path_text, &source).map_err(|error| match error {
+        crate::compile::decode_source_bytes(&bytes, &path_text, false)
+    };
+    let parse_decoded_source = |source: &str| -> Result<PyObjectRef, crate::PyError> {
+        let code = parse_source_module(&path_text, source).map_err(|error| match error {
             crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
+                crate::compile_err_to_syntax_error(error, source, Mode::Exec)
             }
             crate::syntax_warnings::SourceCompileError::Warning(error) => error,
         })?;
-        (
-            crate::box_code_object(code),
-            cache_key.is_some() && cache_ok,
-        )
+        Ok(crate::box_code_object(code))
     };
+    // `_bootstrap_external._validate_timestamp_pyc` / `check_compiled_module`:
+    // a timestamp `.pyc` hit skips the parse; `__file__` stays the source path
+    // and `__cached__` is the `.pyc` (`importing.py` `exec_code_module`).
+    #[cfg(not(feature = "sandbox"))]
+    let mut timestamp_cpathname: Option<rustpython_wtf8::Wtf8Buf> = None;
+    let mut source = String::new();
+    // `gctransform` (`framework.py` + `shadowstack.py` `gc_push_roots`)
+    // keeps `code_w` in a shadow-stack root across `space.newfilename` and
+    // `update_code_filenames` (`importing.py` `load_source_module`). Open
+    // the bracket before the compile-or-cache branch so each arm can pin
+    // the code object as soon as it exists; a timestamp `.pyc` hit has to
+    // hold it across the allocating `newfilename` decode.
     let roots = pyre_object::gc_roots::push_roots();
-    // Root before `update_code_filenames` / later allocations can collect.
-    // `set_compilation_unit_filename_bytes` walks nested codes and may
-    // allocate; the pin is the shadow-stack livevar `gctransform` keeps
-    // across `importing.py update_code_filenames`.
     let code_slot = roots.base();
-    let _ = roots.pin_root(w_code);
+    let store = if cache_ok && let Some(key) = cache_key {
+        source = read_decoded_source()?;
+        match crate::module::imp::interp_imp::frozen_cache_load(key, source.as_bytes()) {
+            Some(w_code) => {
+                let _ = roots.pin_root(w_code);
+                false
+            }
+            None => {
+                let _ = roots.pin_root(parse_decoded_source(&source)?);
+                true
+            }
+        }
+    } else {
+        #[cfg(not(feature = "sandbox"))]
+        {
+            if cache_ok
+                && let Some((code, cpathname)) =
+                    crate::module::imp::interp_imp::try_load_timestamp_pyc(pathname)?
+            {
+                // Pin before `space.newfilename(cpathname)`: filesystem-decoded
+                // like `pathname`, so undecodable bytes round-trip, and the
+                // decode can collect.
+                let _ = roots.pin_root(code);
+                timestamp_cpathname = Some(crate::gateway::fsdecode_filename_wtf8(
+                    &crate::gateway::fsencode_os_str(cpathname.as_os_str()),
+                ));
+                false
+            } else {
+                source = read_decoded_source()?;
+                let _ = roots.pin_root(parse_decoded_source(&source)?);
+                false
+            }
+        }
+        #[cfg(feature = "sandbox")]
+        {
+            source = read_decoded_source()?;
+            let _ = roots.pin_root(parse_decoded_source(&source)?);
+            false
+        }
+    };
     // The whole unit was named by this path, so recurse through the eager
     // nested PyCode constants like PyPy `update_code_filenames`.
+    // `set_compilation_unit_filename_bytes` walks nested codes and may
+    // allocate; read the code object back from the slot `gctransform`
+    // keeps live across that call.
     unsafe {
         crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
     };
-    if let (true, Some(key), Some((source_mtime, source_size))) = (store, cache_key, store_meta) {
+    if let (true, Some(key)) = (store, cache_key) {
         crate::module::imp::interp_imp::frozen_cache_store(
             key,
-            source_mtime,
-            source_size,
+            source.as_bytes(),
             roots.get(code_slot),
         );
     }

@@ -101,10 +101,10 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     // still 1 here, no consumer has cloned yet — using
     // `pyre_interpreter::jit_trace_fnaddrs()`'s runtime values.
     crate::runtime_fnaddr_patch::patch_constants_i_fnaddrs(std::slice::from_mut(&mut jitcode));
-    // The codewriter also baked stale build-time host-static *data* addresses
-    // (`PyType` singletons + prebuilt refs from `HostStaticAddrs`) into
-    // `constants_i` — e.g. `is_int`'s `&INT_TYPE` inlined into `w_list_append`.
-    // Re-pair them with the runtime addresses while refcount is still 1.
+    // Host-static *data* addresses the assembler tagged on `reloc_consts_i`
+    // (`ConstIRelocKind::StaticAddr`; exception-class llexitcase) and
+    // `reloc_consts_r` (prebuilt `HostStaticAddrs.refs`). Re-pair those
+    // with the runtime addresses while refcount is still 1.
     crate::runtime_fnaddr_patch::patch_static_addr_constants(std::slice::from_mut(&mut jitcode));
     // Deferred prebuilt-string constants the codewriter could not allocate
     // at build time (separate process) carry a non-canonical sentinel in

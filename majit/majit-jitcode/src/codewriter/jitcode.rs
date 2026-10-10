@@ -129,6 +129,49 @@ pub struct TypeStaticConstDescriptor {
     pub name: String,
 }
 
+/// Why one `constants_i` slot is a relocatable address rather than an
+/// ordinary integer.
+///
+/// `assembler.py Assembler.emit_const` stores the constant object itself.
+/// A function address is `llmemory.AddressAsInt` / an `lltype` function
+/// pointer; a host static consumed as `Signed` is `heaptracker.adr2int`
+/// of that prebuilt. Provenance travels with the constant, never inferred
+/// from its bits. The integer in the slot is the build-process address
+/// (or a `symbolic_fnaddr_for_path` hash); the runtime patcher rewrites
+/// only slots named here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ConstIRelocKind {
+    /// Residual / direct funcptr (`jtransform.py handle_residual_call` /
+    /// `direct_funcptr_value`). `path` is the `jit_trace_fnaddrs` key
+    /// the codewriter bound (`assembler.py emit_const` carrying the
+    /// symbolic object). `symbolic` is true when no build address
+    /// existed and the slot stores a `symbolic_fnaddr_for_path` hash;
+    /// the runtime reads this flag instead of testing the integer bits.
+    FnAddr { path: String, symbolic: bool },
+    /// Host static consumed as an integer (`HostStaticAddrs.pytypes` /
+    /// exception-class llexitcase). `name` is the shared binding name.
+    StaticAddr { name: String },
+}
+
+/// One relocatable `constants_i` slot. Parallel to
+/// [`TypeStaticConstDescriptor`] for the int bank: the descriptor owns
+/// the slot named by `constants_i_index`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ConstIRelocDescriptor {
+    pub constants_i_index: usize,
+    pub kind: ConstIRelocKind,
+}
+
+/// One relocatable `constants_r` slot. Parallel to
+/// [`ConstIRelocDescriptor`] for the ref bank: the descriptor owns
+/// the slot named by `constants_r_index`. Host-static refs
+/// (`HostStaticAddrs.refs`) use [`ConstIRelocKind::StaticAddr`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ConstRRelocDescriptor {
+    pub constants_r_index: usize,
+    pub kind: ConstIRelocKind,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -272,6 +315,18 @@ pub struct JitCodeBody {
     /// Default empty.
     #[serde(default)]
     pub type_static_consts: Vec<TypeStaticConstDescriptor>,
+    /// Relocatable `constants_i` slots. Empty default: ordinary integer
+    /// constants carry no descriptor, matching `assembler.py emit_const`
+    /// storing a plain `int` rather than a symbolic.
+    #[serde(default)]
+    pub reloc_consts_i: Vec<ConstIRelocDescriptor>,
+    /// Relocatable `constants_r` slots. Empty default: ordinary GCREF
+    /// constants and deferred sentinels (`str_consts`, `type_static_consts`)
+    /// carry no descriptor. Host-static refs the assembler wrote as
+    /// addresses (`assembler.py emit_const` of a prebuilt GCREF) are
+    /// named here so the runtime rewrites them by provenance.
+    #[serde(default)]
+    pub reloc_consts_r: Vec<ConstRRelocDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not
@@ -343,6 +398,9 @@ impl std::fmt::Debug for JitCodeBody {
             .field("str_consts", &self.str_consts)
             .field("unit_variant_consts", &self.unit_variant_consts)
             .field("exc_instance_consts", &self.exc_instance_consts)
+            .field("type_static_consts", &self.type_static_consts)
+            .field("reloc_consts_i", &self.reloc_consts_i)
+            .field("reloc_consts_r", &self.reloc_consts_r)
             .field("c_num_regs_i", &self.c_num_regs_i)
             .field("c_num_regs_r", &self.c_num_regs_r)
             .field("c_num_regs_f", &self.c_num_regs_f)
@@ -365,6 +423,13 @@ pub struct JitCode {
     /// `all_jitcodes[jitcode.index]`.
     #[serde(default)]
     pub fnaddr: i64,
+    /// Provenance of [`Self::fnaddr`]. Same `{ path, symbolic }` pair
+    /// [`ConstIRelocKind::FnAddr`] records for a `constants_i` slot,
+    /// written in `CallControl::get_jitcode` at the `function_fnaddrs`
+    /// hit vs `symbolic_fnaddr_for_path` mint. `None` on shells that
+    /// never went through that constructor (`JitCode::new`).
+    #[serde(default)]
+    pub fnaddr_reloc: Option<ConstIRelocKind>,
     /// RPython `jitcode.py` `self.jitdriver_sd = None`. `Some(index)`
     /// for portal jitcodes (set by `grab_initial_jitcodes` /
     /// `drain_pending_graphs`). `OnceLock` allows the late single-set
@@ -517,6 +582,7 @@ impl JitCode {
         Self {
             name: name.into(),
             fnaddr: 0,
+            fnaddr_reloc: None,
             jitdriver_sd: OnceLock::new(),
             index: OnceLock::new(),
             _called_from: None,
@@ -972,6 +1038,7 @@ impl Clone for JitCode {
         Self {
             name: self.name.clone(),
             fnaddr: self.fnaddr,
+            fnaddr_reloc: self.fnaddr_reloc.clone(),
             jitdriver_sd: self.jitdriver_sd.clone(),
             index: self.index.clone(),
             _called_from: self._called_from.clone(),

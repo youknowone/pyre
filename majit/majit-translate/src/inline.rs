@@ -631,6 +631,15 @@ pub(crate) fn remap_op_kind(
             class_root: class_root.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
+        OpKind::ConstFnAddr {
+            value,
+            path,
+            symbolic,
+        } => OpKind::ConstFnAddr {
+            value: *value,
+            path: path.clone(),
+            symbolic: *symbolic,
+        },
         OpKind::RawLoad {
             base,
             offset,
@@ -1186,6 +1195,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         } => vec![clone_var(base), clone_var(offset), clone_var(value)],
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstSingleFloat(_)
@@ -1483,6 +1493,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // dependency-routing classification.
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstSingleFloat(_)

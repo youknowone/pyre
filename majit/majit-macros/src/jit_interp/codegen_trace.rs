@@ -9,15 +9,18 @@ use super::JitInterpConfig;
 use super::StateFieldKind;
 use super::classify::classify_arms;
 use super::jitcode_lower::{
-    self, LowererConfig, ValueKind, is_can_enter_jit_macro, is_jit_merge_point_macro,
+    self, FLAT_INT_ARRAY_IDENTITY_RESERVE, LowererConfig, ValueKind, is_can_enter_jit_macro,
+    is_jit_merge_point_macro,
 };
 
 /// `pyjitpl.py MetaInterp.initialize_state_from_start` →
 /// `MIFrame.setup_call(original_boxes)`: after greens, the dispatch
 /// JitCode's remaining arguments are the plain reds (int scalars,
-/// flattened `[int]` cells, ref scalars, float scalars). Vable-field
-/// scalars stay in `initialize_virtualizable` / `virtualizable_boxes`
-/// and are not pushed here.
+/// flattened `[int]` cells, ref scalars, float scalars). Virt-array
+/// states still plant those `[int]` cells — they are marker reds
+/// (`handle_jit_marker__jit_merge_point` / `make_three_lists`).
+/// Vable-field scalars stay in `initialize_virtualizable` /
+/// `virtualizable_boxes` and are not pushed here.
 fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
     let Some(sf) = config.state_fields.as_ref() else {
         return quote! {};
@@ -151,9 +154,15 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let fn_name = &func.sig.ident;
     let trace_fn_name = format_ident!("__trace_{}", fn_name);
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
+    let prebuild_fn_name_with_lens =
+        format_ident!("__prebuild_jitcode_liveness_{}_with_array_lens", fn_name);
     let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", fn_name);
+    let dispatch_jitcode_fn_name_with_lens =
+        format_ident!("__dispatch_jitcode_{}_with_array_lens", fn_name);
     let dispatch_jitcode_name = fn_name.to_string();
     let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", fn_name);
+    let declare_schema_fn_name_with_lens =
+        format_ident!("__declare_jit_schema_{}_with_array_lens", fn_name);
     // Must match `codegen_state.rs`'s spelling: the symbolic-state struct is one
     // module-level item shared by both emitters, suffixed so two machines can
     // live in one module.
@@ -289,6 +298,47 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         .collect();
     let dispatch_red_schema_types: Vec<&proc_macro2::TokenStream> =
         dispatch_red_schema.iter().map(|(_, t)| t).collect();
+    let flat_int_identity_base = dispatch_lowerer_config.int_identity_base() as usize;
+    let flat_plain_int_scalars = dispatch_lowerer_config.plain_int_scalar_count() as usize;
+    let flat_int_array_identity_reserve = FLAT_INT_ARRAY_IDENTITY_RESERVE as usize;
+    let state_array_count = dispatch_lowerer_config.state_arrays.len();
+    let (identity_i_scalars, identity_r_scalars, identity_f_scalars) =
+        dispatch_lowerer_config.identity_scalar_red_kind_counts();
+    // True iff Meta's `[int]` lengths fit the prefix `split_identity_reg_ends`
+    // pinned for `alloc_reg`, and every listed cell encodes as a `u8`.
+    // `assembler.py` `emit_const` refuses `val` outside `0..256`; the
+    // codewriter's regalloc has already assigned every red a register.
+    // Lowering is fixed at proc-macro time, so a runtime layout that does
+    // not fit cannot be encoded — the builders return `None` / no-op.
+    let flat_array_identity_ok_pred = quote! {
+        let __flat_array_identity_ok = {
+            let __sum: usize = __flat_array_lens.iter().copied().sum();
+            __sum <= #state_array_count * #flat_int_array_identity_reserve
+                && (0..__sum).all(|__i| {
+                    u8::try_from(#flat_int_identity_base + #flat_plain_int_scalars + __i).is_ok()
+                })
+        };
+    };
+    let build_flat_array_identity_slots = quote! {
+        #flat_array_identity_ok_pred
+        let __flat_array_identity_slots: Vec<u8> = if __flat_array_identity_ok {
+            let mut __slots = Vec::new();
+            let mut __off = #flat_int_identity_base + #flat_plain_int_scalars;
+            for &__len in __flat_array_lens {
+                for __i in 0..__len {
+                    __slots.push(
+                        u8::try_from(__off + __i).expect(
+                            "flat identity slot fits u8 after the layout predicate",
+                        ),
+                    );
+                }
+                __off += __len;
+            }
+            __slots
+        } else {
+            Vec::new()
+        };
+    };
 
     // Slice X-D production wire-up: the identity `label_at` closure
     // and the `jitcell_token_arc_for_number` resolver are constructed
@@ -541,11 +591,13 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         /// pipeline registers it via `JitDriver::register_dispatch_jitcode`.
         ///
         /// Returns `Option<JitCode>`: `Some(jc)` when `lower_dispatch_body`
-        /// succeeded at proc-macro time, `None` when the body shape was
-        /// rejected (e.g. unrecognised inner control flow).  PyPy's
-        /// `make_jitcodes()` / `pyjitpl.py finish_setup()` only
-        /// install completed jitcodes — there is no "empty body installed
-        /// as success" path.  The install pipeline at
+        /// succeeded at proc-macro time and the runtime `[int]` layout
+        /// fits the pinned identity prefix, `None` when the body shape
+        /// was rejected (e.g. unrecognised inner control flow) or the
+        /// Meta lengths overflow that prefix / a cell slot does not fit
+        /// a `u8`.  PyPy's `make_jitcodes()` / `pyjitpl.py finish_setup()`
+        /// only install completed jitcodes — there is no "empty body
+        /// installed as success" path.  The install pipeline at
         /// `codegen_state.rs` `if let Some(jc) = ... { register }`
         /// matches that lifecycle by skipping `register_dispatch_jitcode`
         /// when this returns `None`.
@@ -556,10 +608,26 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             // jtransform.py:1704 portal_jd.index threaded as runtime param.
             __jdindex: i64,
         ) -> Option<majit_metainterp::JitCode> {
+            #dispatch_jitcode_fn_name_with_lens(__asm, __jdindex, &[])
+        }
+
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        fn #dispatch_jitcode_fn_name_with_lens(
+            __asm: &mut majit_metainterp::Assembler,
+            __jdindex: i64,
+            __flat_array_lens: &[usize],
+        ) -> Option<majit_metainterp::JitCode> {
             if !#dispatch_lower_ok {
                 // `lower_dispatch_body` rejected the body at proc-macro
                 // time; surface as None so the install pipeline skips
                 // `register_dispatch_jitcode` per PyPy parity.
+                return None;
+            }
+            #build_flat_array_identity_slots
+            if !__flat_array_identity_ok {
+                // Runtime `[int]` lengths do not fit the pinned identity
+                // prefix / a cell slot does not encode as `u8`. Same
+                // skip-`register_dispatch_jitcode` path as `!dispatch_lower_ok`.
                 return None;
             }
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
@@ -583,6 +651,18 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         /// `metainterp_sd.liveness_info`.
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #prebuild_fn_name(__asm: &mut majit_metainterp::Assembler) {
+            #prebuild_fn_name_with_lens(__asm, &[])
+        }
+
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        fn #prebuild_fn_name_with_lens(
+            __asm: &mut majit_metainterp::Assembler,
+            __flat_array_lens: &[usize],
+        ) {
+            #build_flat_array_identity_slots
+            if !__flat_array_identity_ok {
+                return;
+            }
             #dispatch_prebuild
         }
 
@@ -602,13 +682,47 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         fn #declare_schema_fn_name<S: majit_metainterp::JitState>(
             __driver: &mut majit_metainterp::JitDriver<S>,
         ) {
+            #declare_schema_fn_name_with_lens(__driver, &[])
+        }
+
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        fn #declare_schema_fn_name_with_lens<S: majit_metainterp::JitState>(
+            __driver: &mut majit_metainterp::JitDriver<S>,
+            __flat_array_lens: &[usize],
+        ) {
+            #flat_array_identity_ok_pred
             let __greens: ::std::vec::Vec<(&str, majit_ir::GreenType)> = vec![
                 #( (#dispatch_green_schema_names, #dispatch_green_schema_types) ),*
             ];
             let __reds: ::std::vec::Vec<(&str, majit_ir::Type)> = vec![
                 #( (#dispatch_red_schema_names, #dispatch_red_schema_types) ),*
             ];
+            // Named portal reds only. Flattened `[int]` cells and other
+            // identity slots are marker operands (`resolve_reds`) and
+            // `-live-` entries, not `JitDriverStaticData::vars` —
+            // `portal_calldescr` is the original function
+            // (`warmspot.py` `cpu.calldescrof(portal_runner)`).
             __driver.declare_schema_typed(__greens, __reds);
+            // Same source `resolve_reds` uses: identity scalars from
+            // `identity_slot_registers`, plus Meta-length `[int]` cells
+            // (`__flat_array_identity_slots`) when the layout fits.
+            // `install_canonical_liveness` declares this before building
+            // the dispatch JitCode; `register_dispatch_jitcode` is the
+            // only reader (`merge_point_identity_reds`). A `None`
+            // dispatch skips that register, so this count is unused
+            // unless a JitCode is actually installed — then it must
+            // match the cells the marker listed.
+            let __identity_i = if __flat_array_identity_ok {
+                #identity_i_scalars
+                    + __flat_array_lens.iter().copied().sum::<usize>()
+            } else {
+                #identity_i_scalars
+            };
+            __driver.declare_merge_point_identity_reds((
+                __identity_i,
+                #identity_r_scalars,
+                #identity_f_scalars,
+            ));
         }
 
         #trace_fn_body

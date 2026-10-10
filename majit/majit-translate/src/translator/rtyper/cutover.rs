@@ -1271,6 +1271,7 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::NewList { .. }
             | OpKind::GetSlice { .. }
             | OpKind::ConstInt(_)
+            | OpKind::ConstFnAddr { .. }
             | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
@@ -10355,6 +10356,7 @@ mod tests {
         let fnaddr = ops
             .iter()
             .find_map(|op| match &op.kind {
+                OpKind::ConstFnAddr { value, .. } => Some(*value),
                 OpKind::ConstInt(addr) => Some(*addr),
                 _ => None,
             })

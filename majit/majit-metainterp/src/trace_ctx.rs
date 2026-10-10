@@ -394,6 +394,15 @@ pub struct TraceCtx {
     pub(crate) portal_green_regs_i: Vec<u8>,
     pub(crate) portal_green_regs_r: Vec<u8>,
     pub(crate) portal_green_regs_f: Vec<u8>,
+    /// Merge-point red register bytes, `(I, R, F)` operand order.
+    /// `prepare_list_of_boxes` copies these slots; header-revisit CloseLoop
+    /// re-reads them off the live portal frame or the last-pop snapshot.
+    pub(crate) portal_red_regs_i: Vec<u8>,
+    pub(crate) portal_red_regs_r: Vec<u8>,
+    pub(crate) portal_red_regs_f: Vec<u8>,
+    /// Red `OpRef`s from [`Self::portal_red_regs_*`] at the last portal
+    /// frame, for a Continue walk that has already dropped that frame.
+    pub(crate) live_portal_reds: Option<Vec<(OpRef, Type)>>,
     /// The int pc green that belongs to [`Self::close_greens`].  The structured
     /// `can_enter_jit` key prepends the back-edge target before the declared
     /// greens, so reconstructing the interpreter-entered key for a close needs
@@ -2198,6 +2207,10 @@ impl TraceCtx {
             portal_green_regs_i: Vec::new(),
             portal_green_regs_r: Vec::new(),
             portal_green_regs_f: Vec::new(),
+            portal_red_regs_i: Vec::new(),
+            portal_red_regs_r: Vec::new(),
+            portal_red_regs_f: Vec::new(),
+            live_portal_reds: None,
             close_green_pc: None,
             close_typed_key: None,
             close_jump_into_key: None,
@@ -2291,6 +2304,10 @@ impl TraceCtx {
             portal_green_regs_i: Vec::new(),
             portal_green_regs_r: Vec::new(),
             portal_green_regs_f: Vec::new(),
+            portal_red_regs_i: Vec::new(),
+            portal_red_regs_r: Vec::new(),
+            portal_red_regs_f: Vec::new(),
+            live_portal_reds: None,
             close_green_pc: None,
             close_typed_key: None,
             close_jump_into_key: None,
@@ -3072,6 +3089,36 @@ impl TraceCtx {
         ));
     }
 
+    /// Re-read merge-point red registers off a live frame (`prepare_list_of_boxes`).
+    pub fn snapshot_portal_reds_from_frame(
+        &mut self,
+        ints: &[Option<OpRef>],
+        refs: &[Option<OpRef>],
+        floats: &[Option<OpRef>],
+    ) {
+        fn read(bank: &[Option<OpRef>], regs: &[u8], what: &str, ty: Type) -> Vec<(OpRef, Type)> {
+            regs.iter()
+                .map(|&reg| {
+                    let opref = bank
+                        .get(reg as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "merge-point red {what} register {reg} must be live \
+                                 (`prepare_list_of_boxes` / `reached_loop_header`)"
+                            )
+                        });
+                    (opref, ty)
+                })
+                .collect()
+        }
+        let mut reds = read(ints, &self.portal_red_regs_i, "int", Type::Int);
+        reds.extend(read(refs, &self.portal_red_regs_r, "ref", Type::Ref));
+        reds.extend(read(floats, &self.portal_red_regs_f, "float", Type::Float));
+        self.live_portal_reds = Some(reds);
+    }
+
     /// Header-revisit close: copy the live portal greens into
     /// `close_greens` when the merge point did not write its own.
     ///
@@ -3082,6 +3129,38 @@ impl TraceCtx {
         if self.close_greens.is_none() {
             self.close_greens = self.live_portal_greens.clone();
         }
+    }
+
+    /// `pyjitpl.py MetaInterp.reached_loop_header`: one `duplicates` dict;
+    /// reds first, then `virtualizable_boxes[:-1]`. Stashes `close_jump_boxes`
+    /// as the JUMP/registration list (reds + vable elements).
+    ///
+    /// `dead_array_tail_from` is forwarded to
+    /// [`Self::fill_virtualizable_boxes_to_declared_layout`]: the first array
+    /// index the caller knows holds null. Generic `VirtualizableInfo` has no
+    /// frame field names (`virtualizable.py`); pass `None` to read every hole
+    /// from the heap (`read_boxes`).
+    pub fn reached_loop_header_live_arg_boxes(
+        &mut self,
+        redboxes: &mut [(OpRef, Type)],
+        dead_array_tail_from: Option<usize>,
+    ) -> Vec<(OpRef, Type)> {
+        self.heap_cache_mut().reset();
+        self.fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
+        let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
+            indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
+        self.remove_consts_and_duplicates_with(redboxes, &mut duplicates);
+        let mut live: Vec<(OpRef, Type)> = redboxes.to_vec();
+        if let Some(mut typed) = self.collect_virtualizable_typed_boxes() {
+            if let Some(end) = typed.len().checked_sub(1) {
+                self.remove_consts_and_duplicates_with(&mut typed[..end], &mut duplicates);
+                let elements: Vec<OpRef> = typed[..end].iter().map(|(opref, _)| *opref).collect();
+                self.adopt_normalized_virtualizable_elements(&elements);
+                live.extend_from_slice(&typed[..end]);
+            }
+        }
+        self.close_jump_boxes = Some(live.clone());
+        live
     }
 
     /// pyjitpl.py / :3005 `get_procedure_token(greenboxes)` analog: the
@@ -3327,6 +3406,17 @@ impl TraceCtx {
     pub fn remove_consts_and_duplicates(&mut self, boxes: &mut [(OpRef, Type)]) {
         let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
             indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
+        self.remove_consts_and_duplicates_with(boxes, &mut duplicates);
+    }
+
+    /// `pyjitpl.py MetaInterp.remove_consts_and_duplicates(boxes, endindex, duplicates)`.
+    /// `reached_loop_header` shares one `duplicates` dict: reds first, then
+    /// `virtualizable_boxes[:-1]`.
+    pub fn remove_consts_and_duplicates_with(
+        &mut self,
+        boxes: &mut [(OpRef, Type)],
+        duplicates: &mut indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher>,
+    ) {
         for slot in boxes.iter_mut() {
             let (opref, declared) = *slot;
             if !opref.is_constant() && duplicates.insert(opref) {
@@ -4436,6 +4526,246 @@ impl TraceCtx {
         self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
     }
 
+    /// `virtualizable.py VirtualizableInfo.read_boxes` layout: every static
+    /// field and every item of every array is a box, identity last. A short
+    /// shadow (init used a live-prefix fallback, or a vable array grew) is
+    /// padded with `OpRef::NONE` holes before the identity so the hole scan
+    /// below sees the missing tail. Live holes record `GETFIELD_GC` of the
+    /// array pointer then `GETARRAYITEM_GC` per item
+    /// (`fill_live_virtualizable_holes_from_heap`); dead-tail holes become
+    /// typed null. `pyjitpl.py MetaInterp.reached_loop_header` can then
+    /// `+= virtualizable_boxes; pop()`.
+    ///
+    /// `OpRef::NONE` is not always a heap `None`. `read_boxes` wraps the
+    /// actual `lst[i]`; that value is null only where the interpreter stored
+    /// null. `dead_array_tail_from` is the first array index the caller knows
+    /// holds null; holes at that index and beyond become typed null. A NONE
+    /// hole in a live slot is read from the heap with `GETARRAYITEM_GC` (the
+    /// same recording `extend_vable_array_from_frame` uses for a missing array
+    /// item). `None` means every hole is live: `read_boxes` wrapping `lst[i]`.
+    pub fn fill_virtualizable_boxes_to_declared_layout(
+        &mut self,
+        dead_array_tail_from: Option<usize>,
+    ) {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return;
+        };
+        let Some(lengths) = self.virtualizable_array_lengths().map(|l| l.to_vec()) else {
+            return;
+        };
+        let nstatic = info.num_static_extra_boxes;
+        let narray: usize = lengths.iter().copied().sum();
+        let declared = nstatic + narray;
+        let new_len = {
+            let Some(boxes) = self.virtualizable_boxes.as_mut() else {
+                return;
+            };
+            if boxes.is_empty() {
+                None
+            } else {
+                let data_len = boxes.len() - 1;
+                if data_len < declared {
+                    let identity = boxes.pop().unwrap();
+                    boxes.resize(declared, OpRef::NONE);
+                    boxes.push(identity);
+                    Some(boxes.len())
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(n) = new_len {
+            if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
+                live_null_slots.resize(n, false);
+            }
+        }
+        let hole_indices: Vec<usize> = {
+            let Some(boxes) = self.virtualizable_boxes.as_ref() else {
+                return;
+            };
+            let end = boxes.len().saturating_sub(1);
+            boxes[..end]
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.is_none())
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if hole_indices.is_empty() {
+            return;
+        }
+        let mut dead_tail = Vec::new();
+        let mut live_holes = Vec::new();
+        for idx in hole_indices {
+            if idx >= nstatic {
+                let array_idx = idx - nstatic;
+                if dead_array_tail_from.is_some_and(|from| array_idx >= from) {
+                    dead_tail.push(idx);
+                    continue;
+                }
+            }
+            live_holes.push(idx);
+        }
+        for idx in dead_tail {
+            let ty = self.virtualizable_slot_type(idx).unwrap_or(Type::Ref);
+            let null = self.typed_null_box(ty);
+            if let Some(boxes) = self.virtualizable_boxes.as_mut() {
+                if let Some(slot) = boxes.get_mut(idx) {
+                    *slot = null;
+                }
+            }
+        }
+        if !live_holes.is_empty() {
+            let dest_ptr = self
+                .standard_virtualizable_ptr()
+                .or_else(|| self.virtualizable_heap_ptr.map(|p| p as usize))
+                .unwrap_or(0);
+            self.fill_live_virtualizable_holes_from_heap(&info, dest_ptr, &lengths, &live_holes);
+        }
+    }
+
+    fn typed_null_box(&mut self, ty: Type) -> OpRef {
+        match ty {
+            Type::Ref => self.const_null(),
+            Type::Int => self.const_int(0),
+            Type::Float => self.const_float(0),
+            Type::Void => panic!("typed null for a Void virtualizable slot"),
+        }
+    }
+
+    /// Record `GETFIELD_GC` / `GETARRAYITEM_GC` for each live `OpRef::NONE`
+    /// hole, matching `virtualizable.py VirtualizableInfo.read_boxes`
+    /// wrapping `getattr` / `lst[i]`.
+    fn fill_live_virtualizable_holes_from_heap(
+        &mut self,
+        info: &VirtualizableInfo,
+        dest_ptr: usize,
+        lengths: &[usize],
+        hole_indices: &[usize],
+    ) {
+        let nstatic = info.num_static_extra_boxes;
+        let Some(vbox) = self.standard_virtualizable_box() else {
+            panic!(
+                "virtualizable_boxes has a live OpRef::NONE hole; \
+                 virtualizable.py VirtualizableInfo.read_boxes wraps the heap \
+                 value (getattr / lst[i]), which is null only where the \
+                 interpreter stored null"
+            );
+        };
+        let static_descrs = info.static_field_descrs().to_vec();
+        let mut array_ops: Vec<Option<OpRef>> = vec![None; info.array_fields.len()];
+        let mut replacements = Vec::with_capacity(hole_indices.len());
+        for &idx in hole_indices {
+            if idx < nstatic {
+                let field_type = info.static_fields[idx].field_type;
+                let opcode = match field_type {
+                    Type::Int => OpCode::GetfieldGcI,
+                    Type::Ref => OpCode::GetfieldGcR,
+                    Type::Float => OpCode::GetfieldGcF,
+                    Type::Void => panic!(
+                        "virtualizable_boxes live hole at static field {idx} has Void type; \
+                         virtualizable.py VirtualizableInfo.read_boxes"
+                    ),
+                };
+                let op = self.record_getfield_stamped(
+                    opcode,
+                    vbox,
+                    dest_ptr,
+                    static_descrs[idx].clone(),
+                    field_type,
+                );
+                replacements.push((idx, op));
+                continue;
+            }
+            let mut remaining = idx - nstatic;
+            let mut ai = 0;
+            while ai < lengths.len() && remaining >= lengths[ai] {
+                remaining -= lengths[ai];
+                ai += 1;
+            }
+            if ai >= info.array_fields.len() {
+                panic!(
+                    "virtualizable_boxes live hole at flat index {idx} is outside \
+                     the declared layout; virtualizable.py VirtualizableInfo.read_boxes \
+                     fills every static field and every array item"
+                );
+            }
+            if array_ops[ai].is_none() {
+                let field_descr = info.array_pointer_field_descr(ai);
+                let array_op = self.record_getfield_stamped(
+                    OpCode::GetfieldGcR,
+                    vbox,
+                    dest_ptr,
+                    field_descr,
+                    Type::Ref,
+                );
+                array_ops[ai] = Some(array_op);
+            }
+            let array_op = array_ops[ai].unwrap();
+            let item_type = info.array_fields[ai].item_type;
+            let item_opcode = match item_type {
+                Type::Int => OpCode::GetarrayitemGcI,
+                Type::Ref => OpCode::GetarrayitemGcR,
+                Type::Float => OpCode::GetarrayitemGcF,
+                Type::Void => panic!(
+                    "virtualizable_boxes live hole at array {ai}[{remaining}] has Void \
+                     item_type; virtualizable.py VirtualizableInfo.read_boxes"
+                ),
+            };
+            let array_descr = info.array_item_descr(ai);
+            let op = self.record_getarrayitem_stamped(
+                item_opcode,
+                array_op,
+                remaining as i64,
+                array_descr,
+                item_type,
+            );
+            replacements.push((idx, op));
+        }
+        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
+            for (idx, op) in replacements {
+                boxes[idx] = op;
+            }
+        }
+    }
+
+    /// `virtualizable_boxes[:-1]` for `pyjitpl.py MetaInterp.reached_loop_header`.
+    ///
+    /// `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`.
+    /// Every declared static field and array item is a box
+    /// (`virtualizable.py VirtualizableInfo.read_boxes`); a missing slot is
+    /// a producer bug.
+    pub fn virtualizable_data_boxes(&self) -> Vec<OpRef> {
+        let Some(boxes) = self.virtualizable_boxes.as_ref() else {
+            return Vec::new();
+        };
+        let nstatic = self
+            .virtualizable_info
+            .as_ref()
+            .map_or(0, |info| info.num_static_extra_boxes);
+        let narray = self
+            .virtualizable_array_lengths
+            .as_ref()
+            .map_or(0, |lengths| lengths.iter().copied().sum());
+        let declared = nstatic + narray;
+        let data_len = boxes.len().saturating_sub(1);
+        // A short vec parks the identity at `boxes[data_len]`. Reading that
+        // index as a data slot would hide the hole and emit a JUMP one box
+        // shorter than the LABEL. Panic instead, as
+        // `reached_loop_header` has no skip.
+        if declared > data_len {
+            panic!(
+                "virtualizable_boxes is missing {} slot(s) at reached_loop_header \
+                 (declared {declared} data boxes, shadow has {data_len}); \
+                 pyjitpl.py MetaInterp.reached_loop_header does \
+                 `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()` \
+                 and virtualizable.py VirtualizableInfo.read_boxes fills every slot",
+                declared - data_len,
+            );
+        }
+        boxes[..data_len].to_vec()
+    }
+
     /// `opencoder.py create_top_snapshot` parity for callers that
     /// need to feed `vable_boxes` / `vref_boxes` into
     /// `capture_snapshot_for_last_guard_with_vable_vref`.  Returns the
@@ -4960,7 +5290,11 @@ impl TraceCtx {
         };
         let dest_ptr = match self.concrete_of_opref(vbox) {
             Some(Value::Ref(gcref)) if gcref.as_usize() != 0 => gcref.as_usize(),
-            _ => 0,
+            _ => self
+                .standard_virtualizable_ptr()
+                .or_else(|| self.virtualizable_heap_ptr.map(|p| p as usize))
+                .filter(|&ptr| ptr != 0)
+                .unwrap_or(0),
         };
         let dest_lengths = if dest_ptr != 0 && info.can_read_all_array_lengths_from_heap() {
             unsafe { info.read_array_lengths_from_heap(dest_ptr as *const u8) }
@@ -9626,6 +9960,273 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    fn test_vable_info_one_static_one_array() -> crate::virtualizable::VirtualizableInfo {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "locals",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info
+    }
+
+    fn test_vable_info_one_static_two_arrays() -> crate::virtualizable::VirtualizableInfo {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "a",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.add_array_field(
+            "b",
+            Type::Int,
+            32,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info
+    }
+
+    /// Two vable arrays, short shadow: `read_boxes` is statics then every
+    /// item of array 0 then every item of array 1, identity last. A prefix
+    /// that stops inside array 0 used to stay short because the extend
+    /// path required `array_fields.len() == 1`.
+    #[test]
+    fn fill_virtualizable_boxes_extends_two_arrays_to_the_declared_length() {
+        let info = test_vable_info_one_static_two_arrays();
+        let nstatic = info.num_static_extra_boxes;
+        let len0 = 2usize;
+        let len1 = 1usize;
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_a0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_a0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[len0, len1],
+        );
+        ctx.fill_virtualizable_boxes_to_declared_layout(None);
+        let boxes = ctx.collect_virtualizable_boxes().unwrap();
+        assert_eq!(boxes.len(), nstatic + len0 + len1 + 1);
+        assert!(
+            boxes.iter().all(|b| !b.is_none()),
+            "every declared slot is filled"
+        );
+        assert_eq!(boxes[0], box_pc);
+        assert_eq!(boxes[1], box_a0);
+        assert_eq!(*boxes.last().unwrap(), vable);
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
+        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[3].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    /// A declared array slot with no box used to be skipped by
+    /// `append_virtualizable_boxes`, emitting a JUMP one arg shorter than
+    /// the LABEL registered from `inputarg_types`.
+    #[test]
+    #[should_panic(expected = "reached_loop_header")]
+    fn virtualizable_data_boxes_panics_when_a_declared_slot_is_missing() {
+        let info = test_vable_info_one_static_one_array();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+        ctx.virtualizable_array_lengths = Some(vec![2]);
+        let _ = ctx.virtualizable_data_boxes();
+    }
+
+    #[test]
+    fn fill_virtualizable_boxes_extends_a_short_array_to_the_declared_length() {
+        let info = test_vable_info_one_static_one_array();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+        ctx.virtualizable_array_lengths = Some(vec![2]);
+        ctx.fill_virtualizable_boxes_to_declared_layout(None);
+        let data = ctx.virtualizable_data_boxes();
+        assert_eq!(data.len(), 3, "static + 2 array items");
+        assert_eq!(data[0], box_pc);
+        assert_eq!(data[1], box_arr0);
+        assert_ne!(data[2], box_arr0);
+        assert!(!data[2].is_none());
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    /// A NONE hole in a live array slot is `read_boxes` wrapping `lst[i]`,
+    /// not a heap None. Filling it with CONST_NULL would carry a wrong value
+    /// into the next iteration.
+    #[test]
+    fn fill_virtualizable_boxes_reads_a_live_hole_from_the_heap() {
+        let info = test_vable_info_one_static_one_array();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, OpRef::NONE],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+        ctx.fill_virtualizable_boxes_to_declared_layout(None);
+        let data = ctx.virtualizable_data_boxes();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0], box_pc);
+        assert!(!data[1].is_none(), "live hole is filled");
+        assert!(
+            !data[1].is_constant(),
+            "live hole is GETARRAYITEM_GC, not CONST_NULL"
+        );
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[1].opcode, OpCode::GetarrayitemGcI);
+    }
+
+    fn test_vable_info_with_valuestackdepth() -> crate::virtualizable::VirtualizableInfo {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_field("valuestackdepth", Type::Int, 16);
+        info.add_array_field(
+            "locals",
+            Type::Ref,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Ref),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info
+    }
+
+    /// Dead stack-tail (`array index >= valuestackdepth`) is where
+    /// `popvalue_maybe_none` stored null, so `read_boxes` wraps None.
+    #[test]
+    fn fill_virtualizable_boxes_nulls_dead_stack_tail_holes() {
+        let info = test_vable_info_with_valuestackdepth();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_vsd = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_vsd, box_arr0, OpRef::NONE],
+            &[ph(Type::Int), Value::Int(1), ph(Type::Ref), ph(Type::Ref)],
+            &[2],
+        );
+        ctx.fill_virtualizable_boxes_to_declared_layout(Some(1));
+        let data = ctx.virtualizable_data_boxes();
+        assert_eq!(data.len(), 4, "2 static + 2 array items");
+        assert_eq!(data[0], box_pc);
+        assert_eq!(data[1], box_vsd);
+        assert_eq!(data[2], box_arr0);
+        assert!(!data[3].is_none(), "dead-tail hole is filled");
+        assert!(
+            data[3].is_constant(),
+            "dead stack-tail hole becomes typed null"
+        );
+    }
+
+    /// `None` is `read_boxes`: every hole is the heap value, even an array
+    /// index the caller could have marked dead.
+    #[test]
+    fn fill_virtualizable_boxes_none_reads_every_hole_from_the_heap() {
+        let info = test_vable_info_with_valuestackdepth();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_vsd = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_vsd, box_arr0, OpRef::NONE],
+            &[ph(Type::Int), Value::Int(1), ph(Type::Ref), ph(Type::Ref)],
+            &[2],
+        );
+        ctx.fill_virtualizable_boxes_to_declared_layout(None);
+        let data = ctx.virtualizable_data_boxes();
+        assert_eq!(data.len(), 4);
+        assert!(!data[3].is_none(), "hole is filled");
+        assert!(
+            !data[3].is_constant(),
+            "None boundary reads GETARRAYITEM_GC, not typed null"
+        );
     }
 
     /// `vable_snapshot_buildable` is the precondition the walker checks

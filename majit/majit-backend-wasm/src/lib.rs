@@ -1325,6 +1325,8 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_id_or_identityhash(Some(wasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_write_barrier_before_move(Some(wasm_active_gc_write_barrier_before_move));
+    majit_gc::set_active_write_barrier_from_array(Some(wasm_active_gc_write_barrier_from_array));
+    majit_gc::set_active_writebarrier_before_copy(Some(wasm_active_gc_writebarrier_before_copy));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_subgraph_has_pending_finalizer(Some(wasm_subgraph_has_pending_finalizer));
@@ -2763,6 +2765,23 @@ pub(crate) fn wasm_gc_remove_roots(slots: impl Iterator<Item = usize>) {
 /// silent no-op, so a collecting nursery loses old→young pointers.
 fn wasm_active_gc_write_barrier_before_move(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.writebarrier_before_move(obj));
+}
+
+fn wasm_active_gc_write_barrier_from_array(obj: GcRef, index: usize) {
+    with_wasm_active_gc_mut(|gc| gc.write_barrier_from_array(obj, index));
+}
+
+fn wasm_active_gc_writebarrier_before_copy(
+    source: GcRef,
+    dest: GcRef,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) -> bool {
+    with_wasm_active_gc_mut(|gc| {
+        gc.writebarrier_before_copy(source, dest, source_start, dest_start, length)
+    })
+    .unwrap_or(true)
 }
 
 pub(crate) fn wasm_active_gc_write_barrier(obj: GcRef) {
