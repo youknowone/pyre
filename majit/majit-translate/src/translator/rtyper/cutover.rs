@@ -2427,6 +2427,10 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // non-overwriting, between-passes seeding contract as the unsafe-fn
     // stubs above.
     register_foreign_stdlib_externals(registry);
+    // Zero-arg Void no-effect externals (`icf_identity_token`). Same
+    // between-passes seeding as the stdlib table; jtransform drops the
+    // residual (`is_no_effect_external`) instead of emitting empty asm.
+    register_no_effect_externals(registry);
     // Opaque `f64` methods the front remaps to `ll_math::math_*` C
     // llexternals (`f64_method_llexternal`).  The `std::f64::<Impl>::floor`
     // rows in FOREIGN_STDLIB_EXTERNALS no longer match those callsites;
@@ -3350,6 +3354,44 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Float,
     ),
 ];
+
+/// Zero-arg Void externals with no effects and no graph.
+///
+/// Analog of `extfunc.py register_external(function, [], None,
+/// sandboxsafe=True)` whose body is a no-op. Charon leaves
+/// `majit_ir::icf::icf_identity_token` Foreign: the `#[oopspec]` /
+/// `#[dont_look_inside]` macros insert it as empty `nomem` asm so LLVM
+/// MergeFunctions cannot fold helper bodies. Upstream `isconstant` has
+/// no such call (`rlib/jit.py` returns `NonConstant(False)`); the
+/// annotator must see that body, and jtransform must drop the token
+/// the way `rewrite_op_getfield` returns on `RESULT is lltype.Void`.
+const NO_EFFECT_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[(
+    &["majit_ir", "icf", "icf_identity_token"],
+    &[],
+    LowLevelType::Void,
+)];
+
+/// True when `segments` is a [`NO_EFFECT_EXTERNALS`] path.
+///
+/// jtransform consults this instead of residualizing the empty asm:
+/// `rewrite_op_direct_call` returns `Replace([])`, matching
+/// `jtransform.py rewrite_op_getfield` `if RESULT is lltype.Void: return`.
+pub(crate) fn is_no_effect_external(segments: &[String]) -> bool {
+    NO_EFFECT_EXTERNALS.iter().any(|(path, _, _)| {
+        path.len() == segments.len() && path.iter().zip(segments.iter()).all(|(a, b)| *a == b)
+    })
+}
+
+/// Register the [`NO_EFFECT_EXTERNALS`] table into `registry`.
+///
+/// Same annotator-only, non-overwriting `register_opaque_external`
+/// carrier as [`register_foreign_stdlib_externals`]. The codewriter
+/// drops matching calls rather than residualizing them.
+pub(crate) fn register_no_effect_externals(registry: &CallRegistry) {
+    for (segments, argnames, return_lltype) in NO_EFFECT_EXTERNALS {
+        register_opaque_external(registry, segments, argnames, return_lltype.clone());
+    }
+}
 
 /// Register one opaque external through the annotator-only stub carrier.
 /// The caller retains ownership of which table or synthetic path declares
@@ -9609,6 +9651,153 @@ mod tests {
                 .lookup(&FunctionPathKey::from_segments(["cell", "RefCell", "get"]))
                 .is_none(),
             "RefCell::get is not Cell::get"
+        );
+    }
+
+    /// `rlib/jit.py isconstant`: `@oopspec` + `@specialize.call_location()`
+    /// with body `return NonConstant(False)`. The Rust macro inserts
+    /// `icf_identity_token` (empty `nomem` asm); Charon leaves that
+    /// Foreign. Registering it as a zero-arg Void external
+    /// (`register_external(..., [], None)`) lets the annotator see the
+    /// same SomeBool-not-constant body upstream annotates, and
+    /// jtransform drops the token the way `rewrite_op_getfield`
+    /// returns on `RESULT is lltype.Void`.
+    fn isconstant_oopspec_body_graph() -> LegacyGraph {
+        let mut graph = LegacyGraph::new("isconstant");
+        let value = graph.alloc_value_var();
+        setbinding(&value, ValueType::Int);
+        graph.block_mut(graph.startblock).inputargs = vec![value];
+        graph.block_mut(graph.startblock).operations = vec![crate::model::SpaceOperation {
+            result: None,
+            kind: crate::model::OpKind::Call {
+                target: crate::model::CallTarget::function_path([
+                    "majit_ir",
+                    "icf",
+                    "icf_identity_token",
+                ]),
+                args: vec![],
+                result_ty: ValueType::Void,
+            },
+        }];
+        let false_var = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::ConstBool(false),
+                true,
+            )
+            .unwrap();
+        setbinding(&false_var, ValueType::Bool);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path([
+                        "majit_rlib",
+                        "nonconst",
+                        "non_constant",
+                    ]),
+                    args: crate::model::call_args(vec![false_var]),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        setbinding(&result, ValueType::Bool);
+        graph.set_return(graph.startblock, Some(result));
+        graph
+    }
+
+    #[test]
+    fn isconstant_oopspec_body_annotates_somebool_and_drops_icf_token() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::codewriter::call::GraphStore;
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{CallTarget, OpKind};
+        use crate::parse::CallPath;
+
+        let token = ["majit_ir", "icf", "icf_identity_token"];
+        let isconstant = ["majit_rlib", "jit", "isconstant"];
+        let translator = crate::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let source = isconstant_oopspec_body_graph();
+        let mut graphs = GraphStore::default();
+        graphs.insert(CallPath::from_segments(isconstant), source.clone());
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+
+        let token_entry = registry
+            .lookup(&FunctionPathKey::from_segments(token))
+            .expect("icf_identity_token must be a registered no-effect external");
+        assert!(
+            token_entry
+                .function_desc
+                .borrow()
+                .signature
+                .argnames
+                .is_empty(),
+            "token signature is () -> None"
+        );
+
+        let isconstant_key = FunctionPathKey::from_segments(isconstant);
+        let entry = registry.lookup(&isconstant_key).expect("isconstant entry");
+        assert_eq!(
+            entry.lift_error(),
+            None,
+            "oopspec body must lift once the token is an external"
+        );
+        let pygraph = entry
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .expect("lifted isconstant body");
+        ann.translator
+            .graphs
+            .borrow_mut()
+            .push(std::rc::Rc::clone(&pygraph.graph));
+        let annotated = ann
+            .build_graph_types(
+                &pygraph.graph,
+                &[Some(SomeValue::Integer(SomeInteger::default()))],
+                true,
+            )
+            .expect("isconstant body annotates");
+        match annotated {
+            Some(SomeValue::Bool(b)) => assert!(
+                b.base.const_box.is_none(),
+                "NonConstant(False) is a SomeBool that is not constant"
+            ),
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&source);
+        let ops = &transformed.graph.block(source.startblock).operations;
+        assert!(
+            ops.iter().all(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.as_slice() != token,
+                _ => !format!("{:?}", op.kind).contains("icf_identity_token"),
+            }),
+            "jtransform must drop the ICF token; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::CallResidual {
+                    result_kind: 'v',
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                } if args_i.is_empty() && args_r.is_empty() && args_f.is_empty()
+            )),
+            "token must not residualize to an empty-asm call; ops={ops:?}"
         );
     }
 

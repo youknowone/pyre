@@ -4316,7 +4316,7 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
-        match try_fuse_drain_match(graph, a, r, payload_ty, spec) {
+        match try_fuse_drain_match(graph, a, r, suffix, payload_ty, spec) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
                 // The fusion's reason string, which reaches the census rather
@@ -5135,6 +5135,12 @@ fn apply_remove_identical_inputargs(
     }
 }
 
+/// Arm inputargs bound from the match link's shell argument.
+///
+/// Empty is `Ok(_)` / `Err(_)`: rustc drops the unused phi and the
+/// arm does not receive the shell. [`split_result_ok_err_arms`] already
+/// treats a missing forward as an empty walk
+/// (`flowcontext.py` `FlowContext.guessexception`).
 fn arm_shell_vars_from_args(
     graph: &FunctionGraph,
     args: &[LinkArg],
@@ -5152,14 +5158,13 @@ fn arm_shell_vars_from_args(
             vars.push(var);
         }
     }
-    if vars.is_empty() {
-        return Err("match arm does not receive the shell".to_string());
-    }
     Ok(vars)
 }
 
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
+/// An arm that does not receive the shell is a discarded payload
+/// (`Ok(_)`); there is no `__pos_0` to collapse on that edge.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -6317,10 +6322,77 @@ fn drain_predicate_on(
         .map(|result| (target.clone(), result, result_ty.clone()))
 }
 
+/// Discriminant 0/1 of a `Result` match, with the carrier used only as
+/// `__pos_0` or a forward (`shell_pos0_reads`).
+///
+/// `Ok(_)` / `Err(_)` may omit the payload; a guard such as
+/// `Err(e) if pred(x)` may call `pred` before the unwrap. Either is
+/// ordinary handler flow (`flowcontext.py` `FlowContext.guessexception`).
+/// A use of the carrier as a `Result` (another discriminant, a method
+/// on the shell, a multi-pred merge) fails closed.
+fn split_result_ok_err_arms(
+    graph: &FunctionGraph,
+    b: usize,
+    r_b: &Variable,
+    name: &str,
+) -> Result<(Link, Link), String> {
+    let (case0, case1) = split_diamond_exits(&graph.blocks[b].exits, name)?;
+    let walk_arm = |link: &Link, variant: &str| -> Result<ShellPos0Walk, String> {
+        let Some(carrier) = forward_alias(graph, r_b, link) else {
+            return Ok(ShellPos0Walk {
+                reads: Vec::new(),
+                visited: vec![link.target.0],
+            });
+        };
+        let walk = shell_pos0_reads(graph, link.target.0, &carrier)?;
+        for &(block, pos) in &walk.reads {
+            if !pos0_read_is_variant(graph, block, pos, variant) {
+                return Err(format!(
+                    "{name}: drain fuse: {variant} arm block {block} reads a different Result variant"
+                ));
+            }
+        }
+        Ok(walk)
+    };
+    let ok_on_0 = walk_arm(&case0, "Ok");
+    let err_on_1 = walk_arm(&case1, "Err");
+    if ok_on_0.is_ok() && err_on_1.is_ok() {
+        return Ok((case0, case1));
+    }
+    // Discriminant 1/0 as Ok/Err is the inverted Result layout.
+    if walk_arm(&case1, "Ok").is_ok() && walk_arm(&case0, "Err").is_ok() {
+        return Err(format!(
+            "{name}: drain fuse: Ok/Err arms inverted vs discriminant 0/1"
+        ));
+    }
+    ok_on_0?;
+    err_on_1?;
+    unreachable!("one of the Ok/Err walks failed")
+}
+
+fn pos0_read_is_variant(graph: &FunctionGraph, block: usize, pos: usize, variant: &str) -> bool {
+    let Some(carrier) = graph.blocks[block].inputargs.get(pos) else {
+        return false;
+    };
+    graph.blocks[block].operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { base, field, .. }
+                if base == carrier
+                    && field.name == "__pos_0"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|owner| owner_is_result_variant(owner, variant))
+        )
+    })
+}
+
 fn try_fuse_drain_match(
     graph: &mut FunctionGraph,
     a: usize,
     r: &Variable,
+    suffix: &str,
     payload_ty: &ValueType,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
@@ -6372,31 +6444,10 @@ fn try_fuse_drain_match(
     }
     assert_block_pure_besides(graph, b, &[disc_idx], "discriminant", &name)?;
 
-    // (3) Split B's diamond; identify Ok/Err arms by the `__pos_0` owner
-    // of the read in each arm's target — NOT by discriminant 0/1.
-    let (case0, case1) = split_diamond_exits(&graph.blocks[b].exits, &name)?;
-    let reads_variant = |target: usize, variant: &str| -> bool {
-        graph.blocks[target].operations.iter().any(|op| {
-            matches!(&op.kind,
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref().is_some_and(|o| owner_is_result_variant(o, variant)))
-        })
-    };
-    let (ok_link, err_link) =
-        if reads_variant(case0.target.0, "Ok") && reads_variant(case1.target.0, "Err") {
-            (case0, case1)
-        } else if reads_variant(case1.target.0, "Ok") && reads_variant(case0.target.0, "Err") {
-            // The Ok arm must be the discriminant-0 case (Result: Ok = 0); an
-            // inverted pairing is an unrecognised shape.
-            return Err(format!(
-                "{name}: drain fuse: Ok/Err arms inverted vs discriminant 0/1"
-            ));
-        } else {
-            return Err(format!(
-                "{name}: drain fuse: block {b} arms are not a Result Ok/Err __pos_0 pair"
-            ));
-        };
+    // (3) Discriminant 0/1 is Ok/Err. Payload uses may be empty (`Ok(_)`)
+    // or sit behind a guard (`Err(e) if pred(x)`). A use of the carrier
+    // as a Result fails closed (`shell_pos0_reads`).
+    let (ok_link, err_link) = split_result_ok_err_arms(graph, b, &r_b, &name)?;
     let ok_target = ok_link.target.0;
     let err_target = err_link.target.0;
 
@@ -6405,13 +6456,17 @@ fn try_fuse_drain_match(
     // payload directly).  Record its payload position on the Ok link.
     assert_single_pred(graph, ok_target, &name)?;
 
-    // (5) Err arm: single predecessor, the Err payload read plus a carrier
-    // StopIteration predicate (`matches_stop_iteration` or the keep twin).
+    // (5) Err arm: StopIteration drain unwraps immediately and predicates
+    // the carrier. Anything else is ordinary handler flow
+    // (`flowcontext.py` `FlowContext.guessexception`): the Err edge is
+    // the exception link, the handler stays as written.
     assert_single_pred(graph, err_target, &name)?;
-    let r_err = forward_alias(graph, &r_b, &err_link)
-        .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
-    let err_ops = &graph.blocks[err_target].operations;
-    let (errpay_idx, err_payload) = err_ops
+    let Some(r_err) = forward_alias(graph, &r_b, &err_link) else {
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        return Ok(());
+    };
+    let err_payload_read = graph.blocks[err_target]
+        .operations
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
@@ -6426,15 +6481,24 @@ fn try_fuse_drain_match(
                 op.result.clone().map(|e| (i, e))
             }
             _ => None,
-        })
-        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
+        });
+    let Some((errpay_idx, err_payload)) = err_payload_read else {
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        return Ok(());
+    };
     // A recast that retypes the payload may sit between the payload read
     // and the carrier predicate, and the predicate may be the single
     // successor of that recast (`with_roots!` restore hops included). A
     // keep-style predicate returns the reloaded handle as its second
     // field; `H` re-issues the predicate on the caught carrier.
-    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload, spec)
-        .map_err(|reason| format!("{name}: drain fuse: {reason}"))?;
+    let located =
+        match locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload, spec) {
+            Ok(located) => located,
+            Err(_) => {
+                catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+                return Ok(());
+            }
+        };
     let predicate_target = located.predicate_target.clone();
     let predicate_result = located.predicate_result.clone();
     let predicate_result_ty = located.predicate_result_ty.clone();
@@ -12098,6 +12162,330 @@ mod rebuilt_shell_collapse_tests {
                 .contains(&graph.name),
             );
         }
+    }
+}
+
+/// `match f() { Ok(_) => …, Err(e) if pred(x) => raise e, Err(_) => raise new }`.
+/// Discriminant 0/1 plus payload uses identify the Result drain; the Err
+/// edge is the exception link and the guard stays ordinary flow
+/// (`flowcontext.py` `FlowContext.guessexception`).
+#[cfg(test)]
+mod drain_fuse_guarded_err_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor};
+
+    fn disc_field() -> FieldDescriptor {
+        FieldDescriptor::new(
+            "__discriminant",
+            Some("core::result::Result<(),PyError>".into()),
+        )
+    }
+
+    fn err_pos0() -> FieldDescriptor {
+        FieldDescriptor::new(
+            "__pos_0",
+            Some("core::result::Result<(),PyError>::Err".into()),
+        )
+    }
+
+    fn spec() -> crate::ErrorCarrierSpec<'static> {
+        crate::ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        }
+    }
+
+    fn shell_ctors(graph: &FunctionGraph) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. } if result_ctor_kind(target).is_some())
+            })
+            .count()
+    }
+
+    /// Call → Result discriminant → `Ok(_)` / guarded `Err` + fallback raise.
+    fn guarded_err_fixture() -> (FunctionGraph, Variable, usize, usize) {
+        let mut graph = FunctionGraph::new("guarded_err_drain");
+        let iterable = graph.alloc_value_var();
+        let a = graph.startblock;
+        graph.blocks[a.0].inputargs = vec![iterable.clone()];
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+
+        let (m, m_args) = graph.create_block_with_arg_vars(2);
+        let shell_in = m_args[0].clone();
+        let iterable_m = m_args[1].clone();
+        let disc = graph
+            .push_op_var(
+                m,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: disc_field(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+
+        let (ok_arm, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(ok_arm, None);
+
+        let (err_guard, err_args) = graph.create_block_with_arg_vars(2);
+        let err_shell = err_args[0].clone();
+        let iterable_e = err_args[1].clone();
+        let e = graph
+            .push_op_var(
+                err_guard,
+                OpKind::FieldRead {
+                    base: err_shell,
+                    field: err_pos0(),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("err payload");
+        let pred = graph
+            .push_op_var(
+                err_guard,
+                OpKind::Call {
+                    target: CallTarget::function_path(["is_iterable"]),
+                    args: crate::model::call_args(vec![iterable_e]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("guard pred");
+
+        let (reraise, reraise_args) = graph.create_block_with_arg_vars(1);
+        crate::front::exc_from_raise::set_raise_from_instance(
+            &mut graph,
+            reraise,
+            reraise_args[0].clone(),
+        );
+
+        let (new_raise, _) = graph.create_block_with_arg_vars(0);
+        let fresh = graph
+            .push_op_var(
+                new_raise,
+                OpKind::Call {
+                    target: CallTarget::function_path(["type_error"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("new error");
+        crate::front::exc_from_raise::set_raise_from_instance(&mut graph, new_raise, fresh);
+
+        graph.block_mut(err_guard).exitswitch = Some(ExitSwitch::Value(pred));
+        graph.block_mut(err_guard).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(e)], reraise, Some(ExitCase::Bool(true))),
+            Link::new_mixed(Vec::new(), new_raise, Some(ExitCase::Bool(false))),
+        ];
+        graph.block_mut(m).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(m).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in), LinkArg::Value(iterable_m)],
+                err_guard,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(a, m, vec![r.clone(), iterable]);
+        (graph, r, reraise.0, new_raise.0)
+    }
+
+    #[test]
+    fn a_guarded_err_arm_fuses_to_last_exception() {
+        let (mut graph, r, reraise, new_raise) = guarded_err_fixture();
+        let a = graph.startblock.0;
+        try_fuse_drain_match(&mut graph, a, &r, "<(),PyError>", &ValueType::Void, spec())
+            .expect("guarded Err drain fuses");
+        assert!(
+            matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
+            "the call site is the exception link"
+        );
+        assert_eq!(shell_ctors(&graph), 0, "the rebuilt Result shells collapse");
+        assert!(
+            graph.blocks[reraise]
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the guarded re-raise reaches exceptblock"
+        );
+        assert!(
+            graph.blocks[new_raise]
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the fallback raise reaches exceptblock"
+        );
+    }
+
+    /// `Ok(_)` drops the unused payload phi: the Ok edge carries no shell.
+    /// Restore hops still sit between the call and the discriminant
+    /// (`with_roots!`). `split_result_ok_err_arms` already allows that
+    /// empty arm; collapse must too (`flowcontext.py`
+    /// `FlowContext.guessexception`).
+    fn discarded_ok_guarded_err_fixture() -> (FunctionGraph, Variable, usize, usize) {
+        let (mut graph, r, reraise, new_raise) = guarded_err_fixture();
+        let a = graph.startblock;
+        let m = graph.blocks[a.0].exits[0].target;
+        let (ok_arm, _) = graph.create_block_with_arg_vars(0);
+        graph.set_return(ok_arm, None);
+        graph.blocks[m.0].exits[0].args.clear();
+        graph.blocks[m.0].exits[0].target = ok_arm;
+        let (hop, hop_args) = graph.create_block_with_arg_vars(2);
+        graph.set_goto(hop, m, vec![hop_args[0].clone(), hop_args[1].clone()]);
+        let call_args: Vec<Variable> = graph.blocks[a.0].exits[0]
+            .args
+            .iter()
+            .filter_map(|arg| match arg {
+                LinkArg::Value(v) => Some(v.clone()),
+                LinkArg::Const(_) => None,
+            })
+            .collect();
+        graph.set_goto(a, hop, call_args);
+        (graph, r, reraise, new_raise)
+    }
+
+    #[test]
+    fn a_discarded_ok_payload_with_guarded_err_fuses_to_last_exception() {
+        let (mut graph, r, reraise, new_raise) = discarded_ok_guarded_err_fixture();
+        let a = graph.startblock.0;
+        try_fuse_drain_match(
+            &mut graph,
+            a,
+            &r,
+            "<*mut PyObject,PyError>",
+            &ValueType::Ref(None),
+            spec(),
+        )
+        .expect("discarded Ok(_) with guarded Err fuses");
+        assert!(
+            matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
+            "the call site is the exception link"
+        );
+        assert_eq!(shell_ctors(&graph), 0, "the rebuilt Result shells collapse");
+        assert!(
+            graph.blocks[reraise]
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the guarded re-raise reaches exceptblock"
+        );
+        assert!(
+            graph.blocks[new_raise]
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the fallback raise reaches exceptblock"
+        );
+    }
+
+    #[test]
+    fn a_method_on_the_result_shell_stays_unfused() {
+        let mut graph = FunctionGraph::new("shell_method_not_a_drain");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (m, m_args) = graph.create_block_with_arg_vars(1);
+        let shell_in = m_args[0].clone();
+        let disc = graph
+            .push_op_var(
+                m,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: disc_field(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+        let (ok_arm, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(ok_arm, None);
+        let (err_arm, err_args) = graph.create_block_with_arg_vars(1);
+        graph
+            .push_op_var(
+                err_arm,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "is_ok",
+                        Some("core::result::Result<(),PyError>".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_args[0].clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("method on the shell");
+        graph.set_return(err_arm, None);
+        graph.block_mut(m).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(m).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in)],
+                err_arm,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(a, m, vec![r.clone()]);
+        let err = try_fuse_drain_match(
+            &mut graph,
+            a.0,
+            &r,
+            "<(),PyError>",
+            &ValueType::Void,
+            spec(),
+        )
+        .expect_err("a method on the Result shell is not a drain");
+        assert!(
+            err.contains("outside __pos_0") || err.contains("Result"),
+            "{err}"
+        );
+        assert!(
+            !matches!(
+                graph.blocks[a.0].exitswitch,
+                Some(ExitSwitch::LastException)
+            ),
+            "identification failure does not rewrite the call"
+        );
     }
 }
 
