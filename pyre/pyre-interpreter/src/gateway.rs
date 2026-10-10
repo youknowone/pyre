@@ -2215,6 +2215,20 @@ pub fn make_module_builtin_function_passthrough0(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_builtin_function` carrying `BuiltinCodePassThroughArguments0`.
+///
+/// Used for module-namespace functions that were already registered as
+/// `Function` (not `BuiltinFunction`) and must keep that carrier while
+/// keyword calls go through `func_args`.
+pub fn make_builtin_function_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough0(name, func, func_args);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// Method-descriptor `BuiltinCodePassThroughArguments1`.
 pub fn make_builtin_function_passthrough1(
     name: &'static str,

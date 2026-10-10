@@ -4,7 +4,8 @@ use num_traits::ToPrimitive;
 
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
-    make_module_builtin_function_with_arity, make_module_builtin_function_with_doc,
+    make_module_builtin_function_passthrough0, make_module_builtin_function_with_arity,
+    make_module_builtin_function_with_doc,
 };
 use pyre_object::*;
 use ruff_text_size::Ranged;
@@ -3551,7 +3552,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "breakpoint", || {
-        make_module_builtin_function("breakpoint", builtin_breakpoint)
+        make_module_builtin_function_passthrough0(
+            "breakpoint",
+            builtin_breakpoint,
+            builtin_breakpoint_args,
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "callable", || {
         make_module_builtin_function_with_arity("callable", builtin_callable, 1)
@@ -26446,6 +26451,32 @@ fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         live_args.push(roots.get(base + index));
     }
     call_forwarding_args(hook, &live_args)
+}
+
+/// Keyword path: `space.call_args(sys.breakpointhook, __args__)`.
+fn builtin_breakpoint_args(
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos = &args.arguments_w;
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos_base = roots.pin_roots(pos);
+    let names_base = roots.pin_roots(names);
+    let values_base = roots.pin_roots(values);
+    let npos = pos.len();
+    let nnames = names.len();
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {
+        return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
+    };
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(names_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| roots.get(values_base + i)).collect();
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    crate::call::call_args(hook, &forwarded)
 }
 
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.

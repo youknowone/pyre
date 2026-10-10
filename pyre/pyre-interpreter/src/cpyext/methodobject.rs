@@ -227,7 +227,11 @@ pub fn pycfunction_type() -> PyObjectRef {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__call__",
-                    crate::make_builtin_function("__call__", descr_call),
+                    crate::gateway::make_builtin_function_passthrough1(
+                        "__call__",
+                        descr_call,
+                        descr_call_args,
+                    ),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
@@ -888,6 +892,22 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let carrier = args[0];
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    descr_call_method(carrier, positional, kwargs)
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+fn descr_call_args(
+    carrier: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    descr_call_method(carrier, &args.arguments_w, arguments_as_kwargs_dict(args)?)
+}
+
+fn descr_call_method(
+    carrier: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let Some(method) = method_def(carrier) else {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
@@ -901,6 +921,22 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     };
     call_method_def_in_class(method, w_self, carrier_class(carrier), positional, kwargs)
+}
+
+/// Build a real kwargs dict from `Arguments.keyword_names_w` / `keywords_w`.
+pub(super) fn arguments_as_kwargs_dict(
+    args: &crate::argument::Arguments,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let dict = pyre_object::dictmultiobject::w_dict_new();
+    for (name, value) in names.iter().zip(values.iter()) {
+        crate::baseobjspace::setitem(dict, *name, *value)?;
+    }
+    Ok(Some(dict))
 }
 
 /// Validate one call against its `ml_flags` and hand it to the bridge, naming
