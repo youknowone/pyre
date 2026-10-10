@@ -162,7 +162,7 @@ pub fn select(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
 

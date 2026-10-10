@@ -847,6 +847,9 @@ fn real_main(binary_name: &str) {
             .is_some()
             || payload
                 .downcast_ref::<majit_metainterp::optimize::SpeculativeError>()
+                .is_some()
+            || payload
+                .downcast_ref::<pyre_interpreter::runtime_ops::SandboxStub>()
                 .is_some();
         if !is_silent_control_flow {
             // The suite runner keeps a signal death's last stderr line, and

@@ -804,12 +804,12 @@ pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
     Ok(result)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "host_env", not(feature = "sandbox")))]
 fn defining_module() -> &'static str {
     module_path!()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     use super::*;
 

@@ -80,6 +80,7 @@ pub mod executioncontext;
 pub mod frame_array;
 pub mod function;
 pub mod gateway;
+mod host_seam_stub;
 // The OS-call seam (real syscalls vs. sandbox marshalling trampolines). Unix
 // only: the real bodies use libc and the unix `OsStr`/`OsString` byte views.
 #[cfg(unix)]
@@ -148,6 +149,10 @@ pub mod host_seam {
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
+
+    pub use crate::host_seam_stub::catch_sandbox_stub;
+    #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+    pub use crate::host_seam_stub::stub;
 }
 pub mod app_functional;
 #[cfg(feature = "host_env")]
