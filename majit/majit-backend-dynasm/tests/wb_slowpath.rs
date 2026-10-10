@@ -1,8 +1,8 @@
 //! `assembler.py _build_wb_slowpath`: the slow path of `COND_CALL_GC_WB`
 //! and `COND_CALL_GC_WB_ARRAY` `CALL`s a helper shared by every site. It
 //! must reach the GC with the pushed object, come back to the
-//! card-marking `JNS`, and hand back the live core and XMM registers.
-#![cfg(target_arch = "x86_64")]
+//! card-marking branch, and hand back the live core and float registers.
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use majit_backend::{Backend, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
@@ -70,7 +70,7 @@ fn cond_call_gc_wb_slowpath_reaches_the_gc_and_keeps_live_registers() {
             &[OpRef::input_arg_ref(0)]
         };
         // The sum crosses the barrier in a core register, the float one in
-        // an XMM register; a failing guard hands both back.
+        // a float register; a failing guard hands both back.
         let fail_args = [
             OpRef::float_op(4),
             OpRef::int_op(3),
@@ -132,6 +132,6 @@ fn cond_call_gc_wb_slowpath_reaches_the_gc_and_keeps_live_registers() {
     assert_eq!(
         card_byte,
         1 << (card & 7),
-        "the JNS fall-through must dirty the index's card"
+        "the card-set branch must dirty the index's card"
     );
 }

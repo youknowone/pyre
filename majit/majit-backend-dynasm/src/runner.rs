@@ -3329,7 +3329,7 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_headerless = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
@@ -3347,7 +3347,7 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             inputargs,
             &prepared_ops,
@@ -3600,7 +3600,7 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_headerless = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
@@ -3618,7 +3618,7 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             &inputargs,
             &prepared_ops,
@@ -4822,6 +4822,8 @@ impl Backend for DynasmBackend {
                 .ensure_malloc_slowpath_headerless(&self.descr_attachments);
             self.arch_cpu_ext.ensure_wb_slowpath();
         }
+        #[cfg(target_arch = "aarch64")]
+        self.arch_cpu_ext.ensure_wb_slowpath();
     }
 
     /// `backend/<arch>/__init__.py` parity — pyre's dynasm backend
