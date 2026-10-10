@@ -4617,23 +4617,33 @@ pub fn walk<Sym: WalkSym>(
         // at the CALL for an arm the walk may never take.
         //
         // Before `step`, so nothing of the offending op is recorded or
-        // executed: the op is the effect, and the decline promises the
-        // enclosing CALL can be re-entered from scratch.  Everything walked up
-        // to this point passed the scan, so it committed no live-heap effect
-        // for the rewind to have to undo.
-        if ctx
+        // executed: the op is the effect, and `pc` is an opcode boundary of
+        // this frame.
+        //
+        // The refusal is an abort of THIS frame like any `step` error, so it
+        // takes the same arm below.  A prefix that executed nothing leaves the
+        // enclosing CALL re-enterable (the carrier-owned decline).  A prefix
+        // that did execute — a handler entry published its exception in
+        // `sys_exc_value` before the refused op — is finished from here by
+        // `convert_and_run_from_pyjitpl`: the image is latched at this frame's
+        // own `pc`.  Leaving that latch to the caller pairs the abort with the
+        // CALL instead, which runs the callee a second time on top of the
+        // handler state the first run left published.
+        let poisoned = ctx
             .inline_poison_pcs
             .as_ref()
-            .is_some_and(|pcs| pcs.binary_search(&pc).is_ok())
-        {
+            .is_some_and(|pcs| pcs.binary_search(&pc).is_ok());
+        let stepped = if poisoned {
             if fbw_inline_diag_enabled() {
                 eprintln!("[inline-poison-refuse] pc={pc}");
             }
             census_record("InlineCallee::PoisonedPcReached");
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
-            return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
-        }
-        let (outcome, next_pc) = match step(code, pc, ctx) {
+            Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee))
+        } else {
+            step(code, pc, ctx)
+        };
+        let (outcome, next_pc) = match stepped {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
             // sub-walk driver to push its callee.  Preserve this frame at the
@@ -8792,6 +8802,12 @@ pub(crate) enum InlineAbortCarrier {
         /// [`crate::trace::WalkEndResume::Rewind`] and must prove the odometer
         /// has not moved since.
         entry_executed_effects: usize,
+        /// [`fbw_state::fbw_sys_exc_journal_len`] at that CALL.  The odometer
+        /// above does not count the journaled `sys_exc_value` stores a
+        /// handler entry in the discarded callee applied, and the re-executed
+        /// CALL saves whatever the slot holds as its own `prev`; the flush
+        /// rewinds the journal to this length first.
+        entry_sys_exc_journal_len: usize,
     },
     MidBody(MidBodyPayload),
 }
@@ -8851,6 +8867,8 @@ pub(crate) struct EntryFallback {
     pub call_stack: Vec<pyre_object::PyObjectRef>,
     /// See [`InlineAbortCarrier::Entry::entry_executed_effects`].
     pub entry_executed_effects: usize,
+    /// See [`InlineAbortCarrier::Entry::entry_sys_exc_journal_len`].
+    pub entry_sys_exc_journal_len: usize,
 }
 
 /// Eager in-place cell write the StoreName/StoreGlobal fold applied.
@@ -11352,30 +11370,68 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     // The anchor answers only when the walk stepped past the block head: the
     // `-live-` it names must be a LATER one, or it is the block head itself
     // (or a stale word from a walk that entered mid-opcode) and carrying it
-    // resumes on the landing this exists to skip.  An inline sub-walk's
-    // `op_pc` is a callee coordinate the outer jitcode's tables do not hold,
-    // and its capture resumes at the CALL site instead, so the anchor is not
-    // this guard's to carry there.
+    // resumes on the landing this exists to skip.
+    //
+    // The block head is read from the jitcode that owns `op_pc`.  For an
+    // inlined Python callee that is the callee's own jitcode, and the anchor
+    // is this guard's to carry only when the capture resumes in the callee
+    // frame (`walker_inline_guard_resumes_in_callee`).  A callee whose guards
+    // collapse to the caller's CALL, and a translated helper body, have no
+    // coordinate of their own for it.
     let anchor = ctx.live_before_jit_pc;
-    if anchor == usize::MAX || ctx.fbw_mode.inline_subwalk {
-        return Ok(false);
+    let decline = |why: &str| {
+        if fbw_inline_diag_enabled() {
+            eprintln!("[anchored-fold-guard-decline] pc={op_pc} opcode={opcode:?} why={why}");
+        }
+        Ok(false)
+    };
+    if anchor == usize::MAX {
+        return decline("no -live- stepped in this walk");
     }
-    let block_head = {
+    let block_head = if ctx.fbw_mode.inline_subwalk {
+        if ctx.fbw_mode.transparent_helper_subwalk {
+            return decline("translated helper body");
+        }
+        if !resume_snapshot::walker_inline_guard_resumes_in_callee(ctx) {
+            return decline("inlined callee guards resume at the caller CALL");
+        }
+        let callee_w_code = ctx
+            .session
+            .borrow()
+            .framestack
+            .last()
+            .map(|frame| frame.w_code);
+        let callee_jitcode_index = match callee_w_code {
+            Some(0) => ctx
+                .inline_callee_consts
+                .as_ref()
+                .map(|consts| consts.jitcode_index)
+                .filter(|index| *index >= 0),
+            Some(w_code) => crate::state::ensure_jitcode_index(w_code as *const ()),
+            None => None,
+        };
+        let Some(callee_pjc) =
+            callee_jitcode_index.and_then(crate::state::pyjitcode_for_jitcode_index)
+        else {
+            return decline("inlined callee names no jitcode");
+        };
+        callee_pjc.resume_marker_for_jitcode_pc(op_pc)
+    } else {
         let sym = ctx.fbw_mode.snapshot_sym;
         if sym.is_null() {
-            return Ok(false);
+            return decline("walk carries no snapshot symbol");
         }
         let jitcode = unsafe { (&*sym).jitcode() };
         if jitcode.is_null() {
-            return Ok(false);
+            return decline("snapshot symbol names no jitcode");
         }
         unsafe { (&*jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
     };
     let Some(block_head) = block_head else {
-        return Ok(false);
+        return decline("no block-head marker for this pc");
     };
     if anchor <= block_head {
-        return Ok(false);
+        return decline("anchor is the block head");
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);

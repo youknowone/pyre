@@ -7190,6 +7190,7 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     is_top_inline: bool,
     unjournaled_before_subwalk: bool,
     executed_effects_before: usize,
+    sys_exc_journal_len_before: usize,
     abort_flush_call_jitcode_coord: Option<(u32, usize)>,
 ) {
     if !is_top_inline
@@ -7214,7 +7215,12 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr)
         .or_else(|| reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc))
     {
-        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
+        fbw_set_abort_call_resume(
+            outer_jitcode_index,
+            call_jitcode_pc,
+            stack,
+            sys_exc_journal_len_before,
+        );
     }
 }
 
@@ -10014,6 +10020,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // the same Entry-carrier predicates as a zero-effect sub-walk abort.
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
     let executed_effects_before = fbw_executed_effect_count();
+    let sys_exc_journal_len_before = fbw_sys_exc_journal_len();
     let is_top_inline = !ctx.fbw_mode.inline_subwalk;
     let abort_flush_call_jitcode_coord: Option<(u32, usize)> = if is_top_inline {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -10941,6 +10948,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     is_top_inline,
                     unjournaled_before_subwalk,
                     executed_effects_before,
+                    sys_exc_journal_len_before,
                     abort_flush_call_jitcode_coord,
                 );
             }
@@ -10980,6 +10988,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         is_top_inline,
                         unjournaled_before_subwalk,
                         executed_effects_before,
+                        sys_exc_journal_len_before,
                         abort_flush_call_jitcode_coord,
                     );
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11095,6 +11104,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 is_top_inline,
                                 unjournaled_before_subwalk,
                                 executed_effects_before,
+                                sys_exc_journal_len_before,
                                 abort_flush_call_jitcode_coord,
                             );
                             return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11143,6 +11153,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             is_top_inline,
                             unjournaled_before_subwalk,
                             executed_effects_before,
+                            sys_exc_journal_len_before,
                             abort_flush_call_jitcode_coord,
                         );
                         return Err(DispatchError::callee_inline_unsupported(op.pc));

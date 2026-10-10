@@ -695,6 +695,7 @@ fn try_commit_entry_carrier_call(
     call_jitcode_pc: usize,
     call_stack: &[pyre_object::PyObjectRef],
     entry_executed_effects: usize,
+    entry_sys_exc_journal_len: usize,
 ) -> Option<usize> {
     let resume = WalkEndResume::Rewind {
         effects_at_resume_point: entry_executed_effects,
@@ -739,6 +740,12 @@ fn try_commit_entry_carrier_call(
     }
     let committed = commit_walk_end(flush_committed, WalkEndCommitLeg::EntryCarrierCall, resume);
     debug_assert!(committed, "provability re-checked after a pure flush");
+    // The commit keeps the walk's journals, but the CALL this leg rewinds to
+    // runs again from scratch: a handler entry in the discarded callee
+    // published its exception in `sys_exc_value`, and the re-run's own
+    // `PUSH_EXC_INFO` would save that as `prev` and reinstate it on the way
+    // out.  Hand the slot back as the CALL found it.
+    crate::jitcode_dispatch::fbw_sys_exc_journal_rollback_to(entry_sys_exc_journal_len);
     Some(call_py_pc)
 }
 
@@ -5467,6 +5474,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     call_jitcode_pc,
                     call_stack,
                     entry_executed_effects,
+                    entry_sys_exc_journal_len,
                 }) => {
                     committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
                         ctx,
@@ -5477,6 +5485,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         *call_jitcode_pc,
                         call_stack,
                         *entry_executed_effects,
+                        *entry_sys_exc_journal_len,
                     );
                 }
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
@@ -5543,6 +5552,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                     payload.call_jitcode_pc,
                                     &fallback.call_stack,
                                     fallback.entry_executed_effects,
+                                    fallback.entry_sys_exc_journal_len,
                                 );
                             }
                         }
