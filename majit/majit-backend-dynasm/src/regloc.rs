@@ -123,6 +123,16 @@ pub struct ImmedLoc {
     pub value: i64,
 }
 
+/// `regloc.py` `ConstFloatLoc`: absolute address of an 8-byte literal in
+/// the machine data block. Location code `'j'`, an
+/// `ImmediateAssemblerLocation`, width 8. The address is what
+/// `X86XMMRegisterManager.convert_to_imm` returns; the bits live at
+/// `value`, not in this word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstFloatLoc {
+    pub value: usize,
+}
+
 impl ImmedLoc {
     pub fn new(value: i64) -> Self {
         ImmedLoc { value }
@@ -150,6 +160,8 @@ pub enum Loc {
     Frame(FrameLoc),
     Immed(ImmedLoc),
     ImmedFloat(ImmedLoc),
+    /// `ConstFloatLoc`. Address-bearing; not the float's bit pattern.
+    ConstFloat(ConstFloatLoc),
     Addr(AddressLoc),
 }
 
@@ -204,8 +216,12 @@ impl Loc {
     pub fn is_stack(&self) -> bool {
         matches!(self, Loc::Frame(_) | Loc::Ebp(_))
     }
+    /// `ImmediateAssemblerLocation`: `ImmedLoc` and `ConstFloatLoc`.
     pub fn is_immed(&self) -> bool {
-        matches!(self, Loc::Immed(_) | Loc::ImmedFloat(_))
+        matches!(
+            self,
+            Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_)
+        )
     }
 
     pub fn as_reg(&self) -> Option<RegLoc> {

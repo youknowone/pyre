@@ -13,6 +13,7 @@
 ///   valid_addressing_size  — regalloc.py
 ///   get_scale              — regalloc.py
 use indexmap::IndexMap;
+use majit_backend::BackendError;
 use majit_ir::IndexMapExt;
 use rustc_hash::FxBuildHasher;
 
@@ -793,6 +794,16 @@ pub struct RegisterManager {
     /// RPython calls self.assembler.regalloc_mov() directly; in Rust we
     /// collect moves here and flush them to the assembler's output.
     pub spill_moves: Vec<(Loc, Loc)>,
+    /// `X86XMMRegisterManager.assembler.datablockwrapper`. `0` on the GPR
+    /// manager and on aarch64. The x86 assembler installs the pointer on
+    /// the XMM manager after `prepare_loop` / `prepare_bridge` (those
+    /// rebuild this manager) and after `emit_check_frame_depth`, immediately
+    /// before `walk_operations`.
+    datablockwrapper: usize,
+    /// First `MachineDataBlockWrapper.malloc_aligned` failure.
+    /// `open_malloc` raises `MemoryError`; `walk_operations` returns it as
+    /// `BackendError::CompilationFailed` so `consider_*` stays infallible.
+    pool_error: Option<std::io::Error>,
 }
 
 /// Resolve a constant `OpRef` to its `i64` bit pattern.
@@ -898,7 +909,15 @@ impl RegisterManager {
             box_currently_in_frame_reg: None,
             position: -1,
             spill_moves: Vec::new(),
+            datablockwrapper: 0,
+            pool_error: None,
         }
+    }
+
+    /// Attach `X86XMMRegisterManager.assembler.datablockwrapper` for this walk.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_datablockwrapper(&mut self, wrapper: &mut majit_backend::MachineDataBlockWrapper) {
+        self.datablockwrapper = wrapper as *mut majit_backend::MachineDataBlockWrapper as usize;
     }
 
     // ── RegBindingsDict equivalent ──
@@ -1301,6 +1320,13 @@ impl RegisterManager {
         constants: &indexmap::IndexMap<u32, i64>,
     ) -> Loc {
         if v.is_constant() {
+            // `RegisterManager.loc`: a Const goes through `convert_to_imm`.
+            // With `datablockwrapper` set this is
+            // `X86XMMRegisterManager.convert_to_imm` (`ConstFloatLoc`).
+            // The GPR manager has no wrapper and keeps an `ImmedLoc`.
+            if self.datablockwrapper != 0 {
+                return self.convert_to_imm(v, constants);
+            }
             // history.py/268/314 — inline-Const variants carry the
             // value directly; legacy pool-indexed variants resolve through
             // the constants snapshot.
@@ -1328,7 +1354,7 @@ impl RegisterManager {
             .or_else(|| constants.get(&v.raw()).copied())
         {
             if tp == Type::Float || self.is_float_constant(v) {
-                return Loc::immed_float(val);
+                return self.float_const_loc(val as u64);
             }
             return Loc::immed(val);
         }
@@ -1620,9 +1646,19 @@ impl RegisterManager {
 
     // ── x86-specific methods ──
 
-    /// x86/regalloc.py convert_to_imm
-    pub fn convert_to_imm(&self, v: OpRef, constants: &indexmap::IndexMap<u32, i64>) -> Loc {
+    /// `X86RegisterManager.convert_to_imm` / `X86XMMRegisterManager.convert_to_imm`.
+    ///
+    /// The XMM manager (`datablockwrapper` installed) does
+    /// `malloc_aligned(8, 8)`, writes `getfloatstorage()`, and returns
+    /// `ConstFloatLoc`. A `MemoryError` from `open_malloc` is kept in
+    /// `pool_error` and surfaced by `walk_operations`. The GPR manager
+    /// returns `imm`.
+    pub fn convert_to_imm(&mut self, v: OpRef, constants: &indexmap::IndexMap<u32, i64>) -> Loc {
         debug_assert!(v.is_constant());
+        let val = const_bits_or_panic(v, constants, "convert_to_imm");
+        if self.datablockwrapper != 0 {
+            return self.float_const_loc(val as u64);
+        }
         // x86/regalloc.py:58-61: a non-null `ConstPtr` whose object can
         // still move must never be baked as an immediate — `remove_constptr`
         // (rewrite.py:1100) routes those through the gc_table. Null and
@@ -1636,14 +1672,44 @@ impl RegisterManager {
         {
             panic!("convert_to_imm: ConstPtr needs special care");
         }
-        // history.py/268/314 — inline-Const variants carry the value
-        // directly; legacy pool-indexed Const variants look up the i64
-        // raw bits via the constants snapshot.
-        let val = const_bits_or_panic(v, constants, "convert_to_imm");
         if self.is_float_constant(v) {
             Loc::immed_float(val)
         } else {
             Loc::immed(val)
+        }
+    }
+
+    /// `X86XMMRegisterManager.convert_to_imm` when this manager owns the
+    /// data block; otherwise the bit pattern stays an `ImmedFloat`.
+    fn float_const_loc(&mut self, bits: u64) -> Loc {
+        if self.datablockwrapper == 0 {
+            return Loc::immed_float(bits as i64);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wrapper = unsafe {
+                &mut *(self.datablockwrapper as *mut majit_backend::MachineDataBlockWrapper)
+            };
+            match wrapper.malloc_aligned(8, 8) {
+                Ok(adr) => {
+                    // `compile_loop` / `compile_bridge` hold `AssemblerWriting::enter`
+                    // across the walk, so this store is inside the write window.
+                    unsafe { (adr as *mut u64).write(bits) };
+                    Loc::ConstFloat(ConstFloatLoc { value: adr })
+                }
+                Err(err) => {
+                    if self.pool_error.is_none() {
+                        self.pool_error = Some(err);
+                    }
+                    // Not emitted: `walk_operations` returns before the assembler.
+                    Loc::ConstFloat(ConstFloatLoc { value: 0 })
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = bits;
+            Loc::immed_float(bits as i64)
         }
     }
 
@@ -2247,6 +2313,18 @@ impl<'a> RegAlloc<'a> {
         {
             return loc;
         }
+        // x86/regalloc.py `RegAlloc.make_sure_var_in_reg`: a `ConstFloat` is
+        // `FloatImmedLoc(getfloatstorage())` before `xrm.make_sure_var_in_reg`,
+        // so `save_into_mem` stores the bits and never a `ConstFloatLoc`.
+        // `selected_reg` / `need_lower_byte` do not apply on that path.
+        // aarch64/regalloc.py `Regalloc.make_sure_var_in_reg` has no such
+        // short-circuit: `ARMRegisterManager.return_constant` loads
+        // `ConstFloatLoc` into a VFP scratch, and with no data block that
+        // load is still `convert_to_imm`'s `ImmedFloat`.
+        #[cfg(target_arch = "x86_64")]
+        if tp == Type::Float && v.is_constant() {
+            return Loc::immed_float(self.const_value(v));
+        }
         if tp == Type::Float {
             self.xrm.make_sure_var_in_reg(
                 v,
@@ -2611,10 +2689,22 @@ impl<'a> RegAlloc<'a> {
             self.faillocs_arena.push(None);
             return;
         }
-        // RPython: isinstance(arg, Const) → convert_to_imm(arg)
         if arg.is_constant() {
-            self.faillocs_arena
-                .push(Some(self.rm.convert_to_imm(arg, &self.constants)));
+            let tp = self.tp(arg);
+            if tp == Type::Float {
+                // `locs_for_fail` is `[self.loc(arg) for arg in getfailargs()]`.
+                // A float constant is `X86XMMRegisterManager.convert_to_imm`
+                // (`ConstFloatLoc`) once the data block is installed. The GPR
+                // manager's `convert_to_imm` would leave the bits as `ImmedFloat`.
+                let loc = self.loc(arg, tp);
+                self.faillocs_arena.push(Some(loc));
+            } else {
+                // Integer / ConstPtr stay on the GPR manager. `rm.loc` with
+                // no wrapper skips the movable-ConstPtr check in
+                // `X86RegisterManager.convert_to_imm`.
+                self.faillocs_arena
+                    .push(Some(self.rm.convert_to_imm(arg, &self.constants)));
+            }
             return;
         }
         let tp = self.tp(arg);
@@ -2651,7 +2741,11 @@ impl<'a> RegAlloc<'a> {
     // ── walk_operations + consider_* ──
 
     /// x86/regalloc.py walk_operations — main dispatch loop.
-    pub fn walk_operations(&mut self) -> Vec<RegAllocOp> {
+    ///
+    /// `MachineDataBlockWrapper.malloc_aligned` → `_allocate_next_block` →
+    /// `open_malloc` raises `MemoryError`. That becomes
+    /// `BackendError::CompilationFailed` for `assemble_loop` / `assemble_bridge`.
+    pub fn walk_operations(&mut self) -> Result<Vec<RegAllocOp>, BackendError> {
         self.faillocs_arena.clear();
         self.arglocs_arena.clear();
         // One reserve for the walk: a per-guard `Vec` was 96 B
@@ -2714,6 +2808,16 @@ impl<'a> RegAlloc<'a> {
                 self._dispatch_j2(&j2_op, op, i, &mut output);
                 self._free_j2_op_vars(&j2_op, op);
             }
+            if let Some(err) = self
+                .xrm
+                .pool_error
+                .take()
+                .or_else(|| self.rm.pool_error.take())
+            {
+                return Err(BackendError::CompilationFailed(format!(
+                    "MachineDataBlockWrapper.malloc_aligned: {err}"
+                )));
+            }
         }
 
         // x86/regalloc.py:400-401 free inputargs
@@ -2722,7 +2826,7 @@ impl<'a> RegAlloc<'a> {
             self.possibly_free_var(opref, iarg.tp.get());
         }
 
-        output
+        Ok(output)
     }
 
     /// Free args and result of an op (x86/regalloc.py:308).
@@ -4475,20 +4579,19 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
-    /// x86/regalloc.py same_as / identity operations
-    /// aarch64/regalloc.py _prepare_op_same_as.
+    /// x86/regalloc.py `_consider_same_as` / aarch64 `prepare_op_same_as`.
     ///
-    /// RPython: argloc = convert_to_imm(arg) if imm else make_sure_var_in_reg(arg)
-    ///          possibly_free_vars_for_op(op); free_temp_vars()
-    ///          resloc = force_allocate_reg(op)
+    /// A constant is `self.loc`: FLOAT goes to
+    /// `X86XMMRegisterManager.convert_to_imm` (`ConstFloatLoc`). The GPR
+    /// manager's `convert_to_imm` would leave those bits in `ImmedFloat`.
+    /// A non-constant is forced into the result's register bank.
     #[allow(dead_code)] // x86/regalloc.py consider_same_as
     fn consider_same_as(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
         let arg = op.arg(0).to_opref();
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
-        // aarch64/regalloc.py:880-884
         let argloc = if arg.is_constant() {
-            self.rm.convert_to_imm(arg, &self.constants)
+            self.loc(arg, self.tp(arg))
         } else {
             self.make_sure_var_in_reg(arg, tp, &args, None, false)
         };
@@ -4511,8 +4614,9 @@ impl<'a> RegAlloc<'a> {
     ) {
         let tp = op.opcode.result_type();
         let args = [arg];
+        // `_consider_same_as`: `argloc = self.loc(op.getarg(0))`.
         let argloc = if arg.is_constant() {
-            self.rm.convert_to_imm(arg, &self.constants)
+            self.loc(arg, self.tp(arg))
         } else {
             self.make_sure_var_in_reg(arg, tp, &args, None, false)
         };
@@ -7005,6 +7109,7 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
         (Loc::Immed(ia) | Loc::ImmedFloat(ia), Loc::Immed(ib) | Loc::ImmedFloat(ib)) => {
             ia.value == ib.value
         }
+        (Loc::ConstFloat(a), Loc::ConstFloat(b)) => a.value == b.value,
         _ => false,
     }
 }
@@ -7310,7 +7415,7 @@ mod tests {
         let ops = rcs(vec![add1, add2, finish]);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         let two_loc: Vec<(u32, u32)> = ra_ops
             .iter()
             .filter_map(|ra_op| match ra_op {
@@ -7373,7 +7478,7 @@ mod tests {
         let ops = rcs(ops);
         let mut ra = RegAlloc::new(constants, &inputargs, &ops);
         ra.prepare_loop();
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
 
         let guard_faillocs = ra_ops.iter().find_map(|ra_op| match ra_op {
             RegAllocOp::PerformGuard {
@@ -7437,7 +7542,7 @@ mod tests {
         let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
-        ra.walk_operations();
+        ra.walk_operations().expect("walk_operations");
     }
 
     /// aarch64/assembler.py:1191-1195: the OVF op's answer lives in NZCV, so
@@ -7473,7 +7578,7 @@ mod tests {
             args: vec![i0].into(),
         }];
 
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         let dispatched = ra_ops.iter().find_map(|ra_op| match ra_op {
             RegAllocOp::Perform {
                 op_index,
@@ -7526,7 +7631,7 @@ mod tests {
             arg: i1,
         }];
 
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         let move_src = ra_ops.iter().find_map(|ra_op| {
             if let RegAllocOp::Move { src, .. } = ra_op {
                 return Some(*src);
@@ -7578,7 +7683,7 @@ mod tests {
         let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
 
         let lengthloc = ra_ops
             .iter()
@@ -7628,7 +7733,7 @@ mod tests {
             fail_args: vec![].into(),
         }];
 
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         assert!(
             has_move_from(&ra_ops, &expected_argloc),
             "guard dispatch should materialize the LIR condition, not the raw Op arg: {:?}",
@@ -7669,7 +7774,7 @@ mod tests {
             size: Some(c8),
         }];
 
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         assert!(
             has_move_from(&ra_ops, &expected_argloc),
             "load dispatch should materialize the LIR base, not the raw Op base: {:?}",
@@ -7713,7 +7818,7 @@ mod tests {
             size: Some(c8),
         }];
 
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         assert!(
             has_move_from(&ra_ops, &expected_argloc),
             "store dispatch should materialize the LIR base, not the raw Op base: {:?}",
@@ -7749,7 +7854,7 @@ mod tests {
             fail_args: vec![].into(),
         }];
 
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations().expect("walk_operations");
         assert!(
             has_move_from(&ra_ops, &expected_argloc),
             "generic j2 opcode dispatch should materialize the LIR arg, not the raw Op arg: {:?}",
@@ -7782,7 +7887,7 @@ mod tests {
         let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
-        let output = ra.walk_operations();
+        let output = ra.walk_operations().expect("walk_operations");
         // FORCE_TOKEN produces a Ref in a register, with no pre-existing
         // inputarg frame home. SAVE_ALL_REGS must emit a real spill for it.
         let Some(RegAllocOp::Perform {
@@ -7846,6 +7951,214 @@ mod tests {
                 );
             }
             other => panic!("expected PerformGuard, got {other:?}"),
+        }
+    }
+
+    /// `X86XMMRegisterManager.convert_to_imm` parks the constant with
+    /// `MachineDataBlockWrapper.malloc_aligned` and hands that address to the
+    /// walk. `open_malloc` raises `MemoryError`; `walk_operations` returns it
+    /// as `BackendError::CompilationFailed`.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn xmm_convert_to_imm_address_and_malloc_failure() {
+        fn float_add_trace() -> (Vec<majit_ir::InputArgRc>, Vec<OpRc>) {
+            let inputargs = vec![InputArg::new_float_rc(0)];
+            let add = Op::new(
+                OpCode::FloatAdd,
+                &[rb(OpRef::input_arg_float(0)), rb(OpRef::const_float(1.5))],
+            );
+            add.pos().set(OpRef::float_op(1));
+            let finish = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
+            finish.pos().set(OpRef::void_op(2));
+            finish.setfailargs(vec![].into());
+            finish.set_fail_arg_types(vec![Type::Float]);
+            (inputargs, rcs(vec![add, finish]))
+        }
+
+        fn same_as_float_trace() -> (Vec<majit_ir::InputArgRc>, Vec<OpRc>) {
+            let same = Op::new(OpCode::SameAsF, &[rb(OpRef::const_float(1.5))]);
+            same.pos().set(OpRef::float_op(1));
+            let finish = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
+            finish.pos().set(OpRef::void_op(2));
+            finish.setfailargs(vec![].into());
+            finish.set_fail_arg_types(vec![Type::Float]);
+            (vec![], rcs(vec![same, finish]))
+        }
+
+        fn const_float_addrs(ra: &RegAlloc<'_>, ops: &[RegAllocOp]) -> Vec<usize> {
+            let mut addrs = Vec::new();
+            let mut note = |loc: &Loc| {
+                if let Loc::ConstFloat(loc) = loc {
+                    addrs.push(loc.value);
+                }
+            };
+            for op in ops {
+                match op {
+                    RegAllocOp::Move { src, dst } => {
+                        note(src);
+                        note(dst);
+                    }
+                    RegAllocOp::Perform1 {
+                        loc, result_loc, ..
+                    } => {
+                        note(loc);
+                        if let Some(result) = result_loc {
+                            note(result);
+                        }
+                    }
+                    RegAllocOp::Perform {
+                        arglocs_start,
+                        arglocs_len,
+                        result_loc,
+                        ..
+                    } => {
+                        for loc in ra.arglocs(*arglocs_start, *arglocs_len) {
+                            note(loc);
+                        }
+                        if let Some(result) = result_loc {
+                            note(result);
+                        }
+                    }
+                    RegAllocOp::LoopPins { moves } => {
+                        for (src, dst) in moves {
+                            note(src);
+                            note(dst);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            addrs
+        }
+
+        fn contains_immed_float(ra: &RegAlloc<'_>, ops: &[RegAllocOp]) -> bool {
+            let mut hit = false;
+            let mut note = |loc: &Loc| {
+                if matches!(loc, Loc::ImmedFloat(_)) {
+                    hit = true;
+                }
+            };
+            for op in ops {
+                match op {
+                    RegAllocOp::Move { src, dst } => {
+                        note(src);
+                        note(dst);
+                    }
+                    RegAllocOp::Perform1 {
+                        loc, result_loc, ..
+                    } => {
+                        note(loc);
+                        if let Some(result) = result_loc {
+                            note(result);
+                        }
+                    }
+                    RegAllocOp::Perform {
+                        arglocs_start,
+                        arglocs_len,
+                        result_loc,
+                        ..
+                    } => {
+                        for loc in ra.arglocs(*arglocs_start, *arglocs_len) {
+                            note(loc);
+                        }
+                        if let Some(result) = result_loc {
+                            note(result);
+                        }
+                    }
+                    RegAllocOp::LoopPins { moves } => {
+                        for (src, dst) in moves {
+                            note(src);
+                            note(dst);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            hit
+        }
+
+        let bits = 1.5f64.to_bits();
+        let (inputargs, ops) = float_add_trace();
+        let stats = std::sync::Arc::new(majit_backend::AsmMemoryManagerStats::default());
+        let manager = majit_backend::AsmMemoryManager::new_isolated(std::sync::Arc::clone(&stats));
+        let mut wrapper = majit_backend::MachineDataBlockWrapper::new(manager);
+        let _writing = majit_backend::AssemblerWriting::enter();
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        ra.xrm.set_datablockwrapper(&mut wrapper);
+        let ra_ops = ra.walk_operations().expect("walk_operations");
+        let addrs = const_float_addrs(&ra, &ra_ops);
+        assert!(
+            !addrs.is_empty(),
+            "float constant must be a ConstFloatLoc from convert_to_imm, got {ra_ops:?}"
+        );
+        for addr in &addrs {
+            assert_ne!(*addr, 0);
+            assert_eq!(*addr % 8, 0);
+            let stored = unsafe { (*addr as *const u64).read() };
+            assert_eq!(
+                stored, bits,
+                "pool slot {addr:#x} must hold the convert_to_imm bits"
+            );
+        }
+
+        // `_consider_same_as` of a float constant is `self.loc` →
+        // `X86XMMRegisterManager.convert_to_imm`, so the assembler mov
+        // source is `ConstFloatLoc` rather than `ImmedFloat`.
+        let (inputargs, ops) = same_as_float_trace();
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        ra.xrm.set_datablockwrapper(&mut wrapper);
+        let ra_ops = ra.walk_operations().expect("walk_operations");
+        let addrs = const_float_addrs(&ra, &ra_ops);
+        assert!(
+            !addrs.is_empty(),
+            "SameAsF float constant must be a ConstFloatLoc, got {ra_ops:?}"
+        );
+        assert!(
+            !contains_immed_float(&ra, &ra_ops),
+            "SameAsF must not hand the assembler an ImmedFloat move, got {ra_ops:?}"
+        );
+        for addr in &addrs {
+            assert_ne!(*addr, 0);
+            assert_eq!(*addr % 8, 0);
+            let stored = unsafe { (*addr as *const u64).read() };
+            assert_eq!(
+                stored, bits,
+                "SameAsF pool slot {addr:#x} must hold the bits"
+            );
+        }
+        drop(_writing);
+        drop(wrapper);
+        drop(stats);
+
+        let (inputargs, ops) = float_add_trace();
+        let stats = std::sync::Arc::new(majit_backend::AsmMemoryManagerStats::default());
+        let manager = majit_backend::AsmMemoryManager::new_isolated(stats);
+        let mut wrapper = majit_backend::MachineDataBlockWrapper::new(manager);
+        let err = majit_backend::with_assembler_map_lock(|| {
+            struct ClearCeiling;
+            impl Drop for ClearCeiling {
+                fn drop(&mut self) {
+                    majit_gc::arm_process_memory_ceiling(0);
+                }
+            }
+            let _clear = ClearCeiling;
+            majit_gc::arm_process_memory_ceiling(1);
+            let _writing = majit_backend::AssemblerWriting::enter();
+            let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+            ra.prepare_loop();
+            ra.xrm.set_datablockwrapper(&mut wrapper);
+            ra.walk_operations()
+        });
+        match err {
+            Err(majit_backend::BackendError::CompilationFailed(msg)) => {
+                assert!(
+                    msg.contains("malloc_aligned"),
+                    "expected malloc_aligned failure, got {msg}"
+                );
+            }
+            other => panic!("malloc_aligned must return Err, got {other:?}"),
         }
     }
 }

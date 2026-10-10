@@ -2542,9 +2542,26 @@ struct AsmLargeBlock {
     size: usize,
 }
 
+/// Serializes `AsmLargeBlock::map` with a test that arms
+/// `arm_process_memory_ceiling`. `map` takes this lock, and the test holds
+/// it across the arm/disarm window. `ReentrantMutex` lets that same thread
+/// enter `map` from `open_malloc` without deadlocking: production takes the
+/// arena lock and then this one; the test takes this one and then only an
+/// isolated arena lock.
+#[cfg(not(target_arch = "wasm32"))]
+static ASSEMBLER_MAP_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+
+/// Run `body` while `AsmLargeBlock::map` cannot race a process-ceiling change.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn with_assembler_map_lock<R>(body: impl FnOnce() -> R) -> R {
+    let _guard = ASSEMBLER_MAP_LOCK.lock();
+    body()
+}
+
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 impl AsmLargeBlock {
     fn map(size: usize) -> io::Result<Self> {
+        let _map_lock = ASSEMBLER_MAP_LOCK.lock();
         #[allow(unused_mut)]
         let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2586,6 +2603,7 @@ struct AsmLargeBlock {
 #[cfg(windows)]
 impl AsmLargeBlock {
     fn map(size: usize) -> io::Result<Self> {
+        let _map_lock = ASSEMBLER_MAP_LOCK.lock();
         if !majit_gc::try_charge(size) {
             majit_gc::note_alloc_refused();
             return Err(io::Error::other("process memory limit exceeded"));
@@ -2802,8 +2820,10 @@ impl AsmMemoryManager {
         Arc::new(Self { stats, inner })
     }
 
-    #[cfg(test)]
-    fn new_isolated(stats: Arc<AsmMemoryManagerStats>) -> Arc<Self> {
+    /// Empty free list, not `PROCESS_ARENA`. A test uses this so
+    /// `MachineDataBlockWrapper.malloc_aligned` reaches `AsmLargeBlock::map`
+    /// (`try_charge`) instead of a reused block.
+    pub fn new_isolated(stats: Arc<AsmMemoryManagerStats>) -> Arc<Self> {
         Arc::new(Self {
             stats,
             inner: Arc::new(parking_lot::Mutex::new(AsmMemoryManagerInner::new())),

@@ -130,6 +130,12 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             value: i.value,
             is_float: true,
         },
+        // Not produced here: aarch64 keeps float bits in `ImmedFloat`.
+        // The variant exists so an x86 `ConstFloatLoc` still matches.
+        Loc::ConstFloat(c) => TargetArgLoc::Immed {
+            value: c.value as i64,
+            is_float: true,
+        },
         Loc::Addr(a) => TargetArgLoc::Addr {
             base: a.base,
             index: a.index,
@@ -212,7 +218,9 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
         Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
-        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
+        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => {
+            None
+        }
     }
 }
 
@@ -2243,7 +2251,7 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_check_frame_depth(gcmap);
         }
         // assembler.py:374 walk_operations — get allocation decisions.
-        let ra_ops = ra.walk_operations();
+        let ra_ops = ra.walk_operations()?;
         self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
@@ -6167,7 +6175,7 @@ impl<'a> AssemblerARM64<'a> {
                 Loc::Frame(f) => f.ebp_loc.is_float,
                 Loc::Reg(r) => r.is_xmm,
                 Loc::Immed(_) => false,
-                Loc::ImmedFloat(_) => true,
+                Loc::ImmedFloat(_) | Loc::ConstFloat(_) => true,
                 _ => false,
             };
             let abi_idx = if is_float {
