@@ -6,6 +6,10 @@
 # applied.  120000000 iterations land pypy near 0.11s.  Local dynasm reads
 # 1.3x; 3 leaves room for cranelift and a slower host.  cpython cannot run
 # this many inside the reference timeout.
+# 67f223fe51d (#2246) on main compiles one bridge: gf=201 br=1, t1/4:200
+# then the bridge, t3/14:1. Nursery types split that TY_REF GUARD_VALUE
+# (make_a_counter_per_value): dynasm 213/1 (t1/4:212), cranelift core
+# 265/0 (t1/4:264, no hash reaches eagerness), wasm 201/1 matching main.
 """Hot classmethod dispatch through a type receiver: `Type.cmethod(i)`.
 
 Both `Derived.scaled` (inherited) and `Base.scaled` resolve to a classmethod

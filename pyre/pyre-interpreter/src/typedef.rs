@@ -2704,7 +2704,12 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
         let descr = pyre_object::gc_roots::pin_root(descr);
         let w_type = pyre_object::gc_roots::shadow_stack_get(ns_slot + 1);
         let bound = copy_for_type(descr, w_type);
-        if std::ptr::eq(bound, pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+        let bound_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(bound);
+        if std::ptr::eq(
+            pyre_object::gc_roots::shadow_stack_get(bound_slot),
+            pyre_object::gc_roots::shadow_stack_get(descr_slot),
+        ) {
             continue;
         }
         let bound = pyre_object::gc_roots::pin_root(bound);
@@ -2712,7 +2717,11 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
         let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
         if let Some(text) = pyre_object::w_str_get_value_opt(key) {
             let text = text.to_owned();
-            pyre_object::w_dict_setitem_str_no_proxy(ns, &text, bound);
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                &text,
+                pyre_object::gc_roots::shadow_stack_get(bound_slot),
+            );
         }
     }
 }
@@ -2751,6 +2760,8 @@ fn new_builtin_typeobject(
     // TypeCache.build: establish the final type identity before copying the
     // descriptors, then initialize that same object. No post-init recopy.
     let type_obj = pyre_object::w_type_alloc_builtin();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     unsafe {
         copy_getset_properties(
             pyre_object::gc_roots::shadow_stack_get(save_point + 1),
@@ -2758,7 +2769,7 @@ fn new_builtin_typeobject(
         );
     }
     init_builtin_typeobject(
-        type_obj,
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
         name,
         pyre_object::gc_roots::shadow_stack_get(save_point),
         pyre_object::gc_roots::shadow_stack_get(save_point + 1),
@@ -2844,6 +2855,8 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         &INSTANCE_TYPE as *const PyType,
         PY_NULL,
     );
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     // typeobject.py setup_builtin_type — root type gets its own Layout.
     unsafe {
         let layout = pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
@@ -2859,6 +2872,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         pyre_object::w_type_set_weakrefable(type_obj, false);
     }
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
+    let type_obj = pyre_object::gc_roots::shadow_stack_get(type_slot);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
     type_obj
@@ -3308,6 +3322,7 @@ fn new_typeobject_with_metatype_and_layout(
     method_descriptor: bool,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
+    let base_slot = pyre_object::gc_roots::pin_roots(&[base, w_metatype]);
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new_nonmoving();
     let ns = pyre_object::gc_roots::pin_root(ns);
@@ -3349,15 +3364,22 @@ fn new_typeobject_with_metatype_and_layout(
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         unsafe { stamp_method_owners(ns, owner) };
     }
-    let bases = w_tuple_new(vec![base]);
+    let bases = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(base_slot)]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     // The type object it allocates is what the namespace has to survive: the
     // word handed over is stored in the new type, but this frame's copy is
     // pre-move, so the probes below take a fresh read.
-    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype, w_metatype);
+    let type_obj = new_builtin_typeobject(
+        name,
+        bases,
+        ns as *mut u8,
+        layout_pytype,
+        pyre_object::gc_roots::shadow_stack_get(base_slot + 1),
+    );
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+    let base = pyre_object::gc_roots::shadow_stack_get(base_slot);
 
     // typeobject.py setup_builtin_type:
     //   parent_layout = w_bestbase.layout
@@ -3483,20 +3505,27 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     layout_pytype: *const PyType,
     overridetypedef: *const pyre_object::typedef::TypeDef,
 ) -> PyObjectRef {
-    let base = bases[0];
+    let n_bases = bases.len();
     let _roots = pyre_object::gc_roots::push_roots();
+    let bases_slot = pyre_object::gc_roots::pin_roots(bases);
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new_nonmoving();
     let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
-    let bases_tuple = w_tuple_new(bases.to_vec());
+    let bases_tuple = w_tuple_new(
+        (0..n_bases)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(bases_slot + i))
+            .collect(),
+    );
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+    let base = pyre_object::gc_roots::shadow_stack_get(bases_slot);
     let parent_layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
     let typedef = if overridetypedef.is_null() {
         let has_new = unsafe { pyre_object::w_dict_getitem_str(ns, "__new__").is_some() };
         let has_dict = unsafe { pyre_object::w_dict_getitem_str(ns, "__dict__").is_some() };
-        let inherited_hasdict = bases.iter().any(|&base| unsafe {
-            let layout = pyre_object::w_type_get_layout_ptr(base);
+        let inherited_hasdict = (0..n_bases).any(|i| unsafe {
+            let b = pyre_object::gc_roots::shadow_stack_get(bases_slot + i);
+            let layout = pyre_object::w_type_get_layout_ptr(b);
             !layout.is_null() && (*(*layout).typedef).hasdict
         });
         pyre_object::typedef::leak_typedef(layout_pytype, has_new, has_dict || inherited_hasdict)
@@ -3533,7 +3562,8 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
         // typedef.py:39-41: inherit hasdict/weakrefable from any base.
         let mut hasdict = has_dict;
         let mut weakrefable = has_weakref;
-        for &b in bases {
+        for i in 0..n_bases {
+            let b = pyre_object::gc_roots::shadow_stack_get(bases_slot + i);
             hasdict |= pyre_object::w_type_get_hasdict(b);
             weakrefable |= pyre_object::w_type_get_weakrefable(b);
         }
@@ -12918,7 +12948,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
 ///                                wrapfn="newtext_or_none"),
 /// ```
 fn patch_getset_descriptor_metadata() {
-    let tp = getset_descriptor_type();
+    let mut tp = getset_descriptor_type();
     if tp.is_null() {
         return;
     }
@@ -14790,7 +14820,8 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // any values that have since replaced them.
         let mut temp = Vec::new();
         let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
-        if let Err(err) = mro_subclasses(w_type, &mut temp) {
+        if let Err(mut err) = mro_subclasses(w_type, &mut temp) {
+            let err_slot = err.pin(&_mro_roots);
             for update in temp {
                 let w_updated_type = pyre_object::gc_roots::shadow_stack_get(update.w_type_root);
                 if pyre_object::w_type_get_mro(w_updated_type) == update.new_mro {
@@ -14811,6 +14842,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let saved_bases = pyre_object::gc_roots::shadow_stack_get(saved_bases_root);
                 pyre_object::typeobject::w_type_set_bases(w_type, saved_bases);
             }
+            err.reload(&_mro_roots, err_slot);
             return Err(err);
         }
         Ok(pyre_object::w_none())
@@ -35229,30 +35261,53 @@ pub(crate) fn copy_for_type(
     if !unsafe { pyre_object::typedef::is_getset_property(descr) } {
         return descr;
     }
-    // typedef.py — allocate a fresh GetSetProperty and copy
-    // every slot from the source descriptor (reqcls passes through as
-    // None per the source's `if self.reqcls is None` precondition).
+    // typedef.py — `instantiate(GetSetProperty)` then copy every slot
+    // from the source (reqcls stays None per the `if self.reqcls is None`
+    // precondition). A heap type's copy is nursery so a discarded
+    // `type(name, (), {})` dies at the next minor. An immortal builtin
+    // owner's copy stays `malloc_typed_stable`: its custom trace never
+    // fires and `walk_builtin_type_dicts_gc` is skipped on a clean minor,
+    // so a nursery copy would be swept (`sys.flags.verbose`).
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(descr);
     let _ = pyre_object::gc_roots::pin_root(w_objclass);
     let _ = getset_descriptor_type(); // ensure type registered
     let descr = pyre_object::gc_roots::shadow_stack_get(save_point);
-    let src = unsafe { &*(descr as *const pyre_object::typedef::GetSetProperty) };
-    let new = pyre_object::typedef::w_getset_property_new(
-        src.fget,
-        src.fset,
-        src.fdel,
-        src.doc,
-        pyre_object::PY_NULL,
-        src.use_closure,
-        src.name,
-    );
-    // typedef.py:353 new.w_objclass = w_objclass — write directly to
-    // the typed slot, mirroring PyPy's instance-field assignment.
     let w_objclass = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-    unsafe { pyre_object::typedef::w_getset_set_objclass(new, w_objclass) };
-    new
+    let heap = pyre_object::gc_hook::try_gc_owns_object(w_objclass as *mut u8);
+    let descr = pyre_object::gc_roots::shadow_stack_get(save_point);
+    let w_objclass = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
+    let src = unsafe { &*(descr as *const pyre_object::typedef::GetSetProperty) };
+    if heap {
+        pyre_object::typedef::w_getset_property_instantiate(
+            src.fget,
+            src.fset,
+            src.fdel,
+            src.doc,
+            pyre_object::PY_NULL,
+            src.use_closure,
+            src.name,
+            w_objclass,
+        )
+    } else {
+        let new = pyre_object::typedef::w_getset_property_new(
+            src.fget,
+            src.fset,
+            src.fdel,
+            src.doc,
+            pyre_object::PY_NULL,
+            src.use_closure,
+            src.name,
+        );
+        unsafe {
+            pyre_object::typedef::w_getset_set_objclass(
+                new,
+                pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+            )
+        };
+        new
+    }
 }
 
 /// Public re-export of `copy_for_type` so that

@@ -6,6 +6,11 @@
 # well clear of its startup. With the two accepted names in the loop every
 # iteration left two dead types behind, and the ratio followed the length
 # of `object`'s subclass list rather than the rejection.
+# 67f223fe51d walks 3-arg type() through descr__new__ and classifies
+# except-as-return, so the rejection compiles two loops and one bridge:
+# t2/1:200 (plain eagerness, not a TY_REF split) + t1/37:1. Main and HEAD
+# agree on every backend (gf=201 br=1 lp=2). The hot path raises
+# UnicodeEncodeError and does not allocate a heap type.
 N = 1000000
 # Accepted names are checked a bounded number of times.
 M = 100

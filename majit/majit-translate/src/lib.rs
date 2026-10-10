@@ -1414,13 +1414,16 @@ fn analyze_pipeline_from_module_paths(
         let mut entries: Vec<_> = program.struct_field_attrs.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (qualified, fields) in entries {
-            let layout = program
-                .struct_fields
-                .fields
-                .get(qualified)
-                .map(Vec::as_slice);
+            let layout_pairs: Option<Vec<(String, String)>> =
+                program.struct_fields.fields.get(qualified).map(|rows| {
+                    rows.iter()
+                        .map(|row| (row.name.clone(), row.ty.clone()))
+                        .collect()
+                });
             crate::annotator::classdesc::register_struct_fields_with_layout(
-                qualified, fields, layout,
+                qualified,
+                fields,
+                layout_pairs.as_deref(),
             );
         }
     }
@@ -1479,8 +1482,8 @@ fn analyze_pipeline_from_module_paths(
         .entry("list".to_string())
         .or_insert_with(|| {
             vec![
-                ("length".to_string(), "i64".to_string()),
-                ("items".to_string(), "&()".to_string()),
+                crate::front::semantic::FieldRow::named("length", "i64"),
+                crate::front::semantic::FieldRow::named("items", "&()"),
             ]
         });
     let mut canonical_trait_impls = Vec::new();
@@ -1705,8 +1708,10 @@ fn analyze_pipeline_from_module_paths(
     let provider: &dyn layout::LayoutProvider = match layout_provider {
         Some(p) => p,
         None => {
+            let pair_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+                program.struct_fields.fields.clone().into();
             heuristic = layout::HeuristicLayoutProvider::from_struct_fields(
-                &program.struct_fields.fields,
+                &pair_fields,
                 &program.known_struct_names,
                 &immutable_fields,
             );
@@ -3327,10 +3332,10 @@ mod portal_driver_tests {
             "pyframe::PyFrame",
             "pyre_interpreter::pyframe::PyFrame",
         ] {
-            program
-                .struct_fields
-                .fields
-                .insert(alias.to_string(), Vec::new());
+            program.struct_fields.fields.insert(
+                alias.to_string(),
+                Vec::<crate::front::semantic::FieldRow>::new(),
+            );
             program.struct_ids.insert(alias.to_string(), Some(pyframe));
         }
         let identities = distinct_struct_identities_by_leaf(&program);
@@ -3366,10 +3371,10 @@ mod portal_driver_tests {
         );
 
         let foreign = "other_runtime::PyFrame";
-        program
-            .struct_fields
-            .fields
-            .insert(foreign.to_string(), Vec::new());
+        program.struct_fields.fields.insert(
+            foreign.to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
         program.struct_ids.insert(
             foreign.to_string(),
             Some(majit_ir::descr::StructId::from_canonical(foreign)),
