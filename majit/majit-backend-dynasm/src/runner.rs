@@ -3381,6 +3381,9 @@ impl Backend for DynasmBackend {
         let stack_check_slowpath = self
             .arch_cpu_ext
             .ensure_stack_check_slowpath(&self.descr_attachments);
+        // `setup_once` builds `cond_call_slowpath` after `wb_slowpath`.
+        #[cfg(target_arch = "x86_64")]
+        let cond_call_slowpath = self.arch_cpu_ext.ensure_cond_call_slowpath();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
             trace_id,
@@ -3405,6 +3408,8 @@ impl Backend for DynasmBackend {
             frame_realloc_slowpath,
             #[cfg(target_arch = "x86_64")]
             stack_check_slowpath,
+            #[cfg(target_arch = "x86_64")]
+            cond_call_slowpath,
             inputargs,
             &prepared_ops,
         );
@@ -3669,6 +3674,9 @@ impl Backend for DynasmBackend {
         let stack_check_slowpath = self
             .arch_cpu_ext
             .ensure_stack_check_slowpath(&self.descr_attachments);
+        // Same once-per-CPU `cond_call_slowpath` as `compile_loop`.
+        #[cfg(target_arch = "x86_64")]
+        let cond_call_slowpath = self.arch_cpu_ext.ensure_cond_call_slowpath();
         let mut asm = Asm::new(
             Arc::clone(&self.asm_memory_manager),
             trace_id,
@@ -3693,6 +3701,8 @@ impl Backend for DynasmBackend {
             frame_realloc_slowpath,
             #[cfg(target_arch = "x86_64")]
             stack_check_slowpath,
+            #[cfg(target_arch = "x86_64")]
+            cond_call_slowpath,
             &inputargs,
             &prepared_ops,
         );

@@ -61,6 +61,12 @@ pub(crate) struct X86CpuExt {
     /// where no helper is built yet.
     wb_slowpath: [usize; 5],
     _wb_slowpath_buffers: Vec<ArenaExecutableBuffer>,
+    /// `Assembler386.cond_call_slowpath`: four `_build_cond_call_slowpath`
+    /// entries, index `floats * 2 + callee_only`. `0` until
+    /// `ensure_cond_call_slowpath`. Not a propagate-dependent cache: the
+    /// helper does not bake `propagate_exception_descr`.
+    cond_call_slowpath: [usize; 4],
+    _cond_call_slowpath_buffers: Vec<ArenaExecutableBuffer>,
 }
 
 impl X86CpuExt {
@@ -79,6 +85,8 @@ impl X86CpuExt {
             _stack_check_slowpath_buffer: None,
             wb_slowpath: [0; 5],
             _wb_slowpath_buffers: Vec::new(),
+            cond_call_slowpath: [0; 4],
+            _cond_call_slowpath_buffers: Vec::new(),
         }
     }
 
@@ -166,6 +174,25 @@ impl X86CpuExt {
             self._wb_slowpath_buffers.push(buffer);
         }
         self.wb_slowpath
+    }
+
+    /// `_build_cond_call_slowpath` for all four `(supports_floats, callee_only)`
+    /// pairs, memoised once per CPU. `ensure_wb_slowpath` runs first:
+    /// `reload_frame_if_necessary` inside the helper calls `wb_slowpath[4]`.
+    pub(crate) fn ensure_cond_call_slowpath(&mut self) -> [usize; 4] {
+        if self.cond_call_slowpath[0] != 0 {
+            return self.cond_call_slowpath;
+        }
+        let wb_slowpath = self.ensure_wb_slowpath();
+        let (buffers, addrs) =
+            super::assembler::build_cond_call_slowpaths(wb_slowpath, &self.asm_memory_manager);
+        assert!(
+            addrs.iter().all(|addr| *addr != 0),
+            "build_cond_call_slowpaths returned a null entry"
+        );
+        self._cond_call_slowpath_buffers = buffers;
+        self.cond_call_slowpath = addrs;
+        addrs
     }
 
     /// `assembler.py:328 _build_propagate_exception_path` parity:

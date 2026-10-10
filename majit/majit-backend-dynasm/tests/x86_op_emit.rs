@@ -2,10 +2,12 @@
 //! `genop_int_and`, `genop_int_force_ge_zero`, `genop_float_neg`,
 //! `genop_float_abs`, `_cmp_guard_gc_type`, `genop_guard_guard_is_object`,
 //! `genop_guard_guard_subclass`, `_binaryop`, `_cmpop_float`,
-//! `_store_force_index`, `store_force_descr`, `genop_guard_guard_no_exception`.
+//! `_store_force_index`, `store_force_descr`, `genop_guard_guard_no_exception`,
+//! `cond_call` / `CondCallSlowPath`.
 
 #![cfg(target_arch = "x86_64")]
 
+use std::arch::naked_asm;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -801,6 +803,268 @@ fn cond_call_guard_no_exception_checks_the_call_path() {
         "a quiet call must pass GUARD_NO_EXCEPTION"
     );
     assert!(!majit_backend_dynasm::jit_exc_is_pending());
+}
+
+static FUSED_HITS: AtomicUsize = AtomicUsize::new(0);
+static UNFUSED_HITS: AtomicUsize = AtomicUsize::new(0);
+static VALUE_I_SKIP_HITS: AtomicUsize = AtomicUsize::new(0);
+static VALUE_I_TAKE_HITS: AtomicUsize = AtomicUsize::new(0);
+static VALUE_R_SKIP_HITS: AtomicUsize = AtomicUsize::new(0);
+static VALUE_R_TAKE_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Clobber every register the cond-call helper is supposed to restore.
+/// A normal `extern "C"` callee would save the callee-saved set itself, so
+/// the live value would survive even when `cond_call_slowpath` did not.
+macro_rules! clobber_hits {
+    ($name:ident, $hits:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            naked_asm!(
+                "lock inc qword ptr [rip + {hits}]",
+                "xor eax, eax",
+                "xor ecx, ecx",
+                "xor edx, edx",
+                "xor ebx, ebx",
+                "xor esi, esi",
+                "xor edi, edi",
+                "xor r8, r8",
+                "xor r9, r9",
+                "xor r10, r10",
+                "xor r11, r11",
+                "xor r12, r12",
+                "xor r14, r14",
+                "xor r15, r15",
+                "pxor xmm0, xmm0",
+                "pxor xmm1, xmm1",
+                "pxor xmm2, xmm2",
+                "pxor xmm3, xmm3",
+                "pxor xmm4, xmm4",
+                "pxor xmm5, xmm5",
+                "ret",
+                hits = sym $hits,
+            );
+        }
+    };
+}
+
+clobber_hits!(cond_call_fused_hit, FUSED_HITS);
+clobber_hits!(cond_call_unfused_hit, UNFUSED_HITS);
+
+extern "C" fn cond_call_value_i_skip() -> i64 {
+    VALUE_I_SKIP_HITS.fetch_add(1, Ordering::SeqCst);
+    0x5A5A_5A5A_5A5A_5A5A_u64 as i64
+}
+
+extern "C" fn cond_call_value_i_take() -> i64 {
+    VALUE_I_TAKE_HITS.fetch_add(1, Ordering::SeqCst);
+    0x5A5A_5A5A_5A5A_5A5A_u64 as i64
+}
+
+extern "C" fn cond_call_value_r_skip() -> i64 {
+    VALUE_R_SKIP_HITS.fetch_add(1, Ordering::SeqCst);
+    0x5A5A_5A5A_5A5A_5A5A_u64 as i64
+}
+
+extern "C" fn cond_call_value_r_take() -> i64 {
+    VALUE_R_TAKE_HITS.fetch_add(1, Ordering::SeqCst);
+    0x5A5A_5A5A_5A5A_5A5A_u64 as i64
+}
+
+fn compile_fused_cond_call(func: i64) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+    let cmp = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(1))]);
+    cmp.pos().set(OpRef::int_op(1));
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::int_op(1)), rb(OpRef::const_int(func))],
+    );
+    call.pos().set(OpRef::void_op(0));
+    let ops = vec![
+        OpRc::new(cmp),
+        OpRc::new(call),
+        OpRc::new(finish_of(i0, Type::Int, 2)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile fused COND_CALL: {err:?}"));
+    (backend, token)
+}
+
+fn compile_unfused_cond_call(
+    predicate: i64,
+    func: i64,
+    finish_float: bool,
+) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Float, 1),
+    ];
+    let i0 = inputargs[0].opref();
+    let f0 = inputargs[1].opref();
+    let call = Op::new(
+        OpCode::CondCallN,
+        &[rb(OpRef::const_int(predicate)), rb(OpRef::const_int(func))],
+    );
+    call.pos().set(OpRef::void_op(0));
+    let finish = if finish_float {
+        finish_of(f0, Type::Float, 2)
+    } else {
+        finish_of(i0, Type::Int, 2)
+    };
+    let ops = vec![OpRc::new(call), OpRc::new(finish)];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile unfused COND_CALL: {err:?}"));
+    (backend, token)
+}
+
+fn compile_cond_call_value(opcode: OpCode, func: i64, ty: Type) -> (DynasmBackend, JitCellToken) {
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(ty, 0)];
+    let input = inputargs[0].opref();
+    let result = match ty {
+        Type::Int => OpRef::int_op(1),
+        Type::Ref => OpRef::ref_op(1),
+        other => panic!("cond_call value result type {other:?}"),
+    };
+    let call = Op::new(opcode, &[rb(input), rb(OpRef::const_int(func))]);
+    call.pos().set(result);
+    call.setdescr(call_descr(vec![], ty, true, 8));
+    let ops = vec![OpRc::new(call), OpRc::new(finish_of(result, ty, 2))];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile {opcode:?}: {err:?}"));
+    (backend, token)
+}
+
+#[test]
+fn cond_call_fused_compare_calls_only_when_true() {
+    // `next_op_can_accept_cc` fuses `IntEq` into `CondCallN`. The fast path
+    // is one not-taken `jcc` of that cc. False does not call. True calls,
+    // and the input survives the callee's clobber.
+    let func = cond_call_fused_hit as *const () as usize as i64;
+    FUSED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_fused_cond_call(func);
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 0);
+    assert_eq!(FUSED_HITS.load(Ordering::SeqCst), 0);
+
+    FUSED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_fused_cond_call(func);
+    let frame = backend.execute_token(&token, &[Value::Int(1)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), 1);
+    assert_eq!(FUSED_HITS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cond_call_unfused_preserves_a_live_value() {
+    // Constant predicate: `load_condition_into_cc` emits `test` and `CC_NE`.
+    // A live int and a live float survive both edges. The callee clobbers
+    // the managed registers, including the callee-saved ones.
+    let func = cond_call_unfused_hit as *const () as usize as i64;
+    let live_int = 0x1111_2222_3333_4444i64;
+    let live_float = -2.5f64;
+
+    UNFUSED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_unfused_cond_call(0, func, false);
+    let frame = backend.execute_token(&token, &[Value::Int(live_int), Value::Float(live_float)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), live_int);
+    assert_eq!(UNFUSED_HITS.load(Ordering::SeqCst), 0);
+
+    UNFUSED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_unfused_cond_call(1, func, false);
+    let frame = backend.execute_token(&token, &[Value::Int(live_int), Value::Float(live_float)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), live_int);
+    assert_eq!(UNFUSED_HITS.load(Ordering::SeqCst), 1);
+
+    UNFUSED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_unfused_cond_call(0, func, true);
+    let frame = backend.execute_token(&token, &[Value::Int(live_int), Value::Float(live_float)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_float_bits(
+        backend.get_float_value(&frame, 0),
+        live_float,
+        "unfused don't-call float",
+    );
+    assert_eq!(UNFUSED_HITS.load(Ordering::SeqCst), 0);
+
+    UNFUSED_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_unfused_cond_call(1, func, true);
+    let frame = backend.execute_token(&token, &[Value::Int(live_int), Value::Float(live_float)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_float_bits(
+        backend.get_float_value(&frame, 0),
+        live_float,
+        "unfused call float",
+    );
+    assert_eq!(UNFUSED_HITS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cond_call_value_nonzero_skips_the_call() {
+    // `cond_call` tests `resloc` and takes the slow path on `CC_E`.
+    let live_int = 0x1111_2222_3333_4444i64;
+    VALUE_I_SKIP_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_cond_call_value(
+        OpCode::CondCallValueI,
+        cond_call_value_i_skip as *const () as usize as i64,
+        Type::Int,
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(live_int)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), live_int);
+    assert_eq!(VALUE_I_SKIP_HITS.load(Ordering::SeqCst), 0);
+
+    let live_ref = GcRef(0x1234);
+    VALUE_R_SKIP_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_cond_call_value(
+        OpCode::CondCallValueR,
+        cond_call_value_r_skip as *const () as usize as i64,
+        Type::Ref,
+    );
+    let frame = backend.execute_token(&token, &[Value::Ref(live_ref)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_ref_value(&frame, 0), live_ref);
+    assert_eq!(VALUE_R_SKIP_HITS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cond_call_value_zero_writes_the_helper_result() {
+    let helper_bits = 0x5A5A_5A5A_5A5A_5A5A_u64 as i64;
+    VALUE_I_TAKE_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_cond_call_value(
+        OpCode::CondCallValueI,
+        cond_call_value_i_take as *const () as usize as i64,
+        Type::Int,
+    );
+    let frame = backend.execute_token(&token, &[Value::Int(0)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, 0), helper_bits);
+    assert_eq!(VALUE_I_TAKE_HITS.load(Ordering::SeqCst), 1);
+
+    VALUE_R_TAKE_HITS.store(0, Ordering::SeqCst);
+    let (backend, token) = compile_cond_call_value(
+        OpCode::CondCallValueR,
+        cond_call_value_r_take as *const () as usize as i64,
+        Type::Ref,
+    );
+    let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0))]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(
+        backend.get_ref_value(&frame, 0),
+        GcRef(helper_bits as usize)
+    );
+    assert_eq!(VALUE_R_TAKE_HITS.load(Ordering::SeqCst), 1);
 }
 
 fn no_collect_effect() -> EffectInfo {

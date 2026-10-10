@@ -1083,6 +1083,69 @@ pub(crate) fn build_stack_check_slowpath(
     (buffer, ptr)
 }
 
+/// `_build_cond_call_slowpath` for `(supports_floats, callee_only)` pairs
+/// `(False, False)`, `(False, True)`, `(True, False)`, `(True, True)`.
+///
+/// The helper runs on a fresh `pending_slowpaths`: `reload_frame_if_necessary`
+/// enqueues a frame `WriteBarrierSlowPath`, and `flush_pending_slowpaths`
+/// emits that body into this helper, not into the trace. `wb_slowpath` must
+/// already be built (`ensure_wb_slowpath` before this).
+pub(crate) fn build_cond_call_slowpaths(
+    wb_slowpath: [usize; 5],
+    arena: &Arc<AsmMemoryManager>,
+) -> (Vec<codebuf::ArenaExecutableBuffer>, [usize; 4]) {
+    let inputargs: Vec<InputArgRc> = Vec::new();
+    let operations: Vec<OpRc> = Vec::new();
+    let constants: majit_ir::ConstMap<majit_ir::Const> = Default::default();
+    let classptr_to_typeid: IndexMap<i64, u32> = IndexMap::new();
+    let classptr_to_subclass_range: IndexMap<i64, (i64, i64)> = IndexMap::new();
+    let mut asm = Assembler386::new(
+        Arc::clone(arena),
+        0,
+        0,
+        constants,
+        None,
+        None,
+        classptr_to_typeid,
+        None,
+        classptr_to_subclass_range,
+        crate::guard::AttachedDescrPtrs::default(),
+        // `CpuDescrCell::new` leaks the attachments box. One cell per process:
+        // `ensure_cond_call_slowpath` builds this assembler once.
+        Arc::new(crate::guard::CpuDescrCell::default()),
+        0,
+        0,
+        wb_slowpath,
+        0,
+        0,
+        0,
+        [0; 4],
+        &inputargs,
+        &operations,
+    );
+    let mut buffers = Vec::with_capacity(4);
+    let mut addrs = [0usize; 4];
+    for (index, (supports_floats, callee_only)) in
+        [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+    {
+        asm.emit_cond_call_helper_variant(supports_floats, callee_only);
+        let mc = std::mem::replace(&mut asm.mc, Assembler::new(0));
+        let buffer = codebuf::finalize_executable(mc, arena).expect("cond_call_slowpath: finalize");
+        let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+        assert!(ptr != 0, "cond_call_slowpath[{index}] entry is null");
+        addrs[index] = ptr;
+        buffers.push(buffer);
+    }
+    let entry = asm.self_entry_addr_ptr;
+    drop(asm);
+    // `Assembler386::new` leaks this box. The helper assembler never reads
+    // it back, and it has no `Drop` that does.
+    drop(unsafe { Box::from_raw(entry) });
+    (buffers, addrs)
+}
+
 /// `assembler.py _build_wb_slowpath(withcards, withfloats, for_frame)` —
 /// pure builder. Caching/ownership is the caller's responsibility:
 /// `X86CpuExt::ensure_wb_slowpath` stores the entry in `wb_slowpath`.
@@ -1688,7 +1751,30 @@ enum SlowPathKind {
     /// `IncreaseStackSlowPath`. `gcmap` is the pointer `_check_frame_depth`
     /// captured (`*mut usize` stored as `usize` so the queue stays `Send`).
     IncreaseStack { gcmap: usize },
+    /// `CondCallSlowPath`. `gcmap` is the map `cond_call` read
+    /// (`*mut usize` stored as `usize`). `arglocs` are what
+    /// `remap_frame_layout` writes into `cond_call_register_arguments`:
+    /// the void form's extras, or an empty list for `COND_CALL_VALUE_*`.
+    /// `variant_num` indexes `cond_call_slowpath` (`floats * 2 + callee_only`).
+    CondCall {
+        gcmap: usize,
+        imm_func: i64,
+        arglocs: Vec<Loc>,
+        resloc: Option<Loc>,
+        variant_num: usize,
+        guard_token_no_exception: Option<GuardToken>,
+        expects_guard_no_exception: bool,
+    },
 }
+
+/// `cond_call`: `variant_num = floats * 2 + callee_only`.
+/// Index 2 is `(supports_floats=True, callee_only=False)`. The regalloc
+/// bindings `cond_call` reads are gone by emit, so every site calls this
+/// variant. It saves every managed register the narrower helpers save,
+/// except `cond_call_register_arguments + [eax]`, which the per-site body
+/// spills. Those home slots sit below `JITFRAME_FIXED_SIZE` and do not
+/// overlap spills, so a dead register written there is not a live spill.
+const COND_CALL_SLOWPATH_FLOATS_ALL: usize = 2;
 
 /// assembler.py Assembler386.
 /// In Rust, this is a transient builder — created per compilation,
@@ -1802,12 +1888,6 @@ pub struct Assembler386<'a> {
     /// The same cell is consumed by `append_guard_token_with_faillocs`
     /// so jf_force_descr and jf_descr resolve to the same identity.
     pending_force_cell: Option<usize>,
-    /// `CondCallSlowPath` continue label. Set when `COND_CALL` /
-    /// `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R` is followed by
-    /// `GUARD_NO_EXCEPTION`: `genop_guard_guard_no_exception` emits no
-    /// check on the fast path, and `generate_guard_no_exception` runs on
-    /// the call path before this label is bound.
-    pending_cond_call_skip: Option<DynamicLabel>,
     /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
     /// snapshot of the six descr pointers attached to the owning cpu
     /// instance.  Retained for constructor signature stability across
@@ -1874,6 +1954,10 @@ pub struct Assembler386<'a> {
     /// `Assembler386.stack_check_slowpath`. 0 skips the probe
     /// (`_call_header_with_stack_check`).
     stack_check_slowpath: usize,
+    /// `Assembler386.cond_call_slowpath`, the four
+    /// `_build_cond_call_slowpath` entries. Index is
+    /// `floats * 2 + callee_only`.
+    cond_call_slowpath: [usize; 4],
     /// `assembler.py reserve_gcref_table`: one label per slot of the
     /// reference-constant table reserved at the start of this code block,
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
@@ -2068,6 +2152,7 @@ impl<'a> Assembler386<'a> {
         propagate_exception_path: usize,
         frame_realloc_slowpath: usize,
         stack_check_slowpath: usize,
+        cond_call_slowpath: [usize; 4],
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
@@ -2112,7 +2197,6 @@ impl<'a> Assembler386<'a> {
             },
             pending_force_descr: None,
             pending_force_cell: None,
-            pending_cond_call_skip: None,
             attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
@@ -2125,6 +2209,7 @@ impl<'a> Assembler386<'a> {
             propagate_exception_path,
             frame_realloc_slowpath,
             stack_check_slowpath,
+            cond_call_slowpath,
             gcref_table: Vec::new(),
             datablockwrapper,
             scratch_register_value: -1,
@@ -4024,11 +4109,17 @@ impl<'a> Assembler386<'a> {
         // so no adjustment is needed.  Zero (no external JUMP) is a no-op.
         self.frame_depth = self.frame_depth.max(self.jump_target_frame_depth);
 
-        if self.pending_cond_call_skip.is_some() {
-            panic!(
-                "GUARD_NO_EXCEPTION did not bind the COND_CALL skip label \
-                 (genop_guard_guard_no_exception)"
-            );
+        if self.pending_slowpaths.iter().any(|sp| {
+            matches!(
+                &sp.kind,
+                SlowPathKind::CondCall {
+                    expects_guard_no_exception: true,
+                    guard_token_no_exception: None,
+                    ..
+                }
+            )
+        }) {
+            panic!("a cond-call asked for GUARD_NO_EXCEPTION and the guard never stored the token");
         }
 
         Ok(())
@@ -6259,24 +6350,32 @@ impl<'a> Assembler386<'a> {
                 }
             }
             OpCode::GuardNoException => {
-                // `genop_guard_guard_no_exception`: after COND_CALL /
-                // COND_CALL_VALUE_I / COND_CALL_VALUE_R the fast path emits
-                // nothing. `generate_guard_no_exception` runs on the call
-                // path, then both paths continue at the cond-call skip label.
-                let fused_skip = self.pending_cond_call_skip.take();
-                self.emit_guard_no_exception_check();
-                self.implement_guard_with_faillocs(
-                    op,
-                    op_index,
-                    fail_index,
-                    guard_argloc,
-                    faillocs,
-                );
-                if let Some(skip_label) = fused_skip {
-                    // The don't-call edge jumped over the check, so r11's
-                    // address is not live on both sides of this join.
-                    self.forget_scratch_register();
-                    dynasm!(self.mc ; .arch x64 ; =>skip_label);
+                // `genop_guard_guard_no_exception`: when the preceding
+                // `cond_call` queued a `CondCallSlowPath`, the fast path
+                // emits nothing. The token hangs on that slow path and
+                // `generate_guard_no_exception` runs after the result move.
+                // The don't-call edge never reaches the check.
+                if self.pending_cond_call_wants_guard() {
+                    let fail_label = self.mc.new_dynamic_label();
+                    let token = self.guard_token_with_faillocs(
+                        op,
+                        op_index,
+                        fail_index,
+                        fail_label,
+                        guard_argloc,
+                        faillocs,
+                    );
+                    self.record_guard_token_side_effects(op, &token);
+                    self.stash_cond_call_guard_token(token);
+                } else {
+                    self.emit_guard_no_exception_check();
+                    self.implement_guard_with_faillocs(
+                        op,
+                        op_index,
+                        fail_index,
+                        guard_argloc,
+                        faillocs,
+                    );
                 }
             }
             OpCode::GuardNoOverflow => {
@@ -6977,8 +7076,10 @@ impl<'a> Assembler386<'a> {
         self.set_last_guard_jump_offset(pos);
     }
 
-    /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
-    fn append_guard_token_with_faillocs(
+    /// `store_info_on_descr` fields for one guard, without pushing the token.
+    /// `append_guard_token_with_faillocs` pushes it. `genop_guard_guard_no_exception`
+    /// keeps it on `CondCallSlowPath` until `generate_guard_no_exception`.
+    fn guard_token_with_faillocs(
         &mut self,
         op: &Op,
         op_index: usize,
@@ -6986,7 +7087,7 @@ impl<'a> Assembler386<'a> {
         fail_label: DynamicLabel,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
-    ) {
+    ) -> GuardToken {
         // assembler.py _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
@@ -7124,7 +7225,7 @@ impl<'a> Assembler386<'a> {
             .pending_force_cell
             .take()
             .unwrap_or_else(|| self.fail_descrs.push(descr.clone()));
-        self.pending_guard_tokens.push(GuardToken {
+        GuardToken {
             fail_label,
             fail_descr: descr.clone(),
             fail_cell_ptr,
@@ -7136,9 +7237,77 @@ impl<'a> Assembler386<'a> {
                 op.opcode,
                 OpCode::GuardException | OpCode::GuardNoException | OpCode::GuardNotForced
             ),
-        });
+        }
+    }
+
+    /// `GuardNotForced2` publishes `finish_gcmap` when its token is built.
+    /// A fused `GUARD_NO_EXCEPTION` builds the token on the guard visit and
+    /// pushes it later from `CondCallSlowPath.generate_body`.
+    fn record_guard_token_side_effects(&mut self, op: &Op, token: &GuardToken) {
         if op.opcode == OpCode::GuardNotForced2 {
-            self.finish_gcmap = Some(gcmap);
+            self.finish_gcmap = Some(token.gcmap);
+        }
+    }
+
+    fn push_built_guard_token(&mut self, op: &Op, token: GuardToken) {
+        self.record_guard_token_side_effects(op, &token);
+        self.pending_guard_tokens.push(token);
+    }
+
+    /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
+    fn append_guard_token_with_faillocs(
+        &mut self,
+        op: &Op,
+        op_index: usize,
+        fail_index: u32,
+        fail_label: DynamicLabel,
+        guard_argloc: Option<Loc>,
+        faillocs: &[Option<Loc>],
+    ) {
+        let token = self.guard_token_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            fail_label,
+            guard_argloc,
+            faillocs,
+        );
+        self.push_built_guard_token(op, token);
+    }
+
+    /// `genop_guard_guard_no_exception`: the last queued slow path is the
+    /// `CondCallSlowPath` that set `expects_guard_no_exception`.
+    fn pending_cond_call_wants_guard(&self) -> bool {
+        matches!(
+            self.pending_slowpaths.last(),
+            Some(SlowPath {
+                kind: SlowPathKind::CondCall {
+                    expects_guard_no_exception: true,
+                    guard_token_no_exception: None,
+                    ..
+                },
+                ..
+            })
+        )
+    }
+
+    fn stash_cond_call_guard_token(&mut self, token: GuardToken) {
+        let Some(sp) = self.pending_slowpaths.last_mut() else {
+            panic!("genop_guard_guard_no_exception: no CondCallSlowPath is pending");
+        };
+        match &mut sp.kind {
+            SlowPathKind::CondCall {
+                expects_guard_no_exception: true,
+                guard_token_no_exception,
+                ..
+            } => {
+                assert!(
+                    guard_token_no_exception.is_none(),
+                    "genop_guard_guard_no_exception stored two tokens"
+                );
+                *guard_token_no_exception = Some(token);
+            }
+            _ => panic!("genop_guard_guard_no_exception: the last slow path is not the cond-call"),
         }
     }
 
@@ -7395,6 +7564,168 @@ impl<'a> Assembler386<'a> {
                 self.forget_after_call_or_jmp();
                 rx86::movsd_sx(&mut self.mc, WORD as i32, xmm);
             }
+            SlowPathKind::CondCall {
+                gcmap,
+                imm_func,
+                arglocs,
+                resloc,
+                variant_num,
+                guard_token_no_exception,
+                expects_guard_no_exception,
+            } => {
+                self.generate_cond_call_slowpath(
+                    gcmap,
+                    imm_func,
+                    arglocs,
+                    resloc,
+                    variant_num,
+                    guard_token_no_exception,
+                    expects_guard_no_exception,
+                );
+            }
+        }
+    }
+
+    /// `_build_cond_call_slowpath` body. The caller has already pushed the
+    /// gcmap. Save every register this variant does not, except eax and the
+    /// four `cond_call_register_arguments`, then `call rax`.
+    fn emit_cond_call_helper_variant(&mut self, supports_floats: bool, callee_only: bool) {
+        self.pending_slowpaths.clear();
+        self.scratch_register_value = -1;
+        self.guard_success_cc = None;
+        self.frame_depth_to_patch.clear();
+        let arg_regs = crate::x86::regalloc::cond_call_argument_regs();
+        let ignored = [
+            arg_regs[0],
+            arg_regs[1],
+            arg_regs[2],
+            arg_regs[3],
+            crate::regloc::EAX,
+        ];
+        push_all_regs_to_jitframe_raw(&mut self.mc, &ignored, supports_floats, callee_only);
+        // Win64: alignment plus the 32-byte shadow (`WORD * 5`). SysV: one
+        // word of alignment. The trace body is 0 mod 16 after `_call_header`;
+        // the `call` into this helper leaves 8 mod 16, and this `sub` makes
+        // the inner `call rax` 0 mod 16.
+        #[cfg(target_os = "windows")]
+        let align = (WORD * 5) as i32;
+        #[cfg(not(target_os = "windows"))]
+        let align = WORD as i32;
+        rx86::sub_ri(&mut self.mc, rx86::ESP, align);
+        dynasm!(self.mc ; .arch x64 ; call rax);
+        self.forget_after_call_or_jmp();
+        self.reload_frame_if_necessary();
+        rx86::add_ri(&mut self.mc, rx86::ESP, align);
+        self.pop_gcmap();
+        pop_all_regs_from_jitframe_raw(
+            &mut self.mc,
+            &[crate::regloc::EAX],
+            supports_floats,
+            callee_only,
+        );
+        dynasm!(self.mc ; .arch x64 ; ret);
+        self.forget_after_call_or_jmp();
+        self.flush_pending_slowpaths();
+    }
+
+    /// `CondCallSlowPath.generate_body`. Spill the five registers the helper
+    /// does not save (except `resloc`), remap arguments, `mov eax, imm_func`,
+    /// `call cond_call_slowpath[variant_num]`, move the result, restore eax,
+    /// then `generate_guard_no_exception` when the token is present.
+    fn generate_cond_call_slowpath(
+        &mut self,
+        gcmap: usize,
+        imm_func: i64,
+        arglocs: Vec<Loc>,
+        resloc: Option<Loc>,
+        variant_num: usize,
+        guard_token_no_exception: Option<GuardToken>,
+        expects_guard_no_exception: bool,
+    ) {
+        assert!(gcmap != 0, "cond_call published a null gcmap");
+        self.push_gcmap(gcmap as *mut usize);
+        let arg_regs = crate::x86::regalloc::cond_call_argument_regs();
+        let gprs = [
+            arg_regs[0],
+            arg_regs[1],
+            arg_regs[2],
+            arg_regs[3],
+            crate::regloc::EAX,
+        ];
+        let res_reg = match resloc {
+            Some(Loc::Reg(r)) if !r.is_xmm => Some(r),
+            _ => None,
+        };
+        let mut restore_eax = false;
+        for gpr in gprs {
+            if res_reg == Some(gpr) {
+                continue;
+            }
+            let slot = core_reg_position(gpr).expect("cond_call gpr is a managed register");
+            rx86::mov_br(&mut self.mc, Self::slot_offset(slot), gpr.value);
+            if gpr == crate::regloc::EAX {
+                restore_eax = true;
+            }
+        }
+        assert!(
+            arglocs.len() <= arg_regs.len(),
+            "cond_call remaps at most {} arguments, got {}",
+            arg_regs.len(),
+            arglocs.len()
+        );
+        let dst: Vec<Loc> = arg_regs[..arglocs.len()]
+            .iter()
+            .copied()
+            .map(Loc::Reg)
+            .collect();
+        crate::jump::remap_frame_layout(
+            self,
+            &arglocs,
+            &dst,
+            Loc::Reg(crate::regloc::X86_64_SCRATCH_REG),
+        );
+        rx86::mov_ri(&mut self.mc, rx86::EAX, imm_func);
+        let helper = self
+            .cond_call_slowpath
+            .get(variant_num)
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            helper != 0,
+            "cond_call_slowpath[{variant_num}] was not built (_build_cond_call_slowpath)"
+        );
+        self.load_scratch(helper as i64);
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
+        self.forget_after_call_or_jmp();
+        if let Some(resloc) = resloc {
+            let is_eax = matches!(resloc, Loc::Reg(r) if r == crate::regloc::EAX);
+            if !is_eax {
+                self.regalloc_mov(&Loc::Reg(crate::regloc::EAX), &resloc);
+            }
+        }
+        if restore_eax {
+            let slot = core_reg_position(crate::regloc::EAX).expect("eax is a managed register");
+            rx86::mov_rb(&mut self.mc, rx86::EAX, Self::slot_offset(slot));
+        }
+        if let Some(mut token) = guard_token_no_exception {
+            // `generate_guard_no_exception`: `CMP [pos_exception], 0`,
+            // success on `CC_E`, then the failing `jcc`. The displacement
+            // is the last four bytes, same as `set_last_guard_jump_offset`.
+            // The token is not in `pending_guard_tokens` yet, so the offset
+            // is stored here and the token is pushed before the stubs run.
+            self.emit_guard_no_exception_check();
+            let cc = self
+                .guard_success_cc
+                .take()
+                .expect("generate_guard_no_exception sets CC_E");
+            let fail_label = token.fail_label;
+            self.emit_jcc_to_label(invert_cc(cc), fail_label);
+            let pos = self.mc.offset().0;
+            token.pos_jump_offset = Some(pos - 4);
+            self.pending_guard_tokens.push(token);
+        } else if expects_guard_no_exception {
+            panic!("a cond-call asked for GUARD_NO_EXCEPTION and the guard never stored the token");
         }
     }
 
@@ -10262,129 +10593,81 @@ impl<'a> Assembler386<'a> {
 
     // genop_* — call variants
 
-    /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
-    ///
-    /// `x86/assembler.py cond_call` parity: the regalloc may fuse
-    /// a preceding CompOp's result into `guard_success_cc` rather than
-    /// materialising the boolean (see `next_op_can_accept_cc`). When
-    /// that's the case, `op.arg(0)` lives in the condition flags, not
-    /// a register/slot — so we must branch off the CC directly instead
-    /// of issuing `load_arg_to_rax; test rax, rax`, which would read
-    /// `rbp` (the frame_reg sentinel) and miss the comparison result.
+    /// `cond_call`: one not-taken `jcc` of `guard_success_cc`, then
+    /// `set_continue_addr`. `load_condition_into_cc` emits `test` and
+    /// `CC_NE` only when no compare is pending. The call, the gcmap, and
+    /// `generate_guard_no_exception` live in `CondCallSlowPath`.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        let skip_label = self.mc.new_dynamic_label();
-        if let Some(cc) = self.guard_success_cc.take() {
-            self.emit_jcc_to_label(invert_cc(cc), skip_label);
-        } else {
-            // Read the predicate from its regalloc location, not via
-            // `resolve_opref`: `consider_discard_nargs_j2` emits no
-            // `before_call`, so a predicate the regalloc left register-resident
-            // has no slot mapping and would panic there.  Test it in the
-            // scratch (R11) rather than rax, which IS allocatable here and may
-            // still hold one of the call's own arglocs.
-            self.emit_load_loc_to_scratch(arglocs[0]);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            dynasm!(self.mc ; .arch x64
-            ; test Rq(scratch), Rq(scratch)
-            );
-            dynasm!(self.mc ; .arch x64
-                ; jz =>skip_label
-            );
+        if arglocs.len() < 2 {
+            panic!("cond_call arglocs are predicate, func, extras; got {arglocs:?}");
         }
-
-        // `consider_discard_nargs` emits no `before_call`, so the regalloc
-        // does NOT spill caller-saved registers across a cond_call. The
-        // regalloc already treats the assembler's condition scratch (rax)
-        // as clobbered, but on the taken path the call also clobbers
-        // ecx/edx/esi/edi/r8..r10 + the XMM regs, destroying any value live
-        // across the cond_call. Save and restore all managed registers
-        // around the call — `_build_cond_call_slowpath(callee_only=False)`
-        // parity, plus `push_gcmap` / `pop_gcmap` from
-        // `aarch64/opassembler.py _emit_op_cond_call`. `clear_vable_token`
-        // → `force_now` allocates; a leftover null `jf_gcmap` leaves every
-        // spilled Ref slot unforwarded.
-        //
-        // Load the callee (func_index 1) and its args from their regalloc
-        // locations via `emit_call_from_arglocs`, not by re-resolving the op
-        // operands (`emit_call`): an arg the regalloc left register-resident
-        // has no slot mapping and would panic in `resolve_opref` (or read a
-        // stale slot).  Mirrors the AArch64 `genop_discard_cond_call`.
-        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true, false);
-        let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_call_from_arglocs(op, arglocs, 1, 0);
-        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true, false);
-
-        self.finish_cond_call_fast_path(op_index, skip_label);
+        self.load_condition_into_cc(&arglocs[0]);
+        let cc = self
+            .guard_success_cc
+            .take()
+            .expect("cond_call requires guard_success_cc (load_condition_into_cc)");
+        // Predicate at 0, func at 1. Extras are remapped onto
+        // `cond_call_register_arguments` in the slow path.
+        self.enqueue_cond_call(op, op_index, cc, arglocs[2..].to_vec(), None);
     }
 
-    /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
-    ///
-    /// x86/regalloc.py `consider_cond_call` / `consider_cond_call_value_i`
-    /// (`_r` is the same) and assembler.py `cond_call` / `CondCallSlowPath`.
-    /// Arglocs are `[argloc, resloc]`; extra args already sit in
-    /// `cond_call_register_arguments`. Test `argloc`, skip when nonzero; on
-    /// miss the helper returns a plain word moved into `resloc`. No Option
-    /// rewrite and no `store_rax_to_result`.
+    /// `cond_call` for `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R`.
+    /// `consider_cond_call` tests `resloc` and calls when it is zero.
+    /// Extras already sit in `cond_call_register_arguments`, so the remap
+    /// list is empty. Does not consume `guard_success_cc`.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        let (argloc, resloc) = match arglocs {
-            [argloc, resloc, ..] => (*argloc, *resloc),
+        let resloc = match arglocs {
+            [_, resloc, ..] => *resloc,
             other => panic!(
-                "COND_CALL_VALUE arglocs are [argloc, resloc] (x86/regalloc.py consider_cond_call), got {other:?}"
+                "COND_CALL_VALUE arglocs are [argloc, resloc] (consider_cond_call), got {other:?}"
             ),
         };
-        let skip_label = self.mc.new_dynamic_label();
-        // Test in the scratch so a miss-path extra arg is not clobbered.
-        self.emit_load_loc_to_scratch(argloc);
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64
-            ; test Rq(scratch), Rq(scratch)
-            ; jnz =>skip_label
+        assert!(
+            self.guard_success_cc.is_none(),
+            "cond_call value does not consume guard_success_cc"
         );
-
-        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true, false);
-        let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_cond_call_value_helper(op);
-        // `_build_cond_call_slowpath` leaves the helper word in eax; stash
-        // to the scratch (outside `ALL_CORE_REGS`) after reload so the
-        // restore can put every managed register back, then `MOV resloc, scratch`.
-        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), rax);
-        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true, false);
-        self.regalloc_mov(&Loc::Reg(crate::regloc::X86_64_SCRATCH_REG), &resloc);
-
-        self.finish_cond_call_fast_path(op_index, skip_label);
+        self.emit_test_loc(&resloc);
+        self.enqueue_cond_call(op, op_index, CC_E, Vec::new(), Some(resloc));
     }
 
-    /// `genop_guard_guard_no_exception`: when the next op is
-    /// `GUARD_NO_EXCEPTION`, leave the fast-path continue label for that
-    /// guard. `generate_guard_no_exception` is emitted on this call path
-    /// (`CondCallSlowPath.generate_body`) and then binds the label, so the
-    /// don't-call edge skips both the call and the exception check.
-    fn finish_cond_call_fast_path(&mut self, op_index: usize, skip_label: DynamicLabel) {
-        self.forget_scratch_register();
-        if self
+    /// `cond_call`: queue `CondCallSlowPath` and bind the continue point
+    /// immediately, so the fast path is only the test plus one `jcc`.
+    fn enqueue_cond_call(
+        &mut self,
+        op: &Op,
+        op_index: usize,
+        cc: u8,
+        arglocs: Vec<Loc>,
+        resloc: Option<Loc>,
+    ) {
+        let imm_func = match self.resolve_opref(op.arg(1).to_opref()) {
+            ResolvedArg::Const(val) => val,
+            ResolvedArg::Slot(_) => panic!("cond_call func is Const (cond_call)"),
+        };
+        let Some(gcmap) = self.pending_malloc_nursery_gcmap else {
+            panic!("cond_call gcmap is missing (perform_with_gcmap_ptr)");
+        };
+        if gcmap == 0 {
+            panic!("cond_call published a null gcmap");
+        }
+        let expects_guard_no_exception = self
             .operations
             .get(op_index + 1)
-            .is_some_and(|next| next.opcode == OpCode::GuardNoException)
-        {
-            self.pending_cond_call_skip = Some(skip_label);
-        } else {
-            dynasm!(self.mc ; .arch x64 ; =>skip_label);
-        }
-    }
-
-    /// Inline `cond_call_slowpath` body: extra args already in
-    /// `cond_call_register_arguments`, func is `op.getarg(1)` Const.
-    fn emit_cond_call_value_helper(&mut self, op: &Op) {
-        let func = match self.resolve_opref(op.arg(1).to_opref()) {
-            ResolvedArg::Const(val) => val,
-            ResolvedArg::Slot(_) => {
-                panic!("COND_CALL_VALUE func is Const (x86/regalloc.py consider_cond_call)")
-            }
-        };
-        rx86::mov_ri(&mut self.mc, rx86::EAX, func);
-        self.emit_abi_call_rax();
+            .is_some_and(|next| next.opcode == OpCode::GuardNoException);
+        let mut sp = self.emit_slow_jcc(
+            cc,
+            SlowPathKind::CondCall {
+                gcmap,
+                imm_func,
+                arglocs,
+                resloc,
+                variant_num: COND_CALL_SLOWPATH_FLOATS_ALL,
+                guard_token_no_exception: None,
+                expects_guard_no_exception,
+            },
+        );
+        self.set_continue_here(&mut sp);
+        self.pending_slowpaths.push(sp);
     }
 
     // genop_* — string/array operations
