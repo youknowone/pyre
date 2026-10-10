@@ -33226,17 +33226,27 @@ fn init_repeat_type(ns: PyObjectRef) {
 
 fn itertools_twoarg_new(
     args: &[PyObjectRef],
-    _exact_type: PyObjectRef,
+    exact_type: PyObjectRef,
     name: &str,
 ) -> Result<(PyObjectRef, PyObjectRef, PyObjectRef), crate::PyError> {
-    // interp_itertools.py W_Twoarg__new__, kept in source order.
-    // Bound scope from parse_obj: `cls`, `predicate`/`function`, `iterable`
-    // (`PY_NULL` omitted). Keywords are refused by the pos-only Signature.
-    let cls = args.first().copied().unwrap_or(PY_NULL);
-    let first = args.get(1).copied().filter(|w| !w.is_null());
-    let second = args.get(2).copied().filter(|w| !w.is_null());
-    let extra = args
-        .get(3..)
+    // interp_itertools.py W_Twoarg__new__.  Exact-type keywords are refused
+    // here so a subclass that overrides `__init__` still receives them
+    // (`test_keywords_in_subclass`); a pos-only Signature on `__new__`
+    // would reject that call before this check.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let args_w = positional.get(1..).unwrap_or(&[]);
+    builtinclass_new_args_check(
+        name,
+        exact_type,
+        cls,
+        0,
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
+    let first = args_w.first().copied().filter(|w| !w.is_null());
+    let second = args_w.get(1).copied().filter(|w| !w.is_null());
+    let extra = args_w
+        .get(2..)
         .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
     let given = usize::from(first.is_some()) + usize::from(second.is_some()) + extra;
     let (Some(first), Some(second), 0) = (first, second, extra) else {
