@@ -33745,93 +33745,34 @@ fn init_islice_type(ns: PyObjectRef) {
 fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exact =
         gettypefor(&pyre_object::interp_itertools::BATCHED_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let cls = positional.first().copied().unwrap_or(PY_NULL);
-    let positional = positional.get(1..).unwrap_or(&[]);
-
-    // Argument Clinic signature:
-    //     batched(iterable, n, *, strict=False)
-    let n_positional = positional.len();
+    // Bound scope: pos-only `cls`, `iterable`/`n`, kw-only `strict`
+    // (`PY_NULL` omitted). Clinic converts n and strict before the impl.
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let cls = bound(0).unwrap_or(PY_NULL);
+    let iterable = bound(1).ok_or_else(|| {
+        crate::PyError::type_error("batched() missing required argument 'iterable' (pos 1)")
+    })?;
+    let n_obj = bound(2).ok_or_else(|| {
+        crate::PyError::type_error("batched() missing required argument 'n' (pos 2)")
+    })?;
+    let strict_obj = bound(3).unwrap_or(PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
-    // The positional column is a borrowed slice, not a slot the collector
-    // rewrites either, and the keyword names and defaults below all allocate
-    // before the parse reads it — so it is published alongside the keyword
-    // values and read back at the same point.  The requested class is
-    // published with them: the same allocations can move it.
-    let positional_base = pyre_object::gc_roots::publish_roots(positional);
-    let kwargs_slot = kwargs.map(|dict| pyre_object::gc_roots::publish_roots(&[dict]));
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
-    pyre_object::gc_roots::normalize_roots(
-        cls_slot,
-        1 + n_positional + usize::from(kwargs_slot.is_some()) + 1,
-    );
-    // The entries come back in an owned `Vec`, which is not a slot the
-    // collector rewrites, and every allocation between here and the parse can
-    // move a value sitting in it.  The value column is published as one root
-    // set before the first of those allocations and read back where the
-    // `Arguments` copy is taken. Managed keyword names move, so each mint
-    // is pinned before the next allocation.
-    let (keyword_names_w, keyword_values_base) = match kwargs_slot {
-        Some(slot) => {
-            let dict = pyre_object::gc_roots::shadow_stack_get(slot);
-            let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
-                .into_iter()
-                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
-                .collect();
-            let values: Vec<PyObjectRef> = entries.iter().map(|(_, value)| *value).collect();
-            let base = pyre_object::gc_roots::pin_roots(&values);
-            let mut names = Vec::with_capacity(entries.len());
-            for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8_managed(key);
-                let w_name = pyre_object::gc_roots::pin_root(w_name);
-                names.push(w_name);
-            }
-            (names, base)
-        }
-        None => (Vec::new(), 0),
-    };
-    let signature =
-        crate::gateway::Signature::new(vec!["iterable", "n", "strict"], None, None, 1, 0);
-    let w_kw_defaults = pyre_object::w_dict_new();
-    // A `dict` header moves, and the insertion below allocates both the key
-    // string and the dict's storage, so the pin has to be taken on the fresh
-    // word and the receiver read back out of the slot.  `w_bool_from` hands
-    // back an immortal singleton, so evaluating it after that read allocates
-    // nothing.
-    let _ = pyre_object::gc_roots::pin_root(w_kw_defaults);
-    let kw_defaults_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    unsafe {
-        pyre_object::w_dict_setitem_str_no_proxy(
-            pyre_object::gc_roots::shadow_stack_get(kw_defaults_slot),
-            "strict",
-            pyre_object::w_bool_from(false),
-        )
-    };
-    let keywords_w: Vec<PyObjectRef> = (0..keyword_names_w.len())
-        .map(|index| unsafe {
-            pyre_object::gc_roots::shadow_stack_get(keyword_values_base + index)
-        })
-        .collect();
-    let positional_w: Vec<PyObjectRef> = (0..n_positional)
-        .map(|index| unsafe { pyre_object::gc_roots::shadow_stack_get(positional_base + index) })
-        .collect();
-    let arguments =
-        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
-    let mut scope_w = vec![PY_NULL; signature.scope_length()];
-    arguments.parse_into_scope(PY_NULL, &mut scope_w, "batched", &signature, None, unsafe {
-        pyre_object::gc_roots::shadow_stack_get(kw_defaults_slot)
-    })?;
-
-    // Clinic converts n and strict before entering batched_new_impl.
-    let values_base = pyre_object::gc_roots::pin_roots(&scope_w);
+    let values_base = pyre_object::gc_roots::publish_roots(&[iterable, n_obj, strict_obj]);
+    pyre_object::gc_roots::normalize_roots(cls_slot, 1 + 1 + 3);
     let value =
         |index: usize| unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + index) };
     let n = crate::builtins::space_index_w(value(1))?;
     let n = isize::try_from(n).map_err(|_| {
         crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
     })?;
-    let strict = crate::baseobjspace::is_true(value(2))?;
+    let w_strict = value(2);
+    let strict = if w_strict.is_null() {
+        false
+    } else {
+        crate::baseobjspace::is_true(w_strict)?
+    };
 
     if n < 1 {
         return Err(crate::PyError::value_error("n must be at least one"));
@@ -33854,7 +33795,19 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 fn init_batched_type(ns: PyObjectRef) {
     let entries = [
-        ("__new__", make_new_descr(batched_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_signature(
+                batched_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "iterable", "n", "strict"],
+                    None,
+                    None,
+                    1,
+                    1,
+                ),
+            ),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),

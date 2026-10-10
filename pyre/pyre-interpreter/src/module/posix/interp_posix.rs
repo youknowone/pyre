@@ -459,20 +459,12 @@ fn run_fork_callbacks(kind: &str) {
 }
 
 fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if !pos.is_empty() {
-        return Err(crate::PyError::type_error(
-            "register_at_fork() takes no positional arguments",
-        ));
-    }
-    crate::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["before", "after_in_parent", "after_in_child"],
-        "register_at_fork",
-    )?;
-    let before = crate::builtins::kwarg_get(kwargs, "before");
-    let parent = crate::builtins::kwarg_get(kwargs, "after_in_parent");
-    let child = crate::builtins::kwarg_get(kwargs, "after_in_child");
+    // Bound scope: kw-only `before`/`after_in_parent`/`after_in_child`
+    // (`PY_NULL` omitted).
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let before = bound(0);
+    let parent = bound(1);
+    let child = bound(2);
     if before.is_none() && parent.is_none() && child.is_none() {
         return Err(crate::PyError::type_error(
             "At least one argument is required.",
@@ -2511,7 +2503,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     crate::module_ns_store(
         ns,
         "register_at_fork",
-        crate::make_builtin_function("register_at_fork", register_at_fork),
+        crate::make_builtin_function_with_signature(
+            "register_at_fork",
+            register_at_fork,
+            crate::gateway::Signature::new(
+                vec!["before", "after_in_parent", "after_in_child"],
+                None,
+                None,
+                3,
+                0,
+            ),
+        ),
     );
 
     // os.major(device) / os.minor(device) / os.makedev(major, minor)
