@@ -3231,8 +3231,14 @@ pub fn parse_builtin_signature(
     // against 3.14.6: `sum([1], **{K:0, "start":3})` is
     // `takes at most 2 arguments (3 given)`; `int("5", 10, 1)` is
     // `int expected at most 2 arguments, got 3` (`_PyArg_CheckPositional`
-    // on `descr_new`, cls excluded).
-    if signature_accepts_keywords(sig) && !sig.has_vararg() && npos + nkw > sig.argnames.len() {
+    // on `descr_new`, cls excluded).  A `**kwargs` slot packs unmatched
+    // names (`argument.py` `_collect_keyword_args`), so this overlay
+    // stays off when `has_kwarg`.
+    if signature_accepts_keywords(sig)
+        && !sig.has_vararg()
+        && !sig.has_kwarg()
+        && npos + nkw > sig.argnames.len()
+    {
         let skip = usize::from(signature_cls_constructor(sig));
         let n = sig.argnames.len() - skip;
         let m = npos + nkw - skip;
