@@ -11,9 +11,9 @@
 //! views of the `chars` array carry encoded surrogates the way
 //! `allow_surrogates=True` does upstream.
 
-use parking_lot::Mutex;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
-use std::sync::LazyLock;
+use std::cell::UnsafeCell;
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use crate::lowlevel_string::{
     LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, LOWLEVEL_STRING_LEN_OFFSET,
@@ -807,8 +807,39 @@ struct WeakInternTable(*mut crate::rweakvaldict::WeakDict<crate::celldict::StrKe
 unsafe impl Send for WeakInternTable {}
 unsafe impl Sync for WeakInternTable {}
 
-static WEAK_INTERN: LazyLock<Mutex<WeakInternTable>> =
-    LazyLock::new(|| Mutex::new(WeakInternTable(std::ptr::null_mut())));
+/// Process-global intern table lock.  `parking_lot` parks into a
+/// process-global HashTable that `parking_lot_core` 0.9.12 does not reset
+/// after `fork()`; a child that GCs (`walk_interned_strings_gc`) while a
+/// worker interns then parks into that table.  Same OS-backed choice as
+/// `GcSync::quiesce` / the mutator registry.
+struct InternLock(UnsafeCell<Mutex<WeakInternTable>>);
+unsafe impl Sync for InternLock {}
+
+static WEAK_INTERN: LazyLock<InternLock> = LazyLock::new(|| {
+    InternLock(UnsafeCell::new(Mutex::new(WeakInternTable(
+        std::ptr::null_mut(),
+    ))))
+});
+
+fn lock_intern() -> MutexGuard<'static, WeakInternTable> {
+    // SAFETY: the cell is written only in [`intern_locks_after_fork_child`],
+    // which runs before the child creates any other thread.
+    unsafe { (*WEAK_INTERN.0.get()).lock() }.unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `RPyThreadAfterFork` / `ForkMutex::reinit_after_fork`: write a fresh mutex
+/// around the live table.  Must not lock the inherited waiter table.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn intern_locks_after_fork_child() {
+    let Some(lock) = LazyLock::get(&WEAK_INTERN) else {
+        return;
+    };
+    unsafe {
+        let mutex = &mut *lock.0.get();
+        let table = std::ptr::read(mutex.get_mut().unwrap_or_else(PoisonError::into_inner));
+        std::ptr::write(mutex, Mutex::new(table));
+    }
+}
 
 fn intern_dict(
     table: &mut WeakInternTable,
@@ -830,7 +861,7 @@ struct InternLookupProbe([u8; LOWLEVEL_STR_BASE_SIZE + INTERN_LOOKUP_STACK_BYTES
 
 fn intern_lookup_key(storage: *mut UnicodeValueStorage) -> Option<PyObjectRef> {
     let key = crate::celldict::StrKey(storage);
-    let mut table = WEAK_INTERN.lock();
+    let mut table = lock_intern();
     intern_dict(&mut table).ll_get(key)
 }
 
@@ -874,7 +905,7 @@ fn intern_lookup(value: &Wtf8) -> Option<PyObjectRef> {
 /// ids are registered and the collector singleton is live, and again when a
 /// test installs a fresh collector so the table's lifetime follows that heap.
 pub fn init_interned_strings() {
-    let mut table = WEAK_INTERN.lock();
+    let mut table = lock_intern();
     table.0 = crate::rweakvaldict::ll_new_weakdict();
 }
 
@@ -886,7 +917,7 @@ pub fn init_interned_strings() {
 /// (`setarrayitem_gc`) so `collect_oldrefs_to_nursery` traces a young WEAKREF
 /// and `invalidate_young_weakrefs` rewrites `weakptr` (`incminimark.py`).
 pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    let mut table = WEAK_INTERN.lock();
+    let mut table = lock_intern();
     if table.0.is_null() || !crate::gc_hook::try_gc_owns_object(table.0 as *mut u8) {
         return;
     }
@@ -916,7 +947,7 @@ fn prebuilt_weakref(obj: PyObjectRef) -> *mut crate::weakref::Weakref {
 fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef {
     let valueref = prebuilt_weakref(obj);
     let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
-    let mut table = WEAK_INTERN.lock();
+    let mut table = lock_intern();
     let dict = intern_dict(&mut table);
     if let Some(existing) = dict.ll_get(key) {
         if !replace_managed || !crate::gc_hook::try_gc_owns_object(existing as *mut u8) {
@@ -945,7 +976,7 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
     let valueref = unsafe { crate::weakref::w_weakref_new(obj) };
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
-    let mut table = WEAK_INTERN.lock();
+    let mut table = lock_intern();
     let dict = intern_dict(&mut table);
     if let Some(existing) = dict.ll_get(key) {
         return existing;
@@ -1045,7 +1076,7 @@ pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
 /// `sys.getunicodeinternedsize` exposes this census.
 #[majit_macros::dont_look_inside]
 pub fn interned_size() -> usize {
-    let table = WEAK_INTERN.lock();
+    let table = lock_intern();
     if table.0.is_null() {
         0
     } else {
@@ -1061,7 +1092,7 @@ pub fn interned_size() -> usize {
 /// it.
 #[majit_macros::dont_look_inside]
 pub fn interned_size_immortal() -> usize {
-    let table = WEAK_INTERN.lock();
+    let table = lock_intern();
     if table.0.is_null() {
         0
     } else {
@@ -1096,7 +1127,7 @@ pub fn interned_str_from_const_ptr(ptr: usize) -> Option<PyObjectRef> {
         return None;
     }
     {
-        let mut table = WEAK_INTERN.lock();
+        let mut table = lock_intern();
         if let Some(wrapper) = intern_dict(&mut table).find_live(|wrapper| {
             (unsafe { w_str_storage(wrapper) as usize } == ptr).then_some(wrapper)
         }) {

@@ -18,11 +18,11 @@
 //! Compiled code manipulates the current thread's root_stack_top with inline
 //! load/store instructions (no function calls), exactly as in
 //! `_call_header_shadowstack`.
-use parking_lot::{Mutex, RwLock};
-use std::cell::{Cell, RefCell};
-use std::sync::OnceLock;
+use parking_lot::RwLock;
+use std::cell::{Cell, RefCell, UnsafeCell};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use majit_ir::GcRef;
 
@@ -435,7 +435,26 @@ struct MutatorPruner {
 // quiescence established by gc_sync.
 unsafe impl Send for MutatorEntry {}
 
-static MUTATOR_REGISTRY: Mutex<Vec<MutatorEntry>> = Mutex::new(Vec::new());
+// `gc_sync` keeps the STW pair on OS-backed primitives because a parking_lot
+// condvar inherits its process-global userspace waiter queue
+// (`parking_lot_core` 0.9.12 has no atfork HashTable reset).  This registry
+// is locked after fork (`after_fork_child`) and again when the child starts
+// and joins a Python thread (`unregister_mutator` in `RuntimeThread::Drop`).
+// A contended parking_lot park in that window is the ubuntu
+// `test_2_join_in_forked_process` SIGSEGV.  `std::sync::Mutex` is the same
+// choice as `GcSync::quiesce`.
+struct MutatorRegistry(UnsafeCell<Mutex<Vec<MutatorEntry>>>);
+// SAFETY: every reader goes through [`lock_mutator_registry`] or the
+// single-threaded [`after_fork_child`] rewrite.
+unsafe impl Sync for MutatorRegistry {}
+
+static MUTATOR_REGISTRY: MutatorRegistry = MutatorRegistry(UnsafeCell::new(Mutex::new(Vec::new())));
+
+fn lock_mutator_registry() -> MutexGuard<'static, Vec<MutatorEntry>> {
+    // SAFETY: the cell is written only in [`after_fork_child`], which runs
+    // before the child creates any other thread.
+    unsafe { (*MUTATOR_REGISTRY.0.get()).lock() }.unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Register the current thread's TLS root structures for STW root walks.
 /// Unregistration is the caller's, and the pairing is armed rather than
@@ -463,7 +482,7 @@ pub fn register_mutator() {
     let bh_interp_roots = BH_INTERP_ROOTS.with(|roots| roots as *const _);
     let resume_ref_roots_stack = RESUME_REF_ROOTS_STACK.with(|stack| stack as *const _);
 
-    let mut registry = MUTATOR_REGISTRY.lock();
+    let mut registry = lock_mutator_registry();
     assert!(
         !registry.iter().any(|entry| entry.thread_id == thread_id),
         "mutator thread registered twice"
@@ -504,7 +523,7 @@ fn register_extra_area(
     scoped: bool,
 ) -> usize {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock();
+    let mut registry = lock_mutator_registry();
     let entry = registry
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
@@ -545,7 +564,7 @@ impl MutatorExtraAreaGuard {
 impl Drop for MutatorExtraAreaGuard {
     fn drop(&mut self) {
         let thread_id = std::thread::current().id();
-        let mut registry = MUTATOR_REGISTRY.lock();
+        let mut registry = lock_mutator_registry();
         let entry = registry
             .iter_mut()
             .find(|entry| entry.thread_id == thread_id)
@@ -581,7 +600,7 @@ impl Drop for MutatorExtraAreaGuard {
 /// address it dereferences from `data`, never from caller TLS.
 pub unsafe fn register_mutator_pruner(prune: MutatorPrunerFn, data: *const ()) {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock();
+    let mut registry = lock_mutator_registry();
     let entry = registry
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
@@ -602,7 +621,7 @@ pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>)
         crate::gc_sync::mutators_quiesced(),
         "prune_all_mutator_areas reaches foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     for mutator in registry.iter() {
         for pruner in mutator.pruners.iter() {
             // SAFETY: gc_sync has quiesced every registered owner, and each
@@ -621,7 +640,7 @@ pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>)
 /// cannot be classified.
 pub fn prune_my_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>) {
     let thread_id = std::thread::current().id();
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
         return;
     };
@@ -637,7 +656,7 @@ pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_extra_areas walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     for mutator in registry.iter() {
         for area in mutator.extra_areas.iter().flatten() {
             // SAFETY: gc_sync has quiesced every registered owner, and each
@@ -653,7 +672,7 @@ pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
 /// mutator have no per-thread areas and are a no-op.
 pub fn walk_my_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
     let thread_id = std::thread::current().id();
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
         return;
     };
@@ -670,7 +689,7 @@ pub fn walk_my_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
 /// collector.
 pub fn unregister_mutator() {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock();
+    let mut registry = lock_mutator_registry();
     let index = registry
         .iter()
         .position(|entry| entry.thread_id == thread_id)
@@ -690,11 +709,21 @@ pub fn unregister_mutator() {
 ///
 /// PyPy's `reinit_threads()` retains only the child thread's execution
 /// context.  The shadow-stack registry is the translated equivalent of that
-/// per-thread root ownership.
+/// per-thread root ownership.  `shadowstack.py` `thread_after_fork` writes
+/// `gcdata.thread_stacks = None` and resets `main_tid`/`active_tid` — no
+/// lock.  Do not lock here either: the inherited mutex may still name a
+/// vanished parent's waiter (`RPyThreadAfterFork` / `ForkMutex::reinit_after_fork`).
 pub fn after_fork_child() {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock();
-    registry.retain(|entry| entry.thread_id == thread_id);
+    // SAFETY: the child has one thread, so no live `MutexGuard` into the
+    // old value.  `ptr::write` does not drop the inherited mutex; a vanished
+    // parent thread may still "hold" it (`rgil::init_mutexes`).
+    unsafe {
+        let mutex = &mut *MUTATOR_REGISTRY.0.get();
+        let mut entries = std::mem::take(mutex.get_mut().unwrap_or_else(PoisonError::into_inner));
+        entries.retain(|entry| entry.thread_id == thread_id);
+        std::ptr::write(mutex, Mutex::new(entries));
+    }
 }
 
 /// The GcRef shadow stack — `gcdata.root_stack_base` / `root_stack_top`
@@ -1212,7 +1241,7 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_roots walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     for mutator in registry.iter() {
         // SAFETY: every registered mutator is quiesced, and registry removal
         // precedes the owner's RUNNING decrement and TLS destruction.
@@ -1437,7 +1466,7 @@ pub fn walk_all_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_jf_roots walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     for mutator in registry.iter() {
         // SAFETY: the owning mutator is quiesced and cannot change the stack
         // or its backing allocation until the STW guard resumes it.
@@ -1747,7 +1776,7 @@ pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_bh_regs walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     for mutator in registry.iter() {
         // SAFETY: all owners are quiesced, and each registered slice remains
         // pinned until its owning blackhole frame pops the entry after resume.
@@ -1937,7 +1966,7 @@ pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_resume_ref_roots walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock();
+    let registry = lock_mutator_registry();
     for mutator in registry.iter() {
         // SAFETY: the owner is quiesced and the registered slices stay pinned
         // for the complete resume-construction window.
